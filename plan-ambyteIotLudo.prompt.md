@@ -641,13 +641,13 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
 
 ### Steps
 
-6A.1. Create `components/mqtt_client/` — wraps ESP-MQTT (`esp_mqtt_client`):
+6A.1. Create `components/mqtt_client/` — **DONE** — wraps ESP-MQTT (`esp_mqtt_client`):
   - Add `components/mqtt_client/Kconfig.projbuild` and define the 6A compile-time carrier:
     - `CONFIG_AMBYTE_DEVICE_ID`
     - `CONFIG_AMBYTE_MQTT_URI`
     - `CONFIG_AMBYTE_MQTT_CLIENT_ID`
     - `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`
-  - `typedef struct { const char *broker_uri; const char *client_id; } mqtt_client_config_t;` — `device_id` and `topic_root` are accessed via `CONFIG_AMBYTE_DEVICE_ID` / `CONFIG_AMBYTE_MQTT_TOPIC_ROOT` Kconfig macros directly in `device_commands.c`; they are not passed through `mqtt_client_config_t`
+  - `typedef struct { const char *broker_uri; const char *client_id; } mqtt_client_config_t;` — `broker_uri` and `client_id` are the only MQTT-client-level settings; `topic_root` and `device_id` are domain-level and are injected into `device_commands_config_t` by `app_main`, not through `mqtt_client_config_t`
   - `mqtt_client_init(const mqtt_client_config_t *cfg)` takes config built by `app_main` from NVS first, falling back to `CONFIG_AMBYTE_*` Kconfig symbols; `device_config_init()` must be called before `mqtt_client_init()`
   - `mqtt_client_start()` / `mqtt_client_stop()`
   - Implements `message_publish_fn`, `message_is_connected_fn`, and `message_set_publish_ack_handler_fn`
@@ -655,7 +655,7 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
   - Registers an ESP-MQTT event handler and translates `MQTT_EVENT_PUBLISHED` into the plan's publish-ack callback
   - `REQUIRES domain certs` + `PRIV_REQUIRES mqtt esp_event`
 
-6A.2. Extend persistence for telemetry upload:
+6A.2. Extend persistence for telemetry upload — **DONE**:
   - Add a group-aware repository API now:
     - `measurement_query_header_by_id_fn`
     - `measurement_query_unsynced_headers_fn`
@@ -668,6 +668,13 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
   - On boot, reset any stale `INFLIGHT` headers back to `PENDING` before MQTT publishing starts
 
 6A.3. Add MQTT commands to `device_commands`:
+  - Add two string fields to `device_commands_config_t`:
+    ```c
+    const char *topic_root; /* e.g. "ambyte/prod" — runtime NVS value, Kconfig fallback applied by app_main */
+    const char *device_id;  /* e.g. "thing-abc"  — runtime NVS value, Kconfig fallback applied by app_main */
+    ```
+    `device_commands.c` uses `s_cfg.topic_root` and `s_cfg.device_id` for all topic construction; it does **not** reference `CONFIG_AMBYTE_MQTT_TOPIC_ROOT` or `CONFIG_AMBYTE_DEVICE_ID` directly.
+  - **Migration of existing code**: `device_commands.c` currently uses `CONFIG_AMBYTE_MQTT_TOPIC_ROOT` and `CONFIG_AMBYTE_DEVICE_ID` directly in two snprintf calls (`cmd_mqtt_publish_measurement` topic construction and `device_commands_subscribe_inbound` topic construction); when implementing 6A.3, replace all four `CONFIG_AMBYTE_*` references with `s_cfg.topic_root` and `s_cfg.device_id`
   - `cmd_mqtt_publish(const char *topic, const char *payload)` — raw publish for debugging / ad-hoc messages
   - `cmd_mqtt_publish_measurement(int64_t measure_id)` — query the header plus all value rows for `measure_id`, derive the fixed-contract topic internally, mark the header `INFLIGHT`, then publish with QoS 1
   - `cmd_mqtt_publish_unsynced(const char *measure_type)` — atomically claims the next pending measurement header of the requested type, derives the fixed-contract topic internally, and publishes exactly one logical measurement group per call
@@ -692,14 +699,14 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
     ```
     - `values` is a **JSON object** keyed by `data_type` (not an array)
     - device identifier embedded in the topic, not the payload
-  - Topic format: `<CONFIG_AMBYTE_MQTT_TOPIC_ROOT>/<CONFIG_AMBYTE_DEVICE_ID>/<measure_type>/<measure_id>`
+  - Topic format: `<s_cfg.topic_root>/<s_cfg.device_id>/<measure_type>/<measure_id>`
   - Measurement-oriented MQTT commands use this topic format only; they do not accept caller-provided topic overrides
 
-6A.5. Wire in `app_main.c` — **DONE** (direct event handlers, no supervisor task):
+6A.5. Wire in `app_main.c` — **TODO** (depends on 6A.3 + 6B.3):
   - `app_main` registers static event handlers directly: `on_got_ip` → `mqtt_client_start()`; `on_wifi_disconnect` → `mqtt_client_stop()` + `device_commands_on_mqtt_disconnect()`
   - No MQTT supervisor task — handlers call MQTT APIs directly; this is simpler and sufficient given the single-threaded event loop
   - `device_config_init()` called after NVS init; MQTT config built from NVS first, `CONFIG_AMBYTE_*` Kconfig fallback
-  - All 17 `device_commands_config_t` fields wired including all persistence sync-state fns and messaging fns
+  - All 19 `device_commands_config_t` fields wired: 17 original + `topic_root` + `device_id`; both read from NVS via `device_config_get_mqtt_topic_root()` / `device_config_get_device_id()` with Kconfig fallback (see 6C.4 for the code pattern)
   - `if (wifi_manager_is_connected()) mqtt_client_start()` called after event handler registration to handle the case where WiFi connected during `app_start_wifi()` before handlers were registered
   - `device_commands_subscribe_inbound()` called after `device_commands_init()`
 
@@ -733,24 +740,27 @@ Add inbound MQTT command handling and runtime device configuration only after 6A
   - Dynamic heap reassembly of fragmented `MQTT_EVENT_DATA` (malloc on first chunk, free after dispatch)
   - OOM on oversized payloads: skips remaining chunks and logs error — no crash
 
-6B.3. Implement `components/device_config/` — **DONE**:
-  - NVS namespace `"device_cfg"`: keys `mqtt_uri`, `mqtt_client_id`, `mqtt_topic_root`
-  - `device_config_init()` + get/set functions for each key
-  - `app_main` reads runtime config first, falls back to `CONFIG_AMBYTE_*` if key absent
+6B.3. Implement `components/device_config/` — **DONE** (base); extend with `device_id`:
+  - NVS namespace `"device_cfg"`: keys `mqtt_uri`, `mqtt_client_id`, `mqtt_topic_root`; add `device_id` (9 chars, fits NVS_KEY_NAME_MAX_SIZE = 16)
+  - `device_config_init()` + get/set for all four keys:
+    - `device_config_get_device_id(char *buf, size_t len)` / `device_config_set_device_id(const char *val)`
+  - `app_main` reads all four from NVS first, falls back to `CONFIG_AMBYTE_*` if key absent
 
-6B.4. Wire inbound command topic handling — **DONE**:
+6B.4. Wire inbound command topic handling — **PARTIAL** (subscribe/dispatch done; topic construction uses `CONFIG_AMBYTE_*` placeholder pending 6A.3):
   - `device_commands_subscribe_inbound()` subscribes to `<root>/<device_id>/cmd`
   - `cmd_dispatch_json()` parses JSON `{"cmd":...}` and dispatches to `cmd_*` functions
   - `cJSON` used for parsing (PRIV_REQUIRES in `device_commands/CMakeLists.txt`)
   - Supported commands: `set_rgb`, `read_env`, `status`, `publish_unsynced`, `mqtt_status`, `sleep_ms`, `log`
   - Command parsing lives in `device_commands`, not in `mqtt_client` plumbing
+  - **Pending**: topic construction in `device_commands_subscribe_inbound` and `cmd_mqtt_publish_measurement` currently uses `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`/`CONFIG_AMBYTE_DEVICE_ID` directly; corrected when 6A.3 adds `s_cfg.topic_root`/`s_cfg.device_id` and updates both snprintf calls
 
-6B.5. Add BLE `device-config` provisioning endpoint (deferred — superseded by 6C.4):
-  - Implemented as a `protocomm` endpoint `"dev-cfg"` registered via `wifi_manager_start_provisioning` extra-endpoint API (see 6C.2)
-  - Accepted JSON payload: `{"mqtt_uri":"…","mqtt_client_id":"…","mqtt_topic_root":"…"}`
+6B.5. Add BLE `device-config` provisioning endpoint (deferred — **requires 6C.2 and 6B.3 device_id extension first**):
+  - **Dependency**: cannot be implemented before 6C.2 extends `wifi_manager_start_provisioning` with the extra-endpoint API (current 2-parameter signature has no mechanism to register custom endpoints) and before 6B.3's `device_id` extension is complete (`device_config_set_device_id()` must exist for the handler to persist the device_id field)
+  - Implemented as a `protocomm` endpoint `"dev-cfg"` registered via the extra-endpoint array (see 6C.2 and 6C.4)
+  - Accepted JSON payload: `{"mqtt_uri":"…","mqtt_client_id":"…","mqtt_topic_root":"…","device_id":"…"}`
   - Persist each present field to NVS via `device_config_set_*`; absent fields are left unchanged
   - **Timeout: 120 seconds, session-scoped** (shared with Wi-Fi and cert provisioning — see 6C constraints)
-  - Reboot is deferred to session end alongside cert and Wi-Fi credential writes — single reboot covers all (see 6C.6)
+  - Reboot is deferred to session end alongside cert and Wi-Fi credential writes — single reboot covers all (see 6C.4)
   - `dev_cfg_prov_handler` is a thin wrapper in `app_main.c`; sets `s_config_written = true` on success via `priv_data`
 
 **Verification:** Publish a fragmented test command payload; verify `mqtt_client` reassembles it once, command dispatch runs once, and OOM on oversize payload logs error without crashing.
@@ -767,7 +777,7 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
 
 ### Constraints
 
-- **Security**: Certificate data is delivered as a custom `protocomm` endpoint registered via `wifi_prov_mgr_endpoint_create("cert-prov")`. This endpoint runs **inside** the existing SRP6a-encrypted BLE session (`WIFI_PROV_SECURITY_1`), so the private key is never transmitted in plaintext. A raw standalone GATT characteristic must not be used — it would bypass the session encryption entirely.
+- **Security**: Certificate data is delivered as a custom `protocomm` endpoint registered via `wifi_prov_mgr_endpoint_create("cert-prov")`. This endpoint runs **inside** the existing SRP6a-encrypted BLE session (`WIFI_PROV_SECURITY_1`), so the private key is never transmitted in plaintext. A raw standalone GATT characteristic must not be used — it would bypass the session encryption entirely. Note: `WIFI_PROV_SECURITY_1` (SRP6a) is functional in ESP-IDF 5.x but `WIFI_PROV_SECURITY_2` (SRP6a + AES-GCM) is the current recommendation; upgrading is a future hardening step and does not block 6C.
 - **BLE MTU limit**: `protocomm` endpoint payloads are capped by the negotiated MTU (typically 512 bytes minus framing). A PEM certificate is ~1–2 KB, so multi-chunk transfer is required.
 - **NVS value size limit**: NVS string values are limited to 4000 bytes. PEM certificates and RSA-2048 private keys (~1700 bytes) all fit.
 - **No flash encryption yet**: Certificates stored in NVS are readable if physical access to flash is obtained. This is an accepted risk until flash encryption is addressed in a later phase.
@@ -777,7 +787,7 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
 
 6C.1. Extend `components/certs/` to support NVS-backed certificate storage:
   - NVS namespace `"certs"`, keys: `"ca_cert"` (7), `"dev_cert"` (8), `"dev_key"` (7) — all ≤ 15 chars (NVS_KEY_NAME_MAX_SIZE = 16 incl. null)
-  - On `certs_init()`: read all three keys from NVS into module-level static buffers declared as:
+  - `certs_init()` opens an NVS handle into a module-level `static nvs_handle_t s_handle` (same pattern as `device_config.c` — handle stays open for the device lifetime), then reads all three keys into module-level static buffers:
     ```c
     static char s_ca_cert[2048];
     static char s_dev_cert[2048];
@@ -785,7 +795,7 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
     ```
     6 KB BSS total, always resident. If a key is absent the buffer holds an empty string and the compiled-in global is used as fallback. If flash cost becomes a concern, replace with heap-allocated `char *` pointers initialised to `NULL` on `certs_init()` and allocated only when the NVS key is found.
   - `certs_get_ca()`, `certs_get_device_cert()`, `certs_get_device_key()` — return `const char *` pointing to the static buffer if `buffer[0] != '\0'`, otherwise return the compiled-in global directly. Pointers are stable for the device lifetime; callers must not free them.
-  - `certs_set_ca(const char *pem)`, `certs_set_device_cert(const char *pem)`, `certs_set_device_key(const char *pem)` — write to NVS via `nvs_set_str` + `nvs_commit`; do **not** update the cached static buffer (a reboot is required to reload)
+  - `certs_set_ca(const char *pem)`, `certs_set_device_cert(const char *pem)`, `certs_set_device_key(const char *pem)` — write to NVS via `nvs_set_str` + `nvs_commit` using the open `s_handle`; do **not** update the cached static buffer (a reboot is required to reload)
   - `certs_are_provisioned()` — per-cert check; returns true only if every getter returns a non-empty string:
     ```c
     return certs_get_ca()[0]          != '\0'
@@ -793,7 +803,10 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
         && certs_get_device_key()[0]  != '\0';
     ```
     A mix of NVS-loaded and compiled-in certs correctly returns true.
-  - Remove `certs_port.h` — not needed; certs are infrastructure-to-infrastructure and need no domain port
+  - `certs_port.h` does not exist and should not be created — certs are infrastructure-to-infrastructure and need no domain port
+  - Update `components/certs/CMakeLists.txt`: add `REQUIRES nvs_flash` (needed by `nvs_open`, `nvs_get_str`, `nvs_set_str`)
+  - **Call site**: `app_main()` must call `certs_init()` after NVS init (`app_init_nvs()`) and before `mqtt_client_init()`. Without this call, `s_ca_cert`/`s_dev_cert`/`s_dev_key` remain empty, all `certs_get_*()` callers silently fall back to the compiled-in empty stubs, and TLS is disabled with no error reported.
+  - Add `certs` to `REQUIRES` in `main/CMakeLists.txt` at this step — `app_main.c` now directly calls `certs_init()` and includes `certs.h`; making the dependency explicit here (rather than relying on the transitive path through `mqtt_client`) prevents a build break when 6C.5 later removes `certs` from `mqtt_client/CMakeLists.txt`
 
 6C.2. Decouple `wifi_manager` from cert logic — extend `wifi_manager_start_provisioning` to accept caller-provided extra endpoints:
   - Add to `wifi_manager.h`:
@@ -810,11 +823,13 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
         const wifi_prov_extra_endpoint_t *extra_endpoints,
         size_t                            num_extra_endpoints);
     ```
-  - Inside `wifi_manager_start_provisioning`: iterate `extra_endpoints`, call `wifi_prov_mgr_endpoint_create(ep->name)` for each before `wifi_prov_mgr_start_provisioning()`, then `wifi_prov_mgr_endpoint_register(ep->name, ep->handler, ep->ctx)` for each after start
+  - Inside `wifi_manager_start_provisioning`: call `wifi_prov_mgr_init()` first (line 562 in current `wifi_manager.c`); then iterate `extra_endpoints` and call `wifi_prov_mgr_endpoint_create(ep->name)` for each — this MUST happen after `wifi_prov_mgr_init()` but BEFORE `wifi_prov_mgr_start_provisioning()` (line 576); then call `wifi_prov_mgr_start_provisioning()`; then iterate again and call `wifi_prov_mgr_endpoint_register(ep->name, ep->handler, ep->ctx)` for each after start
   - `wifi_manager` gains no dependency on `certs` or `device_config`; `app_main` owns the endpoint descriptors
+  - Update `wifi_manager/CMakeLists.txt`: move `protocomm` from `PRIV_REQUIRES` to `REQUIRES` — `wifi_manager.h` now exposes `protocomm_req_handler_t` in the public `wifi_prov_extra_endpoint_t` struct; consumers (e.g. `app_main`) must be able to see that type at compile time
 
 6C.3. Implement `cert_prov_handler` — chunked transfer inside the encrypted session:
   - `cert_prov_handler` is a `protocomm_req_handler_t` (signature: `esp_err_t handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen, uint8_t **outbuf, ssize_t *outlen, void *priv_data)`); responses are written into `*outbuf`/`*outlen` (the protocomm response buffer) — not GATT notifications
+  - **CRITICAL**: `*outbuf` MUST be allocated with `malloc` — protocomm calls `free(*outbuf)` after sending the response. Never assign a string literal or stack address to `*outbuf`; always do `*outbuf = malloc(len); memcpy(*outbuf, json_str, len); *outlen = len;`
   - Handler state machine (`IDLE → RECEIVING → DONE`), with `bool *out_written` injected via `priv_data`:
 
     | State | Write received | Action | Response written to `*outbuf` |
@@ -825,30 +840,91 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
     | RECEIVING | fill == total_len (last chunk) | null-terminate; parse JSON; call `certs_set_*` for each present field; free buffer; set `*out_written = true` | `{"ok":true}` or `{"ok":false,"error":"…"}` |
     | RECEIVING | oversize / OOM | free buffer; reset to IDLE | `{"ok":false,"error":"overflow"}` |
 
+  - **Single-chunk complete**: after copying the first chunk, check immediately if `fill == total_len`; if so, process the buffer as a completed message (same action as the RECEIVING last-chunk row) and respond `{"ok":true}` instead of `{"complete":false}`. This handles test payloads or any cert small enough to fit in one BLE packet.
   - On BLE disconnect before last chunk: free buffer, reset to IDLE, no NVS write (`priv_data` flag not set)
+  - **Cleanup after session end**: expose `void cert_prov_handler_reset(void)` — frees in-flight buffer and resets state to IDLE. `app_main` calls this unconditionally after `wifi_manager_start_provisioning()` returns (before the `prov_ok || any_write` reboot check), covering both the timeout+zero-writes path and the normal session-end path.
   - **Accepted JSON payload** (all fields optional; absent fields leave existing NVS values unchanged):
     ```json
     {"ca_cert":"-----BEGIN CERTIFICATE-----\n…","dev_cert":"…","dev_key":"…"}
     ```
   - The client must wait for each protocomm response before sending the next chunk
 
-6C.4. Register endpoints and own write flags in `app_main`:
-  - `app_main` declares and owns both flags:
-    ```c
-    static bool s_certs_written  = false;
-    static bool s_config_written = false;
-    ```
-  - Build the endpoint array and pass it to `wifi_manager_start_provisioning`:
-    ```c
-    wifi_prov_extra_endpoint_t extra[] = {
-        { "cert-prov", cert_prov_handler,    &s_certs_written  },
-        { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
-    };
-    esp_err_t prov_err = wifi_manager_start_provisioning(
-        "AMBYTE", "ambyte123", extra, 2);
-    ```
+6C.4. Refactor `app_start_wifi()` and own write flags in `app_main`:
+
+  **Refactor `app_start_wifi()`** — strip it down to init + start only; remove the provisioning check and both connect paths:
+  ```c
+  static esp_err_t app_start_wifi(void)
+  {
+      esp_err_t err = wifi_manager_init();
+      if (err != ESP_OK) return err;
+      return wifi_manager_start();
+  }
+  ```
+
+  **`app_main()` owns the full Wi-Fi branching** — after `app_start_wifi()` returns, check provisioning state and drive both paths:
+  ```c
+  err = app_start_wifi();
+  if (err != ESP_OK) {
+      ESP_LOGE(APP_TAG, "Wi-Fi startup failed: %s", esp_err_to_name(err));
+      return;
+  }
+
+  bool provisioned = false;
+  wifi_manager_is_provisioned(&provisioned);
+
+  if (!provisioned) {
+      static bool s_certs_written  = false;
+      static bool s_config_written = false;
+
+      wifi_prov_extra_endpoint_t extra[] = {
+          { "cert-prov", cert_prov_handler,    &s_certs_written  },
+          { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
+      };
+      esp_err_t prov_err = wifi_manager_start_provisioning(
+          "AMBYTE", "ambyte123", extra, 2);
+
+      cert_prov_handler_reset(); /* free any in-flight reassembly buffer */
+      bool any_write = s_certs_written || s_config_written;
+      bool prov_ok   = (prov_err == ESP_OK);
+      if (prov_ok || any_write) {
+          esp_restart();
+      }
+      /* else: timed out, zero writes — continue without reboot */
+  } else {
+      err = wifi_manager_connect_stored();
+      if (err == ESP_OK) {
+          ESP_LOGI(APP_TAG, "Wi-Fi connected");
+      } else if (err == ESP_ERR_TIMEOUT) {
+          ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
+      } else {
+          ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
+      }
+  }
+  ```
+
+  The reboot-on-success block (previously 6C.6) is now inline here — 6C.6 is superseded by this structure.
+
   - `dev_cfg_prov_handler` is a thin wrapper that calls `device_config_set_*` for each present JSON field and sets `*(bool *)priv_data = true` on success
-  - Both handlers are defined in `app_main.c`; no cert or config logic moves into `wifi_manager`
+  - Both handlers are defined in `app_main.c` (as static functions above `app_main`); no cert or config logic moves into `wifi_manager`
+  - `app_main.c` uses `cJSON` to parse JSON payloads in both handlers → add `json` to `PRIV_REQUIRES` in `main/CMakeLists.txt`
+  - `on_got_ip` and `on_wifi_disconnect` are registered after this entire Wi-Fi block, so they cannot fire during the provisioning window
+  - After `app_start_wifi()` and the provisioning/connect block, wire `topic_root` and `device_id` into `device_commands_config_t` using NVS reads with Kconfig fallback:
+    ```c
+    char topic_root[128], device_id[64];
+    if (device_config_get_mqtt_topic_root(topic_root, sizeof(topic_root)) != ESP_OK)
+        strncpy(topic_root, CONFIG_AMBYTE_MQTT_TOPIC_ROOT, sizeof(topic_root) - 1);
+    topic_root[sizeof(topic_root) - 1] = '\0';
+    if (device_config_get_device_id(device_id, sizeof(device_id)) != ESP_OK)
+        strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
+    device_id[sizeof(device_id) - 1] = '\0';
+
+    device_commands_config_t cmd_cfg = {
+        /* … all existing fields … */
+        .topic_root = topic_root,
+        .device_id  = device_id,
+    };
+    ```
+    The `topic_root` and `device_id` buffers are on `app_main`'s stack. They remain valid for the device lifetime because `app_main` never returns — this is safe.
 
 6C.5. Decouple `mqtt_client` from `certs` — pass PEM pointers through config:
   - Extend `mqtt_client_config_t` with three new fields:
@@ -857,23 +933,23 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
     const char *device_cert_pem; /* NULL → no client auth */
     const char *device_key_pem;  /* NULL → no client auth */
     ```
-  - `mqtt_client_init()` reads TLS config from these fields instead of referencing `aws_*_pem` globals directly; the `certs_are_provisioned()` gate is replaced by a NULL check on `ca_cert_pem`
+  - `mqtt_client_init()` reads TLS config from these fields; enable TLS only when `ca_cert_pem != NULL`
   - `mqtt_client` no longer REQUIRES `certs`; remove `certs` from `mqtt_client/CMakeLists.txt`
-  - `app_main` calls `certs_get_ca()`, `certs_get_device_cert()`, `certs_get_device_key()` and populates `mqtt_client_config_t` before calling `mqtt_client_init()`
-
-6C.6. Single reboot at provisioning session end:
-  - After `wifi_manager_start_provisioning()` returns, check the return value and the write flags:
+  - `app_main` gates the PEM fields on `certs_are_provisioned()` — `certs_get_*()` always returns a non-NULL pointer (falls back to compiled-in empty string), so a NULL check on the return value alone would always be true and would pass empty certs to the MQTT stack:
     ```c
-    bool any_write = s_certs_written || s_config_written;
-    bool prov_ok   = (prov_err == ESP_OK);
-    if (prov_ok || any_write) {
-        // prov_ok: Wi-Fi creds written; reboot to connect with new credentials
-        // any_write: cert or config written before timeout; reboot to load new NVS values
-        esp_restart();
-    }
-    // else: timed out with zero writes → continue without rebooting
+    bool certs_ok = certs_are_provisioned();
+    mqtt_client_config_t mqtt_cfg = {
+        .broker_uri      = mqtt_uri,
+        .client_id       = mqtt_client_id,
+        .ca_cert_pem     = certs_ok ? certs_get_ca()           : NULL,
+        .device_cert_pem = certs_ok ? certs_get_device_cert()  : NULL,
+        .device_key_pem  = certs_ok ? certs_get_device_key()   : NULL,
+    };
     ```
-  - This covers both the success path and the edge case where cert/config were written but the session timed out before Wi-Fi credentials were sent
+  - `main/CMakeLists.txt` already has `certs` in `REQUIRES` (added in 6C.1); removing `certs` from `mqtt_client/CMakeLists.txt` here is safe
+
+6C.6. ~~Single reboot at provisioning session end~~ — **superseded by 6C.4**:
+  - The `prov_ok || any_write` reboot logic is now inline in `app_main()` immediately after `wifi_manager_start_provisioning()` returns (see 6C.4 code block). No separate step needed.
 
 6C.7. CLI cert status via `device_commands`:
   - Add `certs_status_fn` function pointer to `device_commands_config_t`:
@@ -883,7 +959,8 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
   - Add `cmd_cert_status()` to `device_commands` — calls `s_cfg.certs_status` and returns a `cmd_result_t` describing whether NVS-backed certs are present
   - CLI calls `cmd_cert_status()` — CLI never references `certs` directly
   - `app_main` wires `certs_are_provisioned` into `device_commands_config_t.certs_status`
-  - Update `WIFI_MANAGER_PROV_TIMEOUT_MS` in `wifi_manager.c` to `120000`
+  - After this step, `device_commands_config_t` has **20 fields** total: 17 original + `topic_root` + `device_id` (added in 6A.3) + `certs_status_fn` (this step)
+  - `WIFI_MANAGER_PROV_TIMEOUT_MS` is already `120000` — ✓ DONE
 
 **Verification:** Flash device with empty `certs.c` stubs. Over BLE provisioning (using ESP's provisioning app or `esp_prov` CLI tool), send Wi-Fi credentials to the standard endpoint, device-config JSON to `"dev-cfg"`, and cert JSON to `"cert-prov"`. Confirm single reboot occurs after session. Confirm MQTT connects with TLS to AWS IoT Core on next boot. Run `cert status` CLI command to confirm NVS-backed certs are reported. Test edge case: send only cert JSON then let session time out — confirm single reboot still occurs.
 
