@@ -1,9 +1,25 @@
 CONFIG_AMBYTE_WIFI_SSID="__UNPROVISIONED__"
 CONFIG_AMBYTE_WIFI_PASSWORD="__UNPROVISIONED__"
+# Console on UART1 (GPIO3 TX / GPIO46 RX): the former AMBIT CH0 pins. Verified by
+# multimeter against the CH9102F adapter — its RXD lands on GPIO3 (so the ambyte
+# transmits there) and its TXD on GPIO46 (so the ambyte receives there). The native
+# USB-Serial-JTAG console is disabled because USB-OTG host mode claims the shared
+# GPIO19/20 pads. Flashing still works via ROM download mode over the native port.
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is not set
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+# UART peripheral is selected by the CUSTOM_NUM choice (ESP_CONSOLE_UART_NUM is
+# a derived, non-settable int). Pick UART1 = the freed AMBIT CH0.
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_1=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=3
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=46
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
+
+# USB-OTG host: enable external-hub support so CDC-ACM sensors behind a powered
+# hub are enumerated (default is off). Multi-level hub stays at its default (y).
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 # CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"

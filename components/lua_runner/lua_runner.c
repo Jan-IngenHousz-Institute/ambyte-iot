@@ -1045,6 +1045,126 @@ static void lua_register_db_module(lua_State *L)
     lua_setglobal(L, "db");
 }
 
+/* Read an optional string field `key` from the Lua table on the stack top into
+ * `out` (truncated at cap-1, always NUL-terminated). Balances the stack; an
+ * absent or non-string field leaves `out` untouched. */
+static void lua_get_optional_string(lua_State *L, const char *key,
+                                    char *out, size_t cap)
+{
+    lua_getfield(L, -1, key);
+    if (lua_isstring(L, -1)) {
+        const char *s = lua_tostring(L, -1);
+        strncpy(out, s, cap - 1);
+        out[cap - 1] = '\0';
+    }
+    lua_pop(L, 1);
+}
+
+/* ── usb.* bindings (CDC-ACM line sensors behind the hub) ─────────────── */
+
+/* usb.query{channel=N, cmd="env", timeout_ms=2000, save=true,
+ *           sensor="CO2Dot", lineterminator="\n"}
+ *   -> response_string                          (success or timeout: may be "")
+ *   -> nil, reason                              (no device on channel / error)
+ *
+ * `channel` is the physical hub port index (0..USB_SENSOR_NUM_CHANNELS-1). When
+ * `save` is true the reply (already JSON for the CO2Dot) is persisted as one
+ * event; see cmd_usb_text_query. */
+static int l_usb_query(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    lua_getfield(L, 1, "channel");
+    if (!lua_isinteger(L, -1)) {
+        lua_pop(L, 1);
+        return lua_push_nil_reason(L, "usb.query: 'channel' (integer) required");
+    }
+    lua_Integer ch = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    if (ch < 0 || ch >= USB_SENSOR_NUM_CHANNELS) {
+        return lua_push_nil_reason(L, "usb.query: channel out of range");
+    }
+
+    lua_getfield(L, 1, "cmd");
+    if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
+        return lua_push_nil_reason(L, "usb.query: 'cmd' (string) required");
+    }
+    const char *cmd = lua_tostring(L, -1);
+    lua_pop(L, 1);
+
+    lua_Integer timeout_ms = 2000;
+    lua_getfield(L, 1, "timeout_ms");
+    if (lua_isnumber(L, -1)) {
+        timeout_ms = lua_tointeger(L, -1);
+    }
+    lua_pop(L, 1);
+
+    bool save = true;
+    lua_getfield(L, 1, "save");
+    if (lua_isboolean(L, -1)) {
+        save = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+
+    /* Copy lineterminator into a local buffer so we don't have to keep a Lua
+     * string on the stack (which would shift the top that
+     * lua_get_optional_string reads from). */
+    char terminator[8] = "\n";
+    lua_getfield(L, 1, "lineterminator");
+    if (lua_isstring(L, -1)) {
+        const char *t = lua_tostring(L, -1);
+        strncpy(terminator, t, sizeof(terminator) - 1);
+        terminator[sizeof(terminator) - 1] = '\0';
+    }
+    lua_pop(L, 1);
+
+    char sensor[24] = {0};
+    lua_get_optional_string(L, "sensor", sensor, sizeof(sensor));  /* reads from table at top (index 1) */
+
+    char   response[512];
+    size_t resp_len = 0;
+    cmd_result_t res = cmd_usb_text_query((uint8_t)ch, cmd, terminator,
+                                          (uint32_t)timeout_ms, save,
+                                          sensor[0] ? sensor : NULL,
+                                          response, sizeof(response), &resp_len);
+
+    /* No device bound, or hard error → nil + reason (lets scripts skip a port). */
+    if (res.status != ESP_OK && res.status != ESP_ERR_TIMEOUT) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushlstring(L, response, resp_len);
+    return 1;
+}
+
+/* usb.status(channel) -> "connected" | "disconnected", or nil,reason */
+static int l_usb_status(lua_State *L)
+{
+    lua_Integer ch = luaL_checkinteger(L, 1);
+    if (ch < 0 || ch >= USB_SENSOR_NUM_CHANNELS) {
+        return luaL_error(L, "channel must be 0-%d", USB_SENSOR_NUM_CHANNELS - 1);
+    }
+    bool connected = false;
+    cmd_result_t res = cmd_usb_ping((uint8_t)ch, &connected);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushstring(L, connected ? "connected" : "disconnected");
+    return 1;
+}
+
+static void lua_register_usb_module(lua_State *L)
+{
+    static const luaL_Reg usb_api[] = {
+        {"query",  l_usb_query},
+        {"status", l_usb_status},
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, usb_api);
+    lua_setglobal(L, "usb");
+}
+
 /* Array index → JSON tag, matching the ambit fw AMBYTE send order
  * (PAM.cpp pam_send_results): 0=ENV(leaf temp), 1=fluor, 2=fluoRef, 3=sun,
  * 4=leaf, 5=730, 6=730ref, 7=TIMING. NULL → caller falls back to "arr<idx>". */
@@ -1776,6 +1896,7 @@ static void lua_open_ambyte_env(lua_State *L)
     lua_register_uart_module(L);
     lua_register_db_module(L);
     lua_register_ambit_module(L);
+    lua_register_usb_module(L);
     lua_register_sync_module(L);
 }
 

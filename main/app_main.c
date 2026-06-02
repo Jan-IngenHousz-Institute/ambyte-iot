@@ -39,6 +39,7 @@
 #include "event_log.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
+#include "usb_sensors.h"
 #include "wifi_manager.h"
 
 #define APP_TAG "APP_MAIN"
@@ -732,7 +733,7 @@ void app_main(void)
         return;
     }
 
-    /* ── UART Sensors (4 channels, Option D) ────────────────────── */
+    /* ── UART Sensors (3 channels, Option D; former CH0/UART1 is the console) ── */
     bool uart_available = false;
     err = uart_sensors_init();
     if (err == ESP_OK) {
@@ -742,13 +743,24 @@ void app_main(void)
         for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
             bool conn = false;
             uart_sensors_get_ping_fn()(ch, &conn);
-            ESP_LOGI(APP_TAG, "  AMBIT%u: %s", ch + 1,
+            ESP_LOGI(APP_TAG, "  AMBIT ch%u: %s", ch,
                      conn ? "connected" : "disconnected");
         }
     } else {
         ESP_LOGW(APP_TAG, "UART sensors init failed: %s", esp_err_to_name(err));
     }
     ESP_LOGI(APP_TAG, "Free heap after UART: %lu", (unsigned long)esp_get_free_heap_size());
+
+    /* ── USB Sensors (CDC-ACM behind a powered hub; USB-OTG host on GPIO19/20) ── */
+    bool usb_available = false;
+    err = usb_sensors_init();
+    if (err == ESP_OK) {
+        usb_available = true;
+        ESP_LOGI(APP_TAG, "USB host sensors initialized");
+    } else {
+        ESP_LOGW(APP_TAG, "USB sensors init failed: %s", esp_err_to_name(err));
+    }
+    ESP_LOGI(APP_TAG, "Free heap after USB: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── SD Card ──────────────────────────────────────────────────── */
     bool sd_available = false;
@@ -803,13 +815,14 @@ void app_main(void)
     }
 
     /* ── Hardware inventory ───────────────────────────────────────── */
-    ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s UART=%s",
+    ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s UART=%s USB=%s",
              bme280_is_ready() ? "OK" : "ABSENT",
              pcf2131tfy_rtc_is_ready() ? "OK" : "ABSENT",
              sd_available ? "OK" : "ABSENT",
              lfs_available ? "OK" : "ABSENT",
              persistence_available ? "OK" : "ABSENT",
-             uart_available ? "OK" : "ABSENT");
+             uart_available ? "OK" : "ABSENT",
+             usb_available ? "OK" : "ABSENT");
 
     /* ── Compose device_commands (DDD composition root) ───────────── */
     device_commands_config_t cmd_cfg = {
@@ -841,6 +854,9 @@ void app_main(void)
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
+        .usb_text_query         = usb_available ? usb_sensors_get_text_query_fn()    : NULL,
+        .usb_ping               = usb_available ? usb_sensors_get_ping_fn()          : NULL,
+        .usb_status             = usb_available ? usb_sensors_get_status_fn()        : NULL,
         .request_gc             = lua_runner_request_gc,
     };
     device_commands_init(&cmd_cfg);

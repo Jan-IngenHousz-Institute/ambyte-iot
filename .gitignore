@@ -2,6 +2,8 @@
 .env
 __pycache__/
 build/
+# Fetched by the IDF component manager from dependencies.lock — not vendored.
+managed_components/
 temp_inipreview.txt
 dom_ludo_prototype_ambyte_thing_certs/
 docs/ble-provisioning-cmd.txt

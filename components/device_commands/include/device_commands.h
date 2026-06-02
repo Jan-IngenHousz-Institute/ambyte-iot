@@ -12,6 +12,7 @@
 #include "persistence_port.h"
 #include "sensing_port.h"
 #include "uart_sensor_port.h"
+#include "usb_sensor_port.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,6 +70,12 @@ typedef struct {
     uart_sensor_status_fn               uart_status;
     uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
     uart_sensor_stream_query_fn         uart_stream_query; /* multi-line until sentinel */
+
+    /* USB CDC-ACM sensor ports (USB-host variant) — parallel to the UART ports;
+     * both may be wired at once. NULL = USB layer absent. */
+    usb_sensor_text_query_fn            usb_text_query;    /* ASCII line over CDC-ACM */
+    usb_sensor_ping_fn                  usb_ping;
+    usb_sensor_status_fn                usb_status;
 
     /* Optional heap hook: request a garbage collection in the scripting VM (wired
      * to lua_runner_request_gc). Before a large MQTT publish the publisher asks for
@@ -213,6 +220,24 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
                                  uint32_t timeout_ms,
                                  char *out_resp, size_t resp_cap,
                                  size_t *resp_len);
+
+/* USB CDC-ACM line query (CO2Dot et al). Sends `cmd` + `terminator` to the
+ * device on USB `channel` (= physical hub port) and reads one response line.
+ *
+ * When `save` is true the reply is persisted as one event row. The CO2Dot reply
+ * is itself a JSON object, so it is validated and stored DIRECTLY as the event
+ * payload; a non-JSON reply falls back to {"response":"<text>"}. `device` is
+ * tagged "co2dot"; `sensor` defaults to "usb_ch<N>" when `sensor_name` is NULL.
+ * Returns ESP_ERR_NOT_FOUND when no device is bound to that channel. */
+cmd_result_t cmd_usb_text_query(uint8_t channel,
+                                const char *cmd, const char *terminator,
+                                uint32_t timeout_ms, bool save,
+                                const char *sensor_name,
+                                char *out_resp, size_t resp_cap,
+                                size_t *resp_len);
+
+/* Report whether a USB CDC-ACM device is currently bound to `channel`. */
+cmd_result_t cmd_usb_ping(uint8_t channel, bool *connected);
 
 /* Ambit sensor commands — typed wrappers (Phase 7) */
 

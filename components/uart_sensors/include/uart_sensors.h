@@ -9,13 +9,13 @@ extern "C" {
 #endif
 
 /**
- * Initialise all UART controllers and pin mappings for the 4 sensor channels.
+ * Initialise all UART controllers and pin mappings for the 3 sensor channels.
  *
- * Channel layout (Option D — GPIO-remap for channels 2 & 3):
- *   CH0 (AMBIT1): UART1  — dedicated
- *   CH1 (AMBIT2): UART2  — dedicated
- *   CH2 (AMBIT3): UART0  — shared, GPIO-remapped per query
- *   CH3 (AMBIT4): UART0  — shared, GPIO-remapped per query
+ * Channel layout (Option D — GPIO-remap for channels 1 & 2). The former CH0 on
+ * UART1 was dropped on the USB-host branch; UART1 is now the debug console.
+ *   CH0 (AMBIT2): UART2  — dedicated
+ *   CH1 (AMBIT3): UART0  — shared, GPIO-remapped per query
+ *   CH2 (AMBIT4): UART0  — shared, GPIO-remapped per query
  *
  * Must be called once from app_main before any query/ping.
  */

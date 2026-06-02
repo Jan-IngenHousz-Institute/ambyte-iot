@@ -1291,6 +1291,117 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
     return make_result(ESP_OK, "ch%u: %u bytes", channel, (unsigned)*resp_len);
 }
 
+cmd_result_t cmd_usb_text_query(uint8_t channel,
+                                const char *cmd, const char *terminator,
+                                uint32_t timeout_ms, bool save,
+                                const char *sensor_name,
+                                char *out_resp, size_t resp_cap,
+                                size_t *resp_len)
+{
+    if (!s_initialized || s_cfg.usb_text_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "USB sensors not available");
+    }
+    if (channel >= USB_SENSOR_NUM_CHANNELS) {
+        return make_result(ESP_ERR_INVALID_ARG, "invalid USB channel %u", channel);
+    }
+    if (cmd == NULL || out_resp == NULL || resp_len == NULL || resp_cap < 2) {
+        return make_result(ESP_ERR_INVALID_ARG, "bad args");
+    }
+    if (terminator == NULL) {
+        terminator = "\n";
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t start_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    *resp_len = 0;
+    out_resp[0] = '\0';
+
+    device_commands_measurement_begin();
+    esp_err_t err = s_cfg.usb_text_query(channel, cmd, terminator,
+                                         out_resp, resp_cap, resp_len, timeout_ms);
+    device_commands_measurement_end();
+
+    /* No device on this channel → report distinctly, never save. */
+    if (err == ESP_ERR_NOT_FOUND) {
+        return make_result(ESP_ERR_NOT_FOUND, "USB ch%u: no device", channel);
+    }
+    /* Hard error (not timeout) → propagate without saving. */
+    if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+        return make_result(err, "usb_text_query ch%u failed: %s",
+                           channel, esp_err_to_name(err));
+    }
+
+    /* save=true: one event row. The CO2Dot reply is already a JSON object, so
+     * store it directly as the payload; fall back to {"response":"..."} when it
+     * doesn't parse (or on timeout, where out_resp is ""). */
+    if (save && s_cfg.store_event != NULL && s_cfg.next_id != NULL) {
+        int64_t mid = 0;
+        if (s_cfg.next_id(&mid) == ESP_OK) {
+            gettimeofday(&tv, NULL);
+            int64_t end_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+            char sensor[24];
+            if (sensor_name != NULL && sensor_name[0] != '\0') {
+                snprintf(sensor, sizeof(sensor), "%s", sensor_name);
+            } else {
+                snprintf(sensor, sizeof(sensor), "usb_ch%u", channel);
+            }
+
+            char *pj = NULL;
+            bool pj_is_cjson = false;
+            cJSON *parsed = (err == ESP_OK) ? cJSON_Parse(out_resp) : NULL;
+            if (parsed != NULL && cJSON_IsObject(parsed)) {
+                pj = out_resp;          /* already a valid JSON object */
+            } else {
+                /* Not JSON (or timeout) → wrap the raw text. */
+                cJSON *p = cJSON_CreateObject();
+                if (p != NULL) {
+                    cJSON_AddStringToObject(p, "response", out_resp);
+                    pj = cJSON_PrintUnformatted(p);
+                    pj_is_cjson = true;
+                    cJSON_Delete(p);
+                }
+            }
+            if (parsed != NULL) {
+                cJSON_Delete(parsed);
+            }
+
+            if (pj != NULL) {
+                esp_err_t store_err = s_cfg.store_event(mid, "co2dot", sensor,
+                                                        start_ms_val, end_ms_val, NULL, pj);
+                if (pj_is_cjson) {
+                    free(pj);
+                }
+                if (store_err != ESP_OK) {
+                    ESP_LOGW(TAG, "usb_text_query: save failed: %s", esp_err_to_name(store_err));
+                }
+            }
+        }
+    }
+
+    if (err == ESP_ERR_TIMEOUT) {
+        return make_result(ESP_ERR_TIMEOUT, "USB ch%u: no response within %ums",
+                           channel, (unsigned)timeout_ms);
+    }
+    return make_result(ESP_OK, "USB ch%u: %u bytes", channel, (unsigned)*resp_len);
+}
+
+cmd_result_t cmd_usb_ping(uint8_t channel, bool *connected)
+{
+    if (!s_initialized || s_cfg.usb_ping == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "USB sensors not available");
+    }
+    if (channel >= USB_SENSOR_NUM_CHANNELS || connected == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "bad args");
+    }
+    esp_err_t err = s_cfg.usb_ping(channel, connected);
+    if (err != ESP_OK) {
+        return make_result(err, "usb_ping ch%u failed: %s", channel, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "USB ch%u: %s", channel, *connected ? "connected" : "out");
+}
+
 /* ── Typed Ambit commands ────────────────────────────────────────── *
  *
  * Each function wraps one ambit-1 ESP binary command (see ambit_protocol.h

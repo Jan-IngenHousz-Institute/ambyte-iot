@@ -658,18 +658,21 @@ esp_err_t uart_sensors_init(void)
     }
 
     /* Channel table — pin assignments from hardware schematic.
-     * Single shared bus: all four channels are time-multiplexed onto ONE UART
+     * Single shared bus: all channels are time-multiplexed onto ONE UART
      * controller (UART_NUM_0), pin-remapped per transaction. The parallel
      * trigger/poll/fetch protocol keeps every host↔ambit transaction short, so
-     * one controller suffices; the long measurement runs autonomously on each
-     * C3. (Console is USB-Serial-JTAG, so UART0 is free for sensors.) */
+     * one controller suffices; the long measurement runs autonomously on each C3.
+     *
+     * NOTE (USB-host variant): the schematic CH0 (GPIO3/46) was dropped — those
+     * two pins are now the debug console on UART1 (USB-OTG host claims the
+     * GPIO19/20 pads that carried the USB-Serial-JTAG console). The remaining 3
+     * AMBITs are renumbered 0..2, still time-multiplexed on the shared UART0. */
     /* .boot_pin = the C3 GPIO9 strap for the AMBIT on this channel's UART pins.
      * NOTE: bound to the UART pin pair, NOT the schematic ch-label — the label
      * order differs from this s_ch[] index (see docs/ambit-uart-flash-plan.md). */
-    s_ch[0] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin =  3, .tx_pin = 46, .boot_pin = 2, .shared = true };
-    s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .boot_pin = 7, .shared = true };
-    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .boot_pin = 6, .shared = true };
-    s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .boot_pin = 5, .shared = true };
+    s_ch[0] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .boot_pin = 7, .shared = true };
+    s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .boot_pin = 6, .shared = true };
+    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .boot_pin = 5, .shared = true };
 
     /* AMBIT reset/boot straps (open-drain) for host-driven C3 ROM flashing. */
     ESP_RETURN_ON_ERROR(ambit_boot_gpio_init(), TAG, "AMBIT boot/reset GPIO");
@@ -685,9 +688,9 @@ esp_err_t uart_sensors_init(void)
                                          * AMBIT framing isn't corrupted by APB scaling. */
     };
 
-    /* ── UART0 — single shared bus for all 4 channels (AMBIT1–4)
-     *    Default mapping: CH0 pins. Remapped on-demand per transaction by
-     *    channel_acquire(). UART1/UART2 are left free. ── */
+    /* ── UART0 — single shared bus for all 3 channels (AMBIT2–4 on the USB-host
+     *    variant). Default mapping: CH0 pins. Remapped on-demand per transaction
+     *    by channel_acquire(). UART1 (debug console) and UART2 are left free. ── */
     ESP_RETURN_ON_ERROR(uart_param_config(UART_NUM_0, &uart_cfg), TAG, "UART0 cfg");
     ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_0, s_ch[0].tx_pin, s_ch[0].rx_pin,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
@@ -708,7 +711,8 @@ esp_err_t uart_sensors_init(void)
     }
 
     s_inited = true;
-    ESP_LOGI(TAG, "UART sensors initialised (4 channels, single shared UART0 bus)");
+    ESP_LOGI(TAG, "UART sensors initialised (%d channels, single shared UART0 bus)",
+             UART_SENSOR_NUM_CHANNELS);
     return ESP_OK;
 }
 

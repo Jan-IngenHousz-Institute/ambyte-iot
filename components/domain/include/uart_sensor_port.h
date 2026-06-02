@@ -12,7 +12,12 @@
 extern "C" {
 #endif
 
-#define UART_SENSOR_NUM_CHANNELS  4
+/* CH0 (schematic GPIO3/46) was dropped on the USB-host variant: those two pins
+ * are now the debug console on UART1 (console TX=GPIO3 / RX=GPIO46, verified
+ * against the CH9102F adapter wiring), because USB-OTG host mode claims the
+ * GPIO19/20 pads that previously carried the USB-Serial-JTAG console. The
+ * remaining AMBIT channels are renumbered to 0..2. */
+#define UART_SENSOR_NUM_CHANNELS  3
 /* v2 run streams up to 8 arrays (ENV, Fluo, Fluoref, Sun, Leaf, 730, 730ref,
  * TIMING); keep headroom so the receive loop still reads CMD_END after the last. */
 #define UART_SENSOR_MAX_ARRAYS    12
