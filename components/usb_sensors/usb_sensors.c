@@ -36,11 +36,13 @@
 
 #define TAG "usb_sens"
 
-/* CO2Dot USB identity (see CO2dot/Firmware platformio.ini [env:usb]). All units
- * share these — they are NOT used to tell devices apart, only to confirm the
- * device class. Addressing is by physical hub port. */
-#define CO2DOT_VID            0x16C0
-#define CO2DOT_PID            0x0483
+/* The CO2Dot is an ESP32-C3, which has NO USB-OTG — its Arduino USB-CDC runs
+ * over the chip's built-in USB-Serial-JTAG peripheral, so it enumerates with
+ * Espressif's fixed id 303a:1001 'USB JTAG/serial debug unit', NOT the
+ * 16c0:0483 from the [env:usb] build flags (those only apply to TinyUSB on
+ * S2/S3). So we do NOT filter by VID/PID — we open by device address only
+ * (CDC_HOST_ANY_VID/PID), since each device is already pinned by dev_addr +
+ * physical hub port. */
 #define CO2DOT_INTERFACE_IDX  0
 
 #define USB_RX_LINE_CAP       512      /* one JSON reply line */
@@ -242,10 +244,10 @@ static void usb_connector_task(void *arg)
         }
 
         cdc_acm_host_open_config_t open_cfg = {
-            .vid                 = CO2DOT_VID,
-            .pid                 = CO2DOT_PID,
+            .vid                 = CDC_HOST_ANY_VID,   /* C3 enumerates as 303a:1001 */
+            .pid                 = CDC_HOST_ANY_PID,
             .interface_idx       = CO2DOT_INTERFACE_IDX,
-            .dev_addr            = req.dev_addr,   /* select THIS device */
+            .dev_addr            = req.dev_addr,   /* select THIS device by address */
             .connection_timeout_ms = USB_OPEN_TIMEOUT_MS,
             .out_buffer_size     = USB_TX_BUF_SIZE,
             .in_buffer_size      = USB_IN_BUF_SIZE,

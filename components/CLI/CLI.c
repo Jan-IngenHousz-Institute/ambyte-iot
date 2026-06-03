@@ -474,12 +474,25 @@ static int cli_cmd_usb_scan(int argc, char **argv)
     return (err == ESP_OK) ? 0 : 1;
 }
 
+/* usb_status [ch]
+ *   No argument → report every USB hub-port channel. With <ch> → just that one. */
 static int cli_cmd_usb_status(int argc, char **argv)
 {
-    if (argc != 2) {
-        printf("Usage: usb_status <channel 0-%d>\r\n", USB_SENSOR_NUM_CHANNELS - 1);
+    if (argc > 2) {
+        printf("Usage: usb_status [channel 0-%d]\r\n", USB_SENSOR_NUM_CHANNELS - 1);
         return 1;
     }
+
+    if (argc == 1) {
+        /* No channel given → scan all ports. */
+        for (int ch = 0; ch < USB_SENSOR_NUM_CHANNELS; ch++) {
+            bool connected = false;
+            cmd_usb_ping((uint8_t)ch, &connected);
+            printf("ch%d: %s\r\n", ch, connected ? "connected" : "out");
+        }
+        return 0;
+    }
+
     int ch = atoi(argv[1]);
     if (ch < 0 || ch >= USB_SENSOR_NUM_CHANNELS) {
         printf("Channel must be 0-%d\r\n", USB_SENSOR_NUM_CHANNELS - 1);
@@ -491,15 +504,15 @@ static int cli_cmd_usb_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
-/* usb_query <ch> <timeout_ms> <cmd...>
- *   Sends an ASCII line to the CDC-ACM device on USB port <ch> (default
- *   terminator "\n"), prints the one-line JSON reply. save=false so bench
- *   probing doesn't write to the events DB. */
+/* usb_query <ch> <message> [timeout_ms=1000]
+ *   Sends the ASCII line <message> (single token, LF-terminated) to the
+ *   CDC-ACM device on USB port <ch> and prints the one-line JSON reply.
+ *   timeout_ms is optional and defaults to 1000. save=false so bench probing
+ *   doesn't write to the events DB. */
 static int cli_cmd_usb_query(int argc, char **argv)
 {
-    if (argc < 4) {
-        printf("Usage: usb_query <channel 0-%d> <timeout_ms> <cmd ...>\r\n",
-               USB_SENSOR_NUM_CHANNELS - 1);
+    if (argc < 3 || argc > 4) {
+        printf("Usage: usb_query <ch> <message> [timeout_ms=1000]\r\n");
         return 1;
     }
 
@@ -509,23 +522,12 @@ static int cli_cmd_usb_query(int argc, char **argv)
         return 1;
     }
 
-    int timeout_ms = atoi(argv[2]);
-    if (timeout_ms <= 0) {
-        printf("timeout_ms must be > 0\r\n");
-        return 1;
-    }
+    const char *cmd = argv[2];
 
-    /* Join argv[3..] with single spaces (CO2Dot cmds like "spec_flash,10"
-     * are single tokens, but this stays consistent with uart_query). */
-    char cmd[192];
-    size_t pos = 0;
-    for (int i = 3; i < argc; i++) {
-        int n = snprintf(cmd + pos, sizeof(cmd) - pos, (i == 3) ? "%s" : " %s", argv[i]);
-        if (n <= 0 || (size_t)n >= sizeof(cmd) - pos) {
-            printf("command too long\r\n");
-            return 1;
-        }
-        pos += (size_t)n;
+    /* Optional trailing timeout; default 1 s. */
+    int timeout_ms = (argc == 4) ? atoi(argv[3]) : 1000;
+    if (timeout_ms <= 0) {
+        timeout_ms = 1000;
     }
 
     char   resp[512];
@@ -1405,12 +1407,12 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t usb_status_cmd = {
         .command = "usb_status",
-        .help    = "usb_status <ch>  show if a CDC-ACM device is on that USB hub port",
+        .help    = "usb_status [ch]  CDC-ACM presence; no arg = all hub ports",
         .func    = cli_cmd_usb_status,
     };
     static const esp_console_cmd_t usb_query_cmd = {
         .command = "usb_query",
-        .help    = "usb_query <ch> <timeout_ms> <cmd...>  CDC-ACM line query e.g. 'usb_query 0 2000 env' (save=false)",
+        .help    = "usb_query <ch> <message> [timeout_ms=1000]  CDC-ACM line query e.g. 'usb_query 0 env' (save=false)",
         .func    = cli_cmd_usb_query,
     };
     static const esp_console_cmd_t ambit_temp_cmd = {
