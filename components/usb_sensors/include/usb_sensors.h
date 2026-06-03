@@ -31,6 +31,12 @@ usb_sensor_text_query_fn  usb_sensors_get_text_query_fn(void);
 usb_sensor_ping_fn        usb_sensors_get_ping_fn(void);
 usb_sensor_status_fn      usb_sensors_get_status_fn(void);
 
+/* Diagnostic: list every USB device currently on the bus (hub + sensors) with
+ * the descriptor info captured at enumeration, and the channel each maps to.
+ * Writes a human-readable multi-line report into `out`. Returns ESP_OK, or
+ * ESP_ERR_INVALID_STATE if the USB host isn't up (message still written). */
+esp_err_t usb_sensors_scan(char *out, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

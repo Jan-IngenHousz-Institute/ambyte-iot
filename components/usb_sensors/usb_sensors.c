@@ -72,7 +72,7 @@ typedef struct {
 } usb_slot_t;
 
 static usb_slot_t s_slots[USB_SENSOR_NUM_CHANNELS];
-static SemaphoreHandle_t s_slots_mtx;        /* guards slot connect/disconnect */
+static SemaphoreHandle_t s_slots_mtx;        /* guards slot connect/disconnect + s_seen */
 static QueueHandle_t     s_connect_q;        /* new-device connect requests */
 static bool              s_inited;
 
@@ -81,6 +81,22 @@ typedef struct {
     uint8_t dev_addr;
     uint8_t port_num;
 } connect_req_t;
+
+/* Diagnostic cache: descriptor info captured for every device the new-dev
+ * callback sees (its handle is briefly valid there), keyed by USB address.
+ * usb_sensors_scan() cross-references this against the live device list.
+ * Guarded by s_slots_mtx. */
+#define USB_SCAN_MAX     8
+#define USB_PRODUCT_CAP  32
+typedef struct {
+    bool     used;
+    uint8_t  dev_addr;
+    uint8_t  port_num;
+    uint16_t vid;
+    uint16_t pid;
+    char     product[USB_PRODUCT_CAP];
+} usb_seen_t;
+static usb_seen_t s_seen[USB_SCAN_MAX];
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -92,6 +108,61 @@ static int channel_for_port(uint8_t port_num)
         }
     }
     return -1;
+}
+
+/* Copy a UTF-16LE USB string descriptor to a printable ASCII buffer. */
+static void str_desc_ascii(const usb_str_desc_t *d, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (d == NULL || d->bLength < 2) {
+        return;
+    }
+    int chars = (d->bLength - 2) / 2;
+    size_t n = 0;
+    for (int i = 0; i < chars && n < cap - 1; i++) {
+        uint16_t c = d->wData[i];
+        out[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[n] = '\0';
+}
+
+/* Record/refresh a device's descriptor info in the scan cache (by address). */
+static void seen_record(uint8_t addr, uint8_t port, uint16_t vid, uint16_t pid,
+                        const char *product)
+{
+    xSemaphoreTake(s_slots_mtx, portMAX_DELAY);
+    usb_seen_t *e = NULL;
+    for (int i = 0; i < USB_SCAN_MAX; i++) {           /* reuse same-addr entry */
+        if (s_seen[i].used && s_seen[i].dev_addr == addr) { e = &s_seen[i]; break; }
+    }
+    if (e == NULL) {
+        for (int i = 0; i < USB_SCAN_MAX; i++) {       /* else first free slot */
+            if (!s_seen[i].used) { e = &s_seen[i]; break; }
+        }
+    }
+    if (e != NULL) {
+        e->used = true;
+        e->dev_addr = addr;
+        e->port_num = port;
+        e->vid = vid;
+        e->pid = pid;
+        snprintf(e->product, sizeof(e->product), "%s", product ? product : "");
+    }
+    xSemaphoreGive(s_slots_mtx);
+}
+
+/* Caller must hold s_slots_mtx. */
+static const usb_seen_t *seen_find(uint8_t addr)
+{
+    for (int i = 0; i < USB_SCAN_MAX; i++) {
+        if (s_seen[i].used && s_seen[i].dev_addr == addr) {
+            return &s_seen[i];
+        }
+    }
+    return NULL;
 }
 
 /* ── RX + device-event callbacks (per opened device) ─────────────────── */
@@ -214,9 +285,22 @@ static void on_new_usb_dev(usb_device_handle_t usb_dev)
         ESP_LOGW(TAG, "new dev: usb_host_device_info failed");
         return;
     }
+
+    /* Capture descriptor info for usb_scan while the handle is valid. */
+    uint16_t vid = 0, pid = 0;
+    const usb_device_desc_t *desc = NULL;
+    if (usb_host_get_device_descriptor(usb_dev, &desc) == ESP_OK && desc != NULL) {
+        vid = desc->idVendor;
+        pid = desc->idProduct;
+    }
+    char product[USB_PRODUCT_CAP];
+    str_desc_ascii(info.str_desc_product, product, sizeof(product));
+    seen_record(info.dev_addr, info.parent.port_num, vid, pid, product);
+
     /* port_num == 0 means attached directly to the root port (no hub). */
     connect_req_t req = { .dev_addr = info.dev_addr, .port_num = info.parent.port_num };
-    ESP_LOGI(TAG, "new USB dev: addr %u, hub port %u", req.dev_addr, req.port_num);
+    ESP_LOGI(TAG, "new USB dev: addr %u, hub port %u, %04x:%04x '%s'",
+             req.dev_addr, req.port_num, vid, pid, product);
     if (xQueueSend(s_connect_q, &req, 0) != pdTRUE) {
         ESP_LOGW(TAG, "connect queue full — dropped addr %u", req.dev_addr);
     }
@@ -387,6 +471,62 @@ static esp_err_t usb_status(uint8_t channel, usb_sensor_state_t *out)
         return ESP_ERR_INVALID_ARG;
     }
     *out = s_slots[channel].connected ? USB_SENSOR_CONNECTED : USB_SENSOR_DISCONNECTED;
+    return ESP_OK;
+}
+
+esp_err_t usb_sensors_scan(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    if (!s_inited) {
+        snprintf(out, cap, "USB host not initialised");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t addrs[USB_SCAN_MAX];
+    int n = 0;
+    esp_err_t err = usb_host_device_addr_list_fill(USB_SCAN_MAX, addrs, &n);
+    if (err != ESP_OK) {
+        snprintf(out, cap, "addr_list_fill failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    size_t pos = 0;
+    pos += snprintf(out + pos, cap - pos, "USB devices on bus: %d", n);
+    if (n == 0) {
+        snprintf(out + pos, cap - pos,
+                 "\n  (nothing enumerated — check hub power, OTG cable, VBUS)");
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_slots_mtx, portMAX_DELAY);
+    for (int i = 0; i < n && pos < cap - 1; i++) {
+        const usb_seen_t *s = seen_find(addrs[i]);
+        int w;
+        if (s != NULL) {
+            int ch = channel_for_port(s->port_num);
+            if (ch >= 0) {
+                w = snprintf(out + pos, cap - pos,
+                             "\n  addr %2u  hub-port %u  %04x:%04x '%s'  -> ch%d",
+                             addrs[i], s->port_num, s->vid, s->pid, s->product, ch);
+            } else {
+                w = snprintf(out + pos, cap - pos,
+                             "\n  addr %2u  hub-port %u  %04x:%04x '%s'  -> UNMAPPED (add %u to s_port_map)",
+                             addrs[i], s->port_num, s->vid, s->pid, s->product, s->port_num);
+            }
+        } else {
+            w = snprintf(out + pos, cap - pos,
+                         "\n  addr %2u  (no cached descriptor — likely the hub itself)",
+                         addrs[i]);
+        }
+        if (w <= 0) {
+            break;
+        }
+        pos += ((size_t)w < cap - pos) ? (size_t)w : (cap - pos - 1);
+    }
+    xSemaphoreGive(s_slots_mtx);
     return ESP_OK;
 }
 

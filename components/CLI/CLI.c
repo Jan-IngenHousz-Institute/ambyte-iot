@@ -26,6 +26,7 @@
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_logger.h"
+#include "usb_sensors.h"
 #include "wifi_manager.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
@@ -456,6 +457,96 @@ static int cli_cmd_uart_query(int argc, char **argv)
         return 1;
     }
     printf("ch%d (%u bytes): %s\r\n", ch, (unsigned)resp_len, resp);
+    return 0;
+}
+
+static int cli_cmd_usb_scan(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: usb_scan\r\n");
+        return 1;
+    }
+    char buf[1024];
+    buf[0] = '\0';
+    esp_err_t err = usb_sensors_scan(buf, sizeof(buf));
+    printf("%s\r\n", buf);
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cli_cmd_usb_status(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: usb_status <channel 0-%d>\r\n", USB_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= USB_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", USB_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    bool connected = false;
+    cmd_result_t res = cmd_usb_ping((uint8_t)ch, &connected);
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
+/* usb_query <ch> <timeout_ms> <cmd...>
+ *   Sends an ASCII line to the CDC-ACM device on USB port <ch> (default
+ *   terminator "\n"), prints the one-line JSON reply. save=false so bench
+ *   probing doesn't write to the events DB. */
+static int cli_cmd_usb_query(int argc, char **argv)
+{
+    if (argc < 4) {
+        printf("Usage: usb_query <channel 0-%d> <timeout_ms> <cmd ...>\r\n",
+               USB_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= USB_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", USB_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+
+    int timeout_ms = atoi(argv[2]);
+    if (timeout_ms <= 0) {
+        printf("timeout_ms must be > 0\r\n");
+        return 1;
+    }
+
+    /* Join argv[3..] with single spaces (CO2Dot cmds like "spec_flash,10"
+     * are single tokens, but this stays consistent with uart_query). */
+    char cmd[192];
+    size_t pos = 0;
+    for (int i = 3; i < argc; i++) {
+        int n = snprintf(cmd + pos, sizeof(cmd) - pos, (i == 3) ? "%s" : " %s", argv[i]);
+        if (n <= 0 || (size_t)n >= sizeof(cmd) - pos) {
+            printf("command too long\r\n");
+            return 1;
+        }
+        pos += (size_t)n;
+    }
+
+    char   resp[512];
+    size_t resp_len = 0;
+    cmd_result_t res = cmd_usb_text_query((uint8_t)ch, cmd, "\n",
+                                          (uint32_t)timeout_ms, false, NULL,
+                                          resp, sizeof(resp), &resp_len);
+
+    if (res.status == ESP_ERR_NOT_FOUND) {
+        printf("usb ch%d: no device on this hub port\r\n", ch);
+        return 1;
+    }
+    if (res.status == ESP_ERR_TIMEOUT) {
+        printf("usb ch%d: timeout after %dms (no response)\r\n", ch, timeout_ms);
+        return 1;
+    }
+    if (res.status != ESP_OK) {
+        printf("usb ch%d: %s\r\n", ch, res.message);
+        return 1;
+    }
+    printf("usb ch%d (%u bytes): %s\r\n", ch, (unsigned)resp_len, resp);
     return 0;
 }
 
@@ -1307,6 +1398,21 @@ static esp_err_t cli_register_commands(void)
         .help    = "uart_query <ch> <message> [timeout_ms=1000]  ASCII line query (LF-terminated, never stores)",
         .func    = cli_cmd_uart_query,
     };
+    static const esp_console_cmd_t usb_scan_cmd = {
+        .command = "usb_scan",
+        .help    = "usb_scan  list all USB devices on the bus (hub + sensors) and their hub ports",
+        .func    = cli_cmd_usb_scan,
+    };
+    static const esp_console_cmd_t usb_status_cmd = {
+        .command = "usb_status",
+        .help    = "usb_status <ch>  show if a CDC-ACM device is on that USB hub port",
+        .func    = cli_cmd_usb_status,
+    };
+    static const esp_console_cmd_t usb_query_cmd = {
+        .command = "usb_query",
+        .help    = "usb_query <ch> <timeout_ms> <cmd...>  CDC-ACM line query e.g. 'usb_query 0 2000 env' (save=false)",
+        .func    = cli_cmd_usb_query,
+    };
     static const esp_console_cmd_t ambit_temp_cmd = {
         .command = "ambit_temp",
         .help    = "ambit_temp <0-3>  read leaf+chip temperature from AMBIT sensor",
@@ -1466,6 +1572,21 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&uart_query_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&usb_scan_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&usb_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&usb_query_cmd);
     if (err != ESP_OK) {
         return err;
     }
