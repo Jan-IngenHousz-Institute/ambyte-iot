@@ -36,9 +36,14 @@
 /* Reconnect backoff: attempt 1 is immediate, then BASE, 2*BASE, 4*BASE ...
  * doubling until capped at MAX. After MAX_ATTEMPTS the manager gives up and
  * reports FAILED — at that point the AP has been gone long enough that we
- * stop spamming the log; user code can re-arm via wifi_manager_connect(). */
+ * stop spamming the log; user code can re-arm via wifi_manager_connect().
+ *
+ * MAX is 30 min so the steady-state (last) retry happens every half hour
+ * instead of hammering every 10 s. The ramp reaches the 30-min cap by ~attempt
+ * 14; with 100 attempts total the manager keeps trying for ~43 h before
+ * giving up. */
 #define WIFI_MANAGER_RECONNECT_BACKOFF_BASE_MS 500
-#define WIFI_MANAGER_RECONNECT_BACKOFF_MAX_MS  10000
+#define WIFI_MANAGER_RECONNECT_BACKOFF_MAX_MS  1800000   /* 30 min */
 #define WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS    100
 
 typedef struct {
