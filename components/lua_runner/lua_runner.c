@@ -33,6 +33,11 @@
 #define LUA_QUERY_MAX_RECORDS 64
 #define LUA_SCRIPT_PATH "/sdcard/main.lua"
 
+/* Bundled scheduler library (components/lua_runner/sched.lua), generated into a
+ * C byte array at configure time (see CMakeLists) and loaded before the user
+ * script to define the `sched` global. Provides sched_lua_start[] + sched_lua_size. */
+#include "sched_lua_embed.h"
+
 static TaskHandle_t s_lua_task_handle = NULL;
 
 /* Stop-flag inspected by the Lua debug hook + the interruptible sleep. Set by
@@ -1279,6 +1284,13 @@ static int l_sync_wait(lua_State *L)
     return 0;
 }
 
+/* sync.is_daytime() -> true|false (currently between sunrise and sunset) */
+static int l_sync_is_daytime(lua_State *L)
+{
+    lua_pushboolean(L, time_sync_is_daytime(sync_now()) ? 1 : 0);
+    return 1;
+}
+
 static void lua_register_sync_module(lua_State *L)
 {
     static const luaL_Reg sync_api[] = {
@@ -1287,6 +1299,7 @@ static void lua_register_sync_module(lua_State *L)
         {"until_weekly",   l_sync_until_weekly},
         {"until_sun",      l_sync_until_sun},
         {"sun_today",      l_sync_sun_today},
+        {"is_daytime",     l_sync_is_daytime},
         {"set_location",   l_sync_set_location},
         {"location",       l_sync_location},
         {"wait",           l_sync_wait},
@@ -1332,6 +1345,18 @@ static void lua_runner_task(void *arg)
     lua_register_mqtt_module(L);
     lua_register_ambit_module(L);
     lua_register_sync_module(L);
+
+    /* Define the bundled `sched` global (scheduler library) before the user
+     * script. The chunk returns its module table, which we install as `sched`. */
+    {
+        if (luaL_loadbuffer(L, sched_lua_start, sched_lua_size, "=sched.lua") != LUA_OK ||
+            lua_pcall(L, 0, 1, 0) != LUA_OK) {
+            log_lua_error(L, "failed to load bundled sched.lua");
+            lua_close(L);
+            goto done;
+        }
+        lua_setglobal(L, "sched");
+    }
 
     /* Fire the stop-check every 1000 Lua bytecode instructions — cheap and
      * gives prompt unwinding without measurable interpreter slowdown. */

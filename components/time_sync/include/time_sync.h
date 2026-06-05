@@ -60,6 +60,10 @@ esp_err_t time_sync_sun_on_date(int64_t date_unix, int event, int64_t *out_unix)
  * -1800 = 30 min before. Returns -1 if no event within the next 2 days. */
 int64_t time_sync_until_sun(int64_t now, int event, int64_t offset_sec);
 
+/* True when `now` is between sunrise and sunset (next sunset sooner than next
+ * sunrise). Falls back to true on polar day/night. */
+bool time_sync_is_daytime(int64_t now);
+
 /* Map a weekday name ("sun".."sat", case-insensitive, first 3 chars) to its bit
  * index 0..6, or -1 if unrecognised. */
 int time_sync_day_bit(const char *name);

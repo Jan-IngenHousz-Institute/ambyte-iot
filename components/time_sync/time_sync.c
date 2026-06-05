@@ -155,6 +155,16 @@ int64_t time_sync_until_sun(int64_t now, int event, int64_t offset_sec)
     return -1;
 }
 
+bool time_sync_is_daytime(int64_t now)
+{
+    int64_t to_set  = time_sync_until_sun(now, TIME_SYNC_SUNSET,  0);
+    int64_t to_rise = time_sync_until_sun(now, TIME_SYNC_SUNRISE, 0);
+    if (to_set < 0 || to_rise < 0) {
+        return true;                 /* polar day/night — treat as day */
+    }
+    return to_set < to_rise;         /* sunset sooner than sunrise ⇒ daytime */
+}
+
 int time_sync_day_bit(const char *name)
 {
     static const char *const k[7] = { "sun", "mon", "tue", "wed", "thu", "fri", "sat" };
