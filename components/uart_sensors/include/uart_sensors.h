@@ -28,9 +28,6 @@ uart_sensor_status_fn      uart_sensors_get_status_fn(void);
 uart_sensor_text_query_fn  uart_sensors_get_text_query_fn(void);
 uart_sensor_stream_query_fn uart_sensors_get_stream_query_fn(void);
 
-/* TEMP DEBUG (remove later): raw send+dump of everything a sensor replies. */
-void uart_sensors_raw_dump(uint8_t channel, const char *cmd, uint32_t timeout_ms);
-
 #ifdef __cplusplus
 }
 #endif

@@ -15,7 +15,6 @@
 #include "ambit_protocol.h"
 #include "device_commands.h"
 #include "time_sync.h"
-#include "uart_sensors.h"   /* TEMP: uart_dump debug command */
 #include "i2c_bus.h"
 #include "wifi_manager.h"
 
@@ -562,26 +561,6 @@ static int cli_cmd_sync(int argc, char **argv)
     return 0;
 }
 
-/* TEMP DEBUG (remove later): uart_dump <ch> <cmd> [timeout_ms=2000]
- * Sends the command and logs every byte the sensor replies over the window,
- * ignoring line breaks — to see multi-line / delayed replies. */
-static int cli_cmd_uart_dump(int argc, char **argv)
-{
-    if (argc < 3) {
-        printf("Usage: uart_dump <ch> <cmd> [timeout_ms=2000]\r\n");
-        return 1;
-    }
-    int ch = atoi(argv[1]);
-    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
-        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
-        return 1;
-    }
-    int timeout_ms = (argc >= 4) ? atoi(argv[3]) : 2000;
-    if (timeout_ms <= 0) timeout_ms = 2000;
-    uart_sensors_raw_dump((uint8_t)ch, argv[2], (uint32_t)timeout_ms);
-    return 0;
-}
-
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -663,11 +642,6 @@ static esp_err_t cli_register_commands(void)
         .help    = "sync [sun|loc|interval|clock|weekly|sunrise|sunset …]  RTC scheduling triggers",
         .func    = cli_cmd_sync,
     };
-    static const esp_console_cmd_t uart_dump_cmd = {
-        .command = "uart_dump",
-        .help    = "uart_dump <ch> <cmd> [timeout_ms]  TEMP: dump raw reply bytes (multi-line)",
-        .func    = cli_cmd_uart_dump,
-    };
     static const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
         .help    = "restart the device",
@@ -745,11 +719,6 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&sync_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_console_cmd_register(&uart_dump_cmd);
     if (err != ESP_OK) {
         return err;
     }

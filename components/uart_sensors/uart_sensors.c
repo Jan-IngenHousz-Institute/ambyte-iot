@@ -665,10 +665,6 @@ static esp_err_t do_text_query(uint8_t channel,
             continue; /* no byte yet; loop and re-check deadline */
         }
 
-        /* TEMP DEBUG: dump every received byte (hex + printable). Remove later. */
-        ESP_LOGI(TAG, "ch%u rx 0x%02X '%c'", channel, b,
-                 (b >= 0x20 && b < 0x7F) ? (char)b : '.');
-
         out_resp[(*resp_len)++] = (char)b;
 
         /* Suffix-match against the terminator. */
@@ -686,49 +682,6 @@ static esp_err_t do_text_query(uint8_t channel,
     s_ch[channel].state = UART_SENSOR_DISCONNECTED;
     channel_release(channel);
     return ESP_ERR_TIMEOUT;
-}
-
-/* TEMP DEBUG (remove later): send `cmd`+"\n" and log EVERY byte received for the
- * whole `timeout_ms` window — does NOT stop at a newline, so it reveals multi-
- * line or delayed replies. Exposed via the `uart_dump` CLI command. */
-void uart_sensors_raw_dump(uint8_t channel, const char *cmd, uint32_t timeout_ms)
-{
-    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || cmd == NULL) {
-        ESP_LOGW(TAG, "raw_dump: bad args/state");
-        return;
-    }
-    if (channel_acquire(channel, pdMS_TO_TICKS(timeout_ms)) != ESP_OK) {
-        ESP_LOGW(TAG, "raw_dump: ch%u busy", channel);
-        return;
-    }
-
-    uart_port_t port = s_ch[channel].uart_num;
-    uart_flush_input(port);
-    if (cmd[0] != '\0') {
-        uart_write_bytes(port, cmd, strlen(cmd));
-    }
-    uart_write_bytes(port, "\n", 1);
-
-    ESP_LOGI(TAG, "raw_dump ch%u: sent '%s\\n', reading for %u ms…",
-             channel, cmd, (unsigned)timeout_ms);
-
-    int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
-    size_t count = 0;
-    while (!deadline_reached(deadline)) {
-        int64_t remain_us = deadline - now_us();
-        TickType_t ticks = pdMS_TO_TICKS(remain_us > 0 ? (uint32_t)(remain_us / 1000) : 1);
-        if (ticks == 0) ticks = 1;
-        uint8_t b;
-        if (uart_read_bytes(port, &b, 1, ticks) == 1) {
-            ESP_LOGI(TAG, "raw_dump ch%u [%3u] 0x%02X '%c'", channel,
-                     (unsigned)count, b, (b >= 0x20 && b < 0x7F) ? (char)b : '.');
-            count++;
-        }
-    }
-
-    s_ch[channel].state = (count > 0) ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
-    channel_release(channel);
-    ESP_LOGI(TAG, "raw_dump ch%u: done — %u bytes total", channel, (unsigned)count);
 }
 
 /* ── Streaming ASCII query (multi-line until a sentinel) ──────────────── *
