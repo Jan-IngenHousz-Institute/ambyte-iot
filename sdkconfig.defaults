@@ -25,3 +25,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # CONFIG_FATFS_LFN_NONE is not set
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+# TLS inbound record buffer: 16 KiB default -> 8 KiB. Frees ~8 KiB of internal
+# heap and, crucially, lets MQTT *reconnect* on a fragmented heap (a 16 KiB
+# contiguous block was unobtainable mid-run -> mbedtls ALLOC_FAILED). 8 KiB
+# still holds the broker's TLS handshake cert record. OUT stays 4 KiB
+# (asymmetric content len is already enabled).
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192

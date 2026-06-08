@@ -7,6 +7,7 @@
 #include <sys/time.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -97,8 +98,11 @@ static esp_err_t db_open_and_configure(void)
     sqlite3_free(err);
     if (!ok || rc != SQLITE_OK) {
         ESP_LOGE(TAG, "DB integrity check failed, recovering");
-        sqlite3_close(s_db);
+        sqlite3_close_v2(s_db);
         s_db = NULL;
+        remove(DB_PATH ".corrupt");          /* rename() fails if target exists */
+        remove(DB_PATH "-wal.corrupt");
+        remove(DB_PATH "-journal.corrupt");
         rename(DB_PATH, DB_PATH ".corrupt");
         rename(DB_PATH "-wal", DB_PATH "-wal.corrupt");
         rename(DB_PATH "-journal", DB_PATH "-journal.corrupt");
@@ -110,9 +114,16 @@ static esp_err_t db_open_and_configure(void)
     }
 
     sqlite3_extended_result_codes(s_db, 1);
-    exec_pragma(s_db, "PRAGMA journal_mode = TRUNCATE;");
+    /* journal_mode=MEMORY: keep the rollback journal in RAM instead of creating
+     * and truncating a -journal FILE on every transaction. That per-commit file
+     * churn is a primary FAT-corruption source on consumer SD cards, and the
+     * extra open file handle is a suspected leak on the corrupt path. Trade-off:
+     * a power loss mid-commit can corrupt the DB (recovered on reboot via the
+     * integrity check) — acceptable since events are also published to MQTT.
+     * synchronous=NORMAL fsyncs far less often than FULL. */
     exec_pragma(s_db, "PRAGMA locking_mode = EXCLUSIVE;");
-    exec_pragma(s_db, "PRAGMA synchronous = FULL;");
+    exec_pragma(s_db, "PRAGMA journal_mode = MEMORY;");
+    exec_pragma(s_db, "PRAGMA synchronous = NORMAL;");
     exec_pragma(s_db, "PRAGMA page_size = 4096;");
     /* -16 = 16 KiB page cache. The events DB is tiny and write-mostly, so a big
      * cache buys little; the freed ~48 KiB of internal heap is needed elsewhere
@@ -135,7 +146,7 @@ static esp_err_t db_open_and_configure(void)
     if (rc != SQLITE_OK) {
         ESP_LOGE(TAG, "CREATE events failed: %s", err ? err : "");
         sqlite3_free(err);
-        sqlite3_close(s_db);
+        sqlite3_close_v2(s_db);
         s_db = NULL;
         return ESP_FAIL;
     }
@@ -190,7 +201,7 @@ esp_err_t sqlite_persistence_on_sd_lost(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (s_db) { sqlite3_close(s_db); s_db = NULL; }
+    if (s_db) { sqlite3_close_v2(s_db); s_db = NULL; }
     s_db_available = false;
     xSemaphoreGive(s_mtx);
     ESP_LOGW(TAG, "SD lost — DB closed");
@@ -220,6 +231,33 @@ esp_err_t sqlite_persistence_next_id(int64_t *out_id)
     *out_id = s_next_id++;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
+}
+
+/* Runtime corruption recovery (caller MUST hold s_mtx). The on-disk image went
+ * malformed mid-operation (SQLITE_CORRUPT/NOTADB) — close it, archive to
+ * `.corrupt` (clearing any prior archive first; FATFS rename() fails if the
+ * target exists), and recreate a fresh DB so writes resume instead of failing
+ * until reboot. close_v2 (not close) is used so the connection + its FATFS file
+ * cache are always reclaimed even if SQLite considers it busy — plain close()
+ * leaks them on a corrupt connection, which death-spiralled to OOM. The corrupt
+ * DB's un-synced rows are lost (unavoidable). */
+static void db_recover_locked(void)
+{
+    int crc = SQLITE_OK;
+    if (s_db) { crc = sqlite3_close_v2(s_db); s_db = NULL; }
+    ESP_LOGE(TAG, "DB corrupt at runtime (close=%d, free heap %u) — archiving + recreating",
+             crc, (unsigned)esp_get_free_heap_size());
+    remove(DB_PATH ".corrupt");
+    remove(DB_PATH "-journal.corrupt");
+    remove(DB_PATH "-wal.corrupt");
+    rename(DB_PATH, DB_PATH ".corrupt");
+    rename(DB_PATH "-journal", DB_PATH "-journal.corrupt");
+    rename(DB_PATH "-wal", DB_PATH "-wal.corrupt");
+    increment_nvs_counter("db_corrupt_cnt");
+    s_db_available = (db_open_and_configure() == ESP_OK);
+    if (!s_db_available) {
+        ESP_LOGE(TAG, "DB reopen after corruption failed");
+    }
 }
 
 esp_err_t sqlite_persistence_store_event(int64_t measure_id, const char *device, const char *sensor,
@@ -256,11 +294,25 @@ esp_err_t sqlite_persistence_store_event(int64_t measure_id, const char *device,
     sqlite3_bind_text (st, 7, payload_json, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    xSemaphoreGive(s_mtx);
     if (rc != SQLITE_DONE) {
         ESP_LOGW(TAG, "store_event step failed (%d) for id %lld", rc, (long long)measure_id);
+        /* On-disk corruption: self-heal so the NEXT store works. Rate-limited to
+         * at most once per 20 s — recreating in a tight loop hammers an already-
+         * struggling card and accumulates the per-recovery cost. Between attempts
+         * the corrupt connection is reused (no churn), and stores just fail.
+         * (Extended codes share the low 8 bits with the base code.) */
+        if ((rc & 0xFF) == SQLITE_CORRUPT || (rc & 0xFF) == SQLITE_NOTADB) {
+            static TickType_t s_last_recover_tick = 0;
+            TickType_t now = xTaskGetTickCount();
+            if (s_last_recover_tick == 0 || (now - s_last_recover_tick) >= pdMS_TO_TICKS(20000)) {
+                s_last_recover_tick = now;
+                db_recover_locked();
+            }
+        }
+        xSemaphoreGive(s_mtx);
         return ESP_FAIL;
     }
+    xSemaphoreGive(s_mtx);
     return ESP_OK;
 }
 

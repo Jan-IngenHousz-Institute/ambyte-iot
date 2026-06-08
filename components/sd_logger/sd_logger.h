@@ -9,10 +9,14 @@
 extern "C" {
 #endif
 
-/* Tee every ESP-IDF log line (ESP_LOGx) to a rotating set of text files on the
- * SD card, in addition to the console. Call once, as early as possible in
- * app_main (the FreeRTOS scheduler must already be running), so boot logs are
- * captured.
+/* Tee WARN/ERROR ESP-IDF log lines to a rotating set of text files on the SD
+ * card, in addition to the console (which still shows every level). Call once,
+ * as early as possible in app_main (the FreeRTOS scheduler must already be
+ * running), so early WARN/ERROR are captured.
+ *
+ * WARN/ERROR-only is deliberate: continuous INFO-level logging to a consumer SD
+ * card that also holds the events DB corrupted the shared FAT. The file is now
+ * low-volume and writes nothing while idle.
  *
  * Design: the esp_log vprintf hook formats each line (RTC wall-clock prefix,
  * ANSI colour stripped) into an in-RAM ring buffer — it never touches the SD

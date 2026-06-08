@@ -32,7 +32,7 @@
 #define SD_LOGGER_BASENAME   "ambyte"
 #define SD_LOGGER_FILE_BYTES (1 * 1024 * 1024)   /* per-file cap */
 #define SD_LOGGER_MAX_FILES  6                    /* current + 5 rotated ≈ 6 MB */
-#define SD_LOGGER_RING_BYTES (16 * 1024)          /* in-RAM buffer */
+#define SD_LOGGER_RING_BYTES (8 * 1024)           /* in-RAM buffer (heap is tight) */
 #define SD_LOGGER_LINE_MAX   256                  /* max formatted line */
 #define SD_LOGGER_TASK_STACK 4096
 #define SD_LOGGER_TASK_PRIO  2                     /* low: below comms/measurement */
@@ -96,6 +96,20 @@ static size_t ring_pop(uint8_t *out, size_t cap)
 
 /* ── log sink ─────────────────────────────────────────────────────────── */
 
+/* The IDF log line begins with an optional ANSI colour escape, then the level
+ * letter (E/W/I/D/V). The SD file keeps only WARN and ERROR — INFO/DEBUG are far
+ * too high-volume to write continuously to a consumer SD card sharing the FAT
+ * with the events DB (that combination corrupted the DB). */
+static bool sd_log_level_kept(const char *fmt)
+{
+    const char *p = fmt;
+    if (*p == '\033') {                 /* skip CSI colour escape: ESC [ … final @-~ */
+        p++;
+        if (*p == '[') { p++; while (*p && !(*p >= '@' && *p <= '~')) p++; if (*p) p++; }
+    }
+    return (*p == 'E' || *p == 'W');
+}
+
 static int sd_log_vprintf(const char *fmt, va_list ap)
 {
     /* 1) Console tee. vprintf consumes the va_list, so hand it a private copy. */
@@ -107,6 +121,9 @@ static int sd_log_vprintf(const char *fmt, va_list ap)
     /* The formatting below isn't ISR-safe (localtime_r/vsnprintf take locks),
      * and normal ESP_LOGx is never called from an ISR — guard just in case. */
     if (xPortInIsrContext()) return ret;
+
+    /* 1b) SD file is WARN/ERROR-only; the console (above) still sees everything. */
+    if (!sd_log_level_kept(fmt)) return ret;
 
     /* 2) Build "<RTC wall-clock>  <message>" in one buffer. System time was set
      * from the PCF2131 at boot, so time() is cheap (no I2C); before the RTC
@@ -186,10 +203,12 @@ static void writer_task(void *arg)
     (void)arg;
     uint8_t buf[512];
     TickType_t last_fsync = xTaskGetTickCount();
+    bool dirty = false;                                    /* unflushed bytes pending */
 
     for (;;) {
         if (!sdcard_is_mounted()) {
             close_log();                                   /* ring keeps buffering */
+            dirty = false;
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
             continue;
         }
@@ -211,14 +230,19 @@ static void writer_task(void *arg)
                 continue;
             }
             s_file_bytes += n;
+            dirty = true;
         } else {
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));  /* idle */
         }
 
-        if (s_fp && (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
+        /* Flush only when there's something to flush — with WARN/ERROR-only
+         * capture the ring is usually empty, so the card sees no periodic writes
+         * (an idle fsync still touches the FAT). */
+        if (s_fp && dirty && (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
             fflush(s_fp);
             fsync(fileno(s_fp));
             last_fsync = xTaskGetTickCount();
+            dirty = false;
         }
     }
 }
@@ -241,7 +265,7 @@ esp_err_t sd_logger_init(void)
     }
     s_started = true;
 
-    ESP_LOGI(TAG, "SD logging started -> %s/%s.log (%d files x %d KiB)",
+    ESP_LOGI(TAG, "SD logging started (WARN/ERROR only) -> %s/%s.log (%d files x %d KiB)",
              SD_LOGGER_DIR, SD_LOGGER_BASENAME,
              SD_LOGGER_MAX_FILES, SD_LOGGER_FILE_BYTES / 1024);
     return ESP_OK;

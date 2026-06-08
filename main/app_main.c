@@ -231,8 +231,9 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
 
 void app_main(void)
 {
-    /* Start capturing logs to the SD card first thing, so the whole boot
-     * sequence is recorded (the writer buffers in RAM until the card mounts). */
+    /* Capture WARN/ERROR logs to the SD card (INFO/DEBUG go to the console only).
+     * Verbose continuous logging concurrent with the events DB corrupted the FAT
+     * on a consumer card, so the file is now low-volume + idle-quiet by design. */
     if (sd_logger_init() != ESP_OK) {
         ESP_LOGW(APP_TAG, "SD logger failed to start");
     }
