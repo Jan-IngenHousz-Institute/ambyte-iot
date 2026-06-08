@@ -22,6 +22,17 @@ static SemaphoreHandle_t s_mtx = NULL;
 static StaticSemaphore_t s_mtx_storage;
 static bool s_db_available = false;
 static int64_t s_next_id = 1;
+/* Rate-limits both corruption recreation and reopen-after-failure to once per
+ * window, so a struggling card isn't hammered and a transient low-heap failure
+ * doesn't leave the DB dead until reboot. */
+static TickType_t s_last_db_attempt_tick = 0;
+#define DB_ATTEMPT_INTERVAL_MS 20000
+/* Each recreate/reopen costs heap (and a failing card never recovers), so cap
+ * the total since boot. After the cap, storage is disabled and the device keeps
+ * running (Wi-Fi/MQTT/measurements) instead of draining to OOM — the operator
+ * reboots / replaces the card. */
+static int s_db_recreate_count = 0;
+#define DB_MAX_RECREATE 8
 
 static esp_err_t db_open_and_configure(void);
 
@@ -57,6 +68,22 @@ static int integrity_cb(void *arg, int ncols, char **values, char **names)
     bool *ok = (bool *)arg;
     if (ncols > 0 && values[0] && strcmp(values[0], "ok") != 0) *ok = false;
     return 0;
+}
+
+/* Close a connection, guaranteeing its resources (incl. the VFS file handle +
+ * its 4 KiB FATFS per-file cache) are actually reclaimed. sqlite3_close[_v2]
+ * leaves the connection a "zombie" — deferring the file close, so ~4 KiB leaks
+ * each call — if ANY prepared statement is still open on it. On a corrupt DB an
+ * internal/stray statement can linger, so finalize every statement first. All
+ * persistence ops are serialised under s_mtx, so nothing is mid-use here. */
+static void db_close_all(sqlite3 *db)
+{
+    if (db == NULL) return;
+    sqlite3_stmt *stmt;
+    while ((stmt = sqlite3_next_stmt(db, NULL)) != NULL) {
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
 }
 
 static char *dup_text_col(sqlite3_stmt *st, int col)
@@ -98,7 +125,7 @@ static esp_err_t db_open_and_configure(void)
     sqlite3_free(err);
     if (!ok || rc != SQLITE_OK) {
         ESP_LOGE(TAG, "DB integrity check failed, recovering");
-        sqlite3_close_v2(s_db);
+        db_close_all(s_db);
         s_db = NULL;
         remove(DB_PATH ".corrupt");          /* rename() fails if target exists */
         remove(DB_PATH "-wal.corrupt");
@@ -128,7 +155,7 @@ static esp_err_t db_open_and_configure(void)
     /* -16 = 16 KiB page cache. The events DB is tiny and write-mostly, so a big
      * cache buys little; the freed ~48 KiB of internal heap is needed elsewhere
      * (Wi-Fi/TLS + the MQTT publish, which cJSON-parses the whole payload). */
-    exec_pragma(s_db, "PRAGMA cache_size = -16;");
+    exec_pragma(s_db, "PRAGMA cache_size = -8;");
     exec_pragma(s_db, "PRAGMA temp_store = MEMORY;");
 
     const char *create =
@@ -146,7 +173,7 @@ static esp_err_t db_open_and_configure(void)
     if (rc != SQLITE_OK) {
         ESP_LOGE(TAG, "CREATE events failed: %s", err ? err : "");
         sqlite3_free(err);
-        sqlite3_close_v2(s_db);
+        db_close_all(s_db);
         s_db = NULL;
         return ESP_FAIL;
     }
@@ -201,7 +228,7 @@ esp_err_t sqlite_persistence_on_sd_lost(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (s_db) { sqlite3_close_v2(s_db); s_db = NULL; }
+    if (s_db) { db_close_all(s_db); s_db = NULL; }
     s_db_available = false;
     xSemaphoreGive(s_mtx);
     ESP_LOGW(TAG, "SD lost — DB closed");
@@ -237,23 +264,29 @@ esp_err_t sqlite_persistence_next_id(int64_t *out_id)
  * malformed mid-operation (SQLITE_CORRUPT/NOTADB) — close it, archive to
  * `.corrupt` (clearing any prior archive first; FATFS rename() fails if the
  * target exists), and recreate a fresh DB so writes resume instead of failing
- * until reboot. close_v2 (not close) is used so the connection + its FATFS file
- * cache are always reclaimed even if SQLite considers it busy — plain close()
- * leaks them on a corrupt connection, which death-spiralled to OOM. The corrupt
- * DB's un-synced rows are lost (unavoidable). */
+ * until reboot. db_close_all() finalizes any lingering statement first so the
+ * connection + its FATFS file handle are actually freed (close[_v2] zombies and
+ * leaks ~4 KiB otherwise, which death-spiralled to OOM). The corrupt DB's
+ * un-synced rows are lost (unavoidable). */
 static void db_recover_locked(void)
 {
-    int crc = SQLITE_OK;
-    if (s_db) { crc = sqlite3_close_v2(s_db); s_db = NULL; }
-    ESP_LOGE(TAG, "DB corrupt at runtime (close=%d, free heap %u) — archiving + recreating",
-             crc, (unsigned)esp_get_free_heap_size());
+    if (s_db) { db_close_all(s_db); s_db = NULL; }
+    if (s_db_recreate_count >= DB_MAX_RECREATE) {
+        s_db_available = false;
+        ESP_LOGE(TAG, "DB corrupt %d× — storage DISABLED until reboot (replace the SD card)",
+                 s_db_recreate_count);
+        return;
+    }
+    s_db_recreate_count++;
+    increment_nvs_counter("db_corrupt_cnt");
+    ESP_LOGE(TAG, "DB corrupt at runtime (free heap %u, recreate #%d) — archiving + recreating",
+             (unsigned)esp_get_free_heap_size(), s_db_recreate_count);
     remove(DB_PATH ".corrupt");
     remove(DB_PATH "-journal.corrupt");
     remove(DB_PATH "-wal.corrupt");
     rename(DB_PATH, DB_PATH ".corrupt");
     rename(DB_PATH "-journal", DB_PATH "-journal.corrupt");
     rename(DB_PATH "-wal", DB_PATH "-wal.corrupt");
-    increment_nvs_counter("db_corrupt_cnt");
     s_db_available = (db_open_and_configure() == ESP_OK);
     if (!s_db_available) {
         ESP_LOGE(TAG, "DB reopen after corruption failed");
@@ -268,8 +301,20 @@ esp_err_t sqlite_persistence_store_event(int64_t measure_id, const char *device,
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     if (!s_db_available || s_db == NULL) {
-        xSemaphoreGive(s_mtx);
-        return ESP_ERR_NOT_SUPPORTED;
+        /* DB is down (e.g. a recovery couldn't recreate under low heap). Retry
+         * the open, rate-limited, so it comes back once heap frees up — instead
+         * of staying dead until reboot. */
+        TickType_t now = xTaskGetTickCount();
+        if (sdcard_is_mounted() && s_db_recreate_count < DB_MAX_RECREATE &&
+            (now - s_last_db_attempt_tick) >= pdMS_TO_TICKS(DB_ATTEMPT_INTERVAL_MS)) {
+            s_last_db_attempt_tick = now;
+            s_db_recreate_count++;
+            s_db_available = (db_open_and_configure() == ESP_OK);
+        }
+        if (!s_db_available || s_db == NULL) {
+            xSemaphoreGive(s_mtx);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
     }
 
     const char *sql =
@@ -302,10 +347,9 @@ esp_err_t sqlite_persistence_store_event(int64_t measure_id, const char *device,
          * the corrupt connection is reused (no churn), and stores just fail.
          * (Extended codes share the low 8 bits with the base code.) */
         if ((rc & 0xFF) == SQLITE_CORRUPT || (rc & 0xFF) == SQLITE_NOTADB) {
-            static TickType_t s_last_recover_tick = 0;
             TickType_t now = xTaskGetTickCount();
-            if (s_last_recover_tick == 0 || (now - s_last_recover_tick) >= pdMS_TO_TICKS(20000)) {
-                s_last_recover_tick = now;
+            if ((now - s_last_db_attempt_tick) >= pdMS_TO_TICKS(DB_ATTEMPT_INTERVAL_MS)) {
+                s_last_db_attempt_tick = now;
                 db_recover_locked();
             }
         }

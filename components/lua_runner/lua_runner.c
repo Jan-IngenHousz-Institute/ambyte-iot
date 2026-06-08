@@ -919,7 +919,7 @@ static const char *ambit_array_tag(uint8_t idx)
  * the fragmenting per-run path. Only the lua_runner task calls ambit.run, so a
  * single shared buffer is safe. Sized for current point counts; larger runs
  * truncate (logged). A uint16/compact-storage v2 will shrink this need. */
-#define AMBIT_RUN_PAYLOAD_CAP (16 * 1024)
+#define AMBIT_RUN_PAYLOAD_CAP (8 * 1024)
 static char *s_ambit_payload;
 
 /* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace over the
