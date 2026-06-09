@@ -16,6 +16,7 @@
 #include "device_commands.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
+#include "pcf2131tfy_rtc_api.h"
 #include "sd_logger.h"
 #include "wifi_manager.h"
 
@@ -126,14 +127,9 @@ static int cli_cmd_status(int argc, char **argv)
     return 0;
 }
 
-static int cli_cmd_rtc(int argc, char **argv)
+/* Print the current RTC time (read back through the clock port). */
+static int cli_print_rtc(void)
 {
-    (void)argv;
-    if (argc != 1) {
-        printf("Usage: rtc\r\n");
-        return 1;
-    }
-
     time_t now = 0;
     cmd_result_t res = cmd_read_rtc(&now);
     if (res.status != ESP_OK) {
@@ -147,6 +143,67 @@ static int cli_cmd_rtc(int argc, char **argv)
     strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
     printf("RTC: %s (%lld)\r\n", now_s, (long long)now);
     return 0;
+}
+
+/* rtc                                  → print current time
+ * rtc set <epoch_seconds>              → set from UTC epoch seconds
+ * rtc set <YYYY-MM-DD> <HH:MM:SS>      → set from a UTC date + time
+ * Setting clears the oscillator-stop flag, so this is how a factory-fresh RTC
+ * is brought online; the system clock is re-synced immediately. */
+static int cli_cmd_rtc(int argc, char **argv)
+{
+    if (argc == 1) {
+        return cli_print_rtc();
+    }
+
+    if (strcmp(argv[1], "set") != 0) {
+        printf("Usage: rtc | rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS>  (UTC)\r\n");
+        return 1;
+    }
+
+    struct tm tm_utc = {0};
+
+    if (argc == 3) {
+        /* rtc set <epoch_seconds> */
+        char *end = NULL;
+        const long long epoch = strtoll(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || epoch < 0) {
+            printf("rtc set: invalid epoch '%s'\r\n", argv[2]);
+            return 1;
+        }
+        const time_t t = (time_t)epoch;
+        gmtime_r(&t, &tm_utc);
+    } else if (argc == 4) {
+        /* rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC) */
+        int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+        if (sscanf(argv[2], "%d-%d-%d", &y, &mo, &d) != 3 ||
+            sscanf(argv[3], "%d:%d:%d", &h, &mi, &s) < 2) {
+            printf("rtc set: bad date/time; expected <YYYY-MM-DD> <HH:MM:SS>\r\n");
+            return 1;
+        }
+        if (y < 2000 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+            h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+            printf("rtc set: value out of range\r\n");
+            return 1;
+        }
+        tm_utc.tm_year = y - 1900;
+        tm_utc.tm_mon  = mo - 1;
+        tm_utc.tm_mday = d;
+        tm_utc.tm_hour = h;
+        tm_utc.tm_min  = mi;
+        tm_utc.tm_sec  = s;
+    } else {
+        printf("Usage: rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS>  (UTC)\r\n");
+        return 1;
+    }
+
+    const esp_err_t err = pcf2131tfy_rtc_set_time(&tm_utc);
+    if (err != ESP_OK) {
+        printf("rtc set failed: %s\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("RTC set; ");
+    return cli_print_rtc();
 }
 
 static int cli_cmd_red(int argc, char **argv)
@@ -691,7 +748,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t rtc_cmd = {
         .command = "rtc",
-        .help = "print current RTC timestamp",
+        .help = "rtc | rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC)",
         .func = cli_cmd_rtc,
     };
     static const esp_console_cmd_t red_cmd = {

@@ -33,7 +33,16 @@ time_t PCF2131_base::rtc_time(void)
         return (time_t)(-1);
     }
 
-    now_tm.tm_sec = bcd2dec(bf[1]);
+    /* Seconds register bit 7 is the oscillator-stop flag (OSF): set when the
+     * oscillator has stopped (never-set or power-lost RTC), meaning the time is
+     * invalid. Reject it so callers don't sync the system clock to a bogus value
+     * — and mask it out of the BCD seconds regardless. */
+    if (bf[1] & 0x80U) {
+        set_error(ESP_ERR_INVALID_STATE);
+        return (time_t)(-1);
+    }
+
+    now_tm.tm_sec = bcd2dec(bf[1] & 0x7FU);
     now_tm.tm_min = bcd2dec(bf[2]);
     now_tm.tm_hour = bcd2dec(bf[3]);
     now_tm.tm_mday = bcd2dec(bf[4]);

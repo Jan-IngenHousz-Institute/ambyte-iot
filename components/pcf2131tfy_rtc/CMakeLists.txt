@@ -7,5 +7,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
     REQUIRES domain
-    PRIV_REQUIRES driver i2c_bus
+    PRIV_REQUIRES driver i2c_bus esp_timer
 )

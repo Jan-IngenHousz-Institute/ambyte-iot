@@ -34,6 +34,10 @@
 
 #define APP_TAG "APP_MAIN"
 
+/* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
+ * recovery if the RTC is set/validated after boot). */
+#define APP_RTC_SYNC_INTERVAL_S 3600U
+
 static const i2c_bus_config_t s_i2c_bus_cfg = {
     .port = I2C_BUS_DEFAULT_PORT,
     .sda_gpio = I2C_BUS_DEFAULT_SDA_GPIO,
@@ -89,18 +93,19 @@ static esp_err_t app_init_i2c_and_sensors(void)
     }
 
     if (pcf2131tfy_rtc_is_ready()) {
-        time_t rtc_now = 0;
-        if (pcf2131tfy_rtc_get_time(&rtc_now) == ESP_OK) {
-            /* Push the RTC value into the ESP-IDF system clock so subsequent
-             * gettimeofday / time(NULL) calls return real UTC instead of
-             * seconds-since-boot. Without this, every measurement timestamp
-             * and every MQTT publish "timestamp" field comes out as 1970+uptime. */
-            struct timeval tv = { .tv_sec = rtc_now, .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            ESP_LOGI(APP_TAG, "RTC time: %lld (system clock synced)", (long long)rtc_now);
+        /* Push the RTC into the ESP-IDF system clock so gettimeofday / time(NULL)
+         * return real UTC (every measurement startTicks + MQTT timestamp depends
+         * on this). A never-set RTC reports its time as invalid (OSF) and is
+         * skipped — the clock then stays at the IDF default until the RTC is set. */
+        if (pcf2131tfy_rtc_sync_system_clock() == ESP_OK) {
+            ESP_LOGI(APP_TAG, "system clock synced from RTC");
         } else {
-            ESP_LOGW(APP_TAG, "RTC time read failed");
+            ESP_LOGW(APP_TAG, "RTC time invalid/unreadable — system clock not set; "
+                              "set the RTC and it will auto-sync (no reboot needed)");
         }
+        /* Re-sync periodically: corrects drift over long uptimes and recovers the
+         * clock without a reboot if the RTC is set/validated after boot. */
+        pcf2131tfy_rtc_start_periodic_sync(APP_RTC_SYNC_INTERVAL_S);
     }
 
     err = bme280_init(BME280_I2C_ADDR_SECONDARY);
