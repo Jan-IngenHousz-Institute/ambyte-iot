@@ -201,19 +201,23 @@ static esp_err_t parse_record(char *line, size_t len, measurement_event_t *out)
     strncpy(out->channel, f[1], sizeof(out->channel) - 1);
     strncpy(out->device,  f[2], sizeof(out->device)  - 1);
     strncpy(out->tag,     f[3], sizeof(out->tag)     - 1);
-    strncpy(out->cmd_raw, f[4], sizeof(out->cmd_raw) - 1);
     out->start_ticks_ms = (int64_t)strtoll(f[5], NULL, 10);
     out->end_ticks_ms   = (int64_t)strtoll(f[6], NULL, 10);
     out->sync_state     = MEASUREMENT_SYNC_INFLIGHT;
 
+    /* cmd_raw is variable-length (a full multi-segment "arrun …" command) → heap.
+     * NULL when the field is empty. */
+    if (f[4][0] != '\0') {
+        out->cmd_raw = strdup(f[4]);
+        if (out->cmd_raw == NULL) return ESP_ERR_NO_MEM;
+    }
     if (f[7][0] != '\0') {
         out->metadata_json = strdup(f[7]);
-        if (out->metadata_json == NULL) return ESP_ERR_NO_MEM;
+        if (out->metadata_json == NULL) { measurement_event_free(out); return ESP_ERR_NO_MEM; }
     }
     out->payload_json = strdup(payload);
     if (out->payload_json == NULL) {
-        free(out->metadata_json);
-        out->metadata_json = NULL;
+        measurement_event_free(out);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -384,29 +388,45 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     }
 
     const int64_t measure_id = desc->measure_id;
-    char chan[12], dev[24], tag[16], cmd[40];
+    char chan[12], dev[24], tag[16];
     sanitize_field(chan, sizeof chan, desc->channel);
     sanitize_field(dev,  sizeof dev,  desc->device);
     sanitize_field(tag,  sizeof tag,  desc->tag);
-    sanitize_field(cmd,  sizeof cmd,  desc->cmd_raw);
+    /* cmd_raw is variable-length (a full multi-segment "arrun …" can be ~520 B),
+     * so it gets its own heap-sanitized buffer and its own write rather than
+     * sharing the fixed header buffer. */
+    const char *cmd_src = (desc->cmd_raw != NULL) ? desc->cmd_raw : "";
+    size_t cmd_cap = strlen(cmd_src) + 1;
+    char *cmd = malloc(cmd_cap);
+    if (cmd == NULL) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_NO_MEM;
+    }
+    sanitize_field(cmd, cmd_cap, cmd_src);
     const char *meta = (desc->metadata_json != NULL && desc->metadata_json[0] != '\0')
                        ? desc->metadata_json : "";
     const char *payload_json = desc->payload_json;
 
-    char hdr[192];
-    int hlen = snprintf(hdr, sizeof hdr, "%lld\t%s\t%s\t%s\t%s\t%lld\t%lld\t",
-                        (long long)measure_id, chan, dev, tag, cmd,
-                        (long long)desc->start_ms, (long long)desc->end_ms);
-    if (hlen < 0 || hlen >= (int)sizeof hdr) {
+    /* Header split around cmd_raw: "<id>\t<chan>\t<dev>\t<tag>\t" then cmd, then
+     * "\t<start>\t<end>\t". */
+    char hdr1[96], hdr2[48];
+    int h1 = snprintf(hdr1, sizeof hdr1, "%lld\t%s\t%s\t%s\t",
+                      (long long)measure_id, chan, dev, tag);
+    int h2 = snprintf(hdr2, sizeof hdr2, "\t%lld\t%lld\t",
+                      (long long)desc->start_ms, (long long)desc->end_ms);
+    if (h1 < 0 || h1 >= (int)sizeof hdr1 || h2 < 0 || h2 >= (int)sizeof hdr2) {
+        free(cmd);
         xSemaphoreGive(s_mtx);
         return ESP_FAIL;
     }
+    size_t clen  = strlen(cmd);
     size_t mlen  = strlen(meta);
     size_t plen  = strlen(payload_json);
-    size_t total = (size_t)hlen + mlen + 1 /*tab*/ + plen + 1 /*\n*/;
+    size_t total = (size_t)h1 + clen + (size_t)h2 + mlen + 1 /*tab*/ + plen + 1 /*\n*/;
     if (total >= EVLOG_MAX_RECORD) {
         ESP_LOGE(TAG, "record too large (%u B) for id %lld — dropped",
                  (unsigned)total, (long long)measure_id);
+        free(cmd);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -423,6 +443,7 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
         if (s_wf == NULL) {
             ESP_LOGE(TAG, "rotate: open %s failed", path);
             s_available = false;
+            free(cmd);
             xSemaphoreGive(s_mtx);
             return ESP_FAIL;
         }
@@ -430,11 +451,14 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     }
 
     size_t w = 0;
-    w += fwrite(hdr, 1, (size_t)hlen, s_wf);
+    w += fwrite(hdr1, 1, (size_t)h1, s_wf);
+    w += fwrite(cmd,  1, clen, s_wf);
+    w += fwrite(hdr2, 1, (size_t)h2, s_wf);
     w += fwrite(meta, 1, mlen, s_wf);
     w += fwrite("\t", 1, 1, s_wf);
     w += fwrite(payload_json, 1, plen, s_wf);
     w += fwrite("\n", 1, 1, s_wf);
+    free(cmd);
     if (w != total) {
         /* A failed/short write (e.g. sdmmc couldn't get a DMA buffer under low
          * heap) leaves a torn partial record. Roll the file back to the last good

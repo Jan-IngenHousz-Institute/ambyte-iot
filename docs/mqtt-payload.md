@@ -54,7 +54,7 @@ example:
     "published": "2026-06-11T09:30:00Z",// UTC ISO-8601 at PUBLISH time
     "channel": "uart_1",                // physical port, null = onboard
     "device":  "ambit",                 // discovered sensor name, null = unknown
-    "cmd_raw": "arrun",                 // device-vocabulary/literal command, null = none
+    "cmd_raw": "arrun 1,0,0,0,0,4,0,4,0,1", // full device-vocabulary command (with args), null = none
     "tag": "MEASUREMENT",               // origin enum (firmware-assigned)
     "metadata": { "segments": [ ... ] },// object, or null when absent
     "data":     { ... }                 // object — the measurement quantities
@@ -106,20 +106,22 @@ data=, metadata=, channel= }` remains for derived/custom script events.
 
 | Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
+| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun <len>,<persist>,<bytes…>` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` (730 arrays only on IR-enabled traces) |
 | Spectrum + PAR (`ambit.spec`) | `uart_<ch>` | `ambit` | `get_par` | `{"spec":[10 ints],"par":f}` |
 | Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
 | BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
 | **STATUS heartbeat** (firmware, tag `STATUS`) | `null` | `null` | `null` | `{"wifi":b,"provisioned":b,"db_online":b,"publish_gate":b,"battery_v":f,"input_v":f,"system_v":f,"input_ma":n,"charge_ma":n,"input_present":b,"charge_status":n}` (power keys omitted if charger read fails) |
 | Lua `db.store_event{}` (custom/derived) | `uart_<n>` if `channel=` given, else `null` | `null` (Phase 3 attaches the cache) | `null` | script-defined |
 
-`cmd_raw` uses the **target device's own command vocabulary** — for the AMBIT,
-the ASCII command names from its firmware (`do_command.h`): `arrun` for any
-trace run (the binary sync run, cmd 21, and the async trigger/fetch pair,
-cmds 22/24, are the same stimulus — sync vs async is transport), `get_par`,
-`get_temp`. Onboard sources use the firmware's logical name (`device.bme280`).
-The AMBIT run/trigger `opts.metadata` table is merged into the event's
-`{"segments":[…]}` metadata object.
+`cmd_raw` is the **full command in the target device's own vocabulary**,
+arguments included — for the AMBIT, the literal ASCII command its console
+accepts (`do_command.h`): `arrun <len>,<persist>,<byte,byte,…>` for a trace
+(the segment bytes are the wire encoding; the binary sync run, cmd 21, and the
+async trigger/fetch pair, cmds 22/24, are the same stimulus and store the same
+command), and the argument-free `get_par` / `get_temp`. Onboard sources use
+the firmware's logical name (`device.bme280`). `cmd_raw` is the literal command
+(replayable); `metadata.segments` is the decoded, analysis-friendly view of the
+same trace, and the AMBIT run/trigger `opts.metadata` table is merged into it.
 
 
 ### AMBIT `data` keys

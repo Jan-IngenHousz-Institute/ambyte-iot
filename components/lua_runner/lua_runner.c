@@ -1013,6 +1013,10 @@ static const char *ambit_array_tag(uint8_t idx)
 #define AMBIT_RUN_PAYLOAD_CAP (8 * 1024)
 static char *s_ambit_payload;
 
+/* Max length of a reconstructed "arrun" ASCII command: "arrun " + nseg(≤2) + ","
+ * + persist(≤3) + "," + 16 segments × 8 bytes × "255," (≤4) ≈ 525 B. */
+#define AMBIT_CMD_ASCII_CAP 544
+
 /* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace over the
  * binary AMBYTE protocol (cmd 21): the ambit runs the whole trace, then streams
  * each result array back over the FSM handshake as raw uint32 LE (no ASCII, no
@@ -1048,6 +1052,7 @@ static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
 /* Per-channel state stashed by ambit.trigger for the eventual ambit.fetch store:
  * the run metadata (segments JSON) and the measurement start time. */
 static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][768];
+static char    s_ambit_cmd[UART_SENSOR_NUM_CHANNELS][AMBIT_CMD_ASCII_CAP];
 static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
 
 /* Merge the script's opts.metadata table (at stack index `opts_idx`) into the
@@ -1082,6 +1087,20 @@ static void ambit_meta_merge_user(lua_State *L, int opts_idx, char *meta, size_t
         }
     }
     lua_pop(L, 1);
+}
+
+/* Reconstruct the AMBIT's full ASCII run command from the packed run array,
+ * matching its console grammar (do_command.h: arrun <len>,<persist>,<bytes…>).
+ * This literal command becomes the event's cmd_raw, so the trace's arguments
+ * travel with it (not just the bare verb). */
+static void ambit_build_cmd_ascii(char *out, size_t cap, const uint8_t *run_arr,
+                                  int nseg, uint8_t persist)
+{
+    int off = snprintf(out, cap, "arrun %d,%u", nseg, (unsigned)persist);
+    for (int i = 0; i < nseg * 8 && off > 0 && off < (int)cap; i++) {
+        off += snprintf(out + off, (off < (int)cap) ? cap - off : 0,
+                        ",%u", (unsigned)run_arr[i]);
+    }
 }
 
 /* Build a malloc'd run_arr (caller frees) of nseg*8 bytes plus a metadata JSON
@@ -1159,10 +1178,10 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
 /* Decode an AMBIT FSM response into the reserved JSON payload, optionally store
  * it as one event, free `resp`, and push the Lua result table (or nil+reason).
  * Shared by ambit.run and ambit.fetch so both produce identical events;
- * `cmd_name` is recorded as the event's cmd_raw, using the AMBIT firmware's
- * own ASCII command vocabulary (do_command.h): the binary run (cmd 21) and
- * the async trigger/fetch pair (cmds 22/24) are all the "arrun" measurement
- * — sync vs async is transport, not stimulus, so both store "arrun". */
+ * `cmd_name` is recorded as the event's cmd_raw — the full reconstructed AMBIT
+ * ASCII command incl. its segment args ("arrun <len>,<persist>,<bytes…>",
+ * do_command.h). The binary run (cmd 21) and the async trigger/fetch pair
+ * (cmds 22/24) are the same stimulus, so both store the same arrun command. */
 static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
                                    uint8_t ch, bool store, int64_t start_ms,
                                    int64_t end_ms, const char *metadata_json,
@@ -1297,6 +1316,10 @@ static int l_ambit_run(lua_State *L)
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg, metadata_json, sizeof metadata_json);
     ambit_meta_merge_user(L, 3, metadata_json, sizeof metadata_json);
 
+    /* Reconstruct the full ASCII command (with its segment args) for cmd_raw. */
+    char cmd_ascii[AMBIT_CMD_ASCII_CAP];
+    ambit_build_cmd_ascii(cmd_ascii, sizeof cmd_ascii, run_arr, nseg, persist);
+
     int64_t start_ms = lua_now_ms();
 
     /* Binary AMBYTE run (cmd 21): the ambit streams each result array back over
@@ -1314,7 +1337,7 @@ static int l_ambit_run(lua_State *L)
         return lua_push_nil_reason(L, res.message);
     }
     return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms,
-                                   metadata_json, "arrun");
+                                   metadata_json, cmd_ascii);
 }
 
 /* ambit.trigger(ch, segments [, opts]) — start a retained (async) run on `ch`
@@ -1351,6 +1374,8 @@ static int l_ambit_trigger(lua_State *L)
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg,
                                            s_ambit_meta[ch], sizeof s_ambit_meta[ch]);
     ambit_meta_merge_user(L, 3, s_ambit_meta[ch], sizeof s_ambit_meta[ch]);
+    /* Stash the full ASCII command for the eventual ambit.fetch store. */
+    ambit_build_cmd_ascii(s_ambit_cmd[ch], sizeof s_ambit_cmd[ch], run_arr, nseg, persist);
 
     s_ambit_start_ms[ch] = lua_now_ms();
 
@@ -1416,7 +1441,7 @@ static int l_ambit_fetch(lua_State *L)
 
     return ambit_decode_store_push(L, &resp, ch, store,
                                    s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch],
-                                   "arrun");
+                                   s_ambit_cmd[ch]);
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────

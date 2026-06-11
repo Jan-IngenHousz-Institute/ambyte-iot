@@ -597,13 +597,28 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
 
     /* "" → JSON null for the optional provenance strings. */
-    char chanbuf[16], devbuf[32], cmdbuf[48];
+    char chanbuf[16], devbuf[32];
     if (e.channel[0] != '\0') snprintf(chanbuf, sizeof(chanbuf), "\"%s\"", e.channel);
     else                      strcpy(chanbuf, "null");
     if (e.device[0] != '\0')  snprintf(devbuf, sizeof(devbuf), "\"%s\"", e.device);
     else                      strcpy(devbuf, "null");
-    if (e.cmd_raw[0] != '\0') snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\"", e.cmd_raw);
-    else                      strcpy(cmdbuf, "null");
+    /* cmd_raw is variable-length (a full "arrun …" can be ~520 B) → heap-quoted;
+     * NULL falls back to the JSON null literal in the splice below. */
+    char *cmdbuf = NULL;
+    if (e.cmd_raw != NULL && e.cmd_raw[0] != '\0') {
+        size_t cn = strlen(e.cmd_raw);
+        cmdbuf = malloc(cn + 3);
+        if (cmdbuf == NULL) {
+            s_cfg.mark_event_pending(e.measure_id);
+            measurement_event_free(&e);
+            return make_result(ESP_ERR_NO_MEM, "cmd_raw buf alloc failed (%u B)", (unsigned)(cn + 3));
+        }
+        cmdbuf[0] = '"';
+        memcpy(cmdbuf + 1, e.cmd_raw, cn);
+        cmdbuf[cn + 1] = '"';
+        cmdbuf[cn + 2] = '\0';
+    }
+    const char *cmdfield = cmdbuf ? cmdbuf : "null";
 
     /* Optional envelope fields — empty string when absent. */
     char battpart[48] = "";
@@ -622,13 +637,14 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
 
     size_t cap = strlen(e.payload_json) + (meta ? strlen(meta) : 4)
-               + strlen(chanbuf) + strlen(devbuf) + strlen(cmdbuf) + strlen(e.tag)
+               + strlen(chanbuf) + strlen(devbuf) + strlen(cmdfield) + strlen(e.tag)
                + strlen(battpart) + strlen(tzpart)
                + strlen(fw) + strlen(dn) + strlen(dv)
                + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts)
                + 320;                            /* fixed keys + numbers + punctuation */
     char *payload = malloc(cap);
     if (payload == NULL) {
+        free(cmdbuf);
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
@@ -644,10 +660,11 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         "\"device_id\":\"%s\",\"device_name\":\"%s\","
         "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}",
         (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
-        pub_ts, chanbuf, devbuf, cmdbuf, e.tag,
+        pub_ts, chanbuf, devbuf, cmdfield, e.tag,
         meta ? meta : "null", e.payload_json,
         meas_ts, battpart, tzpart,
         s_mac_str, dn, dv, fw);
+    free(cmdbuf);
 
     if (n < 0 || (size_t)n >= cap) {
         free(payload);
