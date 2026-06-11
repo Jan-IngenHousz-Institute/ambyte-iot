@@ -26,6 +26,7 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                cmd_topic         AMBYTE_COMMAND_TOPIC    (optional; Stage-2 cmd in)
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
                timezone          AMBYTE_TIMEZONE         (optional; IANA name)
+               flash_time        <image build time>      (u32 epoch; RTC fallback)
   certs        ca_cert           file at AMBYTE_CA_CERT
                dev_cert          file at AMBYTE_DEV_CERT
                dev_key           file at AMBYTE_DEV_KEY
@@ -43,6 +44,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -176,6 +178,12 @@ def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
 
     # provisioned=1 is constant; not driven by env.
     out[("wifi_prov", "provisioned")] = ("u8", "1")
+
+    # Image build time (UTC epoch). The firmware sets the RTC from this at boot
+    # when the RTC is invalid or behind it — a no-touch clock bootstrap accurate
+    # to the build→boot delay (the image is regenerated on every build). A
+    # correct RTC is never moved: it always reads ahead of this timestamp.
+    out[("device_cfg", "flash_time")] = ("u32", str(int(time.time())))
     return out
 
 
@@ -198,8 +206,8 @@ def _write_csv(values: dict[tuple[str, str], tuple[str, str]], csv_path: Path) -
     for ns in ns_order:
         lines.append(f"{ns},namespace,,")
         for key, enc, value in by_ns[ns]:
-            if enc == "u8":
-                lines.append(f"{key},data,u8,{value}")
+            if enc in ("u8", "u32"):
+                lines.append(f"{key},data,{enc},{value}")
             else:
                 lines.append(f"{key},data,string,{_quote_csv(value)}")
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

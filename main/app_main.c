@@ -118,20 +118,55 @@ static esp_err_t app_init_i2c_and_sensors(void)
         ESP_LOGI(APP_TAG, "RTC initialized");
     }
 
+    /* The provisioning NVS image embeds its build time (`flash_time`, see
+     * tools/build_nvs_image.py). Used below as a clock bootstrap: applied only
+     * when the clock is invalid or BEHIND it, so a correct RTC is never moved
+     * (a running clock always reads ahead of the image build time). Accuracy =
+     * the build→boot delay — minutes at worst in the normal flash workflow. */
+    uint32_t flash_time = 0;
+    if (device_config_get_flash_time(&flash_time) != ESP_OK) {
+        flash_time = 0;
+    }
+
     if (pcf2131tfy_rtc_is_ready()) {
         /* Push the RTC into the ESP-IDF system clock so gettimeofday / time(NULL)
          * return real UTC (every measurement startTicks + MQTT timestamp depends
          * on this). A never-set RTC reports its time as invalid (OSF) and is
-         * skipped — the clock then stays at the IDF default until the RTC is set. */
-        if (pcf2131tfy_rtc_sync_system_clock() == ESP_OK) {
+         * skipped. */
+        bool clock_ok = (pcf2131tfy_rtc_sync_system_clock() == ESP_OK);
+        if (clock_ok) {
             ESP_LOGI(APP_TAG, "system clock synced from RTC");
-        } else {
+        }
+
+        if (flash_time != 0 && (!clock_ok || time(NULL) < (time_t)flash_time)) {
+            struct tm tm_utc;
+            time_t ft = (time_t)flash_time;
+            gmtime_r(&ft, &tm_utc);
+            /* Writing the RTC clears the oscillator-stop flag and re-syncs the
+             * system clock — this is how a factory-fresh RTC comes online. */
+            if (pcf2131tfy_rtc_set_time(&tm_utc) == ESP_OK) {
+                ESP_LOGW(APP_TAG, "RTC %s — set from flash time %lu "
+                                  "(accurate to the build->boot delay)",
+                         clock_ok ? "behind the flash time" : "invalid",
+                         (unsigned long)flash_time);
+            } else {
+                ESP_LOGW(APP_TAG, "RTC bootstrap from flash time failed — "
+                                  "set the clock with `rtc set <epoch>`");
+            }
+        } else if (!clock_ok) {
             ESP_LOGW(APP_TAG, "RTC time invalid/unreadable — system clock not set; "
                               "set the RTC and it will auto-sync (no reboot needed)");
         }
         /* Re-sync periodically: corrects drift over long uptimes and recovers the
          * clock without a reboot if the RTC is set/validated after boot. */
         pcf2131tfy_rtc_start_periodic_sync(APP_RTC_SYNC_INTERVAL_S);
+    } else if (flash_time != 0 && time(NULL) < (time_t)flash_time) {
+        /* No RTC at all (dev board): seed the system clock from the flash time
+         * so timestamps beat 1970. Not battery-backed — resets every reboot. */
+        struct timeval tv = { .tv_sec = (time_t)flash_time };
+        settimeofday(&tv, NULL);
+        ESP_LOGW(APP_TAG, "no RTC — system clock seeded from flash time %lu "
+                          "(volatile; resets on reboot)", (unsigned long)flash_time);
     }
 
     err = bme280_init(BME280_I2C_ADDR_SECONDARY);

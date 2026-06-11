@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -33,6 +34,10 @@ esp_err_t device_config_get_firmware_version(char *buf, size_t len);
 /* IANA timezone name (e.g. "Europe/Amsterdam") echoed in the MQTT envelope so
  * the cloud derives local-time columns. Optional. */
 esp_err_t device_config_get_timezone(char *buf, size_t len);
+/* UTC epoch of the provisioning-image build (written by tools/build_nvs_image.py
+ * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
+ * or behind it, so a correct clock is never moved. */
+esp_err_t device_config_get_flash_time(uint32_t *out);
 
 /* Setters — persist immediately via nvs_commit */
 esp_err_t device_config_set_mqtt_uri(const char *val);

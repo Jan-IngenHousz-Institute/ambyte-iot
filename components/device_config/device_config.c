@@ -20,6 +20,7 @@
 #define KEY_DEVICE_FIRMWARE "device_firm"
 #define KEY_FIRMWARE_VER    "firmware_ver"
 #define KEY_TIMEZONE        "timezone"
+#define KEY_FLASH_TIME      "flash_time"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -104,6 +105,13 @@ esp_err_t device_config_set_status_topic(const char *val)
 esp_err_t device_config_get_timezone(char *buf, size_t len)
 {
     return cfg_get(KEY_TIMEZONE, buf, len);
+}
+
+esp_err_t device_config_get_flash_time(uint32_t *out)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    return nvs_get_u32(s_handle, KEY_FLASH_TIME, out);
 }
 
 esp_err_t device_config_set_timezone(const char *val)
