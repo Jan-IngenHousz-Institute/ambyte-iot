@@ -32,7 +32,8 @@ typedef enum {
  * channel:       physical port, "uart_<n>" / "usb_<n>"; "" = onboard.
  * device:        discovered sensor name ("ambit"); "" = unknown/onboard.
  * tag:           origin class, one of MEASUREMENT_TAG_*.
- * cmd_raw:       logical command name ("ambit.run") or literal text command.
+ * cmd_raw:       the command that produced the data, in the target device's own
+ *                vocabulary ("arrun", "get_par") or the literal text command.
  * metadata_json: JSON object string, or NULL.
  * payload_json:  JSON object of quantities, e.g. {"temperature":23.1,...} or
  *                {"s_fluo":[...],"r_fluo":[...]}. Heap on claim; caller frees

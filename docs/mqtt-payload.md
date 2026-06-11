@@ -53,7 +53,7 @@ example:
     "published": "2026-06-11T09:30:00Z",// UTC ISO-8601 at PUBLISH time
     "channel": "uart_1",                // physical port, null = onboard
     "device":  "ambit",                 // discovered sensor name, null = unknown
-    "cmd_raw": "ambit.run",             // logical/literal command, null = none
+    "cmd_raw": "arrun",                 // device-vocabulary/literal command, null = none
     "tag": "MEASUREMENT",               // origin enum (firmware-assigned)
     "metadata": { "segments": [ ... ] },// object, or null when absent
     "data":     { ... }                 // object — the measurement quantities
@@ -98,10 +98,17 @@ current firmware paths and the shipped schedule script produce.
 
 | Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT fluorescence run (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `ambit.run` / `ambit.fetch` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
+| AMBIT fluorescence run (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
 | BME280 via CLI/`device.record_env` | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
 | UART text query (`save=true`) | `uart_<n>` | `null` | the literal command | `{"response":"…"}` (empty string on timeout) |
 | Lua `db.store_event{}` (spectra, heartbeat, custom) | `null` | script `device` field | *transitional:* the legacy `sensor` string | script-defined |
+
+`cmd_raw` uses the **target device's own command vocabulary** — for the AMBIT,
+the ASCII command names from its firmware (`do_command.h`): `arrun` for any
+trace run (the binary sync run, cmd 21, and the async trigger/fetch pair,
+cmds 22/24, are the same stimulus — sync vs async is transport). Phase 2's
+fused commands follow suit: `get_par` (spectrum+PAR), `get_temp` (leaf temp).
+Onboard sources use the firmware's logical name (`device.bme280`).
 
 **Transitional notes (until Phase 2/4 of the plan):**
 - `db.store_event`'s legacy `sensor` string (e.g. `"status"`, `"AMBIT"`)

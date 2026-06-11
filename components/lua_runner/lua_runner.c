@@ -1097,7 +1097,10 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
 /* Decode an AMBIT FSM response into the reserved JSON payload, optionally store
  * it as one event, free `resp`, and push the Lua result table (or nil+reason).
  * Shared by ambit.run and ambit.fetch so both produce identical events;
- * `cmd_name` is the logical command recorded as the event's cmd_raw. */
+ * `cmd_name` is recorded as the event's cmd_raw, using the AMBIT firmware's
+ * own ASCII command vocabulary (do_command.h): the binary run (cmd 21) and
+ * the async trigger/fetch pair (cmds 22/24) are all the "arrun" measurement
+ * — sync vs async is transport, not stimulus, so both store "arrun". */
 static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
                                    uint8_t ch, bool store, int64_t start_ms,
                                    int64_t end_ms, const char *metadata_json,
@@ -1251,7 +1254,7 @@ static int l_ambit_run(lua_State *L)
         return lua_push_nil_reason(L, res.message);
     }
     return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms,
-                                   metadata_json, "ambit.run");
+                                   metadata_json, "arrun");
 }
 
 /* ambit.trigger(ch, segments [, opts]) — start a retained (async) run on `ch`
@@ -1355,7 +1358,7 @@ static int l_ambit_fetch(lua_State *L)
 
     return ambit_decode_store_push(L, &resp, ch, store,
                                    s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch],
-                                   "ambit.fetch");
+                                   "arrun");
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────

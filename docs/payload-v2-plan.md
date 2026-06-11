@@ -21,10 +21,15 @@ shims.
 - **`device`** is best-effort sensor self-identification: discovered at boot,
   cached per channel, re-identified on ping failure, `null` when unknown.
   Nothing may rely on it being present.
-- **`cmd_raw`** is the *logical* command name for typed commands
-  (`"ambit.spec"`, `"device.bme280"`), the literal string for raw text queries,
-  `null` otherwise. Never hex frames (the segments metadata already encodes the
-  AMBIT stimulus in decoded form).
+- **`cmd_raw`** is the command that produced the data, in the **target
+  device's own vocabulary** — for the AMBIT, the ASCII names from its
+  firmware's `do_command.h` (`"arrun"` for any trace run incl. the async
+  trigger/fetch pair, `"get_par"`, `"get_temp"`); the literal string for raw
+  text queries; the firmware's logical name for onboard sources
+  (`"device.bme280"`); `null` otherwise. Never hex frames (the segments
+  metadata already encodes the AMBIT stimulus in decoded form).
+  *(Revised 2026-06-11 from "Lua API names" — `ambit.fetch` told the analyst
+  nothing about the stimulus.)*
 - **Store is fused into typed measurement commands** (`store=false` to opt
   out). Transport/diagnostic commands (`ambit.query`, `uart.*`) never store.
   `ambit.trigger`/`poll` don't store — `fetch` is that pair's store point.
