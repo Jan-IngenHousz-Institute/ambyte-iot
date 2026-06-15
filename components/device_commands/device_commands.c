@@ -729,6 +729,19 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     }
     out->publish_gate_open = device_commands_publish_power_ok();
 
+    /* On-board BME280 environment, so every heartbeat carries T/H/P even when
+     * main.lua isn't measuring (broken/missing script, or power-gated). Same
+     * keys/format as the device.bme280 measurement event (cmd_record_env). */
+    if (s_cfg.read_env != NULL) {
+        measurement_t m;
+        if (s_cfg.read_env(&m) == ESP_OK) {
+            out->env_valid         = true;
+            out->temperature_c     = m.temperature_c;
+            out->humidity_percent  = m.humidity_percent;
+            out->pressure_pa       = m.pressure_pa;
+        }
+    }
+
     return make_result(ESP_OK, "status report");
 }
 
@@ -737,8 +750,9 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
  * sync_runner heartbeat (payload-v2 Phase 4): status reporting must survive a
  * missing/crashed main.lua, so it does NOT live in the script. Payload keys
  * match the old Lua status_report table for analysis continuity; power fields
- * are omitted when the charger read fails. Does NOT notify the sync runner —
- * the caller IS the sync runner. */
+ * are omitted when the charger read fails, and BME280 T/H/P fields are appended
+ * when the env read succeeds. Does NOT notify the sync runner — the caller IS
+ * the sync runner. */
 cmd_result_t cmd_store_status_event(void)
 {
     if (!s_initialized || s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
@@ -751,17 +765,20 @@ cmd_result_t cmd_store_status_event(void)
         return r;
     }
 
-    char payload[288];
-    int n;
-    if (s.power_valid) {
-        n = snprintf(payload, sizeof(payload),
-            "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
-            "\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"
-            "\"input_ma\":%u,\"charge_ma\":%u,\"input_present\":%s,\"charge_status\":%u}",
-            s.wifi_connected ? "true" : "false",
-            s.provisioned ? "true" : "false",
-            s.db_online ? "true" : "false",
-            s.publish_gate_open ? "true" : "false",
+    /* Base status, then power and env each append their block when the read
+     * succeeded — so the payload reflects exactly which subsystems were live
+     * this cycle. Env keys/format match the device.bme280 measurement event. */
+    char payload[384];
+    int n = snprintf(payload, sizeof(payload),
+        "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s",
+        s.wifi_connected ? "true" : "false",
+        s.provisioned ? "true" : "false",
+        s.db_online ? "true" : "false",
+        s.publish_gate_open ? "true" : "false");
+    if (n > 0 && n < (int)sizeof(payload) && s.power_valid) {
+        n += snprintf(payload + n, sizeof(payload) - n,
+            ",\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"
+            "\"input_ma\":%u,\"charge_ma\":%u,\"input_present\":%s,\"charge_status\":%u",
             (double)s.power.battery_mv / 1000.0,
             (double)s.power.input_mv / 1000.0,
             (double)s.power.system_mv / 1000.0,
@@ -769,13 +786,14 @@ cmd_result_t cmd_store_status_event(void)
             (unsigned)s.power.charge_ma,
             s.power.input_present ? "true" : "false",
             (unsigned)s.power.charge_status);
-    } else {
-        n = snprintf(payload, sizeof(payload),
-            "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s}",
-            s.wifi_connected ? "true" : "false",
-            s.provisioned ? "true" : "false",
-            s.db_online ? "true" : "false",
-            s.publish_gate_open ? "true" : "false");
+    }
+    if (n > 0 && n < (int)sizeof(payload) && s.env_valid) {
+        n += snprintf(payload + n, sizeof(payload) - n,
+            ",\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f",
+            s.temperature_c, s.humidity_percent, s.pressure_pa);
+    }
+    if (n > 0 && n < (int)sizeof(payload)) {
+        n += snprintf(payload + n, sizeof(payload) - n, "}");
     }
     if (n < 0 || (size_t)n >= sizeof(payload)) {
         return make_result(ESP_FAIL, "status payload build failed");

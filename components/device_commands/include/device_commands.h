@@ -137,6 +137,10 @@ typedef struct {
     bool            power_valid;        /* false if no charger / read failed */
     power_reading_t power;              /* valid only when power_valid */
     bool            publish_gate_open;  /* device_commands_publish_power_ok() */
+    bool            env_valid;          /* false if no BME280 / read failed */
+    float           temperature_c;      /* valid only when env_valid */
+    float           humidity_percent;   /* valid only when env_valid */
+    float           pressure_pa;        /* valid only when env_valid */
 } device_status_snapshot_t;
 
 cmd_result_t cmd_status_report(device_status_snapshot_t *out);
