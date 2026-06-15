@@ -17,6 +17,7 @@
 #include "ambit_ota.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
+#include "lua_runner.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
@@ -868,6 +869,61 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
     return 0;
 }
 
+/* Operator control of the Lua measurement script. `exec` runs a snippet in an
+ * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
+ * db/sync) — the console-side twin of the MQTT lua_exec command. */
+static int cli_cmd_lua(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: lua <start|stop|status|exec <code...>>\r\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "start") == 0) {
+        esp_err_t err = lua_runner_start();
+        if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
+        else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
+        else                              printf("started (loads /sdcard/main.lua)\r\n");
+        return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
+    }
+    if (strcmp(argv[1], "stop") == 0) {
+        esp_err_t err = lua_runner_stop(5000);
+        if (err == ESP_ERR_TIMEOUT) {
+            printf("still busy in a C call (e.g. a long UART read) — it will exit "
+                   "when that returns\r\n");
+        } else {
+            printf("%s\r\n", lua_runner_is_running() ? "stop signaled" : "stopped");
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        printf("lua script: %s\r\n", lua_runner_is_running() ? "RUNNING" : "stopped");
+        return 0;
+    }
+    if (strcmp(argv[1], "exec") == 0) {
+        if (argc < 3) {
+            printf("Usage: lua exec <code...>   e.g. lua exec return device.uptime_ms()\r\n");
+            return 1;
+        }
+        /* Rejoin argv[2..] — the console splits on spaces. */
+        char code[512] = "";
+        size_t off = 0;
+        for (int i = 2; i < argc && off < sizeof(code) - 1; i++) {
+            off += (size_t)snprintf(code + off, sizeof(code) - off, "%s%s",
+                                    i > 2 ? " " : "", argv[i]);
+        }
+        char result[256] = "";
+        esp_err_t err = lua_runner_exec(code, 120000, result, sizeof result);
+        if (err == ESP_OK) {
+            printf("ok: %s\r\n", result[0] ? result : "(no return value)");
+            return 0;
+        }
+        printf("error (%s): %s\r\n", esp_err_to_name(err), result);
+        return 1;
+    }
+    printf("unknown subcommand '%s' (start|stop|status|exec)\r\n", argv[1]);
+    return 1;
+}
+
 /* Print the firmware version of every present AMBIT (cmd 33/2) — the fleet
  * staleness view. Synchronous (console task); the MQTT `ambit_versions` command
  * does the same sweep on the worker and publishes a JSON report. */
@@ -981,6 +1037,11 @@ static esp_err_t cli_register_commands(void)
         .command = "ambit_versions",
         .help    = "ambit_versions  print every present AMBIT's firmware version",
         .func    = cli_cmd_ambit_versions,
+    };
+    static const esp_console_cmd_t lua_cmd = {
+        .command = "lua",
+        .help    = "lua start|stop|status|exec <code...>  control / poke the Lua script",
+        .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
@@ -1101,6 +1162,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_versions_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&lua_cmd);
     if (err != ESP_OK) {
         return err;
     }

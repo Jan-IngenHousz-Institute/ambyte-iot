@@ -16,6 +16,7 @@
 #include "command_router.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
+#include "script_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -449,6 +450,26 @@ void app_main(void)
     if (device_config_get_command_topic(command_topic, sizeof(command_topic)) != ESP_OK) {
         snprintf(command_topic, sizeof(command_topic), "%s/cmd", topic_root);
     }
+    /* One-time migration (2026-06-15): early units were provisioned with the reply
+     * topic under experiment UUID a3b865d1, which the AWS IoT policy does NOT
+     * authorize for publish — every command reply (pong/script_status/ota_status)
+     * was rejected and dropped the device's MQTT connection. Repoint it to the
+     * authorized 665b6b18 experiment with a /status leaf (policy grants
+     * .../AMBYTE<MAC>/<seg>). Idempotent: fires only while the bad UUID is present.
+     * Delivered via OTA, so field units self-heal without a reflash (OTA never
+     * writes NVS); the corrected value is then read by the line below this boot. */
+    {
+        char cur_status[288];
+        if (device_config_get_status_topic(cur_status, sizeof(cur_status)) == ESP_OK &&
+            strstr(cur_status, "a3b865d1") != NULL) {
+            esp_err_t merr = device_config_set_status_topic(
+                "experiment/data_ingest/v1/665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"
+                "/multispeq/v1.0/AMBYTE{MAC}/status");
+            ESP_LOGW(APP_TAG,
+                     "status-topic migration: a3b865d1 -> 665b6b18/.../AMBYTE{MAC}/status (%s)",
+                     esp_err_to_name(merr));
+        }
+    }
     if (device_config_get_status_topic(status_topic, sizeof(status_topic)) != ESP_OK) {
         snprintf(status_topic, sizeof(status_topic), "%s/status", topic_root);
     }
@@ -519,6 +540,19 @@ void app_main(void)
     };
     if (ambit_ota_init(&ambit_ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
+    }
+
+    /* Remote Lua control (Stage 4): MQTT script_update replaces /sdcard/main.lua
+     * (syntax-checked, .bak kept) + restarts the runner; MQTT lua_exec runs a
+     * snippet in an ephemeral state. Lazy worker — no steady-state heap cost. */
+    script_update_config_t script_cfg = {
+        .publish      = mqtt_client_get_publish_fn(),
+        .is_connected = mqtt_client_get_is_connected_fn(),
+        .status_topic = status_topic,
+        .device_id    = device_id,
+    };
+    if (script_update_init(&script_cfg) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "script_update worker not started");
     }
 
     /* ── Wi-Fi init + start ───────────────────────────────────────── */

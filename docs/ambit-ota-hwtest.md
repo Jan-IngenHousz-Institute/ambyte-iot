@@ -136,3 +136,60 @@ Needs ≥2 AMBITs connected (e.g. ch0 + ch1).
   authorized (watch for `PUBACK rc=135`); the **console log is always authoritative**.
 - Status reports are best-effort right after `comms_resume` — MQTT may not have reconnected
   yet when `success`/`failed` is sent, so rely on the log for the final verdict.
+
+---
+
+# Lua remote control — hardware test plan (added 2026-06-12)
+
+Covers the CLI `lua` command, MQTT `lua_exec`, and MQTT `script_update`
+(`components/script_update`; contract in `device-script-delivery.md`).
+
+## Test 5 — CLI lua control
+
+1. `lua status` → `RUNNING` (with a main.lua on SD) or `stopped`.
+2. `lua stop` → `stopped`; LED leaves the measuring colours; `lua status` agrees.
+3. `lua start` → reloads `/sdcard/main.lua`; schedule log lines resume.
+4. `lua exec return device.uptime_ms()` → `ok: <number>` — **while main.lua runs**
+   (proves the parallel ephemeral state).
+5. `lua exec return ambit.ping(0)` → `ok: true` (serializes with the running
+   schedule on the UART mutex; may wait a moment during a measurement).
+6. `lua exec syntax error here` → `error (ESP_ERR_INVALID_ARG): …` (nothing ran).
+
+## Test 6 — MQTT lua_exec
+
+1. Publish to the command topic:
+   ```json
+   {"type":"lua_exec","id":"x1","code":"return 1+1"}
+   ```
+   - **PASS:** log `lua_exec ok: 2`; status topic gets
+     `{"type":"lua_exec_result","id":"x1","ok":true,"result":"2"}`.
+2. A hardware one: `{"type":"lua_exec","id":"x2","code":"return ambit.ping(0)"}`
+   → `"result":"true"`.
+3. A failing one: `{"type":"lua_exec","id":"x3","code":"error('boom')"}`
+   → `"ok":false,"result":"…boom"`.
+4. Runaway guard: `{"type":"lua_exec","id":"x4","code":"while true do end"}`
+   → after ~120 s, `"ok":false` with `exec timeout` (the worker survives).
+
+## Test 7 — MQTT script_update
+
+1. Small valid script (JSON-escape the newlines as `\n`):
+   ```json
+   {"type":"script_update","id":"s1","script":"device.log('hello from pushed script')\nwhile true do device.sleep_ms(5000) end"}
+   ```
+   - **PASS:** log `main.lua replaced (… bytes) + runner restarted`; the pushed
+     script's log line appears; status topic gets `state:"applied"`. SD now has
+     `main.lua.bak` (the previous script).
+2. **Dedupe:** re-publish the exact same message (same `id`) →
+   `script_update id=s1 already applied — ignoring` (no restart).
+3. **Bad script:** `{"type":"script_update","id":"s2","script":"this is not lua"}`
+   → `state:"failed"` with the syntax error; the running script is untouched
+   (no stop/restart happened).
+4. **Checksum:** send with a deliberately wrong `"checksum"` → `failed` +
+   `sha256 mismatch`; then with the correct one (`printf '%s' '<script>' |
+   shasum -a 256`) → `applied`.
+5. **Large script:** push the full `docs/exampleMain.lua` (~8 KB) inline (new id)
+   → exercises the >2 KB transient-heap reassembly; `applied`, schedule resumes.
+6. **Oversize guard:** any message > 16 KB → log
+   `inbound message … > cap 16384 — dropped`, device unaffected.
+7. **Recovery:** restore the real schedule afterwards (re-push exampleMain.lua or
+   copy it back to SD).
