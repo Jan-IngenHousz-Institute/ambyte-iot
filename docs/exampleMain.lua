@@ -41,7 +41,7 @@ local NUM_CHANNELS = 4                              -- AMBIT channels to scan (0
 
 -- ── Protocols (segment tables passed to ambit.run) ────────────────────────
 local SS = {                                        -- steady-state probe (1 line)
-    { pulses = 4, freq = 4, actinic = 0 },
+    { pulses = 9, freq =1, actinic = 0 },
 }
 
 local MPF = {                                       -- multi-phase saturating flash
@@ -171,8 +171,8 @@ end
 -- sched.cron({minutes}, fn [, opts])                -- at minutes-of-hour
 -- sched.sun("sunrise"|"sunset", offset_s, fn)       -- once/day relative to sun
 sched.every(10,   ss_round)                          -- steady-state probe, every 10 s
-sched.every("1m", record_spectra, { when = "day" })  -- spectrum + PAR, daytime
-sched.every("5m", mpf_round,      { when = "day" })  -- saturating flash, daytime
+sched.every("5m", record_spectra, { when = "day" })  -- spectrum + PAR, daytime
+sched.every("10m", mpf_round,      { when = "day" })  -- saturating flash, daytime
 sched.sun("sunset",   30 * 60, edge_round)           -- dark-edge trace, 30 min after sunset
 sched.sun("sunrise", -30 * 60, edge_round)           -- dark-edge trace, 30 min before sunrise
 -- (status heartbeat + liveness LED are firmware-owned — see header)

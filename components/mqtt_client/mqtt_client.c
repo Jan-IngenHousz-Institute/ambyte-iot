@@ -10,14 +10,17 @@
 
 #define TAG                  "mqtt_client"
 
-/* Reassembly cap for an inbound command. esp-mqtt delivers payloads larger than
+/* Reassembly caps for an inbound command. esp-mqtt delivers payloads larger than
  * CONFIG_MQTT_BUFFER_SIZE across several MQTT_EVENT_DATA fragments; we stitch them
- * here. Commands (ping, ota_update) are well under 1 KiB; a 128 KiB inline-Lua
- * script_update (Stage 4) will need a larger / streaming buffer — for now anything
- * over this cap is dropped with a warning. Static (BSS) to avoid heap churn in the
- * mqtt task. */
-#define INBOUND_MSG_MAX      2048
-#define INBOUND_TOPIC_MAX    192
+ * here. Messages up to INBOUND_MSG_MAX use a static (BSS) buffer — no heap churn
+ * for routine commands (ping, ota_update, lua_exec). Larger ones (an inline-Lua
+ * script_update can be a full ~8 KiB main.lua) use a TRANSIENT heap buffer sized
+ * to the message and freed right after dispatch — no permanent BSS cost on the
+ * heap-tight board. Anything over INBOUND_MSG_LARGE_MAX (or unallocatable) is
+ * dropped with a warning. */
+#define INBOUND_MSG_MAX        2048
+#define INBOUND_MSG_LARGE_MAX  16384
+#define INBOUND_TOPIC_MAX      192
 
 static esp_mqtt_client_handle_t s_client    = NULL;
 static volatile bool            s_connected = false;
@@ -32,9 +35,16 @@ static char                 s_command_topic[INBOUND_TOPIC_MAX] = {0};
 static message_received_fn  s_msg_handler = NULL;
 static void                *s_msg_ctx     = NULL;
 static char                 s_rx_buf[INBOUND_MSG_MAX + 1];
+static char                *s_rx_large    = NULL;   /* transient, only while a >2 KiB message is in flight */
 static char                 s_rx_topic[INBOUND_TOPIC_MAX];
 static int                  s_rx_len      = 0;
 static bool                 s_rx_overflow = false;
+
+static void rx_large_free(void)
+{
+    free(s_rx_large);
+    s_rx_large = NULL;
+}
 
 /* ── port implementations ──────────────────────────────────────────── */
 
@@ -80,7 +90,15 @@ static void handle_inbound_data(esp_mqtt_event_handle_t event)
 {
     if (event->current_data_offset == 0) {
         s_rx_len      = 0;
-        s_rx_overflow = (event->total_data_len > INBOUND_MSG_MAX);
+        s_rx_overflow = false;
+        rx_large_free();   /* drop any half-assembled previous message */
+        if (event->total_data_len > INBOUND_MSG_MAX) {
+            if (event->total_data_len <= INBOUND_MSG_LARGE_MAX) {
+                s_rx_large = malloc((size_t)event->total_data_len + 1);
+            }
+            /* > large cap, or the transient alloc failed → drop when complete */
+            s_rx_overflow = (s_rx_large == NULL);
+        }
         size_t tl = (event->topic_len > 0 && (size_t)event->topic_len < sizeof(s_rx_topic))
                         ? (size_t)event->topic_len : 0;
         if (tl > 0) {
@@ -89,9 +107,11 @@ static void handle_inbound_data(esp_mqtt_event_handle_t event)
         s_rx_topic[tl] = '\0';
     }
 
+    char *dst = (s_rx_large != NULL) ? s_rx_large : s_rx_buf;
+    int   cap = (s_rx_large != NULL) ? event->total_data_len : INBOUND_MSG_MAX;
     if (!s_rx_overflow && event->data_len > 0) {
-        if (event->current_data_offset + event->data_len <= INBOUND_MSG_MAX) {
-            memcpy(s_rx_buf + event->current_data_offset, event->data, event->data_len);
+        if (event->current_data_offset + event->data_len <= cap) {
+            memcpy(dst + event->current_data_offset, event->data, event->data_len);
             s_rx_len = event->current_data_offset + event->data_len;
         } else {
             s_rx_overflow = true;
@@ -101,15 +121,17 @@ static void handle_inbound_data(esp_mqtt_event_handle_t event)
     /* Final fragment? */
     if (event->current_data_offset + event->data_len >= event->total_data_len) {
         if (s_rx_overflow) {
-            ESP_LOGW(TAG, "inbound message %d B > cap %d — dropped (topic=%s)",
-                     event->total_data_len, INBOUND_MSG_MAX, s_rx_topic);
+            ESP_LOGW(TAG, "inbound message %d B > cap %d (or no heap) — dropped (topic=%s)",
+                     event->total_data_len, INBOUND_MSG_LARGE_MAX, s_rx_topic);
+            rx_large_free();
             return;
         }
-        s_rx_buf[s_rx_len] = '\0';
+        dst[s_rx_len] = '\0';
         ESP_LOGI(TAG, "inbound %d B on %s", s_rx_len, s_rx_topic);
         if (s_msg_handler != NULL) {
-            s_msg_handler(s_rx_topic, s_rx_buf, (size_t)s_rx_len, s_msg_ctx);
+            s_msg_handler(s_rx_topic, dst, (size_t)s_rx_len, s_msg_ctx);
         }
+        rx_large_free();   /* transient buffer lives only until dispatch returns */
     }
 }
 
@@ -144,6 +166,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
+        rx_large_free();   /* don't hold a half-assembled message across the gap */
         ESP_LOGW(TAG, "MQTT disconnected");
         break;
 

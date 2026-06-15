@@ -1,5 +1,28 @@
 # Pushing scripts to a device over MQTT
 
+> **IMPLEMENTED 2026-06-12** (`components/script_update`, dispatched by
+> `command_router`). The shipped contract, where it differs from the original
+> draft below:
+> - Canonical script field is **`script`**; the draft's `payload` is accepted as
+>   a legacy alias. `checksum` (SHA-256 hex of the raw script) is **optional** —
+>   verified when present.
+> - **Inline size cap is 16 KB** for the whole MQTT message
+>   (`INBOUND_MSG_LARGE_MAX`, transient heap reassembly in `mqtt_client.c`), not
+>   128 KB; `_payload_encoding`/gzip is NOT implemented. A `url` variant is the
+>   documented follow-up if scripts ever outgrow 16 KB.
+> - Apply flow: sha256 (if given) → **Lua syntax check before the SD is
+>   touched** → write `main.lua.new` + fsync → stop runner → previous script kept
+>   as **`/sdcard/main.lua.bak`** → atomic rename → restart runner → NVS id
+>   latch (success only, so the retained message doesn't re-apply on every
+>   reconnect; a failed apply stays retryable under the same id).
+> - Reply on the status topic:
+>   `{"type":"script_status","device_id":…,"id":…,"state":"applied"|"failed","detail":…}`.
+> - Sibling command **`lua_exec`** `{type:"lua_exec", id, code}` runs a snippet
+>   immediately in an ephemeral Lua state (full device/ambit/uart/db/sync env,
+>   120 s budget, alongside a running main.lua) and replies
+>   `{"type":"lua_exec_result", id, ok, result}`. CLI twins: `lua
+>   start|stop|status|exec <code…>`.
+
 Deliver a Lua script to a device by publishing a small JSON message to the device's
 own topic. The device subscribes with its X.509 certificate; you publish from the
 AWS IoT console.

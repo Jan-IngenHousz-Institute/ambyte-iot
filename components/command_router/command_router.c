@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
+#include "script_update.h"
 
 #define TAG "cmd_router"
 
@@ -123,8 +124,42 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
-        ESP_LOGW(TAG, "script_update received (id=%s) — Stage-4 handler not wired yet",
-                 id ? id : "");
+        /* Replace /sdcard/main.lua with the inline script and restart the Lua
+         * runner. `script` is the canonical field; `payload` is the legacy name
+         * from device-script-delivery.md. Optional `checksum` = sha256 hex. */
+        const cJSON *jscript = cJSON_GetObjectItemCaseSensitive(root, "script");
+        if (!cJSON_IsString(jscript)) {
+            jscript = cJSON_GetObjectItemCaseSensitive(root, "payload");
+        }
+        const cJSON *jsum = cJSON_GetObjectItemCaseSensitive(root, "checksum");
+        const char *script   = cJSON_IsString(jscript) ? jscript->valuestring : NULL;
+        const char *checksum = cJSON_IsString(jsum)    ? jsum->valuestring    : NULL;
+        if (script == NULL || script[0] == '\0') {
+            ESP_LOGW(TAG, "script_update id=%s missing 'script' — ignoring", id ? id : "");
+        } else {
+            esp_err_t err = script_update_request(script, checksum, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "script_update id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "script_update id=%s dispatched (%u bytes)",
+                         id ? id : "", (unsigned)strlen(script));
+            }
+        }
+    } else if (strcmp(type, "lua_exec") == 0) {
+        /* Run a Lua snippet immediately (ephemeral state, alongside main.lua);
+         * the result publishes as lua_exec_result on the status topic. */
+        const cJSON *jcode = cJSON_GetObjectItemCaseSensitive(root, "code");
+        const char *code = cJSON_IsString(jcode) ? jcode->valuestring : NULL;
+        if (code == NULL || code[0] == '\0') {
+            ESP_LOGW(TAG, "lua_exec id=%s missing 'code' — ignoring", id ? id : "");
+        } else {
+            esp_err_t err = script_update_exec_request(code, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "lua_exec id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            }
+        }
     } else {
         ESP_LOGW(TAG, "unknown command type '%s'", type);
     }

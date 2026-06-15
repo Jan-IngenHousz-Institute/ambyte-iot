@@ -1059,11 +1059,31 @@ static const char *ambit_array_tag(uint8_t idx)
 
 /* Reserved once (at module register, while the heap is still contiguous) and
  * reused for every run's JSON payload — the run's one big allocation, kept off
- * the fragmenting per-run path. Only the lua_runner task calls ambit.run, so a
- * single shared buffer is safe. Sized for current point counts; larger runs
- * truncate (logged). A uint16/compact-storage v2 will shrink this need. */
+ * the fragmenting per-run path. Sized for current point counts; larger runs
+ * truncate (logged). A uint16/compact-storage v2 will shrink this need.
+ *
+ * The buffer is SHARED between the main-script task and any lua_runner_exec
+ * state (an exec snippet may call ambit.run/fetch while main.lua measures), so
+ * its build+store window is serialized by s_ambit_payload_mtx — created lazily
+ * under a spinlock because the first contender may be either task. */
 #define AMBIT_RUN_PAYLOAD_CAP (8 * 1024)
 static char *s_ambit_payload;
+static SemaphoreHandle_t s_ambit_payload_mtx;
+static portMUX_TYPE      s_payload_mtx_init_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void ambit_payload_mtx_ensure(void)
+{
+    if (s_ambit_payload_mtx != NULL) return;
+    SemaphoreHandle_t m = xSemaphoreCreateMutex();
+    if (m == NULL) return;   /* degenerate to unserialized (pre-exec behaviour) */
+    taskENTER_CRITICAL(&s_payload_mtx_init_lock);
+    if (s_ambit_payload_mtx == NULL) {
+        s_ambit_payload_mtx = m;
+        m = NULL;
+    }
+    taskEXIT_CRITICAL(&s_payload_mtx_init_lock);
+    if (m != NULL) vSemaphoreDelete(m);   /* lost the race — ours is surplus */
+}
 
 /* Max length of a reconstructed "arrun" ASCII command: "arrun " + nseg(≤2) + ","
  * + persist(≤3) + "," + 16 segments × 8 bytes × "255," (≤4) ≈ 525 B. */
@@ -1249,11 +1269,20 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
         return lua_push_nil_reason(L, "ambit run returned no arrays");
     }
 
+    /* Serialize the shared payload buffer between the main script and an exec
+     * state. Held across build + store only; released before ANY call that can
+     * raise a Lua error (longjmp would leak the mutex). */
+    ambit_payload_mtx_ensure();
+    if (s_ambit_payload_mtx != NULL) {
+        xSemaphoreTake(s_ambit_payload_mtx, portMAX_DELAY);
+    }
+
     /* Reserve the JSON payload buffer once (lazily here; normally already done at
      * module register, while the heap was contiguous) and reuse it every run. */
     if (s_ambit_payload == NULL) {
         s_ambit_payload = malloc(AMBIT_RUN_PAYLOAD_CAP);
         if (s_ambit_payload == NULL) {
+            if (s_ambit_payload_mtx != NULL) xSemaphoreGive(s_ambit_payload_mtx);
             uart_sensor_response_free(resp);
             return luaL_error(L, "out of memory reserving %dB payload (free=%d, largest=%d)",
                               (int)AMBIT_RUN_PAYLOAD_CAP,
@@ -1329,6 +1358,10 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
             }
         }
     }
+
+    /* Buffer no longer referenced — release before the Lua pushes below (they
+     * can raise on OOM, and a longjmp must not leak the mutex). */
+    if (s_ambit_payload_mtx != NULL) xSemaphoreGive(s_ambit_payload_mtx);
 
     uart_sensor_response_free(resp);
 
@@ -1717,6 +1750,21 @@ static void lua_register_sync_module(lua_State *L)
 
 /* ── task ────────────────────────────────────────────────────────────── */
 
+/* Open the standard libraries + the full ambyte module set (device/uart/db/
+ * ambit/sync globals) into `L`. Shared by the main-script task and the
+ * ephemeral lua_runner_exec states — every register function is self-contained
+ * per lua_State. `sched` is NOT part of the env: the task loads it separately
+ * (exec snippets have no scheduler loop to run). */
+static void lua_open_ambyte_env(lua_State *L)
+{
+    luaL_openlibs(L);
+    lua_register_device_module(L);
+    lua_register_uart_module(L);
+    lua_register_db_module(L);
+    lua_register_ambit_module(L);
+    lua_register_sync_module(L);
+}
+
 static void log_lua_error(lua_State *L, const char *phase)
 {
     const char *msg = lua_tostring(L, -1);
@@ -1744,12 +1792,7 @@ static void lua_runner_task(void *arg)
         goto done;
     }
 
-    luaL_openlibs(L);
-    lua_register_device_module(L);
-    lua_register_uart_module(L);
-    lua_register_db_module(L);
-    lua_register_ambit_module(L);
-    lua_register_sync_module(L);
+    lua_open_ambyte_env(L);
 
     /* Define the bundled `sched` global (scheduler library) before the user
      * script. The chunk returns its module table, which we install as `sched`. */
@@ -1853,4 +1896,83 @@ esp_err_t lua_runner_stop(uint32_t wait_ms)
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
+}
+
+/* ── on-demand snippet execution (CLI `lua exec` / MQTT lua_exec) ─────────── */
+
+/* Registry keys for the exec deadline — per-state, so concurrent execs (CLI +
+ * MQTT worker) and the main script don't share timer state. */
+#define LUA_EXEC_KEY_START   "ambyte_exec_start_ms"
+#define LUA_EXEC_KEY_BUDGET  "ambyte_exec_budget_ms"
+
+/* Count hook for exec states: abort once the wall-clock budget is spent.
+ * Wrap-safe (uint32 subtraction); esp_log_timestamp wraps after ~49 days. */
+static void lua_exec_deadline_hook(lua_State *L, lua_Debug *ar)
+{
+    (void)ar;
+    lua_getfield(L, LUA_REGISTRYINDEX, LUA_EXEC_KEY_START);
+    lua_getfield(L, LUA_REGISTRYINDEX, LUA_EXEC_KEY_BUDGET);
+    uint32_t start  = (uint32_t)lua_tointeger(L, -2);
+    uint32_t budget = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 2);
+    if (budget > 0 && (uint32_t)(esp_log_timestamp() - start) > budget) {
+        luaL_error(L, "lua_runner: exec timeout (%u ms)", (unsigned)budget);
+    }
+}
+
+esp_err_t lua_runner_exec(const char *code, uint32_t timeout_ms,
+                          char *result, size_t result_cap)
+{
+    if (result != NULL && result_cap > 0) result[0] = '\0';
+    if (code == NULL || code[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    /* Fresh, ephemeral state with the full ambyte env (no sched, no stop hook):
+     * runs ALONGSIDE a running main.lua — same powers, separate VM. Shared
+     * resources (UART transactions, the ambit payload buffer) are serialized at
+     * the C layer, so the two can't corrupt each other, only wait. */
+    lua_State *L = luaL_newstate();
+    if (L == NULL) {
+        if (result != NULL && result_cap > 0) {
+            snprintf(result, result_cap, "out of memory creating Lua state");
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    lua_open_ambyte_env(L);
+
+    if (timeout_ms > 0) {
+        lua_pushinteger(L, (lua_Integer)esp_log_timestamp());
+        lua_setfield(L, LUA_REGISTRYINDEX, LUA_EXEC_KEY_START);
+        lua_pushinteger(L, (lua_Integer)timeout_ms);
+        lua_setfield(L, LUA_REGISTRYINDEX, LUA_EXEC_KEY_BUDGET);
+        lua_sethook(L, lua_exec_deadline_hook, LUA_MASKCOUNT, 1000);
+    }
+
+    esp_err_t ret;
+    const int top0 = lua_gettop(L);
+    if (luaL_loadstring(L, code) != LUA_OK) {
+        const char *msg = lua_tostring(L, -1);
+        ESP_LOGW(LUA_RUNNER_TAG, "exec: syntax error: %s", msg ? msg : "?");
+        if (result != NULL && result_cap > 0) {
+            snprintf(result, result_cap, "%s", msg ? msg : "syntax error");
+        }
+        ret = ESP_ERR_INVALID_ARG;
+    } else if (lua_pcall(L, 0, LUA_MULTRET, 0) != LUA_OK) {
+        const char *msg = lua_tostring(L, -1);
+        ESP_LOGW(LUA_RUNNER_TAG, "exec: %s", msg ? msg : "runtime error");
+        if (result != NULL && result_cap > 0) {
+            snprintf(result, result_cap, "%s", msg ? msg : "runtime error");
+        }
+        ret = ESP_FAIL;
+    } else {
+        if (lua_gettop(L) > top0 && result != NULL && result_cap > 0) {
+            /* First returned value, via tostring semantics (honors __tostring). */
+            const char *s = luaL_tolstring(L, top0 + 1, NULL);
+            snprintf(result, result_cap, "%s", s ? s : "");
+            lua_pop(L, 1);
+        }
+        ret = ESP_OK;
+    }
+
+    lua_close(L);   /* frees the state's transient allocations in full */
+    return ret;
 }
