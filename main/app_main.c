@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_pm.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
@@ -361,6 +362,25 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
+
+    /* ── Power management (Phase 2, DFS-only) ─────────────────────────
+     * Dynamic frequency scaling 80<->160 MHz so the CPU coasts at 80 MHz during
+     * the long idle gaps between measurements. light_sleep stays OFF for now
+     * (that step needs tickless idle + a full peripheral-bracket audit). DFS is
+     * safe here: the AMBIT UART is pinned to XTAL, I2C is DFS-aware, the SPI/SD
+     * driver holds its own APB lock, and measurement windows hold a
+     * NO_LIGHT_SLEEP pm_lock. Requires CONFIG_PM_ENABLE; logs (and is harmless)
+     * if PM is somehow disabled. */
+    {
+        esp_pm_config_t pm_cfg = {
+            .max_freq_mhz       = 160,
+            .min_freq_mhz       = 80,
+            .light_sleep_enable = false,
+        };
+        esp_err_t pmerr = esp_pm_configure(&pm_cfg);
+        ESP_LOGI(APP_TAG, "power mgmt: DFS 80-160 MHz, light_sleep=off (%s)",
+                 esp_err_to_name(pmerr));
+    }
 
     /* ── Status LED ─────────────────────────────────────────────── */
     err = ambyte_status_init();

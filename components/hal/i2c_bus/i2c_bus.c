@@ -58,7 +58,8 @@ esp_err_t i2c_bus_init(const i2c_bus_config_t *config)
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = config->clock_speed_hz,
-        .clk_flags = 0,
+        .clk_flags = I2C_SCLK_SRC_FLAG_AWARE_DFS,  /* DFS-aware source so SCL timing
+                                                    * survives APB scaling (Phase 2) */
     };
 
     esp_err_t err = i2c_param_config(config->port, &idf_config);
@@ -177,7 +178,8 @@ esp_err_t i2c_bus_check_and_recover(i2c_port_t port)
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = s_i2c_bus_config.clock_speed_hz,
-        .clk_flags = 0,
+        .clk_flags = I2C_SCLK_SRC_FLAG_AWARE_DFS,  /* DFS-aware source so SCL timing
+                                                    * survives APB scaling (Phase 2) */
     };
 
     esp_err_t err = i2c_param_config(port, &idf_config);

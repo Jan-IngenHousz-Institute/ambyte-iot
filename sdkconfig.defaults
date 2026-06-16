@@ -72,3 +72,12 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # leak ever needs chasing; off by default to reclaim ~17 KiB static .bss.
 # CONFIG_HEAP_TRACING_STANDALONE=y
 # CONFIG_HEAP_TRACING_STACK_DEPTH=4
+# Phase 2 power management (DFS-only for now): enables esp_pm so app_main can
+# esp_pm_configure() dynamic frequency scaling (CPU 80<->160 MHz) during the idle
+# gaps and hold a NO_LIGHT_SLEEP pm_lock across AMBIT measurement windows.
+# light_sleep is left OFF (set at runtime) until tickless idle + a full
+# peripheral-bracket audit. Safe under DFS: the AMBIT UART is pinned to XTAL and
+# I2C uses I2C_SCLK_SRC_FLAG_AWARE_DFS.
+# NOTE: as with the cert bundle above, editing this file alone does NOT re-apply
+# — delete the per-env sdkconfig (sdkconfig.esp32-s3-devkitm-1) to regenerate.
+CONFIG_PM_ENABLE=y

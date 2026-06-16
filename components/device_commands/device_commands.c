@@ -15,6 +15,7 @@
 #include "esp_rom_crc.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
 #include "esp_wifi.h"
 #include "wifi_manager.h"
 #include "driver/ledc.h"
@@ -48,6 +49,9 @@ static int     s_inflight_msg_id     = -1;
  * overlapping reads don't clear it early. Single 32-bit access is atomic on
  * the ESP32; the sync runner only reads it. */
 static volatile int s_measurement_active = 0;
+/* Phase 2: held across a measurement window so the SoC can't light-sleep mid
+ * AMBIT UART / I2C read. NULL if PM is disabled (begin/end then no-op). */
+static esp_pm_lock_handle_t s_no_ls_lock = NULL;
 
 static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
 {
@@ -119,6 +123,18 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
 
     if (s_cfg.set_publish_ack_handler != NULL) {
         s_cfg.set_publish_ack_handler(on_publish_ack, NULL);
+    }
+
+    /* PM lock for the measurement window (Phase 2). Requires CONFIG_PM_ENABLE;
+     * if PM is off this returns an error and the begin/end hooks stay no-ops. */
+    if (s_no_ls_lock == NULL) {
+        esp_err_t lerr = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0,
+                                            "ambit_meas", &s_no_ls_lock);
+        if (lerr != ESP_OK) {
+            s_no_ls_lock = NULL;
+            ESP_LOGW(TAG, "PM lock unavailable (%s) — measurement won't block light sleep",
+                     esp_err_to_name(lerr));
+        }
     }
 
     ESP_LOGI(TAG, "Device commands initialized");
@@ -870,10 +886,20 @@ void device_commands_on_mqtt_disconnect(void)
 /* ── Measurement-activity gate ──────────────────────────────────────────
  * The sync runner consults device_commands_measurement_active() and pauses
  * publishing while a UART measurement is in progress, draining during idle. */
-void device_commands_measurement_begin(void) { s_measurement_active++; }
+void device_commands_measurement_begin(void)
+{
+    /* Acquire the PM lock on the outermost begin (0->1) so light sleep can't gate
+     * the UART/I2C clocks while a burst is in flight; nested begins don't re-acquire. */
+    if (s_measurement_active++ == 0 && s_no_ls_lock != NULL) {
+        esp_pm_lock_acquire(s_no_ls_lock);
+    }
+}
 void device_commands_measurement_end(void)
 {
-    if (s_measurement_active > 0) s_measurement_active--;
+    /* Release only on a genuine 1->0 transition (balances the begin acquire). */
+    if (s_measurement_active > 0 && --s_measurement_active == 0 && s_no_ls_lock != NULL) {
+        esp_pm_lock_release(s_no_ls_lock);
+    }
     if (s_measurement_active == 0) notify_sync();  /* burst done — let the runner drain */
 }
 bool device_commands_measurement_active(void) { return s_measurement_active > 0; }

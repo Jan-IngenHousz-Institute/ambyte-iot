@@ -586,7 +586,9 @@ esp_err_t uart_sensors_init(void)
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .source_clk = UART_SCLK_XTAL,   /* XTAL, not APB: keeps the 115200 baud divisor
+                                         * stable under DFS / light sleep (Phase 2) so
+                                         * AMBIT framing isn't corrupted by APB scaling. */
     };
 
     /* ── UART0 — single shared bus for all 4 channels (AMBIT1–4)
