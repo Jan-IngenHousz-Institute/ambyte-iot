@@ -223,6 +223,10 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
         },
         .session = {
             .protocol_ver = MQTT_PROTOCOL_V_5,
+            .keepalive    = 300,   /* s; matched to the STATUS heartbeat. Cuts idle
+                                    * PINGREQ from the 120 s default (~720->~288/day);
+                                    * within AWS IoT's 30-1200 s (broker drops after
+                                    * 1.5x keepalive of true silence). */
         },
     };
 

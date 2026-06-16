@@ -56,7 +56,11 @@
 #define WAKE_RETRIES        25
 #define WAKE_RETRY_MS       50
 #define PING_TIMEOUT_MS     2000
-#define PING_CACHE_TTL_US   (10LL * 1000 * 1000)  /* 10 s */
+#define PING_CACHE_TTL_US   (10LL * 1000 * 1000)  /* 10 s — present-sensor re-confirm */
+/* A FAILED ping is cached far longer than a successful one: an absent/empty
+ * channel would otherwise be re-woken (a ~1.25 s wake-retry burst) on every SS
+ * round. A present sensor still re-confirms at the short TTL above. */
+#define PING_FAIL_CACHE_TTL_US (5LL * 60 * 1000 * 1000)  /* 5 min — empty channel */
 
 /* ── Per-channel descriptor ────────────────────────────────────────── */
 
@@ -517,9 +521,11 @@ static esp_err_t do_ping(uint8_t channel, bool *connected)
 
     *connected = false;
 
-    /* Check cache */
+    /* Check cache. Empty channels use the long fail-TTL so they aren't re-probed
+     * every SS round; a present sensor re-confirms at the short TTL. */
     int64_t age = now_us() - s_ch[channel].ping_ts;
-    if (s_ch[channel].ping_ts > 0 && age < PING_CACHE_TTL_US) {
+    int64_t ttl = s_ch[channel].ping_ok ? PING_CACHE_TTL_US : PING_FAIL_CACHE_TTL_US;
+    if (s_ch[channel].ping_ts > 0 && age < ttl) {
         *connected = s_ch[channel].ping_ok;
         return ESP_OK;
     }

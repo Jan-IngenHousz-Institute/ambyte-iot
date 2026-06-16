@@ -454,6 +454,12 @@ esp_err_t wifi_manager_start(void)
         return err;
     }
 
+    /* Pin modem-sleep explicitly rather than rely on the IDF default. MIN_MODEM
+     * lets the radio sleep between DTIM beacons while staying responsive to
+     * inbound commands, and is the power-save mode the planned Phase-2 light-sleep
+     * work depends on. */
+    (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
     s_wifi.started = true;
     return ESP_OK;
 }

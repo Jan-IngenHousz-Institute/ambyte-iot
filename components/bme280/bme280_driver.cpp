@@ -26,6 +26,16 @@ extern "C" esp_err_t bme280_init(uint8_t i2c_addr)
     return ESP_FAIL;
   }
 
+  // Forced (one-shot) mode: the part sleeps between reads instead of converting
+  // continuously. begin() leaves it in MODE_NORMAL @ X16 (draws ~hundreds of µA
+  // 24/7); switch to MODE_FORCED, keeping X16 oversampling so reported precision
+  // is unchanged. bme280_read() triggers + waits for each sample.
+  s_bme280_device.setSampling(Adafruit_BME280::MODE_FORCED,
+                              Adafruit_BME280::SAMPLING_X16,
+                              Adafruit_BME280::SAMPLING_X16,
+                              Adafruit_BME280::SAMPLING_X16,
+                              Adafruit_BME280::FILTER_OFF);
+
   s_bme280_ready = true;
   return ESP_OK;
 }
@@ -42,6 +52,13 @@ extern "C" esp_err_t bme280_read(bme280_reading_t *out_reading)
   }
   if (out_reading == nullptr) {
     return ESP_ERR_INVALID_ARG;
+  }
+
+  // Forced mode: trigger a one-shot conversion and wait for completion, else the
+  // read*() calls return the previous (stale) sample. Returns false on a 2 s
+  // timeout (sensor wedged) — surface as a read failure rather than stale data.
+  if (!s_bme280_device.takeForcedMeasurement()) {
+    return ESP_FAIL;
   }
 
   out_reading->temperature_c = s_bme280_device.readTemperature();
