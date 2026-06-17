@@ -374,11 +374,11 @@ void app_main(void)
     {
         esp_pm_config_t pm_cfg = {
             .max_freq_mhz       = 160,
-            .min_freq_mhz       = 80,
+            .min_freq_mhz       = 40,
             .light_sleep_enable = false,
         };
         esp_err_t pmerr = esp_pm_configure(&pm_cfg);
-        ESP_LOGI(APP_TAG, "power mgmt: DFS 80-160 MHz, light_sleep=off (%s)",
+        ESP_LOGI(APP_TAG, "power mgmt: DFS 40-160 MHz, light_sleep=off (%s)",
                  esp_err_to_name(pmerr));
     }
 
