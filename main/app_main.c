@@ -49,6 +49,20 @@
 #define AMBYTE_FW_TAG "dev"
 #endif
 
+/* Phase-2 DFS frequency window (MHz) — THE knob: change these two values, then
+ * rebuild + flash. (PlatformIO build_flags do NOT reach ESP-IDF component sources
+ * here — verified the -D never lands on this file's compile — so set it HERE, not
+ * in platformio.ini. A Kconfig option is the alternative if a sdkconfig knob is
+ * wanted.) Valid ESP32-S3 freqs: min in {40, 80}, max = 160 (max=240 also needs
+ * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240). min=40 is HW-validated (1 h soak clean);
+ * light_sleep stays off. */
+#ifndef AMBYTE_PM_MIN_FREQ_MHZ
+#define AMBYTE_PM_MIN_FREQ_MHZ 40
+#endif
+#ifndef AMBYTE_PM_MAX_FREQ_MHZ
+#define AMBYTE_PM_MAX_FREQ_MHZ 160
+#endif
+
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
  * recovery if the RTC is set/validated after boot). */
 #define APP_RTC_SYNC_INTERVAL_S 3600U
@@ -373,12 +387,13 @@ void app_main(void)
      * if PM is somehow disabled. */
     {
         esp_pm_config_t pm_cfg = {
-            .max_freq_mhz       = 160,
-            .min_freq_mhz       = 40,
+            .max_freq_mhz       = AMBYTE_PM_MAX_FREQ_MHZ,
+            .min_freq_mhz       = AMBYTE_PM_MIN_FREQ_MHZ,
             .light_sleep_enable = false,
         };
         esp_err_t pmerr = esp_pm_configure(&pm_cfg);
-        ESP_LOGI(APP_TAG, "power mgmt: DFS 40-160 MHz, light_sleep=off (%s)",
+        ESP_LOGI(APP_TAG, "power mgmt: DFS %d-%d MHz, light_sleep=off (%s)",
+                 AMBYTE_PM_MIN_FREQ_MHZ, AMBYTE_PM_MAX_FREQ_MHZ,
                  esp_err_to_name(pmerr));
     }
 
