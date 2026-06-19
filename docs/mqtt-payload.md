@@ -108,7 +108,7 @@ data=, metadata=, channel= }` remains for derived/custom script events.
 
 | Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun <len>,<persist>,<bytes…>` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` (730 arrays only on IR-enabled traces) |
+| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun <len>,<persist>,<bytes…>` | `{"env":[…],"fluo":[…],"s_630":[…],"r_630":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` (730 arrays only on IR-enabled traces) |
 | Spectrum + PAR (`ambit.spec`) | `uart_<ch>` | `ambit` | `get_par` | `{"spec":[10 ints],"par":f}` |
 | Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
 | BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
@@ -144,8 +144,8 @@ matching the AMBIT firmware's send order:
 | idx | key | content |
 |---|---|---|
 | 0 | `env` | leaf temperature, °C (decoded, 2 decimals) |
-| 1 | `s_fluo` | fluorescence signal (raw uint32) |
-| 2 | `r_fluo` | fluorescence reference |
+| 1 | `s_630` | 630 nm fluorescence signal (raw uint32) |
+| 2 | `r_630` | 630 nm fluorescence reference |
 | 3 | `sun` | sun sensor |
 | 4 | `leaf` | leaf sensor |
 | 5 | `s_730` | 730 nm signal |
@@ -156,6 +156,13 @@ Unknown indices fall back to `"arr<idx>"`. All values except `env` are raw
 uint32 counts. `metadata.segments` carries the wire-encoded stimulus
 (`actinic` is the DAC byte after PAR→current conversion, not the requested
 PAR value).
+
+A derived `fluo` key (not an array index) is emitted immediately before
+`s_630`: `fluo[i] = s_630[i] / r_630[i]` per sample (`%.5f`; `r_630==0` → `0`),
+mirroring the AMBIT cloud variant. The binary AMBYTE wire never carries `fluo`
+— ambyte recomputes it from the transmitted `s_630`/`r_630` counts, so it is
+schema-compatible with, but not guaranteed bit-identical to, an AMBIT-direct
+trace (which computes it pre-flooring).
 
 ## Delivery semantics
 

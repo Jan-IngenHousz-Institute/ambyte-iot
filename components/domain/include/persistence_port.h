@@ -40,7 +40,7 @@ typedef enum {
  *                on claim (NULL when absent); freed by measurement_event_free.
  * metadata_json: JSON object string, or NULL.
  * payload_json:  JSON object of quantities, e.g. {"temperature":23.1,...} or
- *                {"s_fluo":[...],"r_fluo":[...]}. Heap on claim; caller frees
+ *                {"s_630":[...],"r_630":[...]}. Heap on claim; caller frees
  *                via measurement_event_free.
  */
 typedef struct {

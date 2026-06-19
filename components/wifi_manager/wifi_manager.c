@@ -530,7 +530,7 @@ esp_err_t wifi_manager_connect_configured(void)
     return wifi_manager_connect(CONFIG_AMBYTE_WIFI_SSID, CONFIG_AMBYTE_WIFI_PASSWORD);
 }
 
-esp_err_t wifi_manager_connect_stored(void)
+esp_err_t wifi_manager_connect_stored_async(void)
 {
     if (!s_wifi.initialized || !s_wifi.started) {
         return ESP_ERR_INVALID_STATE;
@@ -555,6 +555,15 @@ esp_err_t wifi_manager_connect_stored(void)
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         s_wifi.connect_requested = false;
+        return err;
+    }
+    return ESP_OK;   /* connection proceeds in the background (events / reconnect) */
+}
+
+esp_err_t wifi_manager_connect_stored(void)
+{
+    esp_err_t err = wifi_manager_connect_stored_async();
+    if (err != ESP_OK) {
         return err;
     }
 

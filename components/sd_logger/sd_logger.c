@@ -206,13 +206,18 @@ static void writer_task(void *arg)
     bool dirty = false;                                    /* unflushed bytes pending */
 
     for (;;) {
-        if (!sdcard_is_mounted()) {
+        /* Check the lock-free loss latch BEFORE sdcard_is_mounted() (which takes
+         * the contended sd_card lock): when a card is pulled this is the fast
+         * loop that re-arms the failing I/O, so it must stop the instant loss is
+         * latched and not keep poking the gone card. */
+        if (sdcard_io_lost() || !sdcard_is_mounted()) {
             close_log();                                   /* ring keeps buffering */
             dirty = false;
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
             continue;
         }
         if (s_fp == NULL && !open_log()) {
+            sdcard_report_io_error();                      /* open on a gone card → loss */
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -222,13 +227,15 @@ static void writer_task(void *arg)
             if (s_file_bytes + n > SD_LOGGER_FILE_BYTES) {
                 close_log();
                 rotate_files();
-                if (!open_log()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+                if (!open_log()) { sdcard_report_io_error(); vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
             }
             if (fwrite(buf, 1, n, s_fp) != n) {            /* card pulled / full */
                 close_log();
+                sdcard_report_io_error();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
+            sdcard_report_io_ok();                         /* good write → reset streak */
             s_file_bytes += n;
             dirty = true;
         } else {

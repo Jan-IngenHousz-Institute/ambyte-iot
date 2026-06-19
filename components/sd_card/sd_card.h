@@ -32,8 +32,26 @@ bool sdcard_is_mounted(void);
 // pulled card) and attempts a remount when unmounted. On every mount-state
 // transition it calls `cb(mounted)`, so callers (persistence, Lua) can react.
 // Safe to call once after sdcard_mount(); subsequent calls are no-ops.
+//
+// The CMD13 poll alone is not enough: it serializes through the same SDMMC host
+// mutex as the failing reads/writes and loses the race for the sd_card lock to a
+// task stuck in a multi-second failing transfer, so a pulled card can go
+// undetected indefinitely. The error-driven path below closes that gap.
 typedef void (*sdcard_state_cb_t)(bool mounted);
 esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb);
+
+// Error-driven card-loss signalling (lock-free; safe from any task).
+//
+// Any task doing SD file I/O calls sdcard_report_io_error() when an op fails and
+// sdcard_report_io_ok() when one succeeds. After a short run of consecutive
+// failures (a pulled/dead card), the loss is latched and the hot-plug monitor is
+// woken to tear the mount down immediately — without waiting on the CMD13 poll or
+// the contended sd_card lock. sdcard_io_lost() is a cheap, lock-free gate writers
+// check BEFORE attempting I/O so they stop re-arming failing ops at once. The
+// latch clears only on a successful remount.
+void sdcard_report_io_error(void);
+void sdcard_report_io_ok(void);
+bool sdcard_io_lost(void);
 
 #ifdef __cplusplus
 }

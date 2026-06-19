@@ -613,26 +613,24 @@ void app_main(void)
         ESP_LOGE(APP_TAG, "Device not provisioned — run tools/build_nvs_image.py and re-flash NVS");
     }
 
-    err = wifi_manager_connect_stored();
-    if (err == ESP_OK) {
-        ESP_LOGI(APP_TAG, "Wi-Fi connected");
-    } else if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
-    } else {
-        ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
-    }
-
-
     /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
-    /* Registered after the provisioning/connect block so they cannot fire
-     * during provisioning and trigger an MQTT start mid-session. */
+    /* Registered BEFORE initiating the connect so a fast GOT_IP can't be missed:
+     * on_got_ip starts MQTT, on_wifi_disconnect tears it down. The non-BT,
+     * NVS-seeded provisioning path has no interactive flow these could disturb. */
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,         on_got_ip,          NULL);
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,  on_wifi_disconnect, NULL);
 
-    /* Start MQTT now if WiFi was already connected during the connect block */
-    if (wifi_manager_is_connected()) {
-        ESP_LOGI(APP_TAG, "WiFi already up — starting MQTT");
-        mqtt_client_start();
+    /* Kick off Wi-Fi WITHOUT blocking the boot. A missing AP (reason=201,
+     * NO_AP_FOUND) would otherwise stall here for the full connect timeout,
+     * delaying everything below — sensors, SD, and the Lua measurement loop, none
+     * of which depend on Wi-Fi. Publishing is power-gated and drains in the
+     * background once on_got_ip fires; the connect + MQTT start complete
+     * asynchronously via the events registered above. */
+    err = wifi_manager_connect_stored_async();
+    if (err == ESP_OK) {
+        ESP_LOGI(APP_TAG, "Wi-Fi connect initiated (continues in background)");
+    } else {
+        ESP_LOGW(APP_TAG, "Wi-Fi connect could not start: %s", esp_err_to_name(err));
     }
 
     /* ── I2C + Sensors ────────────────────────────────────────────── */

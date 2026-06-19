@@ -48,7 +48,10 @@
 
 static SemaphoreHandle_t s_mtx = NULL;
 static StaticSemaphore_t s_mtx_storage;
-static bool s_available = false;
+/* volatile: event_log_on_sd_lost flips this false WITHOUT s_mtx (it may not be
+ * able to take the lock in time when a writer is stuck in a failing transfer),
+ * so the flag must be observed promptly by the next store. */
+static volatile bool s_available = false;
 
 /* Tail (write) file. */
 static FILE     *s_wf        = NULL;
@@ -227,6 +230,11 @@ static esp_err_t parse_record(char *line, size_t len, measurement_event_t *out)
  * pending. Caller holds s_mtx (or is single-threaded at init). */
 static esp_err_t evlog_open_locked(void)
 {
+    /* A prior event_log_on_sd_lost() that timed out on s_mtx may have left the
+     * tail FILE* open (card gone, couldn't close). Close it now before we reopen
+     * so the descriptor can't leak across a loss→restore cycle. */
+    if (s_wf != NULL) { fclose(s_wf); s_wf = NULL; }
+
     mkdir(EVLOG_DIR, 0777);
 
     uint32_t min_seq = 0, max_seq = 0;
@@ -333,14 +341,28 @@ esp_err_t event_log_init(void)
 esp_err_t event_log_on_sd_lost(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    /* Stop new stores FIRST, without waiting for the lock. A writer stuck in a
+     * failing multi-second fwrite still holds s_mtx, but the next store to acquire
+     * it will see s_available=false (and sdcard_io_lost()) and bail. This is what
+     * makes the close starvation-proof: even if we can't grab the lock to close
+     * the file, the writers are already shut off. */
+    s_available = false;
+
+    /* Generous timeout: must outlast one in-flight store's worst-case failing
+     * write burst on a gone card (writes time out at ~5 s each in the driver), so
+     * the close actually happens instead of leaking the open tail. If it still
+     * times out, the FILE* is closed defensively on the next evlog_open_locked. */
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(8000)) != pdTRUE) {
+        ESP_LOGW(TAG, "SD lost — stores halted, but tail close deferred (lock busy)");
+        return ESP_ERR_TIMEOUT;
+    }
     if (s_wf != NULL) {
-        evlog_flush_writer_locked();
+        evlog_flush_writer_locked();    /* best-effort; may fail on a gone card */
         fclose(s_wf);
         s_wf = NULL;
     }
     evlog_persist_cursor_locked();      /* save progress before the card goes */
-    s_available = false;
     xSemaphoreGive(s_mtx);
     ESP_LOGW(TAG, "SD lost — event log closed");
     return ESP_OK;
@@ -381,8 +403,11 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    /* Lock-free early-out: if the card has been latched lost, don't even take the
+     * lock or touch the (gone) media — bail before re-arming a failing write. */
+    if (sdcard_io_lost()) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (!s_available || s_wf == NULL) {
+    if (!s_available || s_wf == NULL || sdcard_io_lost()) {
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -473,8 +498,10 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
             ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
         }
         xSemaphoreGive(s_mtx);
+        sdcard_report_io_error();   /* a pulled/dead card latches loss after a few of these */
         return ESP_FAIL;
     }
+    sdcard_report_io_ok();          /* good write → reset the consecutive-failure streak */
     s_tail_size += (long)total;
     s_pending++;
 

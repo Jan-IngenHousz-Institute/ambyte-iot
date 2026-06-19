@@ -1046,8 +1046,8 @@ static const char *ambit_array_tag(uint8_t idx)
 {
     switch (idx) {
         case 0: return "env";      /* ENV — leaf temperature, degC */
-        case 1: return "s_fluo";   /* Fluo — fluorescence signal */
-        case 2: return "r_fluo";   /* Fluoref — fluorescence reference */
+        case 1: return "s_630";    /* 630 nm fluorescence signal */
+        case 2: return "r_630";    /* 630 nm fluorescence reference */
         case 3: return "sun";
         case 4: return "leaf";
         case 5: return "s_730";    /* 730 signal */
@@ -1103,7 +1103,7 @@ static void ambit_payload_mtx_ensure(void)
  * Returns { points=<fluor len>, stored=K, leaf_temp=degC, arrays=N }. The per-
  * point arrays are persisted to the DB (the point of the run), not materialised
  * back into Lua, to keep memory bounded for large runs. store=true persists one
- * event whose payload is {"leaf_temp":[…],"fluor":[…],"fluoRef":[…],…}. */
+ * event whose payload is {"env":[…],"fluo":[…],"s_630":[…],"r_630":[…],…}. */
 /* Actinic value → AMBIT LED-current byte, matching the original WRENCH ambyte
  * (protocol.cpp::generate_arr): a negative value (-255..-1) is an exact DAC level
  * (|value|); a positive value (1..9999) is PAR in µmol → byte = par_coef × PAR,
@@ -1305,14 +1305,40 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
         else off += (size_t)_n;                                               \
     } while (0)
 
+    /* Locate the 630 nm signal/reference arrays (idx 1/2) up front so we can
+     * emit a derived "fluo" = signal/reference per sample, mirroring the AMBIT
+     * cloud variant (which computes it on-device). The binary AMBYTE wire never
+     * carries fluo, so ambyte recomputes it from the transmitted counts; r==0
+     * (reference floored on the AMBIT) → 0, %.5f to match the cloud encoding. */
+    const uart_data_array_t *s630 = NULL, *r630 = NULL;
+    for (uint8_t a = 0; a < narr; a++) {
+        if      (resp->arrays[a].index == 1) s630 = &resp->arrays[a];
+        else if (resp->arrays[a].index == 2) r630 = &resp->arrays[a];
+    }
+
     AMB_APP("{");
+    bool first = true;
     for (uint8_t a = 0; a < narr && !trunc; a++) {
         const uart_data_array_t *arr = &resp->arrays[a];
         char tagbuf[12];
         const char *tag = ambit_array_tag(arr->index);
         if (tag == NULL) { snprintf(tagbuf, sizeof tagbuf, "arr%u", arr->index); tag = tagbuf; }
 
-        AMB_APP("%s\"%s\":[", a == 0 ? "" : ",", tag);
+        /* Inject "fluo" immediately before the 630 nm signal, matching the
+         * AMBIT cloud key order {…,"fluo","s_630","r_630",…}. */
+        if (arr->index == 1 && s630 && r630) {
+            AMB_APP("%s\"fluo\":[", first ? "" : ",");
+            first = false;
+            uint16_t n = s630->length < r630->length ? s630->length : r630->length;
+            for (uint16_t i = 0; i < n && !trunc; i++) {
+                double f = r630->data[i] ? (double)s630->data[i] / (double)r630->data[i] : 0.0;
+                AMB_APP("%s%.5f", i ? "," : "", f);
+            }
+            AMB_APP("]");
+        }
+
+        AMB_APP("%s\"%s\":[", first ? "" : ",", tag);
+        first = false;
         for (uint16_t i = 0; i < arr->length && !trunc; i++) {
             if (arr->index == 0) {                  /* ENV → leaf temp degC */
                 double t = (int16_t)(arr->data[i] & 0xFFFF) / 100.0;
