@@ -40,6 +40,8 @@
 #define EVLOG_FLUSH_EVERY_N  8                /* …or every N records, whichever first */
 #define EVLOG_CURSOR_BATCH   16               /* persist read cursor every N acks */
 #define EVLOG_ID_BLOCK       64               /* reserve next_id in blocks → 1 NVS write / 64 ids */
+#define EVLOG_SCAN_MAX_LINES 20000            /* bound the boot pending-count (stat only) */
+#define EVLOG_SCAN_MAX_MS    3000             /* …and its wall-clock, so a huge/slow backlog can't churn on */
 
 #define NVS_NS               "evlog"
 #define NVS_KEY_RD_SEQ       "rd_seq"
@@ -72,8 +74,10 @@ static long      s_inflight_len     = 0;
 static int64_t   s_next_id  = 1;
 static int64_t   s_id_limit = 1;
 
-/* Counters (re-derived on boot). Every present record is unsynced ⇒ total==pending. */
-static int64_t   s_pending = 0;
+/* Counters (re-derived on boot). Every present record is unsynced ⇒ total==pending.
+ * s_pending is counted off the boot path by evlog_count_task (see below). */
+static int64_t     s_pending    = 0;
+static TaskHandle_t s_count_task = NULL;   /* one-shot boot backlog counter */
 
 /* Flush / cursor-persist bookkeeping. */
 static uint32_t   s_writes_since_flush = 0;
@@ -151,15 +155,52 @@ static void evlog_persist_nid_locked(void)
     nvs_close(h);
 }
 
-/* One boot pass over the live records (cursor → tail): the pending count AND the
- * max measure_id present. Reads complete lines only; a partial trailing line in
- * the tail has no '\n' and is correctly excluded. Uses s_line (safe: only init /
- * on_sd_restored call this, never concurrently with a claim). The max id lets us
- * reseed next_id above anything still on the card even when NVS was wiped. */
-static void evlog_scan_locked(int64_t *out_pending, int64_t *out_max_id)
+/* The highest measure_id on the card is the newest record. Records are appended in
+ * strictly-ascending id order, so it lives in the last non-empty file (the tail, or
+ * the file just below it if the tail was freshly rotated and is still empty). Scan
+ * only that one (≤EVLOG_ROTATE_BYTES) file, so next_id can be reseeded on boot
+ * WITHOUT walking the whole backlog. Uses s_line — caller holds s_mtx / is init. */
+static int64_t evlog_tail_max_id_locked(void)
 {
-    int64_t pending = 0, max_id = 0;
-    for (uint32_t seq = s_rd_seq; seq <= s_tail_seq; seq++) {
+    uint32_t seq = s_tail_seq;
+    while (seq >= 1) {
+        char path[64];
+        evlog_file_path(path, sizeof path, seq);
+        FILE *f = fopen(path, "rb");
+        if (f != NULL) {
+            int64_t max_id = 0;
+            while (fgets(s_line, sizeof s_line, f) != NULL) {
+                size_t len = strlen(s_line);
+                if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
+                int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+                if (id > max_id) max_id = id;
+            }
+            fclose(f);
+            if (max_id > 0) return max_id;
+        }
+        if (seq == 1) break;
+        seq--;
+    }
+    return 0;
+}
+
+/* One-shot task: count the pending backlog (cursor → tail) OFF the boot path, so a
+ * large offline accumulation (Wi-Fi down → nothing drains) can't stall app_main
+ * before the console starts. BOUNDED by line count and wall-clock — beyond that the
+ * count is a floor (true value ≥ reported), which is fine: it is a stat only, and
+ * claim/publish walk the cursor regardless. Runs under s_mtx (serialised with
+ * store/claim/drain — no concurrent FATFS handles) but only briefly (≤EVLOG_SCAN_MAX_MS).
+ * next_id was already seeded synchronously in evlog_open_locked, so a partial count
+ * never risks id collisions. */
+static void evlog_count_task(void *arg)
+{
+    (void)arg;
+    int64_t pending = 0;
+    bool    capped  = false;
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    const TickType_t t0 = xTaskGetTickCount();
+    for (uint32_t seq = s_rd_seq; seq <= s_tail_seq && !capped; seq++) {
         char path[64];
         evlog_file_path(path, sizeof path, seq);
         FILE *f = fopen(path, "rb");
@@ -170,14 +211,26 @@ static void evlog_scan_locked(int64_t *out_pending, int64_t *out_max_id)
         while (fgets(s_line, sizeof s_line, f) != NULL) {
             size_t len = strlen(s_line);
             if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
-            int64_t id = (int64_t)strtoll(s_line, NULL, 10);
-            if (id > max_id) max_id = id;
             pending++;
+            if (pending >= EVLOG_SCAN_MAX_LINES ||
+                (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(EVLOG_SCAN_MAX_MS)) {
+                capped = true;
+                break;
+            }
         }
         fclose(f);
     }
-    if (out_pending) *out_pending = pending;
-    if (out_max_id)  *out_max_id  = max_id;
+    s_pending    = pending;
+    s_count_task = NULL;
+    xSemaphoreGive(s_mtx);
+
+    if (capped) {
+        ESP_LOGW(TAG, "pending backlog >= %lld (count capped) — drain via Wi-Fi/MQTT "
+                      "or clear /sdcard/events", (long long)pending);
+    } else {
+        ESP_LOGI(TAG, "pending backlog counted: %lld", (long long)pending);
+    }
+    vTaskDelete(NULL);
 }
 
 /* Parse one (newline-included) record line in place. Returns:
@@ -282,8 +335,11 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_size = evlog_file_size(s_tail_seq);
 
-    int64_t max_id = 0;
-    evlog_scan_locked(&s_pending, &max_id);
+    /* Seed next_id from the card synchronously — cheap: only the tail file. The
+     * potentially-huge pending COUNT is deferred to evlog_count_task (spawned below)
+     * so boot, and the console, never wait on a large offline backlog. */
+    int64_t max_id = evlog_tail_max_id_locked();
+    s_pending = 0;   /* provisional; evlog_count_task fills it in shortly */
 
     /* Never hand out an id that collides with a record still on the card. NVS
      * (where next_id's HWM lives) is wiped on every reflash and could be lost to
@@ -303,9 +359,17 @@ static esp_err_t evlog_open_locked(void)
     s_acks_since_persist = 0;
     s_inflight_active    = false;
 
-    ESP_LOGI(TAG, "ready: files %u..%u, cursor seq=%u off=%ld, pending=%lld, max_id=%lld, next_id=%lld",
+    ESP_LOGI(TAG, "ready: files %u..%u, cursor seq=%u off=%ld, max_id=%lld, next_id=%lld (pending counting in background)",
              (unsigned)min_seq, (unsigned)max_seq, (unsigned)s_rd_seq, s_rd_off,
-             (long long)s_pending, (long long)max_id, (long long)s_next_id);
+             (long long)max_id, (long long)s_next_id);
+
+    /* Count the backlog off the boot path (see evlog_count_task). Guard against a
+     * duplicate if a prior count is still running (e.g. rapid SD loss/restore). */
+    if (s_count_task == NULL) {
+        if (xTaskCreate(evlog_count_task, "evlog_count", 4096, NULL, 3, &s_count_task) != pdPASS) {
+            s_count_task = NULL;   /* count skipped; pending stays provisional 0 (stat only) */
+        }
+    }
     return ESP_OK;
 }
 
