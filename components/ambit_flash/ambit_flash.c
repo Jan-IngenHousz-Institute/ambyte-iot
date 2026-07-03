@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -18,6 +19,10 @@
 #include "esp_loader.h"
 #include "uart_sensors.h"
 #include "sd_card.h"
+#include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
+#include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
+
+#define AMBIT_FW_ROOT  "/sdcard/ambit_fw"
 
 #define TAG            "ambit_flash"
 #define FLASH_UART     UART_NUM_0
@@ -296,4 +301,111 @@ done:
         out->total_bytes     = total;
     }
     return ret;
+}
+
+/* ── version check (detect + report; no flashing) ────────────────────────── */
+
+static bool ver_gt(uint8_t a, uint8_t b, uint8_t c, uint8_t x, uint8_t y, uint8_t z)
+{
+    if (a != x) return a > x;
+    if (b != y) return b > y;
+    return c > z;
+}
+
+static bool dir_has_all_regions(const char *dir)
+{
+    for (size_t i = 0; i < NUM_REGIONS; i++) {
+        if (region_file_size(dir, s_regions[i].fname) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    DIR *d = opendir(AMBIT_FW_ROOT);
+    if (d == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    bool found = false;
+    ambit_flash_target_t best = {0};
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        unsigned mj, mn, bt;
+        char     tail;
+        /* Accept exactly "N.N.N" — the trailing %c catches "0.0.7.bak" etc. */
+        if (sscanf(e->d_name, "%u.%u.%u%c", &mj, &mn, &bt, &tail) != 3) continue;
+        if (mj > 255 || mn > 255 || bt > 255) continue;
+        /* Rebuild the path from the parsed numbers (bounded; also enforces canonical
+         * "major.minor.batch" folder names — non-canonical spellings won't match). */
+        char dir[96];
+        snprintf(dir, sizeof dir, "%s/%u.%u.%u", AMBIT_FW_ROOT, mj, mn, bt);
+        if (!dir_has_all_regions(dir)) continue;
+        if (!found || ver_gt((uint8_t)mj, (uint8_t)mn, (uint8_t)bt,
+                             best.major, best.minor, best.batch)) {
+            best.major = (uint8_t)mj;
+            best.minor = (uint8_t)mn;
+            best.batch = (uint8_t)bt;
+            snprintf(best.dir, sizeof best.dir, "%s", dir);
+            found = true;
+        }
+    }
+    closedir(d);
+
+    if (!found) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *out = best;
+    return ESP_OK;
+}
+
+int ambit_flash_check(void)
+{
+    ambit_flash_target_t tgt;
+    esp_err_t e = ambit_flash_find_target(&tgt);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "no SD target image under %s — put a build in a "
+                      "<major.minor.batch> folder with the 4 region files", AMBIT_FW_ROOT);
+        return -1;
+    }
+    ESP_LOGW(TAG, "SD target: v%u.%u.%u (%s)", tgt.major, tgt.minor, tgt.batch, tgt.dir);
+
+    int mismatches = 0;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        bool connected = false;
+        cmd_result_t pr = cmd_uart_ping(ch, &connected);
+        if (pr.status != ESP_OK || !connected) {
+            ESP_LOGI(TAG, "  ch%u: absent", ch);
+            continue;
+        }
+        uint8_t buf[64];
+        size_t  len = 0;
+        cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW, buf, sizeof buf, &len);
+        if (r.status != ESP_OK || len < sizeof(ambit_fw_info_t)) {
+            ESP_LOGW(TAG, "  ch%u: present but version unreadable (%s)",
+                     ch, esp_err_to_name(r.status));
+            continue;
+        }
+        const ambit_fw_info_t *fw = (const ambit_fw_info_t *)buf;
+        if (fw->major == tgt.major && fw->minor == tgt.minor && fw->batch == tgt.batch) {
+            ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date", ch, fw->major, fw->minor, fw->batch);
+        } else {
+            mismatches++;
+            ESP_LOGW(TAG, "  ch%u: v%u.%u.%u != target v%u.%u.%u — run: ambit_flash %u %u.%u.%u",
+                     ch, fw->major, fw->minor, fw->batch,
+                     tgt.major, tgt.minor, tgt.batch,
+                     ch, tgt.major, tgt.minor, tgt.batch);
+        }
+    }
+    ESP_LOGW(TAG, "AMBIT version check: %d channel(s) differ from the SD target", mismatches);
+    return mismatches;
 }

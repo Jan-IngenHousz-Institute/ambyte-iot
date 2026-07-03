@@ -16,6 +16,7 @@
 #include "command_router.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
+#include "ambit_flash.h"
 #include "script_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
@@ -778,6 +779,12 @@ void app_main(void)
     /* ── Start application tasks ──────────────────────────────────── */
     app_start_lua_runner(sd_available);
     app_start_cli();
+
+    /* Detect + report AMBIT firmware drift vs the SD target image (no auto-flash;
+     * a human runs `ambit_flash <ch> <ver>`). Read-only + bus-mutex-serialised. */
+    if (sd_available && uart_available) {
+        (void)ambit_flash_check();
+    }
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu",
              (unsigned long)esp_get_free_heap_size());

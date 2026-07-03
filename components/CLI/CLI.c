@@ -973,6 +973,29 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
     return (e == ESP_OK) ? 0 : 1;
 }
 
+/* Detect + report AMBIT firmware drift vs the SD target image (no flashing). Finds
+ * the highest /sdcard/ambit_fw/<major.minor.batch>/ with the 4 region files and
+ * compares each present AMBIT's running version to it. Read-only; safe with Lua up. */
+static int cli_cmd_ambit_check(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: ambit_check\r\n");
+        return 1;
+    }
+    int m = ambit_flash_check();
+    if (m < 0) {
+        printf("No SD target image — put the build in "
+               "/sdcard/ambit_fw/<major.minor.batch>/ (4 region files).\r\n");
+    } else if (m == 0) {
+        printf("All present AMBITs match the SD target.\r\n");
+    } else {
+        printf("%d channel(s) differ from the SD target — see the log for the "
+               "ambit_flash command(s) to run.\r\n", m);
+    }
+    return 0;
+}
+
 /* Operator control of the Lua measurement script. `exec` runs a snippet in an
  * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
  * db/sync) — the console-side twin of the MQTT lua_exec command. */
@@ -1157,6 +1180,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "ambit_flash <0-3> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
         .func    = cli_cmd_ambit_flash,
     };
+    static const esp_console_cmd_t ambit_check_cmd = {
+        .command = "ambit_check",
+        .help    = "ambit_check  report each AMBIT's version vs the SD target /sdcard/ambit_fw/<M.m.b> (no flashing)",
+        .func    = cli_cmd_ambit_check,
+    };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
         .help    = "lua start|stop|status|exec <code...>  control / poke the Lua script",
@@ -1296,6 +1324,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_flash_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_check_cmd);
     if (err != ESP_OK) {
         return err;
     }

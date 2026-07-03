@@ -56,6 +56,28 @@ typedef struct {
 esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
                             ambit_flash_image_result_t *out);
 
+/* A firmware image discovered on the SD card: its version + directory. */
+typedef struct {
+    uint8_t major;
+    uint8_t minor;
+    uint8_t batch;
+    char    dir[96];   /* e.g. "/sdcard/ambit_fw/0.0.7" */
+} ambit_flash_target_t;
+
+/* Scan /sdcard/ambit_fw for version-named subfolders (<major>.<minor>.<batch>)
+ * that contain all four region files, and return the HIGHEST version as the
+ * target. ESP_OK + *out on success; ESP_ERR_NOT_FOUND if none present;
+ * ESP_ERR_INVALID_STATE if the SD is unavailable. */
+esp_err_t ambit_flash_find_target(ambit_flash_target_t *out);
+
+/* Detect + report (Phase 3, no flashing): find the SD target image, then for each
+ * present AMBIT read its running version (cmd 33/2) and log whether it matches the
+ * target — including the exact `ambit_flash <ch> <ver>` to run on a mismatch.
+ * Returns the number of present channels that differ from the target, or -1 if no
+ * SD target image is present. Read-only and bus-mutex-serialised, so it is safe to
+ * run with the Lua measurement loop active. */
+int ambit_flash_check(void);
+
 #ifdef __cplusplus
 }
 #endif

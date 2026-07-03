@@ -3,7 +3,7 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
     REQUIRES uart_sensors
-    PRIV_REQUIRES driver esp_timer esp_serial_flasher sd_card
+    PRIV_REQUIRES driver esp_timer esp_serial_flasher sd_card device_commands
 )
 # esp_serial_flasher is vendored at components/esp_serial_flasher (source only — the
 # registry tarball's deep test/ paths blow past Windows MAX_PATH). We use our own

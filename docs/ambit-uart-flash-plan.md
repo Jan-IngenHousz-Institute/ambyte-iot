@@ -17,8 +17,16 @@ Progress:
   fail-fast checks the 4 region files exist, `esp_loader_connect_with_stub` + raise baud (default
   460800), asserts target == C3, then streams each region from SD (`flash_start`/`write`/`finish`
   with MD5 verify) at `0x0/0x8000/0xe000/0x10000`, and resets into the new app. **NVS (0x9000)
-  never touched → calibration preserved.** Builds clean. Needs on-HW flash test + the SD region
-  files staged (below).
+  never touched → calibration preserved.** **HW-PASSED 2026-07-02** (`ambit_flash 3 I01`, 448992 B,
+  all regions MD5-verified, 460800 baud).
+- ✅ **Phase 3 v1 (detect + report; no auto-flash)** — `ambit_flash_find_target()` picks the
+  HIGHEST `/sdcard/ambit_fw/<major.minor.batch>/` folder that has all 4 region files;
+  `ambit_flash_check()` reads each present AMBIT's version (cmd 33/2) and logs match / mismatch
+  (+ the exact `ambit_flash <ch> <ver>` to run). Runs once at boot (report-only) and on demand via
+  CLI `ambit_check`. Read-only + bus-mutex-serialised (safe with Lua up). Builds clean; needs HW
+  verify. Decisions: **version-named folders** + **detect-and-report only** (no autonomous flash).
+  NOTE: folders must be named `major.minor.batch` for the check — e.g. rename `I01` → the image's
+  version (the manual `ambit_flash <ch> I01` still works with any folder name).
 
 ## 1. Goal
 
