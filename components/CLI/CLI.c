@@ -15,8 +15,10 @@
 #include "freertos/task.h"
 
 #include "ambit_ota.h"
+#include "ambit_flash.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
+#include "uart_sensors.h"
 #include "lua_runner.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
@@ -869,6 +871,108 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
     return 0;
 }
 
+/* Phase-1 bench test for the host-driven AMBIT flasher: drive an AMBIT into the
+ * ESP32-C3 ROM serial download mode (`enter`) or reset it back to its app
+ * (`run`) using the ambyte reset/boot lines. After `enter` the chip STAYS in
+ * download mode — verify with esptool on the FFC tap:
+ *   esptool --chip esp32c3 --port <COM> --before no_reset --after no_reset chip_id
+ * Stop Lua first (`lua stop`) so the shared UART bus is free. */
+static int cli_cmd_ambit_dl(int argc, char **argv)
+{
+    if (argc != 3 ||
+        (strcmp(argv[2], "enter") != 0 && strcmp(argv[2], "run") != 0)) {
+        printf("Usage: ambit_dl <0-3> <enter|run>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    esp_err_t err = uart_sensors_flash_session_begin((uint8_t)ch, 2000);
+    if (err != ESP_OK) {
+        printf("bus busy (%s) — try `lua stop` first\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    if (strcmp(argv[2], "enter") == 0) {
+        err = uart_sensors_enter_download((uint8_t)ch);
+        printf("ch%d enter_download: %s — chip should be in ROM download mode; "
+               "connect esptool on the FFC tap\r\n", ch, esp_err_to_name(err));
+    } else {
+        err = uart_sensors_run_app((uint8_t)ch);
+        printf("ch%d run_app: %s — chip reset into its application\r\n",
+               ch, esp_err_to_name(err));
+    }
+    uart_sensors_flash_session_end((uint8_t)ch);
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+/* Host-driven ROM flasher probe: force the AMBIT on <ch> into ESP32-C3 ROM
+ * download mode over the FFC, connect via esp-serial-flasher, read chip + MAC,
+ * then reset it back to its app. No PC/tap needed — the ambyte is the flasher.
+ * Stop Lua first (`lua stop`) so the shared UART bus is free. */
+static int cli_cmd_ambit_probe(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: ambit_probe <0-3>   (stop Lua first: `lua stop`)\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    ambit_flash_probe_result_t r;
+    esp_err_t err = ambit_flash_probe((uint8_t)ch, &r);
+    if (err == ESP_OK && r.connected) {
+        printf("ch%d: AMBIT ROM OK — chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+               ch, r.chip, r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5]);
+    } else {
+        printf("ch%d: no ROM response (%s) — check wiring / that Lua is stopped\r\n",
+               ch, esp_err_to_name(err));
+    }
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+/* Full ROM flash of an AMBIT from an SD firmware folder (bootloader/partitions/
+ * boot_app0/app.bin). Works on bare / bricked / any-firmware units. Preserves NVS
+ * calibration (0x9000 untouched). Stop Lua first (`lua stop`); confirm afterward
+ * with `ambit_versions`. */
+static int cli_cmd_ambit_flash(int argc, char **argv)
+{
+    if (argc < 3 || argc > 4) {
+        printf("Usage: ambit_flash <0-3> <version|/sdcard/dir> [baud=460800]\r\n");
+        printf("  version X  => /sdcard/ambit_fw/X/{bootloader,partitions,boot_app0,app}.bin\r\n");
+        printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop Lua first.\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    char dir[160];
+    if (argv[2][0] == '/') {
+        snprintf(dir, sizeof dir, "%s", argv[2]);
+    } else {
+        snprintf(dir, sizeof dir, "/sdcard/ambit_fw/%s", argv[2]);
+    }
+    uint32_t baud = (argc == 4) ? (uint32_t)strtoul(argv[3], NULL, 10) : 0;
+
+    printf("Flashing AMBIT ch%d from %s (this takes ~10-60 s)...\r\n", ch, dir);
+    ambit_flash_image_result_t r;
+    esp_err_t e = ambit_flash_image((uint8_t)ch, dir, baud, &r);
+    if (e == ESP_OK) {
+        printf("ch%d: FLASH OK — %d regions, %u bytes; AMBIT reset into new app.\r\n"
+               "  Confirm with `ambit_versions`.\r\n",
+               ch, r.regions_written, (unsigned)r.total_bytes);
+    } else {
+        printf("ch%d: FLASH FAILED (%s) after %d region(s) — see log\r\n",
+               ch, esp_err_to_name(e), r.regions_written);
+    }
+    return (e == ESP_OK) ? 0 : 1;
+}
+
 /* Operator control of the Lua measurement script. `exec` runs a snippet in an
  * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
  * db/sync) — the console-side twin of the MQTT lua_exec command. */
@@ -1038,6 +1142,21 @@ static esp_err_t cli_register_commands(void)
         .help    = "ambit_versions  print every present AMBIT's firmware version",
         .func    = cli_cmd_ambit_versions,
     };
+    static const esp_console_cmd_t ambit_dl_cmd = {
+        .command = "ambit_dl",
+        .help    = "ambit_dl <0-3> <enter|run>  force AMBIT into ROM download mode / back to app (flasher bench test)",
+        .func    = cli_cmd_ambit_dl,
+    };
+    static const esp_console_cmd_t ambit_probe_cmd = {
+        .command = "ambit_probe",
+        .help    = "ambit_probe <0-3>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop Lua first)",
+        .func    = cli_cmd_ambit_probe,
+    };
+    static const esp_console_cmd_t ambit_flash_cmd = {
+        .command = "ambit_flash",
+        .help    = "ambit_flash <0-3> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
+        .func    = cli_cmd_ambit_flash,
+    };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
         .help    = "lua start|stop|status|exec <code...>  control / poke the Lua script",
@@ -1162,6 +1281,21 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_versions_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_dl_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_probe_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_flash_cmd);
     if (err != ESP_OK) {
         return err;
     }

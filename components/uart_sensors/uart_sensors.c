@@ -62,12 +62,24 @@
  * round. A present sensor still re-confirms at the short TTL above. */
 #define PING_FAIL_CACHE_TTL_US (5LL * 60 * 1000 * 1000)  /* 5 min — empty channel */
 
+/* ── AMBIT ROM-flash reset/boot control ─────────────────────────────────
+ * Host-driven C3 firmware update: force an AMBIT (ESP8685/ESP32-C3) into its
+ * ROM serial download mode by holding the C3 boot strap (GPIO9, per channel —
+ * s_ch[].boot_pin) LOW across a CHIP_EN reset (shared, below). Both are driven
+ * OPEN-DRAIN against 10k pull-ups on the AMBIT; CHIP_EN also has a 2.2uF cap
+ * (RC ~22 ms), so EN must be held low long enough to discharge it and the
+ * strap kept low across the full EN rise. */
+#define AMBIT_RESET_GPIO        1     /* shared CHIP_EN, active-low, open-drain */
+#define AMBIT_EN_LOW_HOLD_MS    20    /* hold CHIP_EN low to discharge the 2.2uF cap */
+#define AMBIT_BOOT_HOLD_MS     100    /* keep GPIO9 low across the ~22 ms EN rise + margin */
+
 /* ── Per-channel descriptor ────────────────────────────────────────── */
 
 typedef struct {
     uart_port_t         uart_num;
     int                 rx_pin;
     int                 tx_pin;
+    int                 boot_pin;    /* C3 GPIO9 boot strap (open-drain), for ROM flashing */
     bool                shared;      /* channels sharing UART0 */
     uart_sensor_state_t state;
     int64_t             ping_ts;     /* last ping timestamp (µs) */
@@ -171,6 +183,82 @@ static void channel_release(uint8_t ch)
         s_ch[ch].state = UART_SENSOR_DISCONNECTED;
     }
     xSemaphoreGive(s_ch_mtx[ch]);
+}
+
+/* ── AMBIT ROM-flash: reset/boot sequencer ──────────────────────────────
+ * See the AMBIT_RESET_GPIO block above. Forces one AMBIT into the ESP32-C3
+ * ROM serial download mode over the shared FFC/UART so the ambyte can flash it
+ * via the ROM bootloader. The reset line is SHARED, so a download-entry briefly
+ * resets all four AMBITs; only the target (its boot strap held low) enters
+ * download mode — the others reboot into their application. Only call inside the
+ * quiesced flash context (Lua stopped), where no other channel transaction is
+ * in flight. */
+
+/* Configure CHIP_EN (shared) + the four per-channel boot straps as open-drain,
+ * idle = released (Hi-Z, pulled high by the AMBIT's 10k). */
+static esp_err_t ambit_boot_gpio_init(void)
+{
+    uint64_t mask = (1ULL << AMBIT_RESET_GPIO);
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
+        mask |= (1ULL << s_ch[i].boot_pin);
+    }
+    gpio_config_t cfg = {
+        .pin_bit_mask = mask,
+        .mode         = GPIO_MODE_OUTPUT_OD,   /* low = assert, released = Hi-Z */
+        .pull_up_en   = GPIO_PULLUP_DISABLE,   /* external 10k pull-ups on the AMBIT */
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "boot/reset gpio_config");
+    gpio_set_level(AMBIT_RESET_GPIO, 1);       /* released */
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
+        gpio_set_level(s_ch[i].boot_pin, 1);   /* released */
+    }
+    return ESP_OK;
+}
+
+esp_err_t uart_sensors_flash_session_begin(uint8_t ch, uint32_t wait_ms)
+{
+    if (!s_inited)                      return ESP_ERR_INVALID_STATE;
+    if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
+    /* Owns the shared bus + remaps UART0 to `ch` for the whole flash session. */
+    return channel_acquire(ch, pdMS_TO_TICKS(wait_ms));
+}
+
+void uart_sensors_flash_session_end(uint8_t ch)
+{
+    if (ch >= UART_SENSOR_NUM_CHANNELS) return;
+    channel_release(ch);   /* leaves the channel DISCONNECTED → re-pinged later */
+}
+
+esp_err_t uart_sensors_enter_download(uint8_t ch)
+{
+    if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
+    /* Only the target straps to download; the other AMBITs reboot to app. */
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
+        gpio_set_level(s_ch[i].boot_pin, (i == ch) ? 0 : 1);
+    }
+    gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge cap */
+    gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp */
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_BOOT_HOLD_MS));       /* hold strap across the rise */
+    gpio_set_level(s_ch[ch].boot_pin, 1);               /* release strap */
+    uart_flush_input(UART_NUM_0);                        /* drop reset-time line noise */
+    ESP_LOGI(TAG, "ch%u: AMBIT forced into ROM serial download mode", ch);
+    return ESP_OK;
+}
+
+esp_err_t uart_sensors_run_app(uint8_t ch)
+{
+    if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
+        gpio_set_level(s_ch[i].boot_pin, 1);   /* all straps released → normal boot */
+    }
+    gpio_set_level(AMBIT_RESET_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));
+    gpio_set_level(AMBIT_RESET_GPIO, 1);
+    ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
+    return ESP_OK;
 }
 
 /* ── Ambit wake sequence ───────────────────────────────────────────── */
@@ -575,10 +663,16 @@ esp_err_t uart_sensors_init(void)
      * trigger/poll/fetch protocol keeps every host↔ambit transaction short, so
      * one controller suffices; the long measurement runs autonomously on each
      * C3. (Console is USB-Serial-JTAG, so UART0 is free for sensors.) */
-    s_ch[0] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin =  3, .tx_pin = 46, .shared = true };
-    s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .shared = true };
-    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .shared = true };
-    s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .shared = true };
+    /* .boot_pin = the C3 GPIO9 strap for the AMBIT on this channel's UART pins.
+     * NOTE: bound to the UART pin pair, NOT the schematic ch-label — the label
+     * order differs from this s_ch[] index (see docs/ambit-uart-flash-plan.md). */
+    s_ch[0] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin =  3, .tx_pin = 46, .boot_pin = 2, .shared = true };
+    s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .boot_pin = 7, .shared = true };
+    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .boot_pin = 6, .shared = true };
+    s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .boot_pin = 5, .shared = true };
+
+    /* AMBIT reset/boot straps (open-drain) for host-driven C3 ROM flashing. */
+    ESP_RETURN_ON_ERROR(ambit_boot_gpio_init(), TAG, "AMBIT boot/reset GPIO");
 
     uart_config_t uart_cfg = {
         .baud_rate  = UART_BAUD_RATE,
