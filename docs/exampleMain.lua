@@ -178,3 +178,10 @@ sched.sun("sunrise", -30 * 60, edge_round)           -- dark-edge trace, 30 min 
 -- (status heartbeat + liveness LED are firmware-owned — see header)
 
 sched.run()                                          -- blocking merge loop
+
+
+for ch = 0, NUM_CHANNELS - 1 do
+    if ambit.run(ch) then
+        device.log(string.format("ch%d: %s", ch, ambit.query(ch)))
+    end
+end

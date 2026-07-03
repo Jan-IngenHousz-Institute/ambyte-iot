@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "title": "Ambit-demo - Workbook",
+    "version": "1.0.0",
+    "created": "2026-07-02T12:31:26.000Z",
+    "device_family": "multispeq"
+  },
+  "cells": [
+    {
+      "id": "node_1778059641810",
+      "type": "protocol",
+      "payload": {
+        "name": "Measurement Node",
+        "version": 1,
+        "protocolId": "692731ee-74f9-4d4c-864f-c450505ef760"
+      },
+      "isCollapsed": false
+    },
+    {
+      "id": "node_1778059642744",
+      "type": "macro",
+      "payload": {
+        "name": "Analysis Node",
+        "macroId": "1c61fb3a-ee78-4c6c-b705-fcc9e979de59",
+        "language": "javascript"
+      },
+      "isCollapsed": false
+    }
+  ]
+}
