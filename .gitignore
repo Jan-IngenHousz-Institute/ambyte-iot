@@ -5,6 +5,7 @@ build/
 temp_inipreview.txt
 dom_ludo_prototype_ambyte_thing_certs/
 docs/ble-provisioning-cmd.txt
+flashed_macs.csv
 open-jii/
 ambit-1/
 device_certs/
