@@ -86,7 +86,9 @@ def read_mac_via_esptool(port, verbose=False):
             "save_mac: esptool not found — `uv pip install esptool` "
             "(or run inside the repo venv).")
 
-    cmd = cmd + ["--chip", "esp32s3", "--port", port, "read-mac"]
+    # Use the underscore form: esptool v4 requires "read_mac", and v5 still
+    # accepts it (with a deprecation warning) — so one spelling works on both.
+    cmd = cmd + ["--chip", "esp32s3", "--port", port, "read_mac"]
     if verbose:
         sys.stderr.write("save_mac: " + " ".join(cmd) + "\n")
 
