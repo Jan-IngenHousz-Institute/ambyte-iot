@@ -35,6 +35,11 @@
 /* Cap on consecutive "still in flight" polls before abandoning the drain this
  * cycle (~5 s) — guards against a lost PUBACK wedging the loop. */
 #define SYNC_RUNNER_MAX_ACK_POLLS 50
+/* An in-flight slot held longer than this had its PUBACK lost/expired (or the
+ * broker dropped without notice while Wi-Fi stayed up): reap it so the event
+ * re-publishes instead of the slot wedging the drain permanently. Well above any
+ * real PUBACK round-trip and above esp-mqtt's ~30 s outbox-expiry default. */
+#define SYNC_RUNNER_INFLIGHT_MAX_MS 60000
 
 static TaskHandle_t s_task_handle = NULL;
 /* STATUS heartbeat period (s); 0 = disabled. Set once at start. */
@@ -73,7 +78,15 @@ static void sync_runner_drain(void)
             ack_polls = 0;
             vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_ACK_POLL_MS));
         } else if (res.status == ESP_ERR_INVALID_STATE) {
-            /* Previous event still in flight — wait for its PUBACK. */
+            /* Previous event still in flight — normally clears within a PUBACK
+             * round-trip. But a lost/expired PUBACK (or a broker drop while
+             * Wi-Fi stays associated) can leave the slot latched forever; if it
+             * has been held far longer than any real round-trip, reap it so the
+             * event re-publishes instead of the drain wedging until reboot. */
+            if (device_commands_reap_stale_inflight(SYNC_RUNNER_INFLIGHT_MAX_MS)) {
+                ack_polls = 0;
+                continue;   /* slot freed — re-claim and publish immediately */
+            }
             if (++ack_polls > SYNC_RUNNER_MAX_ACK_POLLS) {
                 ESP_LOGW(TAG, "drain stalled waiting for PUBACK");
                 return;

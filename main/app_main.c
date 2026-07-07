@@ -735,6 +735,7 @@ void app_main(void)
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
+        .set_disconnect_handler = mqtt_client_get_set_disconnect_handler_fn(),
         .topic_root             = topic_root,
         .device_id              = device_id,
         .protocol_id            = protocol_id,

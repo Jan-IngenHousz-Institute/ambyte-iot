@@ -30,6 +30,10 @@ static bool                     s_started   = false;
 static message_publish_ack_fn s_ack_handler = NULL;
 static void                  *s_ack_ctx     = NULL;
 
+/* Transport-disconnect callback (MQTT-level; fires even when Wi-Fi stays up) */
+static message_disconnect_fn  s_disconnect_handler = NULL;
+static void                  *s_disconnect_ctx     = NULL;
+
 /* Inbound: subscribe target + received-message callback + reassembly state */
 static char                 s_command_topic[INBOUND_TOPIC_MAX] = {0};
 static message_received_fn  s_msg_handler = NULL;
@@ -80,6 +84,13 @@ static esp_err_t mqtt_set_received_handler_impl(message_received_fn handler, voi
 {
     s_msg_handler = handler;
     s_msg_ctx     = ctx;
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_set_disconnect_handler_impl(message_disconnect_fn handler, void *ctx)
+{
+    s_disconnect_handler = handler;
+    s_disconnect_ctx     = ctx;
     return ESP_OK;
 }
 
@@ -168,6 +179,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         s_connected = false;
         rx_large_free();   /* don't hold a half-assembled message across the gap */
         ESP_LOGW(TAG, "MQTT disconnected");
+        /* Clear any in-flight publish slot now, even though Wi-Fi is still up:
+         * the message this session was awaiting a PUBACK for is gone, so the
+         * app must revert it to PENDING or the drain wedges on reconnect. */
+        if (s_disconnect_handler != NULL) {
+            s_disconnect_handler(s_disconnect_ctx);
+        }
         break;
 
     case MQTT_EVENT_PUBLISHED:
@@ -290,4 +307,9 @@ message_set_publish_ack_handler_fn mqtt_client_get_set_ack_handler_fn(void)
 message_set_received_handler_fn mqtt_client_get_set_received_handler_fn(void)
 {
     return mqtt_set_received_handler_impl;
+}
+
+message_set_disconnect_handler_fn   mqtt_client_get_set_disconnect_handler_fn(void)
+{
+    return mqtt_set_disconnect_handler_impl;
 }

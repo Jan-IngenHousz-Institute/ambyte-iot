@@ -47,6 +47,7 @@ typedef struct {
     message_publish_fn                  publish;
     message_is_connected_fn             message_is_connected;
     message_set_publish_ack_handler_fn  set_publish_ack_handler;
+    message_set_disconnect_handler_fn   set_disconnect_handler;  /* clears in-flight slot on MQTT drop; NULL = only Wi-Fi drop clears it */
 
     /* Topic config (Phase 6A) */
     const char                         *topic_root;
@@ -300,8 +301,28 @@ cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status);
  * the AMBIT bootloader rolls back to the previous image on its next reboot. */
 cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status);
 
-/* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
+/* Clear any in-flight publish slot (revert it to PENDING). Called from both the
+ * Wi-Fi disconnect handler and, via set_disconnect_handler, the MQTT-level
+ * disconnect — so a broker/TLS drop that leaves Wi-Fi associated still frees the
+ * slot instead of wedging the drain until reboot. */
 void device_commands_on_mqtt_disconnect(void);
+
+/* Revert a stale in-flight publish slot to PENDING if it has been latched longer
+ * than max_age_ms. A lost/expired PUBACK (e.g. esp-mqtt outbox expiry) with the
+ * connection nominally up leaves no callback, so without this the one-in-flight
+ * slot never clears and the whole drain wedges until reboot. Returns true if a
+ * stale slot was reaped. Called by the sync_runner while draining. */
+bool device_commands_reap_stale_inflight(int64_t max_age_ms);
+
+/* Diagnostic: report the in-flight publish slot. *msg_id and *measure_id are -1
+ * when idle; *age_ms is ms since the slot was latched (0 when idle). Any
+ * out-pointer may be NULL. */
+void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *age_ms);
+
+/* Test hook: inject a fake, already-stale in-flight slot (no real measure_id) so
+ * the reaper path can be exercised on hardware without engineering a lost PUBACK.
+ * The next sync_runner drain (kick it with sync_runner_notify) reaps it. */
+void device_commands_inject_stale_inflight(void);
 
 #ifdef __cplusplus
 }

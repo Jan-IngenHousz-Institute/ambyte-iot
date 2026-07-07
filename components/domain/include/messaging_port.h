@@ -27,6 +27,14 @@ typedef void      (*message_received_fn)(const char *topic, const char *payload,
 typedef esp_err_t (*message_set_received_handler_fn)(message_received_fn handler,
                                                      void *ctx);
 
+/* Callback delivered when the transport loses its connection at the MQTT level
+ * (i.e. MQTT_EVENT_DISCONNECTED — fires even when Wi-Fi stays associated). Lets
+ * the app clear any in-flight publish slot so a reconnect doesn't wedge behind a
+ * message that will never be ACKed. Runs in the transport's task context. */
+typedef void      (*message_disconnect_fn)(void *ctx);
+typedef esp_err_t (*message_set_disconnect_handler_fn)(message_disconnect_fn handler,
+                                                       void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

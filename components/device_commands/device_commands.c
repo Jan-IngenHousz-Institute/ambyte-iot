@@ -42,6 +42,13 @@ static StaticSemaphore_t s_inflight_mtx_storage;
 /* One event in flight at a time (one measure_id = one MQTT message). */
 static int64_t s_inflight_measure_id = -1;
 static int     s_inflight_msg_id     = -1;
+/* Monotonic (esp_timer) ms when the slot was latched; 0 when idle. Used by
+ * device_commands_reap_stale_inflight() to break a wedge from a lost PUBACK. */
+static int64_t s_inflight_since_ms   = 0;
+
+/* Monotonic milliseconds since boot — independent of the wall clock (which jumps
+ * on RTC sync), so it measures elapsed in-flight time correctly. */
+static inline int64_t mono_ms(void) { return esp_timer_get_time() / 1000; }
 
 /* Measurement-activity gate. Incremented around every UART sensor transaction
  * so the background sync runner can pause publishing while a measurement is in
@@ -92,6 +99,7 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
     int64_t mid = s_inflight_measure_id;
     s_inflight_measure_id = -1;
     s_inflight_msg_id     = -1;
+    s_inflight_since_ms   = 0;
     xSemaphoreGive(s_inflight_mtx);
 
     if (status == ESP_OK && s_cfg.mark_event_synced != NULL) {
@@ -99,6 +107,14 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
     } else if (s_cfg.mark_event_pending != NULL) {
         s_cfg.mark_event_pending(mid);
     }
+}
+
+/* Adapter so the MQTT transport's disconnect callback (message_disconnect_fn)
+ * can drive the same in-flight-clear as the Wi-Fi disconnect path. */
+static void on_mqtt_disconnect_cb(void *ctx)
+{
+    (void)ctx;
+    device_commands_on_mqtt_disconnect();
 }
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg)
@@ -123,6 +139,11 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
 
     if (s_cfg.set_publish_ack_handler != NULL) {
         s_cfg.set_publish_ack_handler(on_publish_ack, NULL);
+    }
+    /* Clear the in-flight slot on an MQTT-level disconnect too, not just a Wi-Fi
+     * drop — otherwise a broker/TLS drop with Wi-Fi still up wedges the drain. */
+    if (s_cfg.set_disconnect_handler != NULL) {
+        s_cfg.set_disconnect_handler(on_mqtt_disconnect_cb, NULL);
     }
 
     /* PM lock for the measurement window (Phase 2). Requires CONFIG_PM_ENABLE;
@@ -714,6 +735,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
         s_inflight_measure_id = e.measure_id;
         s_inflight_msg_id     = msg_id;
+        s_inflight_since_ms   = mono_ms();
         xSemaphoreGive(s_inflight_mtx);
     } else {
         ESP_LOGW(TAG, "inflight latch failed; event may be re-published on retry");
@@ -876,11 +898,68 @@ void device_commands_on_mqtt_disconnect(void)
     bool had = (mid >= 0 && s_inflight_msg_id >= 0);
     s_inflight_measure_id = -1;
     s_inflight_msg_id     = -1;
+    s_inflight_since_ms   = 0;
     xSemaphoreGive(s_inflight_mtx);
 
     if (had && s_cfg.mark_event_pending != NULL) {
         s_cfg.mark_event_pending(mid);
     }
+}
+
+bool device_commands_reap_stale_inflight(int64_t max_age_ms)
+{
+    if (s_inflight_mtx == NULL) return false;
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    bool    stale = false;
+    int64_t mid   = -1;
+    if (s_inflight_msg_id >= 0 && (mono_ms() - s_inflight_since_ms) >= max_age_ms) {
+        stale = true;
+        mid   = s_inflight_measure_id;
+        s_inflight_measure_id = -1;
+        s_inflight_msg_id     = -1;
+        s_inflight_since_ms   = 0;
+    }
+    xSemaphoreGive(s_inflight_mtx);
+
+    if (stale) {
+        ESP_LOGW(TAG, "reaped stale in-flight publish (id=%lld) — no PUBACK in %lld ms, will re-publish",
+                 (long long)mid, (long long)max_age_ms);
+        /* mid < 0 = an injected test slot (no real event): clear only. */
+        if (mid >= 0 && s_cfg.mark_event_pending != NULL) {
+            s_cfg.mark_event_pending(mid);
+        }
+    }
+    return stale;
+}
+
+void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *age_ms)
+{
+    int     mi  = -1;
+    int64_t me  = -1;
+    int64_t age = 0;
+    if (s_inflight_mtx != NULL &&
+        xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        mi  = s_inflight_msg_id;
+        me  = s_inflight_measure_id;
+        age = (s_inflight_msg_id >= 0) ? (mono_ms() - s_inflight_since_ms) : 0;
+        xSemaphoreGive(s_inflight_mtx);
+    }
+    if (msg_id)     *msg_id     = mi;
+    if (measure_id) *measure_id = me;
+    if (age_ms)     *age_ms     = age;
+}
+
+void device_commands_inject_stale_inflight(void)
+{
+    if (s_inflight_mtx == NULL) return;
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    s_inflight_measure_id = -1;          /* no real event — reaper won't touch data */
+    s_inflight_msg_id     = 0x7FFFFFFF;  /* bogus msg_id no PUBACK will ever match */
+    /* Back-date the latch a full 10 min so age >= any reap threshold immediately,
+     * independent of current uptime (age == mono_ms() - since_ms == 10 min here). */
+    s_inflight_since_ms   = mono_ms() - (10 * 60 * 1000);
+    xSemaphoreGive(s_inflight_mtx);
+    ESP_LOGW(TAG, "injected fake stale in-flight slot (test hook) — expect a reap on next drain");
 }
 
 /* ── Measurement-activity gate ──────────────────────────────────────────

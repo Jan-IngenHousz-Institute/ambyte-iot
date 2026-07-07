@@ -32,6 +32,7 @@ message_publish_fn                  mqtt_client_get_publish_fn(void);
 message_is_connected_fn             mqtt_client_get_is_connected_fn(void);
 message_set_publish_ack_handler_fn  mqtt_client_get_set_ack_handler_fn(void);
 message_set_received_handler_fn     mqtt_client_get_set_received_handler_fn(void);
+message_set_disconnect_handler_fn   mqtt_client_get_set_disconnect_handler_fn(void);
 
 #ifdef __cplusplus
 }

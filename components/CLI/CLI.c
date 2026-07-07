@@ -20,6 +20,7 @@
 #include "device_commands.h"
 #include "uart_sensors.h"
 #include "lua_runner.h"
+#include "sync_runner.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
@@ -613,6 +614,38 @@ static int cli_cmd_pwm(int argc, char **argv)
     cmd_result_t res = cmd_pwm(duty, freq, enable);
     printf("%s\r\n", res.message);
     return (res.status == ESP_OK) ? 0 : 1;
+}
+
+/* inflight                → print the MQTT in-flight publish slot (msg_id, measure_id, age)
+ * inflight stall          → inject a fake stale slot + kick the sync runner; the
+ *                           reaper should clear it within one drain cycle. This
+ *                           validates the lost-PUBACK wedge fix without having to
+ *                           engineer a real dropped ack. */
+static int cli_cmd_inflight(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "stall") == 0) {
+        device_commands_inject_stale_inflight();
+        sync_runner_notify();   /* wake a drain so the reaper runs now */
+        printf("injected stale in-flight slot; kicked sync runner.\r\n"
+               "watch for 'reaped stale in-flight publish', then run 'inflight' "
+               "again — it should read idle.\r\n");
+        return 0;
+    }
+    if (argc >= 2) {
+        printf("Usage: inflight [stall]\r\n");
+        return 1;
+    }
+
+    int     msg_id = -1;
+    int64_t measure_id = -1, age_ms = 0;
+    device_commands_inflight_status(&msg_id, &measure_id, &age_ms);
+    if (msg_id < 0) {
+        printf("in-flight: idle (no publish awaiting PUBACK)\r\n");
+    } else {
+        printf("in-flight: msg_id=%d measure_id=%lld age=%lld ms\r\n",
+               msg_id, (long long)measure_id, (long long)age_ms);
+    }
+    return 0;
 }
 
 static int cli_cmd_reboot(int argc, char **argv)
@@ -1210,6 +1243,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "restart the device",
         .func    = cli_cmd_reboot,
     };
+    static const esp_console_cmd_t inflight_cmd = {
+        .command = "inflight",
+        .help    = "inflight | inflight stall  show/exercise the MQTT in-flight publish slot",
+        .func    = cli_cmd_inflight,
+    };
     static const esp_console_cmd_t ota_status_cmd = {
         .command = "ota_status",
         .help    = "show running/boot/next OTA partition + rollback state",
@@ -1354,6 +1392,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&reboot_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&inflight_cmd);
     if (err != ESP_OK) {
         return err;
     }
