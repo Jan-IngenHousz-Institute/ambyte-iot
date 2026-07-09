@@ -419,6 +419,10 @@ LICENSE              # CERN-OHL-S v2
 - AMBIT version-drift detection (target detected, out-of-date channel flagged).
 - Publish-reliability in-flight-slot reaper (stall → reaped → drain intact).
 - DFS power management at `min=40` MHz (1 h clean soak).
+- Cert provisioning end-to-end (host-side NVS pre-pop): TLS connect + publish to
+  AWS IoT under the `AMBYTE_{MAC}` client identity.
+- Large-publish defer-gate (no more TLS-write failure → MQTT drop on a
+  fragmented heap; the drain stays connected and retries).
 
 **Pending / needs hardware verification:**
 - SD hot pull/reinsert recovery (builds clean; pull/reinsert HW test not yet done).
@@ -426,8 +430,23 @@ LICENSE              # CERN-OHL-S v2
 - Crash-test measurement cadence tuning (benchmark: SS @ 10 s + MPF @ 1 min).
 - Light-sleep and Wi-Fi radio gating (power management next steps).
 - Two remaining openJII partner asks on the payload schema.
+- Large arrun-trace publish fix (early event free + `OUT_CONTENT_LEN` 2048):
+  the previously-wedging ~5.4 KB trace must publish, not defer — see
+  [planning/hwtest-publish-reliability.md](planning/hwtest-publish-reliability.md).
+- Connectivity watchdog reboot (`netwd test`) with a TLS transfer in flight
+  (validates the sys_evt 6144 B stack bump on its real failure path).
+- Reaper against a REAL lost PUBACK (link up, return path blocked) + MQTT-level
+  disconnect clear with Wi-Fi associated — the synthetic `inflight stall` only
+  proves the mechanism.
+- `evlog rewind` re-queue + re-drain; fluo-drop payload shape on a live trace
+  (openJII heads-up sent before field units get the fluo-dropping build).
 
-**In flight:** branch `feature/publish-reliability-hardening` carries the in-flight-slot reaper plus uncommitted MAC tooling / reliability work (`CLI.c`, `device_commands.c/.h`, `sync_runner.c/.h`).
+**Recent (this branch, needs the HW pass above):** stale-slot reaper +
+MQTT-disconnect clear, connectivity watchdog (1 h no-PUBACK reboot), large-publish
+heap hardening (defer-gate + Lua-GC settle + early event free + 2 KiB TLS out
+records), `evlog`/`inflight`/`netwd` CLI, dropped the derived `fluo` payload key
+(computed downstream from `s_630`/`r_630`), AMBIT fw 1.0.0 SD image under
+[docs/example_sdFolder/ambit_fw/1.0.0](docs/example_sdFolder/ambit_fw/1.0.0).
 
 **Separate direction (not on this branch):** `USBHubPlan.md` proposes moving the console to a UART and using the native USB peripheral as a USB host through a powered hub, replacing the AMBIT/UART pipeline with a `usb_sensors` (CDC-ACM) component — a plan/branch, not merged.
 
