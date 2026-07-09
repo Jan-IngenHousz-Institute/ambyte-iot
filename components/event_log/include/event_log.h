@@ -1,6 +1,8 @@
 #ifndef AMBYTE_EVENT_LOG_H
 #define AMBYTE_EVENT_LOG_H
 
+#include <stdint.h>
+
 #include "esp_err.h"
 #include "persistence_port.h"
 
@@ -50,6 +52,19 @@ esp_err_t event_log_mark_event_pending(int64_t measure_id);
  * dropped as the cursor advances and drained files are deleted). */
 esp_err_t event_log_db_stats(bool *available, int64_t *total,
                              int64_t *pending, int64_t *next_id);
+
+/* Rewind the read cursor to the start of file ev-<seq>.log so that record and all
+ * newer ones revert to PENDING and re-publish. Pass seq=0 to rewind to the oldest
+ * file still on the card (re-publish everything). The target is clamped to the
+ * files actually present, the claimed in-flight slot is abandoned, and the cursor
+ * is persisted to NVS. Fills *out_seq (the clamped target) and *out_pending (a
+ * floor if the count was capped); either may be NULL. Re-publish is at-least-once,
+ * so records already delivered are re-sent and deduped downstream on measure_id. */
+esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending);
+
+/* Diagnostic: report the read cursor position and the current tail file seq. Any
+ * out-pointer may be NULL. */
+esp_err_t event_log_cursor_info(uint32_t *rd_seq, uint32_t *rd_off, uint32_t *tail_seq);
 
 /* Getters for function pointers (wired into device_commands_config_t). */
 measurement_next_id_fn            event_log_get_next_id_fn(void);

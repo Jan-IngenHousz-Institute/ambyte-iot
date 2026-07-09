@@ -21,6 +21,7 @@
 #include "uart_sensors.h"
 #include "lua_runner.h"
 #include "sync_runner.h"
+#include "event_log.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
@@ -678,6 +679,59 @@ static int cli_cmd_netwd(int argc, char **argv)
     return 0;
 }
 
+/* evlog              → print the event-log cursor + pending backlog
+ * evlog rewind       → rewind the cursor to the OLDEST file still on the card
+ *                      (re-publish everything) and kick a drain
+ * evlog rewind <seq> → rewind to ev-<seq>.log so that record and all newer ones
+ *                      revert to PENDING and re-publish. There is no per-record
+ *                      state in the .log files — a record is PENDING iff it sits
+ *                      at/after the NVS read cursor — so this is how you force
+ *                      re-delivery without editing the SD files. At-least-once:
+ *                      already-delivered records are re-sent and deduped
+ *                      downstream on measure_id. */
+static int cli_cmd_evlog(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "rewind") == 0) {
+        uint32_t seq = 0;                       /* 0 = oldest file present (everything) */
+        if (argc >= 3) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || v == 0 || v > 0xFFFFFFFFUL) {
+                printf("Usage: evlog rewind [<seq>]   (seq = the ev-<seq>.log file number, >= 1)\r\n");
+                return 1;
+            }
+            seq = (uint32_t)v;
+        }
+        device_commands_abort_inflight();        /* free the MQTT slot so the drain re-publishes now */
+        uint32_t new_seq = 0;
+        int64_t  pending = 0;
+        esp_err_t err = event_log_rewind(seq, &new_seq, &pending);
+        if (err != ESP_OK) {
+            printf("evlog rewind failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        sync_runner_notify();                    /* wake a drain immediately */
+        printf("cursor rewound to ev-%06u.log — %lld record(s) pending; draining now.\r\n",
+               (unsigned)new_seq, (long long)pending);
+        return 0;
+    }
+    if (argc >= 2) {
+        printf("Usage: evlog [rewind [<seq>]]\r\n");
+        return 1;
+    }
+
+    bool     available = false;
+    int64_t  pending = 0, next_id = 0;
+    uint32_t rd_seq = 0, rd_off = 0, tail_seq = 0;
+    event_log_db_stats(&available, NULL, &pending, &next_id);
+    event_log_cursor_info(&rd_seq, &rd_off, &tail_seq);
+    printf("event log: %s\r\n", available ? "available" : "OFFLINE (SD not mounted?)");
+    printf(" - cursor: ev-%06u.log @ off %u  (tail ev-%06u.log)\r\n",
+           (unsigned)rd_seq, (unsigned)rd_off, (unsigned)tail_seq);
+    printf(" - pending: %lld   next_id: %lld\r\n", (long long)pending, (long long)next_id);
+    return 0;
+}
+
 static int cli_cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -1283,6 +1337,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "netwd | netwd test  show/force the connectivity watchdog (test reboots)",
         .func    = cli_cmd_netwd,
     };
+    static const esp_console_cmd_t evlog_cmd = {
+        .command = "evlog",
+        .help    = "evlog | evlog rewind [<seq>]  show cursor / re-queue records to PENDING",
+        .func    = cli_cmd_evlog,
+    };
     static const esp_console_cmd_t ota_status_cmd = {
         .command = "ota_status",
         .help    = "show running/boot/next OTA partition + rollback state",
@@ -1437,6 +1496,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&netwd_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&evlog_cmd);
     if (err != ESP_OK) {
         return err;
     }

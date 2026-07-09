@@ -20,6 +20,12 @@ esp_err_t lua_runner_stop(uint32_t wait_ms);
  * stopped). Probe for the status-LED blinker's "measuring" state. */
 bool lua_runner_is_running(void);
 
+/* Request a full GC in the Lua VM, serviced at the next debug-hook tick in the
+ * Lua task's context. Safe to call from any task (sets a flag only). Wired into
+ * device_commands as request_gc so a large MQTT publish can de-fragment the
+ * shared heap before allocating its outbox + TLS buffers. */
+void lua_runner_request_gc(void);
+
 /* Execute a Lua snippet in a fresh, ephemeral state with the full ambyte env
  * (device/uart/db/ambit/sync globals; no `sched`). Runs in the CALLER's task,
  * in parallel with a running main.lua — remote-CLI parity, not a debugger: it

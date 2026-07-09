@@ -53,6 +53,12 @@ static TaskHandle_t s_lua_task_handle = NULL;
  * lua_runner_stop(); the script unwinds via luaL_error and the task exits. */
 static volatile bool s_should_stop = false;
 
+/* GC request inspected by the Lua debug hook. Set (from another task) by
+ * lua_runner_request_gc() so the MQTT publisher can ask the scripting VM to
+ * collect + de-fragment the shared heap before a large publish. Serviced in the
+ * Lua task's own context (the hook), which is the only safe place to touch L. */
+static volatile bool s_gc_request = false;
+
 /* Signaled by the task when it has finished cleaning up (lua_close done). Lets
  * lua_runner_stop() wait for a clean exit before lua_runner_start() spawns a
  * new task — avoids two Lua states alive at once. Created lazily. */
@@ -1103,7 +1109,8 @@ static void ambit_payload_mtx_ensure(void)
  * Returns { points=<fluor len>, stored=K, leaf_temp=degC, arrays=N }. The per-
  * point arrays are persisted to the DB (the point of the run), not materialised
  * back into Lua, to keep memory bounded for large runs. store=true persists one
- * event whose payload is {"env":[…],"fluo":[…],"s_630":[…],"r_630":[…],…}. */
+ * event whose payload is {"env":[…],"s_630":[…],"r_630":[…],…} — raw counts
+ * only; the derived fluo ratio is computed downstream from s_630/r_630. */
 /* Actinic value → AMBIT LED-current byte, matching the original WRENCH ambyte
  * (protocol.cpp::generate_arr): a negative value (-255..-1) is an exact DAC level
  * (|value|); a positive value (1..9999) is PAR in µmol → byte = par_coef × PAR,
@@ -1305,17 +1312,11 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
         else off += (size_t)_n;                                               \
     } while (0)
 
-    /* Locate the 630 nm signal/reference arrays (idx 1/2) up front so we can
-     * emit a derived "fluo" = signal/reference per sample, mirroring the AMBIT
-     * cloud variant (which computes it on-device). The binary AMBYTE wire never
-     * carries fluo, so ambyte recomputes it from the transmitted counts; r==0
-     * (reference floored on the AMBIT) → 0, %.5f to match the cloud encoding. */
-    const uart_data_array_t *s630 = NULL, *r630 = NULL;
-    for (uint8_t a = 0; a < narr; a++) {
-        if      (resp->arrays[a].index == 1) s630 = &resp->arrays[a];
-        else if (resp->arrays[a].index == 2) r630 = &resp->arrays[a];
-    }
-
+    /* The payload carries the raw transmitted counts only. The derived
+     * fluorescence ratio (fluo = s_630/r_630 per sample, r==0 → 0) is NOT
+     * emitted — it is recomputed downstream (openJII / analysis tools) from
+     * s_630 and r_630. Dropping it cut the largest arrun payloads ~31%: it was
+     * the biggest and least-compressible array (%.5f floats vs %u counts). */
     AMB_APP("{");
     bool first = true;
     for (uint8_t a = 0; a < narr && !trunc; a++) {
@@ -1323,19 +1324,6 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
         char tagbuf[12];
         const char *tag = ambit_array_tag(arr->index);
         if (tag == NULL) { snprintf(tagbuf, sizeof tagbuf, "arr%u", arr->index); tag = tagbuf; }
-
-        /* Inject "fluo" immediately before the 630 nm signal, matching the
-         * AMBIT cloud key order {…,"fluo","s_630","r_630",…}. */
-        if (arr->index == 1 && s630 && r630) {
-            AMB_APP("%s\"fluo\":[", first ? "" : ",");
-            first = false;
-            uint16_t n = s630->length < r630->length ? s630->length : r630->length;
-            for (uint16_t i = 0; i < n && !trunc; i++) {
-                double f = r630->data[i] ? (double)s630->data[i] / (double)r630->data[i] : 0.0;
-                AMB_APP("%s%.5f", i ? "," : "", f);
-            }
-            AMB_APP("]");
-        }
 
         AMB_APP("%s\"%s\":[", first ? "" : ",", tag);
         first = false;
@@ -1806,6 +1794,22 @@ static void lua_stop_hook(lua_State *L, lua_Debug *ar)
     if (s_should_stop) {
         luaL_error(L, "lua_runner: stop signaled");
     }
+    /* Service a heap-GC request from the MQTT publisher (safe here: we hold L in
+     * the Lua task). A full collect coalesces the shared heap so a large publish
+     * can find its contiguous outbox + TLS buffers. Rare (per large arrun trace). */
+    if (s_gc_request) {
+        s_gc_request = false;
+        lua_gc(L, LUA_GCCOLLECT, 0);
+    }
+}
+
+/* Ask the Lua task to run a full GC at its next hook tick (~every 1000 bytecode
+ * instructions). Safe to call from any task — it only sets a flag; the collect
+ * itself runs in the Lua task. No-op effect until the script executes bytecode
+ * (a script blocked in a long C call services it once it resumes). */
+void lua_runner_request_gc(void)
+{
+    s_gc_request = true;
 }
 
 static void lua_runner_task(void *arg)

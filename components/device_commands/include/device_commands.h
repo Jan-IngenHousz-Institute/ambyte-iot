@@ -66,6 +66,12 @@ typedef struct {
     uart_sensor_status_fn               uart_status;
     uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
     uart_sensor_stream_query_fn         uart_stream_query; /* multi-line until sentinel */
+
+    /* Optional heap hook: request a garbage collection in the scripting VM (wired
+     * to lua_runner_request_gc). Before a large MQTT publish the publisher asks for
+     * a GC to de-fragment the shared heap; NULL = no GC available (the publish
+     * still heap-gates and defers if the largest free block is too small). */
+    void                              (*request_gc)(void);
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -306,6 +312,13 @@ cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status);
  * disconnect — so a broker/TLS drop that leaves Wi-Fi associated still frees the
  * slot instead of wedging the drain until reboot. */
 void device_commands_on_mqtt_disconnect(void);
+
+/* Clear the in-flight publish slot WITHOUT marking the event pending — the caller
+ * has already rewound the persistence cursor (see event_log_rewind), so the event
+ * is pending by position. Frees the slot so the drain can re-publish immediately
+ * instead of waiting out the reaper. A late PUBACK for the abandoned msg_id is a
+ * no-op. Used by the `evlog rewind` CLI command. */
+void device_commands_abort_inflight(void);
 
 /* Revert a stale in-flight publish slot to PENDING if it has been latched longer
  * than max_age_ms. A lost/expired PUBACK (e.g. esp-mqtt outbox expiry) with the

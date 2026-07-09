@@ -4,6 +4,7 @@
 
 #include "device_commands.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -86,6 +87,14 @@ __attribute__((weak)) bool sync_runner_is_allowed(void)
  * or a PUBACK stalls. One measure_id = one message, one in flight at a time. */
 static void sync_runner_drain(void)
 {
+    /* Heap snapshot at each drain entry — the "heap:" line referenced in
+     * sdkconfig.defaults. Large arrun-trace publishes (~5–9 KB) fail when the
+     * largest free block can't hold the outbox item + TLS write buffer, so this
+     * is the number to watch when tuning the heap budget (Track 1). */
+    ESP_LOGI(TAG, "heap: free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
     int ack_polls = 0;
     while (sync_runner_is_allowed()) {
         cmd_result_t res = cmd_mqtt_publish_next_event();

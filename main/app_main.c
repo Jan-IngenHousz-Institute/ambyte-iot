@@ -21,6 +21,7 @@
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -748,6 +749,7 @@ void app_main(void)
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
+        .request_gc             = lua_runner_request_gc,
     };
     device_commands_init(&cmd_cfg);
 
@@ -787,6 +789,7 @@ void app_main(void)
         (void)ambit_flash_check();
     }
 
-    ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu",
-             (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }

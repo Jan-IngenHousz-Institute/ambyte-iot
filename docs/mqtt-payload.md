@@ -108,7 +108,7 @@ data=, metadata=, channel= }` remains for derived/custom script events.
 
 | Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun <len>,<persist>,<bytes…>` | `{"env":[…],"fluo":[…],"s_630":[…],"r_630":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` (730 arrays only on IR-enabled traces) |
+| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun <len>,<persist>,<bytes…>` | `{"env":[…],"s_630":[…],"r_630":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` (730 arrays only on IR-enabled traces) |
 | Spectrum + PAR (`ambit.spec`) | `uart_<ch>` | `ambit` | `get_par` | `{"spec":[10 ints],"par":f}` |
 | Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
 | BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
@@ -157,12 +157,14 @@ uint32 counts. `metadata.segments` carries the wire-encoded stimulus
 (`actinic` is the DAC byte after PAR→current conversion, not the requested
 PAR value).
 
-A derived `fluo` key (not an array index) is emitted immediately before
-`s_630`: `fluo[i] = s_630[i] / r_630[i]` per sample (`%.5f`; `r_630==0` → `0`),
-mirroring the AMBIT cloud variant. The binary AMBYTE wire never carries `fluo`
-— ambyte recomputes it from the transmitted `s_630`/`r_630` counts, so it is
-schema-compatible with, but not guaranteed bit-identical to, an AMBIT-direct
-trace (which computes it pre-flooring).
+**No derived `fluo` key.** The payload carries raw counts only; the
+fluorescence ratio is computed downstream as `fluo[i] = s_630[i] / r_630[i]`
+per sample (`r_630==0` → `0`) by openJII / analysis tools. (Earlier firmware
+emitted a device-computed `fluo` array before `s_630`, mirroring the AMBIT
+cloud variant; it was dropped because it was the largest array in the payload
+— ~31% of a big arrun trace — and fully derivable. Events stored by older
+firmware, including any backlog still on SD cards, publish with the `fluo`
+key present, so consumers should treat it as optional during the transition.)
 
 ## Delivery semantics
 

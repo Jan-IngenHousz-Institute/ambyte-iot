@@ -114,6 +114,29 @@ static bool parse_ev_name(const char *name, uint32_t *seq)
     return true;
 }
 
+/* Scan EVLOG_DIR for the lowest/highest ev-NNNNNN.log seq present. Returns true
+ * if any log file exists (then min_seq and max_seq are filled). Caller holds
+ * s_mtx (or is single-threaded at init). */
+static bool evlog_scan_range_locked(uint32_t *min_seq, uint32_t *max_seq)
+{
+    uint32_t mn = 0, mx = 0;
+    bool any = false;
+    DIR *d = opendir(EVLOG_DIR);
+    if (d != NULL) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            uint32_t seq;
+            if (parse_ev_name(ent->d_name, &seq)) {
+                if (!any) { mn = mx = seq; any = true; }
+                else { if (seq < mn) mn = seq; if (seq > mx) mx = seq; }
+            }
+        }
+        closedir(d);
+    }
+    if (any) { if (min_seq) *min_seq = mn; if (max_seq) *max_seq = mx; }
+    return any;
+}
+
 /* channel/device/tag/cmd_raw are the only raw fields → strip tab/newline/control
  * so they can't break the line framing; they're short controlled strings anyway. */
 static void sanitize_field(char *dst, size_t cap, const char *src)
@@ -192,13 +215,14 @@ static int64_t evlog_tail_max_id_locked(void)
  * store/claim/drain — no concurrent FATFS handles) but only briefly (≤EVLOG_SCAN_MAX_MS).
  * next_id was already seeded synchronously in evlog_open_locked, so a partial count
  * never risks id collisions. */
-static void evlog_count_task(void *arg)
+/* Count PENDING records from the cursor (s_rd_seq/off) to the tail, BOUNDED by
+ * line count and wall-clock so a huge backlog can't churn on. *capped_out (may be
+ * NULL) is set true if a bound was hit — then the return is a floor (true ≥ it).
+ * Caller holds s_mtx; uses the shared s_line buffer. */
+static int64_t evlog_scan_pending_locked(bool *capped_out)
 {
-    (void)arg;
     int64_t pending = 0;
     bool    capped  = false;
-
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
     const TickType_t t0 = xTaskGetTickCount();
     for (uint32_t seq = s_rd_seq; seq <= s_tail_seq && !capped; seq++) {
         char path[64];
@@ -220,7 +244,18 @@ static void evlog_count_task(void *arg)
         }
         fclose(f);
     }
-    s_pending    = pending;
+    if (capped_out) *capped_out = capped;
+    return pending;
+}
+
+static void evlog_count_task(void *arg)
+{
+    (void)arg;
+    bool capped = false;
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_pending    = evlog_scan_pending_locked(&capped);
+    int64_t pending = s_pending;
     s_count_task = NULL;
     xSemaphoreGive(s_mtx);
 
@@ -291,20 +326,9 @@ static esp_err_t evlog_open_locked(void)
     mkdir(EVLOG_DIR, 0777);
 
     uint32_t min_seq = 0, max_seq = 0;
-    bool any = false;
-    DIR *d = opendir(EVLOG_DIR);
-    if (d != NULL) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            uint32_t seq;
-            if (parse_ev_name(ent->d_name, &seq)) {
-                if (!any) { min_seq = max_seq = seq; any = true; }
-                else { if (seq < min_seq) min_seq = seq; if (seq > max_seq) max_seq = seq; }
-            }
-        }
-        closedir(d);
+    if (!evlog_scan_range_locked(&min_seq, &max_seq)) {
+        min_seq = max_seq = 1;               /* fresh — tail created by fopen("a") below */
     }
-    if (!any) { min_seq = max_seq = 1; }     /* fresh — tail created by fopen("a") below */
     s_tail_seq = max_seq;
 
     /* Read cursor; default to the oldest file. */
@@ -705,6 +729,58 @@ esp_err_t event_log_mark_event_pending(int64_t measure_id)
     if (s_inflight_active && measure_id == s_inflight_id) {
         s_inflight_active = false;           /* cursor unchanged → re-read next claim */
     }
+    xSemaphoreGive(s_mtx);
+    return ESP_OK;
+}
+
+esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_SUPPORTED; }
+
+    /* Clamp the target to the files actually on the card. Drained files were
+     * deleted, so the oldest present file (min_seq) is as far back as we can go;
+     * seq==0 means "the oldest file" (re-publish everything still on the card). */
+    uint32_t min_seq = 0, max_seq = 0;
+    if (!evlog_scan_range_locked(&min_seq, &max_seq)) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_NOT_FOUND;            /* no log files to rewind to */
+    }
+    uint32_t target = (seq == 0) ? min_seq : seq;
+    if (target < min_seq) target = min_seq;
+    if (target > max_seq) target = max_seq;
+    /* Rewind only: never advance the cursor forward, which would skip still-pending
+     * records and orphan their files (they're deleted only as the reader passes
+     * them). A forward request is clamped back to the current cursor file. */
+    if (target > s_rd_seq) target = s_rd_seq;
+
+    s_rd_seq          = target;
+    s_rd_off          = 0;
+    s_inflight_active = false;               /* abandon any claimed slot; a stale PUBACK
+                                              * for it is now a no-op (guarded on active) */
+    evlog_persist_cursor_locked();
+
+    bool capped = false;
+    s_pending = evlog_scan_pending_locked(&capped);
+    int64_t pending = s_pending;
+
+    if (out_seq)     *out_seq     = s_rd_seq;
+    if (out_pending) *out_pending = pending;
+    xSemaphoreGive(s_mtx);
+
+    ESP_LOGW(TAG, "cursor rewound to seq=%u off=0 — %lld%s record(s) pending, will re-publish",
+             (unsigned)target, (long long)pending, capped ? "+" : "");
+    return ESP_OK;
+}
+
+esp_err_t event_log_cursor_info(uint32_t *rd_seq, uint32_t *rd_off, uint32_t *tail_seq)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (rd_seq)   *rd_seq   = s_rd_seq;
+    if (rd_off)   *rd_off   = (uint32_t)s_rd_off;
+    if (tail_seq) *tail_seq = s_tail_seq;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
 }

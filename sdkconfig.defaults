@@ -47,9 +47,15 @@ CONFIG_FATFS_MAX_LFN=255
 # first data read. Safe to raise BECAUSE DYNAMIC_BUFFER makes this a *transient
 # per-record ceiling*, not a buffer held for the connection's life: MQTT's small
 # records still alloc small, only OTA's large records use the 16 KiB headroom. OUT
-# stays 4 KiB (asymmetric content len is enabled). Watch the sync_runner "heap:"
+# is separate (asymmetric content len is enabled). Watch the sync_runner "heap:"
 # line after this change to confirm steady-state MQTT is unaffected.
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+# OUT dropped 4 KiB -> 2 KiB: the per-write TLS buffer is allocated to this size
+# with DYNAMIC_BUFFER on, and its ~4.4 KiB alloc was the exact failure that dropped
+# MQTT while publishing a large (~5.4 KiB) arrun trace on a fragmented heap. A 2 KiB
+# out record just sends a big payload in more records (a few extra header bytes,
+# negligible) while halving that transient alloc. TX only — inbound/OTA use IN.
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
 # Dynamic TLS record buffers: free the 8 KiB IN / 4 KiB OUT record buffers
 # *between* records and reallocate per-record sized to need, instead of holding
 # all 12 KiB for the connection's lifetime. This is the targeted fix for the OOM

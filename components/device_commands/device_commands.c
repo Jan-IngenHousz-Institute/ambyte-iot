@@ -11,6 +11,7 @@
 
 #include "ambit_protocol.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_system.h"
@@ -27,6 +28,14 @@
 
 #define MQTT_TOPIC_MAX        256
 #define MQTT_PAYLOAD_MAX     (128U * 1024U)   /* AWS IoT max payload */
+
+/* Large-publish heap gate (Track 1) — see the gate in cmd_mqtt_publish_next_event.
+ * An arrun-trace envelope (~5–9 KB) needs a contiguous outbox copy plus a
+ * transient ~4.4 KB mbedTLS write buffer; a burst of small publishes fragments the
+ * heap so the largest free block can fall below that even with ample total free. */
+#define DC_LARGE_PUBLISH_BYTES     3072U   /* envelopes above this get the heap gate */
+#define DC_PUBLISH_HEAP_HEADROOM   2048U   /* floor slack atop the envelope copy (payload_json is freed pre-publish; TLS write ~2.4 KB) */
+#define DC_PUBLISH_SETTLE_MS       300U    /* let the requested GC + transient frees land before re-checking */
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
@@ -687,6 +696,42 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                + strlen(fw) + strlen(dn) + strlen(dv)
                + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts)
                + 320;                            /* fixed keys + numbers + punctuation */
+
+    /* Large-payload heap gate. Attempting a big publish into a fragmented heap
+     * fails the TLS write and drops the MQTT session, wedging the FIFO drain. For a
+     * large envelope: request a scripting-VM GC (serviced in the Lua task) and let
+     * transient buffers settle, re-check, and if the largest free block still can't
+     * hold the payload + TLS headroom (or total free is too tight for the payload +
+     * its outbox copy), DEFER — revert to PENDING and end the cycle so it retries
+     * when the heap recovers, instead of failing the publish and dropping MQTT. */
+    if (cap > DC_LARGE_PUBLISH_BYTES) {
+        /* Floor, not a tight fit: the event's JSON is freed right after the
+         * envelope is built (below) and the TLS write buffer is now ~2.4 KB
+         * (OUT_CONTENT_LEN=2048), so the publish no longer needs a ~15 KB block.
+         * We only need the envelope copy to allocate (cap, contiguous) plus rough
+         * total room for the outbox copy. Defer only when the heap is genuinely
+         * too low — attempting then would fail the TLS write and drop MQTT. */
+        size_t need_block = cap + DC_PUBLISH_HEAP_HEADROOM;
+        size_t need_free  = 2U * cap + DC_PUBLISH_HEAP_HEADROOM;
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        size_t freeb   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        if (largest < need_block || freeb < need_free) {
+            if (s_cfg.request_gc != NULL) s_cfg.request_gc();
+            vTaskDelay(pdMS_TO_TICKS(DC_PUBLISH_SETTLE_MS));
+            largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            freeb   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        }
+        if (largest < need_block || freeb < need_free) {
+            free(cmdbuf);
+            s_cfg.mark_event_pending(e.measure_id);
+            int64_t mid = e.measure_id;
+            measurement_event_free(&e);
+            return make_result(ESP_ERR_NO_MEM,
+                               "large publish deferred (heap): id=%lld ~%uB largest=%u free=%u",
+                               (long long)mid, (unsigned)cap, (unsigned)largest, (unsigned)freeb);
+        }
+    }
+
     char *payload = malloc(cap);
     if (payload == NULL) {
         free(cmdbuf);
@@ -720,6 +765,17 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
 
     size_t payload_len = (size_t)n;
+
+    /* The envelope now holds its own copy of the event's JSON, so free the claimed
+     * event's heap strings (~payload_len B: payload_json + metadata + cmd_raw)
+     * BEFORE the publish. Otherwise they sit alongside esp-mqtt's outbox copy and
+     * the mbedTLS write buffer — the ~4.6 KB payload_json alone is what pushes a
+     * large arrun trace past the largest free block. Only the heap pointers are
+     * freed/nulled; e.measure_id/tag/channel (scalar + fixed arrays) stay valid for
+     * the logging, latch, and return below, and the later measurement_event_free
+     * calls become safe no-ops. */
+    measurement_event_free(&e);
+
     if (payload_len >= MQTT_PAYLOAD_MAX) {
         ESP_LOGW(TAG, "event payload %u bytes exceeds %u; may be rejected",
                  (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
@@ -731,10 +787,25 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
              topic, (long long)e.measure_id, e.tag,
              e.channel[0] ? e.channel : "-", (unsigned)payload_len);
 
+    /* Heap probe for large payloads (arrun traces ~5–9 KB): a QoS1 publish needs
+     * a contiguous outbox copy (~payload_len) plus a transient TLS write buffer,
+     * so the largest free block — not total free — is what gates it. Logged
+     * before the attempt (and again on failure) to size the Track 1 heap work. */
+    if (payload_len > 2048) {
+        ESP_LOGW(TAG, "large publish %u B (id=%lld): heap free=%u largest=%u",
+                 (unsigned)payload_len, (long long)e.measure_id,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, payload_len, &msg_id);
     free(payload);
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "publish failed id=%lld (%u B): heap free=%u largest=%u",
+                 (long long)e.measure_id, (unsigned)payload_len,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(err, "event publish failed: %s", esp_err_to_name(err));
@@ -912,6 +983,20 @@ void device_commands_on_mqtt_disconnect(void)
     if (had && s_cfg.mark_event_pending != NULL) {
         s_cfg.mark_event_pending(mid);
     }
+}
+
+void device_commands_abort_inflight(void)
+{
+    if (s_inflight_mtx == NULL) return;
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    s_inflight_measure_id = -1;
+    s_inflight_msg_id     = -1;
+    s_inflight_since_ms   = 0;
+    xSemaphoreGive(s_inflight_mtx);
+    /* Deliberately does NOT mark_event_pending: the caller (evlog rewind) has
+     * already moved the persistence cursor, so the event is pending by position.
+     * A late PUBACK for the abandoned msg_id is a harmless no-op (the slot and the
+     * event_log claim are both cleared). */
 }
 
 bool device_commands_reap_stale_inflight(int64_t max_age_ms)
