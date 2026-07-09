@@ -324,6 +324,12 @@ void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *
  * The next sync_runner drain (kick it with sync_runner_notify) reaps it. */
 void device_commands_inject_stale_inflight(void);
 
+/* Milliseconds since the last successful PUBACK (monotonic; seeded to boot time).
+ * The connectivity watchdog uses this to detect a device that should be
+ * publishing but cannot. Returns 0 if the reading couldn't be taken (treated as
+ * healthy so the watchdog never reboots on transient contention). */
+int64_t device_commands_ms_since_publish_ok(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -28,6 +29,21 @@
  * payload buffer and cJSON tree itself, so the task stack stays light. */
 #define SYNC_RUNNER_TASK_STACK   8192
 #define SYNC_RUNNER_TASK_PRIO    3   /* below lua_runner (5), above idle */
+
+/* ── Connectivity / liveness watchdog ────────────────────────────────────
+ * A device that SHOULD be publishing (external power, valid clock, events
+ * pending) but lands no PUBACK for a long stretch is stuck in a way the normal
+ * retry paths can't clear on their own: the Wi-Fi manager has permanently given
+ * up reconnecting, an in-flight slot is wedged, or the publisher task died. The
+ * only universal recovery for an unattended remote unit is a reboot, which
+ * re-arms Wi-Fi, re-opens MQTT, and rebuilds any lost state (the SD backlog and
+ * NVS cursor survive, so nothing is lost). Runs as a SEPARATE task from the drain
+ * so it also catches a wedged/dead drain task. */
+#define SYNC_WD_TASK_NAME     "sync_wdog"
+#define SYNC_WD_TASK_STACK    4096
+#define SYNC_WD_TASK_PRIO     2                      /* mostly sleeps */
+#define SYNC_WD_TICK_MS       60000U                 /* evaluate once a minute */
+#define SYNC_WD_TIMEOUT_MS    (60LL * 60 * 1000)     /* 1 h with no PUBACK while it should publish */
 
 /* Time to wait between publish attempts while draining, to let the broker's
  * PUBACK free the single in-flight slot before the next publish. */
@@ -100,6 +116,69 @@ static void sync_runner_drain(void)
                 ESP_LOGW(TAG, "publish skipped: %s", res.message);
             }
             return;
+        }
+    }
+}
+
+/* ── Watchdog implementation ─────────────────────────────────────────────── */
+static TaskHandle_t  s_wd_task = NULL;
+static volatile bool s_wd_test = false;   /* one-shot: force a zero-timeout eval */
+
+/* Core decision, shared by the watchdog task and the status query. Fills the
+ * out-params (any may be NULL) and returns true when a reboot is warranted:
+ * publishing is allowed (external power, no measurement), the clock is valid,
+ * events are pending, AND no PUBACK has landed within timeout_ms. */
+static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
+                                         bool *clock_ok, int64_t *pending_out,
+                                         int64_t *since_out)
+{
+    bool    a = sync_runner_is_allowed();
+    bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
+    int64_t pending = 0;
+    (void)cmd_db_status(NULL, NULL, &pending, NULL);
+    int64_t since = device_commands_ms_since_publish_ok();
+
+    if (allowed)     *allowed     = a;
+    if (clock_ok)    *clock_ok    = c;
+    if (pending_out) *pending_out = pending;
+    if (since_out)   *since_out   = since;
+
+    return a && c && pending > 0 && since > timeout_ms;
+}
+
+bool sync_runner_watchdog_status(bool *allowed, bool *clock_ok, int64_t *pending,
+                                 int64_t *since_ms, int64_t *timeout_ms)
+{
+    if (timeout_ms) *timeout_ms = SYNC_WD_TIMEOUT_MS;
+    return sync_runner_wd_should_reboot(SYNC_WD_TIMEOUT_MS, allowed, clock_ok,
+                                        pending, since_ms);
+}
+
+void sync_runner_watchdog_test(void)
+{
+    s_wd_test = true;
+    if (s_wd_task != NULL) xTaskNotifyGive(s_wd_task);   /* evaluate now */
+}
+
+static void sync_runner_wd_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SYNC_WD_TICK_MS));
+
+        bool    test    = s_wd_test;
+        s_wd_test       = false;
+        /* -1 in test mode: any since (>=0) exceeds it, so a reboot fires as soon
+         * as the real guards (allowed + clock + pending) hold. */
+        int64_t timeout = test ? -1 : SYNC_WD_TIMEOUT_MS;
+
+        int64_t pending = 0, since = 0;
+        if (sync_runner_wd_should_reboot(timeout, NULL, NULL, &pending, &since)) {
+            ESP_LOGE(TAG, "connectivity watchdog%s: no successful publish for %lld ms "
+                          "(%lld pending, power+clock OK) — rebooting to recover",
+                     test ? " [TEST]" : "", (long long)since, (long long)pending);
+            vTaskDelay(pdMS_TO_TICKS(200));   /* let the line reach console + SD log */
+            esp_restart();
         }
     }
 }
@@ -186,7 +265,18 @@ esp_err_t sync_runner_start(uint32_t heartbeat_s)
     }
     /* Become the wake target for every stored event + measurement-end. */
     device_commands_set_sync_notifier(sync_runner_notify);
-    ESP_LOGI(TAG, "background sync started (wake-on-store, fallback=%u ms, heartbeat=%u s)",
-             (unsigned)SYNC_RUNNER_FALLBACK_MS, (unsigned)heartbeat_s);
+
+    /* Connectivity/liveness watchdog — separate task so it survives a wedged
+     * drain. Non-fatal if it can't start (the drain still runs). */
+    if (xTaskCreate(sync_runner_wd_task, SYNC_WD_TASK_NAME, SYNC_WD_TASK_STACK,
+                    NULL, SYNC_WD_TASK_PRIO, &s_wd_task) != pdPASS) {
+        s_wd_task = NULL;
+        ESP_LOGW(TAG, "connectivity watchdog failed to start (out of memory)");
+    }
+
+    ESP_LOGI(TAG, "background sync started (wake-on-store, fallback=%u ms, heartbeat=%u s, "
+                  "watchdog=%llu ms)",
+             (unsigned)SYNC_RUNNER_FALLBACK_MS, (unsigned)heartbeat_s,
+             (unsigned long long)SYNC_WD_TIMEOUT_MS);
     return ESP_OK;
 }

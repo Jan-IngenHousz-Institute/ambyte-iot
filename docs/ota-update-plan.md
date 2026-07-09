@@ -13,7 +13,7 @@ Lua-script push that shares the same inbound channel.
 > partner fixed the subscribe policy, so the **custom command topic works today**
 > (`device/scripts/v1/…`, SUBACK rc=1). AWS Jobs, by contrast, still needs partner
 > work the device can't self-serve: `$aws/things/<thing>/jobs/*` requires
-> `client_id == thing name` (currently `client_id=AMBYTE{MAC}` ≠ thing
+> `client_id == thing name` (currently `client_id=AMBYTE_{MAC}` ≠ thing
 > `dom_ludo_…`) **and** a separate jobs-topic policy grant. Since OTA is needed
 > now, **Stage 3 ships triggered by the working custom topic** carrying a GitHub
 > URL (the original idea); **Stage 2 (Jobs) is deferred** to a later swap of just

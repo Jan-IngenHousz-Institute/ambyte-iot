@@ -648,6 +648,36 @@ static int cli_cmd_inflight(int argc, char **argv)
     return 0;
 }
 
+/* netwd        → print the connectivity/liveness watchdog inputs + verdict
+ * netwd test   → force an immediate zero-timeout evaluation; if publishing is
+ *                allowed with pending work, the device REBOOTS now (validates the
+ *                watchdog without waiting for the real 1 h timeout). */
+static int cli_cmd_netwd(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "test") == 0) {
+        printf("connectivity watchdog: forcing a zero-timeout evaluation.\r\n"
+               "if publishing is allowed with pending work, the device REBOOTS now.\r\n");
+        sync_runner_watchdog_test();
+        return 0;
+    }
+    if (argc >= 2) {
+        printf("Usage: netwd [test]\r\n");
+        return 1;
+    }
+
+    bool    allowed = false, clock_ok = false;
+    int64_t pending = 0, since = 0, timeout = 0;
+    bool would = sync_runner_watchdog_status(&allowed, &clock_ok, &pending, &since, &timeout);
+    printf("connectivity watchdog:\r\n");
+    printf(" - publish allowed (power/measurement gate): %s\r\n", allowed ? "yes" : "no");
+    printf(" - clock valid: %s\r\n", clock_ok ? "yes" : "no");
+    printf(" - pending events: %lld\r\n", (long long)pending);
+    printf(" - since last PUBACK: %lld ms (reboot timeout %lld ms)\r\n",
+           (long long)since, (long long)timeout);
+    printf(" - would reboot now: %s\r\n", would ? "YES" : "no");
+    return 0;
+}
+
 static int cli_cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -1248,6 +1278,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "inflight | inflight stall  show/exercise the MQTT in-flight publish slot",
         .func    = cli_cmd_inflight,
     };
+    static const esp_console_cmd_t netwd_cmd = {
+        .command = "netwd",
+        .help    = "netwd | netwd test  show/force the connectivity watchdog (test reboots)",
+        .func    = cli_cmd_netwd,
+    };
     static const esp_console_cmd_t ota_status_cmd = {
         .command = "ota_status",
         .help    = "show running/boot/next OTA partition + rollback state",
@@ -1397,6 +1432,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&inflight_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&netwd_cmd);
     if (err != ESP_OK) {
         return err;
     }

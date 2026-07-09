@@ -34,7 +34,7 @@ Events publish in store order (FIFO).
 ```
 
 - `topic_root` comes from NVS (`AMBYTE_TOPIC_ROOT`, e.g.
-  `experiment/data_ingest/v1/<experiment-uuid>/multispeq/v1.0/AMBYTE{MAC}`;
+  `experiment/data_ingest/v1/<experiment-uuid>/multispeq/v1.0/AMBYTE_{MAC}`;
   the `{MAC}` token is expanded at boot to the board's STA MAC).
 - The cloud pipeline extracts `experiment_id` from the 4th topic segment;
   the `/1234` suffix is a hardcoded literal it ignores.

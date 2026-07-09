@@ -500,9 +500,9 @@ void app_main(void)
             strstr(cur_status, "a3b865d1") != NULL) {
             esp_err_t merr = device_config_set_status_topic(
                 "experiment/data_ingest/v1/665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"
-                "/multispeq/v1.0/AMBYTE{MAC}/status");
+                "/multispeq/v1.0/AMBYTE_{MAC}/status");
             ESP_LOGW(APP_TAG,
-                     "status-topic migration: a3b865d1 -> 665b6b18/.../AMBYTE{MAC}/status (%s)",
+                     "status-topic migration: a3b865d1 -> 665b6b18/.../AMBYTE_{MAC}/status (%s)",
                      esp_err_to_name(merr));
         }
     }

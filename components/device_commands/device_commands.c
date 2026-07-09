@@ -45,6 +45,10 @@ static int     s_inflight_msg_id     = -1;
 /* Monotonic (esp_timer) ms when the slot was latched; 0 when idle. Used by
  * device_commands_reap_stale_inflight() to break a wedge from a lost PUBACK. */
 static int64_t s_inflight_since_ms   = 0;
+/* Monotonic ms of the last successful PUBACK (end-to-end publish success). The
+ * connectivity watchdog uses "time since" this to detect a device that should be
+ * publishing but can't, and reboot it. Seeded to boot time in init. */
+static int64_t s_last_publish_ok_ms  = 0;
 
 /* Monotonic milliseconds since boot — independent of the wall clock (which jumps
  * on RTC sync), so it measures elapsed in-flight time correctly. */
@@ -100,6 +104,7 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
     s_inflight_measure_id = -1;
     s_inflight_msg_id     = -1;
     s_inflight_since_ms   = 0;
+    if (status == ESP_OK) s_last_publish_ok_ms = mono_ms();  /* connectivity-watchdog heartbeat */
     xSemaphoreGive(s_inflight_mtx);
 
     if (status == ESP_OK && s_cfg.mark_event_synced != NULL) {
@@ -128,6 +133,9 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     if (s_inflight_mtx == NULL) {
         s_inflight_mtx = xSemaphoreCreateMutexStatic(&s_inflight_mtx_storage);
     }
+    /* Start the watchdog "last success" clock at boot, so a device that boots
+     * with a backlog and never connects is given the full timeout before reboot. */
+    s_last_publish_ok_ms = mono_ms();
 
     uint8_t mac[6];
     if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
@@ -930,6 +938,20 @@ bool device_commands_reap_stale_inflight(int64_t max_age_ms)
         }
     }
     return stale;
+}
+
+int64_t device_commands_ms_since_publish_ok(void)
+{
+    int64_t t = 0;
+    if (s_inflight_mtx != NULL &&
+        xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        t = s_last_publish_ok_ms;
+        xSemaphoreGive(s_inflight_mtx);
+    } else {
+        return 0;   /* couldn't read — report "healthy" so the watchdog never
+                     * reboots on a transient mutex contention. */
+    }
+    return mono_ms() - t;
 }
 
 void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *age_ms)

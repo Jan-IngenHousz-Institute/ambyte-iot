@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -40,6 +41,22 @@ void sync_runner_notify(void);
  *        measurement is active AND the device is on external power.
  */
 bool sync_runner_is_allowed(void);
+
+/**
+ * @brief Report the connectivity-watchdog inputs and verdict (using the real
+ *        timeout). Any out-pointer may be NULL. Returns true if the device is
+ *        currently in the reboot-warranting state (allowed to publish, clock
+ *        valid, events pending, and no PUBACK within the timeout).
+ */
+bool sync_runner_watchdog_status(bool *allowed, bool *clock_ok, int64_t *pending,
+                                 int64_t *since_ms, int64_t *timeout_ms);
+
+/**
+ * @brief Test hook: force the watchdog to evaluate immediately with a zero
+ *        timeout. If publishing is allowed with pending work, the device reboots
+ *        now — used to validate the watchdog on hardware without waiting an hour.
+ */
+void sync_runner_watchdog_test(void);
 
 #ifdef __cplusplus
 }
