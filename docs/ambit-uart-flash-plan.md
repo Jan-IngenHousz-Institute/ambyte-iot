@@ -22,11 +22,22 @@ Progress:
 - ✅ **Phase 3 v1 (detect + report; no auto-flash)** — `ambit_flash_find_target()` picks the
   HIGHEST `/sdcard/ambit_fw/<major.minor.batch>/` folder that has all 4 region files;
   `ambit_flash_check()` reads each present AMBIT's version (cmd 33/2) and logs match / mismatch
-  (+ the exact `ambit_flash <ch> <ver>` to run). Runs once at boot (report-only) and on demand via
-  CLI `ambit_check`. Read-only + bus-mutex-serialised (safe with Lua up). Builds clean; needs HW
-  verify. Decisions: **version-named folders** + **detect-and-report only** (no autonomous flash).
+  (+ the exact `ambit_flash <ch> <ver>` to run). On demand via CLI `ambit_check`. Read-only +
+  bus-mutex-serialised (safe with Lua up). Builds clean; needs HW verify.
   NOTE: folders must be named `major.minor.batch` for the check — e.g. rename `I01` → the image's
   version (the manual `ambit_flash <ch> I01` still works with any folder name).
+- ✅ **Phase 3 full (boot auto-flash)** — `ambit_flash_boot_sync()` replaces the boot-time
+  report-only call (2026-07-10; supersedes the earlier detect-and-report-only decision):
+  runs in `app_main` BEFORE the Lua runner ever starts (UART bus free → no quiesce; console
+  already up). Pass 1 pings + reads every channel's version (cmd 33/2); pass 2 ROM-probes the
+  silent channels so **bare/bricked units** are found; every `running != target` or bare channel
+  is flashed via `ambit_flash_image()` and then version-verified. **Gating:** flash only when
+  `device_commands_publish_power_ok()` (same gate as MQTT publishing; waits up to 30 s for the
+  15 s on-dwell, skips to next boot on battery) + NVS per-channel fail cap (`ambit_fl`/`bf<ch>`,
+  3 unverified attempts per target version → give up until a different version is staged;
+  covers the mislabelled-folder reflash loop too). Deliberately NOT built on the `ambit_ota`
+  worker: its resume path restarts Lua, which would break the pre-Lua ordering. Builds clean;
+  needs HW verify (§Phase 4 matrix).
 
 ## 1. Goal
 
@@ -245,21 +256,31 @@ Flash flow per channel:
 
 Never `esp_loader_erase_flash()` whole-chip; only the four code regions are written.
 
-### 6.4 Orchestration + trigger (Phase 3)
+### 6.4 Orchestration + trigger (Phase 3) — SHIPPED 2026-07-10 as `ambit_flash_boot_sync()`
 
-Extend the existing `ambit_ota` worker (reuse its lazy task, quiesce, and status-report
-infra):
+Implemented in `components/ambit_flash` (NOT on the `ambit_ota` worker as originally sketched —
+the worker's resume path restarts Lua, which conflicts with the boot ordering below). Called
+once from `app_main` before `app_start_lua_runner()`, gated `sd_available && uart_available`:
 
-- New op "sync from SD folder": on boot and/or on command, quiesce (Lua+MQTT), for each
-  present channel run the §3 selection logic.
+- Boot ordering: CLI console first → **AMBIT sync** → Lua runner → MQTT connect + backlog
+  drain (both held by the boot-complete latch — see `on_got_ip` / `sync_runner_boot_complete`).
+  Running pre-Lua means the shared UART needs no quiesce and ROM probes (which hard-reset all
+  four AMBITs via the shared EN line) can't disturb a measurement.
+- Bare/bricked detection: channels that fail the app-level ping get `ambit_flash_probe()`;
+  a ROM SYNC answer ⇒ flashable unit with no working app ⇒ flash it.
 - **Gating** (avoid battery drain / loops):
-  - Gate the *flash* on external power present (MP2731 telemetry, already read in
-    [`main/app_main.c`](../main/app_main.c)) and/or an explicit config flag.
-  - Record `last_flashed → version` per channel in NVS; a channel that failed to confirm the
-    same target twice is not retried indefinitely (report instead).
+  - Flash only while `device_commands_publish_power_ok()` — the exact gate MQTT publishing
+    uses (VIN-present, debounced 15 s on-dwell). Polls up to 30 s for it to open, then defers
+    to the next powered boot. Dev boards without a charger are never gated.
+  - NVS fail cap: ns `ambit_fl`, key `bf<ch>` = `"<M.m.b>:<fails>"`. 3 attempts that don't end
+    version-VERIFIED at the target ⇒ that channel is skipped for that target (staging a
+    different version resets it). Counts the mislabelled-folder case (flash verifies but the
+    app reports another version) so it can't reflash every boot.
 - Version compare: parse target from the SD folder name; compare `major.minor.batch`; flash
   when `running != target` (the SD image is the source of truth — allows intentional
-  downgrade). Direction (`!=` vs `<`) is a config knob; default `!=`.
+  downgrade). Post-flash the version is re-read via cmd 33/2 (direct query — deliberately NOT
+  ping-gated: a bare unit's failed boot ping is cached for 5 min) and only a confirmed match
+  counts as success.
 
 ## 7. Reset → download-mode sequence (summary)
 

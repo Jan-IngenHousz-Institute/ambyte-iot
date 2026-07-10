@@ -15,6 +15,9 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs.h"
 
 #include "esp_loader.h"
 #include "uart_sensors.h"
@@ -312,6 +315,11 @@ static bool ver_gt(uint8_t a, uint8_t b, uint8_t c, uint8_t x, uint8_t y, uint8_
     return c > z;
 }
 
+static bool fw_matches(const ambit_fw_info_t *fw, const ambit_flash_target_t *tgt)
+{
+    return fw->major == tgt->major && fw->minor == tgt->minor && fw->batch == tgt->batch;
+}
+
 static bool dir_has_all_regions(const char *dir)
 {
     for (size_t i = 0; i < NUM_REGIONS; i++) {
@@ -396,7 +404,7 @@ int ambit_flash_check(void)
             continue;
         }
         const ambit_fw_info_t *fw = (const ambit_fw_info_t *)buf;
-        if (fw->major == tgt.major && fw->minor == tgt.minor && fw->batch == tgt.batch) {
+        if (fw_matches(fw, &tgt)) {
             ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date", ch, fw->major, fw->minor, fw->batch);
         } else {
             mismatches++;
@@ -408,4 +416,278 @@ int ambit_flash_check(void)
     }
     ESP_LOGW(TAG, "AMBIT version check: %d channel(s) differ from the SD target", mismatches);
     return mismatches;
+}
+
+/* ── boot-time auto-sync (Phase 3 full) ──────────────────────────────────── */
+
+/* Anti-brick-loop latch, NVS ns "ambit_fl", key "bf<ch>" = "<M.m.b>:<fails>".
+ * Counts attempts that did not end with the channel VERIFIED at the target —
+ * covering both flash failures and the mislabelled-folder case (flash verifies
+ * but the app inside reports a different version than the folder name, which
+ * would otherwise reflash on every boot). Staging a different target version
+ * resets the count; a verified flash clears it. */
+#define BOOT_NVS_NS          "ambit_fl"
+#define BOOT_FAIL_MAX        3
+/* device_commands' publish power gate opens after 15 s of continuous external
+ * power (5 s eval cache) — poll a little past that before giving up. */
+#define BOOT_GATE_WAIT_MS    30000
+#define BOOT_GATE_POLL_MS    2000
+/* AMBIT app boot time after the post-flash reset, before the version verify. */
+#define BOOT_VERIFY_DELAY_MS 4000
+#define BOOT_VERIFY_TRIES    2
+
+static void boot_fail_key(uint8_t ch, char *key, size_t cap)
+{
+    snprintf(key, cap, "bf%u", ch);
+}
+
+static int boot_fail_count(uint8_t ch, const char *ver)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return 0;
+    }
+    char key[8], val[24];
+    boot_fail_key(ch, key, sizeof key);
+    size_t len = sizeof val;
+    esp_err_t e = nvs_get_str(h, key, val, &len);
+    nvs_close(h);
+    if (e != ESP_OK) {
+        return 0;
+    }
+    char stored_ver[16];
+    int  fails = 0;
+    if (sscanf(val, "%15[^:]:%d", stored_ver, &fails) != 2 ||
+        strcmp(stored_ver, ver) != 0) {
+        return 0;   /* different target than the one that failed — start over */
+    }
+    return fails;
+}
+
+static void boot_fail_bump(uint8_t ch, const char *ver, int prev)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    char key[8], val[24];
+    boot_fail_key(ch, key, sizeof key);
+    snprintf(val, sizeof val, "%s:%d", ver, prev + 1);
+    if (nvs_set_str(h, key, val) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void boot_fail_clear(uint8_t ch)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    char key[8];
+    boot_fail_key(ch, key, sizeof key);
+    if (nvs_erase_key(h, key) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+/* Read one channel's running fw version via cmd 33/2. do_query does its own
+ * wake, so this works regardless of a cached ping failure (a bare unit's boot
+ * ping is fail-cached for 5 min — the post-flash verify must not consult it). */
+static bool boot_read_version(uint8_t ch, ambit_fw_info_t *fw)
+{
+    uint8_t buf[64];
+    size_t  len = 0;
+    cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW, buf, sizeof buf, &len);
+    if (r.status != ESP_OK || len < sizeof(ambit_fw_info_t)) {
+        return false;
+    }
+    memcpy(fw, buf, sizeof *fw);
+    return true;
+}
+
+int ambit_flash_boot_sync(void)
+{
+    ambit_flash_target_t tgt;
+    if (ambit_flash_find_target(&tgt) != ESP_OK) {
+        ESP_LOGI(TAG, "boot sync: no SD target image under %s — skipping", AMBIT_FW_ROOT);
+        return -1;
+    }
+    char ver[16];
+    snprintf(ver, sizeof ver, "%u.%u.%u", tgt.major, tgt.minor, tgt.batch);
+    ESP_LOGW(TAG, "boot sync: SD target v%s (%s)", ver, tgt.dir);
+
+    /* Pass 1: app-level version read for every channel (harmless to running
+     * units). Silent channels are remembered for the ROM-probe pass. */
+    enum { CH_OK, CH_STALE, CH_SILENT, CH_BARE, CH_ABSENT, CH_SKIPPED };
+    int state[UART_SENSOR_NUM_CHANNELS];
+    int fails[UART_SENSOR_NUM_CHANNELS];   /* -1 = not read from NVS yet */
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        fails[ch] = -1;
+        bool connected = false;
+        (void)cmd_uart_ping(ch, &connected);
+        if (!connected) {
+            state[ch] = CH_SILENT;
+            continue;
+        }
+        ambit_fw_info_t fw;
+        if (!boot_read_version(ch, &fw)) {
+            state[ch] = CH_SKIPPED;
+            ESP_LOGW(TAG, "  ch%u: present but version unreadable — not auto-flashing; "
+                          "run: ambit_flash %u %s", ch, ch, ver);
+            continue;
+        }
+        if (fw_matches(&fw, &tgt)) {
+            state[ch] = CH_OK;
+            ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date", ch, fw.major, fw.minor, fw.batch);
+        } else {
+            state[ch] = CH_STALE;
+            ESP_LOGW(TAG, "  ch%u: v%u.%u.%u != target v%s — will auto-flash",
+                     ch, fw.major, fw.minor, fw.batch, ver);
+        }
+    }
+
+    /* Pass 2: ROM-probe the silent channels — a bare/bricked unit has no app to
+     * answer the ping but its ROM bootloader always answers SYNC. NOTE: each
+     * probe hard-resets ALL FOUR AMBITs (shared enable line); that is why this
+     * whole function must run before Lua starts measuring — and why fail-capped
+     * channels are skipped BEFORE the probe (a capped channel would otherwise
+     * cost seconds + a gratuitous reset of the whole bank on every boot). */
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (state[ch] != CH_SILENT) {
+            continue;
+        }
+        fails[ch] = boot_fail_count(ch, ver);
+        if (fails[ch] >= BOOT_FAIL_MAX) {
+            state[ch] = CH_SKIPPED;
+            ESP_LOGE(TAG, "  ch%u: silent, %d failed auto-flash attempts for v%s — "
+                          "giving up on this target; run: ambit_flash %u %s",
+                     ch, fails[ch], ver, ch, ver);
+            continue;
+        }
+        ambit_flash_probe_result_t pr;
+        if (ambit_flash_probe(ch, &pr) != ESP_OK) {
+            state[ch] = CH_ABSENT;
+            ESP_LOGI(TAG, "  ch%u: absent", ch);
+            continue;
+        }
+        /* ROM answered, so a unit is physically there. Before declaring it bare,
+         * re-try the app version read (the probe reset it into its app; give it
+         * time to boot): the boot auto-ping's failure is fail-cached for 5 min,
+         * so a unit that was merely still booting then would otherwise be
+         * misclassified as bare and needlessly reflashed. boot_read_version
+         * bypasses the ping cache (do_query does its own wake). */
+        vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
+        ambit_fw_info_t fw;
+        if (boot_read_version(ch, &fw)) {
+            if (fw_matches(&fw, &tgt)) {
+                state[ch] = CH_OK;
+                ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date (ping glitch, app alive)",
+                         ch, fw.major, fw.minor, fw.batch);
+            } else {
+                state[ch] = CH_STALE;
+                ESP_LOGW(TAG, "  ch%u: v%u.%u.%u != target v%s — will auto-flash",
+                         ch, fw.major, fw.minor, fw.batch, ver);
+            }
+        } else {
+            state[ch] = CH_BARE;
+            ESP_LOGW(TAG, "  ch%u: no app response but ROM answered — bare/bricked "
+                          "unit, will auto-flash", ch);
+        }
+    }
+
+    /* Fail-cap filter (pass-1 stale channels) + tally. */
+    int n_need = 0, n_skipped = 0;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (state[ch] == CH_SKIPPED) {
+            n_skipped++;
+            continue;
+        }
+        if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
+            continue;
+        }
+        if (fails[ch] < 0) {
+            fails[ch] = boot_fail_count(ch, ver);
+        }
+        if (fails[ch] >= BOOT_FAIL_MAX) {
+            ESP_LOGE(TAG, "  ch%u: %d failed auto-flash attempts for v%s — giving up "
+                          "on this target; run: ambit_flash %u %s",
+                     ch, fails[ch], ver, ch, ver);
+            state[ch] = CH_SKIPPED;
+            n_skipped++;
+            continue;
+        }
+        n_need++;
+    }
+    if (n_need == 0) {
+        if (n_skipped > 0) {
+            ESP_LOGW(TAG, "boot sync: nothing to auto-flash, but %d channel(s) were "
+                          "SKIPPED (fail cap / unreadable version — see lines above)",
+                     n_skipped);
+        } else {
+            ESP_LOGW(TAG, "boot sync: all present AMBITs match v%s — nothing to flash", ver);
+        }
+        return 0;
+    }
+
+    /* Power gate — the same condition that gates MQTT publishing. The gate needs
+     * ~15 s of observed external power to open from its boot-closed state, so
+     * give it time instead of sampling once. */
+    if (!device_commands_publish_power_ok()) {
+        ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing — waiting up to %d s "
+                      "for the power gate", n_need, BOOT_GATE_WAIT_MS / 1000);
+        for (int waited = 0;
+             waited < BOOT_GATE_WAIT_MS && !device_commands_publish_power_ok();
+             waited += BOOT_GATE_POLL_MS) {
+            vTaskDelay(pdMS_TO_TICKS(BOOT_GATE_POLL_MS));
+        }
+    }
+    if (!device_commands_publish_power_ok()) {
+        ESP_LOGE(TAG, "boot sync: on battery — %d channel(s) stay on their current "
+                      "firmware until a powered boot (or run ambit_flash manually)", n_need);
+        return 0;
+    }
+
+    /* Flash + verify each channel. ~30-60 s per channel; the console is already
+     * up and Lua has not started, so the UART bus is exclusively ours. */
+    int flashed = 0;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
+            continue;
+        }
+        ESP_LOGW(TAG, "boot sync: auto-flashing ch%u -> v%s", ch, ver);
+        ambit_flash_image_result_t res;
+        bool verified = false;
+        if (ambit_flash_image(ch, tgt.dir, 0, &res) == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
+            for (int try = 0; try < BOOT_VERIFY_TRIES && !verified; try++) {
+                ambit_fw_info_t fw;
+                if (boot_read_version(ch, &fw)) {
+                    if (fw_matches(&fw, &tgt)) {
+                        verified = true;
+                    } else {
+                        ESP_LOGE(TAG, "  ch%u: flashed OK but app reports v%u.%u.%u — "
+                                      "does the folder name match the image?",
+                                 ch, fw.major, fw.minor, fw.batch);
+                        break;
+                    }
+                } else if (try + 1 < BOOT_VERIFY_TRIES) {
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+            }
+        }
+        if (verified) {
+            boot_fail_clear(ch);
+            flashed++;
+            ESP_LOGW(TAG, "  ch%u: now running v%s (verified)", ch, ver);
+        } else {
+            boot_fail_bump(ch, ver, fails[ch]);
+            ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s)",
+                     ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);
+        }
+    }
+    ESP_LOGW(TAG, "boot sync: %d/%d channel(s) flashed to v%s", flashed, n_need, ver);
+    return flashed;
 }

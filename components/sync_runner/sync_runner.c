@@ -21,6 +21,13 @@
 
 /* Stagger the first drain past boot-time noise (Wi-Fi join, TLS, DB boot scan). */
 #define SYNC_RUNNER_START_DELAY_MS  10000U
+/* The first pass additionally waits for app_main's boot-complete signal (CLI up,
+ * AMBIT auto-flash done, Lua started) so the backlog drain can never compete
+ * with the startup sequence — the fixed stagger alone was decoupled from the
+ * remaining boot work and a large backlog starved the prio-2 console. Capped so
+ * a wedged boot step can't silence the publisher forever. */
+#define SYNC_RUNNER_BOOT_WAIT_MAX_MS (5U * 60U * 1000U)
+#define SYNC_RUNNER_BOOT_POLL_MS     500U
 /* Fallback re-check when nothing notifies us — catches power-gate openings
  * (battery→external power, which is not a store event) and any missed wake.
  * Most drains are notification-driven; this is just the safety heartbeat. */
@@ -61,6 +68,13 @@
 static TaskHandle_t s_task_handle = NULL;
 /* STATUS heartbeat period (s); 0 = disabled. Set once at start. */
 static uint32_t     s_heartbeat_s = 0;
+/* Boot-complete latch — see SYNC_RUNNER_BOOT_WAIT_MAX_MS. */
+static volatile bool s_boot_complete = false;
+
+void sync_runner_boot_complete(void)
+{
+    s_boot_complete = true;
+}
 
 /* Wake the drain task. Registered as the device_commands store/measurement-end
  * notifier; also safe to call directly. No-op until the task exists. */
@@ -205,8 +219,16 @@ static void sync_runner_task(void *arg)
 {
     (void)arg;
 
-    /* Stagger the first run so we don't compete with boot-time noise
-     * (Wi-Fi join, MQTT TLS handshake, event_log boot scan). */
+    /* Hold the first pass until app_main finishes the startup sequence, then
+     * stagger past the MQTT TLS handshake that boot-complete just unlocked. */
+    for (uint32_t waited = 0;
+         !s_boot_complete && waited < SYNC_RUNNER_BOOT_WAIT_MAX_MS;
+         waited += SYNC_RUNNER_BOOT_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_BOOT_POLL_MS));
+    }
+    if (!s_boot_complete) {
+        ESP_LOGW(TAG, "boot-complete signal never arrived — draining anyway");
+    }
     vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_START_DELAY_MS));
 
     /* Heartbeat bookkeeping: backdated so the first pass stores immediately

@@ -180,6 +180,45 @@ static void app_workload_resume(void)
     }
 }
 
+/* Boot-complete latch: Wi-Fi connects asynchronously, so an IP can land while
+ * app_main is still initializing — and starting the MQTT TLS handshake (plus,
+ * 10 s later, the backlog drain) at that moment starved the rest of the boot;
+ * the console REPL sometimes never came up. on_got_ip therefore PARKS the MQTT
+ * start until app_open_boot_gate() runs at the end of the startup sequence
+ * (CLI, AMBIT firmware sync, Lua). Mux-guarded: on_got_ip runs on the
+ * esp_event task, concurrent with app_main. */
+static portMUX_TYPE s_boot_mux      = portMUX_INITIALIZER_UNLOCKED;
+static bool         s_boot_complete = false;
+static bool         s_mqtt_deferred = false;
+
+static bool app_boot_is_complete(void)
+{
+    taskENTER_CRITICAL(&s_boot_mux);
+    bool done = s_boot_complete;
+    taskEXIT_CRITICAL(&s_boot_mux);
+    return done;
+}
+
+/* Open the boot gate: deferred MQTT + the upload drain may start. MUST run on
+ * EVERY app_main exit path that is reachable after the Wi-Fi connect kick-off —
+ * an early `return` that skips it parks MQTT forever (on_got_ip defers while
+ * the latch is closed) and the device never phones home. Idempotent. */
+static void app_open_boot_gate(void)
+{
+    taskENTER_CRITICAL(&s_boot_mux);
+    s_boot_complete = true;
+    bool start_mqtt = s_mqtt_deferred;
+    s_mqtt_deferred = false;
+    taskEXIT_CRITICAL(&s_boot_mux);
+    /* Skip the parked start if Wi-Fi dropped while boot was finishing — the
+     * next GOT_IP starts MQTT directly now that the latch is open. */
+    if (start_mqtt && wifi_manager_is_connected()) {
+        ESP_LOGI(APP_TAG, "boot complete — starting deferred MQTT");
+        mqtt_client_start();
+    }
+    sync_runner_boot_complete();
+}
+
 static esp_err_t app_init_i2c_and_sensors(void)
 {
     esp_err_t err = i2c_bus_init(&s_i2c_bus_cfg);
@@ -294,6 +333,13 @@ static void app_on_sd_state_change(bool mounted)
     if (mounted) {
         /* DB first (the script will hit cmd_store_event almost immediately). */
         event_log_on_sd_restored();
+        /* During boot (e.g. an SD bounce while the AMBIT firmware sync is
+         * mid-flash) leave Lua to the boot sequence — starting it here would
+         * break ambit_flash_boot_sync's pre-Lua exclusive-UART assumption. */
+        if (!app_boot_is_complete()) {
+            ESP_LOGW(APP_TAG, "SD restored during boot — Lua start left to the boot sequence");
+            return;
+        }
         esp_err_t err = lua_runner_start();
         if (err == ESP_OK) {
             ESP_LOGI(APP_TAG, "Lua runner restarted (SD inserted)");
@@ -363,6 +409,16 @@ static void app_start_cli(void)
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    taskENTER_CRITICAL(&s_boot_mux);
+    bool defer = !s_boot_complete;
+    if (defer) {
+        s_mqtt_deferred = true;
+    }
+    taskEXIT_CRITICAL(&s_boot_mux);
+    if (defer) {
+        ESP_LOGI(APP_TAG, "IP acquired — MQTT start deferred until boot completes");
+        return;
+    }
     ESP_LOGI(APP_TAG, "IP acquired — starting MQTT");
     mqtt_client_start();
 }
@@ -370,6 +426,11 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    /* A drop before boot completes cancels any parked MQTT start — the next
+     * GOT_IP re-parks (or starts) it as appropriate. */
+    taskENTER_CRITICAL(&s_boot_mux);
+    s_mqtt_deferred = false;
+    taskEXIT_CRITICAL(&s_boot_mux);
     /* Only log + tear down if MQTT was actually running. Wi-Fi reconnect
      * attempts before we ever got an IP also fire this event, and there's
      * nothing to "stop" then — wifi_manager already logs the disconnect. */
@@ -665,6 +726,9 @@ void app_main(void)
     err = app_init_i2c_and_sensors();
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "I2C startup failed: %s", esp_err_to_name(err));
+        /* Aborting boot, but Wi-Fi is already connecting: open the gate so the
+         * broken unit can still phone home over MQTT for remote diagnosis. */
+        app_open_boot_gate();
         return;
     }
 
@@ -704,6 +768,7 @@ void app_main(void)
         ESP_LOGE(APP_TAG, "SPIKE_LOG: no SD card — nothing to test");
     }
     ESP_LOGW(APP_TAG, "SPIKE_LOG build — normal startup skipped");
+    app_open_boot_gate();   /* keep MQTT-on-IP behaviour in the spike build */
     return;
 #endif
 
@@ -780,6 +845,12 @@ void app_main(void)
     };
     device_commands_init(&cmd_cfg);
 
+    /* ── CLI ──────────────────────────────────────────────────────────
+     * Console first: everything below (sync runner, AMBIT firmware sync, Lua)
+     * can take seconds to minutes, and the operator needs a live prompt while
+     * it runs. Commands degrade gracefully for anything not started yet. */
+    app_start_cli();
+
     /* ── Background MQTT sync + STATUS heartbeat ─────────────────────── */
     if (persistence_available) {
         uint32_t heartbeat_s = 300;                       /* default 5 min */
@@ -806,15 +877,22 @@ void app_main(void)
         }
     }
 
-    /* ── Start application tasks ──────────────────────────────────── */
-    app_start_lua_runner(sd_available);
-    app_start_cli();
-
-    /* Detect + report AMBIT firmware drift vs the SD target image (no auto-flash;
-     * a human runs `ambit_flash <ch> <ver>`). Read-only + bus-mutex-serialised. */
+    /* ── AMBIT firmware sync from SD ──────────────────────────────────
+     * BEFORE Lua ever starts: the shared UART is still free (no quiesce dance)
+     * and probing may hard-reset all four AMBITs. Bricked/blank units are
+     * revived via the ROM bootloader; flashing is power-gated like MQTT
+     * publishing. Detect-only `ambit_check` remains available from the CLI. */
     if (sd_available && uart_available) {
-        (void)ambit_flash_check();
+        (void)ambit_flash_boot_sync();
     }
+
+    /* ── Start the measurement loop ───────────────────────────────── */
+    app_start_lua_runner(sd_available);
+
+    /* ── Boot complete: release MQTT + the upload drain ───────────────
+     * Everything is initialized and Lua is running — the TLS handshake and
+     * backlog drain can no longer compete with the startup sequence. */
+    app_open_boot_gate();
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",
              (unsigned long)esp_get_free_heap_size(),

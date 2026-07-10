@@ -1620,6 +1620,12 @@ esp_err_t cli_start(void)
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt = "ambyte> ";
     repl_config.max_cmdline_length = 512;
+    /* The IDF default (2) parks the console below every worker on the chip
+     * (sync_runner 3, ambit_ota 4, esp-mqtt 5) — under boot/publish load the
+     * prompt starved. 6 keeps typing responsive above all of those while
+     * staying below lua_runner (10), whose measurement timing must not be
+     * preempted by console echo. */
+    repl_config.task_priority = 6;
 
     esp_err_t err = cli_create_repl(&repl_config);
     if (err != ESP_OK) {

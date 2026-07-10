@@ -81,7 +81,7 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 6. Non-blocking Wi-Fi (`wifi_manager_connect_stored_async`) + `on_got_ip`/`on_wifi_disconnect` handlers.
 7. I2C + RTC + clock bootstrap + BME280 + MP2731.
 8. `uart_sensors_init` (auto-pings 4 channels) → SD card mount → LittleFS mount → `event_log_init` → SD hot-plug monitor.
-9. `device_commands_init` (composition) → `sync_runner_start` → LED blinker → Lua runner → CLI → `ambit_flash_check` (report-only version-drift scan).
+9. `device_commands_init` (composition) → **CLI** (first, so the operator has a prompt during the rest) → `sync_runner_start` (first drain held by the boot-complete latch) → LED blinker → `ambit_flash_boot_sync` (power-gated AMBIT auto-flash from SD, pre-Lua) → Lua runner → **boot complete**: deferred MQTT start + upload drain released. (`on_got_ip` parks the MQTT start while boot is in progress so the TLS handshake/backlog can't starve the startup sequence.)
 
 ### Tasks (each created inside its own component)
 
@@ -261,7 +261,8 @@ The **AMBIT** is an external multispeq-style measurement device (leaf photosynth
 
 - **Strategy B — cooperative app-OTA over UART** ([components/ambit_ota](components/ambit_ota)): the ambyte downloads a C3 `.bin` from HTTPS to SD, then streams it in ≤200-byte CRC16 chunks (cmds 25–29) into the AMBIT's spare OTA slot with C3-side rollback. Needs a **running, cooperating** AMBIT. Trigger: CLI `ambit_ota <ch> <url>` or MQTT `{type:ambit_ota}` (`ch` can be `all`/0xFF).
 - **Strategy A — ROM-bootloader UART flasher** ([components/ambit_flash](components/ambit_flash) + vendored [components/esp_serial_flasher](components/esp_serial_flasher)): the **universal** path for **bare / bricked / pre-OTA** units. It drives the C3 hardware straps (shared `CHIP_EN` reset on IO1, per-channel `GPIO9` boot strap) to force one target into the ROM download mode, then flashes 4 region images from `/sdcard/ambit_fw/<ver>/` (`bootloader.bin@0x0`, `partitions.bin@0x8000`, `boot_app0.bin@0xe000`, `app.bin@0x10000`) with per-region MD5 verify. **NVS at `0x9000` is never written**, so per-unit AMBIT calibration survives. CLI: `ambit_probe`, `ambit_dl`, `ambit_flash <ch> <ver>`.
-- **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): at boot and on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. **Detect-and-report only — never autonomous flashing** (human decides); read-only + bus-mutex-serialised so safe with Lua active.
+- **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. Read-only + bus-mutex-serialised so safe with Lua active.
+- **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before Lua starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on the same power condition as MQTT publishing (skips to the next powered boot on battery) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
 
 ---
 
