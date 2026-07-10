@@ -34,6 +34,9 @@ typedef struct {
     measurement_claim_next_event_fn   claim_next_event;   /* used by sync_runner */
     measurement_mark_event_synced_fn  mark_event_synced;
     measurement_mark_event_pending_fn mark_event_pending;
+    measurement_quarantine_fn         quarantine_event;    /* poison-event escape (see
+                                                            * persistence_port.h); NULL =
+                                                            * a stuck event defers forever */
     measurement_db_stats_fn           db_stats;            /* read-only event-table stats */
 
     /* Status port */

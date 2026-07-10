@@ -33,6 +33,7 @@
 #define TAG "event_log"
 
 #define EVLOG_DIR            "/sdcard/events"
+#define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
 #define EVLOG_LINE_CAP       12288            /* max bytes read back per record (incl '\n') */
 #define EVLOG_MAX_RECORD     (EVLOG_LINE_CAP - 16)  /* store rejects bigger — must stay readable */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
@@ -733,6 +734,61 @@ esp_err_t event_log_mark_event_pending(int64_t measure_id)
     return ESP_OK;
 }
 
+esp_err_t event_log_quarantine_event(int64_t measure_id)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_SUPPORTED; }
+
+    /* Read the record at the cursor — same read-after-flush handshake as claim. */
+    if (s_rd_seq >= s_tail_seq) evlog_flush_writer_locked();
+    char path[64];
+    evlog_file_path(path, sizeof path, s_rd_seq);
+    FILE *rf = fopen(path, "rb");
+    if (rf == NULL) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_FOUND; }
+    if (fseek(rf, s_rd_off, SEEK_SET) != 0 ||
+        fgets(s_line, sizeof s_line, rf) == NULL) {
+        fclose(rf);
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_NOT_FOUND;
+    }
+    fclose(rf);
+
+    size_t len = strlen(s_line);
+    if (len == 0 || s_line[len - 1] != '\n') {
+        /* Torn/over-long record: claim's own skip logic owns those cases. */
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* The head record must be the event the publisher is stuck on — a moved
+     * cursor (ack raced in, rewind, reboot) must not skip an innocent record. */
+    if ((int64_t)strtoll(s_line, NULL, 10) != measure_id) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Archive FIRST — the record is only skipped once it is durably elsewhere.
+     * If the append fails, stay put and let the caller retry next cycle. */
+    FILE *qf = fopen(EVLOG_QUARANTINE, "a");
+    if (qf == NULL) { xSemaphoreGive(s_mtx); return ESP_FAIL; }
+    size_t w = fwrite(s_line, 1, len, qf);
+    fflush(qf);
+    fsync(fileno(qf));
+    fclose(qf);
+    if (w != len) { xSemaphoreGive(s_mtx); return ESP_FAIL; }
+
+    /* Advance past it — mark_synced without an ack. */
+    s_rd_off += (long)len;
+    s_inflight_active = false;
+    if (s_pending > 0) s_pending--;
+    evlog_persist_cursor_locked();
+    xSemaphoreGive(s_mtx);
+
+    ESP_LOGW(TAG, "quarantined event id=%lld (%u B) -> %s — cursor advanced, drain unblocked",
+             (long long)measure_id, (unsigned)len, EVLOG_QUARANTINE);
+    return ESP_OK;
+}
+
 esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
@@ -805,4 +861,5 @@ measurement_store_event_fn        event_log_get_store_event_fn(void)        { re
 measurement_claim_next_event_fn   event_log_get_claim_next_event_fn(void)   { return event_log_claim_next_event; }
 measurement_mark_event_synced_fn  event_log_get_mark_event_synced_fn(void)  { return event_log_mark_event_synced; }
 measurement_mark_event_pending_fn event_log_get_mark_event_pending_fn(void) { return event_log_mark_event_pending; }
+measurement_quarantine_fn         event_log_get_quarantine_fn(void)         { return event_log_quarantine_event; }
 measurement_db_stats_fn           event_log_get_db_stats_fn(void)           { return event_log_db_stats; }

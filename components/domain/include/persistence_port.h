@@ -99,6 +99,14 @@ typedef esp_err_t (*measurement_claim_next_event_fn)(measurement_event_t *out);
 typedef esp_err_t (*measurement_mark_event_synced_fn)(int64_t measure_id);
 typedef esp_err_t (*measurement_mark_event_pending_fn)(int64_t measure_id);
 
+/* Poison-event escape: archive the event at the HEAD of the publish queue to a
+ * quarantine sidecar and advance past it, so one un-publishable record (e.g. an
+ * envelope larger than the heap can ever carry) cannot head-of-line-block the
+ * whole strict-FIFO backlog forever. `measure_id` must match the head record
+ * (guards against cursor drift) — ESP_ERR_INVALID_STATE otherwise. The record
+ * is only skipped AFTER it was durably archived; nothing is deleted. */
+typedef esp_err_t (*measurement_quarantine_fn)(int64_t measure_id);
+
 /* Read-only event-table stats (no mutation). *available = DB open (SD mounted);
  * *total = row count; *pending = rows not yet synced (sync_state != SYNCED);
  * *next_id = the next measure_id to be allocated. Any out-pointer may be NULL.

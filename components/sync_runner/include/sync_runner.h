@@ -45,8 +45,11 @@ bool sync_runner_is_allowed(void);
 /**
  * @brief Report the connectivity-watchdog inputs and verdict (using the real
  *        timeout). Any out-pointer may be NULL. Returns true if the device is
- *        currently in the reboot-warranting state (allowed to publish, clock
- *        valid, events pending, and no PUBACK within the timeout).
+ *        currently in the reboot-warranting state (external power, clock valid,
+ *        events pending, and no PUBACK within the timeout). NOTE: *allowed is
+ *        the POWER gate only — the watchdog deliberately ignores the measurement
+ *        window (a near-100%-duty schedule phase-locked to the 60 s tick blinded
+ *        it in the field; the drain's own gate still honours the window).
  */
 bool sync_runner_watchdog_status(bool *allowed, bool *clock_ok, int64_t *pending,
                                  int64_t *since_ms, int64_t *timeout_ms);

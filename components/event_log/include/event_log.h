@@ -47,6 +47,12 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out);
 esp_err_t event_log_mark_event_synced(int64_t measure_id);
 esp_err_t event_log_mark_event_pending(int64_t measure_id);
 
+/* Poison-event escape (measurement_quarantine_fn): append the record at the
+ * read cursor — which must carry `measure_id` — to /sdcard/events/quarantine.log,
+ * then advance the cursor past it. Skips only after a successful archive write,
+ * so quarantined data is preserved on the card (re-ingest manually if wanted). */
+esp_err_t event_log_quarantine_event(int64_t measure_id);
+
 /* Read-only stats (see measurement_db_stats_fn). *total == *pending: every
  * record physically present in the log is not-yet-synced (synced records are
  * dropped as the cursor advances and drained files are deleted). */
@@ -72,6 +78,7 @@ measurement_store_event_fn        event_log_get_store_event_fn(void);
 measurement_claim_next_event_fn   event_log_get_claim_next_event_fn(void);
 measurement_mark_event_synced_fn  event_log_get_mark_event_synced_fn(void);
 measurement_mark_event_pending_fn event_log_get_mark_event_pending_fn(void);
+measurement_quarantine_fn         event_log_get_quarantine_fn(void);
 measurement_db_stats_fn           event_log_get_db_stats_fn(void);
 
 #ifdef __cplusplus

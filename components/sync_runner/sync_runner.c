@@ -135,13 +135,22 @@ static volatile bool s_wd_test = false;   /* one-shot: force a zero-timeout eval
 
 /* Core decision, shared by the watchdog task and the status query. Fills the
  * out-params (any may be NULL) and returns true when a reboot is warranted:
- * publishing is allowed (external power, no measurement), the clock is valid,
- * events are pending, AND no PUBACK has landed within timeout_ms. */
+ * on external power, the clock is valid, events are pending, AND no PUBACK has
+ * landed within timeout_ms.
+ *
+ * Deliberately checks the POWER gate only — NOT sync_runner_is_allowed(), which
+ * also includes the measurement window. Field data (2026-07-09, 5.6 h wedge):
+ * a 9 s measurement in a 10 s schedule keeps that gate ~closed, and the 60 s
+ * watchdog tick phase-locks to the 10 s cadence (60 = 6x10), so the watchdog
+ * sampled a closed gate every time and never fired. A 1-hour liveness watchdog
+ * must not consult a 10-second pause: if nothing has published for an hour, the
+ * momentary measurement window is irrelevant — the pipeline is stuck. A reboot
+ * mid-measurement loses at most one round; the SD backlog survives. */
 static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
                                          bool *clock_ok, int64_t *pending_out,
                                          int64_t *since_out)
 {
-    bool    a = sync_runner_is_allowed();
+    bool    a = device_commands_publish_power_ok();
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
     int64_t pending = 0;
     (void)cmd_db_status(NULL, NULL, &pending, NULL);

@@ -62,6 +62,35 @@ esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id);
  * The CLI reads versions directly instead (synchronous console output). */
 esp_err_t ambit_ota_report_versions(const char *id);
 
+/* Queue a ROM-bootloader probe of `channel` (0-3, or AMBIT_OTA_CH_ALL): drive the
+ * straps into download mode, read chip + MAC, reset back to the app, and publish
+ * one `ambit_probe` JSON report (per channel: rom+chip+mac, rom:false, or
+ * error:"bus_busy" when Lua wouldn't release the UART — indeterminate, NOT
+ * absent). Works regardless of the AMBIT's app firmware (bricked/blank units
+ * answer too) — the remote twin of the CLI `ambit_probe`.
+ *
+ * NOT harmless to measurements: the reset strap (CHIP_EN) is SHARED, so every
+ * probe hard-resets ALL FOUR AMBITs and aborts any in-progress sensor run on
+ * every channel. Lua is stopped for the (few-second) window; MQTT stays up.
+ * Never deduped (idempotent identity read); `id` only correlates the report. */
+esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id);
+
+/* Queue a full 4-region ROM flash from /sdcard/ambit_fw/<version>/ onto `channel`
+ * (0-3, or AMBIT_OTA_CH_ALL = every channel whose ROM answers a probe — including
+ * units whose app firmware is dead, which ambit_ota cannot reach). `version` must
+ * be canonical <major>.<minor>.<batch> (path-safe; each part 0-255). NVS@0x9000 is
+ * never written, so per-unit calibration survives. Quiesces Lua + MQTT for the
+ * whole sweep (~10-60 s per channel), resumes, then publishes per-channel
+ * `ambit_flash_status` reports (flash_ok / flash_failed / absent / bus_busy).
+ * `id` dedupes a retained trigger — latched (own NVS key, separate from the OTA
+ * latch) only when every ROM-answering channel flashed OK; NULL (CLI) never
+ * dedupes. A persistently-FAILING id is refused after 3 attempts (returns
+ * ESP_ERR_INVALID_STATE) so a retained trigger with a bad version/unstaged SD
+ * can't loop the disruptive sweep forever — fix the cause, retry under a new id.
+ * The SD folder must already hold the 4 region files — this path does not
+ * download. */
+esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id);
+
 #ifdef __cplusplus
 }
 #endif

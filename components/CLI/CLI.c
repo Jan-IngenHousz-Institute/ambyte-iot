@@ -670,7 +670,8 @@ static int cli_cmd_netwd(int argc, char **argv)
     int64_t pending = 0, since = 0, timeout = 0;
     bool would = sync_runner_watchdog_status(&allowed, &clock_ok, &pending, &since, &timeout);
     printf("connectivity watchdog:\r\n");
-    printf(" - publish allowed (power/measurement gate): %s\r\n", allowed ? "yes" : "no");
+    printf(" - power gate open (watchdog ignores the measurement window): %s\r\n",
+           allowed ? "yes" : "no");
     printf(" - clock valid: %s\r\n", clock_ok ? "yes" : "no");
     printf(" - pending events: %lld\r\n", (long long)pending);
     printf(" - since last PUBACK: %lld ms (reboot timeout %lld ms)\r\n",
@@ -1024,31 +1025,56 @@ static int cli_cmd_ambit_dl(int argc, char **argv)
     return (err == ESP_OK) ? 0 : 1;
 }
 
+/* Strict "<0-3>" channel parse: no trailing junk ("0all"), no bare words —
+ * atoi("ALL") would silently become channel 0 and, for ambit_flash, start an
+ * unintended ROM flash of channel 0. */
+static bool cli_parse_channel(const char *s, int *ch)
+{
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v >= UART_SENSOR_NUM_CHANNELS) {
+        return false;
+    }
+    *ch = (int)v;
+    return true;
+}
+
 /* Host-driven ROM flasher probe: force the AMBIT on <ch> into ESP32-C3 ROM
  * download mode over the FFC, connect via esp-serial-flasher, read chip + MAC,
  * then reset it back to its app. No PC/tap needed — the ambyte is the flasher.
- * Stop Lua first (`lua stop`) so the shared UART bus is free. */
+ * Stop Lua first (`lua stop`) so the shared UART bus is free. NOTE: the reset
+ * strap is shared, so a probe hard-resets ALL FOUR AMBITs. */
 static int cli_cmd_ambit_probe(int argc, char **argv)
 {
     if (argc != 2) {
-        printf("Usage: ambit_probe <0-3>   (stop Lua first: `lua stop`)\r\n");
+        printf("Usage: ambit_probe <0-3|all>   (stop Lua first: `lua stop`)\r\n");
         return 1;
     }
-    int ch = atoi(argv[1]);
-    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
-        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
-        return 1;
-    }
-    ambit_flash_probe_result_t r;
-    esp_err_t err = ambit_flash_probe((uint8_t)ch, &r);
-    if (err == ESP_OK && r.connected) {
-        printf("ch%d: AMBIT ROM OK — chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
-               ch, r.chip, r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5]);
+    int from, to;
+    if (strcmp(argv[1], "all") == 0) {
+        from = 0;
+        to   = UART_SENSOR_NUM_CHANNELS;
     } else {
-        printf("ch%d: no ROM response (%s) — check wiring / that Lua is stopped\r\n",
-               ch, esp_err_to_name(err));
+        if (!cli_parse_channel(argv[1], &from)) {
+            printf("Channel must be 0-%d or 'all'\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+            return 1;
+        }
+        to = from + 1;
     }
-    return (err == ESP_OK) ? 0 : 1;
+    int failures = 0;
+    for (int ch = from; ch < to; ch++) {
+        ambit_flash_probe_result_t r;
+        esp_err_t err = ambit_flash_probe((uint8_t)ch, &r);
+        if (err == ESP_OK && r.connected) {
+            printf("ch%d: AMBIT ROM OK — chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                   ch, r.chip, r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5]);
+        } else {
+            printf("ch%d: no ROM response (%s) — check wiring / that Lua is stopped\r\n",
+                   ch, esp_err_to_name(err));
+            failures++;
+        }
+    }
+    return (failures == 0) ? 0 : 1;
 }
 
 /* Full ROM flash of an AMBIT from an SD firmware folder (bootloader/partitions/
@@ -1058,14 +1084,43 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
 static int cli_cmd_ambit_flash(int argc, char **argv)
 {
     if (argc < 3 || argc > 4) {
-        printf("Usage: ambit_flash <0-3> <version|/sdcard/dir> [baud=460800]\r\n");
+        printf("Usage: ambit_flash <0-3|all> <version|/sdcard/dir> [baud=460800]\r\n");
         printf("  version X  => /sdcard/ambit_fw/X/{bootloader,partitions,boot_app0,app}.bin\r\n");
+        printf("  all        => queue a background sweep of every ROM-answering channel\r\n");
+        printf("                (version form only; watch the log, confirm with ambit_versions)\r\n");
         printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop Lua first.\r\n");
         return 1;
     }
-    int ch = atoi(argv[1]);
-    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
-        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+    if (strcmp(argv[1], "all") == 0) {
+        if (argv[2][0] == '/') {
+            printf("'all' takes a version (e.g. 1.0.0), not a directory\r\n");
+            return 1;
+        }
+        if (argc == 4) {
+            /* Don't silently drop it — the single-channel form honours baud. */
+            printf("'all' does not take a baud (the sweep uses the 460800 default);\r\n"
+                   "  use the single-channel form to override the link speed.\r\n");
+            return 1;
+        }
+        /* Run on the ambit_ota worker (same path as the MQTT trigger): quiesces
+         * Lua + MQTT itself and sweeps every channel whose ROM answers — a 4-
+         * channel sweep can take minutes, too long to block the console. NULL id:
+         * operator-initiated, never deduped. */
+        esp_err_t err = ambit_ota_request_flash(AMBIT_OTA_CH_ALL, argv[2], NULL);
+        if (err != ESP_OK) {
+            printf("queue failed: %s%s\r\n", esp_err_to_name(err),
+                   (err == ESP_ERR_INVALID_ARG) ? " (version must be <major>.<minor>.<batch>)" :
+                   (err == ESP_ERR_NO_MEM)      ? " (an AMBIT op is already running)" : "");
+            return 1;
+        }
+        printf("queued: flash all ROM-answering channels from /sdcard/ambit_fw/%s\r\n"
+               "  (~10-60 s per channel; Lua+MQTT pause during the sweep)\r\n"
+               "  watch the log; confirm afterward with `ambit_versions`.\r\n", argv[2]);
+        return 0;
+    }
+    int ch;
+    if (!cli_parse_channel(argv[1], &ch)) {
+        printf("Channel must be 0-%d or 'all'\r\n", UART_SENSOR_NUM_CHANNELS - 1);
         return 1;
     }
     char dir[160];
@@ -1289,12 +1344,12 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t ambit_probe_cmd = {
         .command = "ambit_probe",
-        .help    = "ambit_probe <0-3>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop Lua first)",
+        .help    = "ambit_probe <0-3|all>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop Lua first)",
         .func    = cli_cmd_ambit_probe,
     };
     static const esp_console_cmd_t ambit_flash_cmd = {
         .command = "ambit_flash",
-        .help    = "ambit_flash <0-3> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
+        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
         .func    = cli_cmd_ambit_flash,
     };
     static const esp_console_cmd_t ambit_check_cmd = {

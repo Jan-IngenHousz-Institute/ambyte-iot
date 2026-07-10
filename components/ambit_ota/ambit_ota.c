@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ambit_flash.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
 #include "esp_crt_bundle.h"
@@ -19,26 +20,41 @@
 
 #define TAG "ambit_ota"
 
-#define AMBIT_OTA_TASK_STACK   8192
+/* 10 KiB: the OTA path fit in 8 KiB, but the FLASH op adds esp-serial-flasher's
+ * connect/MD5 machinery on this same stack. The task is spawned on demand and
+ * exits when idle, so the extra 2 KiB is transient, not resident. */
+#define AMBIT_OTA_TASK_STACK   10240
 #define AMBIT_OTA_TASK_PRIO    4          /* below lua_runner(10); not latency-critical */
 #define AMBIT_OTA_URL_MAX      256
 #define AMBIT_OTA_MAX_RETRY    4          /* per-chunk resend attempts on CRC/transport error */
 #define AMBIT_OTA_REBOOT_WAIT_MS 5000     /* let the C3 reboot into the new image before re-querying */
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
-#define AMBIT_OTA_IDLE_EXIT_MS 2000   /* free the 8 KB worker stack this long after idle */
+#define AMBIT_OTA_IDLE_EXIT_MS 2000   /* free the worker stack this long after idle */
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
 
 #define NVS_NS                 "ambit_ota"
-#define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied update */
+#define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied OTA */
+#define KEY_APPLIED_FLASH      "applied_fl"   /* separate latch for ROM-flash ids: a flash
+                                               * success must not clobber the OTA latch (or
+                                               * vice versa) and un-dedupe the other op's
+                                               * retained trigger */
+#define KEY_FLASH_FAIL_ID      "fl_fail_id"   /* last FAILED flash id + attempt count: a */
+#define KEY_FLASH_FAIL_N       "fl_fail_n"    /* retained trigger with a persistent failure
+                                               * (missing SD folder, no ROM answer) must not
+                                               * bounce Lua+MQTT and hard-reset the AMBITs
+                                               * forever — cap the retries per id */
+#define AMBIT_FLASH_FAIL_MAX   3
 
 #define AMBIT_OP_OTA       0
 #define AMBIT_OP_VERSIONS  1
+#define AMBIT_OP_PROBE     2          /* ROM-bootloader probe (chip + MAC report) */
+#define AMBIT_OP_FLASH     3          /* full 4-region ROM flash from an SD folder */
 
 typedef struct {
-    uint8_t op;                       /* AMBIT_OP_OTA | AMBIT_OP_VERSIONS */
+    uint8_t op;                       /* AMBIT_OP_* */
     uint8_t channel;
-    char    url[AMBIT_OTA_URL_MAX];
+    char    url[AMBIT_OTA_URL_MAX];   /* OTA: download URL; FLASH: /sdcard/ambit_fw/<ver> dir */
     char    id[AMBIT_OTA_ID_MAX];
 } ambit_ota_req_t;
 
@@ -52,25 +68,72 @@ static SemaphoreHandle_t  s_lock;     /* guards s_task lifecycle vs enqueue */
  * retained/duplicate MQTT trigger for an already-applied id is ignored, while a
  * failed attempt stays retryable under the same id. CLI passes a NULL id (an
  * operator-initiated update is never deduped). */
-static void latch_set(const char *id)
+static void latch_set(const char *key, const char *id)
 {
     if (id == NULL || id[0] == '\0') return;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    if (nvs_set_str(h, KEY_APPLIED, id) == ESP_OK) nvs_commit(h);
+    if (nvs_set_str(h, key, id) == ESP_OK) nvs_commit(h);
     nvs_close(h);
 }
 
-static bool already_applied(const char *id)
+static bool already_applied(const char *key, const char *id)
 {
     if (id == NULL || id[0] == '\0') return false;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     char prev[AMBIT_OTA_ID_MAX] = "";
     size_t len = sizeof prev;
-    esp_err_t err = nvs_get_str(h, KEY_APPLIED, prev, &len);
+    esp_err_t err = nvs_get_str(h, key, prev, &len);
     nvs_close(h);
     return err == ESP_OK && strcmp(prev, id) == 0;
+}
+
+/* ── flash retry cap ──────────────────────────────────────────────────────
+ * A FAILED flash id is remembered with an attempt count. Success-only latching
+ * keeps transient failures retryable, but a flash whose failure is persistent
+ * (typo'd version, unstaged SD, zero ROM-answering channels) would otherwise
+ * loop forever off a retained trigger — each cycle bouncing Lua + MQTT and
+ * hard-resetting every AMBIT. After AMBIT_FLASH_FAIL_MAX attempts the id is
+ * refused; the operator retries under a fresh id once the cause is fixed. */
+static uint8_t flash_fail_count(const char *id)
+{
+    if (id == NULL || id[0] == '\0') return 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+    char prev[AMBIT_OTA_ID_MAX] = "";
+    size_t len = sizeof prev;
+    uint8_t n = 0;
+    if (nvs_get_str(h, KEY_FLASH_FAIL_ID, prev, &len) != ESP_OK ||
+        strcmp(prev, id) != 0 ||
+        nvs_get_u8(h, KEY_FLASH_FAIL_N, &n) != ESP_OK) {
+        n = 0;
+    }
+    nvs_close(h);
+    return n;
+}
+
+static void flash_fail_note(const char *id)
+{
+    if (id == NULL || id[0] == '\0') return;   /* CLI (no id): never capped */
+    uint8_t n = flash_fail_count(id);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_str(h, KEY_FLASH_FAIL_ID, id) == ESP_OK &&
+        nvs_set_u8(h, KEY_FLASH_FAIL_N, (uint8_t)(n + 1)) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void flash_fail_clear(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_erase_key(h, KEY_FLASH_FAIL_ID);
+    nvs_erase_key(h, KEY_FLASH_FAIL_N);
+    nvs_commit(h);
+    nvs_close(h);
 }
 
 /* ── best-effort status report (console always; MQTT if connected) ───────── */
@@ -88,7 +151,7 @@ static void json_escape(char *out, size_t cap, const char *in)
     out[o] = '\0';
 }
 
-static void report(const char *state, uint8_t ch, const char *id)
+static void report_as(const char *type, const char *state, uint8_t ch, const char *id)
 {
     if (s_cfg.publish == NULL || s_cfg.status_topic == NULL || s_cfg.status_topic[0] == '\0') {
         return;
@@ -100,12 +163,17 @@ static void report(const char *state, uint8_t ch, const char *id)
     json_escape(esc_id, sizeof esc_id, id);
     char msg[224];
     int n = snprintf(msg, sizeof msg,
-        "{\"type\":\"ambit_ota_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"channel\":%u,\"state\":\"%s\"}",
-        s_cfg.device_id ? s_cfg.device_id : "", esc_id, (unsigned)ch, state);
+        "{\"type\":\"%s\",\"device_id\":\"%s\",\"id\":\"%s\",\"channel\":%u,\"state\":\"%s\"}",
+        type, s_cfg.device_id ? s_cfg.device_id : "", esc_id, (unsigned)ch, state);
     if (n > 0 && (size_t)n < sizeof msg) {
         int msg_id = 0;
         s_cfg.publish(s_cfg.status_topic, msg, (size_t)n, &msg_id);
     }
+}
+
+static void report(const char *state, uint8_t ch, const char *id)
+{
+    report_as("ambit_ota_status", state, ch, id);
 }
 
 /* ── HTTP GET → file on SD ────────────────────────────────────────────────
@@ -368,7 +436,7 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
     if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
 
     if (ok) {
-        latch_set(r->id);   /* dedupe a retained trigger — only when fully successful */
+        latch_set(KEY_APPLIED, r->id);   /* dedupe a retained trigger — only when fully successful */
         ESP_LOGW(TAG, "AMBIT OTA SUCCESS (id=%s)", r->id[0] ? r->id : "(none)");
         report("success", r->channel, r->id);
     } else {
@@ -426,7 +494,187 @@ static void ambit_do_versions(const char *id)
     }
 }
 
-/* Lazy worker: spawned on demand by ambit_ota_enqueue(), exits (freeing its 8 KB
+/* ── ROM-bootloader probe sweep ───────────────────────────────────────────
+ * Drive each requested channel's straps into download mode, read chip + MAC,
+ * reset back to the app, and publish one ambit_probe JSON report. Works with no
+ * cooperating app firmware — this is how a remote operator distinguishes
+ * "bricked but flashable" from "hardware absent". Lua is stopped for the window
+ * (the flasher needs the shared UART); MQTT stays up (op takes seconds and
+ * needs no TLS heap), so the report publishes immediately. */
+static void ambit_do_probe(const ambit_ota_req_t *r)
+{
+    const bool all  = (r->channel == AMBIT_OTA_CH_ALL);
+    const uint8_t from = all ? 0 : r->channel;
+    const uint8_t to   = all ? UART_SENSOR_NUM_CHANNELS : (uint8_t)(r->channel + 1);
+    ESP_LOGW(TAG, "AMBIT probe requested: ch=%s id=%s",
+             all ? "all" : "one", r->id[0] ? r->id : "(none)");
+
+    if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
+
+    char esc_id[AMBIT_OTA_ID_MAX * 2 + 1] = "";
+    json_escape(esc_id, sizeof esc_id, r->id);
+    char buf[512];
+    int  o = snprintf(buf, sizeof buf,
+        "{\"type\":\"ambit_probe\",\"device_id\":\"%s\",\"id\":\"%s\",\"channels\":[",
+        s_cfg.device_id ? s_cfg.device_id : "", esc_id);
+
+    for (uint8_t c = from; c < to; c++) {
+        if (o < 0 || o >= (int)sizeof buf - 96) break;   /* room for one entry + "]}" */
+        const char *sep = (c == from) ? "" : ",";
+        ambit_flash_probe_result_t pr;
+        esp_err_t err = ambit_flash_probe(c, &pr);
+        if (err == ESP_OK && pr.connected) {
+            ESP_LOGW(TAG, "AMBIT%u: ROM OK chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x",
+                     c + 1, pr.chip, pr.mac[0], pr.mac[1], pr.mac[2],
+                     pr.mac[3], pr.mac[4], pr.mac[5]);
+            o += snprintf(buf + o, sizeof buf - o,
+                "%s{\"ch\":%u,\"rom\":true,\"chip\":%d,"
+                "\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}",
+                sep, c, pr.chip, pr.mac[0], pr.mac[1], pr.mac[2],
+                pr.mac[3], pr.mac[4], pr.mac[5]);
+        } else if (err == ESP_ERR_TIMEOUT) {
+            /* Couldn't take the UART bus (Lua didn't stop in time) — the channel
+             * state is UNKNOWN, not absent. Report it distinctly so a remote
+             * operator doesn't conclude "hardware dead" from a busy bus. */
+            ESP_LOGW(TAG, "AMBIT%u: bus busy — probe indeterminate", c + 1);
+            o += snprintf(buf + o, sizeof buf - o,
+                          "%s{\"ch\":%u,\"error\":\"bus_busy\"}", sep, c);
+        } else {
+            ESP_LOGW(TAG, "AMBIT%u: no ROM response (%s)", c + 1, esp_err_to_name(err));
+            o += snprintf(buf + o, sizeof buf - o, "%s{\"ch\":%u,\"rom\":false}", sep, c);
+        }
+    }
+
+    if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
+
+    if (o > 0 && o < (int)sizeof buf - 2) {
+        o += snprintf(buf + o, sizeof buf - o, "]}");
+        if (s_cfg.publish != NULL && s_cfg.status_topic != NULL && s_cfg.status_topic[0] != '\0' &&
+            (s_cfg.is_connected == NULL || s_cfg.is_connected())) {
+            int msg_id = 0;
+            s_cfg.publish(s_cfg.status_topic, buf, (size_t)o, &msg_id);
+        }
+    }
+}
+
+/* ── full ROM flash from an SD version folder ─────────────────────────────
+ * Strategy A over MQTT: flash the 4 region images (NVS@0x9000 never written) on
+ * one channel, or on every channel whose ROM answers a probe — deliberately NOT
+ * ping-gated like the OTA sweep, because reviving units whose app firmware is
+ * dead/ancient is this op's main job. Quiesces Lua + MQTT for the whole sweep
+ * (the flasher owns the UART for ~10-60 s per channel and must not compete for
+ * heap), then resumes and reports per channel. */
+static void ambit_do_flash(const ambit_ota_req_t *r)
+{
+    const bool all = (r->channel == AMBIT_OTA_CH_ALL);
+    const char *dir = r->url;
+
+    /* Re-check the dedupe latch at EXECUTION time: a duplicate delivery can pass
+     * the enqueue-time check while the first copy is still in flight (queue depth
+     * is 2), and would otherwise run a full second sweep after the first latched. */
+    if (already_applied(KEY_APPLIED_FLASH, r->id)) {
+        ESP_LOGI(TAG, "ambit_flash id=%s already applied — skipping queued duplicate", r->id);
+        return;
+    }
+    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s dir=%s id=%s",
+             all ? "all" : "one", dir, r->id[0] ? r->id : "(none)");
+
+    /* Per-channel outcome, reported after comms resume. */
+    enum { FL_SKIP = -1, FL_FAIL = 0, FL_OK = 1, FL_ABSENT = 2, FL_BUSY = 3 };
+    int8_t res[UART_SENSOR_NUM_CHANNELS];
+    memset(res, FL_SKIP, sizeof res);   /* -1 = 0xFF per byte */
+
+    if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
+    if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    bool ok = false;
+    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+        ESP_LOGE(TAG, "SD not available — no region images to flash");
+    } else if (all) {
+        int attempted = 0, ok_count = 0;
+        for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
+            ambit_flash_probe_result_t pr;
+            esp_err_t perr = ambit_flash_probe(c, &pr);
+            if (perr == ESP_ERR_TIMEOUT) {
+                /* Bus still held (Lua didn't stop) — indeterminate, not absent. */
+                ESP_LOGW(TAG, "AMBIT%u: bus busy — skipping (state unknown)", c + 1);
+                res[c] = FL_BUSY;
+                continue;
+            }
+            if (perr != ESP_OK || !pr.connected) {
+                ESP_LOGW(TAG, "AMBIT%u: no ROM response — skipping", c + 1);
+                res[c] = FL_ABSENT;
+                continue;
+            }
+            attempted++;
+            ambit_flash_image_result_t fr;
+            esp_err_t ferr = ambit_flash_image(c, dir, 0, &fr);
+            res[c] = (ferr == ESP_OK) ? FL_OK : FL_FAIL;
+            if (ferr == ESP_OK) {
+                ok_count++;
+                ESP_LOGW(TAG, "AMBIT%u: FLASH OK (%d regions, %u B)",
+                         c + 1, fr.regions_written, (unsigned)fr.total_bytes);
+            } else {
+                ESP_LOGE(TAG, "AMBIT%u: FLASH FAILED (%s) after %d region(s)",
+                         c + 1, esp_err_to_name(ferr), fr.regions_written);
+            }
+        }
+        ESP_LOGW(TAG, "AMBIT flash all: %d/%d ROM-answering channels flashed", ok_count, attempted);
+        ok = (attempted > 0 && ok_count == attempted);
+    } else {
+        ambit_flash_image_result_t fr;
+        esp_err_t ferr = ambit_flash_image(r->channel, dir, 0, &fr);
+        res[r->channel] = (ferr == ESP_OK) ? FL_OK
+                        : (ferr == ESP_ERR_TIMEOUT) ? FL_BUSY : FL_FAIL;
+        ok = (ferr == ESP_OK);
+        ESP_LOGW(TAG, "AMBIT%u: flash %s", r->channel + 1, ok ? "OK" : "FAILED");
+    }
+
+    /* Latch BEFORE comms resume: the reconnect's resubscribe redelivers a
+     * retained trigger immediately, and it must hit an already-written latch or
+     * the whole sweep runs twice. Failures bump the per-id retry cap the same
+     * way, so a persistent failure can't loop the fleet reset forever. */
+    if (ok) {
+        latch_set(KEY_APPLIED_FLASH, r->id);
+        flash_fail_clear();
+    } else {
+        flash_fail_note(r->id);
+    }
+
+    if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
+    if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
+
+    /* Give MQTT a bounded window to reconnect so the reports actually go out
+     * (report_as drops them when disconnected; the console log has them anyway). */
+    if (s_cfg.is_connected != NULL) {
+        for (int i = 0; i < 60 && !s_cfg.is_connected(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!s_cfg.is_connected()) {
+            ESP_LOGW(TAG, "MQTT not back after 30 s — flash reports dropped "
+                          "(verify by effect: ambit_versions)");
+        }
+    }
+    for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
+        if (res[c] == FL_SKIP) continue;
+        report_as("ambit_flash_status",
+                  (res[c] == FL_OK) ? "flash_ok"
+                  : (res[c] == FL_ABSENT) ? "absent"
+                  : (res[c] == FL_BUSY) ? "bus_busy" : "flash_failed",
+                  c, r->id);
+    }
+
+    if (ok) {
+        ESP_LOGW(TAG, "AMBIT FLASH SUCCESS (id=%s)", r->id[0] ? r->id : "(none)");
+        report_as("ambit_flash_status", "success", r->channel, r->id);
+    } else {
+        ESP_LOGE(TAG, "AMBIT FLASH FAILED (id=%s)", r->id[0] ? r->id : "(none)");
+        report_as("ambit_flash_status", "failed", r->channel, r->id);
+    }
+}
+
+/* Lazy worker: spawned on demand by ambit_ota_enqueue(), exits (freeing its
  * stack) once idle. This board runs near its heap limit (~17 KB largest block, no
  * PSRAM); a permanently-resident 8 KB stack for a rare maintenance op would shrink
  * the headroom the telemetry drain needs to buffer a ~4 KB AMBIT payload. The exit
@@ -438,10 +686,11 @@ static void ambit_ota_task(void *arg)
     ambit_ota_req_t r;
     for (;;) {
         if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(AMBIT_OTA_IDLE_EXIT_MS)) == pdTRUE) {
-            if (r.op == AMBIT_OP_VERSIONS) {
-                ambit_do_versions(r.id);
-            } else {
-                ambit_do_ota(&r);
+            switch (r.op) {
+            case AMBIT_OP_VERSIONS: ambit_do_versions(r.id); break;
+            case AMBIT_OP_PROBE:    ambit_do_probe(&r);      break;
+            case AMBIT_OP_FLASH:    ambit_do_flash(&r);      break;
+            default:                ambit_do_ota(&r);        break;
             }
             continue;
         }
@@ -510,9 +759,12 @@ esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
     if (url == NULL || url[0] == '\0' || strlen(url) >= AMBIT_OTA_URL_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (id != NULL && strlen(id) >= AMBIT_OTA_ID_MAX) {
+        return ESP_ERR_INVALID_ARG;   /* would truncate — the latch could never match it */
+    }
     /* Dedupe on the last successfully-applied id (idempotent under a retained
      * MQTT trigger). A NULL id (CLI) or a failed attempt is never deduped. */
-    if (already_applied(id)) {
+    if (already_applied(KEY_APPLIED, id)) {
         ESP_LOGI(TAG, "ambit_ota id=%s already applied — ignoring", id);
         return ESP_OK;
     }
@@ -531,6 +783,60 @@ esp_err_t ambit_ota_report_versions(const char *id)
     ambit_ota_req_t r;
     memset(&r, 0, sizeof r);
     r.op = AMBIT_OP_VERSIONS;
+    if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
+    return ambit_ota_enqueue(&r);
+}
+
+esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id)
+{
+    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (id != NULL && strlen(id) >= AMBIT_OTA_ID_MAX) return ESP_ERR_INVALID_ARG;
+    ambit_ota_req_t r;
+    memset(&r, 0, sizeof r);
+    r.op      = AMBIT_OP_PROBE;
+    r.channel = channel;
+    if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
+    return ambit_ota_enqueue(&r);   /* identity read: never deduped */
+}
+
+esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id)
+{
+    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Strict canonical <major>.<minor>.<batch> — the trailing %c rejects extra
+     * characters, so an MQTT-supplied version can never smuggle path segments;
+     * the folder path is rebuilt from the parsed numbers (mirrors ambit_flash's
+     * own directory-name parser). */
+    unsigned mj = 0, mn = 0, bt = 0;
+    char tail = 0;
+    if (version == NULL ||
+        sscanf(version, "%u.%u.%u%c", &mj, &mn, &bt, &tail) != 3 ||
+        mj > 255 || mn > 255 || bt > 255) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (id != NULL && strlen(id) >= AMBIT_OTA_ID_MAX) {
+        return ESP_ERR_INVALID_ARG;   /* would truncate — the latch could never match it */
+    }
+    if (already_applied(KEY_APPLIED_FLASH, id)) {
+        ESP_LOGI(TAG, "ambit_flash id=%s already applied — ignoring", id);
+        return ESP_OK;
+    }
+    if (flash_fail_count(id) >= AMBIT_FLASH_FAIL_MAX) {
+        ESP_LOGE(TAG, "ambit_flash id=%s failed %u times — refusing further retries "
+                      "(fix the cause, then retry under a NEW id)",
+                 id, AMBIT_FLASH_FAIL_MAX);
+        return ESP_ERR_INVALID_STATE;
+    }
+    ambit_ota_req_t r;
+    memset(&r, 0, sizeof r);
+    r.op      = AMBIT_OP_FLASH;
+    r.channel = channel;
+    snprintf(r.url, sizeof r.url, "/sdcard/ambit_fw/%u.%u.%u", mj, mn, bt);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     return ambit_ota_enqueue(&r);
 }

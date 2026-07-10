@@ -36,6 +36,13 @@
 #define DC_LARGE_PUBLISH_BYTES     3072U   /* envelopes above this get the heap gate */
 #define DC_PUBLISH_HEAP_HEADROOM   2048U   /* floor slack atop the envelope copy (payload_json is freed pre-publish; TLS write ~2.4 KB) */
 #define DC_PUBLISH_SETTLE_MS       300U    /* let the requested GC + transient frees land before re-checking */
+/* Poison-event escape: after this many CONSECUTIVE heap-defers/publish-failures
+ * of the SAME event, quarantine it (archive to SD + advance the cursor) so one
+ * un-publishable record can't head-of-line-block the strict FIFO forever.
+ * ~30 attempts ≈ 5 min at the observed drain cadence. Field-proven necessary
+ * (2026-07-09): a 5.4 KB old-schema trace deferred 2092x over 5.6 h, wedging
+ * ~8300 events behind it on a unit whose largest free block never recovers. */
+#define DC_PUBLISH_STUCK_MAX       30
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
@@ -587,6 +594,37 @@ cmd_result_t cmd_store_event(const measurement_event_desc_t *desc)
 /* Publish the next pending event as one MQTT message (one measure_id = one
  * message). Keeps the cloud's `sample:[…]` wrapper; the event's quantities are
  * nested under `data`. */
+/* Consecutive defer/failure counter for the event at the FIFO head. Only real
+ * publish problems count (the not-connected path returns before claiming, so a
+ * flaky link never trips this). At the cap the event is quarantined via the
+ * persistence port — archived on SD, cursor advanced, drain unblocked. Single
+ * caller task (sync_runner is the sole publisher), so plain statics suffice. */
+static int64_t s_stuck_id = -1;
+static int     s_stuck_n  = 0;
+
+static void note_publish_stuck(int64_t mid)
+{
+    if (mid != s_stuck_id) {
+        s_stuck_id = mid;
+        s_stuck_n  = 0;
+    }
+    s_stuck_n++;
+    if (s_stuck_n < DC_PUBLISH_STUCK_MAX || s_cfg.quarantine_event == NULL) return;
+
+    esp_err_t err = s_cfg.quarantine_event(mid);
+    if (err == ESP_OK) {
+        ESP_LOGE(TAG, "event id=%lld quarantined after %d consecutive failed publish "
+                      "attempts — archived on SD, drain unblocked",
+                 (long long)mid, s_stuck_n);
+        s_stuck_id = -1;
+        s_stuck_n  = 0;
+    } else {
+        ESP_LOGW(TAG, "quarantine of stuck event id=%lld failed (%s) — will retry",
+                 (long long)mid, esp_err_to_name(err));
+        s_stuck_n--;   /* hold at the cap; retry the quarantine next cycle */
+    }
+}
+
 cmd_result_t cmd_mqtt_publish_next_event(void)
 {
     if (!s_initialized || s_cfg.publish == NULL ||
@@ -726,9 +764,11 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
             s_cfg.mark_event_pending(e.measure_id);
             int64_t mid = e.measure_id;
             measurement_event_free(&e);
+            note_publish_stuck(mid);   /* repeated defers of one event → quarantine */
             return make_result(ESP_ERR_NO_MEM,
-                               "large publish deferred (heap): id=%lld ~%uB largest=%u free=%u",
-                               (long long)mid, (unsigned)cap, (unsigned)largest, (unsigned)freeb);
+                               "large publish deferred (heap): id=%lld ~%uB largest=%u free=%u (attempt %d/%d)",
+                               (long long)mid, (unsigned)cap, (unsigned)largest, (unsigned)freeb,
+                               s_stuck_n, DC_PUBLISH_STUCK_MAX);
         }
     }
 
@@ -807,9 +847,13 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         s_cfg.mark_event_pending(e.measure_id);
+        note_publish_stuck(e.measure_id);   /* repeated failures of one event → quarantine */
         measurement_event_free(&e);
         return make_result(err, "event publish failed: %s", esp_err_to_name(err));
     }
+    /* A publish went out — whatever was stuck is moving again. */
+    s_stuck_id = -1;
+    s_stuck_n  = 0;
 
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
         s_inflight_measure_id = e.measure_id;

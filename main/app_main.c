@@ -139,19 +139,45 @@ static bool app_wifi_provisioned(void)
     return provisioned;
 }
 
-/* Pause/resume the Lua measurement task for the OTA worker — stopping it during
- * the download frees its heap (8 KB AMBIT buffer + transient tables) so the
- * download's TLS doesn't fragment against concurrent measurement allocations. */
+/* Pause/resume the Lua measurement task for the maintenance workers (self-OTA,
+ * AMBIT OTA/probe/flash, script update) — stopping it frees its heap (8 KB AMBIT
+ * buffer + transient tables) and the shared UART. REFCOUNTED: the workers run on
+ * independent tasks, so overlapping suspend windows must not let one worker's
+ * resume restart Lua inside another's quiesced window. */
+static portMUX_TYPE s_workload_mux    = portMUX_INITIALIZER_UNLOCKED;
+static int          s_workload_susp_n = 0;
+
 static void app_workload_suspend(void)
 {
-    if (lua_runner_stop(5000) != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Lua task did not stop before OTA — heap may fragment");
+    taskENTER_CRITICAL(&s_workload_mux);
+    bool first = (s_workload_susp_n++ == 0);
+    taskEXIT_CRITICAL(&s_workload_mux);
+    if (first && lua_runner_stop(5000) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Lua task did not stop before the maintenance op — "
+                          "UART may be busy / heap may fragment");
     }
 }
 
 static void app_workload_resume(void)
 {
-    (void)lua_runner_start();   /* reloads /sdcard/main.lua after a failed OTA */
+    taskENTER_CRITICAL(&s_workload_mux);
+    bool last = (s_workload_susp_n > 0 && --s_workload_susp_n == 0);
+    taskEXIT_CRITICAL(&s_workload_mux);
+    if (!last) return;
+
+    /* Reloads /sdcard/main.lua. If the preceding stop TIMED OUT (script was stuck
+     * in a long C call), the old task is still unwinding and start returns
+     * INVALID_STATE — without a retry the measurement loop would silently stay
+     * dead until a manual `lua start`/reboot. Retry until the old task exits. */
+    esp_err_t err = ESP_OK;
+    for (int i = 0; i < 20; i++) {
+        err = lua_runner_start();
+        if (err != ESP_ERR_INVALID_STATE) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Lua restart after maintenance op: %s", esp_err_to_name(err));
+    }
 }
 
 static esp_err_t app_init_i2c_and_sensors(void)
@@ -732,6 +758,7 @@ void app_main(void)
         .claim_next_event   = persistence_available ? event_log_get_claim_next_event_fn()   : NULL,
         .mark_event_synced  = persistence_available ? event_log_get_mark_event_synced_fn()  : NULL,
         .mark_event_pending = persistence_available ? event_log_get_mark_event_pending_fn() : NULL,
+        .quarantine_event   = persistence_available ? event_log_get_quarantine_fn()         : NULL,
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),

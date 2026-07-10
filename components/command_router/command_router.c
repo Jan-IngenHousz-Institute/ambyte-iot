@@ -115,6 +115,71 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url=%s)", id ? id : "", ch, url);
             }
         }
+    } else if (strcmp(type, "ambit_probe") == 0) {
+        /* ROM-bootloader probe (chip + MAC) — works on bricked/blank AMBITs.
+         * {channel: 0-3 | "all" | negative}; absent = all. Publishes one
+         * ambit_probe report on the status topic. */
+        uint8_t ch = AMBIT_OTA_CH_ALL;
+        const cJSON *jch = cJSON_GetObjectItemCaseSensitive(root, "channel");
+        bool ch_ok = true;
+        if (jch != NULL) {
+            /* Integers only: 3.7 must be rejected, not silently truncated to 3. */
+            if (cJSON_IsNumber(jch) && jch->valuedouble == (double)jch->valueint) {
+                if (jch->valueint >= 0 && jch->valueint < 4) ch = (uint8_t)jch->valueint;
+                else if (jch->valueint < 0)                  ch = AMBIT_OTA_CH_ALL;
+                else                                         ch_ok = false;
+            } else if (!(cJSON_IsString(jch) && strcmp(jch->valuestring, "all") == 0)) {
+                ch_ok = false;
+            }
+        }
+        if (!ch_ok) {
+            ESP_LOGW(TAG, "ambit_probe id=%s bad 'channel' (0-3 or \"all\") — ignoring",
+                     id ? id : "");
+        } else {
+            esp_err_t err = ambit_ota_request_probe(ch, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ambit_probe id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "ambit_probe id=%s dispatched (ch=%u)", id ? id : "", ch);
+            }
+        }
+    } else if (strcmp(type, "ambit_flash") == 0) {
+        /* Full 4-region ROM flash from /sdcard/ambit_fw/<version>/ (Strategy A —
+         * revives bricked/pre-OTA units; AMBIT NVS/calibration preserved).
+         * {version:"M.m.b", channel: 0-3 | "all" | negative}; absent channel =
+         * all ROM-answering channels. The SD must already hold the folder —
+         * this path does not download. ambit_ota owns the id dedupe latch. */
+        const cJSON *jver = cJSON_GetObjectItemCaseSensitive(root, "version");
+        const char *version = cJSON_IsString(jver) ? jver->valuestring : NULL;
+        uint8_t ch = AMBIT_OTA_CH_ALL;
+        const cJSON *jch = cJSON_GetObjectItemCaseSensitive(root, "channel");
+        bool ch_ok = true;
+        if (jch != NULL) {
+            /* Integers only: 3.7 must be rejected, not silently truncated to 3. */
+            if (cJSON_IsNumber(jch) && jch->valuedouble == (double)jch->valueint) {
+                if (jch->valueint >= 0 && jch->valueint < 4) ch = (uint8_t)jch->valueint;
+                else if (jch->valueint < 0)                  ch = AMBIT_OTA_CH_ALL;
+                else                                         ch_ok = false;
+            } else if (!(cJSON_IsString(jch) && strcmp(jch->valuestring, "all") == 0)) {
+                ch_ok = false;
+            }
+        }
+        if (version == NULL) {
+            ESP_LOGW(TAG, "ambit_flash id=%s missing 'version' — ignoring", id ? id : "");
+        } else if (!ch_ok) {
+            ESP_LOGW(TAG, "ambit_flash id=%s bad 'channel' (0-3 or \"all\") — ignoring",
+                     id ? id : "");
+        } else {
+            esp_err_t err = ambit_ota_request_flash(ch, version, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatched (ch=%u ver=%s)",
+                         id ? id : "", ch, version);
+            }
+        }
     } else if (strcmp(type, "ambit_versions") == 0) {
         /* Sweep every channel's AMBIT firmware version → one ambit_versions
          * report on the status topic. Runs on the ambit_ota worker, off this
