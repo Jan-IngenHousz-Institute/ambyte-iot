@@ -1,0 +1,5 @@
+# This bundle carries build artifacts + provisioning secrets (private key,
+# Wi-Fi password). Only the flasher scripts + README are tracked; the payload
+# is transferred out-of-band, never committed.
+bin/
+reference/
