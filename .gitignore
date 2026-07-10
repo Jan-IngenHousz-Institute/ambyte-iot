@@ -9,7 +9,7 @@ flashed_macs.csv
 open-jii/
 ambit-1/
 device_certs/
-
+.pip/
 
 
 # Claude Code personal/local settings (machine-specific permissions)
