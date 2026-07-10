@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -99,42 +100,134 @@ def _find_idf() -> Path:
     return p
 
 
-def _find_idf_python() -> str:
-    """Return a Python interpreter that has the esp_idf_nvs_partition_gen module.
+# ---------------------------------------------------------------------------
+# NVS generator Python resolution
+#
+# ESP-IDF 5.5+ ships nvs_partition_gen.py as a thin wrapper around the pip
+# package below, which lives only in IDF's own venv. PlatformIO's outer penv —
+# and a uv/pyenv interpreter that happens to be running the build — do not have
+# it. We probe every known venv layout, pick the first interpreter that can
+# *actually import* the package, and (unless opted out) install it if nothing
+# has it yet.
+# ---------------------------------------------------------------------------
 
-    ESP-IDF 5.5+ split nvs_partition_gen.py into a thin wrapper around a pip
-    package. That package lives in IDF's own venv — PlatformIO ships one per
-    IDF version at ~/.platformio/penv/.espidf-X.Y.Z/. PIO's outer penv doesn't
-    have it. The lookup order:
-      1. IDF_PYTHON_ENV_PATH/{Scripts,bin}/python — the official env var.
-      2. ~/.platformio/penv/.espidf-*/{Scripts,bin}/python — PlatformIO layout.
-      3. sys.executable — fall back; only works if user installed the package
-         into the current interpreter manually.
+_NVS_MODULE = "esp_idf_nvs_partition_gen"   # importable module name
+_NVS_PYPI   = "esp-idf-nvs-partition-gen"   # PyPI project name
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _has_nvs_module(python: str) -> bool:
+    """True if `python` can import the NVS-generator package."""
+    try:
+        r = subprocess.run([python, "-c", f"import {_NVS_MODULE}"],
+                           capture_output=True, text=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def _idf_python_candidates() -> list[Path]:
+    """Ordered Python-interpreter paths that might host the NVS package.
+
+    Covers the three ways ESP-IDF's Python env lands on a machine:
+      1. IDF_PYTHON_ENV_PATH — set by IDF's export.{sh,ps1}; authoritative.
+      2. PlatformIO layout    — <core>/penv/.espidf-X.Y.Z/ (newest first,
+         honouring PLATFORMIO_CORE_DIR over the ~/.platformio default).
+      3. Standalone IDF        — ~/.espressif/python_env/idfX.Y_pyZ.Z_env/.
     """
     candidates: list[Path] = []
 
+    def add(base: Path) -> None:
+        candidates.append(base / "Scripts" / "python.exe")   # Windows
+        candidates.append(base / "bin" / "python")           # POSIX
+
     env_path = os.environ.get("IDF_PYTHON_ENV_PATH")
     if env_path:
-        candidates += [
-            Path(env_path) / "Scripts" / "python.exe",
-            Path(env_path) / "bin" / "python",
-        ]
+        add(Path(env_path))
 
-    pio_penv = Path(os.path.expanduser("~/.platformio/penv"))
+    pio_core = Path(os.environ.get("PLATFORMIO_CORE_DIR")
+                    or os.path.expanduser("~/.platformio"))
+    pio_penv = pio_core / "penv"
     if pio_penv.is_dir():
-        # Latest IDF version first — sort descending so .espidf-5.5.0 wins over
-        # leftover .espidf-4.4.7 from an older install.
+        # Newest IDF first — .espidf-5.5.0 beats a leftover .espidf-4.4.7.
         for child in sorted(pio_penv.glob(".espidf-*"), reverse=True):
-            candidates += [
-                child / "Scripts" / "python.exe",
-                child / "bin" / "python",
-            ]
+            add(child)
 
-    for candidate in candidates:
+    espressif = Path(os.path.expanduser("~/.espressif/python_env"))
+    if espressif.is_dir():
+        for child in sorted(espressif.glob("idf*_env"), reverse=True):
+            add(child)
+
+    return candidates
+
+
+def _pip_install_nvs(python: str) -> bool:
+    """Install the NVS package into `python`. Try its own pip, then uv."""
+    attempts = [[python, "-m", "pip", "install",
+                 "--disable-pip-version-check", _NVS_PYPI]]
+    uv = shutil.which("uv")
+    if uv:
+        attempts.append([uv, "pip", "install", "--python", python, _NVS_PYPI])
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError:
+            continue
+        if r.returncode == 0:
+            return True
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+    return False
+
+
+def _missing_module_help(python: str) -> str:
+    return (
+        f"nvs_partition_gen.py needs the '{_NVS_MODULE}' package, which "
+        f"{python} cannot import.\nInstall it and re-build:\n"
+        f"  {python} -m pip install {_NVS_PYPI}\n"
+        f"or, with uv:\n"
+        f"  uv pip install --python {python} {_NVS_PYPI}")
+
+
+def _find_idf_python() -> str:
+    """Return a Python interpreter that can import the NVS-generator package.
+
+    Probes every known IDF-venv layout and returns the first interpreter that
+    *actually imports* the package — a file merely existing is not enough (an
+    older .espidf-5.3.1 has nvs_partition_gen.py but not this package). If
+    nothing has it, installs it into the best target (a real IDF venv when one
+    exists, else the running interpreter) and returns that. Set
+    AMBYTE_NVS_NO_AUTOINSTALL=1 to skip the install and fail with instructions.
+    """
+    existing: list[str] = []
+    for candidate in _idf_python_candidates():
         if candidate.is_file():
-            return str(candidate)
+            path = str(candidate)
+            if _has_nvs_module(path):
+                return path
+            existing.append(path)
 
-    return sys.executable
+    # A user may have installed the package into the interpreter running the
+    # build (e.g. `uv run pio run`); accept that before trying to install.
+    if _has_nvs_module(sys.executable):
+        return sys.executable
+
+    # Nothing has it. Prefer a real IDF venv as the install home (persists per
+    # IDF version, benefits every project); else the running interpreter.
+    target = existing[0] if existing else sys.executable
+
+    if _truthy(os.environ.get("AMBYTE_NVS_NO_AUTOINSTALL")):
+        raise SystemExit(_missing_module_help(target))
+
+    print(f"ambyte-nvs: '{_NVS_MODULE}' not found - installing {_NVS_PYPI} "
+          f"into {target}", file=sys.stderr)
+    if _pip_install_nvs(target) and _has_nvs_module(target):
+        return target
+
+    raise SystemExit(_missing_module_help(target))
 
 
 def _read_pem(path_str: str) -> str:
@@ -232,10 +325,8 @@ def _run_generator(idf_path: Path, csv_path: Path, out_path: Path) -> None:
         sys.stderr.write(result.stdout)
         sys.stderr.write(result.stderr)
         raise SystemExit(
-            f"nvs_partition_gen.py failed (exit {result.returncode}). "
-            f"If you see 'No module named esp_idf_nvs_partition_gen', install it "
-            f"into the IDF Python env:\n  uv pip install --python {python} "
-            f"esp_idf_nvs_partition_gen")
+            f"nvs_partition_gen.py failed (exit {result.returncode}) using "
+            f"{python}.")
 
 
 def main() -> int:
