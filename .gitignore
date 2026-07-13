@@ -1,4 +1,5 @@
 .*/
+!.github/
 .env
 __pycache__/
 build/
@@ -9,8 +10,8 @@ flashed_macs.csv
 open-jii/
 ambit-1/
 device_certs/
-.pip/
-.flash/*
+pip/
+/flash/
 
 # Claude Code personal/local settings (machine-specific permissions)
 .claude/settings.local.json
