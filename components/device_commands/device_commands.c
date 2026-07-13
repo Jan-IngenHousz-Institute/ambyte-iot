@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "cJSON.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -1368,8 +1369,20 @@ cmd_result_t cmd_usb_text_query(uint8_t channel,
             }
 
             if (pj != NULL) {
-                esp_err_t store_err = s_cfg.store_event(mid, "co2dot", sensor,
-                                                        start_ms_val, end_ms_val, NULL, pj);
+                char channel_str[12];
+                snprintf(channel_str, sizeof(channel_str), "usb_ch%u", channel);
+                const measurement_event_desc_t desc = {
+                    .measure_id    = mid,
+                    .channel       = channel_str,
+                    .device        = sensor,
+                    .tag           = MEASUREMENT_TAG_MEASUREMENT,
+                    .cmd_raw       = cmd,
+                    .start_ms      = start_ms_val,
+                    .end_ms        = end_ms_val,
+                    .metadata_json = NULL,
+                    .payload_json  = pj,
+                };
+                esp_err_t store_err = s_cfg.store_event(&desc);
                 if (pj_is_cjson) {
                     free(pj);
                 }
