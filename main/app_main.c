@@ -548,6 +548,11 @@ void app_main(void)
     if (device_config_get_device_name(device_name, sizeof(device_name)) != ESP_OK) {
         device_name[0] = '\0';
     }
+    /* Expand {MAC} in device_name too — same placeholder support as client-id/
+     * topic-root above, so a shared .env (AMBYTE_DEVICE_NAME=AMBYTE_{MAC}) yields
+     * a per-board name in the payload instead of the literal token. No-op when
+     * device_name has no {MAC} (e.g. the AmbyteOnAir default). */
+    subst_token(device_name, sizeof(device_name), "{MAC}", mac_str);
     if (device_config_get_device_version(device_version, sizeof(device_version)) != ESP_OK) {
         device_version[0] = '\0';
     }

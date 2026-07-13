@@ -18,6 +18,7 @@
 #include "ambit_flash.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
+#include "device_config.h"
 #include "uart_sensors.h"
 #include "lua_runner.h"
 #include "sync_runner.h"
@@ -1251,6 +1252,102 @@ static int cli_cmd_ambit_versions(int argc, char **argv)
     return 0;
 }
 
+/* device_config (NVS namespace "device_cfg") get/set over the console. All keys
+ * here are string-valued with matching get(char*,size_t)/set(const char*) pairs;
+ * flash_time/heartbeat_s are omitted (no string setter). Values are read once at
+ * boot in app_main, so a `cfg set` takes effect on the next reboot. */
+typedef esp_err_t (*cfg_get_fn)(char *buf, size_t len);
+typedef esp_err_t (*cfg_set_fn)(const char *val);
+
+typedef struct {
+    const char *key;
+    cfg_get_fn  get;
+    cfg_set_fn  set;
+} cfg_entry_t;
+
+static const cfg_entry_t s_cfg_table[] = {
+    { "mqtt_uri",         device_config_get_mqtt_uri,         device_config_set_mqtt_uri },
+    { "mqtt_client_id",   device_config_get_mqtt_client_id,   device_config_set_mqtt_client_id },
+    { "mqtt_topic_root",  device_config_get_mqtt_topic_root,  device_config_set_mqtt_topic_root },
+    { "command_topic",    device_config_get_command_topic,    device_config_set_command_topic },
+    { "status_topic",     device_config_get_status_topic,     device_config_set_status_topic },
+    { "device_id",        device_config_get_device_id,        device_config_set_device_id },
+    { "protocol_id",      device_config_get_protocol_id,      device_config_set_protocol_id },
+    { "device_name",      device_config_get_device_name,      device_config_set_device_name },
+    { "device_version",   device_config_get_device_version,   device_config_set_device_version },
+    { "device_firmware",  device_config_get_device_firmware,  device_config_set_device_firmware },
+    { "firmware_version", device_config_get_firmware_version, device_config_set_firmware_version },
+    { "timezone",         device_config_get_timezone,         device_config_set_timezone },
+};
+
+static const cfg_entry_t *cfg_find(const char *key)
+{
+    for (size_t i = 0; i < sizeof(s_cfg_table) / sizeof(s_cfg_table[0]); ++i) {
+        if (strcmp(s_cfg_table[i].key, key) == 0) {
+            return &s_cfg_table[i];
+        }
+    }
+    return NULL;
+}
+
+static int cli_cmd_cfg(int argc, char **argv)
+{
+    const size_t n = sizeof(s_cfg_table) / sizeof(s_cfg_table[0]);
+    char buf[320];   /* covers the longest value (topics are char[288] at boot) */
+
+    /* cfg  — dump every key/value */
+    if (argc == 1) {
+        for (size_t i = 0; i < n; ++i) {
+            if (s_cfg_table[i].get(buf, sizeof(buf)) == ESP_OK) {
+                printf("  %-16s = %s\r\n", s_cfg_table[i].key, buf);
+            } else {
+                printf("  %-16s = (unset)\r\n", s_cfg_table[i].key);
+            }
+        }
+        return 0;
+    }
+
+    /* cfg get <key> */
+    if (argc == 3 && strcmp(argv[1], "get") == 0) {
+        const cfg_entry_t *e = cfg_find(argv[2]);
+        if (e == NULL) {
+            printf("cfg: unknown key '%s'\r\n", argv[2]);
+            return 1;
+        }
+        const esp_err_t err = e->get(buf, sizeof(buf));
+        if (err == ESP_OK) {
+            printf("%s = %s\r\n", e->key, buf);
+        } else {
+            printf("%s = (unset: %s)\r\n", e->key, esp_err_to_name(err));
+        }
+        return 0;
+    }
+
+    /* cfg set <key> <value> */
+    if (argc == 4 && strcmp(argv[1], "set") == 0) {
+        const cfg_entry_t *e = cfg_find(argv[2]);
+        if (e == NULL) {
+            printf("cfg: unknown key '%s'\r\n", argv[2]);
+            return 1;
+        }
+        const esp_err_t err = e->set(argv[3]);
+        if (err != ESP_OK) {
+            printf("cfg set %s failed: %s\r\n", e->key, esp_err_to_name(err));
+            return 1;
+        }
+        printf("cfg set %s = %s  (reboot to apply)\r\n", e->key, argv[3]);
+        return 0;
+    }
+
+    printf("Usage: cfg | cfg get <key> | cfg set <key> <value>\r\n");
+    printf("Keys:");
+    for (size_t i = 0; i < n; ++i) {
+        printf(" %s", s_cfg_table[i].key);
+    }
+    printf("\r\n");
+    return 1;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -1266,6 +1363,11 @@ static esp_err_t cli_register_commands(void)
         .command = "rtc",
         .help = "rtc | rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC)",
         .func = cli_cmd_rtc,
+    };
+    static const esp_console_cmd_t cfg_cmd = {
+        .command = "cfg",
+        .help = "cfg | cfg get <key> | cfg set <key> <value>  read/write device_cfg NVS (reboot to apply)",
+        .func = cli_cmd_cfg,
     };
     static const esp_console_cmd_t red_cmd = {
         .command = "red",
@@ -1426,6 +1528,10 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&rtc_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_console_cmd_register(&cfg_cmd);
     if (err != ESP_OK) {
         return err;
     }
