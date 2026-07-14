@@ -30,9 +30,34 @@ does the flashing (zip it, copy to a USB stick, etc.) and they run one script.
    ./flash.sh --port /dev/tty.usbmodem2101
    ```
 
-3. When it finishes, the board reboots into the new firmware, connects to Wi-Fi,
+3. It asks for a **device name** (the MQTT payload `device_name` field). Press
+   Enter to keep the default `AMBYTE_<MAC>`, or type a friendly name (e.g.
+   `Roof-3`). A custom name is applied to the board over the USB console right
+   after flashing — see [Device name](#device-name) below.
+
+4. When it finishes, the board reboots into the new firmware, connects to Wi-Fi,
    and comes up on MQTT with a per-board identity (`AMBYTE_<MAC>` — the `{MAC}`
    token is expanded on-device, so this one bundle works for **every** board).
+
+### Device name
+
+The `device_name` in the MQTT payload defaults to `AMBYTE_<MAC>` (baked into
+`bin/nvs.bin`; the firmware expands `{MAC}` at boot). To give a board a
+human-friendly name instead, type it at the prompt (or pass `--name`):
+
+```
+flash.cmd --name Roof-3      # set device_name, skip the prompt
+flash.cmd --yes              # non-interactive: keep the default AMBYTE_<MAC>
+```
+
+A custom name is **not** baked into `nvs.bin` (that would need a rebuild, which
+breaks the compile-free bundle). Instead, after flashing, the script reconnects
+to the board's USB-Serial-JTAG console and runs `cfg set device_name <name>`
+followed by `reboot`. If that step can't reach the console it just prints the
+one command to run by hand — the board is already flashed and works meanwhile.
+
+The MQTT **client-id** and **topic-root** are never affected; they always stay
+`AMBYTE_<MAC>`.
 
 ### Allow-list gate
 
