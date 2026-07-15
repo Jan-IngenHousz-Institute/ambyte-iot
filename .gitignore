@@ -12,6 +12,7 @@ ambit-1/
 device_certs/
 pip/
 /flash/
+planning/
 
 # Claude Code personal/local settings (machine-specific permissions)
 .claude/settings.local.json

@@ -1732,6 +1732,13 @@ esp_err_t cli_start(void)
      * staying below lua_runner (10), whose measurement timing must not be
      * preempted by console echo. */
     repl_config.task_priority = 6;
+    /* `lua exec` runs a full Lua state (luaL_openlibs + every ambyte module +
+     * lua_pcall) INLINE on this console task — the same workload the dedicated
+     * Lua tasks run on 8 KB stacks (LUA_RUNNER_TASK_STACK / SCRIPT_TASK_STACK).
+     * The ESP-IDF default REPL stack (4096) overflows under it (observed:
+     * "stack overflow in task console_repl" after `lua exec`). Size for that
+     * workload PLUS this task's own line-edit/dispatch frames on top. */
+    repl_config.task_stack_size = 12288;
 
     esp_err_t err = cli_create_repl(&repl_config);
     if (err != ESP_OK) {
