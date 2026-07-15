@@ -41,7 +41,7 @@ local NUM_CHANNELS = 4                              -- AMBIT channels to scan (0
 
 -- ── Protocols (segment tables passed to ambit.run) ────────────────────────
 local SS = {                                        -- steady-state probe (1 line)
-    { pulses = 180, freq =1, actinic = 0 },
+    { pulses = 50, freq =1, actinic = 0 },
 }
 
 local MPF = {                                       -- multi-phase saturating flash
@@ -170,7 +170,7 @@ end
 -- sched.every(period, fn [, {when="day"|"night"}])  -- clock-aligned interval
 -- sched.cron({minutes}, fn [, opts])                -- at minutes-of-hour
 -- sched.sun("sunrise"|"sunset", offset_s, fn)       -- once/day relative to sun
-sched.every("3m",   ss_round)                          -- steady-state probe, every 3 minutes
+sched.every("1m",   ss_round)                          -- steady-state probe, every 1 minute
 sched.every("5m", record_spectra, { when = "day" })  -- spectrum + PAR, daytime
 sched.every("10m", mpf_round,      { when = "day" })  -- saturating flash, daytime
 sched.sun("sunset",   30 * 60, edge_round)           -- dark-edge trace, 30 min after sunset
