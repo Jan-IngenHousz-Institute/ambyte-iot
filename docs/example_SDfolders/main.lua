@@ -1,47 +1,9 @@
--- main.lua — measurement schedule for the Ambyte (runs as /sdcard/main.lua).
---
--- EXECUTION MODEL
---   The firmware bundles a scheduler (`sched`) and exposes five globals:
---     device.*  on-board I/O      (BME280, RTC, MP2731 power; LED is firmware-owned)
---     ambit.*   everything AMBIT  (ping/spec/leaf_temp/run/trigger/poll/fetch
---                                  + config/diagnostics; channel is always arg 1)
---     uart.*    raw serial        (uart.query for not-yet-drivered sensors)
---     db.*      the event log     (db.store_event for CUSTOM events, db.next_id)
---     sync.*    RTC-based timing   (sunrise/sunset, intervals, wait)
---   This file registers jobs with `sched`, then calls sched.run() (never returns).
---
---   MEASUREMENT COMMANDS STORE THEMSELVES. ambit.spec / ambit.leaf_temp /
---   ambit.run / ambit.fetch / device.bme280 persist their result as one event
---   by default (pass {store=false} to probe without storing); the firmware
---   stamps the provenance (channel, device, cmd_raw, tag, ticks).
---   db.store_event{ data=, metadata=, channel= } is for derived/custom events
---   only. Raw transport (uart.query, ambit.query) never stores.
---
---   STORE, DON'T PUBLISH. Lua never talks to MQTT. A background task
---   (sync_runner) is the sole publisher: it drains stored events to the cloud
---   when, and only when, the device is on external power (the "publish power
---   gate" — VIN present). On battery, events stay in the log and drain the next
---   time the panel/USB brings power back. Nothing is lost, only delayed; the
---   measurement time is preserved in each event's startTicks.
---
---   FIRMWARE-OWNED, NOT IN THIS SCRIPT: the STATUS heartbeat (one tag=STATUS
---   event every AMBYTE_HEARTBEAT_S, default 5 min, stored by sync_runner) and
---   the status LED (colour-coded blink: green/blue measuring with/without
---   Wi-Fi, white/yellow idle, red = no SD, red x2 = low battery, purple =
---   unprovisioned; slow+dim on battery). Both keep working when this script
---   crashes or the SD is missing — that's the point.
---
---   GC is handled by sched.run() between cycles — jobs may build large transient
---   tables (AMBIT arrays) freely.
---
--- ACTINIC CONVENTION (segment .actinic field):
---   negative = raw DAC |value|   positive = PAR µmol (via AMBIT calibration)   0 = off
 
 local NUM_CHANNELS = 4                              -- AMBIT channels to scan (0..N-1)
 
 -- ── Protocols (segment tables passed to ambit.run) ────────────────────────
 local SS = {                                        -- steady-state probe (1 line)
-    { pulses = 50, freq =1, actinic = 0 },
+    { pulses = 40, freq =1, actinic = 0 },
 }
 
 local MPF = {                                       -- multi-phase saturating flash
@@ -55,8 +17,6 @@ local MPF = {                                       -- multi-phase saturating fl
 
 -- ── Helpers ───────────────────────────────────────────────────────────────
 
--- One spectrum + PAR per connected AMBIT. ambit.spec stores its own event
--- (channel/device/cmd_raw="get_par" stamped by the firmware).
 local function record_spectra()
     local stored = 0
     for ch = 0, NUM_CHANNELS - 1 do
@@ -93,14 +53,9 @@ local function estimate_ms(trace)
     return math.floor(total)
 end
 
--- Trigger the trace on every connected AMBIT back-to-back, then poll and fetch
--- each as it finishes. The 4 ambits measure concurrently, so wall-time ≈ the
--- slowest run plus the (serialized) result fetches, instead of the sum of four.
--- store=true persists each run as an event; sync_runner publishes it later when
--- the power gate is open. Lua never publishes. The measurement window is held
--- across the whole cycle so the publisher can't race a fetch on the tight heap.
-local function run_trace(tag, trace)
-    device.measurement_window(true)
+
+local function run_trace(tag, trace, hold_window)
+    if hold_window then device.measurement_window(true) end
 
     local est     = estimate_ms(trace)
     local pending = {}                 -- ch -> t0 (uptime_ms at trigger)
@@ -117,9 +72,7 @@ local function run_trace(tag, trace)
         end
     end
 
-    -- Poll + fetch loop. Stay off a channel's wire until ~90% of its estimate has
-    -- elapsed (a poll's wake bytes reach a measuring sensor). Only "done"/"error"
-    -- are terminal; a silent channel past the deadline is treated as broken.
+    
     while count > 0 do
         device.sleep_ms(POLL_INTERVAL_MS)
         local now = device.uptime_ms()
@@ -152,13 +105,15 @@ local function run_trace(tag, trace)
         end
     end
 
-    device.measurement_window(false)
+    if hold_window then device.measurement_window(false) end
 end
 
 -- ── Job bodies ────────────────────────────────────────────────────────────
-local function ss_round()   run_trace("SS",   SS)  end
-local function mpf_round()  run_trace("MPF",  MPF) end
-local function edge_round() run_trace("edge", MPF) end
+-- SS passes hold_window=false → the publisher drains concurrently during the
+-- poll-loop gaps. MPF/edge are large arrun traces → hold the window (true).
+local function ss_round()   run_trace("SS",   SS,  false) end
+local function mpf_round()  run_trace("MPF",  MPF, true)  end
+local function edge_round() run_trace("edge", MPF, true)  end
 
 -- ── Boot banner ───────────────────────────────────────────────────────────
 do
@@ -167,9 +122,7 @@ do
 end
 
 -- ── Schedule ──────────────────────────────────────────────────────────────
--- sched.every(period, fn [, {when="day"|"night"}])  -- clock-aligned interval
--- sched.cron({minutes}, fn [, opts])                -- at minutes-of-hour
--- sched.sun("sunrise"|"sunset", offset_s, fn)       -- once/day relative to sun
+
 sched.every("1m",   ss_round)                          -- steady-state probe, every 1 minute
 sched.every("5m", record_spectra, { when = "day" })  -- spectrum + PAR, daytime
 sched.every("10m", mpf_round,      { when = "day" })  -- saturating flash, daytime

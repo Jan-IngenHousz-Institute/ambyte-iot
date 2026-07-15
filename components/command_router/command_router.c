@@ -189,24 +189,37 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
-        /* Replace /sdcard/main.lua with the inline script. `script` is the
-         * canonical field; `payload` is the legacy name from
-         * device-script-delivery.md. Optional `checksum` = sha256 hex. Optional
-         * `reboot` (bool, default true) restarts the whole device after a
-         * successful swap so the new script runs from a fresh boot; set it false
-         * to keep the in-place swap + Lua-runner restart. */
+        /* Replace /sdcard/main.lua. Two delivery modes:
+         *   - `url`   : download the script over HTTPS (reliable on a fragmented
+         *               heap — tiny command, chunked download). Preferred for big
+         *               scripts. `checksum` = sha256 hex of the fetched file.
+         *   - `script`: inline (legacy alias `payload`). Capped at the 16 KB MQTT
+         *               message and needs a contiguous TLS buffer to be received.
+         * Optional `reboot` (bool, default true) restarts the device after a
+         * successful swap; false keeps the in-place Lua-runner restart. */
         const cJSON *jscript = cJSON_GetObjectItemCaseSensitive(root, "script");
         if (!cJSON_IsString(jscript)) {
             jscript = cJSON_GetObjectItemCaseSensitive(root, "payload");
         }
-        const cJSON *jsum = cJSON_GetObjectItemCaseSensitive(root, "checksum");
+        const cJSON *jurl    = cJSON_GetObjectItemCaseSensitive(root, "url");
+        const cJSON *jsum    = cJSON_GetObjectItemCaseSensitive(root, "checksum");
         const cJSON *jreboot = cJSON_GetObjectItemCaseSensitive(root, "reboot");
         const char *script   = cJSON_IsString(jscript) ? jscript->valuestring : NULL;
+        const char *url      = cJSON_IsString(jurl)    ? jurl->valuestring    : NULL;
         const char *checksum = cJSON_IsString(jsum)    ? jsum->valuestring    : NULL;
         bool reboot = true;   /* default: reboot into the new script */
         if (cJSON_IsBool(jreboot)) reboot = cJSON_IsTrue(jreboot);
-        if (script == NULL || script[0] == '\0') {
-            ESP_LOGW(TAG, "script_update id=%s missing 'script' — ignoring", id ? id : "");
+        if (url != NULL && url[0] != '\0') {
+            esp_err_t err = script_update_url_request(url, checksum, id, reboot);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "script_update(url) id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (%s, %s)",
+                         id ? id : "", url, reboot ? "reboot" : "in-place");
+            }
+        } else if (script == NULL || script[0] == '\0') {
+            ESP_LOGW(TAG, "script_update id=%s missing 'script'/'url' — ignoring", id ? id : "");
         } else {
             esp_err_t err = script_update_request(script, checksum, id, reboot);
             if (err != ESP_OK) {

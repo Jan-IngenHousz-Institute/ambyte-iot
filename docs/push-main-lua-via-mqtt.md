@@ -33,10 +33,12 @@ payload, but the process is identical for any script.
   new script runs from a clean boot — expect the device to drop offline for a few
   seconds and reconnect on the new `main.lua`. The `id` is latched *before* the
   reboot, so a **retained** update can't loop the reboot (it dedupes on reconnect).
-- **Size limit:** the whole MQTT message must be **≤ 16384 bytes**
-  (`INBOUND_MSG_LARGE_MAX`). There is no chunking and no `url` fetch variant
-  implemented, so a script whose JSON message exceeds 16 KB cannot be delivered
-  this way. (The bundled example is ~7.9 KB.)
+- **Size limit (inline):** the whole MQTT message must be **≤ 16384 bytes**
+  (`INBOUND_MSG_LARGE_MAX`), and — more limiting in practice — receiving a big
+  inline message needs a **contiguous ~8 KB TLS buffer**, which a fragmented heap
+  (mid-measurement) often can't provide, so large inline pushes fail with
+  `Dynamic Impl: alloc(…) failed / -0x7F00`. **For anything but a small script,
+  use the [`url` variant](#url-variant) below** — it sidesteps this entirely.
 
 ### The three gotchas that bite people
 
@@ -224,6 +226,61 @@ To revert, either:
 - push the previous script again via this same process (with a **new `id`**), or
 - on the serial console: `lua stop`, restore the `.bak` over `main.lua` (pull the
   SD or use a file tool), then `lua start`.
+
+---
+
+<a id="url-variant"></a>
+## The `url` variant — reliable delivery for large scripts
+
+The inline push must receive the whole script in one MQTT message, which needs a
+contiguous ~8 KB TLS record buffer — exactly what a fragmented heap (during
+continuous measurement) can't give, so large inline pushes fail with
+`Dynamic Impl: alloc(…) failed`. The `url` variant avoids this: the **command is
+tiny** (just the URL), so it's received on any heap state; the device then stops
+Lua (defragmenting the heap) and **streams** the script over HTTPS in 4 KB chunks
+— no large contiguous allocation, ever. Same reliability as OTA.
+
+**1. Host the script** at a **direct raw** URL (not a github `/blob/` page):
+```
+https://raw.githubusercontent.com/<owner>/<repo>/<branch>/path/main.lua
+```
+
+**2. Compute its checksum** over the exact hosted bytes:
+```bash
+curl -sL '<raw-url>' | sha256sum         # or: sha256sum main.lua  (the file you upload verbatim)
+```
+
+**3. Publish the tiny command** to the command topic (Retain OFF):
+```json
+{
+  "type": "script_update",
+  "id": "main-lua-url-2026-07-15-001",
+  "url": "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/main.lua",
+  "checksum": "<sha256 of the fetched file>"
+}
+```
+`checksum` is optional (a bad download also fails the syntax check / short-download
+guard), but recommended. `reboot` defaults true, as with inline.
+
+**Serial** on success:
+```
+cmd_router:  script_update(url) id=… dispatched (https://…, reboot)
+script_upd:  script_update(url) id=…: https://…
+script_upd:  downloaded <N> bytes, sha256=…
+script_upd:  main.lua replaced from url (<N> bytes); previous kept as /sdcard/main.lua.bak — rebooting to run it
+```
+Status reply: `{"type":"script_status",…,"state":"applied","detail":"<N> bytes; rebooting"}`.
+
+Failure `detail`s add `download failed (<err>)` (unreachable URL / non-200 / short
+or truncated read — check it's a direct raw link) on top of the shared table below.
+During the download the device stops **both** Lua and MQTT (to free the heap for
+the download's TLS), then reconnects and reports — so expect a brief MQTT gap. The
+device needs external power / connectivity to reach the URL.
+
+> **`reboot` needs an `id`.** With `reboot` defaulting to true, a command with no
+> `id` is rejected (`"failed":"reboot requires an id"`) — an un-dedupable retained
+> reboot command would boot-loop. Always include a unique `id` (the builder does
+> this automatically); or set `"reboot": false` to apply in place without one.
 
 ---
 

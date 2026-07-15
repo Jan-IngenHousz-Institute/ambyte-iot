@@ -671,10 +671,18 @@ void app_main(void)
      * (syntax-checked, .bak kept) + restarts the runner; MQTT lua_exec runs a
      * snippet in an ephemeral state. Lazy worker — no steady-state heap cost. */
     script_update_config_t script_cfg = {
-        .publish      = mqtt_client_get_publish_fn(),
-        .is_connected = mqtt_client_get_is_connected_fn(),
-        .status_topic = status_topic,
-        .device_id    = device_id,
+        .publish          = mqtt_client_get_publish_fn(),
+        .is_connected     = mqtt_client_get_is_connected_fn(),
+        .status_topic     = status_topic,
+        .device_id        = device_id,
+        /* url variant: stop Lua (defragment) AND stop MQTT (free its TLS heap)
+         * around the HTTPS download so the download's TLS handshake gets a clean
+         * contiguous heap — same quiesce hooks as OTA. MQTT is resumed before the
+         * status reply. */
+        .workload_suspend = app_workload_suspend,
+        .workload_resume  = app_workload_resume,
+        .comms_suspend    = mqtt_client_stop,
+        .comms_resume     = mqtt_client_start,
     };
     if (script_update_init(&script_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "script_update worker not started");

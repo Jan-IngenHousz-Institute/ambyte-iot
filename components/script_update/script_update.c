@@ -5,6 +5,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -20,7 +22,7 @@
 
 #define TAG "script_upd"
 
-#define SCRIPT_TASK_STACK   8192
+#define SCRIPT_TASK_STACK   10240    /* 10 KB: the url download runs esp_http_client+mbedTLS here (matches ambit_ota) */
 #define SCRIPT_TASK_PRIO    4        /* below lua_runner(10); admin work, not latency-critical */
 #define SCRIPT_IDLE_EXIT_MS 2000     /* free the worker stack this long after idle */
 #define SCRIPT_ID_MAX       64
@@ -35,8 +37,12 @@
 #define NVS_NS         "script_upd"
 #define KEY_APPLIED    "applied_id"
 
-#define OP_UPDATE 0
-#define OP_EXEC   1
+#define OP_UPDATE     0
+#define OP_EXEC       1
+#define OP_UPDATE_URL 2
+
+#define SCRIPT_DL_BUF          4096     /* HTTP chunk size — small on purpose (no large contiguous alloc) */
+#define SCRIPT_HTTP_TIMEOUT_MS 20000
 
 typedef struct {
     uint8_t op;
@@ -163,6 +169,123 @@ static bool syntax_ok(const char *script, char *err, size_t err_cap)
     return ok;
 }
 
+/* Parse-only syntax check straight from a file (url variant — the script is on
+ * the SD, not in RAM). luaL_loadfile compiles without executing. */
+static bool syntax_ok_file(const char *path, char *err, size_t err_cap)
+{
+    lua_State *L = luaL_newstate();
+    if (L == NULL) {
+        snprintf(err, err_cap, "out of memory for syntax check");
+        return false;
+    }
+    bool ok = (luaL_loadfile(L, path) == LUA_OK);
+    if (!ok) {
+        const char *msg = lua_tostring(L, -1);
+        snprintf(err, err_cap, "%s", msg ? msg : "syntax error");
+    }
+    lua_close(L);
+    return ok;
+}
+
+/* Stream `url` (HTTPS) into `path`, hashing the bytes as they arrive. 4 KB chunks
+ * — never a large contiguous alloc, so this succeeds where an inline 16 KB MQTT
+ * message fails on a fragmented heap. On success writes the lowercase-hex SHA-256
+ * into hex65[65] and the byte count into *out_size. Removes a partial file on
+ * error. Same TLS/buffer settings as the OTA downloaders (cert bundle validates
+ * GitHub + CDN; 4 KiB buffers fit long signed-redirect URLs). */
+static esp_err_t download_to_file_sha256(const char *url, const char *path,
+                                         char hex65[65], size_t *out_size)
+{
+    *out_size = 0;
+    hex65[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms        = SCRIPT_HTTP_TIMEOUT_MS,
+        .keep_alive_enable = true,
+        .buffer_size       = SCRIPT_DL_BUF,
+        .buffer_size_tx    = SCRIPT_DL_BUF,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c == NULL) return ESP_FAIL;
+
+    esp_err_t err = esp_http_client_open(c, 0);
+    if (err != ESP_OK) { esp_http_client_cleanup(c); return err; }
+
+    int64_t clen   = esp_http_client_fetch_headers(c);
+    int     status = esp_http_client_get_status_code(c);
+    if (status != 200) {
+        ESP_LOGE(TAG, "download HTTP status %d (need 200 — use a direct raw URL, not a /blob/ page)",
+                 status);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return ESP_FAIL;
+    }
+    uint8_t *buf = malloc(SCRIPT_DL_BUF);
+    if (buf == NULL) {
+        fclose(f);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        remove(path);
+        return ESP_ERR_NO_MEM;
+    }
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);   /* 0 = SHA-256 */
+
+    size_t total = 0;
+    bool wr_ok = true;
+    while (1) {
+        int r = esp_http_client_read(c, (char *)buf, SCRIPT_DL_BUF);
+        if (r < 0) { err = ESP_FAIL; break; }
+        if (r == 0) break;   /* EOF */
+        mbedtls_sha256_update(&sha, buf, (size_t)r);
+        if (fwrite(buf, 1, (size_t)r, f) != (size_t)r) { err = ESP_ERR_NO_MEM; wr_ok = false; break; }
+        total += (size_t)r;
+        vTaskDelay(1);       /* yield so the idle task is fed on a fast link */
+    }
+
+    unsigned char digest[32];
+    mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+
+    if (wr_ok) { fflush(f); fsync(fileno(f)); }
+    free(buf);
+    fclose(f);
+
+    /* Positive completion check: esp_http_client_read()==0 can't distinguish a
+     * real EOF from a mid-stream TLS/socket close, and the Content-Length guard
+     * below is skipped for chunked responses (clen<=0). Without this, a truncated
+     * download whose prefix happens to parse could be installed. */
+    if (err == ESP_OK && !esp_http_client_is_complete_data_received(c)) {
+        ESP_LOGE(TAG, "incomplete download — connection closed before all data received");
+        err = ESP_FAIL;
+    }
+
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+
+    if (err == ESP_OK && clen > 0 && total != (size_t)clen) {
+        ESP_LOGE(TAG, "short download: %u of %lld bytes", (unsigned)total, (long long)clen);
+        err = ESP_FAIL;
+    }
+    if (err != ESP_OK) { remove(path); return err; }
+
+    for (int i = 0; i < 32; i++) sprintf(hex65 + i * 2, "%02x", digest[i]);
+    hex65[64] = '\0';
+    *out_size = total;
+    return ESP_OK;
+}
+
 static void do_update(const script_req_t *r)
 {
     const size_t len = strlen(r->text);
@@ -250,6 +373,98 @@ static void do_update(const script_req_t *r)
     report_script("applied", r->id, detail);
 }
 
+/* ── OP_UPDATE_URL: download /sdcard/main.lua from a URL ───────────────────────
+ * The command message is tiny (just the URL), so it's received even on a
+ * fragmented heap; the heavy transfer is a chunked HTTPS download AFTER Lua is
+ * stopped (heap defragmented). This is the reliable path for large scripts —
+ * inline 16 KB MQTT delivery needs a contiguous TLS record buffer the fragmented
+ * heap can't provide. `r->text` holds the URL. */
+static void do_update_url(const script_req_t *r)
+{
+    ESP_LOGW(TAG, "script_update(url) id=%s: %s", r->id[0] ? r->id : "(none)", r->text);
+    char detail[192] = "";
+
+    if (s_cfg.workload_suspend == NULL || s_cfg.workload_resume == NULL) {
+        ESP_LOGE(TAG, "url variant needs workload hooks — not configured");
+        report_script("failed", r->id, "url variant unavailable");
+        return;
+    }
+
+    /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
+     * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a
+     * clean, contiguous heap on this PSRAM-less board. MQTT is resumed before we
+     * report. */
+    s_cfg.workload_suspend();
+    if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
+
+    bool applied = false;
+    size_t n = 0;
+    char got[65] = "";
+
+    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+        ESP_LOGE(TAG, "SD not available");
+        snprintf(detail, sizeof detail, "SD card not mounted");
+    } else {
+        esp_err_t err = download_to_file_sha256(r->text, LUA_PATH_NEW, got, &n);
+        if (err != ESP_OK) {
+            snprintf(detail, sizeof detail, "download failed (%s)", esp_err_to_name(err));
+            ESP_LOGE(TAG, "%s", detail);
+        } else if (r->checksum[0] != '\0' &&
+                   (strlen(r->checksum) != 64 || strncasecmp(got, r->checksum, 64) != 0)) {
+            ESP_LOGE(TAG, "checksum mismatch — script rejected");
+            remove(LUA_PATH_NEW);
+            snprintf(detail, sizeof detail, "sha256 mismatch");
+        } else if (!syntax_ok_file(LUA_PATH_NEW, detail, sizeof detail)) {
+            ESP_LOGE(TAG, "syntax check failed: %s — main.lua untouched", detail);
+            remove(LUA_PATH_NEW);
+        } else {
+            ESP_LOGW(TAG, "downloaded %u bytes, sha256=%s", (unsigned)n, got);
+            /* Lua already stopped; swap (previous kept as .bak; atomic on FATFS). */
+            remove(LUA_PATH_BAK);
+            (void)rename(LUA_PATH, LUA_PATH_BAK);
+            if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
+                ESP_LOGE(TAG, "rename to %s failed", LUA_PATH);
+                (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
+                snprintf(detail, sizeof detail, "rename failed");
+            } else {
+                latch_set(r->id);   /* before any reboot: dedupes a retained trigger */
+                applied = true;
+            }
+        }
+    }
+
+    /* Bring MQTT back and give it a moment to reconnect so the status reply lands
+     * (best-effort — the serial log is authoritative either way). */
+    if (s_cfg.comms_resume != NULL) {
+        s_cfg.comms_resume();
+        for (int i = 0; i < 50 && s_cfg.is_connected != NULL && !s_cfg.is_connected(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    if (!applied) {
+        report_script("failed", r->id, detail);
+        s_cfg.workload_resume();   /* restart the old script */
+        return;
+    }
+
+    if (r->reboot) {
+        ESP_LOGW(TAG, "main.lua replaced from url (%u bytes); previous kept as %s — rebooting to run it",
+                 (unsigned)n, LUA_PATH_BAK);
+        snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
+        report_script("applied", r->id, detail);
+        vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
+        esp_restart();                                       /* no return */
+    }
+
+    /* In-place: restart the Lua runner on the new script. */
+    s_cfg.workload_resume();
+    ESP_LOGW(TAG, "main.lua replaced from url (%u bytes) + runner restarted; previous kept as %s",
+             (unsigned)n, LUA_PATH_BAK);
+    snprintf(detail, sizeof detail, "%u bytes", (unsigned)n);
+    report_script("applied", r->id, detail);
+}
+
 /* ── OP_EXEC: run a snippet now ───────────────────────────────────────────── */
 
 static void do_exec(const script_req_t *r)
@@ -274,8 +489,9 @@ static void script_task(void *arg)
     script_req_t r;
     for (;;) {
         if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(SCRIPT_IDLE_EXIT_MS)) == pdTRUE) {
-            if (r.op == OP_EXEC) do_exec(&r);
-            else                 do_update(&r);
+            if (r.op == OP_EXEC)            do_exec(&r);
+            else if (r.op == OP_UPDATE_URL) do_update_url(&r);
+            else                            do_update(&r);
             free(r.text);
             continue;
         }
@@ -350,16 +566,42 @@ static esp_err_t request_common(uint8_t op, const char *text,
     return err;
 }
 
+/* A reboot with no id can't be deduped (latch_set/already_applied are no-ops for
+ * an empty id), so a RETAINED reboot=true command would re-apply + reboot on every
+ * reconnect — a boot loop. Require an id to reboot. */
+static bool reboot_needs_id(const char *id, bool reboot, const char *what)
+{
+    if (reboot && (id == NULL || id[0] == '\0')) {
+        ESP_LOGW(TAG, "%s reboot=true requires an id — rejecting (retained-loop guard)", what);
+        report_script("failed", id, "reboot requires an id");
+        return true;
+    }
+    return false;
+}
+
 esp_err_t script_update_request(const char *script, const char *checksum, const char *id,
                                 bool reboot)
 {
-    /* Retained-topic dedupe: an already-applied id is ignored (success-latched).
-     * This is also what stops a retained reboot=true update from looping forever. */
+    if (reboot_needs_id(id, reboot, "script_update")) return ESP_ERR_INVALID_ARG;
+    /* Retained-topic dedupe: an already-applied id is ignored (success-latched). */
     if (already_applied(id)) {
         ESP_LOGI(TAG, "script_update id=%s already applied — ignoring", id);
         return ESP_OK;
     }
     return request_common(OP_UPDATE, script, checksum, id, reboot);
+}
+
+esp_err_t script_update_url_request(const char *url, const char *checksum, const char *id,
+                                    bool reboot)
+{
+    if (reboot_needs_id(id, reboot, "script_update(url)")) return ESP_ERR_INVALID_ARG;
+    /* Same success-latch dedupe as the inline path (stops a retained url command
+     * from re-downloading + re-rebooting on every reconnect). */
+    if (already_applied(id)) {
+        ESP_LOGI(TAG, "script_update(url) id=%s already applied — ignoring", id);
+        return ESP_OK;
+    }
+    return request_common(OP_UPDATE_URL, url, checksum, id, reboot);   /* text holds the URL */
 }
 
 esp_err_t script_update_exec_request(const char *code, const char *id)
