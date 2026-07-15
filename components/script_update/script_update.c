@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -25,6 +26,7 @@
 #define SCRIPT_ID_MAX       64
 #define SCRIPT_EXEC_TIMEOUT_MS 120000   /* snippets may run multi-second AMBIT measurements */
 #define SCRIPT_RESULT_MAX   192
+#define SCRIPT_REBOOT_DELAY_MS 500   /* let the 'applied' reply flush before esp_restart (matches ota_update) */
 
 #define LUA_PATH       "/sdcard/main.lua"
 #define LUA_PATH_NEW   "/sdcard/main.lua.new"
@@ -38,6 +40,7 @@
 
 typedef struct {
     uint8_t op;
+    bool    reboot;            /* OP_UPDATE only: reboot after a successful swap (default) */
     char    id[SCRIPT_ID_MAX];
     char    checksum[65];      /* optional sha256 hex ('\0' = absent) */
     char   *text;              /* heap-dup'd script/snippet — freed by the worker */
@@ -217,6 +220,21 @@ static void do_update(const script_req_t *r)
         return;
     }
 
+    /* Reboot path (default): the new main.lua is on the SD and the runner is
+     * already stopped — a full restart runs it from a fresh boot (clean heap,
+     * ordered startup). Latch FIRST so a retained trigger dedupes on reconnect
+     * and can't loop the reboot (same guard as ota_update). */
+    if (r->reboot) {
+        latch_set(r->id);
+        ESP_LOGW(TAG, "main.lua replaced (%u bytes); previous kept as %s — rebooting to run it",
+                 (unsigned)len, LUA_PATH_BAK);
+        snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)len);
+        report_script("applied", r->id, detail);
+        vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
+        esp_restart();                                       /* no return */
+    }
+
+    /* In-place path (reboot=false): restart just the Lua runner on the new file. */
     esp_err_t err = lua_runner_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "runner restart failed: %s (script IS installed — `lua start` manually)",
@@ -313,7 +331,7 @@ esp_err_t script_update_init(const script_update_config_t *cfg)
 }
 
 static esp_err_t request_common(uint8_t op, const char *text,
-                                const char *checksum, const char *id)
+                                const char *checksum, const char *id, bool reboot)
 {
     if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
     if (text == NULL || text[0] == '\0') return ESP_ERR_INVALID_ARG;
@@ -321,6 +339,7 @@ static esp_err_t request_common(uint8_t op, const char *text,
     script_req_t r;
     memset(&r, 0, sizeof r);
     r.op = op;
+    r.reboot = reboot;
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     if (checksum != NULL) strncpy(r.checksum, checksum, sizeof r.checksum - 1);
     r.text = strdup(text);
@@ -331,17 +350,19 @@ static esp_err_t request_common(uint8_t op, const char *text,
     return err;
 }
 
-esp_err_t script_update_request(const char *script, const char *checksum, const char *id)
+esp_err_t script_update_request(const char *script, const char *checksum, const char *id,
+                                bool reboot)
 {
-    /* Retained-topic dedupe: an already-applied id is ignored (success-latched). */
+    /* Retained-topic dedupe: an already-applied id is ignored (success-latched).
+     * This is also what stops a retained reboot=true update from looping forever. */
     if (already_applied(id)) {
         ESP_LOGI(TAG, "script_update id=%s already applied — ignoring", id);
         return ESP_OK;
     }
-    return request_common(OP_UPDATE, script, checksum, id);
+    return request_common(OP_UPDATE, script, checksum, id, reboot);
 }
 
 esp_err_t script_update_exec_request(const char *code, const char *id)
 {
-    return request_common(OP_EXEC, code, NULL, id);   /* exec is never deduped */
+    return request_common(OP_EXEC, code, NULL, id, false);   /* exec is never deduped/rebooted */
 }

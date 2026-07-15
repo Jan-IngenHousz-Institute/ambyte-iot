@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "esp_err.h"
@@ -37,9 +38,14 @@ esp_err_t script_update_init(const script_update_config_t *cfg);
 /* Queue a main.lua replacement. `script` is copied (caller's buffer may die);
  * `checksum` (optional, NULL ok) is the lowercase/uppercase hex SHA-256 of the
  * script; `id` dedupes a retained message (latched on success only; NULL = no
- * dedupe). Reports {"type":"script_status",...,"state":"applied"|"failed"}.
+ * dedupe). `reboot` = true (the default) restarts the whole device after a
+ * successful swap so the new script runs from a fresh boot; false keeps the old
+ * in-place behaviour (stop + swap + restart just the Lua runner). Either way the
+ * id is latched on success FIRST, so a retained trigger can't loop the reboot.
+ * Reports {"type":"script_status",...,"state":"applied"|"failed"}.
  * ESP_ERR_INVALID_STATE before init; ESP_ERR_NO_MEM if busy or out of memory. */
-esp_err_t script_update_request(const char *script, const char *checksum, const char *id);
+esp_err_t script_update_request(const char *script, const char *checksum, const char *id,
+                                bool reboot);
 
 /* Queue a snippet for immediate execution (lua_runner_exec, 120 s budget).
  * Reports {"type":"lua_exec_result",...,"ok":…,"result":"…"}. */

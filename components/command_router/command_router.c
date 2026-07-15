@@ -189,26 +189,32 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
-        /* Replace /sdcard/main.lua with the inline script and restart the Lua
-         * runner. `script` is the canonical field; `payload` is the legacy name
-         * from device-script-delivery.md. Optional `checksum` = sha256 hex. */
+        /* Replace /sdcard/main.lua with the inline script. `script` is the
+         * canonical field; `payload` is the legacy name from
+         * device-script-delivery.md. Optional `checksum` = sha256 hex. Optional
+         * `reboot` (bool, default true) restarts the whole device after a
+         * successful swap so the new script runs from a fresh boot; set it false
+         * to keep the in-place swap + Lua-runner restart. */
         const cJSON *jscript = cJSON_GetObjectItemCaseSensitive(root, "script");
         if (!cJSON_IsString(jscript)) {
             jscript = cJSON_GetObjectItemCaseSensitive(root, "payload");
         }
         const cJSON *jsum = cJSON_GetObjectItemCaseSensitive(root, "checksum");
+        const cJSON *jreboot = cJSON_GetObjectItemCaseSensitive(root, "reboot");
         const char *script   = cJSON_IsString(jscript) ? jscript->valuestring : NULL;
         const char *checksum = cJSON_IsString(jsum)    ? jsum->valuestring    : NULL;
+        bool reboot = true;   /* default: reboot into the new script */
+        if (cJSON_IsBool(jreboot)) reboot = cJSON_IsTrue(jreboot);
         if (script == NULL || script[0] == '\0') {
             ESP_LOGW(TAG, "script_update id=%s missing 'script' — ignoring", id ? id : "");
         } else {
-            esp_err_t err = script_update_request(script, checksum, id);
+            esp_err_t err = script_update_request(script, checksum, id, reboot);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "script_update id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "script_update id=%s dispatched (%u bytes)",
-                         id ? id : "", (unsigned)strlen(script));
+                ESP_LOGW(TAG, "script_update id=%s dispatched (%u bytes, %s)",
+                         id ? id : "", (unsigned)strlen(script), reboot ? "reboot" : "in-place");
             }
         }
     } else if (strcmp(type, "lua_exec") == 0) {
