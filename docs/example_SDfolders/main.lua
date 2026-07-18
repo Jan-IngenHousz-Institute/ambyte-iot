@@ -62,7 +62,7 @@ local function run_trace(tag, trace, hold_window)
     local count   = 0
     for ch = 0, NUM_CHANNELS - 1 do
         if ambit.ping(ch) then
-            local ok, err = ambit.trigger(ch, trace, { interrupt = false })
+            local ok, err = ambit.trigger(ch, trace, { interrupt = false, metadata = { protocol = tag } })
             if ok then
                 pending[ch] = device.uptime_ms()
                 count = count + 1

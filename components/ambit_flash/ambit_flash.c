@@ -15,6 +15,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_system.h"        /* esp_reset_reason */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -436,6 +437,20 @@ int ambit_flash_check(void)
 #define BOOT_VERIFY_DELAY_MS 4000
 #define BOOT_VERIFY_TRIES    2
 
+/* (c) Absent-slot probe cap. An empty channel answers neither the app ping nor
+ * ROM SYNC, yet each ROM probe pulses the shared CHIP_EN and reboots all four
+ * AMBITs. After this many consecutive non-cold boots that probe a slot empty,
+ * stop probing it — otherwise a board with unpopulated channels resets the whole
+ * bank on every boot. A power-on reset clears the tally (see boot_sync), so a
+ * newly inserted module is re-detected after a power cycle. NVS ns "ambit_fl",
+ * key "ba<ch>" = i32 empty-boot count. */
+#define ABSENT_PROBE_MAX     3
+
+/* (c) Settle delay after each shared-CHIP_EN pulse (every probe and every flash
+ * reboots all four AMBITs at once). Spacing the coincident-reboot bursts lets a
+ * marginal supply recover between them instead of taking them back-to-back. */
+#define AMBIT_RESET_SETTLE_MS 500
+
 static void boot_fail_key(uint8_t ch, char *key, size_t cap)
 {
     snprintf(key, cap, "bf%u", ch);
@@ -493,6 +508,75 @@ static void boot_fail_clear(uint8_t ch)
     nvs_close(h);
 }
 
+/* (c) Absent-slot probe tally — see ABSENT_PROBE_MAX. Stored as an i32 count in
+ * the same NVS namespace as the fail counter (key "ba<ch>"), independent of the
+ * target version (it tracks physical presence, not firmware). */
+static int boot_absent_count(uint8_t ch)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return 0;
+    }
+    char key[8];
+    snprintf(key, sizeof key, "ba%u", ch);
+    int32_t v = 0;
+    (void)nvs_get_i32(h, key, &v);   /* key absent → v stays 0 */
+    nvs_close(h);
+    return (int)v;
+}
+
+static void boot_absent_bump(uint8_t ch, int prev)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    char key[8];
+    snprintf(key, sizeof key, "ba%u", ch);
+    if (nvs_set_i32(h, key, (int32_t)(prev + 1)) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void boot_absent_clear(uint8_t ch)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    char key[8];
+    snprintf(key, sizeof key, "ba%u", ch);
+    if (nvs_erase_key(h, key) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void boot_absent_clear_all(void)
+{
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        boot_absent_clear(ch);
+    }
+}
+
+/* Human-readable reset cause for the boot-sync guard log. */
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int-wdt";
+    case ESP_RST_TASK_WDT:  return "task-wdt";
+    case ESP_RST_WDT:       return "other-wdt";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    default:                return "other";
+    }
+}
+
 /* Read one channel's running fw version via cmd 33/2. do_query does its own
  * wake, so this works regardless of a cached ping failure (a bare unit's boot
  * ping is fail-cached for 5 min — the post-flash verify must not consult it). */
@@ -510,6 +594,31 @@ static bool boot_read_version(uint8_t ch, ambit_fw_info_t *fw)
 
 int ambit_flash_boot_sync(void)
 {
+    /* (a) Suspect-reset guard. A brownout/panic/watchdog reset can strike
+     * mid-flash (flashing draws current, and the shared CHIP_EN reboots all four
+     * AMBITs on every probe). Re-running auto-flash right after such a reset risks
+     * interrupting the same half-written unit again — a self-perpetuating re-brick
+     * loop. Skip this boot; a clean (power-on/SW) boot retries. External-pin resets
+     * are treated as clean (a tech may reset to trigger a flash); the per-attempt
+     * fail-cap still bounds any loop those cause. */
+    const esp_reset_reason_t rr = esp_reset_reason();
+    if (rr == ESP_RST_BROWNOUT || rr == ESP_RST_PANIC ||
+        rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) {
+        ESP_LOGW(TAG, "boot sync: last reset was %s — skipping AMBIT auto-flash this "
+                      "boot to avoid a mid-flash re-brick loop; retries on a clean boot",
+                 reset_reason_str(rr));
+        return -1;
+    }
+
+    /* (c) On a cold boot, forget which slots came up empty last time so a newly
+     * inserted AMBIT is re-detected (the absent-slot cap in pass 2 otherwise stops
+     * probing long-empty slots to avoid rebooting the whole bank every boot). Done
+     * before the target lookup so a cold boot always re-detects, even if the SD
+     * image is added later. */
+    if (rr == ESP_RST_POWERON) {
+        boot_absent_clear_all();
+    }
+
     ambit_flash_target_t tgt;
     if (ambit_flash_find_target(&tgt) != ESP_OK) {
         ESP_LOGI(TAG, "boot sync: no SD target image under %s — skipping", AMBIT_FW_ROOT);
@@ -567,12 +676,27 @@ int ambit_flash_boot_sync(void)
                      ch, fails[ch], ver, ch, ver);
             continue;
         }
-        ambit_flash_probe_result_t pr;
-        if (ambit_flash_probe(ch, &pr) != ESP_OK) {
+        /* (c) Skip the ROM probe of a slot that has come up empty ABSENT_PROBE_MAX
+         * boots running — each probe pulses the shared CHIP_EN and reboots all four
+         * AMBITs, so an unpopulated slot would otherwise reset the whole bank every
+         * boot. Cleared on a cold boot (above), so a power-cycle re-detects. */
+        const int absent = boot_absent_count(ch);
+        if (absent >= ABSENT_PROBE_MAX) {
             state[ch] = CH_ABSENT;
+            ESP_LOGI(TAG, "  ch%u: absent (probe skipped after %d empty boots — "
+                          "power-cycle to re-detect)", ch, absent);
+            continue;
+        }
+        ambit_flash_probe_result_t pr;
+        const esp_err_t probe_err = ambit_flash_probe(ch, &pr);
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_RESET_SETTLE_MS));   /* (c) rail recovery after the coincident reboot */
+        if (probe_err != ESP_OK) {
+            state[ch] = CH_ABSENT;
+            boot_absent_bump(ch, absent);
             ESP_LOGI(TAG, "  ch%u: absent", ch);
             continue;
         }
+        boot_absent_clear(ch);
         /* ROM answered, so a unit is physically there. Before declaring it bare,
          * re-try the app version read (the probe reset it into its app; give it
          * time to boot): the boot auto-ping's failure is fail-cached for 5 min,
@@ -657,7 +781,15 @@ int ambit_flash_boot_sync(void)
         if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
             continue;
         }
-        ESP_LOGW(TAG, "boot sync: auto-flashing ch%u -> v%s", ch, ver);
+        /* (b) Count the attempt in NVS BEFORE touching the chip. ambit_flash_image
+         * erases the AMBIT app region before writing, so a host reset mid-flash
+         * (brownout/WDT/panic) both bricks the unit AND never reaches the post-flash
+         * bump — the half-written unit would then reflash-and-reset forever.
+         * Persisting up-front caps the loop at BOOT_FAIL_MAX even across interrupted
+         * flashes; a verified flash clears the count again below. */
+        boot_fail_bump(ch, ver, fails[ch]);
+        ESP_LOGW(TAG, "boot sync: auto-flashing ch%u -> v%s (attempt %d/%d)",
+                 ch, ver, fails[ch] + 1, BOOT_FAIL_MAX);
         ambit_flash_image_result_t res;
         bool verified = false;
         if (ambit_flash_image(ch, tgt.dir, 0, &res) == ESP_OK) {
@@ -679,14 +811,14 @@ int ambit_flash_boot_sync(void)
             }
         }
         if (verified) {
-            boot_fail_clear(ch);
+            boot_fail_clear(ch);   /* clears the pre-attempt bump above */
             flashed++;
             ESP_LOGW(TAG, "  ch%u: now running v%s (verified)", ch, ver);
         } else {
-            boot_fail_bump(ch, ver, fails[ch]);
-            ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s)",
-                     ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);
+            ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s — "
+                          "already counted)", ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);
         }
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_RESET_SETTLE_MS));   /* (c) rail recovery before the next channel */
     }
     ESP_LOGW(TAG, "boot sync: %d/%d channel(s) flashed to v%s", flashed, n_need, ver);
     return flashed;

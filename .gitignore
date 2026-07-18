@@ -16,3 +16,4 @@ planning-internalDocs/
 
 # Claude Code personal/local settings (machine-specific permissions)
 .claude/settings.local.json
+databricks/
