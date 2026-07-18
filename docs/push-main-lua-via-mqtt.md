@@ -5,8 +5,11 @@ by publishing one JSON message. The firmware syntax-checks the script, stages it
 stops the Lua runner, swaps the file (keeping the old one as `main.lua.bak`),
 restarts the runner, and replies on the status topic.
 
-This runbook uses the example script at
-[`docs/example_Sdfolders/main.lua`](example_Sdfolders/main.lua) as the concrete
+**Delivery is by raw URL** — the command carries just a link, and the device
+streams the script over HTTPS. This is the default because it works on any heap
+state (even mid-measurement); inline embedding is a fallback for tiny scripts and
+lives in [Appendix A](#appendix-a). This runbook uses the example script at
+[`docs/example_SDfolders/main.lua`](example_SDfolders/main.lua) as the concrete
 payload, but the process is identical for any script.
 
 > **Contract reference:** the field/behaviour contract lives in
@@ -22,29 +25,42 @@ payload, but the process is identical for any script.
   this deployment the command topic happens to be
   `device/scripts/v1/Ambyte/2/AMBYTE_{MAC}`, but *any* command type is handled on
   whatever the command topic is set to.
+- **URL delivery (default):** the command is tiny — just `{type, id, url, checksum}`.
+  Because the message is small it is received on any heap state; the device then
+  stops **both** Lua and MQTT (defragmenting the heap and freeing it for the
+  download's TLS), **streams** the script over HTTPS in 4 KB chunks — no large
+  contiguous allocation, ever — then reconnects and applies. Same reliability as
+  OTA. (Contrast inline embedding, [Appendix A](#appendix-a): the whole ~8 KB
+  script rides in one MQTT message that needs a contiguous ~8 KB TLS buffer a busy
+  device often can't allocate, so large inline pushes silently drop.)
 - The device replies on its **status topic** with a `script_status` message.
-- Apply order (`components/script_update/script_update.c`): **sha256** (if a
-  checksum is supplied) → **Lua syntax check** (parse-only, before the SD is
-  touched) → write `main.lua.new` + fsync → stop runner → keep old script as
-  `main.lua.bak` → atomic rename → **latch the `id` in NVS (success only)** →
+- Apply order (`components/script_update/script_update.c`): **download** (URL) →
+  **sha256** (if a checksum is supplied) → **Lua syntax check** (parse-only, before
+  the SD is touched) → write `main.lua.new` + fsync → stop runner → keep old script
+  as `main.lua.bak` → atomic rename → **latch the `id` in NVS (success only)** →
   **reboot into the new script** (the default). Send `"reboot": false` to keep the
   old in-place behaviour instead (swap + restart just the Lua runner, no reboot).
 - **Reboot by default:** a successful update **restarts the whole device** so the
   new script runs from a clean boot — expect the device to drop offline for a few
   seconds and reconnect on the new `main.lua`. The `id` is latched *before* the
   reboot, so a **retained** update can't loop the reboot (it dedupes on reconnect).
-- **Size limit (inline):** the whole MQTT message must be **≤ 16384 bytes**
-  (`INBOUND_MSG_LARGE_MAX`), and — more limiting in practice — receiving a big
-  inline message needs a **contiguous ~8 KB TLS buffer**, which a fragmented heap
-  (mid-measurement) often can't provide, so large inline pushes fail with
-  `Dynamic Impl: alloc(…) failed / -0x7F00`. **For anything but a small script,
-  use the [`url` variant](#url-variant) below** — it sidesteps this entirely.
+
+### Prerequisites for URL delivery
+
+1. The script must be reachable at a **direct raw URL** (public, no auth — the
+   device fetches anonymously) — a `raw.githubusercontent.com/...` link, **not** a
+   github `/blob/` page. For this repo that is
+   `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`; the builder
+   in Step 2 derives it for you.
+2. **Commit *and* push the script first.** GitHub raw serves the *pushed commit*,
+   not your working copy — an un-pushed edit means the device downloads stale bytes
+   (and fails the checksum). The builder warns when the file is dirty or unpushed.
 
 ### The three gotchas that bite people
 
 1. **`id` must be unique per push.** A successful apply latches the `id` in NVS;
-   re-sending the same `id` logs `already applied — ignoring` and does nothing.
-   Use a fresh id every time (e.g. a timestamp).
+   re-sending the same `id` logs `already applied — ignoring` and **sends no reply**.
+   Use a fresh id every time (the builder auto-stamps a UTC timestamp).
 2. **The topic contains a live `{MAC}` placeholder.** `cfg get command_topic`
    shows the *stored template* (`…/AMBYTE_{MAC}`); the firmware expands `{MAC}` to
    the board's Wi-Fi STA MAC **at boot, in RAM only**. You must publish to the
@@ -91,52 +107,71 @@ subscribing to device/scripts/v1/Ambyte/2/AMBYTE_E8:F6:0A:B1:1F:34 (msg_id=…)
 
 ---
 
-## 2. Build the payload
+## 2. Commit, push, and build the URL command
 
-The awkward part is turning a multi-line `.lua` file into a single JSON string with
-a matching SHA-256. The helper [`build_script_payload.py`](build_script_payload.py)
-does it correctly and portably — **standard-library Python 3.8+, no dependencies,
-any OS**. It normalizes line endings to LF, hashes the exact bytes it puts in the
-message (so the checksum can never disagree with the script), enforces the 16 KB
-cap, and writes a compact `payload.json`:
+**First commit and push** your `main.lua` to the branch the raw URL points at
+(the device downloads the pushed commit, not your working tree):
 
 ```bash
-python3 docs/build_script_payload.py docs/example_Sdfolders/main.lua
+git add docs/example_SDfolders/main.lua
+git commit -m "update main.lua"
+git push
 ```
 
-Running it on the bundled example prints something like (your exact `script bytes` /
-`sha256` / `message bytes` depend on the file's current contents):
+Then build the command. The helper [`build_script_payload.py`](build_script_payload.py)
+— **standard-library Python 3.8+, no dependencies, any OS** — auto-derives the raw
+URL from the git remote + current branch + file path, computes the SHA-256 over the
+exact hosted bytes, and writes a tiny `payload.json`:
+
+```bash
+python3 docs/build_script_payload.py docs/example_SDfolders/main.lua
+```
 
 ```
-id            = main-lua-20260715-101530
-script bytes  = 7551   (CRLF->LF normalized)
-sha256        = d3f25d95572c4b83dd4770dca3bf2200fe3db67fcd4b47760751e2f22b81749b
+mode          = URL (auto-derived from git)
+url           = https://raw.githubusercontent.com/<owner>/<repo>/main/docs/example_SDfolders/main.lua
+id            = main-lua-url-20260718-192658
+script bytes  = 6730   (CRLF->LF normalized)
+sha256        = 7e04cc1b09e8fb63796db2a594d51207f27294329d09a49b774d2d1051efe785
 reboot        = yes (device default)
-message bytes = 7893 / 16384   OK, within cap
--> wrote payload.json   (paste into the AWS IoT MQTT test client, or: mosquitto_pub ... -f payload.json)
+message bytes = 253 / 16384   OK, within cap
+-> wrote payload.json
 ```
+
+`payload.json` is just:
+
+```json
+{"type":"script_update","id":"main-lua-url-20260718-192658","url":"https://raw.githubusercontent.com/<owner>/<repo>/main/docs/example_SDfolders/main.lua","checksum":"7e04cc1b09e8fb63796db2a594d51207f27294329d09a49b774d2d1051efe785"}
+```
+
+**The builder warns if the URL would serve stale bytes** — `!! WARNING: … has
+UNCOMMITTED changes …` or `… ahead of origin/<branch> …`. Fix that (commit + push)
+before publishing, or the device fails on `sha256 mismatch`.
 
 Options:
 
 | Flag | Effect |
 |---|---|
-| *(none)* | writes `./payload.json` with a fresh `main-lua-<UTC timestamp>` id |
+| *(none)* | URL command; raw URL auto-derived from git, fresh `main-lua-url-<UTC>` id |
+| `--url RAW_URL` | URL command with an explicit host (non-GitHub, gist, S3, …) instead of the git-derived one |
+| `--inline` | embed the script in the message instead (fallback — see [Appendix A](#appendix-a)) |
 | `--id ID` | set the update id explicitly (reusing an applied id is ignored by the device) |
-| `--no-checksum` | omit the `checksum` field (it's optional) |
-| `--ascii` | escape non-ASCII to `\uXXXX` — paste-safe for channels that might mangle UTF-8 (larger message; checksum unchanged) |
-| `--no-reboot` | add `"reboot": false` — swap in place without rebooting (the device default is to reboot into the new script) |
+| `--no-checksum` | omit the `checksum` field (it's optional; a bad download still fails the syntax check) |
+| `--no-reboot` | add `"reboot": false` — swap in place without rebooting (the device default is to reboot) |
 | `-o FILE` / `-o -` | write to FILE, or `-` for stdout (pipe to clipboard: `\| clip` / `\| pbcopy` / `\| xclip -sel c`) |
+
+**Verify the hosted bytes** match the checksum (authoritative — hashes what the
+device will actually download):
+
+```bash
+curl -sL '<raw-url>' | sha256sum          # or, fully offline, hash the pushed blob:
+git show origin/<branch>:docs/example_SDfolders/main.lua | sha256sum
+```
 
 **Notes**
 - **`checksum` is optional** (`--no-checksum`); when present it's verified, when
-  absent it's not. Recommended to keep it.
-- The `script` field is canonical; `payload` is accepted as a legacy alias.
-- If `message bytes` ever exceeds **16384**, the tool refuses to write and the
-  device would drop it anyway — serial shows `mqtt_client: inbound message <N> B >
-  cap 16384 (or no heap) — dropped (topic=…)`. Trim the script; there is no
-  chunked/URL path.
-
-
+  absent it's not. Recommended to keep it — it also catches a truncated download.
+- The `script` field is canonical for inline; `payload` is accepted as a legacy alias.
 
 ---
 
@@ -167,28 +202,28 @@ In **MQTT test client → Publish to a topic**:
 - **Publish.**
 
 The device must be **online** (connected to AWS IoT) for a non-retained publish to
-reach it. By default it **reboots** right after applying (the `applied` reply is
-published first), so expect a few seconds offline before it reconnects on the new
-script. Add `"reboot": false` (or `--no-reboot`) to swap in place without rebooting.
+reach it, and it needs external power / connectivity to reach the URL. During the
+download it stops **both** Lua and MQTT, so expect a brief MQTT gap; by default it
+then **reboots** right after applying (the `applied` reply is published first). Add
+`"reboot": false` (or `--no-reboot`) to swap in place without rebooting.
 
 ---
 
 ## 5. Verify
 
 **Serial console (authoritative — independent of whether the MQTT reply reaches you).**
-By default the message lands, applies, and the device **reboots** into the new script:
+By default the command lands, the device downloads + applies, and **reboots** into
+the new script:
 
 ```
 mqtt_client: inbound <M> B on device/scripts/v1/Ambyte/2/AMBYTE_E8:F6:0A:B1:1F:34
-cmd_router:  command type=script_update id=main-lua-...
-cmd_router:  script_update id=... dispatched (<N> bytes, reboot)
-script_upd:  script_update id=...: <N> bytes
-script_upd:  main.lua replaced (<N> bytes); previous kept as /sdcard/main.lua.bak — rebooting to run it
+cmd_router:  command type=script_update id=main-lua-url-...
+cmd_router:  script_update(url) id=… dispatched (https://…, reboot)
+script_upd:  script_update(url) id=…: https://…
+script_upd:  downloaded <N> bytes, sha256=…
+script_upd:  main.lua replaced from url (<N> bytes); previous kept as /sdcard/main.lua.bak — rebooting to run it
    ... device reboots: boot banner + ordered-boot logs ...
 ```
-
-(`inbound <M> B` is the whole message; `dispatched (<N> bytes, …)` and the `script_upd`
-count are the decoded **script** length. The trailing `reboot`/`in-place` tag shows the mode.)
 
 After the reboot the new schedule starts — for the bundled example:
 
@@ -200,7 +235,7 @@ dev_cmd: SS ch0: <points> points, <temp>C, stored 1     (steady-state)
 **Status topic (your AWS subscription)** — published just before the reboot:
 
 ```json
-{"type":"script_status","device_id":"03:25:07:04","id":"main-lua-...","state":"applied","detail":"<N> bytes; rebooting"}
+{"type":"script_status","device_id":"03:25:07:04","id":"main-lua-url-...","state":"applied","detail":"<N> bytes; rebooting"}
 ```
 
 `state:"applied"` = success. If the update was **retained**, the device re-receives it
@@ -208,7 +243,7 @@ on reconnect and logs `already applied — ignoring` — no second reboot (the s
 
 **With `"reboot": false`** the device does *not* restart: the serial log reads
 `main.lua replaced (<N> bytes) + runner restarted` and the reply `detail` is just
-`"<N> bytes"`. Any `state:"failed"` → see the failure table below.
+`"<N> bytes"`. Any `state:"failed"` → see the [failure reference](#failure-reference).
 
 ---
 
@@ -229,58 +264,36 @@ To revert, either:
 
 ---
 
-<a id="url-variant"></a>
-## The `url` variant — reliable delivery for large scripts
+<a id="appendix-a"></a>
+## Appendix A — inline fallback (small scripts / no host)
 
-The inline push must receive the whole script in one MQTT message, which needs a
-contiguous ~8 KB TLS record buffer — exactly what a fragmented heap (during
-continuous measurement) can't give, so large inline pushes fail with
-`Dynamic Impl: alloc(…) failed`. The `url` variant avoids this: the **command is
-tiny** (just the URL), so it's received on any heap state; the device then stops
-Lua (defragmenting the heap) and **streams** the script over HTTPS in 4 KB chunks
-— no large contiguous allocation, ever. Same reliability as OTA.
+When you can't host the file (no push access, private host the device can't reach,
+a quick one-off), embed the script directly with `--inline`:
 
-**1. Host the script** at a **direct raw** URL (not a github `/blob/` page):
-```
-https://raw.githubusercontent.com/<owner>/<repo>/<branch>/path/main.lua
-```
-
-**2. Compute its checksum** over the exact hosted bytes:
 ```bash
-curl -sL '<raw-url>' | sha256sum         # or: sha256sum main.lua  (the file you upload verbatim)
+python3 docs/build_script_payload.py docs/example_SDfolders/main.lua --inline
 ```
 
-**3. Publish the tiny command** to the command topic (Retain OFF):
+This normalizes line endings, hashes the exact bytes it puts in the message, and
+writes a `payload.json` containing the whole script:
+
 ```json
-{
-  "type": "script_update",
-  "id": "main-lua-url-2026-07-15-001",
-  "url": "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/main.lua",
-  "checksum": "<sha256 of the fetched file>"
-}
+{"type":"script_update","id":"main-lua-...","script":"<lua>","checksum":"<sha256>"}
 ```
-`checksum` is optional (a bad download also fails the syntax check / short-download
-guard), but recommended. `reboot` defaults true, as with inline.
 
-**Serial** on success:
-```
-cmd_router:  script_update(url) id=… dispatched (https://…, reboot)
-script_upd:  script_update(url) id=…: https://…
-script_upd:  downloaded <N> bytes, sha256=…
-script_upd:  main.lua replaced from url (<N> bytes); previous kept as /sdcard/main.lua.bak — rebooting to run it
-```
-Status reply: `{"type":"script_status",…,"state":"applied","detail":"<N> bytes; rebooting"}`.
+Publish it exactly as in Steps 3–5. **Caveats that make URL the default:**
 
-Failure `detail`s add `download failed (<err>)` (unreachable URL / non-200 / short
-or truncated read — check it's a direct raw link) on top of the shared table below.
-During the download the device stops **both** Lua and MQTT (to free the heap for
-the download's TLS), then reconnects and reports — so expect a brief MQTT gap. The
-device needs external power / connectivity to reach the URL.
-
-> **`reboot` needs an `id`.** With `reboot` defaulting to true, a command with no
-> `id` is rejected (`"failed":"reboot requires an id"`) — an un-dedupable retained
-> reboot command would boot-loop. Always include a unique `id` (the builder does
-> this automatically); or set `"reboot": false` to apply in place without one.
+- **Size limit:** the whole MQTT message must be **≤ 16384 bytes**
+  (`INBOUND_MSG_LARGE_MAX`). The builder refuses to write over that.
+- **Contiguous-heap fragility (the real killer):** any message over **2048 bytes**
+  (`INBOUND_MSG_MAX`) needs a contiguous transient heap buffer sized to the message.
+  A fragmented heap (mid-measurement) often can't provide it, so the push **silently
+  drops** — serial shows `inbound message <N> B > cap 16384 (or no heap) — dropped
+  (topic=…)` or `Dynamic Impl: alloc(…) failed / -0x7F00`, and **no reply arrives**.
+  This is exactly what URL delivery avoids. If an inline push produces no reply,
+  don't retry it — switch to URL.
+- `--ascii` escapes non-ASCII to `\uXXXX` for channels that might mangle UTF-8
+  (larger message; checksum unchanged). `--no-reboot` / `--no-checksum` work here too.
 
 ---
 
@@ -292,20 +305,22 @@ that happens before the swap.
 
 | `detail` | Cause | Fix |
 |---|---|---|
-| `sha256 mismatch` | checksum ≠ sha256 of the decoded script | regenerate with the Step-2 script (don't hand-edit either field); or omit `checksum` |
+| `download failed (<err>)` | *(URL only)* unreachable URL / non-200 / short or truncated read | check it's a direct **raw** link (not `/blob/`), public, and the device has connectivity |
+| `sha256 mismatch` | checksum ≠ sha256 of the downloaded/decoded script | you likely didn't push, or pushed different bytes — `git show origin/<branch>:<path> \| sha256sum` and regenerate; or omit `checksum` |
 | *(a Lua parse error)* | script fails the parse-only syntax check | fix the syntax; note **runtime** errors are NOT caught here — a script that parses but crashes at run reports `applied`, then fails in the runner → recover via `main.lua.bak` |
+| `reboot requires an id` | a reboot command (the default) with no `id` — un-dedupable, would boot-loop | include a unique `id` (the builder always does) or set `"reboot": false` |
 | `SD card not mounted` | SD failed to mount at apply time (e.g. `sdmmc 0x107` timeout) | the id is **not** latched on this failure, so it stays retryable — re-publish once the SD is healthy |
 | `cannot open /sdcard/main.lua.new` / `SD write failed` | SD write error mid-stage | check the card; retry |
 | `lua task busy; retry` | runner stuck in a long C call, didn't stop within 5 s | wait a moment and re-publish |
 | `rename failed` | FATFS rename failed (rare) | retry; old script auto-restored |
 | `script installed but runner restart failed` | *(reboot:false only)* file swapped but runner wouldn't start | `lua start` on the console, or reboot |
 
-Also note: `already applied — ignoring` (info log, no reply) means you reused an
+Also note: `already applied — ignoring` (info log, **no reply**) means you reused an
 `id` that was already applied — bump the `id`.
 
 ---
 
-## Appendix: local/scriptable alternative (mosquitto)
+## Appendix B — local/scriptable alternative (mosquitto)
 
 For a repeatable push without the console, use the device cert bundle under
 `device_certs/<bundle>/` (same auth the device uses; give the test client a
