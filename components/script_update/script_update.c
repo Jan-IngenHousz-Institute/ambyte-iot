@@ -437,7 +437,7 @@ static void do_update_url(const script_req_t *r)
      * (best-effort — the serial log is authoritative either way). */
     if (s_cfg.comms_resume != NULL) {
         s_cfg.comms_resume();
-        for (int i = 0; i < 50 && s_cfg.is_connected != NULL && !s_cfg.is_connected(); i++) {
+        for (int i = 0; i < 3000 && s_cfg.is_connected != NULL && !s_cfg.is_connected(); i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
