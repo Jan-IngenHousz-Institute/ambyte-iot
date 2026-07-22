@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_app_desc.h"
@@ -34,8 +35,7 @@ typedef struct {
 } ota_request_t;
 
 static ota_update_config_t s_cfg;
-static QueueHandle_t       s_queue;
-static TaskHandle_t        s_task;
+static bool                s_ready;   /* init done; dispatch via the shared worker (s_cfg.submit) */
 
 /* ── status reporting ──────────────────────────────────────────────────── */
 
@@ -269,27 +269,30 @@ static void confirm_pending_after_boot(void)
     }
 }
 
-static void ota_task(void *arg)
+/* Run one queued OTA op in the shared maintenance worker (fix #3). Owns and frees
+ * `arg` (a heap ota_request_t). Reboots on success; returns on failure. */
+static void ota_run(void *arg)
 {
-    (void)arg;
-    confirm_pending_after_boot();   /* handle a just-applied image before serving requests */
-
-    ota_request_t r;
-    for (;;) {
-        if (xQueueReceive(s_queue, &r, portMAX_DELAY) == pdTRUE) {
-            /* Global maintenance gate: refuse to overlap another update type (a
-             * concurrent self-OTA/AMBIT-OTA/script-update would fight for the heap
-             * and could hold two TLS sessions → OOM). */
-            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
-                ESP_LOGW(TAG, "another maintenance op in progress — OTA id=%s dropped",
-                         r.id[0] ? r.id : "");
-                ota_report("dropped", r.id, "another maintenance op is in progress");
-                continue;
-            }
-            ota_do_update(&r);   /* reboots on success; returns (and releases) on failure */
-            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
-        }
+    ota_request_t *r = arg;
+    /* Global maintenance gate: refuse to overlap another update type (a
+     * concurrent AMBIT-OTA/script-update would fight for the heap and could hold
+     * two TLS sessions → OOM). Redundant under the single shared worker, kept as
+     * belt-and-suspenders. */
+    if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+        ESP_LOGW(TAG, "another maintenance op in progress — OTA id=%s dropped",
+                 r->id[0] ? r->id : "");
+        ota_report("dropped", r->id, "another maintenance op is in progress");
+        free(r);
+        return;
     }
+    ota_do_update(r);   /* reboots on success; returns (and releases) on failure */
+    if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
+    free(r);
+}
+
+void ota_update_run_boot_confirm(void)
+{
+    confirm_pending_after_boot();   /* no-op fast return on a normal boot */
 }
 
 /* ── public API ────────────────────────────────────────────────────────── */
@@ -297,28 +300,15 @@ static void ota_task(void *arg)
 esp_err_t ota_update_init(const ota_update_config_t *cfg)
 {
     if (cfg == NULL) return ESP_ERR_INVALID_ARG;
-    if (s_task != NULL) return ESP_OK;   /* idempotent */
-    s_cfg = *cfg;
-
-    s_queue = xQueueCreate(2, sizeof(ota_request_t));
-    if (s_queue == NULL) return ESP_ERR_NO_MEM;
-
-    /* Pin to core 0 (PRO_CPU, with Wi-Fi/lwIP). lua_runner is pinned to core 1;
-     * keeping OTA off core 1 avoids the measurement task preempting the download
-     * if it were ever running, and the download yields on I/O anyway. */
-    if (xTaskCreatePinnedToCore(ota_task, "ota_update", OTA_TASK_STACK, NULL,
-                                OTA_TASK_PRIO, &s_task, 0) != pdPASS) {
-        vQueueDelete(s_queue);
-        s_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "OTA worker started");
+    s_cfg   = *cfg;
+    s_ready = true;   /* ops dispatch to the shared maintenance worker via s_cfg.submit */
+    ESP_LOGI(TAG, "OTA module ready (shared maintenance worker)");
     return ESP_OK;
 }
 
 esp_err_t ota_update_request(const char *url, const char *id)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (url == NULL || url[0] == '\0' || strlen(url) >= OTA_URL_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -328,12 +318,21 @@ esp_err_t ota_update_request(const char *url, const char *id)
         ESP_LOGI(TAG, "ota_update id=%s already applied — ignoring", id ? id : "");
         return ESP_OK;
     }
-    ota_request_t r;
-    memset(&r, 0, sizeof r);
-    strncpy(r.url, url, sizeof r.url - 1);
-    if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
-    if (xQueueSend(s_queue, &r, 0) == pdTRUE) return ESP_OK;
-    /* Queue full (an OTA is already in flight) — tell the operator, don't drop silently. */
-    ota_report("dropped", id, "an OTA is already in progress");
-    return ESP_ERR_NO_MEM;
+    /* Heap-copy the request and hand it to the shared worker. The copy is small
+     * (~320 B), so it allocates even on a fragmented heap — unlike the old ~8 KB
+     * task stack that this dispatch used to need. */
+    ota_request_t *r = calloc(1, sizeof *r);
+    if (r == NULL) {
+        ota_report("dropped", id, "out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    strncpy(r->url, url, sizeof r->url - 1);
+    if (id != NULL) strncpy(r->id, id, sizeof r->id - 1);
+    if (s_cfg.submit == NULL || !s_cfg.submit(ota_run, r)) {
+        /* Worker queue full — an update is already queued/in flight. */
+        ota_report("dropped", id, "an OTA is already in progress");
+        free(r);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

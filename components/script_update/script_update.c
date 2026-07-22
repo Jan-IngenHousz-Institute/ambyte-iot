@@ -22,9 +22,6 @@
 
 #define TAG "script_upd"
 
-#define SCRIPT_TASK_STACK   10240    /* 10 KB: the url download runs esp_http_client+mbedTLS here (matches ambit_ota) */
-#define SCRIPT_TASK_PRIO    4        /* below lua_runner(10); admin work, not latency-critical */
-#define SCRIPT_IDLE_EXIT_MS 2000     /* free the worker stack this long after idle */
 #define SCRIPT_ID_MAX       64
 #define SCRIPT_EXEC_TIMEOUT_MS 120000   /* snippets may run multi-second AMBIT measurements */
 #define SCRIPT_RESULT_MAX   192
@@ -53,9 +50,7 @@ typedef struct {
 } script_req_t;
 
 static script_update_config_t s_cfg;
-static QueueHandle_t          s_queue;
-static TaskHandle_t           s_task;   /* NULL when no worker is running (lazy) */
-static SemaphoreHandle_t      s_lock;   /* guards s_task lifecycle vs enqueue */
+static bool                   s_ready;   /* init done; dispatch via the shared worker (s_cfg.submit) */
 
 /* ── dedupe latch (NVS, success only — same semantics as the OTAs) ────────── */
 
@@ -494,60 +489,50 @@ static void do_exec(const script_req_t *r)
     report_exec(r->id, err == ESP_OK, result);
 }
 
-/* ── lazy worker (same shape as ambit_ota: zero steady-state heap) ────────── */
+/* ── shared maintenance worker dispatch (fix #3) ──────────────────────────── */
 
-static void script_task(void *arg)
+/* Run one queued script/exec op in the shared maintenance worker. Owns and frees
+ * `arg` (a heap script_req_t) AND its ->text. Previously this ran on a per-op
+ * lazy task with a 10 KB stack, whose xTaskCreate failed (ESP_ERR_NO_MEM) on the
+ * fragmented field heap — so a remote main.lua push (the primary recovery path)
+ * could not launch. It now runs on the single resident maintenance worker. */
+static void script_run(void *arg)
 {
-    (void)arg;
-    script_req_t r;
-    for (;;) {
-        if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(SCRIPT_IDLE_EXIT_MS)) == pdTRUE) {
-            /* Global maintenance gate: refuse to overlap another update type. A
-             * concurrent self-OTA / AMBIT op on its own task would fight for the
-             * heap and could leave two TLS sessions live → OOM on this board. */
-            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
-                ESP_LOGW(TAG, "another maintenance op in progress — script op=%u id=%s dropped",
-                         r.op, r.id[0] ? r.id : "(none)");
-                if (r.op == OP_EXEC) report_exec(r.id, false, "device busy (maintenance in progress)");
-                else                 report_script("busy", r.id, "another maintenance op is in progress");
-                free(r.text);
-                continue;
-            }
-            if (r.op == OP_EXEC)            do_exec(&r);
-            else if (r.op == OP_UPDATE_URL) do_update_url(&r);
-            else                            do_update(&r);
-            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
-            free(r.text);
-            continue;
-        }
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (uxQueueMessagesWaiting(s_queue) == 0) {
-            s_task = NULL;
-            xSemaphoreGive(s_lock);
-            vTaskDelete(NULL);   /* idle — give the stack back */
-        }
-        xSemaphoreGive(s_lock);
+    script_req_t *r = arg;
+    /* Global maintenance gate: refuse to overlap another update type. Redundant
+     * under the single shared worker (ops are already serialized), kept as
+     * belt-and-suspenders. */
+    if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+        ESP_LOGW(TAG, "another maintenance op in progress — script op=%u id=%s dropped",
+                 r->op, r->id[0] ? r->id : "(none)");
+        if (r->op == OP_EXEC) report_exec(r->id, false, "device busy (maintenance in progress)");
+        else                  report_script("busy", r->id, "another maintenance op is in progress");
+        free(r->text);
+        free(r);
+        return;
     }
+    if (r->op == OP_EXEC)            do_exec(r);
+    else if (r->op == OP_UPDATE_URL) do_update_url(r);
+    else                            do_update(r);
+    if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
+    free(r->text);
+    free(r);
 }
 
+/* Hand a request to the shared maintenance worker. Takes ownership of r->text on
+ * success (the worker frees it); on failure the caller (request_common) frees it.
+ * The heap copy is small (~350 B), so it allocates even on a fragmented heap. */
 static esp_err_t enqueue(script_req_t *r)
 {
-    if (s_queue == NULL || s_lock == NULL) return ESP_ERR_INVALID_STATE;
-    esp_err_t ret = ESP_OK;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (xQueueSend(s_queue, r, 0) != pdTRUE) {
-        ret = ESP_ERR_NO_MEM;                 /* an op is already queued/in-flight */
-    } else if (s_task == NULL) {
-        if (xTaskCreatePinnedToCore(script_task, "script_upd", SCRIPT_TASK_STACK,
-                                    NULL, SCRIPT_TASK_PRIO, &s_task, 0) != pdPASS) {
-            script_req_t drop;
-            xQueueReceive(s_queue, &drop, 0);   /* undo — no worker to run it */
-            s_task = NULL;
-            ret = ESP_ERR_NO_MEM;
-        }
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    script_req_t *copy = malloc(sizeof *copy);
+    if (copy == NULL) return ESP_ERR_NO_MEM;   /* caller frees r->text */
+    *copy = *r;                                /* copy->text aliases r->text */
+    if (s_cfg.submit == NULL || !s_cfg.submit(script_run, copy)) {
+        free(copy);                            /* NOT copy->text — caller still owns it */
+        return ESP_ERR_NO_MEM;                 /* worker queue full — op already queued/in-flight */
     }
-    xSemaphoreGive(s_lock);
-    return ret;
+    return ESP_OK;                             /* worker now owns copy + copy->text */
 }
 
 /* ── public API ───────────────────────────────────────────────────────────── */
@@ -555,26 +540,16 @@ static esp_err_t enqueue(script_req_t *r)
 esp_err_t script_update_init(const script_update_config_t *cfg)
 {
     if (cfg == NULL) return ESP_ERR_INVALID_ARG;
-    s_cfg = *cfg;
-    if (s_queue != NULL) return ESP_OK;   /* idempotent */
-
-    s_lock  = xSemaphoreCreateMutex();
-    s_queue = xQueueCreate(2, sizeof(script_req_t));
-    if (s_lock == NULL || s_queue == NULL) {
-        if (s_lock)  vSemaphoreDelete(s_lock);
-        if (s_queue) vQueueDelete(s_queue);
-        s_lock = NULL;
-        s_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "script/exec worker ready (spawned on demand)");
+    s_cfg   = *cfg;
+    s_ready = true;   /* ops dispatch to the shared maintenance worker via s_cfg.submit */
+    ESP_LOGI(TAG, "script/exec module ready (shared maintenance worker)");
     return ESP_OK;
 }
 
 static esp_err_t request_common(uint8_t op, const char *text,
                                 const char *checksum, const char *id, bool reboot)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (text == NULL || text[0] == '\0') return ESP_ERR_INVALID_ARG;
 
     script_req_t r;

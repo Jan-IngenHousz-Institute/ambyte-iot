@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "CLI.h"
@@ -235,6 +236,56 @@ static void app_comms_resume(void)
     bool last = (s_comms_susp_n > 0 && --s_comms_susp_n == 0);
     taskEXIT_CRITICAL(&s_comms_mux);
     if (last) mqtt_client_start();
+}
+
+/* ── Shared maintenance worker (fix #3) ───────────────────────────────────
+ * The three update workers (self-OTA, AMBIT OTA/flash/probe/versions, script
+ * update/exec) used to each spawn their own task ON DEMAND with a ~10 KB stack.
+ * On the field's fragmented, no-PSRAM heap (largest free block seen pegged at
+ * ~3.3 KB) that lazy xTaskCreate returned ESP_ERR_NO_MEM, so the very commands
+ * meant to RECOVER a degraded unit (push a new main.lua, reflash a mismatched
+ * AMBIT) could not even launch — observed 2026-07-20 as "script_update(url) …
+ * dispatch failed: ESP_ERR_NO_MEM". The maintenance lock already makes the three
+ * mutually exclusive, so ONE resident worker suffices. Created here while the
+ * heap is still clean (before Lua starts), its stack can never fail to allocate;
+ * dispatch is now just a small (~few-hundred-byte) job enqueue that fits even a
+ * fragmented heap. Net resident cost is one stack (~10 KB) — replacing the old
+ * resident 8 KB OTA task plus two on-demand 10 KB stacks. */
+#define MAINT_WORKER_STACK 10240   /* max of the three old stacks (OTA 8K, ambit/script 10K) */
+#define MAINT_WORKER_PRIO  4       /* same as the three old workers; below lua_runner(10) */
+#define MAINT_WORKER_QLEN  4       /* a couple of ops may queue behind a long URL update */
+
+typedef struct {
+    void (*run)(void *arg);   /* the component's op handler; must free(arg) */
+    void  *arg;               /* heap-owned request copy */
+} maint_job_t;
+
+static QueueHandle_t s_maint_q;
+
+/* Submit hook handed to every update worker's config. Enqueues a job for the
+ * shared worker; returns false if the queue is full (op is then reported dropped
+ * by the caller). The worker — not this call — runs run(arg) and frees arg. */
+static bool app_maint_submit(void (*run)(void *arg), void *arg)
+{
+    if (s_maint_q == NULL || run == NULL) return false;
+    maint_job_t job = { .run = run, .arg = arg };
+    return xQueueSend(s_maint_q, &job, 0) == pdTRUE;
+}
+
+static void app_maint_worker(void *arg)
+{
+    (void)arg;
+    /* Confirm (or roll back) a just-applied self-OTA image before serving any
+     * request. This ran in ota_update's own task before; it now lives here since
+     * this is the single maintenance task. No-op fast return on a normal boot. */
+    ota_update_run_boot_confirm();
+
+    maint_job_t job;
+    for (;;) {
+        if (xQueueReceive(s_maint_q, &job, portMAX_DELAY) == pdTRUE) {
+            job.run(job.arg);   /* runs the op to completion; OTA success/rollback reboots */
+        }
+    }
 }
 
 /* Boot-complete latch: Wi-Fi connects asynchronously, so an IP can land while
@@ -718,6 +769,7 @@ void app_main(void)
         .workload_resume   = app_workload_resume,
         .maintenance_begin = app_maintenance_begin,
         .maintenance_end   = app_maintenance_end,
+        .submit            = app_maint_submit,
         .status_topic      = status_topic,
         .device_id         = device_id,
     };
@@ -736,6 +788,7 @@ void app_main(void)
         .comms_resume      = app_comms_resume,
         .maintenance_begin = app_maintenance_begin,
         .maintenance_end   = app_maintenance_end,
+        .submit            = app_maint_submit,
         .publish           = mqtt_client_get_publish_fn(),
         .is_connected      = mqtt_client_get_is_connected_fn(),
         .status_topic      = status_topic,
@@ -763,9 +816,26 @@ void app_main(void)
         .comms_resume      = app_comms_resume,
         .maintenance_begin = app_maintenance_begin,
         .maintenance_end   = app_maintenance_end,
+        .submit            = app_maint_submit,
     };
     if (script_update_init(&script_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "script_update worker not started");
+    }
+
+    /* Start the single shared maintenance worker now — the heap is still clean
+     * (Lua has not started), so its stack allocation cannot fail the way the old
+     * per-op lazy spawns did on a fragmented heap. Must run AFTER the three
+     * *_init() calls above so their configs (used by the worker's boot-confirm
+     * and job handlers) are stored. If it can't start, remote OTA / AMBIT flash /
+     * script update are unavailable, but the device still measures + publishes. */
+    s_maint_q = xQueueCreate(MAINT_WORKER_QLEN, sizeof(maint_job_t));
+    if (s_maint_q == NULL ||
+        xTaskCreatePinnedToCore(app_maint_worker, "maint", MAINT_WORKER_STACK,
+                                NULL, MAINT_WORKER_PRIO, NULL, 0) != pdPASS) {
+        if (s_maint_q != NULL) { vQueueDelete(s_maint_q); s_maint_q = NULL; }
+        ESP_LOGE(APP_TAG, "maintenance worker failed to start — remote OTA/flash/script disabled");
+    } else {
+        ESP_LOGI(APP_TAG, "maintenance worker started (shared, resident)");
     }
 
     /* ── Wi-Fi init + start ───────────────────────────────────────── */

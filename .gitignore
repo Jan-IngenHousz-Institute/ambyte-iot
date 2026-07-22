@@ -18,3 +18,4 @@ planning-internalDocs/
 .claude/settings.local.json
 databricks/
 log_debug/
+dataset.csv

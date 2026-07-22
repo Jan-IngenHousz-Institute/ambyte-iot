@@ -42,13 +42,25 @@ typedef struct {
      * end() releases it. Both NULL = no gate (always proceed). */
     bool                  (*maintenance_begin)(void);
     void                  (*maintenance_end)(void);
+    /* Submit the OTA op to the shared maintenance worker (one resident task for
+     * ALL update types, created while the heap is clean at boot). run(arg) runs
+     * the op and must free(arg). Returns false if the worker queue is full. This
+     * replaces a per-op task spawn that could fail (ESP_ERR_NO_MEM) on the
+     * fragmented field heap. Required (NULL = requests fail INVALID_STATE). */
+    bool                  (*submit)(void (*run)(void *arg), void *arg);
     const char             *status_topic;   /* where status JSON is published */
     const char             *device_id;      /* included in status payloads */
 } ota_update_config_t;
 
-/* Start the OTA worker task. On boot it confirms a just-applied PENDING_VERIFY
- * image once MQTT reconnects (else rolls back), then waits for requests. */
+/* Prepare the OTA module (stores cfg). The actual worker is the shared
+ * maintenance task in app_main; requests are dispatched to it via cfg.submit. */
 esp_err_t ota_update_init(const ota_update_config_t *cfg);
+
+/* Confirm (or roll back) a just-applied PENDING_VERIFY image. Called ONCE by the
+ * shared maintenance worker before it serves requests; blocks up to the confirm
+ * timeout waiting for MQTT only when an image is actually pending, else returns
+ * immediately. Safe to call on a normal boot (no-op). */
+void ota_update_run_boot_confirm(void);
 
 /* Queue an OTA from `url` (HTTPS; e.g. a public GitHub release/raw asset). `id`
  * correlates the status reports + the post-reboot confirmation. Non-blocking:

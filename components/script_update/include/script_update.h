@@ -44,6 +44,12 @@ typedef struct {
      * "busy" rather than overlapping. end() releases it. Both NULL = no gate. */
     bool                  (*maintenance_begin)(void);
     void                  (*maintenance_end)(void);
+    /* Submit the op to the shared maintenance worker (one resident task for ALL
+     * update types, created while the heap is clean at boot). run(arg) runs the
+     * op and must free(arg). Returns false if the worker queue is full. Replaces
+     * the old on-demand task spawn that failed (ESP_ERR_NO_MEM) on the fragmented
+     * field heap. Required (NULL = requests fail INVALID_STATE). */
+    bool                  (*submit)(void (*run)(void *arg), void *arg);
 } script_update_config_t;
 
 /* Prepare the worker plumbing (idempotent; the task itself spawns on demand). */

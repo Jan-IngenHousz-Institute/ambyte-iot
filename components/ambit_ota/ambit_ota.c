@@ -30,7 +30,6 @@
 #define AMBIT_OTA_REBOOT_WAIT_MS 5000     /* let the C3 reboot into the new image before re-querying */
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
-#define AMBIT_OTA_IDLE_EXIT_MS 2000   /* free the worker stack this long after idle */
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
 
 #define NVS_NS                 "ambit_ota"
@@ -59,9 +58,7 @@ typedef struct {
 } ambit_ota_req_t;
 
 static ambit_ota_config_t s_cfg;
-static QueueHandle_t      s_queue;
-static TaskHandle_t       s_task;     /* NULL when no worker is running (lazy) */
-static SemaphoreHandle_t  s_lock;     /* guards s_task lifecycle vs enqueue */
+static bool               s_ready;    /* init done; dispatch via the shared worker (s_cfg.submit) */
 
 /* ── dedupe latch (NVS) ──────────────────────────────────────────────────
  * Mirror of ota_update: an id is latched only on a *successful* update, so a
@@ -750,69 +747,48 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
     }
 }
 
-/* Lazy worker: spawned on demand by ambit_ota_enqueue(), exits (freeing its
- * stack) once idle. This board runs near its heap limit (~17 KB largest block, no
- * PSRAM); a permanently-resident 8 KB stack for a rare maintenance op would shrink
- * the headroom the telemetry drain needs to buffer a ~4 KB AMBIT payload. The exit
- * decision and the enqueue+spawn both run under s_lock, and the task re-checks the
- * queue under the lock before deleting, so a request can't race into a dying task. */
-static void ambit_ota_task(void *arg)
+/* Run one queued AMBIT op in the shared maintenance worker (fix #3). Owns and
+ * frees `arg` (a heap ambit_ota_req_t). Previously this was a per-op lazy task
+ * with a 10 KB stack; that xTaskCreate returned ESP_ERR_NO_MEM on the fragmented
+ * field heap, so a remote reflash of a mismatched AMBIT could not launch. The op
+ * now runs on the single resident maintenance worker (created when the heap was
+ * clean at boot), and dispatch is a tiny job enqueue. */
+static void ambit_ota_run(void *arg)
 {
-    (void)arg;
-    ambit_ota_req_t r;
-    for (;;) {
-        if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(AMBIT_OTA_IDLE_EXIT_MS)) == pdTRUE) {
-            /* Global maintenance gate: refuse to overlap another update type (a
-             * concurrent self-OTA/script-update on its own task would fight for the
-             * heap / hold a second TLS session → OOM on this no-PSRAM board; a UART
-             * op would corrupt the other's transactions). */
-            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
-                ESP_LOGW(TAG, "another maintenance op in progress — ambit op=%u id=%s dropped",
-                         r.op, r.id[0] ? r.id : "");
-                report_busy(&r);
-                continue;
-            }
-            switch (r.op) {
-            case AMBIT_OP_VERSIONS: ambit_do_versions(r.id); break;
-            case AMBIT_OP_PROBE:    ambit_do_probe(&r);      break;
-            case AMBIT_OP_FLASH:    ambit_do_flash(&r);      break;
-            default:                ambit_do_ota(&r);        break;
-            }
-            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
-            continue;
-        }
-        /* Idle timeout: exit to give the stack back, unless a request just arrived. */
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (uxQueueMessagesWaiting(s_queue) == 0) {
-            s_task = NULL;
-            xSemaphoreGive(s_lock);
-            vTaskDelete(NULL);   /* no return — stack reclaimed */
-        }
-        xSemaphoreGive(s_lock);   /* a request raced in; loop and process it */
+    ambit_ota_req_t *r = arg;
+    /* Global maintenance gate: refuse to overlap another update type. Redundant
+     * under the single shared worker (ops are already serialized), kept as
+     * belt-and-suspenders. */
+    if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+        ESP_LOGW(TAG, "another maintenance op in progress — ambit op=%u id=%s dropped",
+                 r->op, r->id[0] ? r->id : "");
+        report_busy(r);
+        free(r);
+        return;
     }
+    switch (r->op) {
+    case AMBIT_OP_VERSIONS: ambit_do_versions(r->id); break;
+    case AMBIT_OP_PROBE:    ambit_do_probe(r);        break;
+    case AMBIT_OP_FLASH:    ambit_do_flash(r);        break;
+    default:                ambit_do_ota(r);          break;
+    }
+    if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
+    free(r);
 }
 
-/* Queue a request, spawning the worker if it isn't running. */
+/* Hand a request to the shared maintenance worker. The heap copy is small
+ * (~330 B), so it allocates even on a fragmented heap. */
 static esp_err_t ambit_ota_enqueue(const ambit_ota_req_t *r)
 {
-    if (s_queue == NULL || s_lock == NULL) return ESP_ERR_INVALID_STATE;
-    esp_err_t ret = ESP_OK;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (xQueueSend(s_queue, r, 0) != pdTRUE) {
-        ret = ESP_ERR_NO_MEM;                 /* an op is already queued/in-flight */
-    } else if (s_task == NULL) {
-        /* Core 0 like ota_update: lua_runner (the UART's other user) is on core 1
-         * and suspended during the op anyway; the download yields on I/O. */
-        if (xTaskCreatePinnedToCore(ambit_ota_task, "ambit_ota", AMBIT_OTA_TASK_STACK,
-                                    NULL, AMBIT_OTA_TASK_PRIO, &s_task, 0) != pdPASS) {
-            ambit_ota_req_t drop;
-            xQueueReceive(s_queue, &drop, 0);  /* undo the enqueue — no worker to run it */
-            s_task = NULL;
-            ret = ESP_ERR_NO_MEM;
-        }
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    ambit_ota_req_t *copy = malloc(sizeof *copy);
+    if (copy == NULL) return ESP_ERR_NO_MEM;
+    *copy = *r;
+    if (s_cfg.submit == NULL || !s_cfg.submit(ambit_ota_run, copy)) {
+        free(copy);                           /* worker queue full — op already queued/in-flight */
+        return ESP_ERR_NO_MEM;
     }
-    xSemaphoreGive(s_lock);
-    return ret;
+    return ESP_OK;
 }
 
 /* ── public API ───────────────────────────────────────────────────────────── */
@@ -820,26 +796,15 @@ static esp_err_t ambit_ota_enqueue(const ambit_ota_req_t *r)
 esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg)
 {
     if (cfg == NULL) return ESP_ERR_INVALID_ARG;
-    s_cfg = *cfg;
-    if (s_queue != NULL) return ESP_OK;   /* idempotent */
-
-    s_lock  = xSemaphoreCreateMutex();
-    s_queue = xQueueCreate(2, sizeof(ambit_ota_req_t));
-    if (s_lock == NULL || s_queue == NULL) {
-        if (s_lock)  vSemaphoreDelete(s_lock);
-        if (s_queue) vQueueDelete(s_queue);
-        s_lock = NULL;
-        s_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    /* No task yet — spawned on the first request, exits when idle (lazy). */
-    ESP_LOGI(TAG, "AMBIT OTA ready (worker spawned on demand)");
+    s_cfg   = *cfg;
+    s_ready = true;   /* ops dispatch to the shared maintenance worker via s_cfg.submit */
+    ESP_LOGI(TAG, "AMBIT OTA ready (shared maintenance worker)");
     return ESP_OK;
 }
 
 esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -866,7 +831,7 @@ esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
 
 esp_err_t ambit_ota_report_versions(const char *id)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     ambit_ota_req_t r;
     memset(&r, 0, sizeof r);
     r.op = AMBIT_OP_VERSIONS;
@@ -876,7 +841,7 @@ esp_err_t ambit_ota_report_versions(const char *id)
 
 esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -891,7 +856,7 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id)
 
 esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id)
 {
-    if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
         return ESP_ERR_INVALID_ARG;
     }
