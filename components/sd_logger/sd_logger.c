@@ -54,6 +54,12 @@ static volatile size_t s_file_bytes;     /* stats: current file size */
 static FILE           *s_fp;
 static bool            s_started;
 
+/* Pre-reboot handshake: prepare_shutdown() sets s_stop_req; the writer task (the
+ * sole owner of s_fp) drains the ring, flushes, closes, and sets s_stopped, then
+ * parks. Keeping all file I/O in the writer task avoids a cross-task race on s_fp. */
+static volatile bool   s_stop_req;
+static volatile bool   s_stopped;
+
 static inline size_t ring_used(void)
 {
     return (s_head + SD_LOGGER_RING_BYTES - s_tail) % SD_LOGGER_RING_BYTES;
@@ -206,6 +212,24 @@ static void writer_task(void *arg)
     bool dirty = false;                                    /* unflushed bytes pending */
 
     for (;;) {
+        /* Pre-reboot drain (Item B): flush whatever is buffered to the current
+         * file, fsync + close it so sdcard_unmount() can finalize FATFS cleanly,
+         * then park until the reboot. Only the writer task ever touches s_fp, so
+         * this is race-free. Skipped if the card is already gone (s_fp == NULL). */
+        if (s_stop_req) {
+            if (s_fp != NULL && !sdcard_io_lost() && sdcard_is_mounted()) {
+                size_t n;
+                while ((n = ring_pop(buf, sizeof buf)) > 0) {
+                    if (fwrite(buf, 1, n, s_fp) != n) break;
+                }
+                fflush(s_fp);
+                fsync(fileno(s_fp));
+            }
+            close_log();
+            s_stopped = true;
+            vTaskDelay(portMAX_DELAY);   /* parked — the reboot follows shortly */
+        }
+
         /* Check the lock-free loss latch BEFORE sdcard_is_mounted() (which takes
          * the contended sd_card lock): when a card is pulled this is the fast
          * loop that re-arms the failing I/O, so it must stop the instant loss is
@@ -276,6 +300,18 @@ esp_err_t sd_logger_init(void)
              SD_LOGGER_DIR, SD_LOGGER_BASENAME,
              SD_LOGGER_MAX_FILES, SD_LOGGER_FILE_BYTES / 1024);
     return ESP_OK;
+}
+
+void sd_logger_prepare_shutdown(void)
+{
+    if (!s_started) return;
+    s_stop_req = true;
+    /* Wait (bounded ~1 s) for the writer task to flush + close. The writer polls
+     * at SD_LOGGER_POLL_MS (idle) / *2 (card out), so it observes the flag well
+     * within this window; a reboot must not hang if it somehow doesn't. */
+    for (int i = 0; i < 100 && !s_stopped; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 void sd_logger_stats(bool *active, size_t *buffered, size_t *dropped, size_t *file_bytes)

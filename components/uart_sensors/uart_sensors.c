@@ -210,10 +210,24 @@ static esp_err_t ambit_boot_gpio_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "boot/reset gpio_config");
-    gpio_set_level(AMBIT_RESET_GPIO, 1);       /* released */
+    /* All boot straps released first → the AMBITs boot their application, NOT ROM
+     * download mode, across the reset pulse below. */
     for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
         gpio_set_level(s_ch[i].boot_pin, 1);   /* released */
     }
+
+    /* Deliberate CHIP_EN reset pulse at init. On a normal S3 boot / OTA-restart
+     * the shared reset line was previously only *released* (Hi-Z), never pulsed
+     * low — so a C3 left mid-measurement by an abrupt esp_restart() (OTA, script
+     * update, watchdog, CLI reboot) keeps running, and can stay hung or leave the
+     * actinic LEDs energized. Pulsing EN low here, at the quiesced boot moment
+     * before any measurement starts, forces all four C3s into a known clean reboot
+     * with LEDs off, independent of the C3 firmware state — this is what makes a
+     * "reboot mid-measurement" fully benign. Mirrors uart_sensors_run_app()'s
+     * low-hold; briefly reboots all four C3s (shared line), which is fine at init. */
+    gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge the 2.2uF cap */
+    gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp back up */
     return ESP_OK;
 }
 

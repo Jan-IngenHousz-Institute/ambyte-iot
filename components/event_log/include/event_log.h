@@ -40,6 +40,12 @@ esp_err_t event_log_init(void);
 esp_err_t event_log_on_sd_lost(void);
 esp_err_t event_log_on_sd_restored(void);
 
+/* Pre-reboot power-safety drain (register once via esp_register_shutdown_handler).
+ * Flushes + fsyncs the periodically-buffered tail, persists the read cursor, and
+ * closes the tail file so a following sdcard_unmount() can finalize FATFS cleanly
+ * instead of leaving a torn FAT/dir-entry metadata write. Bounded lock wait. */
+esp_err_t event_log_prepare_shutdown(void);
+
 /* Event store / claim / mark (see persistence_port.h for semantics). */
 esp_err_t event_log_next_id(int64_t *out_id);
 esp_err_t event_log_store_event(const measurement_event_desc_t *desc);

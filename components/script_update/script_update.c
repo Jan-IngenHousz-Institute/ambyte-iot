@@ -292,6 +292,12 @@ static void do_update(const script_req_t *r)
     ESP_LOGW(TAG, "script_update id=%s: %u bytes", r->id[0] ? r->id : "(none)", (unsigned)len);
     char detail[160];
 
+    /* On-receipt ack: tell the operator the command was received before doing any
+     * work (syntax check + SD write + Lua stop can take a few seconds, and the
+     * fleet-OTA notebook waits for an initial reply). MQTT stays up on the inline
+     * path, so this lands immediately. */
+    report_script("accepted", r->id, NULL);
+
     if (r->checksum[0] != '\0' && !checksum_ok(r->text, r->checksum)) {
         ESP_LOGE(TAG, "checksum mismatch — script rejected");
         report_script("failed", r->id, "sha256 mismatch");
@@ -389,6 +395,13 @@ static void do_update_url(const script_req_t *r)
         report_script("failed", r->id, "url variant unavailable");
         return;
     }
+
+    /* On-receipt ack — MUST publish BEFORE comms_suspend() below, after which MQTT
+     * is gone and the operator would otherwise see nothing until the terminal
+     * report minutes later (or never, if the reconnect drops it). Flush before the
+     * comms drop, mirroring the OTA path's accepted-ack flush. */
+    report_script("accepted", r->id, NULL);
+    vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
 
     /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
      * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a
@@ -489,9 +502,21 @@ static void script_task(void *arg)
     script_req_t r;
     for (;;) {
         if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(SCRIPT_IDLE_EXIT_MS)) == pdTRUE) {
+            /* Global maintenance gate: refuse to overlap another update type. A
+             * concurrent self-OTA / AMBIT op on its own task would fight for the
+             * heap and could leave two TLS sessions live → OOM on this board. */
+            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+                ESP_LOGW(TAG, "another maintenance op in progress — script op=%u id=%s dropped",
+                         r.op, r.id[0] ? r.id : "(none)");
+                if (r.op == OP_EXEC) report_exec(r.id, false, "device busy (maintenance in progress)");
+                else                 report_script("busy", r.id, "another maintenance op is in progress");
+                free(r.text);
+                continue;
+            }
             if (r.op == OP_EXEC)            do_exec(&r);
             else if (r.op == OP_UPDATE_URL) do_update_url(&r);
             else                            do_update(&r);
+            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
             free(r.text);
             continue;
         }

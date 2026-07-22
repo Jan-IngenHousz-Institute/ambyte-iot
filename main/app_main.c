@@ -27,6 +27,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_pm.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
@@ -177,6 +178,63 @@ static void app_workload_resume(void)
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "Lua restart after maintenance op: %s", esp_err_to_name(err));
     }
+}
+
+/* Global maintenance lock (Item D). The three maintenance workers — self-OTA
+ * (ota_update), AMBIT OTA/flash/probe/versions (ambit_ota), and script update/
+ * exec (script_update) — run on INDEPENDENT tasks with no shared "maintenance in
+ * progress" gate. Two close-spaced commands of different types (or a QoS1
+ * redelivery of one) could otherwise overlap: one worker resuming MQTT while
+ * another still holds an HTTPS/TLS session → two TLS sessions on this no-PSRAM
+ * board → OOM/crash — the exact thing the per-op quiesce exists to prevent; or one
+ * worker's esp_restart firing while another is mid main.lua rename → no main.lua.
+ * A single flag, taken at each worker's op entry and released on completion, makes
+ * the three mutually exclusive; a second concurrent op of any type is rejected as
+ * "busy"/"dropped". */
+static portMUX_TYPE s_maint_mux  = portMUX_INITIALIZER_UNLOCKED;
+static bool         s_maint_busy = false;
+
+static bool app_maintenance_begin(void)
+{
+    bool acquired;
+    taskENTER_CRITICAL(&s_maint_mux);
+    acquired = !s_maint_busy;
+    if (acquired) s_maint_busy = true;
+    taskEXIT_CRITICAL(&s_maint_mux);
+    return acquired;
+}
+
+static void app_maintenance_end(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    s_maint_busy = false;
+    taskEXIT_CRITICAL(&s_maint_mux);
+}
+
+/* Refcounted MQTT suspend/resume for the maintenance workers (belt-and-suspenders
+ * to the maintenance lock above). Raw mqtt_client_stop/start are idempotent but
+ * NOT refcounted — this wrapper restarts MQTT only when the LAST holder resumes,
+ * so an overlapping suspend window can never let one resume reopen MQTT (and its
+ * TLS heap) inside another's quiesced download. Mirrors app_workload_suspend/
+ * resume. (Wi-Fi lifecycle events still call mqtt_client_stop/start directly; both
+ * are guarded by the client's own started-flag, so mixing is safe.) */
+static portMUX_TYPE s_comms_mux    = portMUX_INITIALIZER_UNLOCKED;
+static int          s_comms_susp_n = 0;
+
+static void app_comms_suspend(void)
+{
+    taskENTER_CRITICAL(&s_comms_mux);
+    bool first = (s_comms_susp_n++ == 0);
+    taskEXIT_CRITICAL(&s_comms_mux);
+    if (first) mqtt_client_stop();
+}
+
+static void app_comms_resume(void)
+{
+    taskENTER_CRITICAL(&s_comms_mux);
+    bool last = (s_comms_susp_n > 0 && --s_comms_susp_n == 0);
+    taskEXIT_CRITICAL(&s_comms_mux);
+    if (last) mqtt_client_start();
 }
 
 /* Boot-complete latch: Wi-Fi connects asynchronously, so an IP can land while
@@ -353,6 +411,22 @@ static void app_on_sd_state_change(bool mounted)
         lua_runner_stop(5000);
         event_log_on_sd_lost();
     }
+}
+
+/* Pre-reboot power-safety hook (Item B). Every esp_restart() in the tree (OTA,
+ * script_update, connectivity watchdog, CLI reboot, Wi-Fi clear) previously fired
+ * with no fsync/unmount, and FATFS is not power-safe — a torn FAT/dir-entry write
+ * could orphan clusters or, rarely, leave an unmountable card, which would stop
+ * the measurement loop entirely (main.lua lives on the SD). Registering ONE
+ * shutdown handler here (esp_register_shutdown_handler runs it before every
+ * esp_restart) drains + closes the buffered SD writers and cleanly unmounts, so
+ * ALL reboot paths benefit without touching each call site. Runs with the
+ * scheduler still active, so the mutex/task handshakes inside are safe. */
+static void app_prepare_reboot(void)
+{
+    event_log_prepare_shutdown();   /* flush + fsync + close the events tail */
+    sd_logger_prepare_shutdown();   /* drain the log ring + close the log file */
+    (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
 }
 
 static esp_err_t app_init_littlefs(void)
@@ -636,14 +710,16 @@ void app_main(void)
      * and confirms a just-applied image on the next MQTT reconnect (else rolls
      * back). Triggered by command_router's ota_update dispatch. */
     ota_update_config_t ota_cfg = {
-        .publish          = mqtt_client_get_publish_fn(),
-        .is_connected     = mqtt_client_get_is_connected_fn(),
-        .comms_suspend    = mqtt_client_stop,
-        .comms_resume     = mqtt_client_start,
-        .workload_suspend = app_workload_suspend,
-        .workload_resume  = app_workload_resume,
-        .status_topic     = status_topic,
-        .device_id        = device_id,
+        .publish           = mqtt_client_get_publish_fn(),
+        .is_connected      = mqtt_client_get_is_connected_fn(),
+        .comms_suspend     = app_comms_suspend,
+        .comms_resume      = app_comms_resume,
+        .workload_suspend  = app_workload_suspend,
+        .workload_resume   = app_workload_resume,
+        .maintenance_begin = app_maintenance_begin,
+        .maintenance_end   = app_maintenance_end,
+        .status_topic      = status_topic,
+        .device_id         = device_id,
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");
@@ -654,14 +730,16 @@ void app_main(void)
      * streams it to the sensor over the binary UART link; the AMBIT verifies and
      * reboots into its spare slot. Same quiesce hooks as the self-OTA. */
     ambit_ota_config_t ambit_ota_cfg = {
-        .workload_suspend = app_workload_suspend,
-        .workload_resume  = app_workload_resume,
-        .comms_suspend    = mqtt_client_stop,
-        .comms_resume     = mqtt_client_start,
-        .publish          = mqtt_client_get_publish_fn(),
-        .is_connected     = mqtt_client_get_is_connected_fn(),
-        .status_topic     = status_topic,
-        .device_id        = device_id,
+        .workload_suspend  = app_workload_suspend,
+        .workload_resume   = app_workload_resume,
+        .comms_suspend     = app_comms_suspend,
+        .comms_resume      = app_comms_resume,
+        .maintenance_begin = app_maintenance_begin,
+        .maintenance_end   = app_maintenance_end,
+        .publish           = mqtt_client_get_publish_fn(),
+        .is_connected      = mqtt_client_get_is_connected_fn(),
+        .status_topic      = status_topic,
+        .device_id         = device_id,
     };
     if (ambit_ota_init(&ambit_ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
@@ -679,10 +757,12 @@ void app_main(void)
          * around the HTTPS download so the download's TLS handshake gets a clean
          * contiguous heap — same quiesce hooks as OTA. MQTT is resumed before the
          * status reply. */
-        .workload_suspend = app_workload_suspend,
-        .workload_resume  = app_workload_resume,
-        .comms_suspend    = mqtt_client_stop,
-        .comms_resume     = mqtt_client_start,
+        .workload_suspend  = app_workload_suspend,
+        .workload_resume   = app_workload_resume,
+        .comms_suspend     = app_comms_suspend,
+        .comms_resume      = app_comms_resume,
+        .maintenance_begin = app_maintenance_begin,
+        .maintenance_end   = app_maintenance_end,
     };
     if (script_update_init(&script_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "script_update worker not started");
@@ -795,6 +875,16 @@ void app_main(void)
         esp_err_t mon_err = sdcard_start_monitor(2000, app_on_sd_state_change);
         if (mon_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "SD monitor failed to start: %s", esp_err_to_name(mon_err));
+        }
+    }
+
+    /* ── Pre-reboot SD power-safety hook (Item B) ─────────────────────
+     * Registered once; esp_register_shutdown_handler invokes it before every
+     * esp_restart(), so the event log + SD log are flushed and FATFS is cleanly
+     * unmounted on all reboot paths. */
+    if (sd_available) {
+        if (esp_register_shutdown_handler(app_prepare_reboot) != ESP_OK) {
+            ESP_LOGW(APP_TAG, "could not register SD pre-reboot flush handler");
         }
     }
 

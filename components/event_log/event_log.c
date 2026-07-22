@@ -457,6 +457,32 @@ esp_err_t event_log_on_sd_lost(void)
     return ESP_OK;
 }
 
+esp_err_t event_log_prepare_shutdown(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+
+    /* Pre-reboot drain: flush + fsync the periodically-buffered tail writes (store
+     * flushes only every EVLOG_FLUSH_EVERY_N records / EVLOG_FLUSH_PERIOD_MS, so up
+     * to a few records sit unflushed), persist the read cursor, and CLOSE the tail
+     * so FATFS can finalize its directory entry cleanly when sdcard_unmount() runs
+     * next. Every esp_restart() otherwise fired with no fsync/unmount, risking a
+     * torn FAT/dir-entry metadata write. Bounded lock wait — a reboot must not hang
+     * on a stuck writer; if it times out the data already fsync'd at the last
+     * periodic flush is still safe, we just skip the final few records. */
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW(TAG, "pre-reboot flush skipped (lock busy) — last periodic flush stands");
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_wf != NULL) {
+        evlog_flush_writer_locked();
+        fclose(s_wf);
+        s_wf = NULL;
+    }
+    evlog_persist_cursor_locked();
+    xSemaphoreGive(s_mtx);
+    return ESP_OK;
+}
+
 esp_err_t event_log_on_sd_restored(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;

@@ -27,6 +27,12 @@ extern "C" {
  * mounts; on a mid-run pull the file is closed and reopened on reinsertion. */
 esp_err_t sd_logger_init(void);
 
+/* Pre-reboot power-safety flush (register once via esp_register_shutdown_handler,
+ * before sdcard_unmount()). Signals the writer task to drain the RAM ring to the
+ * current file, fsync + close it, and park; blocks up to ~1 s for that to finish.
+ * Leaves the log file's FATFS metadata finalizable by a following unmount. */
+void sd_logger_prepare_shutdown(void);
+
 /* Diagnostics snapshot (e.g. for a CLI command). Any out-pointer may be NULL.
  *  active     : the log file is currently open and being written
  *  buffered   : bytes waiting in the RAM ring buffer

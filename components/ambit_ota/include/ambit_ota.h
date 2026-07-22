@@ -37,6 +37,12 @@ typedef struct {
     void (*comms_suspend)(void);      /* mqtt_client_stop — free TLS heap for the HTTPS download */
     void (*comms_resume)(void);       /* mqtt_client_start — after the update */
 
+    /* Global maintenance lock: begin() returns false if another maintenance op
+     * (any update type) is already running — the AMBIT op is then rejected as
+     * "busy" rather than overlapping. end() releases it. Both NULL = no gate. */
+    bool (*maintenance_begin)(void);
+    void (*maintenance_end)(void);
+
     /* Optional best-effort status reporting (used once MQTT is back; NULL = log-only). */
     message_publish_fn      publish;
     message_is_connected_fn is_connected;

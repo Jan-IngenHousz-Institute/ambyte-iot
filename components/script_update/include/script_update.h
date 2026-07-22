@@ -39,6 +39,11 @@ typedef struct {
     script_workload_fn      workload_resume;
     script_workload_fn      comms_suspend;      /* mqtt_client_stop — free MQTT's TLS heap for the download */
     script_workload_fn      comms_resume;       /* mqtt_client_start — reconnect before reporting */
+    /* Global maintenance lock: begin() returns false if another maintenance op
+     * (any update type) is already running — the script op is then rejected as
+     * "busy" rather than overlapping. end() releases it. Both NULL = no gate. */
+    bool                  (*maintenance_begin)(void);
+    void                  (*maintenance_end)(void);
 } script_update_config_t;
 
 /* Prepare the worker plumbing (idempotent; the task itself spawns on demand). */

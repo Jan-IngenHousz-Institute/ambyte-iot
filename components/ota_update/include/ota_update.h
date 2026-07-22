@@ -36,6 +36,12 @@ typedef struct {
     void                  (*workload_suspend)(void); /* stop the Lua measurement task during the DL
                                                       * (frees heap, avoids fragmentation); NULL = skip */
     void                  (*workload_resume)(void);  /* restart it after a failed DL; NULL = skip */
+    /* Global maintenance lock: begin() returns false if another maintenance op
+     * (any update type) is already running — the OTA is then rejected as "dropped"
+     * rather than overlapping (two TLS sessions → OOM on this no-PSRAM board).
+     * end() releases it. Both NULL = no gate (always proceed). */
+    bool                  (*maintenance_begin)(void);
+    void                  (*maintenance_end)(void);
     const char             *status_topic;   /* where status JSON is published */
     const char             *device_id;      /* included in status payloads */
 } ota_update_config_t;

@@ -151,7 +151,10 @@ static void json_escape(char *out, size_t cap, const char *in)
     out[o] = '\0';
 }
 
-static void report_as(const char *type, const char *state, uint8_t ch, const char *id)
+/* `detail` (nullable) adds a "detail":"…" reason field — previously a failed
+ * report carried only the state, giving a remote operator no clue why. */
+static void report_as(const char *type, const char *state, uint8_t ch, const char *id,
+                      const char *detail)
 {
     if (s_cfg.publish == NULL || s_cfg.status_topic == NULL || s_cfg.status_topic[0] == '\0') {
         return;
@@ -161,10 +164,13 @@ static void report_as(const char *type, const char *state, uint8_t ch, const cha
     }
     char esc_id[AMBIT_OTA_ID_MAX * 2 + 1] = "";
     json_escape(esc_id, sizeof esc_id, id);
-    char msg[224];
+    char esc_detail[160] = "";
+    if (detail != NULL) json_escape(esc_detail, sizeof esc_detail, detail);
+    char msg[416];
     int n = snprintf(msg, sizeof msg,
-        "{\"type\":\"%s\",\"device_id\":\"%s\",\"id\":\"%s\",\"channel\":%u,\"state\":\"%s\"}",
-        type, s_cfg.device_id ? s_cfg.device_id : "", esc_id, (unsigned)ch, state);
+        "{\"type\":\"%s\",\"device_id\":\"%s\",\"id\":\"%s\",\"channel\":%u,\"state\":\"%s\"%s%s%s}",
+        type, s_cfg.device_id ? s_cfg.device_id : "", esc_id, (unsigned)ch, state,
+        detail ? ",\"detail\":\"" : "", esc_detail, detail ? "\"" : "");
     if (n > 0 && (size_t)n < sizeof msg) {
         int msg_id = 0;
         s_cfg.publish(s_cfg.status_topic, msg, (size_t)n, &msg_id);
@@ -173,7 +179,25 @@ static void report_as(const char *type, const char *state, uint8_t ch, const cha
 
 static void report(const char *state, uint8_t ch, const char *id)
 {
-    report_as("ambit_ota_status", state, ch, id);
+    report_as("ambit_ota_status", state, ch, id, NULL);
+}
+
+static void report_detail(const char *state, uint8_t ch, const char *id, const char *detail)
+{
+    report_as("ambit_ota_status", state, ch, id, detail);
+}
+
+/* Reject an op because the global maintenance lock is held by another update
+ * type — reported under the op's own status type so the operator sees why. */
+static void report_busy(const ambit_ota_req_t *r)
+{
+    const char *detail = "another maintenance op is in progress";
+    switch (r->op) {
+    case AMBIT_OP_FLASH:    report_as("ambit_flash_status", "busy", r->channel, r->id, detail); break;
+    case AMBIT_OP_PROBE:    report_as("ambit_probe",        "busy", r->channel, r->id, detail); break;
+    case AMBIT_OP_VERSIONS: report_as("ambit_versions",     "busy", r->channel, r->id, detail); break;
+    default:                report_detail("busy", r->channel, r->id, detail);                   break;
+    }
 }
 
 /* ── HTTP GET → file on SD ────────────────────────────────────────────────
@@ -390,23 +414,42 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
         ESP_LOGE(TAG, "URL is a GitHub web page (/blob/ or /tree/), not a file:");
         ESP_LOGE(TAG, "  %s", url);
         ESP_LOGE(TAG, "use a direct .bin — raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>");
-        report("failed", r->channel, r->id);
+        report_detail("failed", r->channel, r->id,
+                      "bad_url: use a direct .bin, not a /blob//tree/ web url");
         return;
     }
+
+    /* On-receipt ack — MUST publish BEFORE comms_suspend() (after it MQTT is gone).
+     * The terminal report only comes minutes later after the download + stream +
+     * reconnect, so without this the operator (and the fleet-OTA notebook) sees
+     * nothing on receipt. */
+    report("accepted", r->channel, r->id);
+    vTaskDelay(pdMS_TO_TICKS(500));   /* flush the ack before MQTT drops */
 
     /* Quiesce: free the UART (stop Lua) and the heap/TLS (stop MQTT). */
     if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
     vTaskDelay(pdMS_TO_TICKS(500));
 
+    /* Per-channel outcome for the "all" sweep, reported AFTER comms resume: the
+     * sweep runs inside the MQTT blackout, so reporting each result inline (as this
+     * used to) published into a dead session and dropped it. Mirrors the flash
+     * path's deferred per-channel reporting. */
+    enum { OTA_SKIP = -1, OTA_FAIL = 0, OTA_OK = 1, OTA_ABSENT = 2 };
+    int8_t res[UART_SENSOR_NUM_CHANNELS];
+    memset(res, OTA_SKIP, sizeof res);   /* -1 = 0xFF per byte */
+
     bool ok = false;
+    const char *detail = NULL;
     if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
         ESP_LOGE(TAG, "SD not available — cannot stage the AMBIT image");
+        detail = "SD not available";
     } else {
         size_t    img_size = 0;
         esp_err_t err = http_get_to_file(url, AMBIT_FW_PATH, &img_size);   /* download once */
         if (err != ESP_OK || img_size == 0) {
             ESP_LOGE(TAG, "download failed (%s, %u bytes)", esp_err_to_name(err), (unsigned)img_size);
+            detail = "download failed";
         } else {
             ESP_LOGW(TAG, "downloaded %u bytes -> %s", (unsigned)img_size, AMBIT_FW_PATH);
             if (all) {
@@ -417,31 +460,59 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
                     cmd_result_t pr = cmd_uart_ping(c, &connected);
                     if (pr.status != ESP_OK || !connected) {
                         ESP_LOGW(TAG, "AMBIT%u: not present — skipping", c + 1);
+                        res[c] = OTA_ABSENT;
                         continue;
                     }
                     present++;
                     bool ok_c = ambit_ota_one(c, img_size);
-                    report(ok_c ? "success" : "failed", c, r->id);
+                    res[c] = ok_c ? OTA_OK : OTA_FAIL;
                     if (ok_c) ok_count++;
                 }
                 ESP_LOGW(TAG, "AMBIT OTA all: %d/%d present channels updated", ok_count, present);
                 ok = (present > 0 && ok_count == present);
+                if (!ok) detail = (present == 0) ? "no AMBIT present" : "one or more channels failed";
             } else {
                 ok = ambit_ota_one(r->channel, img_size);
+                if (!ok) detail = "stream/confirm failed";
             }
         }
     }
 
+    /* Latch BEFORE comms resume (like the flash path): a reconnect's resubscribe
+     * redelivers a retained trigger immediately, and it must hit an already-written
+     * latch or the whole sweep runs twice. Only on full success. */
+    if (ok) latch_set(KEY_APPLIED, r->id);
+
     if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
     if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
 
+    /* Give MQTT a bounded window to reconnect so the reports actually land
+     * (report_* drop while disconnected; the console log has them regardless).
+     * Without this the terminal report fired the instant after comms_resume, ahead
+     * of the TLS reconnect, and was almost always dropped. Mirrors the flash path. */
+    if (s_cfg.is_connected != NULL) {
+        for (int i = 0; i < 60 && !s_cfg.is_connected(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!s_cfg.is_connected()) {
+            ESP_LOGW(TAG, "MQTT not back after 30 s — OTA reports dropped "
+                          "(verify by effect: ambit_versions)");
+        }
+    }
+
+    /* Deferred per-channel results (populated only for the "all" sweep). */
+    for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
+        if (res[c] == OTA_SKIP) continue;
+        report(res[c] == OTA_OK ? "success" : (res[c] == OTA_ABSENT ? "absent" : "failed"),
+               c, r->id);
+    }
+
     if (ok) {
-        latch_set(KEY_APPLIED, r->id);   /* dedupe a retained trigger — only when fully successful */
         ESP_LOGW(TAG, "AMBIT OTA SUCCESS (id=%s)", r->id[0] ? r->id : "(none)");
         report("success", r->channel, r->id);
     } else {
         ESP_LOGE(TAG, "AMBIT OTA FAILED (id=%s)", r->id[0] ? r->id : "(none)");
-        report("failed", r->channel, r->id);
+        report_detail("failed", r->channel, r->id, detail);
     }
 }
 
@@ -584,6 +655,11 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
     int8_t res[UART_SENSOR_NUM_CHANNELS];
     memset(res, FL_SKIP, sizeof res);   /* -1 = 0xFF per byte */
 
+    /* On-receipt ack — publish BEFORE comms_suspend() (after it MQTT is gone for
+     * the whole ~10-60 s/channel sweep and only the terminal report comes back). */
+    report_as("ambit_flash_status", "accepted", r->channel, r->id, NULL);
+    vTaskDelay(pdMS_TO_TICKS(500));   /* flush the ack before MQTT drops */
+
     if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -662,15 +738,15 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
                   (res[c] == FL_OK) ? "flash_ok"
                   : (res[c] == FL_ABSENT) ? "absent"
                   : (res[c] == FL_BUSY) ? "bus_busy" : "flash_failed",
-                  c, r->id);
+                  c, r->id, NULL);
     }
 
     if (ok) {
         ESP_LOGW(TAG, "AMBIT FLASH SUCCESS (id=%s)", r->id[0] ? r->id : "(none)");
-        report_as("ambit_flash_status", "success", r->channel, r->id);
+        report_as("ambit_flash_status", "success", r->channel, r->id, NULL);
     } else {
         ESP_LOGE(TAG, "AMBIT FLASH FAILED (id=%s)", r->id[0] ? r->id : "(none)");
-        report_as("ambit_flash_status", "failed", r->channel, r->id);
+        report_as("ambit_flash_status", "failed", r->channel, r->id, NULL);
     }
 }
 
@@ -686,12 +762,23 @@ static void ambit_ota_task(void *arg)
     ambit_ota_req_t r;
     for (;;) {
         if (xQueueReceive(s_queue, &r, pdMS_TO_TICKS(AMBIT_OTA_IDLE_EXIT_MS)) == pdTRUE) {
+            /* Global maintenance gate: refuse to overlap another update type (a
+             * concurrent self-OTA/script-update on its own task would fight for the
+             * heap / hold a second TLS session → OOM on this no-PSRAM board; a UART
+             * op would corrupt the other's transactions). */
+            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+                ESP_LOGW(TAG, "another maintenance op in progress — ambit op=%u id=%s dropped",
+                         r.op, r.id[0] ? r.id : "");
+                report_busy(&r);
+                continue;
+            }
             switch (r.op) {
             case AMBIT_OP_VERSIONS: ambit_do_versions(r.id); break;
             case AMBIT_OP_PROBE:    ambit_do_probe(&r);      break;
             case AMBIT_OP_FLASH:    ambit_do_flash(&r);      break;
             default:                ambit_do_ota(&r);        break;
             }
+            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
             continue;
         }
         /* Idle timeout: exit to give the stack back, unless a request just arrived. */

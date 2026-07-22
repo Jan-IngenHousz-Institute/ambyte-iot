@@ -277,7 +277,17 @@ static void ota_task(void *arg)
     ota_request_t r;
     for (;;) {
         if (xQueueReceive(s_queue, &r, portMAX_DELAY) == pdTRUE) {
-            ota_do_update(&r);
+            /* Global maintenance gate: refuse to overlap another update type (a
+             * concurrent self-OTA/AMBIT-OTA/script-update would fight for the heap
+             * and could hold two TLS sessions → OOM). */
+            if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
+                ESP_LOGW(TAG, "another maintenance op in progress — OTA id=%s dropped",
+                         r.id[0] ? r.id : "");
+                ota_report("dropped", r.id, "another maintenance op is in progress");
+                continue;
+            }
+            ota_do_update(&r);   /* reboots on success; returns (and releases) on failure */
+            if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
         }
     }
 }
