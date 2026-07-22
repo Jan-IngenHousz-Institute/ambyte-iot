@@ -929,13 +929,29 @@ cmd_result_t cmd_store_status_event(void)
     /* Base status, then power and env each append their block when the read
      * succeeded — so the payload reflects exactly which subsystems were live
      * this cycle. Env keys/format match the device.bme280 measurement event. */
-    char payload[384];
+    char payload[512];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s",
         s.wifi_connected ? "true" : "false",
         s.provisioned ? "true" : "false",
         s.db_online ? "true" : "false",
         s.publish_gate_open ? "true" : "false");
+    /* SD/persistence health — surfaces the audit's silent-loss counters so a
+     * degrading card is visible before the cliff (free space, skipped/dropped
+     * records, delivery high-water, io-lost). */
+    if (n > 0 && n < (int)sizeof(payload) && s_cfg.sd_health != NULL) {
+        bool sd_io_lost = false;
+        uint64_t sd_free = 0;
+        int64_t sd_skipped = 0, sd_dropped = 0, last_acked = 0;
+        if (s_cfg.sd_health(&sd_io_lost, &sd_free, &sd_skipped, &sd_dropped, &last_acked) == ESP_OK) {
+            n += snprintf(payload + n, sizeof(payload) - n,
+                ",\"sd_free_kb\":%llu,\"sd_skipped\":%lld,\"sd_dropped\":%lld,"
+                "\"last_acked_id\":%lld,\"sd_io_lost\":%s",
+                (unsigned long long)(sd_free / 1024),
+                (long long)sd_skipped, (long long)sd_dropped, (long long)last_acked,
+                sd_io_lost ? "true" : "false");
+        }
+    }
     if (n > 0 && n < (int)sizeof(payload) && s.power_valid) {
         n += snprintf(payload + n, sizeof(payload) - n,
             ",\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"

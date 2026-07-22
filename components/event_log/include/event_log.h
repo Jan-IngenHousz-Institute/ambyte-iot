@@ -65,6 +65,26 @@ esp_err_t event_log_quarantine_event(int64_t measure_id);
 esp_err_t event_log_db_stats(bool *available, int64_t *total,
                              int64_t *pending, int64_t *next_id);
 
+/* Richer health snapshot for the STATUS heartbeat — makes the silent-loss sites
+ * observable in the field. `skipped` counts records/files the drain passed without
+ * publishing (external delete, corrupt/over-long line, OOM-quarantine); `dropped`
+ * counts records refused at store (too-large, storage-full, short-write);
+ * `last_acked_id` is the end-to-end delivery high-water; `write_full` is the
+ * storage-full-but-healthy state. */
+typedef struct {
+    bool     available;
+    bool     write_full;
+    int64_t  pending;
+    int64_t  next_id;
+    int64_t  last_acked_id;
+    int64_t  skipped;
+    int64_t  dropped;
+    uint32_t rd_seq;
+    uint32_t tail_seq;
+} evlog_health_t;
+
+esp_err_t event_log_health(evlog_health_t *out);
+
 /* Rewind the read cursor to the start of file ev-<seq>.log so that record and all
  * newer ones revert to PENDING and re-publish. Pass seq=0 to rewind to the oldest
  * file still on the card (re-publish everything). The target is clamped to the

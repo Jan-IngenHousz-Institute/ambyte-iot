@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -24,6 +25,11 @@ esp_err_t sdcard_init_default(void);
 esp_err_t sdcard_mount(void);
 esp_err_t sdcard_unmount(void);
 bool sdcard_is_mounted(void);
+
+// Free bytes on the mounted FATFS volume (via esp_vfs_fat_info). Returns an error
+// if the card is not mounted. Lets callers distinguish a full card from a dead one
+// and surface remaining space in telemetry.
+esp_err_t sdcard_free_bytes(uint64_t *out_free);
 
 // Hot-plug monitoring (no card-detect pin → software polling).
 //

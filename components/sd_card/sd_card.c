@@ -1,5 +1,7 @@
 #include "sd_card.h"
 
+#include <stdint.h>
+
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_log.h"
@@ -11,6 +13,10 @@
 
 #define TAG "sd_card"
 #define SD_CARD_ACCESS_TIMEOUT_TICKS pdMS_TO_TICKS(1000)
+
+/* Forward decls (definitions live in the hot-plug/latch section below). */
+static void sdcard_io_reset(void);
+static void sdcard_note_corrupt_mount(void);
 
 typedef struct {
     gpio_num_t clk;
@@ -143,7 +149,14 @@ static esp_err_t sdcard_mount_locked(bool quiet)
         &s_mount_config,
         &s_sdcard.card);
     if (err != ESP_OK) {
-        if (!quiet) {
+        if (err == ESP_FAIL) {
+            /* Card answered card-init but FATFS could not mount it — a corrupt/garbage
+             * filesystem, NOT an absent card. This silently bricks the node (main.lua +
+             * the event log both live on SD), so surface it distinctly even when the
+             * monitor calls quiet, and count it in NVS for post-mortem (audit A1).
+             * format_if_mount_failed stays false so field data is never auto-wiped. */
+            sdcard_note_corrupt_mount();
+        } else if (!quiet) {
             ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(err));
         }
         s_sdcard.card = NULL;
@@ -151,7 +164,41 @@ static esp_err_t sdcard_mount_locked(bool quiet)
     }
 
     s_sdcard.mounted = true;
+    sdcard_io_reset();          /* a clean (re)mount re-arms writers — not only the monitor path (audit E4) */
+
+    /* Log card identity + capacity once per mount: a bad batch is traceable and a
+     * counterfeit fake-capacity card leaves a breadcrumb (audit J5). */
+    if (s_sdcard.card != NULL) {
+        uint64_t cap_mb = ((uint64_t)s_sdcard.card->csd.capacity *
+                           s_sdcard.card->csd.sector_size) >> 20;
+        ESP_LOGI(TAG, "SD mounted: '%s' %lluMB serial=0x%08x",
+                 s_sdcard.card->cid.name, (unsigned long long)cap_mb,
+                 (unsigned)s_sdcard.card->cid.serial);
+    }
     return ESP_OK;
+}
+
+/* Free bytes on the mounted FATFS volume (audit C1/C2/C4 — distinguishes a full
+ * card from a dead one and feeds the storage-full watermark + heartbeat telemetry). */
+esp_err_t sdcard_free_bytes(uint64_t *out_free)
+{
+    if (out_free == NULL) return ESP_ERR_INVALID_ARG;
+    uint64_t total = 0, freeb = 0;
+    esp_err_t err = esp_vfs_fat_info(SD_MOUNT_POINT, &total, &freeb);
+    if (err == ESP_OK) *out_free = freeb;
+    return err;
+}
+
+/* Log a "present-but-unmountable" (corrupt-FS) mount failure once per boot, so a
+ * corrupt-card brick is diagnosable in the boot log (audit A1). Kept driver-local
+ * (no NVS dependency); a persistent counter, if wanted, belongs in the app layer. */
+static void sdcard_note_corrupt_mount(void)
+{
+    static bool logged_this_boot = false;
+    if (logged_this_boot) return;
+    logged_this_boot = true;
+    ESP_LOGE(TAG, "SD present but FATFS unmountable (corrupt filesystem?) — persistence + "
+                  "main.lua offline (format_if_mount_failed=false, so field data is preserved)");
 }
 
 esp_err_t sdcard_init_default(void)
@@ -284,6 +331,25 @@ static void sdcard_io_reset(void)
     portEXIT_CRITICAL_SAFE(&s_io_lock);
 }
 
+/* CMD13 poll debounce: a marginal HIGHSPEED bus can throw a lone transient CMD13
+ * error on a still-present card, so require two consecutive bad polls before tearing
+ * the mount down (the error-driven latch stays the fast real-pull path) — audit E1. */
+static int s_probe_fail_streak = 0;
+
+/* Unmount + latch loss. Latching here (not only in the writer-driven path) closes the
+ * window where a CMD13-detected loss left both writer gates open (audit F2). */
+static void sdcard_teardown_locked(const char *reason)
+{
+    ESP_LOGW(TAG, "card lost (%s) — unmounting", reason);
+    esp_err_t u = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sdcard.card);
+    if (u != ESP_OK) ESP_LOGW(TAG, "unmount after card-loss: %s", esp_err_to_name(u));
+    s_sdcard.card    = NULL;
+    s_sdcard.mounted = false;
+    portENTER_CRITICAL_SAFE(&s_io_lock);
+    s_sd_io_lost = true;
+    portEXIT_CRITICAL_SAFE(&s_io_lock);
+}
+
 /* One probe step: try to detect a state transition. Returns the new mounted
  * state (or current state if no change). Takes the lock briefly. */
 static bool sdcard_probe_step(void)
@@ -295,29 +361,32 @@ static bool sdcard_probe_step(void)
     bool was_mounted = s_sdcard.mounted;
 
     if (was_mounted && s_sdcard.card != NULL) {
-        /* Error-driven loss wins over the poll: if a writer has already latched
-         * repeated I/O failures, skip the (potentially host-mutex-blocked) CMD13
-         * and tear down straight away. Otherwise fall back to the CMD13 probe. */
-        bool      io_lost = s_sd_io_lost;
-        esp_err_t err     = io_lost ? ESP_FAIL : sdmmc_get_status(s_sdcard.card);
-        if (io_lost || err != ESP_OK) {
-            ESP_LOGW(TAG, "card lost (%s) — unmounting",
-                     io_lost ? "I/O errors" : esp_err_to_name(err));
-            esp_err_t u = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sdcard.card);
-            if (u != ESP_OK) {
-                ESP_LOGW(TAG, "unmount after card-loss: %s", esp_err_to_name(u));
+        if (s_sd_io_lost) {
+            /* Error-driven loss wins over the poll: a writer already latched repeated
+             * I/O failures — tear down now, skipping the (possibly host-mutex-blocked)
+             * CMD13. */
+            sdcard_teardown_locked("I/O errors");
+            s_probe_fail_streak = 0;
+        } else {
+            esp_err_t err = sdmmc_get_status(s_sdcard.card);
+            if (err != ESP_OK) {
+                if (++s_probe_fail_streak >= 2) {   /* debounce a lone transient CMD13 */
+                    sdcard_teardown_locked(esp_err_to_name(err));
+                    s_probe_fail_streak = 0;
+                } else {
+                    ESP_LOGW(TAG, "CMD13 probe failed (%s) — retrying before unmount",
+                             esp_err_to_name(err));
+                }
+            } else {
+                s_probe_fail_streak = 0;             /* healthy poll → reset debounce */
             }
-            s_sdcard.card    = NULL;
-            s_sdcard.mounted = false;
-            /* Leave s_sd_io_lost latched while OUT so the writers stay gated; it
-             * clears only on a successful remount below. */
         }
     } else if (!was_mounted) {
-        /* Card was out — try to remount. Quiet on failure (likely no card). */
+        /* Card was out — try to remount. Quiet on failure (likely no card).
+         * sdcard_mount_locked() now clears the io-loss latch itself on success. */
         esp_err_t err = sdcard_mount_locked(true);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "card detected — remounted");
-            sdcard_io_reset();        /* card good again → unlatch, re-arm writers */
         }
     }
 

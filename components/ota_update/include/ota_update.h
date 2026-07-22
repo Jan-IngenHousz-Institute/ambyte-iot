@@ -48,6 +48,13 @@ typedef struct {
      * replaces a per-op task spawn that could fail (ESP_ERR_NO_MEM) on the
      * fragmented field heap. Required (NULL = requests fail INVALID_STATE). */
     bool                  (*submit)(void (*run)(void *arg), void *arg);
+    /* Post-reboot health gate EXTENSION: returns true when SD/persistence is healthy
+     * (or when the unit genuinely has no card). A just-applied image is marked valid
+     * only if MQTT reconnects AND this returns true, so an image that reconnects but
+     * breaks SD mounting / the event log rolls back instead of stranding the unit
+     * measurement-dead (audit: the rollback gate was MQTT-only). NULL = skip the
+     * check (preserves MQTT-only confirm). */
+    bool                  (*persistence_healthy)(void);
     const char             *status_topic;   /* where status JSON is published */
     const char             *device_id;      /* included in status payloads */
 } ota_update_config_t;

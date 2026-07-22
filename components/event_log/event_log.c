@@ -17,6 +17,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,12 +38,15 @@
 #define EVLOG_LINE_CAP       12288            /* max bytes read back per record (incl '\n') */
 #define EVLOG_MAX_RECORD     (EVLOG_LINE_CAP - 16)  /* store rejects bigger — must stay readable */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
-#define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush (NOT per-event fsync) */
-#define EVLOG_FLUSH_EVERY_N  8                /* …or every N records, whichever first */
+#define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
+#define EVLOG_FLUSH_EVERY_N  1                /* fsync each record: at ~0.4 writes/s the write-amp is trivial and
+                                               * the brownout-loss window shrinks to one record (audit G3/B2) */
 #define EVLOG_CURSOR_BATCH   16               /* persist read cursor every N acks */
 #define EVLOG_ID_BLOCK       64               /* reserve next_id in blocks → 1 NVS write / 64 ids */
 #define EVLOG_SCAN_MAX_LINES 20000            /* bound the boot pending-count (stat only) */
 #define EVLOG_SCAN_MAX_MS    3000             /* …and its wall-clock, so a huge/slow backlog can't churn on */
+#define EVLOG_MIN_FREE_BYTES (256 * 1024)     /* storage-full watermark: refuse writes below this (audit C1/C2) */
+#define EVLOG_OOM_STUCK_MAX  30               /* NO_MEM retries on one head record → quarantine it (audit D2) */
 
 #define NVS_NS               "evlog"
 #define NVS_KEY_RD_SEQ       "rd_seq"
@@ -84,6 +88,21 @@ static TaskHandle_t s_count_task = NULL;   /* one-shot boot backlog counter */
 static uint32_t   s_writes_since_flush = 0;
 static TickType_t s_last_flush_tick    = 0;
 static uint32_t   s_acks_since_persist = 0;
+
+/* Health / loss accounting (surfaced via event_log_health for the STATUS heartbeat,
+ * so silent-skip and drop sites become observable in the field). */
+static int64_t   s_skipped       = 0;   /* records/files skipped at the cursor without publishing */
+static int64_t   s_dropped       = 0;   /* records refused/dropped at store (too-large, full, short-write) */
+static int64_t   s_last_acked_id = 0;   /* highest measure_id confirmed synced (PUBACK) */
+/* Storage-full is distinct from card-loss: a full card is HEALTHY, so we pause
+ * writes WITHOUT reporting an I/O error (which would unmount it + restart Lua).
+ * The drain keeps running, frees space, and store admission re-enables writes. */
+static volatile bool s_write_full = false;
+/* Head-of-line OOM tracking: a record too big to strdup on the fragmented heap is
+ * retried; after EVLOG_OOM_STUCK_MAX strikes on the SAME head it is quarantined so
+ * the drain advances instead of reboot-looping. */
+static int64_t   s_oom_head_id = 0;
+static uint32_t  s_oom_strikes = 0;
 
 /* A reusable line buffer for claim — only touched under s_mtx. */
 static char s_line[EVLOG_LINE_CAP];
@@ -152,12 +171,56 @@ static void sanitize_field(char *dst, size_t cap, const char *src)
     dst[j] = '\0';
 }
 
-static void evlog_flush_writer_locked(void)
+/* Flush + fsync the tail. Returns ESP_FAIL if the underlying media write failed
+ * (a full/dying card), so callers can surface it instead of counting torn data as
+ * durable. Returns ESP_OK when there is nothing open to flush. */
+static esp_err_t evlog_flush_writer_locked(void)
 {
-    if (s_wf != NULL) {
-        fflush(s_wf);
-        fsync(fileno(s_wf));
+    if (s_wf == NULL) return ESP_OK;
+    if (fflush(s_wf) != 0 || fsync(fileno(s_wf)) != 0 || ferror(s_wf)) {
+        clearerr(s_wf);
+        return ESP_FAIL;
     }
+    return ESP_OK;
+}
+
+/* Reopen just the tail file for append after a prior open/rotate failure closed it,
+ * without the full re-scan of evlog_open_locked. Caller holds s_mtx. */
+static esp_err_t evlog_reopen_tail_locked(void)
+{
+    if (s_wf != NULL) return ESP_OK;
+    char path[64];
+    evlog_file_path(path, sizeof path, s_tail_seq);
+    s_wf = fopen(path, "a");
+    if (s_wf == NULL) return ESP_FAIL;
+    s_tail_size = evlog_file_size(s_tail_seq);
+    return ESP_OK;
+}
+
+/* Copy rec_len raw bytes at the current cursor to quarantine.log (archive-before-skip).
+ * Used only by the OOM head-of-line escape, where parse_record has already mangled
+ * s_line, so we re-read the raw record from disk. Clobbers s_line. Caller holds s_mtx. */
+static bool evlog_archive_head_locked(long rec_len)
+{
+    if (rec_len <= 0 || rec_len > (long)sizeof s_line) return false;
+    char path[64];
+    evlog_file_path(path, sizeof path, s_rd_seq);
+    FILE *rf = fopen(path, "rb");
+    if (rf == NULL) return false;
+    bool ok = false;
+    if (fseek(rf, s_rd_off, SEEK_SET) == 0 &&
+        fread(s_line, 1, (size_t)rec_len, rf) == (size_t)rec_len) {
+        FILE *qf = fopen(EVLOG_QUARANTINE, "a");
+        if (qf != NULL) {
+            size_t w = fwrite(s_line, 1, (size_t)rec_len, qf);
+            fflush(qf);
+            fsync(fileno(qf));
+            fclose(qf);
+            ok = (w == (size_t)rec_len);
+        }
+    }
+    fclose(rf);
+    return ok;
 }
 
 static void evlog_persist_cursor_locked(void)
@@ -353,6 +416,36 @@ static esp_err_t evlog_open_locked(void)
 
     char path[64];
     evlog_file_path(path, sizeof path, s_tail_seq);
+
+    /* Repair a brownout-torn final record: an ungraceful reset (brownout/POR/panic
+     * bypasses the shutdown-handler fsync) can leave the tail ending mid-record with
+     * no '\n'. Truncate back to the last newline so the next append can't concatenate
+     * into — and corrupt the framing of — the torn record (audit B3). Only truncate
+     * when a newline is found in the trailing window; if none is (an over-long/corrupt
+     * fragment), leave it for the reader's over-long-skip to handle rather than nuke
+     * good data. */
+    long tsz = evlog_file_size(s_tail_seq);
+    if (tsz > 0) {
+        FILE *tf = fopen(path, "rb+");
+        if (tf != NULL) {
+            long scan = (tsz < EVLOG_LINE_CAP) ? tsz : EVLOG_LINE_CAP;
+            if (fseek(tf, tsz - scan, SEEK_SET) == 0) {
+                size_t got = fread(s_line, 1, (size_t)scan, tf);
+                long last_nl = -1;
+                for (long i = (long)got - 1; i >= 0; i--) {
+                    if (s_line[i] == '\n') { last_nl = i; break; }
+                }
+                if (last_nl >= 0) {
+                    long good_end = tsz - scan + last_nl + 1;
+                    if (good_end < tsz && ftruncate(fileno(tf), good_end) == 0) {
+                        ESP_LOGW(TAG, "repaired torn tail %s: %ld -> %ld B", path, tsz, good_end);
+                    }
+                }
+            }
+            fclose(tf);
+        }
+    }
+
     s_wf = fopen(path, "a");
     if (s_wf == NULL) {
         ESP_LOGE(TAG, "open tail %s failed", path);
@@ -522,9 +615,32 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
      * lock or touch the (gone) media — bail before re-arming a failing write. */
     if (sdcard_io_lost()) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (!s_available || s_wf == NULL || sdcard_io_lost()) {
+    if (!s_available || sdcard_io_lost()) {
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* Self-heal: a prior rotate/open failure may have closed the tail without
+     * latching the log offline (see rotate path). Reopen it here rather than
+     * staying dark for the rest of the session (audit D1). */
+    if (s_wf == NULL && evlog_reopen_tail_locked() != ESP_OK) {
+        sdcard_report_io_error();
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* Storage-full admission control: a full card is healthy, so refuse cleanly
+     * (no I/O-error report → no unmount/Lua-restart thrash) and let the drain free
+     * space. Re-enable once the drain has recovered headroom (audit C1/C2). */
+    if (s_write_full) {
+        uint64_t freeb = 0;
+        if (sdcard_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
+            s_write_full = false;
+            ESP_LOGI(TAG, "SD storage recovered (%llu B free) — writes resumed",
+                     (unsigned long long)freeb);
+        } else {
+            s_dropped++;
+            xSemaphoreGive(s_mtx);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     const int64_t measure_id = desc->measure_id;
@@ -566,6 +682,7 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     if (total >= EVLOG_MAX_RECORD) {
         ESP_LOGE(TAG, "record too large (%u B) for id %lld — dropped",
                  (unsigned)total, (long long)measure_id);
+        s_dropped++;
         free(cmd);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_SIZE;
@@ -574,17 +691,23 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     /* Roll to a fresh file before the tail would exceed the rotate threshold, so
      * a fully-published file can later be deleted to reclaim space. */
     if (s_tail_size > 0 && s_tail_size + (long)total > EVLOG_ROTATE_BYTES) {
-        evlog_flush_writer_locked();
+        if (evlog_flush_writer_locked() != ESP_OK) sdcard_report_io_error();
         fclose(s_wf);
+        s_wf = NULL;
         s_tail_seq++;
         char path[64];
         evlog_file_path(path, sizeof path, s_tail_seq);
         s_wf = fopen(path, "a");
         if (s_wf == NULL) {
-            ESP_LOGE(TAG, "rotate: open %s failed", path);
-            s_available = false;
+            /* Do NOT latch the log offline: a transient open failure (heap/DMA OOM)
+             * must not disable persistence for the rest of the session. Drop this one
+             * record; the next store's self-heal reopens the (now-incremented) tail
+             * (audit D1). */
+            ESP_LOGE(TAG, "rotate: open %s failed — retrying next store", path);
+            s_dropped++;
             free(cmd);
             xSemaphoreGive(s_mtx);
+            sdcard_report_io_error();
             return ESP_FAIL;
         }
         s_tail_size = 0;
@@ -606,14 +729,30 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
          * the NEXT record. The event is simply dropped (not counted as pending).
          * Best-effort: under severe OOM even the truncate may fail, but then the
          * reader's skip-bad still discards the torn line on read. */
-        ESP_LOGE(TAG, "store_event: short write (%u/%u) for id %lld — SD error; rolling back",
+        ESP_LOGE(TAG, "store_event: short write (%u/%u) for id %lld — rolling back",
                  (unsigned)w, (unsigned)total, (long long)measure_id);
         fflush(s_wf);
         if (ftruncate(fileno(s_wf), s_tail_size) != 0) {
             ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
         }
+        s_dropped++;
+        /* Distinguish a FULL card (healthy — pause writes, keep draining) from a
+         * pulled/dead one (report I/O error → latch → unmount). A false unmount of a
+         * full-but-healthy card causes the remount/Lua-restart thrash (audit C1). */
+        uint64_t freeb = 0;
+        bool full = (errno == ENOSPC) ||
+                    (sdcard_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
+        if (full) {
+            if (!s_write_full) {
+                ESP_LOGW(TAG, "SD storage full (%llu B free) — writes paused, draining to reclaim",
+                         (unsigned long long)freeb);
+            }
+            s_write_full = true;
+            xSemaphoreGive(s_mtx);
+            return ESP_ERR_NO_MEM;      /* full is not card-loss: no report_io_error */
+        }
         xSemaphoreGive(s_mtx);
-        sdcard_report_io_error();   /* a pulled/dead card latches loss after a few of these */
+        sdcard_report_io_error();       /* a pulled/dead card latches loss after a few of these */
         return ESP_FAIL;
     }
     sdcard_report_io_ok();          /* good write → reset the consecutive-failure streak */
@@ -624,7 +763,13 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     TickType_t now = xTaskGetTickCount();
     if (s_writes_since_flush >= EVLOG_FLUSH_EVERY_N ||
         (now - s_last_flush_tick) >= pdMS_TO_TICKS(EVLOG_FLUSH_PERIOD_MS)) {
-        evlog_flush_writer_locked();
+        if (evlog_flush_writer_locked() != ESP_OK) {
+            /* The record's bytes reached stdio but fsync failed — treat as an I/O
+             * error so a dying card is caught rather than counting torn data durable. */
+            xSemaphoreGive(s_mtx);
+            sdcard_report_io_error();
+            return ESP_FAIL;
+        }
         s_writes_since_flush = 0;
         s_last_flush_tick    = now;
     }
@@ -647,16 +792,31 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
     esp_err_t result = ESP_ERR_NOT_FOUND;
     for (int guard = 0; guard < 100000; guard++) {
         bool is_tail = (s_rd_seq >= s_tail_seq);
-        if (is_tail) evlog_flush_writer_locked();   /* push appends to media first */
+        if (is_tail && evlog_flush_writer_locked() != ESP_OK) {  /* push appends to media first */
+            sdcard_report_io_error();
+            result = ESP_FAIL;
+            break;
+        }
 
         char path[64];
         evlog_file_path(path, sizeof path, s_rd_seq);
+        errno = 0;
         FILE *rf = fopen(path, "rb");
         if (rf == NULL) {
-            if (!is_tail) {                          /* rotated file already gone → next */
-                s_rd_seq++; s_rd_off = 0;
-                evlog_persist_cursor_locked();
-                continue;
+            if (!is_tail) {
+                if (errno == ENOENT) {               /* file genuinely gone (external delete/rotation) */
+                    ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)s_rd_seq);
+                    s_skipped++;
+                    s_rd_seq++; s_rd_off = 0;
+                    evlog_persist_cursor_locked();
+                    continue;
+                }
+                /* Any other errno is an I/O error, NOT a drained file — never skip it:
+                 * bail and retry after recovery so a transient fault can't lose a whole
+                 * pending file (audit B1). */
+                sdcard_report_io_error();
+                result = ESP_FAIL;
+                break;
             }
             result = ESP_ERR_NOT_FOUND;              /* tail missing — bail */
             break;
@@ -664,9 +824,15 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
         if (fseek(rf, s_rd_off, SEEK_SET) != 0) { fclose(rf); result = ESP_ERR_NOT_FOUND; break; }
 
         char *got = fgets(s_line, sizeof s_line, rf);
-        if (got == NULL) {                           /* EOF at the cursor */
+        if (got == NULL) {                           /* EOF — or a read error */
+            if (ferror(rf)) {                        /* READ ERROR, not EOF: never delete/advance */
+                clearerr(rf); fclose(rf);
+                sdcard_report_io_error();
+                result = ESP_FAIL;                   /* bail; retry after recovery (audit B1) */
+                break;
+            }
             fclose(rf);
-            if (!is_tail) {                          /* rotated file fully drained → delete */
+            if (!is_tail) {                          /* genuine EOF → rotated file fully drained → delete */
                 remove(path);
                 s_rd_seq++; s_rd_off = 0;
                 evlog_persist_cursor_locked();
@@ -687,19 +853,33 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
                     skipped += (long)l2;
                     if (l2 > 0 && more[l2 - 1] == '\n') break;
                 }
+                if (ferror(rf)) {                    /* over-long scan hit a read error → don't skip */
+                    clearerr(rf); fclose(rf);
+                    sdcard_report_io_error();
+                    result = ESP_FAIL;
+                    break;
+                }
                 fclose(rf);
                 ESP_LOGW(TAG, "skipping over-long record seq=%u off=%ld (%ld B)",
                          (unsigned)s_rd_seq, s_rd_off, skipped);
                 s_rd_off += skipped;
+                s_skipped++;
                 if (s_pending > 0) s_pending--;
                 evlog_persist_cursor_locked();
                 continue;
+            }
+            if (ferror(rf)) {                        /* partial line due to a read error, not a torn record */
+                clearerr(rf); fclose(rf);
+                sdcard_report_io_error();
+                result = ESP_FAIL;
+                break;
             }
             fclose(rf);
             if (!is_tail) {                          /* torn tail of a closed file → drop it */
                 ESP_LOGW(TAG, "partial record at end of rotated %s — dropping", path);
                 remove(path);
                 s_rd_seq++; s_rd_off = 0;
+                s_skipped++;
                 evlog_persist_cursor_locked();
                 continue;
             }
@@ -713,17 +893,39 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
             s_inflight_active = true;
             s_inflight_id     = out->measure_id;
             s_inflight_len    = (long)len;
+            s_oom_head_id     = 0;   /* made progress — clear OOM strike tracking */
+            s_oom_strikes     = 0;
             result = ESP_OK;
             break;
         }
-        if (pr == ESP_ERR_NO_MEM) {                  /* don't consume — retry next drain */
-            result = ESP_ERR_NO_MEM;
+        if (pr == ESP_ERR_NO_MEM) {
+            /* Fragmented heap can't strdup this (oversized) record. Retrying it
+             * forever head-of-line-blocks the whole backlog into an hourly reboot
+             * loop (audit D2). After EVLOG_OOM_STUCK_MAX strikes on the SAME head,
+             * quarantine it by raw line so the drain advances. parse_record has
+             * mangled s_line, so archive re-reads the raw record from disk. */
+            int64_t head_id = (int64_t)strtoll(got, NULL, 10);
+            if (head_id == s_oom_head_id) s_oom_strikes++;
+            else { s_oom_head_id = head_id; s_oom_strikes = 1; }
+            if (s_oom_strikes >= EVLOG_OOM_STUCK_MAX &&
+                evlog_archive_head_locked((long)len)) {
+                ESP_LOGW(TAG, "OOM-stuck record id=%lld quarantined after %u strikes — drain unblocked",
+                         (long long)head_id, (unsigned)s_oom_strikes);
+                s_rd_off += (long)len;
+                if (s_pending > 0) s_pending--;
+                s_skipped++;
+                s_oom_head_id = 0; s_oom_strikes = 0;
+                evlog_persist_cursor_locked();
+                continue;
+            }
+            result = ESP_ERR_NO_MEM;                 /* don't consume — retry next drain */
             break;
         }
         /* malformed record → skip past it */
         ESP_LOGW(TAG, "skipping bad record seq=%u off=%ld len=%u",
                  (unsigned)s_rd_seq, s_rd_off, (unsigned)len);
         s_rd_off += (long)len;
+        s_skipped++;
         if (s_pending > 0) s_pending--;
         evlog_persist_cursor_locked();
     }
@@ -739,6 +941,7 @@ esp_err_t event_log_mark_event_synced(int64_t measure_id)
     if (s_inflight_active && measure_id == s_inflight_id) {
         s_rd_off += s_inflight_len;          /* advance past the published record */
         s_inflight_active = false;
+        s_last_acked_id   = measure_id;      /* end-to-end delivery high-water (telemetry) */
         if (s_pending > 0) s_pending--;
         if (++s_acks_since_persist >= EVLOG_CURSOR_BATCH) {
             evlog_persist_cursor_locked();
@@ -876,6 +1079,24 @@ esp_err_t event_log_db_stats(bool *available, int64_t *total,
     if (total)     *total     = s_pending;
     if (pending)   *pending   = s_pending;
     if (next_id)   *next_id   = s_next_id;
+    xSemaphoreGive(s_mtx);
+    return ESP_OK;
+}
+
+esp_err_t event_log_health(evlog_health_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    out->available     = s_available;
+    out->write_full    = s_write_full;
+    out->pending       = s_pending;
+    out->next_id       = s_next_id;
+    out->last_acked_id = s_last_acked_id;
+    out->skipped       = s_skipped;
+    out->dropped       = s_dropped;
+    out->rd_seq        = s_rd_seq;
+    out->tail_seq      = s_tail_seq;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
 }

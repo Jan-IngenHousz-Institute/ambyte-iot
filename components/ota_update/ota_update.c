@@ -101,6 +101,23 @@ static bool wait_connected(uint32_t timeout_s)
     return s_cfg.is_connected();
 }
 
+/* Poll until SD/persistence reports healthy or the timeout elapses. Returns true
+ * immediately when the check isn't wired (backward-compatible MQTT-only confirm).
+ * Persistence comes up during boot init — well before MQTT connects — so a short
+ * window is plenty; it only exists to absorb the maintenance-worker/init race. */
+static bool wait_persistence_ok(uint32_t timeout_s)
+{
+    if (s_cfg.persistence_healthy == NULL) return true;
+    uint32_t budget = timeout_s * 1000U;
+    while (budget > 0) {
+        if (s_cfg.persistence_healthy()) return true;
+        uint32_t step = (budget < OTA_CONNECT_POLL_MS) ? budget : OTA_CONNECT_POLL_MS;
+        vTaskDelay(pdMS_TO_TICKS(step));
+        budget -= step;
+    }
+    return s_cfg.persistence_healthy();
+}
+
 /* ── applied-id latch (NVS) ─────────────────────────────────────────────
  * The id of the last image that was *successfully* written + booted. Set only
  * on success (right before reboot), so a FAILED download never burns the id —
@@ -245,7 +262,10 @@ static void confirm_pending_after_boot(void)
     (void)latch_get(id, sizeof id);
     ESP_LOGW(TAG, "booted a PENDING_VERIFY image (id=%s) — confirming via MQTT", id);
 
-    if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) {
+    /* Health = MQTT reconnect AND SD/persistence up. The persistence check catches
+     * an image that comes online but breaks SD mounting / the event log — which the
+     * MQTT-only gate would have kept, stranding the unit measurement-dead. */
+    if (wait_connected(OTA_CONFIRM_TIMEOUT_S) && wait_persistence_ok(60)) {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         if (err != ESP_OK) {
             /* Could not commit the image as valid (flash/otadata error). Do NOT
@@ -255,14 +275,15 @@ static void confirm_pending_after_boot(void)
             ESP_LOGE(TAG, "mark_app_valid failed: %s — rebooting", esp_err_to_name(err));
             esp_restart();
         }
-        ESP_LOGW(TAG, "image confirmed valid");
+        ESP_LOGW(TAG, "image confirmed valid (MQTT + persistence healthy)");
         /* Keep the latch as the applied-id dedupe record. */
         ota_report("success", id, NULL);
     } else {
         /* Couldn't prove health within the window — revert to the known-good slot.
          * The latch stays so the same (bad) id isn't auto-retried; a new id, or a
          * fixed image under a new id, is the way forward. */
-        ESP_LOGE(TAG, "no MQTT within %ds — rolling back", OTA_CONFIRM_TIMEOUT_S);
+        ESP_LOGE(TAG, "health gate failed (MQTT/persistence) within %ds — rolling back",
+                 OTA_CONFIRM_TIMEOUT_S);
         esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();   /* normally no return */
         ESP_LOGE(TAG, "rollback call returned (%s) — forcing reboot", esp_err_to_name(err));
         esp_restart();   /* never continue into the request loop while PENDING_VERIFY */

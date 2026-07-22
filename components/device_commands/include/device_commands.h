@@ -75,6 +75,13 @@ typedef struct {
      * a GC to de-fragment the shared heap; NULL = no GC available (the publish
      * still heap-gates and defers if the largest free block is too small). */
     void                              (*request_gc)(void);
+
+    /* Optional SD/persistence telemetry for the STATUS heartbeat, so silent-loss
+     * sites become visible in the field. Fills any non-NULL out-param; returns
+     * ESP_OK if the event-log health snapshot was read. NULL = omit the SD fields. */
+    esp_err_t                         (*sd_health)(bool *io_lost, uint64_t *free_bytes,
+                                                   int64_t *skipped, int64_t *dropped,
+                                                   int64_t *last_acked_id);
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);

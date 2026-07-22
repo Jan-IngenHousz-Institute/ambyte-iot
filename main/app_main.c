@@ -480,6 +480,62 @@ static void app_prepare_reboot(void)
     (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
 }
 
+/* ── SD/persistence health for the OTA boot-confirm gate ───────────────────
+ * The OTA rollback gate was MQTT-only, so an image that reconnects but breaks SD
+ * mounting / the event log would be kept, stranding the unit measurement-dead. The
+ * sticky NVS flag "sd_card/ever_ok" (set the first time persistence comes up on any
+ * image) lets the gate tell "this unit is known to have a working card" — where a
+ * new image failing to bring persistence up is a REGRESSION → roll back — from a
+ * genuinely card-less unit, which must not be blocked on SD. */
+static bool app_sd_ever_ok_get(void)
+{
+    uint8_t v = 0;
+    nvs_handle_t h;
+    if (nvs_open("sd_card", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "ever_ok", &v);
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+static void app_sd_ever_ok_set(void)
+{
+    if (app_sd_ever_ok_get()) return;
+    nvs_handle_t h;
+    if (nvs_open("sd_card", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "ever_ok", 1);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* Wired into ota_update_config_t.persistence_healthy — polled by the boot-confirm
+ * gate after MQTT reconnects, before an image is marked valid. */
+static bool app_persistence_healthy(void)
+{
+    bool avail = false;
+    if (event_log_db_stats(&avail, NULL, NULL, NULL) == ESP_OK && avail) return true;
+    if (sdcard_is_mounted()) return false;      /* card present but persistence down → regression */
+    if (app_sd_ever_ok_get()) return false;     /* known-good card, not mounted now → regression */
+    return true;                                /* genuinely card-less unit → don't block OTA on SD */
+}
+
+/* SD/persistence telemetry for the STATUS heartbeat (wired into
+ * device_commands_config_t.sd_health). Composes the sd_card + event_log health
+ * signals so silent-loss counters and free space reach the platform each cycle. */
+static esp_err_t app_sd_health(bool *io_lost, uint64_t *free_bytes,
+                               int64_t *skipped, int64_t *dropped, int64_t *last_acked_id)
+{
+    if (io_lost)    *io_lost = sdcard_io_lost();
+    if (free_bytes) { *free_bytes = 0; (void)sdcard_free_bytes(free_bytes); }
+    evlog_health_t h;
+    if (event_log_health(&h) != ESP_OK) return ESP_FAIL;
+    if (skipped)       *skipped       = h.skipped;
+    if (dropped)       *dropped       = h.dropped;
+    if (last_acked_id) *last_acked_id = h.last_acked_id;
+    return ESP_OK;
+}
+
 static esp_err_t app_init_littlefs(void)
 {
     esp_vfs_littlefs_conf_t lfs_conf = {
@@ -665,6 +721,11 @@ void app_main(void)
         strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
         device_id[sizeof(device_id) - 1] = '\0';
     }
+    /* Expand {MAC} in device_id too — same placeholder support as client-id/
+     * topic-root/device-name above, so a shared .env (AMBYTE_DEVICE_ID={MAC})
+     * yields a per-board id in the payload instead of the literal token. No-op
+     * when device_id has no {MAC} (e.g. a fixed AMBYTE_DEVICE_ID). */
+    subst_token(device_id, sizeof(device_id), "{MAC}", mac_str);
     static char protocol_id[32], device_name[64], device_version[16],
                 device_firmware[16], firmware_version[16], timezone[48];
     if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
@@ -758,20 +819,21 @@ void app_main(void)
 
     /* MQTT-triggered self-OTA (docs/ota-update-plan.md Stage 3). The worker
      * suspends MQTT during the download (the board can't hold two TLS sessions),
-     * and confirms a just-applied image on the next MQTT reconnect (else rolls
-     * back). Triggered by command_router's ota_update dispatch. */
+     * and confirms a just-applied image on the next MQTT reconnect + SD/persistence
+     * health (else rolls back). Triggered by command_router's ota_update dispatch. */
     ota_update_config_t ota_cfg = {
-        .publish           = mqtt_client_get_publish_fn(),
-        .is_connected      = mqtt_client_get_is_connected_fn(),
-        .comms_suspend     = app_comms_suspend,
-        .comms_resume      = app_comms_resume,
-        .workload_suspend  = app_workload_suspend,
-        .workload_resume   = app_workload_resume,
-        .maintenance_begin = app_maintenance_begin,
-        .maintenance_end   = app_maintenance_end,
-        .submit            = app_maint_submit,
-        .status_topic      = status_topic,
-        .device_id         = device_id,
+        .publish              = mqtt_client_get_publish_fn(),
+        .is_connected         = mqtt_client_get_is_connected_fn(),
+        .comms_suspend        = app_comms_suspend,
+        .comms_resume         = app_comms_resume,
+        .workload_suspend     = app_workload_suspend,
+        .workload_resume      = app_workload_resume,
+        .maintenance_begin    = app_maintenance_begin,
+        .maintenance_end      = app_maintenance_end,
+        .submit               = app_maint_submit,
+        .persistence_healthy  = app_persistence_healthy,
+        .status_topic         = status_topic,
+        .device_id            = device_id,
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");
@@ -934,6 +996,12 @@ void app_main(void)
         if (err == ESP_OK) {
             persistence_available = true;
             ESP_LOGI(APP_TAG, "Persistence layer ready");
+            /* Record that this unit has a working SD/persistence so the OTA boot
+             * gate can treat a future image that can't bring it up as a regression. */
+            bool avail = false;
+            if (event_log_db_stats(&avail, NULL, NULL, NULL) == ESP_OK && avail) {
+                app_sd_ever_ok_set();
+            }
         } else {
             ESP_LOGW(APP_TAG, "Persistence init failed: %s", esp_err_to_name(err));
         }
@@ -981,6 +1049,7 @@ void app_main(void)
         .mark_event_pending = persistence_available ? event_log_get_mark_event_pending_fn() : NULL,
         .quarantine_event   = persistence_available ? event_log_get_quarantine_fn()         : NULL,
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
+        .sd_health          = persistence_available ? app_sd_health                         : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
