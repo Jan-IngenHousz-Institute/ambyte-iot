@@ -13,6 +13,7 @@
 #include "ambyte_status.h"
 #include "certs.h"
 #include "device_config.h"
+#include "timezone.h"
 #include "bme280.h"
 #include "command_router.h"
 #include "ota_update.h"
@@ -392,6 +393,16 @@ static esp_err_t app_init_i2c_and_sensors(void)
         ESP_LOGW(APP_TAG, "no RTC — system clock seeded from flash time %lu "
                           "(volatile; resets on reboot)", (unsigned long)flash_time);
     }
+
+    /* Install the DST rule for the configured IANA timezone so the RTC-based
+     * scheduler (sched.lua) fires jobs on LOCAL wall time. The RTC and every
+     * stored timestamp stay UTC; this only affects on-device scheduling. Applied
+     * before Lua starts (app_init_littlefs, later in the boot sequence). */
+    char tz[48];
+    if (device_config_get_timezone(tz, sizeof(tz)) != ESP_OK) {
+        tz[0] = '\0';
+    }
+    timezone_apply(tz);
 
     err = bme280_init(BME280_I2C_ADDR_SECONDARY);
     if (err != ESP_OK) {

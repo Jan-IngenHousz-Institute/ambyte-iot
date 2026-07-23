@@ -14,22 +14,38 @@
 #define TS_DEG (TS_PI / 180.0)
 
 /* ── location / timezone config (defaults: NL, CEST) ─────────────────── */
-static double s_lat = 52.173;   /* degrees north */
-static double s_lon = 5.819;    /* degrees east (positive = east) */
-static int    s_tz  = 2;        /* hours RTC is ahead of UTC (sun events only) */
+static double  s_lat   = 52.173;   /* degrees north */
+static double  s_lon   = 5.819;    /* degrees east (positive = east) */
+/* Seconds the local clock is ahead of UTC. Callers hand in LOCAL times (they
+ * read the UTC RTC and add this — see components/timezone), and the sun path
+ * shifts its UTC instants onto the same local frame by the same amount. Kept in
+ * seconds so a DST-aware offset from libc lands here exactly; the hours-based
+ * set/get_location API rounds. Default +2 h = CEST (NL summer), so behaviour is
+ * unchanged until a timezone is applied. */
+static int32_t s_off_s = 2 * 3600;
 
 void time_sync_set_location(double lat, double lon, int tz_offset_hours)
 {
-    s_lat = lat;
-    s_lon = lon;
-    s_tz  = tz_offset_hours;
+    s_lat   = lat;
+    s_lon   = lon;
+    s_off_s = tz_offset_hours * 3600;
 }
 
 void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours)
 {
     if (lat) *lat = s_lat;
     if (lon) *lon = s_lon;
-    if (tz_offset_hours) *tz_offset_hours = s_tz;
+    if (tz_offset_hours) *tz_offset_hours = (int)(s_off_s / 3600);
+}
+
+void time_sync_set_utc_offset_seconds(int32_t seconds)
+{
+    s_off_s = seconds;
+}
+
+int32_t time_sync_get_utc_offset_seconds(void)
+{
+    return s_off_s;
 }
 
 /* ── calendar helpers (Howard Hinnant's civil algorithms) ────────────── *
@@ -139,7 +155,7 @@ esp_err_t time_sync_sun_on_date(int64_t date_unix, int event, int64_t *out_unix)
     double w0  = acos(cosw) / TS_DEG;
     double Jev = (event == TIME_SYNC_SUNSET) ? (Jtr + w0 / 360.0) : (Jtr - w0 / 360.0);
     double unix_utc = (Jev - 2440587.5) * 86400.0;
-    *out_unix = (int64_t)floor(unix_utc + (double)s_tz * 3600.0 + 0.5);  /* → local */
+    *out_unix = (int64_t)floor(unix_utc + 0.5) + s_off_s;   /* UTC instant → local frame */
     return ESP_OK;
 }
 

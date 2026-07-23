@@ -30,6 +30,7 @@ if (HAVE_LOCAL_LUA)
         REQUIRES
             device_commands
             time_sync
+            timezone
             json
             lua
     )
@@ -56,6 +57,7 @@ else()
         REQUIRES
             device_commands
             time_sync
+            timezone
             json
     )
 

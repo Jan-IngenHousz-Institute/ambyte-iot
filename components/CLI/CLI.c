@@ -24,6 +24,7 @@
 #include "sync_runner.h"
 #include "event_log.h"
 #include "time_sync.h"
+#include "timezone.h"
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_logger.h"
@@ -90,11 +91,23 @@ static int cli_cmd_status(int argc, char **argv)
     printf(" - RTC ready: %s\r\n", rtc_ready ? "yes" : "no");
 
     if (rtc_ready) {
-        struct tm tm_now;
-        char now_s[32] = {0};
-        localtime_r(&rtc_time, &tm_now);
-        strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
-        printf(" - RTC now: %s (%lld)\r\n", now_s, (long long)rtc_time);
+        struct tm tm_utc, tm_loc;
+        char utc_s[32] = {0}, loc_s[32] = {0};
+        gmtime_r(&rtc_time, &tm_utc);
+        strftime(utc_s, sizeof(utc_s), "%Y-%m-%d %H:%M:%S", &tm_utc);
+        printf(" - RTC (UTC): %s (%lld)\r\n", utc_s, (long long)rtc_time);
+
+        /* Local wall clock the scheduler actually fires on: RTC (UTC) + the
+         * DST-aware offset for the configured timezone (components/timezone;
+         * falls back to time_sync's fixed offset when no zone is applied).
+         * Format the shifted epoch with gmtime_r so the fields read as local. */
+        int32_t off = timezone_utc_offset_seconds((int64_t)rtc_time);
+        time_t  loc = (time_t)((int64_t)rtc_time + off);
+        gmtime_r(&loc, &tm_loc);
+        strftime(loc_s, sizeof(loc_s), "%Y-%m-%d %H:%M:%S", &tm_loc);
+        int off_h = (int)(off / 3600);
+        int off_m = (int)((off < 0 ? -off : off) % 3600) / 60;
+        printf(" - RTC local: %s (UTC%+03d:%02d)\r\n", loc_s, off_h, off_m);
     }
 
     /* Wi-Fi connection + provisioning state. */
@@ -750,8 +763,10 @@ static int cli_cmd_reboot(int argc, char **argv)
 static int cli_cmd_sync(int argc, char **argv)
 {
     time_t now_t = 0;
-    cmd_read_rtc(&now_t);
-    const int64_t now = (int64_t)now_t;
+    cmd_read_rtc(&now_t);                        /* UTC — RTC holds UTC by design */
+    /* Localize like the Lua scheduler does, so `sync` previews match what jobs
+     * actually fire on (DST-correct via the applied timezone). */
+    const int64_t now = timezone_localize((int64_t)now_t);
 
     const char *sub = (argc >= 2) ? argv[1] : "sun";
 
@@ -770,9 +785,9 @@ static int cli_cmd_sync(int argc, char **argv)
             time_sync_localtime(u, NULL, NULL, NULL, &hh, &mm, NULL, NULL);
             snprintf(sss, sizeof(sss), "%02d:%02d", hh, mm);
         }
-        printf("RTC now: %04d-%02d-%02d %02d:%02d:%02d (wday %d)\r\n", y, mo, d, h, mi, s, wd);
+        printf("local now: %04d-%02d-%02d %02d:%02d:%02d (wday %d)\r\n", y, mo, d, h, mi, s, wd);
         printf("loc: lat=%.4f lon=%.4f tz=%+d\r\n", lat, lon, tz);
-        printf("sunrise %s  sunset %s  (RTC time)\r\n", srs, sss);
+        printf("sunrise %s  sunset %s  (local time)\r\n", srs, sss);
         return 0;
     }
 

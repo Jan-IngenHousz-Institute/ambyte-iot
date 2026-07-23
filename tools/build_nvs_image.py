@@ -25,7 +25,8 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                firmware_ver      AMBYTE_FIRMWARE_VERSION
                cmd_topic         AMBYTE_COMMAND_TOPIC    (optional; Stage-2 cmd in)
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
-               timezone          AMBYTE_TIMEZONE         (optional; IANA name)
+               timezone          AMBYTE_TIMEZONE         (IANA name; defaults to
+                                                          Europe/Amsterdam)
                heartbeat_s       AMBYTE_HEARTBEAT_S      (optional; u32 seconds)
                flash_time        <image build time>      (u32 epoch; RTC fallback)
   certs        ca_cert           file at AMBYTE_CA_CERT
@@ -82,11 +83,20 @@ FIELDS = [
 OPTIONAL_FIELDS = [
     ("AMBYTE_COMMAND_TOPIC",    "device_cfg", "cmd_topic",       "string"),
     ("AMBYTE_STATUS_TOPIC",     "device_cfg", "status_topic",    "string"),
-    # IANA timezone name echoed in the MQTT envelope (cloud derives local time).
+    # IANA timezone name. Drives DST-aware on-device scheduling (sched.lua
+    # sun/day-night/clock jobs, via components/timezone) AND is echoed in the
+    # MQTT envelope so the cloud derives local-time columns. Defaults to
+    # DEFAULT_TIMEZONE below when unset.
     ("AMBYTE_TIMEZONE",         "device_cfg", "timezone",        "string"),
     # STATUS heartbeat period in seconds (firmware default 300; 0 disables).
     ("AMBYTE_HEARTBEAT_S",      "device_cfg", "heartbeat_s",     "u32"),
 ]
+
+# Baked when AMBYTE_TIMEZONE is unset, so a fresh flash schedules in NL local
+# time from first boot — even with flash.py --no-provision, or if the console
+# provisioning step is skipped — instead of falling back to the firmware's fixed
+# offset. Mirrors flash/flash.py's DEFAULT_TIMEZONE; override via AMBYTE_TIMEZONE.
+DEFAULT_TIMEZONE = "Europe/Amsterdam"
 
 
 def _find_idf() -> Path:
@@ -271,6 +281,11 @@ def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
         raw = os.environ.get(env_var)
         if raw:
             out[(ns, key)] = (kind, raw)
+
+    # Timezone default: bake Europe/Amsterdam when unset so on-device scheduling
+    # is DST-correct from first boot. setdefault → an explicit AMBYTE_TIMEZONE
+    # (added just above from .env/shell) always wins.
+    out.setdefault(("device_cfg", "timezone"), ("string", DEFAULT_TIMEZONE))
 
     # provisioned=1 is constant; not driven by env.
     out[("wifi_prov", "provisioned")] = ("u8", "1")

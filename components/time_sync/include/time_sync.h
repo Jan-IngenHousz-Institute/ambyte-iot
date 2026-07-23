@@ -12,11 +12,15 @@ extern "C" {
 
 /* RTC-based measurement scheduling math (pure, no hardware access).
  *
- * Time model: every `now`/`date_unix` argument is RTC (LOCAL) Unix seconds —
- * i.e. whatever the PCF2131 holds, which is the local wall clock. Clock/interval/
- * weekday math runs directly on that. Only sunrise/sunset is timezone-aware: it
- * is computed in UTC from lat/lon and shifted by the configured tz offset (hours
- * the RTC is ahead of UTC) so it lines up with the RTC.
+ * Time model: every `now`/`date_unix` argument is LOCAL Unix seconds. The RTC
+ * (and every stored/published timestamp) is UTC; callers localize by ADDING the
+ * configured UTC offset before calling in — see components/timezone, which
+ * derives a DST-correct offset from the device's IANA timezone and pushes it
+ * here via time_sync_set_utc_offset_seconds(). Clock/interval/weekday math then
+ * runs on the local wall clock, and sunrise/sunset (computed in UTC from lat/lon)
+ * is shifted by the SAME offset so it lines up. Returned values are always
+ * durations (seconds-until), which are frame-independent — so the caller waits
+ * the same number of seconds regardless of the frame it localized `now` into.
  */
 
 enum {
@@ -25,10 +29,17 @@ enum {
 };
 
 /* Location / timezone. Defaults: 52.173 N, 5.819 E, tz = +2 (NL summer / CEST).
- * tz_offset_hours = hours the RTC/local clock is ahead of UTC (CEST=2, CET=1,
- * UTC=0); used ONLY for sunrise/sunset. */
+ * tz_offset_hours = whole hours the local clock is ahead of UTC (CEST=2, CET=1,
+ * UTC=0). Sets both the sunrise/sunset shift AND the offset callers use to
+ * localize `now`; get rounds the stored seconds to hours. */
 void time_sync_set_location(double lat, double lon, int tz_offset_hours);
 void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours);
+
+/* Set/get the local-minus-UTC offset in seconds — the DST-aware value normally
+ * owned by components/timezone. Finer-grained than set_location()'s whole hours
+ * and applied to every path (localized `now` + sunrise/sunset). */
+void    time_sync_set_utc_offset_seconds(int32_t seconds);
+int32_t time_sync_get_utc_offset_seconds(void);
 
 /* Break a local Unix time into calendar fields. Any out-pointer may be NULL.
  * wday: 0=Sun .. 6=Sat. */

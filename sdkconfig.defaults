@@ -96,3 +96,36 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # NOTE: as with the cert bundle above, editing this file alone does NOT re-apply
 # — delete the per-env sdkconfig (sdkconfig.esp32-s3-devkitm-1) to regenerate.
 CONFIG_PM_ENABLE=y
+# ── PSRAM (2 MB QUAD, module N16R2) ────────────────────────────────────────────
+# The production module physically has 2 MB QUAD PSRAM. Enabling it is the
+# config-level fix for the internal-DRAM heap fragmentation that stalled large
+# MQTT publishes (arrun traces ~3-9 KB) and starved Lua/TLS reconnects on the
+# ~24 KB fragmented internal heap. ALWAYSINTERNAL=1024 is the load-bearing knob:
+# allocations >1 KB (envelope copy, esp-mqtt outbox copy, mbedTLS cert-flight)
+# spill to PSRAM so internal DRAM de-fragments; a higher threshold leaves them
+# internal and PSRAM buys nothing. IGNORE_NOTFOUND=y is mandatory for a fleet OTA:
+# a unit whose PSRAM fails to enumerate then boots degraded instead of abort()-
+# looping (brick). ALLOW_STACK_EXTERNAL off keeps task stacks out of PSRAM — a
+# stack torn down in a cache-disabled OTA flash window would panic; inert today
+# (IDF 5.5 forces stacks internal) but a foot-gun for future *WithCaps tasks.
+# RESERVE_INTERNAL keeps ~32 KB internal for DMA/ISR. Audit: memory/psram-enablement.md.
+# NOTE: editing this file alone does NOT re-apply — the per-env generated
+# sdkconfig.esp32-s3-devkitm-1 is set to match; delete it to regenerate.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# FREERTOS_TASK_CREATE_ALLOW_EXT_MEM is the current name of the deprecated
+# SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY: it only lets xTaskCreateStatic ACCEPT a
+# SPIRAM stack. Off (=n) makes the kernel REJECT any SPIRAM stack, so a future
+# *WithCaps/static-SPIRAM stack on a flash/OTA-touching task asserts loudly
+# instead of silently bricking the next cache-disabled flash write.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n
+# mbedTLS uses the default heap (internal-first, spills the big >1 KB handshake/
+# cert buffers to PSRAM). NOT INTERNAL (pins TLS to DRAM -> reconnect OOM stays)
+# and NOT EXTERNAL (forces every TLS alloc to slower PSRAM).
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y

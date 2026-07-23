@@ -929,13 +929,24 @@ cmd_result_t cmd_store_status_event(void)
     /* Base status, then power and env each append their block when the read
      * succeeded — so the payload reflects exactly which subsystems were live
      * this cycle. Env keys/format match the device.bme280 measurement event. */
-    char payload[512];
+    char payload[640];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s",
         s.wifi_connected ? "true" : "false",
         s.provisioned ? "true" : "false",
         s.db_online ? "true" : "false",
         s.publish_gate_open ? "true" : "false");
+    /* Internal-DRAM heap telemetry — once PSRAM joins the default heap the total
+     * "heap free" hides internal-DRAM fragmentation. SD DMA, the TLS write, and
+     * any MALLOC_CAP_INTERNAL alloc draw only from this pool, so report its free +
+     * largest block: the number to watch to confirm PSRAM actually relieves the
+     * internal fragmentation (bench gate) and to catch DRAM pressure in the field. */
+    if (n > 0 && n < (int)sizeof(payload)) {
+        n += snprintf(payload + n, sizeof(payload) - n,
+            ",\"heap_int_free_kb\":%u,\"heap_int_largest_kb\":%u",
+            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    }
     /* SD/persistence health — surfaces the audit's silent-loss counters so a
      * degrading card is visible before the cliff (free space, skipped/dropped
      * records, delivery high-water, io-lost). */

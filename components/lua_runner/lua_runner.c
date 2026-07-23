@@ -18,6 +18,7 @@
 #include "device_commands.h"
 #include "ambit_protocol.h"   /* AMBIT_ASYNC_* run-state constants for ambit.poll */
 #include "time_sync.h"
+#include "timezone.h"
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
@@ -1604,8 +1605,12 @@ static void lua_register_ambit_module(lua_State *L)
 static int64_t sync_now(void)
 {
     time_t t = 0;
-    cmd_read_rtc(&t);
-    return (int64_t)t;
+    cmd_read_rtc(&t);                       /* UTC — the RTC holds UTC by design */
+    /* time_sync reasons in LOCAL wall time; hand it a localized `now` (and, as a
+     * side effect, refresh its offset so the sunrise/sunset path stays on the
+     * same frame). DST-correct via the applied IANA timezone; see
+     * components/timezone. */
+    return timezone_localize((int64_t)t);
 }
 
 /* sync.until_interval(period_s [, phase_s]) -> seconds */
