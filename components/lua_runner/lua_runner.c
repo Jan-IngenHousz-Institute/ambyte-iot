@@ -1073,7 +1073,7 @@ static const char *ambit_array_tag(uint8_t idx)
  * state (an exec snippet may call ambit.run/fetch while main.lua measures), so
  * its build+store window is serialized by s_ambit_payload_mtx — created lazily
  * under a spinlock because the first contender may be either task. */
-#define AMBIT_RUN_PAYLOAD_CAP (8 * 1024)
+#define AMBIT_RUN_PAYLOAD_CAP (64000)
 static char *s_ambit_payload;
 static SemaphoreHandle_t s_ambit_payload_mtx;
 static portMUX_TYPE      s_payload_mtx_init_lock = portMUX_INITIALIZER_UNLOCKED;
