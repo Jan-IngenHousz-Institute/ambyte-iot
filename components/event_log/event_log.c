@@ -52,6 +52,7 @@
 #define NVS_KEY_RD_SEQ       "rd_seq"
 #define NVS_KEY_RD_OFF       "rd_off"
 #define NVS_KEY_NID          "nid"
+#define NVS_KEY_CARDID       "card_id"   /* SDMMC serial bound to the persisted cursor (audit I2/I3) */
 
 static SemaphoreHandle_t s_mtx = NULL;
 static StaticSemaphore_t s_mtx_storage;
@@ -271,6 +272,51 @@ static int64_t evlog_tail_max_id_locked(void)
     return 0;
 }
 
+/* Full-directory scan for the highest measure_id across ALL ev files. Used only on
+ * a detected card swap, where the tail-only scan could miss a higher id in a lower-seq
+ * file and hand out a colliding measure_id on the foreign card (audit I3). Caller
+ * holds s_mtx; uses s_line. */
+static int64_t evlog_scan_max_id_locked(void)
+{
+    int64_t max_id = 0;
+    uint32_t mn = 0, mx = 0;
+    if (!evlog_scan_range_locked(&mn, &mx)) return 0;
+    for (uint32_t seq = mn; seq <= mx; seq++) {
+        char path[64];
+        evlog_file_path(path, sizeof path, seq);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) continue;
+        while (fgets(s_line, sizeof s_line, f) != NULL) {
+            size_t len = strlen(s_line);
+            if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
+            int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+            if (id > max_id) max_id = id;
+        }
+        fclose(f);
+    }
+    return max_id;
+}
+
+static uint32_t evlog_nvs_get_cardid(void)
+{
+    uint32_t v = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, NVS_KEY_CARDID, &v);
+        nvs_close(h);
+    }
+    return v;
+}
+
+static void evlog_nvs_set_cardid(uint32_t v)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u32(h, NVS_KEY_CARDID, v);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 /* One-shot task: count the pending backlog (cursor → tail) OFF the boot path, so a
  * large offline accumulation (Wi-Fi down → nothing drains) can't stall app_main
  * before the console starts. BOUNDED by line count and wall-clock — beyond that the
@@ -395,6 +441,21 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_seq = max_seq;
 
+    /* Card-identity guard: the read cursor + next_id HWM live in NVS (internal flash),
+     * but the log lives on the SD. If the card was swapped/restored while NVS persisted,
+     * applying the stale cursor to a DIFFERENT card's log would strand its lower-seq
+     * files (the ~35k-record gap failure) or hand out colliding measure_ids. Detect the
+     * swap by CID serial and, on mismatch, re-publish this card's log from the oldest
+     * file and reseed next_id from a FULL scan (audit I2/I3). */
+    uint32_t card_serial = sdcard_card_serial();
+    uint32_t prev_serial = evlog_nvs_get_cardid();
+    bool card_swapped = (prev_serial != 0 && card_serial != 0 && prev_serial != card_serial);
+    if (card_swapped) {
+        ESP_LOGW(TAG, "SD card changed (serial 0x%08x -> 0x%08x) — re-publishing this card's "
+                      "log from oldest, reseeding id from full scan",
+                 (unsigned)prev_serial, (unsigned)card_serial);
+    }
+
     /* Read cursor; default to the oldest file. */
     uint32_t cseq = min_seq, coff32 = 0;
     nvs_handle_t h;
@@ -411,6 +472,7 @@ static esp_err_t evlog_open_locked(void)
     long fsz  = evlog_file_size(cseq);
     long coff = (long)coff32;
     if (coff > fsz) coff = fsz;
+    if (card_swapped) { cseq = min_seq; coff = 0; }   /* foreign cursor → start at oldest */
     s_rd_seq = cseq;
     s_rd_off = coff;
 
@@ -453,11 +515,17 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_size = evlog_file_size(s_tail_seq);
 
-    /* Seed next_id from the card synchronously — cheap: only the tail file. The
-     * potentially-huge pending COUNT is deferred to evlog_count_task (spawned below)
-     * so boot, and the console, never wait on a large offline backlog. */
-    int64_t max_id = evlog_tail_max_id_locked();
+    /* Seed next_id from the card synchronously — cheap: only the tail file (records are
+     * appended in ascending id order, so the tail holds the max). On a card SWAP the
+     * tail-only shortcut is unsafe (a lower-seq file could hold a higher id from the
+     * foreign device), so scan the whole directory once. */
+    int64_t max_id = card_swapped ? evlog_scan_max_id_locked() : evlog_tail_max_id_locked();
     s_pending = 0;   /* provisional; evlog_count_task fills it in shortly */
+
+    /* Bind this card's serial to the cursor for next-boot swap detection. */
+    if (card_serial != 0 && card_serial != prev_serial) {
+        evlog_nvs_set_cardid(card_serial);
+    }
 
     /* Never hand out an id that collides with a record still on the card. NVS
      * (where next_id's HWM lives) is wiped on every reflash and could be lost to
@@ -540,8 +608,14 @@ esp_err_t event_log_on_sd_lost(void)
         return ESP_ERR_TIMEOUT;
     }
     if (s_wf != NULL) {
-        evlog_flush_writer_locked();    /* best-effort; may fail on a gone card */
-        fclose(s_wf);
+        /* If the card is already latched lost, the FATFS volume may be freed by the
+         * monitor's teardown at any moment — flushing/closing the handle would race
+         * that free (UAF, audit R-8). Just abandon the handle; the next
+         * evlog_open_locked closes it defensively (a bounded, one-per-loss leak). */
+        if (!sdcard_io_lost()) {
+            evlog_flush_writer_locked();    /* best-effort; card believed present */
+            fclose(s_wf);
+        }
         s_wf = NULL;
     }
     evlog_persist_cursor_locked();      /* save progress before the card goes */
@@ -604,7 +678,7 @@ esp_err_t event_log_next_id(int64_t *out_id)
     return ESP_OK;
 }
 
-esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
+static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
         desc->tag == NULL || desc->tag[0] == '\0') {
@@ -778,9 +852,8 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
     return ESP_OK;
 }
 
-esp_err_t event_log_claim_next_event(measurement_event_t *out)
+static esp_err_t event_log_claim_impl(measurement_event_t *out)
 {
-    if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -963,7 +1036,7 @@ esp_err_t event_log_mark_event_pending(int64_t measure_id)
     return ESP_OK;
 }
 
-esp_err_t event_log_quarantine_event(int64_t measure_id)
+static esp_err_t event_log_quarantine_impl(int64_t measure_id)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -1018,7 +1091,7 @@ esp_err_t event_log_quarantine_event(int64_t measure_id)
     return ESP_OK;
 }
 
-esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
+static esp_err_t event_log_rewind_impl(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -1099,6 +1172,47 @@ esp_err_t event_log_health(evlog_health_t *out)
     out->tail_seq      = s_tail_seq;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
+}
+
+/* ── public entry points: SD RW-gate wrappers ─────────────────────────────
+ * Every op that touches the FATFS volume runs between sdcard_io_begin()/io_end() so
+ * an unmount cannot free the volume mid-op (audit F1/R-5). The begin/end are 1:1 by
+ * construction — exactly one begin, exactly one end, NO branch between — so no return
+ * path inside the *_impl (which keep all their own s_mtx handling) can leak a ref.
+ * The ref spans the brief s_mtx wait too, which only delays a teardown by ms. */
+esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
+{
+    if (desc == NULL || desc->payload_json == NULL ||
+        desc->tag == NULL || desc->tag[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t rc = event_log_store_impl(desc);
+    sdcard_io_end();
+    return rc;
+}
+
+esp_err_t event_log_claim_next_event(measurement_event_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!sdcard_io_begin()) { memset(out, 0, sizeof *out); return ESP_ERR_NOT_SUPPORTED; }
+    esp_err_t rc = event_log_claim_impl(out);
+    sdcard_io_end();
+    return rc;
+}
+
+esp_err_t event_log_quarantine_event(int64_t measure_id)
+{
+    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t rc = event_log_quarantine_impl(measure_id);
+    sdcard_io_end();
+    return rc;
+}
+
+esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
+{
+    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t rc = event_log_rewind_impl(seq, out_seq, out_pending);
+    sdcard_io_end();
+    return rc;
 }
 
 /* ── fn getters ──────────────────────────────────────────────────────── */

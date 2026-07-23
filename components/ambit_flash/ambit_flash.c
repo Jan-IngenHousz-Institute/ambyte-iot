@@ -128,8 +128,23 @@ static long region_file_size(const char *dir, const char *fname)
 }
 
 /* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5). */
+static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
+                                                const flash_region_t *r, uint32_t *bytes_out);
+
+/* SD RW-gate wrapper (audit R-6): the hot-plug monitor's teardown must not free the
+ * FATFS volume under this region's fread loop. Per-region ref; io_begin fails cleanly
+ * if the card is gone. 1:1 begin/end by construction (no branch between). */
 static esp_loader_error_t flash_one_region(esp_loader_t *loader, const char *dir,
                                            const flash_region_t *r, uint32_t *bytes_out)
+{
+    if (!sdcard_io_begin()) return ESP_LOADER_ERROR_FAIL;
+    esp_loader_error_t le = flash_one_region_impl(loader, dir, r, bytes_out);
+    sdcard_io_end();
+    return le;
+}
+
+static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
+                                                const flash_region_t *r, uint32_t *bytes_out)
 {
     char path[192];
     snprintf(path, sizeof path, "%s/%s", dir, r->fname);

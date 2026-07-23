@@ -230,51 +230,63 @@ static void writer_task(void *arg)
             vTaskDelay(portMAX_DELAY);   /* parked — the reboot follows shortly */
         }
 
-        /* Check the lock-free loss latch BEFORE sdcard_is_mounted() (which takes
-         * the contended sd_card lock): when a card is pulled this is the fast
-         * loop that re-arms the failing I/O, so it must stop the instant loss is
-         * latched and not keep poking the gone card. */
+        /* Check the lock-free loss latch BEFORE sdcard_is_mounted(): when a card is
+         * pulled this is the fast loop that re-arms the failing I/O, so it must stop
+         * the instant loss is latched. Do NOT close_log() here — fclose would touch a
+         * volume the monitor's teardown may free at any moment (UAF, audit R-8).
+         * Abandon the handle instead; the leaked stdio buffer is one-per-loss and
+         * bounded, and the ring keeps buffering in RAM. */
         if (sdcard_io_lost() || !sdcard_is_mounted()) {
-            close_log();                                   /* ring keeps buffering */
+            s_fp = NULL; s_file_open = false;
             dirty = false;
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
+            continue;
+        }
+
+        /* Gate the whole FATFS-touching iteration so an unmount can't free the volume
+         * mid-op (audit F1/R-8). EVERY exit below routes through the single iter_end. */
+        if (!sdcard_io_begin()) {
+            vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));
             continue;
         }
         if (s_fp == NULL && !open_log()) {
             sdcard_report_io_error();                      /* open on a gone card → loss */
             vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+            goto iter_end;
         }
-
-        size_t n = ring_pop(buf, sizeof buf);
-        if (n > 0) {
-            if (s_file_bytes + n > SD_LOGGER_FILE_BYTES) {
-                close_log();
-                rotate_files();
-                if (!open_log()) { sdcard_report_io_error(); vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        {
+            size_t n = ring_pop(buf, sizeof buf);
+            if (n > 0) {
+                if (s_file_bytes + n > SD_LOGGER_FILE_BYTES) {
+                    close_log();
+                    rotate_files();
+                    if (!open_log()) { sdcard_report_io_error(); vTaskDelay(pdMS_TO_TICKS(1000)); goto iter_end; }
+                }
+                if (fwrite(buf, 1, n, s_fp) != n) {        /* card pulled / full */
+                    close_log();
+                    sdcard_report_io_error();
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    goto iter_end;
+                }
+                sdcard_report_io_ok();                     /* good write → reset streak */
+                s_file_bytes += n;
+                dirty = true;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));  /* idle */
             }
-            if (fwrite(buf, 1, n, s_fp) != n) {            /* card pulled / full */
-                close_log();
-                sdcard_report_io_error();
-                vTaskDelay(pdMS_TO_TICKS(500));
-                continue;
-            }
-            sdcard_report_io_ok();                         /* good write → reset streak */
-            s_file_bytes += n;
-            dirty = true;
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));  /* idle */
-        }
 
-        /* Flush only when there's something to flush — with WARN/ERROR-only
-         * capture the ring is usually empty, so the card sees no periodic writes
-         * (an idle fsync still touches the FAT). */
-        if (s_fp && dirty && (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
-            fflush(s_fp);
-            fsync(fileno(s_fp));
-            last_fsync = xTaskGetTickCount();
-            dirty = false;
+            /* Flush only when there's something to flush — with WARN/ERROR-only
+             * capture the ring is usually empty, so the card sees no periodic writes
+             * (an idle fsync still touches the FAT). */
+            if (s_fp && dirty && (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
+                fflush(s_fp);
+                fsync(fileno(s_fp));
+                last_fsync = xTaskGetTickCount();
+                dirty = false;
+            }
         }
+    iter_end:
+        sdcard_io_end();
     }
 }
 

@@ -281,7 +281,18 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
     return ESP_OK;
 }
 
+static void do_update_impl(const script_req_t *r);
+
+/* SD RW-gate wrapper (audit R-6): the whole op writes main.lua.new + renames it on SD;
+ * hold one ref so a monitor teardown can't free the volume mid-write/rename. */
 static void do_update(const script_req_t *r)
+{
+    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
+    do_update_impl(r);
+    sdcard_io_end();
+}
+
+static void do_update_impl(const script_req_t *r)
 {
     const size_t len = strlen(r->text);
     ESP_LOGW(TAG, "script_update id=%s: %u bytes", r->id[0] ? r->id : "(none)", (unsigned)len);
@@ -380,7 +391,17 @@ static void do_update(const script_req_t *r)
  * stopped (heap defragmented). This is the reliable path for large scripts —
  * inline 16 KB MQTT delivery needs a contiguous TLS record buffer the fragmented
  * heap can't provide. `r->text` holds the URL. */
+static void do_update_url_impl(const script_req_t *r);
+
+/* SD RW-gate wrapper (audit R-6): guards the download-to-SD + syntax read + rename. */
 static void do_update_url(const script_req_t *r)
+{
+    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
+    do_update_url_impl(r);
+    sdcard_io_end();
+}
+
+static void do_update_url_impl(const script_req_t *r)
 {
     ESP_LOGW(TAG, "script_update(url) id=%s: %s", r->id[0] ? r->id : "(none)", r->text);
     char detail[192] = "";

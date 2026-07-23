@@ -204,7 +204,20 @@ static void report_busy(const ambit_ota_req_t *r)
  * (release-asset 302 following is a follow-up). Same proven TLS/buffer settings
  * as the ambyte self-OTA (cert bundle validates GitHub + its CDN; 4 KiB buffers
  * fit GitHub's long signed-redirect URLs). */
+static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t *out_size);
+
+/* SD RW-gate wrapper (audit R-6): guard the download's fwrite loop against a monitor
+ * teardown freeing the volume mid-write. */
 static esp_err_t http_get_to_file(const char *url, const char *path, size_t *out_size)
+{
+    if (out_size) *out_size = 0;
+    if (!sdcard_io_begin()) return ESP_ERR_INVALID_STATE;
+    esp_err_t rc = http_get_to_file_impl(url, path, out_size);
+    sdcard_io_end();
+    return rc;
+}
+
+static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t *out_size)
 {
     *out_size = 0;
 
@@ -351,7 +364,19 @@ static bool ambit_stream_image(uint8_t ch, FILE *f, size_t img_size)
  * reboots into the new (PENDING_VERIFY) image — confirm it ONLY if it answers.
  * If it doesn't answer or the confirm fails, the C3 bootloader rolls back to the
  * previous image on its next reboot. Returns true only when confirmed healthy. */
+static bool ambit_ota_one_impl(uint8_t ch, size_t img_size);
+
+/* SD RW-gate wrapper (audit R-6): guard the fopen + fread stream of the AMBIT image
+ * from SD against a monitor teardown freeing the volume mid-stream. */
 static bool ambit_ota_one(uint8_t ch, size_t img_size)
+{
+    if (!sdcard_io_begin()) return false;
+    bool ok = ambit_ota_one_impl(ch, img_size);
+    sdcard_io_end();
+    return ok;
+}
+
+static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
 {
     ambit_log_version(ch, "before");
 

@@ -31,6 +31,10 @@ bool sdcard_is_mounted(void);
 // and surface remaining space in telemetry.
 esp_err_t sdcard_free_bytes(uint64_t *out_free);
 
+// SDMMC serial number (CID) of the mounted card; 0 if no card is mounted. Used to
+// detect a card swap so persistence never applies a stale cursor to a foreign log.
+uint32_t sdcard_card_serial(void);
+
 // Hot-plug monitoring (no card-detect pin → software polling).
 //
 // sdcard_start_monitor() spawns a low-priority task that wakes every period_ms,
@@ -58,6 +62,23 @@ esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb);
 void sdcard_report_io_error(void);
 void sdcard_report_io_ok(void);
 bool sdcard_io_lost(void);
+
+// FATFS read/write gate (prevents unmount from freeing the volume under a live op).
+// EVERY task doing SD file I/O must bracket its operation:
+//     if (!sdcard_io_begin()) { /* SD unavailable — bail cleanly */ }
+//     ...fopen/fwrite/fread/fsync/remove/rename...
+//     sdcard_io_end();
+// begin() takes a ref and returns true only while the card is mounted, not lost, and
+// no teardown is pending; it returns false (no ref) otherwise. Unmount raises the
+// teardown gate, waits for all refs to drain, and only then calls f_mount(NULL) — so
+// the volume is never freed mid-op. begin()/end() MUST be 1:1 on every path; a leaked
+// ref defers unmount until it drains. Never take any blocking lock between them.
+bool sdcard_io_begin(void);
+void sdcard_io_end(void);
+
+// Suspend the hot-plug monitor task (used by the pre-reboot handler so a teardown
+// can't race the final flush/unmount). No resume — the reboot follows.
+void sdcard_monitor_suspend(void);
 
 #ifdef __cplusplus
 }

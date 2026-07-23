@@ -17,6 +17,9 @@
 /* Forward decls (definitions live in the hot-plug/latch section below). */
 static void sdcard_io_reset(void);
 static void sdcard_note_corrupt_mount(void);
+/* Drain in-flight FATFS ops then unmount; NEVER frees the volume while an op is in
+ * flight (returns false = deferred, caller/monitor retries). Caller holds the mutex. */
+static bool sdcard_drain_and_unmount_locked(const char *reason);
 
 typedef struct {
     gpio_num_t clk;
@@ -34,7 +37,8 @@ typedef struct {
     sdmmc_slot_config_t slot;
     sdmmc_card_t *card;
     bool initialized;
-    bool mounted;
+    volatile bool mounted;   /* read lock-free by sdcard_is_mounted (advisory); real FS
+                              * access is authorized by sdcard_io_begin, not this flag */
 } sdcard_service_t;
 
 static portMUX_TYPE s_sdcard_mutex_guard = portMUX_INITIALIZER_UNLOCKED;
@@ -183,10 +187,27 @@ static esp_err_t sdcard_mount_locked(bool quiet)
 esp_err_t sdcard_free_bytes(uint64_t *out_free)
 {
     if (out_free == NULL) return ESP_ERR_INVALID_ARG;
+    /* f_getfree walks the live volume — gate it so a concurrent unmount can't free
+     * the volume under it (audit R-11); the in-store callers are already bracketed,
+     * this covers the STATUS-heartbeat call. */
+    if (!sdcard_io_begin()) return ESP_ERR_INVALID_STATE;
     uint64_t total = 0, freeb = 0;
     esp_err_t err = esp_vfs_fat_info(SD_MOUNT_POINT, &total, &freeb);
     if (err == ESP_OK) *out_free = freeb;
+    sdcard_io_end();
     return err;
+}
+
+/* SDMMC serial (CID) of the mounted card, 0 if not mounted. Lets persistence detect
+ * a card swap and avoid applying a stale NVS read-cursor to a different card's log
+ * (audit I2/I3 — the failure class behind the ~35k-record gap). */
+uint32_t sdcard_card_serial(void)
+{
+    uint32_t serial = 0;
+    if (sdcard_lock() != ESP_OK) return 0;
+    if (s_sdcard.mounted && s_sdcard.card != NULL) serial = s_sdcard.card->cid.serial;
+    sdcard_unlock();
+    return serial;
 }
 
 /* Log a "present-but-unmountable" (corrupt-FS) mount failure once per boot, so a
@@ -233,32 +254,25 @@ esp_err_t sdcard_unmount(void)
     }
 
     if (s_sdcard.mounted) {
-        err = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sdcard.card);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "SD unmount failed: %s", esp_err_to_name(err));
-            sdcard_unlock();
-            return err;
+        /* Drain in-flight FATFS ops before f_mount(NULL); never free the volume
+         * under a live writer (audit F1). Callers reach this via app_prepare_reboot
+         * AFTER the monitor is suspended + writers flushed/closed, so refs are 0 and
+         * the drain returns immediately. */
+        if (!sdcard_drain_and_unmount_locked("explicit unmount")) {
+            err = ESP_ERR_TIMEOUT;   /* deferred: ops still in flight */
         }
-
-        s_sdcard.card = NULL;
-        s_sdcard.mounted = false;
     }
 
     sdcard_unlock();
-    return ESP_OK;
+    return err;
 }
 
+/* Lock-free advisory read (audit F3/F4). NEVER take the blocking mutex here: callers
+ * poll this frequently and a mutex held for the ≤8 s teardown drain would wedge them.
+ * A stale value is harmless — every real FS touch is authorized by sdcard_io_begin. */
 bool sdcard_is_mounted(void)
 {
-    bool mounted = false;
-
-    if (sdcard_lock() != ESP_OK) {
-        return false;
-    }
-
-    mounted = s_sdcard.mounted;
-    sdcard_unlock();
-    return mounted;
+    return s_sdcard.mounted;
 }
 
 /* ── Hot-plug monitor ─────────────────────────────────────────────────── */
@@ -266,6 +280,14 @@ bool sdcard_is_mounted(void)
 static TaskHandle_t      s_monitor_task = NULL;
 static sdcard_state_cb_t s_state_cb     = NULL;
 static uint32_t          s_monitor_period_ms = 2000;   /* removal-detection probe (card in) */
+
+/* Monitor stack (12 KB). Heap-allocated, NOT static/BSS: on this no-PSRAM board the
+ * heap is tight (largest free block ~31 KB) and a permanent 12 KB static reservation
+ * tips the marginal Lua-script load into ENOMEM. The monitor is created once at boot
+ * while the heap is still clean (~126 KB free), so xTaskCreate can't realistically
+ * fail there — the static-stack "insurance" (audit D4) costs more than it protects
+ * against on this hardware. */
+#define SD_MONITOR_STACK_BYTES   12288
 
 /* While the card is OUT, retry quickly for a short window after loss (a human
  * reinserting a card expects recovery in seconds, not minutes), then back off to
@@ -291,6 +313,15 @@ static uint32_t          s_monitor_period_ms = 2000;   /* removal-detection prob
 static portMUX_TYPE  s_io_lock        = portMUX_INITIALIZER_UNLOCKED;
 static volatile int  s_io_fail_streak = 0;   /* volatile: read lock-free in the ok() fast-path */
 static volatile bool s_sd_io_lost     = false;
+
+/* FATFS RW-gate (audit F1): in-flight FATFS-op refcount + a teardown-pending flag.
+ * A writer takes a ref (sdcard_io_begin) only while mounted, not lost, and no teardown
+ * pending; teardown sets s_teardown_pending, waits for refs to hit 0, and only THEN
+ * calls f_mount(NULL) — so the volume is never freed under a live op. If refs don't
+ * drain, teardown DEFERS (retries next tick) rather than proceed. All three fields
+ * live under s_io_lock (the brief spinlock, never the blocking s_sdcard.mutex). */
+static volatile int  s_io_refs          = 0;
+static volatile bool s_teardown_pending = false;
 
 void sdcard_report_io_error(void)
 {
@@ -321,14 +352,52 @@ bool sdcard_io_lost(void)
     return s_sd_io_lost;
 }
 
-/* Clear the latch + streak. Called only when the card is known-good again
- * (successful (re)mount) — never while out, so writers stay gated meanwhile. */
+/* Re-arm after a successful (re)mount: clear the loss latch AND the RW-gate. Called
+ * only when the card is known-good again — never while out, so writers stay gated
+ * meanwhile. Resetting refs to 0 is safe because no op can span an unmount→remount
+ * (teardown proved refs==0 before it freed the volume). Enforces the invariant
+ * teardown_pending==true ⇒ card not usable (audit E4/F2/R-7). */
 static void sdcard_io_reset(void)
 {
     portENTER_CRITICAL_SAFE(&s_io_lock);
-    s_io_fail_streak = 0;
-    s_sd_io_lost     = false;
+    s_io_fail_streak   = 0;
+    s_sd_io_lost       = false;
+    s_teardown_pending = false;
+    s_io_refs          = 0;
     portEXIT_CRITICAL_SAFE(&s_io_lock);
+}
+
+/* RW-gate acquire/release (audit F1). A FATFS writer brackets its whole op:
+ *   if (!sdcard_io_begin()) { bail — SD going away }
+ *   ...fopen/fwrite/fsync/remove...
+ *   sdcard_io_end();
+ * begin() fails (returns false, no ref taken) if the card is unmounted, lost, or a
+ * teardown is pending. Lock-free (brief spinlock), safe from any task. */
+bool sdcard_io_begin(void)
+{
+    bool ok = false;
+    portENTER_CRITICAL_SAFE(&s_io_lock);
+    if (!s_teardown_pending && !s_sd_io_lost && s_sdcard.mounted) {
+        s_io_refs++;
+        ok = true;
+    }
+    portEXIT_CRITICAL_SAFE(&s_io_lock);
+    return ok;
+}
+
+void sdcard_io_end(void)
+{
+    portENTER_CRITICAL_SAFE(&s_io_lock);
+    configASSERT(s_io_refs > 0);          /* catch a begin/end imbalance in test */
+    if (s_io_refs > 0) s_io_refs--;
+    portEXIT_CRITICAL_SAFE(&s_io_lock);
+}
+
+/* Suspend the hot-plug monitor so it cannot run a teardown concurrently with the
+ * pre-reboot flush/unmount (audit R-9). Called first in the shutdown handler. */
+void sdcard_monitor_suspend(void)
+{
+    if (s_monitor_task != NULL) vTaskSuspend(s_monitor_task);
 }
 
 /* CMD13 poll debounce: a marginal HIGHSPEED bus can throw a lone transient CMD13
@@ -336,18 +405,45 @@ static void sdcard_io_reset(void)
  * the mount down (the error-driven latch stays the fast real-pull path) — audit E1. */
 static int s_probe_fail_streak = 0;
 
-/* Unmount + latch loss. Latching here (not only in the writer-driven path) closes the
- * window where a CMD13-detected loss left both writer gates open (audit F2). */
-static void sdcard_teardown_locked(const char *reason)
+/* Drain in-flight FATFS ops, then unmount + latch loss. The gate (teardown_pending)
+ * is raised FIRST under s_io_lock so no new op can start; then we wait for in-flight
+ * refs to drain. Only when refs==0 do we call f_mount(NULL) — the volume is NEVER
+ * freed under a live writer (audit F1/R-1/R-2). If refs don't drain within the budget
+ * we DEFER: leave the mount up + teardown_pending set (writers stay gated) and return
+ * false; the monitor's next tick retries, and a stuck driver op self-clears in ~5 s.
+ * Caller holds s_sdcard.mutex. Returns true iff the volume was actually unmounted. */
+#define SD_TEARDOWN_DRAIN_TICKS  800   /* ×10 ms = 8 s, > the ~5 s driver-op timeout */
+static bool sdcard_drain_and_unmount_locked(const char *reason)
 {
+    portENTER_CRITICAL_SAFE(&s_io_lock);
+    s_teardown_pending = true;                 /* gate new ops out (authoritative) */
+    portEXIT_CRITICAL_SAFE(&s_io_lock);
+
+    int refs = 0;
+    for (int i = 0; i < SD_TEARDOWN_DRAIN_TICKS; i++) {
+        portENTER_CRITICAL_SAFE(&s_io_lock);
+        refs = s_io_refs;
+        portEXIT_CRITICAL_SAFE(&s_io_lock);
+        if (refs == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (refs != 0) {
+        ESP_LOGW(TAG, "SD teardown (%s) DEFERRED — %d FATFS op(s) still in flight, retrying",
+                 reason, refs);
+        return false;                          /* do NOT free the volume under a live op */
+    }
+
     ESP_LOGW(TAG, "card lost (%s) — unmounting", reason);
     esp_err_t u = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sdcard.card);
     if (u != ESP_OK) ESP_LOGW(TAG, "unmount after card-loss: %s", esp_err_to_name(u));
     s_sdcard.card    = NULL;
     s_sdcard.mounted = false;
+    /* Latch loss so writers stay gated until a successful remount (which calls
+     * sdcard_io_reset → clears both s_sd_io_lost and s_teardown_pending). */
     portENTER_CRITICAL_SAFE(&s_io_lock);
     s_sd_io_lost = true;
     portEXIT_CRITICAL_SAFE(&s_io_lock);
+    return true;
 }
 
 /* One probe step: try to detect a state transition. Returns the new mounted
@@ -363,16 +459,20 @@ static bool sdcard_probe_step(void)
     if (was_mounted && s_sdcard.card != NULL) {
         if (s_sd_io_lost) {
             /* Error-driven loss wins over the poll: a writer already latched repeated
-             * I/O failures — tear down now, skipping the (possibly host-mutex-blocked)
-             * CMD13. */
-            sdcard_teardown_locked("I/O errors");
+             * I/O failures — tear down now (drained; deferred+retried next tick if an
+             * op is still in flight), skipping the CMD13 probe. */
+            (void)sdcard_drain_and_unmount_locked("I/O errors");
             s_probe_fail_streak = 0;
         } else {
+            /* CMD13 stays UNDER s_sdcard.mutex (audit R-3): moving it off-mutex would
+             * race an unmount freeing s_sdcard.card. A healthy poll is sub-10 ms; the
+             * slow (pulled-card) case is short-circuited by the s_sd_io_lost branch. */
             esp_err_t err = sdmmc_get_status(s_sdcard.card);
             if (err != ESP_OK) {
                 if (++s_probe_fail_streak >= 2) {   /* debounce a lone transient CMD13 */
-                    sdcard_teardown_locked(esp_err_to_name(err));
-                    s_probe_fail_streak = 0;
+                    if (sdcard_drain_and_unmount_locked(esp_err_to_name(err))) {
+                        s_probe_fail_streak = 0;
+                    }   /* else deferred → keep streak so the next tick retries at once */
                 } else {
                     ESP_LOGW(TAG, "CMD13 probe failed (%s) — retrying before unmount",
                              esp_err_to_name(err));
@@ -458,9 +558,11 @@ esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb)
 
     /* 12 KB stack: the remount path goes through esp_vfs_fat_sdmmc_mount +
      * FATFS, and the cb fans out to event_log_on_sd_restored() + lua_runner_start()
-     * (FATFS reopen is a heavy stack user). 4 KB overflowed; 8 KB was marginal. */
+     * (FATFS reopen is a heavy stack user). 4 KB overflowed; 8 KB was marginal.
+     * Static (BSS) storage so a fragmented heap can never fail to start the only
+     * task that can recover a lost card (audit D4). */
     BaseType_t ok = xTaskCreate(sdcard_monitor_task, "sd_monitor",
-                                12288, NULL, 2, &s_monitor_task);
+                                SD_MONITOR_STACK_BYTES, NULL, 2, &s_monitor_task);
     if (ok != pdPASS) {
         s_monitor_task = NULL;
         return ESP_ERR_NO_MEM;

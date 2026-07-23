@@ -475,6 +475,10 @@ static void app_on_sd_state_change(bool mounted)
  * scheduler still active, so the mutex/task handshakes inside are safe. */
 static void app_prepare_reboot(void)
 {
+    /* Suspend the hot-plug monitor FIRST so its teardown can't race the final flush +
+     * unmount below (audit R-9) — the drains then run monitor-free, and sdcard_unmount
+     * sees no writer refs so it completes immediately. */
+    sdcard_monitor_suspend();
     event_log_prepare_shutdown();   /* flush + fsync + close the events tail */
     sd_logger_prepare_shutdown();   /* drain the log ring + close the log file */
     (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
@@ -1008,8 +1012,13 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "Free heap after persistence: %lu", (unsigned long)esp_get_free_heap_size());
 
-    /* ── SD hot-plug monitor ──────────────────────────────────────── */
-    if (sd_available) {
+    /* ── SD hot-plug monitor ──────────────────────────────────────────
+     * Start UNCONDITIONALLY, even if the boot mount failed. The monitor is the only
+     * path that remounts a card absent/failed at boot, so gating it on boot-mount
+     * success would permanently disable SD for the whole session on a transient
+     * boot-time fault (audit D3). Harmless when no card is present (it just polls).
+     * The static-stack task (audit D4) cannot fail to start on a fragmented heap. */
+    {
         esp_err_t mon_err = sdcard_start_monitor(2000, app_on_sd_state_change);
         if (mon_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "SD monitor failed to start: %s", esp_err_to_name(mon_err));
@@ -1017,13 +1026,12 @@ void app_main(void)
     }
 
     /* ── Pre-reboot SD power-safety hook (Item B) ─────────────────────
-     * Registered once; esp_register_shutdown_handler invokes it before every
-     * esp_restart(), so the event log + SD log are flushed and FATFS is cleanly
-     * unmounted on all reboot paths. */
-    if (sd_available) {
-        if (esp_register_shutdown_handler(app_prepare_reboot) != ESP_OK) {
-            ESP_LOGW(APP_TAG, "could not register SD pre-reboot flush handler");
-        }
+     * Registered unconditionally so a card the monitor mounts LATER still gets a
+     * clean unmount on the next reboot. esp_register_shutdown_handler invokes it
+     * before every esp_restart(); the drain/unmount are no-ops when nothing is
+     * mounted, so it is safe even if the boot mount failed. */
+    if (esp_register_shutdown_handler(app_prepare_reboot) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "could not register SD pre-reboot flush handler");
     }
 
     /* ── Hardware inventory ───────────────────────────────────────── */
