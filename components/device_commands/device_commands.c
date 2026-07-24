@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "timezone.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -677,7 +678,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
      * pipeline aliases it to measurement_time_utc, so battery-queued events must
      * carry their capture time, not the publish time. Publish time goes into the
      * sample as `published`. */
-    char meas_ts[32], pub_ts[32];
+    char meas_ts[32], pub_ts[32], meas_local[40];
     {
         struct tm tm_info;
         time_t ts = (time_t)(e.start_ticks_ms / 1000);
@@ -686,6 +687,21 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         ts = time(NULL);
         gmtime_r(&ts, &tm_info);
         strftime(pub_ts, sizeof(pub_ts), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+
+        /* timestamp_local: the SAME instant as `timestamp` (measurement start),
+         * rendered in the device's local zone with an explicit ±HH:MM suffix so it
+         * is unambiguous ISO-8601 (not bare wall time) and encodes DST. The offset
+         * is DST-resolved for that instant, matching the scheduler's frame — so a
+         * battery-queued winter event localizes with the winter offset. Use the
+         * PURE timezone_utc_offset_seconds(); timezone_localize() must NOT be called
+         * here — it mutates time_sync's stored offset (a scheduler-only side effect). */
+        int32_t off = timezone_utc_offset_seconds((int64_t)(e.start_ticks_ms / 1000));
+        time_t loc = (time_t)(e.start_ticks_ms / 1000) + off;
+        gmtime_r(&loc, &tm_info);
+        size_t k = strftime(meas_local, sizeof(meas_local), "%Y-%m-%dT%H:%M:%S", &tm_info);
+        int32_t ao = off < 0 ? -off : off;
+        snprintf(meas_local + k, sizeof(meas_local) - k, "%c%02d:%02d",
+                 off < 0 ? '-' : '+', (int)(ao / 3600), (int)((ao % 3600) / 60));
     }
 
     /* "" → JSON null for the optional provenance strings. */
@@ -732,7 +748,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                + strlen(chanbuf) + strlen(devbuf) + strlen(cmdfield) + strlen(e.tag)
                + strlen(battpart) + strlen(tzpart)
                + strlen(fw) + strlen(dn) + strlen(dv)
-               + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts)
+               + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts) + sizeof(meas_local)
                + 320;                            /* fixed keys + numbers + punctuation */
 
     /* Large-payload heap gate. Attempting a big publish into a fragmented heap
@@ -782,7 +798,8 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
 
     int n = snprintf(payload, cap,
         "{\"sample\":[{"
-            "\"v\":2,\"measure_id\":%lld,\"startTicks\":%lld,\"endTicks\":%lld,"
+            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld,"
+            "\"timestamp_local\":\"%s\","
             "\"published\":\"%s\",\"channel\":%s,\"device\":%s,"
             "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s"
         "}],"
@@ -790,7 +807,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         "\"device_id\":\"%s\",\"device_name\":\"%s\","
         "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}",
         (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
-        pub_ts, chanbuf, devbuf, cmdfield, e.tag,
+        meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
         meta ? meta : "null", e.payload_json,
         meas_ts, battpart, tzpart,
         s_mac_str, dn, dv, fw);
