@@ -1058,6 +1058,7 @@ void app_main(void)
     device_commands_config_t cmd_cfg = {
         .read_env               = bme280_get_sensor_read_fn(),
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
+        .set_clock              = pcf2131tfy_rtc_set_epoch,
         .read_power             = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
         .set_status             = ambyte_status_get_set_fn(),
         .sd_ready               = sd_available ? sdcard_is_mounted : NULL,

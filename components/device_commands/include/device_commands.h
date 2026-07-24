@@ -26,6 +26,7 @@ typedef struct {
     /* Sensing ports */
     sensor_read_fn              read_env;
     clock_read_fn               read_clock;
+    clock_set_fn                set_clock;    /* set RTC+system clock from a UTC epoch; NULL = unsupported */
     power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
 
     /* Persistence ports — one row per measurement event (event-document model) */
@@ -114,6 +115,10 @@ bool device_commands_publish_power_ok(void);
 
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
+/* Set the RTC (and system clock) from a UTC epoch (seconds). Validates a sane
+ * range and returns the applied UTC time (ISO-8601) in .message on success. The
+ * epoch MUST be UTC — the RTC is UTC by design. Used by the MQTT set_time cmd. */
+cmd_result_t cmd_set_rtc(int64_t epoch_utc);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
 

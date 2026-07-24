@@ -317,6 +317,36 @@ cmd_result_t cmd_read_rtc(time_t *out_time)
     return make_result(ESP_OK, "RTC: %lld", (long long)*out_time);
 }
 
+/* Sanity bounds for an externally-supplied clock (MQTT set_time). Reject anything
+ * outside [2024-01-01, 2100-01-01) so a garbage/stale/replayed stamp — a never-set
+ * 1970 clock, a corrupt payload, an absurd future — can't wreck the RTC. We do NOT
+ * gate on distance from the current time: a wrong clock is the reason to call this,
+ * so a freshness check would reject legitimate corrections (the current clock can't
+ * be trusted). The operator must therefore NOT send set_time as a retained message. */
+#define CMD_SET_RTC_MIN_EPOCH  1704067200LL   /* 2024-01-01T00:00:00Z */
+#define CMD_SET_RTC_MAX_EPOCH  4102444800LL   /* 2100-01-01T00:00:00Z */
+
+cmd_result_t cmd_set_rtc(int64_t epoch_utc)
+{
+    if (!s_initialized || s_cfg.set_clock == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "RTC set not available");
+    }
+    if (epoch_utc < CMD_SET_RTC_MIN_EPOCH || epoch_utc >= CMD_SET_RTC_MAX_EPOCH) {
+        return make_result(ESP_ERR_INVALID_ARG,
+                           "epoch %lld out of range [2024,2100)", (long long)epoch_utc);
+    }
+    esp_err_t err = s_cfg.set_clock((time_t)epoch_utc);
+    if (err != ESP_OK) {
+        return make_result(err, "RTC set failed: %s", esp_err_to_name(err));
+    }
+    char iso[32];
+    struct tm tm_utc;
+    time_t t = (time_t)epoch_utc;
+    gmtime_r(&t, &tm_utc);
+    strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+    return make_result(ESP_OK, "%s", iso);
+}
+
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time)
 {
     bool bme_ok = false;

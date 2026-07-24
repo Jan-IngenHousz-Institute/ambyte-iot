@@ -23,6 +23,11 @@ clock_read_fn pcf2131tfy_rtc_get_clock_read_fn(void);
  * how a factory-fresh RTC is brought online. `utc_tm` is not modified. */
 esp_err_t pcf2131tfy_rtc_set_time(const struct tm *utc_tm);
 
+/* Convenience: set the RTC from a UTC epoch (seconds). Wraps set_time (gmtime_r +
+ * set), so it also re-syncs the system clock. Matches clock_set_fn for injection
+ * into device_commands (the MQTT set_time path). */
+esp_err_t pcf2131tfy_rtc_set_epoch(time_t epoch_utc);
+
 /* Read the RTC and push it into the ESP system clock (settimeofday) when the
  * read is valid (oscillator running). No-op leaving the system clock untouched
  * when the RTC time is invalid/unreadable (e.g. a never-set RTC). Returns the

@@ -19,6 +19,9 @@ typedef struct {
 
 typedef esp_err_t (*sensor_read_fn)(measurement_t *out);
 typedef esp_err_t (*clock_read_fn)(time_t *out);
+/* Set the RTC (and system clock) from a UTC epoch. Injected like clock_read_fn so
+ * the device_commands layer stays driver-agnostic. */
+typedef esp_err_t (*clock_set_fn)(time_t epoch_utc);
 
 /* On-board power telemetry from the MP2731 charger (mV / mA). */
 typedef struct {

@@ -85,6 +85,13 @@ extern "C" esp_err_t pcf2131tfy_rtc_set_time(const struct tm *utc_tm)
     return pcf2131tfy_rtc_sync_system_clock();
 }
 
+extern "C" esp_err_t pcf2131tfy_rtc_set_epoch(time_t epoch_utc)
+{
+    struct tm utc_tm;
+    gmtime_r(&epoch_utc, &utc_tm);
+    return pcf2131tfy_rtc_set_time(&utc_tm);
+}
+
 extern "C" esp_err_t pcf2131tfy_rtc_sync_system_clock(void)
 {
     time_t now = 0;

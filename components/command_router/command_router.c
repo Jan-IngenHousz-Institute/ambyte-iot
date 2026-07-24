@@ -9,6 +9,7 @@
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "script_update.h"
+#include "device_commands.h"
 
 #define TAG "cmd_router"
 
@@ -243,6 +244,30 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "lua_exec id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             }
+        }
+    } else if (strcmp(type, "set_time") == 0) {
+        /* Set the device RTC from a UTC epoch: {"epoch": <UTC seconds>}. The RTC is
+         * UTC by design — send UTC, never local. Do NOT publish set_time as a
+         * retained message: the sender-stamped epoch would replay stale on a late
+         * reconnect (cmd_set_rtc range-checks but cannot detect a merely-old stamp).
+         * Parse via valuedouble (not valueint) so epochs past 2038 don't overflow. */
+        const cJSON *jepoch = cJSON_GetObjectItemCaseSensitive(root, "epoch");
+        if (!cJSON_IsNumber(jepoch)) {
+            ESP_LOGW(TAG, "set_time id=%s missing/invalid 'epoch' — ignoring", id ? id : "");
+        } else {
+            int64_t epoch = (int64_t)jepoch->valuedouble;
+            cmd_result_t r = cmd_set_rtc(epoch);
+            ESP_LOGW(TAG, "set_time id=%s epoch=%lld -> %s (%s)", id ? id : "",
+                     (long long)epoch, r.status == ESP_OK ? "OK" : "FAIL", r.message);
+            char reply[384];
+            /* Bound id and detail so the fixed buffer can never truncate (r.message
+             * is char[256]; id is caller-supplied). */
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"set_time_result\",\"id\":\"%.64s\",\"ok\":%s,"
+                     "\"epoch\":%lld,\"detail\":\"%.150s\"}",
+                     id ? id : "", r.status == ESP_OK ? "true" : "false",
+                     (long long)epoch, r.message);
+            publish_reply(reply);
         }
     } else {
         ESP_LOGW(TAG, "unknown command type '%s'", type);
