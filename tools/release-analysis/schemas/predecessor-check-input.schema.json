@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ambyte.invalid/schemas/predecessor-check-input.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_identity",
+    "expected_decision",
+    "expected_version",
+    "merged_commit",
+    "predecessor"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "candidate_identity": {
+      "$ref": "release-analysis.schema.json#/$defs/candidateIdentity"
+    },
+    "expected_decision": {
+      "$ref": "release-analysis.schema.json#/$defs/releaseDecision"
+    },
+    "expected_version": {
+      "$ref": "release-analysis.schema.json#/$defs/version"
+    },
+    "merged_commit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha", "parent_sha", "tree_sha", "pull_request"],
+      "properties": {
+        "sha": {
+          "$ref": "release-analysis.schema.json#/$defs/sha"
+        },
+        "parent_sha": {
+          "$ref": "release-analysis.schema.json#/$defs/sha"
+        },
+        "tree_sha": {
+          "$ref": "release-analysis.schema.json#/$defs/sha"
+        },
+        "pull_request": {
+          "$ref": "release-analysis.schema.json#/$defs/pullRequest"
+        }
+      }
+    },
+    "predecessor": {
+      "$ref": "base-state-input.schema.json"
+    }
+  }
+}

@@ -36,7 +36,7 @@ static void handle_ping(const char *id)
              "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld}",
              id ? id : "",
              s_cfg.device_id ? s_cfg.device_id : "",
-             s_cfg.firmware_version ? s_cfg.firmware_version : "",
+             s_cfg.running_firmware_version ? s_cfg.running_firmware_version : "",
              up_ms);
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);

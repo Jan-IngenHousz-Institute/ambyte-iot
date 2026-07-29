@@ -1,0 +1,1 @@
+"""Exact-artifact firmware publisher."""

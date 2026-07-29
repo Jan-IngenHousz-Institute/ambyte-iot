@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jii.example/schemas/firmware-candidate-metadata-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "repository", "pull_request", "source", "analysis", "workflow"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "pull_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "title"],
+      "properties": {
+        "number": {"type": "integer", "minimum": 1},
+        "title": {"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["head_sha", "base_sha", "tree_sha"],
+      "properties": {
+        "head_sha": {"$ref": "#/$defs/git_sha"},
+        "base_sha": {"$ref": "#/$defs/git_sha"},
+        "tree_sha": {"$ref": "#/$defs/git_sha"}
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "release_version", "notes_sha256", "latest_release_tag", "recovery_of_sha"],
+      "properties": {
+        "decision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["release", "bump", "kind", "reason"],
+          "properties": {
+            "release": {"type": "boolean"},
+            "bump": {"type": ["string", "null"], "enum": ["major", "minor", "patch", null]},
+            "kind": {"enum": ["release", "no-release", "recovery"]},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        },
+        "release_version": {
+          "type": ["string", "null"],
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "notes_sha256": {"$ref": "#/$defs/sha256"},
+        "latest_release_tag": {
+          "type": "string",
+          "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "recovery_of_sha": {"anyOf": [{"$ref": "#/$defs/git_sha"}, {"type": "null"}]}
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha", "run_id", "run_attempt"],
+      "properties": {
+        "sha": {"$ref": "#/$defs/git_sha"},
+        "run_id": {"type": "integer", "minimum": 1},
+        "run_attempt": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "$defs": {
+    "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

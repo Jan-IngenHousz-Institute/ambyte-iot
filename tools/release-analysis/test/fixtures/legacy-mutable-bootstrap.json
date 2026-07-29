@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "first_parent_commits": [
+    {
+      "sha": "40787cf000000000000000000000000000000000",
+      "parent_sha": "8f1ff74000000000000000000000000000000000",
+      "tree_sha": "0000000000000000000000000000000000000000",
+      "subject": "legacy v1.0.4"
+    },
+    {
+      "sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "parent_sha": "40787cf000000000000000000000000000000000",
+      "tree_sha": "1111111111111111111111111111111111111111",
+      "subject": "fw 1.0.5"
+    },
+    {
+      "sha": "b98ef489614e9c6d98af70020f1adaaf36b1630b",
+      "parent_sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "tree_sha": "2222222222222222222222222222222222222222",
+      "subject": "rtc ota"
+    },
+    {
+      "sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "parent_sha": "b98ef489614e9c6d98af70020f1adaaf36b1630b",
+      "tree_sha": "3333333333333333333333333333333333333333",
+      "subject": "untrusted squash text",
+      "pull_request": {
+        "number": 52,
+        "title": "ci: add firmware release automation",
+        "url": "https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/52"
+      }
+    }
+  ],
+  "release_tags": [
+    {
+      "name": "v1.0.4",
+      "target_sha": "40787cf000000000000000000000000000000000",
+      "published": true,
+      "immutable": false
+    },
+    {
+      "name": "v1.0.5",
+      "target_sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "published": true,
+      "immutable": false
+    }
+  ],
+  "recovery_markers": []
+}

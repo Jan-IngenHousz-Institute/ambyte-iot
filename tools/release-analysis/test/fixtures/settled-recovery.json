@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "first_parent_commits": [
+    {
+      "sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "parent_sha": "a146073000000000000000000000000000000000",
+      "tree_sha": "1111111111111111111111111111111111111111",
+      "subject": "fw 1.0.5"
+    },
+    {
+      "sha": "b98ef489614e9c6d98af70020f1adaaf36b1630b",
+      "parent_sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "tree_sha": "2222222222222222222222222222222222222222",
+      "subject": "rtc ota"
+    },
+    {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_sha": "b98ef489614e9c6d98af70020f1adaaf36b1630b",
+      "tree_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "subject": "editable squash text",
+      "pull_request": {
+        "number": 41,
+        "title": "feat(sensor): add calibrated readings",
+        "url": "https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/41"
+      }
+    },
+    {
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "parent_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tree_sha": "ffffffffffffffffffffffffffffffffffffffff",
+      "subject": "another editable squash message",
+      "pull_request": {
+        "number": 42,
+        "title": "ci: repair candidate retention",
+        "url": "https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/42"
+      }
+    },
+    {
+      "sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "parent_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "tree_sha": "dddddddddddddddddddddddddddddddddddddddd",
+      "subject": "merge actor text is irrelevant",
+      "pull_request": {
+        "number": 43,
+        "title": "revert: recover failed firmware release",
+        "url": "https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/43"
+      },
+      "recovery": {
+        "failed_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "failed_parent_sha": "b98ef489614e9c6d98af70020f1adaaf36b1630b",
+        "expected_revert_tree_sha": "dddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ],
+  "release_tags": [
+    {
+      "name": "v1.0.5",
+      "target_sha": "508bca7c302c8a5e1b5214d5b03d243de6965ac6",
+      "published": true,
+      "immutable": true
+    }
+  ],
+  "recovery_markers": [
+    {
+      "name": "release-aborted/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "target_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "protected": true
+    }
+  ]
+}

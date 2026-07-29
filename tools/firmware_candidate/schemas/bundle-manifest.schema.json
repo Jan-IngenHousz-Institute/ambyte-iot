@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jii.example/schemas/firmware-bundle-manifest-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "firmware_version", "provisioning", "tool_versions", "files"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "firmware_version": {"type": "string", "minLength": 1, "maxLength": 31},
+    "provisioning": {"$ref": "#/$defs/provisioning"},
+    "tool_versions": {"$ref": "#/$defs/tool_versions"},
+    "files": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/file"}}
+  },
+  "$defs": {
+    "provisioning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nvs", "device_secrets"],
+      "properties": {"nvs": {"const": "excluded"}, "device_secrets": {"const": "excluded"}}
+    },
+    "tool_versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platformio_core", "platformio_platform", "esp_idf", "esp_idf_package", "esptool", "esptool_package"],
+      "properties": {
+        "platformio_core": {"const": "6.1.19"},
+        "platformio_platform": {"const": "espressif32@6.12.0"},
+        "esp_idf": {"const": "5.5.0"},
+        "esp_idf_package": {"const": "3.50500.0"},
+        "esptool": {"const": "4.9.0"},
+        "esptool_package": {"const": "2.40900.250804"}
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^[^/\\\\]+(?:/[^/\\\\]+)*$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ambyte.invalid/schemas/predecessor-check-output.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "ready",
+    "merged_sha",
+    "predecessor_sha",
+    "latest_release_tag",
+    "release_tag",
+    "decision",
+    "version",
+    "predecessor_state"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ok": { "const": true },
+    "ready": { "const": true },
+    "merged_sha": {
+      "$ref": "release-analysis.schema.json#/$defs/sha"
+    },
+    "predecessor_sha": {
+      "$ref": "release-analysis.schema.json#/$defs/sha"
+    },
+    "latest_release_tag": { "type": "string" },
+    "release_tag": {
+      "type": ["string", "null"]
+    },
+    "decision": {
+      "$ref": "release-analysis.schema.json#/$defs/releaseDecision"
+    },
+    "version": {
+      "$ref": "release-analysis.schema.json#/$defs/version"
+    },
+    "predecessor_state": {
+      "$ref": "base-state-output.schema.json"
+    }
+  }
+}

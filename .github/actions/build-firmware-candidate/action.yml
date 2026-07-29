@@ -1,0 +1,66 @@
+name: Build unprovisioned firmware candidate
+description: Build the exact checkout, verify its app descriptor, and create an acyclic portable candidate
+
+inputs:
+  version:
+    description: Bare release semver or deterministic pr-<number>-<12 lowercase hex>
+    required: true
+  metadata:
+    description: Absolute or workspace-relative candidate metadata JSON path
+    required: true
+  release-notes:
+    description: Absolute or workspace-relative canonical release notes path
+    required: true
+  output-dir:
+    description: Empty destination directory for candidate files
+    required: true
+
+outputs:
+  artifact-name:
+    description: Deterministic GitHub artifact name bound in candidate-manifest.json
+    value: ${{ steps.package.outputs.artifact-name }}
+  candidate-path:
+    description: Absolute directory containing the verified candidate
+    value: ${{ steps.package.outputs.candidate-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned PlatformIO Core
+      shell: bash
+      run: |
+        set -euo pipefail
+        AMBYTE_PIO_VENV="${RUNNER_TEMP}/ambyte-platformio-6.1.19"
+        python3 -m venv "${AMBYTE_PIO_VENV}"
+        "${AMBYTE_PIO_VENV}/bin/python" -m pip install \
+          --disable-pip-version-check \
+          -r "${GITHUB_ACTION_PATH}/../../../tools/firmware_candidate/requirements-build.txt"
+        printf 'AMBYTE_PIO_VENV=%s\n' "${AMBYTE_PIO_VENV}" >> "${GITHUB_ENV}"
+
+    - name: Build, package, and verify candidate
+      id: package
+      shell: bash
+      env:
+        AMBYTE_NVS_SKIP: "1"
+        AMBYTE_PROJECT_VER: ${{ inputs.version }}
+        AMBYTE_METADATA_PATH: ${{ inputs.metadata }}
+        AMBYTE_NOTES_PATH: ${{ inputs.release-notes }}
+        AMBYTE_OUTPUT_PATH: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        "${AMBYTE_PIO_VENV}/bin/python" \
+          "${GITHUB_ACTION_PATH}/../../../tools/firmware_candidate/build.py" \
+          --repo-root "${GITHUB_WORKSPACE}" \
+          --pio "${AMBYTE_PIO_VENV}/bin/pio" \
+          --metadata "${AMBYTE_METADATA_PATH}" \
+          --release-notes "${AMBYTE_NOTES_PATH}" \
+          --output-dir "${AMBYTE_OUTPUT_PATH}" \
+          --version "${AMBYTE_PROJECT_VER}"
+        AMBYTE_CANDIDATE_PATH="$(realpath "${AMBYTE_OUTPUT_PATH}")"
+        AMBYTE_ARTIFACT_NAME="$(
+          "${AMBYTE_PIO_VENV}/bin/python" -c \
+            'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["artifact_name"])' \
+            "${AMBYTE_CANDIDATE_PATH}/candidate-manifest.json"
+        )"
+        printf 'candidate-path=%s\n' "${AMBYTE_CANDIDATE_PATH}" >> "${GITHUB_OUTPUT}"
+        printf 'artifact-name=%s\n' "${AMBYTE_ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"

@@ -29,6 +29,8 @@ esp_err_t device_config_get_device_id(char *buf, size_t len);
 esp_err_t device_config_get_protocol_id(char *buf, size_t len);
 esp_err_t device_config_get_device_name(char *buf, size_t len);
 esp_err_t device_config_get_device_version(char *buf, size_t len);
+/* Legacy provisioning metadata. These values are not the running firmware
+ * version; fleet-visible fw/status/telemetry uses esp_app_desc_t instead. */
 esp_err_t device_config_get_device_firmware(char *buf, size_t len);
 esp_err_t device_config_get_firmware_version(char *buf, size_t len);
 /* IANA timezone name (e.g. "Europe/Amsterdam") echoed in the MQTT envelope so

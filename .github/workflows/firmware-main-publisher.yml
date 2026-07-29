@@ -1,0 +1,93 @@
+name: Firmware main publisher
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact 40-character merged commit on the main first-parent chain
+        required: true
+        type: string
+      pr_workflow_run_id:
+        description: Positive successful Firmware pull request gate workflow run ID
+        required: true
+        type: string
+      artifact_id:
+        description: Positive GitHub artifact ID belonging to that exact PR run
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: ambyte-firmware-main-publisher
+  queue: max
+
+jobs:
+  publish:
+    name: Publish exact firmware candidate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact merged target
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Fetch current main and release/recovery tags without persisting credentials
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [[ "${ACTUAL_SHA}" != "${TARGET_SHA}" ]]; then
+            echo "::error::Expected exact target ${TARGET_SHA}, got ${ACTUAL_SHA}"
+            exit 1
+          fi
+          AUTH_HEADER="basic $(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 -w0)"
+          git -c http.extraheader="AUTHORIZATION: ${AUTH_HEADER}" \
+            fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git -c http.extraheader="AUTHORIZATION: ${AUTH_HEADER}" \
+            fetch --force origin 'refs/tags/*:refs/tags/*'
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: tools/release-analysis/package-lock.json
+
+      - name: Install locked release-analysis dependencies
+        working-directory: tools/release-analysis
+        run: npm ci --ignore-scripts
+
+      - name: Verify and publish the exact PR candidate
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+          PR_WORKFLOW_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_workflow_run_id || '' }}
+          ARTIFACT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact_id || '' }}
+        run: |
+          set -euo pipefail
+          python3 tools/main_publisher/cli.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --repo-root "${GITHUB_WORKSPACE}" \
+            --runner-temp "${RUNNER_TEMP}" \
+            --api-url "${GITHUB_API_URL}" \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --event-ref "${GITHUB_REF}" \
+            --target-sha "${TARGET_SHA}" \
+            --push-sha "${GITHUB_SHA}" \
+            --pr-workflow-run-id "${PR_WORKFLOW_RUN_ID}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --summary "${GITHUB_STEP_SUMMARY}"

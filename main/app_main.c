@@ -21,6 +21,7 @@
 #include "ambit_flash.h"
 #include "script_update.h"
 #include "device_commands.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -741,8 +742,7 @@ void app_main(void)
      * yields a per-board id in the payload instead of the literal token. No-op
      * when device_id has no {MAC} (e.g. a fixed AMBYTE_DEVICE_ID). */
     subst_token(device_id, sizeof(device_id), "{MAC}", mac_str);
-    static char protocol_id[32], device_name[64], device_version[16],
-                device_firmware[16], firmware_version[16], timezone[48];
+    static char protocol_id[32], device_name[64], device_version[16], timezone[48];
     if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
         protocol_id[0] = '\0';
     }
@@ -757,12 +757,15 @@ void app_main(void)
     if (device_config_get_device_version(device_version, sizeof(device_version)) != ESP_OK) {
         device_version[0] = '\0';
     }
-    if (device_config_get_device_firmware(device_firmware, sizeof(device_firmware)) != ESP_OK) {
-        device_firmware[0] = '\0';
-    }
-    if (device_config_get_firmware_version(firmware_version, sizeof(firmware_version)) != ESP_OK) {
-        firmware_version[0] = '\0';
-    }
+    /* The running image descriptor is the only runtime firmware authority.
+     * Older NVS keys remain readable through device_config/CLI for provisioning
+     * compatibility, but must never drive fleet-visible fw/status/telemetry:
+     * OTA deliberately preserves NVS, so those values can describe the image
+     * that was originally provisioned rather than the image executing now. */
+    const esp_app_desc_t *running_app = esp_app_get_description();
+    const char *running_firmware_version =
+        (running_app != NULL) ? running_app->version : "";
+    ESP_LOGI(APP_TAG, "Running firmware version: %s", running_firmware_version);
     if (device_config_get_timezone(timezone, sizeof(timezone)) != ESP_OK) {
         timezone[0] = '\0';
     }
@@ -825,7 +828,7 @@ void app_main(void)
         .publish          = mqtt_client_get_publish_fn(),
         .status_topic     = status_topic,
         .device_id        = device_id,
-        .firmware_version = firmware_version,
+        .running_firmware_version = running_firmware_version,
     };
     if (command_router_init(&cr_cfg) == ESP_OK) {
         mqtt_client_get_set_received_handler_fn()(command_router_get_received_fn(), NULL);
@@ -1079,7 +1082,7 @@ void app_main(void)
         .protocol_id            = protocol_id,
         .device_name            = device_name,
         .device_version         = device_version,
-        .device_firmware        = device_firmware,
+        .device_firmware        = running_firmware_version,
         .timezone               = timezone,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,

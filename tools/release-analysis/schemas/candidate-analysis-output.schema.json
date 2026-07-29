@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ambyte.invalid/schemas/candidate-analysis-output.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "pull_request",
+    "decision",
+    "version",
+    "notes",
+    "candidate_identity",
+    "base_state"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ok": { "const": true },
+    "pull_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "url", "title", "parsed_title"],
+      "properties": {
+        "number": { "type": "integer" },
+        "url": { "type": "string", "format": "uri" },
+        "title": { "type": "string" },
+        "parsed_title": {
+          "$ref": "release-analysis.schema.json#/$defs/parsedTitle"
+        }
+      }
+    },
+    "decision": {
+      "$ref": "release-analysis.schema.json#/$defs/releaseDecision"
+    },
+    "version": {
+      "$ref": "release-analysis.schema.json#/$defs/version"
+    },
+    "notes": {
+      "$ref": "release-analysis.schema.json#/$defs/notes"
+    },
+    "candidate_identity": {
+      "$ref": "release-analysis.schema.json#/$defs/candidateIdentity"
+    },
+    "base_state": {
+      "$ref": "base-state-output.schema.json"
+    }
+  }
+}
