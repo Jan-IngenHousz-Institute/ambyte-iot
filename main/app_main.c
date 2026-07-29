@@ -111,7 +111,11 @@ void sntp_sync_time(struct timeval *tv)
         ESP_LOGW(APP_TAG, "SNTP correction could not be written to RTC: %s",
                  esp_err_to_name(rtc_err));
     }
-    esp_err_t hwm_err = clock_trust_refresh_hwm_at(tv->tv_sec);
+    /* Authoritative write: SNTP may LOWER a poisoned floor (a clock that ran
+     * fast poisons the monotonic hwm; without this, every boot re-adopts the
+     * future value and the following SNTP step backwards re-wedges all
+     * wall-clock deadlines — observed on the bench 2026-07-29). */
+    esp_err_t hwm_err = clock_trust_set_hwm_authoritative(tv->tv_sec);
     if (hwm_err != ESP_OK) {
         ESP_LOGW(APP_TAG, "SNTP correction could not refresh time high-water: %s",
                  esp_err_to_name(hwm_err));

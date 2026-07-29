@@ -100,7 +100,17 @@ esp_err_t clock_trust_boot_guard(bool rtc_suspect, bool *out_adopted,
     return ESP_OK;
 }
 
-esp_err_t clock_trust_refresh_hwm_at(time_t epoch_utc)
+/* Shared writer for the two trust levels. Local sources (RTC/system clock —
+ * `authoritative=false`) may only RAISE the stored floor: they can be wrong-fast
+ * and must never lower a good floor. SNTP (`authoritative=true`) outranks the
+ * floor in both directions and OVERWRITES it — bench-proven necessity
+ * (2026-07-29): a clock that ran fast for one hour poisoned the monotonic
+ * floor; every subsequent boot re-adopted the poisoned (future) value via the
+ * rollback guard and the following SNTP correction stepped the clock BACKWARDS,
+ * re-wedging every wall-clock deadline (Lua scheduler, power-gate dwell) for
+ * up to the poison duration. Letting network time lower the floor makes the
+ * poison last one sync instead of one wall-clock catch-up. */
+static esp_err_t clock_trust_write_hwm(time_t epoch_utc, bool authoritative)
 {
     if (epoch_utc < (time_t)CLOCK_TRUST_VALID_FLOOR_S ||
         (uint64_t)epoch_utc > UINT32_MAX) {
@@ -118,7 +128,13 @@ esp_err_t clock_trust_refresh_hwm_at(time_t epoch_utc)
         esp_err_t get_err = nvs_get_u32(nvs, CLOCK_TRUST_NVS_KEY, &old_hwm);
         if (get_err != ESP_OK && get_err != ESP_ERR_NVS_NOT_FOUND) {
             err = get_err;
-        } else if ((uint32_t)epoch_utc > old_hwm) {
+        } else if ((uint32_t)epoch_utc > old_hwm ||
+                   (authoritative && (uint32_t)epoch_utc != old_hwm)) {
+            if (authoritative && (uint32_t)epoch_utc < old_hwm) {
+                ESP_LOGW(TAG, "SNTP lowered poisoned time high-water %u -> %u "
+                              "(floor was ahead of true time)",
+                         (unsigned)old_hwm, (unsigned)epoch_utc);
+            }
             err = nvs_set_u32(nvs, CLOCK_TRUST_NVS_KEY, (uint32_t)epoch_utc);
             if (err == ESP_OK) err = nvs_commit(nvs);
         }
@@ -130,6 +146,16 @@ esp_err_t clock_trust_refresh_hwm_at(time_t epoch_utc)
         ESP_LOGW(TAG, "time high-water refresh failed: %s", esp_err_to_name(err));
     }
     return err;
+}
+
+esp_err_t clock_trust_set_hwm_authoritative(time_t epoch_utc)
+{
+    return clock_trust_write_hwm(epoch_utc, true);
+}
+
+esp_err_t clock_trust_refresh_hwm_at(time_t epoch_utc)
+{
+    return clock_trust_write_hwm(epoch_utc, false);
 }
 
 esp_err_t clock_trust_refresh_hwm(void)

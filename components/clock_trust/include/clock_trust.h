@@ -29,6 +29,11 @@ esp_err_t clock_trust_refresh_hwm(void);
 /* Same operation for a known-good epoch (the accepted SNTP sample). */
 esp_err_t clock_trust_refresh_hwm_at(time_t epoch_utc);
 
+/* SNTP-accepted time: overwrites the stored floor in BOTH directions (network
+ * time outranks the floor). Local sources must use the monotonic refresh
+ * above; only the SNTP acceptance path may call this. */
+esp_err_t clock_trust_set_hwm_authoritative(time_t epoch_utc);
+
 /* Record that the running system clock was accepted from SNTP. This changes
  * clock_src but deliberately does not clear sticky boot suspicion. */
 void clock_trust_note_sntp(void);
