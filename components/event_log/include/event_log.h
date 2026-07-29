@@ -36,6 +36,11 @@ extern "C" {
  */
 esp_err_t event_log_init(void);
 
+/* Register the composition-root hook that clears the MQTT correlation window
+ * after a successful SD reopen rebuilds this component from the durable cursor.
+ * NULL clears it. The callback runs after event_log releases its mutex. */
+void event_log_set_reset_notifier(void (*fn)(void));
+
 /* Called by the SD hot-plug monitor when the card is pulled/reinserted. */
 esp_err_t event_log_on_sd_lost(void);
 esp_err_t event_log_on_sd_restored(void);

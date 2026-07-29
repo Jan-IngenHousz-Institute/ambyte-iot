@@ -67,6 +67,15 @@ static StaticSemaphore_t s_mtx_storage;
  * able to take the lock in time when a writer is stuck in a failing transfer),
  * so the flag must be observed promptly by the next store. */
 static volatile bool s_available = false;
+/* Composition-root callback: an SD reopen rebuilds this component's volatile
+ * claim window from the durable cursor, so the MQTT peer must discard its RAM
+ * correlation table/queue at the same boundary. Stored once during boot. */
+static void (*s_reset_notifier)(void) = NULL;
+/* Set only under s_mtx when an invariant-recovery path discards the event window.
+ * The mutating caller consumes it before releasing s_mtx, then invokes the peer
+ * reset outside the lock. This preserves the event_log -> device_commands
+ * dependency boundary without leaving the two RAM windows divergent for 60 s. */
+static bool s_reset_pending = false;
 
 /* Tail (write) file. */
 static FILE     *s_wf        = NULL;
@@ -333,10 +342,18 @@ static void evlog_advance_acked_prefix_locked(void)
     while (s_window_count > 0 && s_window[0].acked) {
         evlog_window_slot_t front = s_window[0];
         if (front.seq != s_rd_seq || front.off != s_rd_off) {
-            ESP_LOGE(TAG, "window frontier mismatch: cursor=%u:%ld slot=%u:%ld id=%lld — refusing advance",
+            ESP_LOGE(TAG, "window frontier mismatch: cursor=%u:%ld slot=%u:%ld id=%lld — RESETTING volatile window; durable cursor will replay",
                      (unsigned)s_rd_seq, s_rd_off, (unsigned)front.seq, front.off,
                      (long long)front.measure_id);
-            break;
+            /* The cursor is durable truth. Holding this impossible RAM shape
+             * forever turns one invariant violation into a permanent publisher
+             * outage; abandoning claims costs only bounded duplicates. Stale
+             * MQTT completions/latches must be discarded at the same recovery
+             * boundary; the caller fires the registered reset after s_mtx is
+             * released, then this cursor is claimed again. */
+            evlog_window_clear_locked();
+            s_reset_pending = true;
+            return;
         }
 
         s_rd_seq = front.seq;
@@ -707,6 +724,11 @@ esp_err_t event_log_init(void)
     return ESP_OK;
 }
 
+void event_log_set_reset_notifier(void (*fn)(void))
+{
+    s_reset_notifier = fn;
+}
+
 esp_err_t event_log_on_sd_lost(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
@@ -774,12 +796,30 @@ esp_err_t event_log_on_sd_restored(void)
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     esp_err_t err = ESP_OK;
+    bool reopened = false;
     if (!s_available) {
         err = evlog_open_locked();
-        s_available = (err == ESP_OK);
+        reopened = (err == ESP_OK);
     }
+    bool available = s_available;
     xSemaphoreGive(s_mtx);
-    if (s_available) ESP_LOGI(TAG, "SD restored — event log reopened");
+    /* Keep admission closed across the whole two-component reset. A claimant that
+     * runs after reopen but before peer reconciliation observes NOT_SUPPORTED,
+     * never a fresh event window paired with stale MQTT latches/completions.
+     * The notifier must run outside s_mtx; publish availability only after it has
+     * returned, using a brief re-take so every normal claimant sees one atomic
+     * false -> reconciled -> true transition. */
+    if (reopened) {
+        if (s_reset_notifier != NULL) s_reset_notifier();
+        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            ESP_LOGE(TAG, "SD reopened but availability publish timed out — holding event log offline");
+            return ESP_ERR_TIMEOUT;
+        }
+        s_available = true;
+        available = true;
+        xSemaphoreGive(s_mtx);
+    }
+    if (available) ESP_LOGI(TAG, "SD restored — event log reopened");
     return err;
 }
 
@@ -1169,7 +1209,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         fclose(rf);
 
         /* Raw-record bytes are a conservative, persistence-owned first gate.
-         * device_commands applies the exact envelope-byte gate before enqueue;
+         * device_commands applies the exact envelope-byte gate before publish;
          * both must fit, so JSON framing can never push the MQTT window over
          * PUBLISH_WINDOW_BYTES.  A reverted slot bypasses this check because its
          * bytes are already charged above. */
@@ -1202,6 +1242,13 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
              * loop (audit D2). After EVLOG_OOM_STUCK_MAX strikes on the SAME head,
              * quarantine it by raw line so the drain advances. parse_record has
              * mangled s_line, so archive re-reads the raw record from disk. */
+            if (!at_cursor) {
+                /* A later-slot allocation failure may not feed the destructive
+                 * frontier OOM escape at all. Wait for the current prefix to
+                 * close, then retry/count it when it is exactly the cursor. */
+                result = ESP_ERR_NO_MEM;
+                break;
+            }
             if (record_id == s_oom_head_id) s_oom_strikes++;
             else { s_oom_head_id = record_id; s_oom_strikes = 1; }
             if (s_oom_strikes >= EVLOG_OOM_STUCK_MAX &&
@@ -1254,7 +1301,12 @@ esp_err_t event_log_mark_event_synced(int64_t measure_id)
     s_window[idx].claimed = false;
     s_window[idx].acked = true;
     evlog_advance_acked_prefix_locked();
+    bool reset_pending = s_reset_pending;
+    s_reset_pending = false;
     xSemaphoreGive(s_mtx);
+    /* Invariant recovery cleared event_log's volatile window. Reset the peer only
+     * after releasing s_mtx so its bounded portMUX/queue work cannot invert locks. */
+    if (reset_pending && s_reset_notifier != NULL) s_reset_notifier();
     return ESP_OK;
 }
 
@@ -1287,8 +1339,8 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
      * ESP_ERR_INVALID_STATE rather than archive an innocent frontier record. */
     if (s_window_count > 0 &&
         (s_window[0].measure_id != measure_id || s_window[0].seq != s_rd_seq ||
-         s_window[0].off != s_rd_off || s_window[0].acked)) {
-        ESP_LOGW(TAG, "quarantine refused for non-frontier id=%lld; frontier id=%lld at %u:%ld",
+         s_window[0].off != s_rd_off || s_window[0].claimed || s_window[0].acked)) {
+        ESP_LOGW(TAG, "quarantine refused for non-pending frontier id=%lld; frontier id=%lld at %u:%ld",
                  (long long)measure_id, (long long)s_window[0].measure_id,
                  (unsigned)s_window[0].seq, s_window[0].off);
         xSemaphoreGive(s_mtx);
@@ -1345,7 +1397,11 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
     evlog_normalize_cursor_locked();
     evlog_persist_cursor_locked();
     s_acks_since_persist = 0;
+    bool reset_pending = s_reset_pending;
+    s_reset_pending = false;
     xSemaphoreGive(s_mtx);
+
+    if (reset_pending && s_reset_notifier != NULL) s_reset_notifier();
 
     ESP_LOGW(TAG, "quarantined event id=%lld (%u B) -> %s — cursor advanced, drain unblocked",
              (long long)measure_id, (unsigned)len, EVLOG_QUARANTINE);

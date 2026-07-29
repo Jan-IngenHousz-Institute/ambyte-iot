@@ -99,28 +99,6 @@ static esp_err_t mqtt_publish_impl(const char *topic, const char *payload,
     return ESP_OK;
 }
 
-/* Store the complete QoS-1 packet in ESP-MQTT's outbox, but leave every socket
- * write to the mqtt task.  Unlike esp_mqtt_client_publish(), this returns the
- * packet id without synchronously putting the packet on the wire.  The windowed
- * drain uses that separation to finish its msg_id latch before a PUBACK can be
- * consumed; other command/status publishers keep the synchronous port above. */
-static esp_err_t mqtt_enqueue_impl(const char *topic, const char *payload,
-                                   size_t len, int *out_msg_id)
-{
-    if (s_client == NULL || !s_connected) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    int msg_id = esp_mqtt_client_enqueue(s_client, topic, payload, (int)len,
-                                         1, 0, true);
-    if (msg_id < 0) {
-        return msg_id == -2 ? ESP_ERR_NO_MEM : ESP_FAIL;
-    }
-    if (out_msg_id != NULL) {
-        *out_msg_id = msg_id;
-    }
-    return ESP_OK;
-}
-
 static bool mqtt_is_connected_impl(void)
 {
     return s_connected;
@@ -469,11 +447,6 @@ bool mqtt_client_is_running(void)
 message_publish_fn mqtt_client_get_publish_fn(void)
 {
     return mqtt_publish_impl;
-}
-
-message_enqueue_fn mqtt_client_get_enqueue_fn(void)
-{
-    return mqtt_enqueue_impl;
 }
 
 message_is_connected_fn mqtt_client_get_is_connected_fn(void)

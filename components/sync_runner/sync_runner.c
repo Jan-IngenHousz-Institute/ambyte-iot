@@ -101,7 +101,7 @@
 #define SYNC_WD_TASK_PRIO     2                      /* mostly sleeps */
 
 /* Once the byte/slot window binds, yield briefly while the MQTT task delivers
- * completions. Successful enqueue iterations use taskYIELD() only: the point of
+ * completions. Successful publish iterations use taskYIELD() only: the point of
  * the window is to fill one connection without a fixed 100-ms serial cadence. */
 #define SYNC_RUNNER_WINDOW_WAIT_MS 10U
 /* An in-flight slot held longer than this had its PUBACK lost/expired (or the

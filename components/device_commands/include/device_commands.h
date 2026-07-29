@@ -49,7 +49,6 @@ typedef struct {
 
     /* Messaging ports (Phase 6A) */
     message_publish_fn                  publish;
-    message_enqueue_fn                  enqueue;          /* non-blocking QoS1 event drain */
     message_is_connected_fn             message_is_connected;
     message_error_disconnect_count_fn   error_disconnect_count;
     message_connection_stats_fn         connection_stats;
@@ -352,7 +351,9 @@ cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status);
 /* Apply queued PUBACK/error/disconnect completions to persistence. The sync
  * runner is the sole caller/consumer; MQTT and Wi-Fi callbacks only enqueue and
  * wake it, so their event tasks never wait on event_log's FATFS mutex. Must run
- * before the next claim. Leaves a failed completion queued for a later retry. */
+ * before the next claim. Retryable failures (for example mutex timeout) remain
+ * queued; reset/offline terminal states are dropped so stale ids cannot wedge
+ * the restored durable cursor. */
 esp_err_t cmd_process_pending_acks(void);
 
 /* Detach every unacknowledged publish-window slot and enqueue one PENDING
@@ -361,6 +362,11 @@ esp_err_t cmd_process_pending_acks(void);
  * touches persistence; the sync runner applies the transitions through
  * cmd_process_pending_acks(). */
 void device_commands_on_mqtt_disconnect(void);
+
+/* Reconcile the volatile MQTT half after persistence reopens and discards its
+ * RAM claim window. Clears the latch table + completion queue and wakes the
+ * drain; the durable cursor is then re-claimed. No event-log call is made. */
+void device_commands_on_persistence_reset(void);
 
 /* Clear the whole in-flight publish table and completion queue WITHOUT marking
  * records pending — the caller is about to rewind persistence (see
@@ -371,8 +377,9 @@ void device_commands_abort_inflight(void);
 /* Revert one stale in-flight publish slot to PENDING if it has been latched longer
  * than max_age_ms. A lost/expired PUBACK (e.g. esp-mqtt outbox expiry) with the
  * connection nominally up leaves no callback, so without this the frontier can
- * wedge until reboot. Returns true if a
- * stale slot was reaped. Called by the sync_runner while draining. */
+ * wedge until reboot. Reset/offline terminal states clear the volatile token;
+ * retryable persistence errors restore it. Returns true if a stale slot was
+ * reaped. Called by the sync_runner while draining. */
 bool device_commands_reap_stale_inflight(int64_t max_age_ms);
 
 /* Diagnostic: report the oldest in-flight publish slot. *msg_id and *measure_id

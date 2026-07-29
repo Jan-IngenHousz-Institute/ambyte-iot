@@ -30,7 +30,6 @@ void      mqtt_client_stop(void);
 bool      mqtt_client_is_running(void);   /* true once start() has been called and stop() hasn't been */
 
 message_publish_fn                  mqtt_client_get_publish_fn(void);
-message_enqueue_fn                  mqtt_client_get_enqueue_fn(void);
 message_is_connected_fn             mqtt_client_get_is_connected_fn(void);
 message_error_disconnect_count_fn   mqtt_client_get_error_disconnect_count_fn(void);
 message_connection_stats_fn         mqtt_client_get_connection_stats_fn(void);

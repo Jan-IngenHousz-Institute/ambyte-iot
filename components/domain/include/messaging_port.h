@@ -11,12 +11,6 @@ extern "C" {
 /* out_msg_id receives the broker-assigned message ID (QoS 1); may be NULL for fire-and-forget */
 typedef esp_err_t (*message_publish_fn)(const char *topic, const char *payload, size_t len,
                                         int *out_msg_id);
-/* Queue a QoS-1 message into the transport outbox without performing the socket
- * write in the caller's task.  The returned msg_id is available before the MQTT
- * task performs network I/O, which lets a caller install its ACK-correlation
- * latch before a fast broker can answer. */
-typedef esp_err_t (*message_enqueue_fn)(const char *topic, const char *payload, size_t len,
-                                        int *out_msg_id);
 typedef bool      (*message_is_connected_fn)(void);
 
 /* Number of transport-error disconnect episodes seen inside the requested

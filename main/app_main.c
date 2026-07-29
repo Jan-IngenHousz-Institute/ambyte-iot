@@ -1093,7 +1093,6 @@ void app_main(void)
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .sd_health          = persistence_available ? app_sd_health                         : NULL,
         .publish                = mqtt_client_get_publish_fn(),
-        .enqueue                = mqtt_client_get_enqueue_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .error_disconnect_count = mqtt_client_get_error_disconnect_count_fn(),
         .connection_stats       = mqtt_client_get_connection_stats_fn(),
@@ -1116,6 +1115,12 @@ void app_main(void)
         .watchdog_armed         = sync_runner_watchdog_armed,
     };
     device_commands_init(&cmd_cfg);
+    if (persistence_available) {
+        /* SD restore rebuilds event_log's volatile claim window. Clear the peer
+         * MQTT latch/queue through a registered callback rather than coupling
+         * the infrastructure component directly to device_commands. */
+        event_log_set_reset_notifier(device_commands_on_persistence_reset);
+    }
 
     /* ── CLI ──────────────────────────────────────────────────────────
      * Console first: everything below (sync runner, AMBIT firmware sync, Lua)
