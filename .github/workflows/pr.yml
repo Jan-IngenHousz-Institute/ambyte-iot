@@ -58,6 +58,9 @@ jobs:
           git reset --soft "${PR_BASE_SHA}"
           git commit --allow-empty -m "${PR_TITLE}"
 
+          # Match OpenJII's PR preview: env-ci reads these process variables.
+          export GITHUB_REF="refs/heads/main"
+          export GITHUB_EVENT_NAME="push"
           set +e
           npx semantic-release --dry-run --no-ci 2>&1 | tee release-preview.log
           RELEASE_STATUS=${PIPESTATUS[0]}
