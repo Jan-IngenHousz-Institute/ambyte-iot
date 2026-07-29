@@ -69,7 +69,7 @@ jobs:
             exit "${RELEASE_STATUS}"
           fi
 
-          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}')
+          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}' || true)
           if [[ -n "${VERSION}" ]]; then
             BUILD_VERSION="${VERSION}"
             ZIP_NAME="ambyte-iot-v${VERSION}.zip"
