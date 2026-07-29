@@ -29,6 +29,7 @@ if (HAVE_LOCAL_LUA)
             "include"
         REQUIRES
             device_commands
+            event_log
             time_sync
             timezone
             json
@@ -56,6 +57,7 @@ else()
             "include"
         REQUIRES
             device_commands
+            event_log
             time_sync
             timezone
             json

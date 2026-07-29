@@ -83,7 +83,9 @@
 #define SYNC_RUNNER_FALLBACK_MS     30000U
 #define SYNC_RUNNER_TASK_NAME    "sync_runner"
 /* 8 KiB matches lua_runner. cmd_mqtt_publish_next_event heap-allocates the
- * payload buffer and cJSON tree itself, so the task stack stays light. */
+ * envelope; event_log claim reads as much as the active record cap (64 KiB
+ * normally) into its one-time PSRAM-backed s_line buffer. Neither scales this
+ * task's stack with record size. */
 #define SYNC_RUNNER_TASK_STACK   8192
 #define SYNC_RUNNER_TASK_PRIO    3   /* below lua_runner (5), above idle */
 
@@ -173,9 +175,10 @@ __attribute__((weak)) bool sync_runner_is_allowed(void)
 static void sync_runner_drain(void)
 {
     /* Heap snapshot at each drain entry — the "heap:" line referenced in
-     * sdkconfig.defaults. Large arrun-trace publishes (~5–9 KB) fail when the
-     * largest free block can't hold the outbox item + TLS write buffer, so this
-     * is the number to watch when tuning the heap budget (Track 1). */
+     * sdkconfig.defaults. Claims can read a full 64-KiB record from SD, but that
+     * write lands in event_log's reusable PSRAM buffer, not here. The envelope
+     * and MQTT outbox still scale to the record while TLS needs internal/DMA
+     * headroom, so these capability-specific numbers govern the publish gate. */
     size_t window_slots = 0, window_bytes = 0;
     device_commands_window_status(&window_slots, &window_bytes);
     ESP_LOGI(TAG, "heap: 8bit free=%u largest=%u; internal free=%u largest=%u; dma free=%u largest=%u; window=%u/%u slots %u/%u B",

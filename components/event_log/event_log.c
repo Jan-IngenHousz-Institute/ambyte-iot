@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -38,8 +39,10 @@
 
 #define EVLOG_DIR            "/sdcard/events"
 #define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
-#define EVLOG_LINE_CAP       12288            /* max bytes read back per record (incl '\n') */
-#define EVLOG_MAX_RECORD     (EVLOG_LINE_CAP - 16)  /* store rejects bigger — must stay readable */
+/* lua_runner's AMBIT_RUN_PAYLOAD_CAP is 64000. Its generated-record maxima are
+ * 63999 payload + 104 fixed header + 522 arrun command + 895 metadata + 2
+ * framing = 65522 B, below EVLOG_RECORD_CAP_NORMAL with 30 B spare. The producer
+ * has a static assertion against the exported cap in event_log.h. */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
 #define EVLOG_FLUSH_EVERY_N  1                /* fsync each record: at ~0.4 writes/s the write-amp is trivial and
@@ -139,10 +142,50 @@ static volatile bool s_write_full = false;
 static int64_t   s_oom_head_id = 0;
 static uint32_t  s_oom_strikes = 0;
 
-/* A reusable line buffer for claim — only touched under s_mtx. */
-static char s_line[EVLOG_LINE_CAP];
+/* One reusable read/claim buffer, allocated once before the log opens. On the
+ * normal board malloc(65568) is routed to PSRAM by
+ * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024. A unit whose PSRAM failed to
+ * enumerate never attempts that allocation from internal DRAM: it gets only the
+ * old 12-KiB buffer and matching runtime store/read caps. Claim, re-claim,
+ * tail-id scans, torn-tail repair, quarantine, and OOM archive all run under
+ * s_mtx and write at most s_line_cap bytes into this same PSRAM buffer; none of
+ * the 64-KiB worst case is task-stack storage. */
+static char   *s_line       = NULL;
+static size_t  s_line_cap   = 0;
+static size_t  s_max_record = 0;
 
 /* ── small helpers ───────────────────────────────────────────────────── */
+
+static esp_err_t evlog_allocate_line_buffer(void)
+{
+    if (s_line != NULL) return ESP_OK;       /* event_log_init is normally one-shot */
+
+    bool have_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+    size_t cap = have_psram ? EVLOG_LINE_CAP_NORMAL : EVLOG_LINE_CAP_FALLBACK;
+    s_line = malloc(cap);                    /* >1 KiB routes to PSRAM when present */
+    if (s_line == NULL && have_psram) {
+        ESP_LOGE(TAG, "PSRAM event-line allocation (%u B) failed — falling back to degraded %u-B cap",
+                 (unsigned)cap, (unsigned)EVLOG_LINE_CAP_FALLBACK);
+        cap = EVLOG_LINE_CAP_FALLBACK;
+        s_line = malloc(cap);
+    }
+    if (s_line == NULL) {
+        ESP_LOGE(TAG, "event-line allocation failed at degraded %u-B cap",
+                 (unsigned)EVLOG_LINE_CAP_FALLBACK);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_line_cap = cap;
+    s_max_record = cap - EVLOG_RECORD_GUARD_BYTES;
+    if (cap == EVLOG_LINE_CAP_NORMAL) {
+        ESP_LOGI(TAG, "event-line buffer: %u B (PSRAM policy), max record %u B",
+                 (unsigned)s_line_cap, (unsigned)s_max_record);
+    } else {
+        ESP_LOGW(TAG, "DEGRADED: PSRAM unavailable; event-line buffer %u B, records >= %u B are refused",
+                 (unsigned)s_line_cap, (unsigned)s_max_record);
+    }
+    return ESP_OK;
+}
 
 static void evlog_file_path(char *buf, size_t cap, uint32_t seq)
 {
@@ -270,7 +313,7 @@ static esp_err_t evlog_reopen_tail_locked(void)
  * s_rd_off. Re-reading and comparing the frontier id makes mismatch fail closed. */
 static bool evlog_archive_head_locked(long rec_len, int64_t expected_measure_id)
 {
-    if (rec_len <= 0 || rec_len >= (long)sizeof s_line) return false;
+    if (rec_len <= 0 || rec_len >= (long)s_line_cap) return false;
     char path[64];
     evlog_file_path(path, sizeof path, s_rd_seq);
     FILE *rf = fopen(path, "rb");
@@ -393,7 +436,7 @@ static int64_t evlog_tail_max_id_locked(void)
         FILE *f = fopen(path, "rb");
         if (f != NULL) {
             int64_t max_id = 0;
-            while (fgets(s_line, sizeof s_line, f) != NULL) {
+            while (fgets(s_line, s_line_cap, f) != NULL) {
                 size_t len = strlen(s_line);
                 if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
                 int64_t id = (int64_t)strtoll(s_line, NULL, 10);
@@ -422,7 +465,7 @@ static int64_t evlog_scan_max_id_locked(void)
         evlog_file_path(path, sizeof path, seq);
         FILE *f = fopen(path, "rb");
         if (f == NULL) continue;
-        while (fgets(s_line, sizeof s_line, f) != NULL) {
+        while (fgets(s_line, s_line_cap, f) != NULL) {
             size_t len = strlen(s_line);
             if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
             int64_t id = (int64_t)strtoll(s_line, NULL, 10);
@@ -478,7 +521,7 @@ static int64_t evlog_scan_pending_locked(bool *capped_out)
         if (seq == s_rd_seq && s_rd_off > 0) {
             if (fseek(f, s_rd_off, SEEK_SET) != 0) { fclose(f); continue; }
         }
-        while (fgets(s_line, sizeof s_line, f) != NULL) {
+        while (fgets(s_line, s_line_cap, f) != NULL) {
             size_t len = strlen(s_line);
             if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
             pending++;
@@ -626,7 +669,7 @@ static esp_err_t evlog_open_locked(void)
     if (tsz > 0) {
         FILE *tf = fopen(path, "rb+");
         if (tf != NULL) {
-            long scan = (tsz < EVLOG_LINE_CAP) ? tsz : EVLOG_LINE_CAP;
+            long scan = (tsz < (long)s_line_cap) ? tsz : (long)s_line_cap;
             if (fseek(tf, tsz - scan, SEEK_SET) == 0) {
                 size_t got = fread(s_line, 1, (size_t)scan, tf);
                 long last_nl = -1;
@@ -699,6 +742,9 @@ static esp_err_t evlog_open_locked(void)
 
 esp_err_t event_log_init(void)
 {
+    esp_err_t line_err = evlog_allocate_line_buffer();
+    if (line_err != ESP_OK) return line_err;
+
     s_mtx = xSemaphoreCreateMutexStatic(&s_mtx_storage);
     if (s_mtx == NULL) return ESP_ERR_NO_MEM;
 
@@ -912,9 +958,10 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     size_t mlen  = strlen(meta);
     size_t plen  = strlen(payload_json);
     size_t total = (size_t)h1 + clen + (size_t)h2 + mlen + 1 /*tab*/ + plen + 1 /*\n*/;
-    if (total >= EVLOG_MAX_RECORD) {
-        ESP_LOGE(TAG, "record too large (%u B) for id %lld — dropped",
-                 (unsigned)total, (long long)measure_id);
+    if (total >= s_max_record) {
+        ESP_LOGE(TAG, "record too large (%u B) for active %u-B cap (max record %u B), id %lld — dropped",
+                 (unsigned)total, (unsigned)s_line_cap, (unsigned)s_max_record,
+                 (long long)measure_id);
         s_dropped++;
         free(cmd);
         xSemaphoreGive(s_mtx);
@@ -1042,7 +1089,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         evlog_file_path(path, sizeof path, slot->seq);
         FILE *rf = fopen(path, "rb");
         if (rf == NULL || fseek(rf, slot->off, SEEK_SET) != 0 ||
-            fgets(s_line, sizeof s_line, rf) == NULL) {
+            fgets(s_line, s_line_cap, rf) == NULL) {
             if (rf != NULL) fclose(rf);
             ESP_LOGE(TAG, "re-claim failed for id=%lld at %u:%ld — holding window",
                      (long long)slot->measure_id, (unsigned)slot->seq, slot->off);
@@ -1130,7 +1177,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             break;
         }
 
-        char *got = fgets(s_line, sizeof s_line, rf);
+        char *got = fgets(s_line, s_line_cap, rf);
         if (got == NULL) {
             if (ferror(rf)) {
                 clearerr(rf); fclose(rf);
@@ -1156,10 +1203,10 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         size_t len = strlen(got);
         bool complete = (len > 0 && got[len - 1] == '\n');
         if (!complete) {
-            if (len == sizeof(s_line) - 1) {         /* over-long/corrupt: no '\n' within cap */
+            if (len == s_line_cap - 1U) {            /* over-long/corrupt: no '\n' within active cap */
                 long skipped = (long)len;
                 char *more;
-                while ((more = fgets(s_line, sizeof s_line, rf)) != NULL) {
+                while ((more = fgets(s_line, s_line_cap, rf)) != NULL) {
                     size_t l2 = strlen(more);
                     skipped += (long)l2;
                     if (l2 > 0 && more[l2 - 1] == '\n') break;
@@ -1210,10 +1257,17 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
 
         /* Raw-record bytes are a conservative, persistence-owned first gate.
          * device_commands applies the exact envelope-byte gate before publish;
-         * both must fit, so JSON framing can never push the MQTT window over
-         * PUBLISH_WINDOW_BYTES.  A reverted slot bypasses this check because its
-         * bytes are already charged above. */
-        if (s_window_bytes + len > PUBLISH_WINDOW_BYTES) {
+         * both serialize a lone over-budget item, then enforce the byte ceiling
+         * once anything is outstanding. A reverted slot bypasses this check
+         * because its bytes are already charged above. */
+        /* An empty window admits one record even at the active cap: equality
+         * fills the 64-KiB budget, while the final 15 B allowed by the 65552-B
+         * store cap may exceed it slightly. Either way the record serializes the
+         * window; device_commands' exact envelope/publish-cap gate then publishes
+         * or archives it. Once any bytes are outstanding, the budget is strict. */
+        if (s_window_bytes > 0 &&
+            (s_window_bytes >= PUBLISH_WINDOW_BYTES ||
+             len > PUBLISH_WINDOW_BYTES - s_window_bytes)) {
             result = ESP_ERR_INVALID_STATE;
             break;
         }
@@ -1353,7 +1407,7 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
     FILE *rf = fopen(path, "rb");
     if (rf == NULL) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_FOUND; }
     if (fseek(rf, s_rd_off, SEEK_SET) != 0 ||
-        fgets(s_line, sizeof s_line, rf) == NULL) {
+        fgets(s_line, s_line_cap, rf) == NULL) {
         fclose(rf);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_FOUND;

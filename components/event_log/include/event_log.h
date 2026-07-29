@@ -6,6 +6,17 @@
 #include "esp_err.h"
 #include "persistence_port.h"
 
+/* Compile-time storage limits shared with the AMBIT producer and MQTT publisher.
+ * event_log_init selects NORMAL when PSRAM enumerates and FALLBACK otherwise;
+ * the active runtime cap is kept private to event_log.c. A record whose byte
+ * length is >= the selected RECORD_CAP is refused, leaving the line-buffer guard
+ * available for framing/NUL safety. */
+#define EVLOG_LINE_CAP_NORMAL       65568U
+#define EVLOG_LINE_CAP_FALLBACK     12288U
+#define EVLOG_RECORD_GUARD_BYTES    16U
+#define EVLOG_RECORD_CAP_NORMAL     (EVLOG_LINE_CAP_NORMAL - EVLOG_RECORD_GUARD_BYTES)
+#define EVLOG_RECORD_CAP_FALLBACK   (EVLOG_LINE_CAP_FALLBACK - EVLOG_RECORD_GUARD_BYTES)
+
 #ifdef __cplusplus
 extern "C" {
 #endif

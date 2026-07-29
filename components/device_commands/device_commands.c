@@ -1,4 +1,5 @@
 #include "device_commands.h"
+#include "event_log.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -31,10 +32,36 @@
 #define MQTT_TOPIC_MAX        256
 #define MQTT_PAYLOAD_MAX     (128U * 1024U)   /* AWS IoT max payload */
 
+/* Bench-gated large-publish ceiling. The default derives from the normal store
+ * cap plus 4 KiB of JSON-envelope headroom, so producer/store changes cannot
+ * silently make a valid record hit the publish-policy archive path. A
+ * conservative field build can set
+ * -DAMBYTE_PUBLISH_MAX_BYTES=16384 until chunking exists. This gate is distinct
+ * from the larger store cap: lowering it archives an over-cap event to the
+ * event-log quarantine sidecar, increments s_oversize_skipped, and advances the
+ * FIFO instead of silently dropping data or head-of-line blocking forever. */
+#ifndef AMBYTE_PUBLISH_MAX_BYTES
+#define AMBYTE_PUBLISH_MAX_BYTES (EVLOG_RECORD_CAP_NORMAL + 4096U)
+#define AMBYTE_PUBLISH_CAP_IS_DEFAULT 1
+#else
+#define AMBYTE_PUBLISH_CAP_IS_DEFAULT 0
+#endif
+
+#define DC_EVENT_ENVELOPE_FMT \
+        "{\"sample\":[{" \
+            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld," \
+            "\"timestamp_local\":\"%s\"," \
+            "\"published\":\"%s\",\"channel\":%s,\"device\":%s," \
+            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s" \
+        "}]," \
+        "\"timestamp\":\"%s\",%s%s" \
+        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+
 /* Large-publish heap gate (Track 1) — see the gate in cmd_mqtt_publish_next_event.
- * An arrun-trace envelope (~5–9 KB) needs a contiguous outbox copy plus a
- * transient ~4.4 KB mbedTLS write buffer; a burst of small publishes fragments the
- * heap so the largest free block can fall below that even with ample total free. */
+ * An arrun envelope can now approach 64 KiB and needs an outbox copy plus a
+ * transient mbedTLS write buffer. The large mallocs route to PSRAM, while the
+ * internal/DMA pools still need contiguous TLS/lwIP headroom. */
 #define DC_LARGE_PUBLISH_BYTES     3072U   /* envelopes above this get the heap gate */
 #define DC_PUBLISH_HEAP_HEADROOM   2048U   /* floor slack atop the envelope copy (payload_json is freed pre-publish; TLS write ~2.4 KB) */
 #define DC_PUBLISH_SETTLE_MS       300U    /* let the requested GC + transient frees land before re-checking */
@@ -55,6 +82,12 @@ _Static_assert(PUBLISH_WINDOW_SLOTS > 0 && PUBLISH_WINDOW_SLOTS <= 16,
                "device-command ACK table supports at most 16 publish slots");
 _Static_assert(DC_ACK_QUEUE_DEPTH >= (2U * PUBLISH_WINDOW_SLOTS),
                "ACK queue must hold a full window plus disconnect-flush headroom");
+_Static_assert(AMBYTE_PUBLISH_MAX_BYTES > 0 && AMBYTE_PUBLISH_MAX_BYTES < MQTT_PAYLOAD_MAX,
+               "publish cap must be non-zero and below the broker payload limit");
+#if AMBYTE_PUBLISH_CAP_IS_DEFAULT
+_Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
+               "default publish cap must exceed the normal store cap");
+#endif
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
@@ -132,6 +165,11 @@ typedef struct {
     uint8_t failures;
 } dc_stuck_slot_t;
 static dc_stuck_slot_t s_stuck[PUBLISH_WINDOW_SLOTS];
+/* Publish-cap skips are intentionally separate from poison-record retry counts:
+ * these records are valid and preserved on SD, merely unsupported by this
+ * build's link-size policy. Sole sync-runner writer, so no lock is required. */
+static uint32_t s_oversize_skipped = 0;
+static int64_t  s_oversize_warned_id = 0;
 
 /* Monotonic milliseconds since boot — independent of the wall clock (which jumps
  * on RTC sync), so it measures elapsed in-flight time correctly. */
@@ -1130,12 +1168,60 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
 
-    size_t cap = strlen(e.payload_json) + (meta ? strlen(meta) : 4)
-               + strlen(chanbuf) + strlen(devbuf) + strlen(cmdfield) + strlen(e.tag)
-               + strlen(battpart) + strlen(tzpart)
-               + strlen(fw) + strlen(dn) + strlen(dv)
-               + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts) + sizeof(meas_local)
-               + 320;                            /* fixed keys + numbers + punctuation */
+    /* Size the exact serialized envelope before any large allocation. This lets
+     * a lowered publish cap identify a valid 64-KiB stored record and archive it
+     * without first tripping the ordinary internal/DMA heap gate. */
+    int n = snprintf(NULL, 0, DC_EVENT_ENVELOPE_FMT,
+        (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
+        meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
+        meta ? meta : "null", e.payload_json,
+        meas_ts, battpart, tzpart,
+        s_mac_str, dn, dv, fw);
+    if (n < 0) {
+        free(cmdbuf);
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
+        return make_result(ESP_FAIL, "envelope sizing failed");
+    }
+    size_t payload_len = (size_t)n;
+    size_t cap = payload_len + 1U;
+
+    /* This policy branch is intended for builds that deliberately lower the
+     * publish ceiling (for example 16 KiB) below the normal store capability.
+     * The derived default includes envelope headroom above every stored record. */
+    if (payload_len > AMBYTE_PUBLISH_MAX_BYTES) {
+        int64_t mid = e.measure_id;
+        free(cmdbuf);
+        esp_err_t pending_err = s_cfg.mark_event_pending(mid);
+        if (s_oversize_warned_id != mid) {
+            ESP_LOGW(TAG, "event id=%lld envelope %u B exceeds AMBYTE_PUBLISH_MAX_BYTES=%u — preserving in quarantine sidecar",
+                     (long long)mid, (unsigned)payload_len,
+                     (unsigned)AMBYTE_PUBLISH_MAX_BYTES);
+            s_oversize_warned_id = mid;
+        }
+        if (pending_err != ESP_OK) {
+            measurement_event_free(&e);
+            return make_result(pending_err,
+                               "publish-cap event id=%lld could not revert claim: %s",
+                               (long long)mid, esp_err_to_name(pending_err));
+        }
+
+        esp_err_t quarantine_err = s_cfg.quarantine_event != NULL
+            ? s_cfg.quarantine_event(mid) : ESP_ERR_NOT_SUPPORTED;
+        measurement_event_free(&e);
+        if (quarantine_err == ESP_OK) {
+            s_oversize_skipped++;
+            clear_publish_stuck(mid);
+            return make_result(ESP_OK,
+                               "publish-cap skip id=%lld (%u>%u B): archived on SD (oversize_skipped=%u)",
+                               (long long)mid, (unsigned)payload_len,
+                               (unsigned)AMBYTE_PUBLISH_MAX_BYTES,
+                               (unsigned)s_oversize_skipped);
+        }
+        return make_result(quarantine_err,
+                           "publish-cap event id=%lld waiting for frontier/archive: %s",
+                           (long long)mid, esp_err_to_name(quarantine_err));
+    }
 
     /* Window-aware heap gate. MALLOC_CAP_8BIT totals include PSRAM and therefore
      * cannot prove that lwIP/Wi-Fi/TLS allocations fit. Charge the already queued
@@ -1180,16 +1266,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
     }
 
-    int n = snprintf(payload, cap,
-        "{\"sample\":[{"
-            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld,"
-            "\"timestamp_local\":\"%s\","
-            "\"published\":\"%s\",\"channel\":%s,\"device\":%s,"
-            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s"
-        "}],"
-        "\"timestamp\":\"%s\",%s%s"
-        "\"device_id\":\"%s\",\"device_name\":\"%s\","
-        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}",
+    n = snprintf(payload, cap, DC_EVENT_ENVELOPE_FMT,
         (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
         meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
         meta ? meta : "null", e.payload_json,
@@ -1205,17 +1282,19 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                            n, (unsigned)cap);
     }
 
-    size_t payload_len = (size_t)n;
-
     /* Exact MQTT-window admission uses the serialized envelope length, not the
      * raw event-log line. If 15 small envelopes leave less room than this one,
      * revert this ONE claim and wait for completions; the event-log FIFO returns
-     * it before admitting a newer offset, so the window cannot wedge or skip. */
+     * it before admitting a newer offset, so the window cannot wedge or skip.
+     * An empty MQTT window deliberately admits one envelope even above the
+     * nominal byte budget; it serializes the link just like event_log's lone
+     * maximum record. Once any envelope is outstanding, the budget is strict. */
     portENTER_CRITICAL(&s_inflight_mtx);
     inflight_usage_locked(&active_slots, &outstanding_bytes);
     portEXIT_CRITICAL(&s_inflight_mtx);
     if (active_slots >= PUBLISH_WINDOW_SLOTS ||
-        outstanding_bytes + payload_len > PUBLISH_WINDOW_BYTES) {
+        (outstanding_bytes > 0 &&
+         outstanding_bytes + payload_len > PUBLISH_WINDOW_BYTES)) {
         int64_t mid = e.measure_id;
         free(payload);
         s_cfg.mark_event_pending(mid);
@@ -1228,10 +1307,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
 
     /* The envelope now holds its own copy of the event's JSON, so free the claimed
-     * event's heap strings (~payload_len B: payload_json + metadata + cmd_raw)
+     * event's heap strings (up to the 64-KiB record cap: payload + metadata + cmd)
      * BEFORE the publish. Otherwise they sit alongside esp-mqtt's outbox copy and
-     * the mbedTLS write buffer — the ~4.6 KB payload_json alone is what pushes a
-     * large arrun trace past the largest free block. Only the heap pointers are
+     * the mbedTLS write buffer. Only the heap pointers are
      * freed/nulled; e.measure_id/tag/channel (scalar + fixed arrays) stay valid for
      * the logging, latch, and return below, and the later measurement_event_free
      * calls become safe no-ops. */
@@ -1248,10 +1326,10 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
              topic, (long long)e.measure_id, e.tag,
              e.channel[0] ? e.channel : "-", (unsigned)payload_len);
 
-    /* Heap probe for large payloads (arrun traces ~5–9 KB): a QoS1 publish needs
-     * a contiguous outbox copy (~payload_len) plus a transient TLS write buffer,
-     * so the largest free block — not total free — is what gates it. Logged
-     * before the attempt (and again on failure) to size the Track 1 heap work. */
+    /* Heap probe for large payloads (arrun traces can approach 64 KiB): QoS1
+     * retains an outbox copy while TLS writes sequential fragments. Large copies
+     * follow the PSRAM malloc policy, but capability-specific largest blocks are
+     * still logged to diagnose internal/DMA starvation. */
     if (payload_len > 2048) {
         ESP_LOGW(TAG, "large publish %u B (id=%lld): heap free=%u largest=%u",
                  (unsigned)payload_len, (long long)e.measure_id,
