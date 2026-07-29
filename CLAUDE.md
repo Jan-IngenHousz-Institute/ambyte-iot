@@ -60,6 +60,8 @@ Databricks `open_jii_dev.centrum.clean_data`.
 
 - Heavy rationale comments are the house style — a constraint's *why* belongs at its
   definition (this codebase reads like a field-incident logbook; keep it that way).
-- Commits: no Claude co-author trailers.
+- Commits: Conventional Commits for every commit message and PR title —
+  `type(scope): description` (e.g. `feat(evlog): …`, `fix(rtc): …`, `docs: …`,
+  `test(bench): …`). No Claude co-author trailers.
 - Fleet realities: all devices share one X.509 cert (fleet-provisioning migration planned);
   client ids are `AMBYTE_<MAC>`; ~500 devices/site is the target scale.
