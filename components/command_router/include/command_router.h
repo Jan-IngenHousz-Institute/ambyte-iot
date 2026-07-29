@@ -25,7 +25,7 @@ typedef struct {
     message_publish_fn  publish;          /* mqtt_client_get_publish_fn() — for replies/acks */
     const char         *status_topic;     /* topic for replies, e.g. "<topic_root>/status" */
     const char         *device_id;        /* included in reply payloads */
-    const char         *running_firmware_version; /* esp_app_desc_t version in reply payloads */
+    const char         *firmware_version; /* included in reply payloads */
 } command_router_config_t;
 
 esp_err_t command_router_init(const command_router_config_t *cfg);

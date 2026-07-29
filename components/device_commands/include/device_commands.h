@@ -61,8 +61,6 @@ typedef struct {
     const char                         *protocol_id;
     const char                         *device_name;
     const char                         *device_version;
-    /* Backward-compatible payload key; value must be the running app descriptor
-     * version, never the legacy provisioned NVS firmware metadata. */
     const char                         *device_firmware;
     const char                         *timezone;      /* IANA name, "" = unset */
 
