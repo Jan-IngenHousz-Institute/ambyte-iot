@@ -17,6 +17,7 @@
 #include "ambit_ota.h"
 #include "ambit_flash.h"
 #include "ambit_protocol.h"
+#include "clock_trust.h"
 #include "device_commands.h"
 #include "device_config.h"
 #include "uart_sensors.h"
@@ -165,7 +166,10 @@ static int cli_print_rtc(void)
 
     struct tm tm_now;
     char now_s[32] = {0};
-    localtime_r(&now, &tm_now);
+    /* RTC calendar + epoch are UTC by contract. localtime_r() made this one
+     * display silently depend on the scheduler's process-global TZ rule even
+     * though the sibling `status` command correctly labels/prints UTC. */
+    gmtime_r(&now, &tm_now);
     strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
     printf("RTC: %s (%lld)\r\n", now_s, (long long)now);
     return 0;
@@ -228,6 +232,7 @@ static int cli_cmd_rtc(int argc, char **argv)
         printf("rtc set failed: %s\r\n", esp_err_to_name(err));
         return 1;
     }
+    clock_trust_note_rtc();
     printf("RTC set; ");
     return cli_print_rtc();
 }

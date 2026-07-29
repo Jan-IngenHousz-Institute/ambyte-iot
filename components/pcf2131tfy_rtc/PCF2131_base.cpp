@@ -1,5 +1,70 @@
 #include "RTC_NXP.h"
 
+/* The PCF2131 calendar registers are UTC by firmware contract. libc mktime()
+ * cannot be used here: it interprets its input as LOCAL civil time, so merely
+ * installing Europe/Amsterdam's CEST rule made every RTC read/set appear one
+ * hour early. Convert the calendar directly instead. Besides being independent
+ * of process-global TZ/DST state, this keeps RTC->epoch and epoch->RTC exact
+ * inverses for the chip's supported 2000..2099 range. */
+static constexpr int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy = (153U * (month + (month > 2 ? -3 : 9)) + 2U) / 5U
+                         + day - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return static_cast<int64_t>(era) * 146097LL + static_cast<int64_t>(doe)
+           - 719468LL;
+}
+
+static constexpr bool is_leap_year(int year)
+{
+    return (year % 4 == 0) && ((year % 100 != 0) || (year % 400 == 0));
+}
+
+static bool tm_to_utc_epoch(const struct tm *value, time_t *out)
+{
+    if (value == nullptr || out == nullptr) return false;
+
+    const int year = value->tm_year + 1900;
+    const int month = value->tm_mon + 1;
+    static constexpr uint8_t month_days[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    };
+    if (year < 2000 || year > 2099 || month < 1 || month > 12 ||
+        value->tm_hour < 0 || value->tm_hour > 23 ||
+        value->tm_min < 0 || value->tm_min > 59 ||
+        value->tm_sec < 0 || value->tm_sec > 59) {
+        return false;
+    }
+    int max_day = month_days[month - 1];
+    if (month == 2 && is_leap_year(year)) ++max_day;
+    if (value->tm_mday < 1 || value->tm_mday > max_day) return false;
+
+    const int64_t seconds = days_from_civil(year, static_cast<unsigned>(month),
+                                            static_cast<unsigned>(value->tm_mday))
+                            * 86400LL + value->tm_hour * 3600LL
+                            + value->tm_min * 60LL + value->tm_sec;
+    *out = static_cast<time_t>(seconds);
+    return static_cast<int64_t>(*out) == seconds;
+}
+
+static int utc_weekday(time_t epoch)
+{
+    /* 1970-01-01 was Thursday (4). The supported RTC range is post-epoch, but
+     * retain a positive modulo so this helper stays correct if reused. */
+    int64_t days = static_cast<int64_t>(epoch) / 86400LL;
+    int weekday = static_cast<int>((days + 4LL) % 7LL);
+    return weekday < 0 ? weekday + 7 : weekday;
+}
+
+/* Compile-time round-trip anchors: these values are unaffected by TZ, DST, or
+ * the host running the build. 2024 also anchors the firmware clock-valid gate. */
+static_assert(days_from_civil(1970, 1, 1) == 0, "UTC epoch anchor changed");
+static_assert(days_from_civil(2024, 1, 1) * 86400LL == 1704067200LL,
+              "UTC 2024 round-trip anchor changed");
+
 PCF2131_base::PCF2131_base()
 {
 }
@@ -50,9 +115,10 @@ time_t PCF2131_base::rtc_time(void)
     now_tm.tm_year = bcd2dec(bf[7]) + 100;
     now_tm.tm_isdst = 0;
 
-    const time_t now = mktime(&now_tm);
-    if (now == (time_t)(-1)) {
+    time_t now = 0;
+    if (!tm_to_utc_epoch(&now_tm, &now)) {
         set_error(ESP_FAIL);
+        return (time_t)(-1);
     }
 
     return now;
@@ -67,10 +133,13 @@ void PCF2131_base::set(struct tm *now_tmp)
         return;
     }
 
-    time_t now_time;
-    struct tm cnv_tm = {};
-
     uint8_t bf[8] = {};
+
+    time_t now_time = 0;
+    if (!tm_to_utc_epoch(now_tmp, &now_time)) {
+        set_error(ESP_ERR_INVALID_ARG);
+        return;
+    }
 
     bf[1] = dec2bcd(now_tmp->tm_sec);
     bf[2] = dec2bcd(now_tmp->tm_min);
@@ -79,12 +148,7 @@ void PCF2131_base::set(struct tm *now_tmp)
     bf[6] = dec2bcd(now_tmp->tm_mon + 1);
     bf[7] = dec2bcd(now_tmp->tm_year - 100);
 
-    now_time = mktime(now_tmp);
-    if (localtime_r(&now_time, &cnv_tm) == nullptr) {
-        set_error(ESP_FAIL);
-        return;
-    }
-    bf[5] = dec2bcd(cnv_tm.tm_wday);
+    bf[5] = dec2bcd(utc_weekday(now_time));
 
     _bit_op8(Control_1, static_cast<uint8_t>(~0x28U), 0x20U);
     _bit_op8(SR_Reset, static_cast<uint8_t>(~0x80U), 0x80U);
@@ -165,9 +229,10 @@ time_t PCF2131_base::timestamp(int num)
     ts_tm.tm_year = bcd2dec(v[6]) + 100;
     ts_tm.tm_isdst = 0;
 
-    const time_t ts = mktime(&ts_tm);
-    if (ts == (time_t)(-1)) {
+    time_t ts = 0;
+    if (!tm_to_utc_epoch(&ts_tm, &ts)) {
         set_error(ESP_FAIL);
+        return (time_t)(-1);
     }
 
     return ts;

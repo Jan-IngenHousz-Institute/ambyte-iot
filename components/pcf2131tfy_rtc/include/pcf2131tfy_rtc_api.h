@@ -15,6 +15,11 @@ esp_err_t pcf2131tfy_rtc_init(void);
 
 bool pcf2131tfy_rtc_is_ready(void);
 
+/* Read the PCF2131 seconds-register oscillator-stop flag without clearing it.
+ * The flag is a trust signal, not merely a readiness bit: boot telemetry keeps
+ * evidence that the RTC stopped even when a later fallback write clears it. */
+esp_err_t pcf2131tfy_rtc_get_oscillator_stopped(bool *out_stopped);
+
 esp_err_t pcf2131tfy_rtc_get_time(time_t *out_time);
 clock_read_fn pcf2131tfy_rtc_get_clock_read_fn(void);
 

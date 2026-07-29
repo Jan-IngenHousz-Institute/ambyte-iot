@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "clock_trust.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -46,6 +47,7 @@
 #define SYNC_MEM_MIN_UPTIME_S             (6LL * 60 * 60)  /* steady low pools cannot boot-loop */
 #define SYNC_MEM_REBOOT_GUARD_S           (6LL * 60 * 60)  /* independent persistent anti-loop */
 #define SYNC_WD_TICK_MS                   60000U             /* evaluate periodic guards once a minute */
+#define SYNC_TIME_HWM_INTERVAL_MS          (60U * 60U * 1000U) /* durable rollback floor once/hour */
 #define SYNC_WD_TIMEOUT_MS                (60LL * 60 * 1000) /* legacy: 1 h without PUBACK while due */
 #define SYNC_PUBACK_MIN_UPTIME_S          (60LL * 60)       /* the 1 h observation period itself */
 #define SYNC_PUBACK_REBOOT_GUARD_S        (2LL * 60 * 60)  /* fast recovery, independent of churn */
@@ -615,12 +617,14 @@ static void sync_runner_wd_task(void *arg)
     (void)arg;
 
     const TickType_t wd_tick_ticks = pdMS_TO_TICKS(SYNC_WD_TICK_MS);
+    const TickType_t hwm_ticks = pdMS_TO_TICKS(SYNC_TIME_HWM_INTERVAL_MS);
     const TickType_t hb_ticks = pdMS_TO_TICKS(s_heartbeat_s * 1000U);
     TickType_t now_tick = xTaskGetTickCount();
     /* Backdate both clocks so policy checks start immediately and the first
      * post-boot-complete heartbeat remains a boot marker. */
     TickType_t last_periodic = now_tick - wd_tick_ticks;
     TickType_t last_hb = now_tick - hb_ticks;
+    TickType_t last_hwm = now_tick - hwm_ticks;
     uint32_t mem_low_samples = 0;
     uint32_t jitter_min = nightly_jitter_minutes();
     ESP_LOGI(TAG, "self-healing watchdog ready (nightly jitter=%u min)",
@@ -639,6 +643,16 @@ static void sync_runner_wd_task(void *arg)
 
         if (periodic) {
             last_periodic = now_tick;
+
+            /* The same independent task that owns liveness policy also owns
+             * this low-rate durability tick. Backdating above creates a floor
+             * on the first valid minute of a new installation; after that only
+             * a strictly higher u32 epoch commits, once per hour. Pre-2024
+             * clocks retry next minute without touching NVS. */
+            if ((now_tick - last_hwm) >= hwm_ticks &&
+                clock_trust_refresh_hwm() == ESP_OK) {
+                last_hwm = now_tick;
+            }
 
             int32_t reboot_day = 0;
             bool clock_fallback = false;

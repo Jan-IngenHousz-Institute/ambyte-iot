@@ -32,6 +32,23 @@ extern "C" bool pcf2131tfy_rtc_is_ready(void)
     return s_rtc_ready;
 }
 
+extern "C" esp_err_t pcf2131tfy_rtc_get_oscillator_stopped(bool *out_stopped)
+{
+    if (out_stopped == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_rtc_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *out_stopped = s_pcf2131.oscillator_stop();
+    const esp_err_t err = s_pcf2131.last_error();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RTC oscillator-stop read failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 extern "C" esp_err_t pcf2131tfy_rtc_get_time(time_t *out_time)
 {
     if (out_time == NULL) {
@@ -72,7 +89,9 @@ extern "C" esp_err_t pcf2131tfy_rtc_set_time(const struct tm *utc_tm)
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct tm t = *utc_tm;   /* set() normalizes via mktime — keep caller's copy intact */
+    /* The backend validates/converts this calendar with UTC arithmetic; it must
+     * never pass through mktime(), whose meaning changes after timezone_apply(). */
+    struct tm t = *utc_tm;
     s_pcf2131.set(&t);
     const esp_err_t err = s_pcf2131.last_error();
     if (err != ESP_OK) {

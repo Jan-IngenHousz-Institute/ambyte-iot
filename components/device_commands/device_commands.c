@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "clock_trust.h"
 #include "timezone.h"
 
 #include "esp_app_desc.h"
@@ -716,6 +717,7 @@ cmd_result_t cmd_set_rtc(int64_t epoch_utc)
     if (err != ESP_OK) {
         return make_result(err, "RTC set failed: %s", esp_err_to_name(err));
     }
+    clock_trust_note_rtc();
     char iso[32];
     struct tm tm_utc;
     time_t t = (time_t)epoch_utc;
@@ -1535,6 +1537,9 @@ cmd_result_t cmd_store_status_event(void)
     if (s_cfg.last_wd_reboot_reason != NULL) {
         (void)s_cfg.last_wd_reboot_reason(wd_reason, sizeof wd_reason);
     }
+    const char *clock_source = "rtc";
+    bool clock_suspect = false;
+    clock_trust_get_status(&clock_source, &clock_suspect);
 
     /* Schema split (2026-07-28, Dominik): the sample's `data` object carries only
      * MEASUREMENTS (the BME280 environment readings); all device-health/info
@@ -1543,6 +1548,16 @@ cmd_result_t cmd_store_status_event(void)
      * The bounded base always fits. Optional SD and power blocks are appended
      * transactionally below. Two buffers ≈ the previous single 1024 B one, so
      * the wd-task stack budget is unchanged. */
+    /* Worst-case budget (ticket-09 review, host-measured against the actual
+     * format strings): base 571 + SD 158 + power 160 + '}' + NUL = 891 B →
+     * only 5 B spare in this 896-B buffer at true format maxima (%.3f of a
+     * pathological negative mV reading renders 10 chars ×3; the u32 currents
+     * render 10 digits). With physically plausible field values the payload is
+     * ~756 B (~140 B headroom). DO NOT add fields against the 140 B figure:
+     * budget against the 5 B one, or grow the buffer — an overflow doesn't
+     * corrupt (status_append_optional drops the offending block with a WARN)
+     * but silently costs the power block on outlier readings. env_data's
+     * separate 128 B keeps the wd-task stack buffers at ~1 KiB total. */
     char payload[896];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
@@ -1550,6 +1565,7 @@ cmd_result_t cmd_store_status_event(void)
         "\"psram_size_kb\":%u,\"heap_dma_largest_kb\":%u,\"mqtt_reconnects\":%u,"
         "\"last_disc_reason\":\"%.23s\",\"conn_age_s\":%lld,\"pending\":%lld,"
         "\"last_wd_reboot_reason\":\"%.15s\",\"wd_armed\":%s,\"app_version\":\"%.31s\","
+        "\"clock_src\":\"%.4s\",\"clock_suspect\":%s,"
         "\"heap_int_free_kb\":%u,\"heap_int_largest_kb\":%u",
         s.wifi_connected ? "true" : "false",
         s.provisioned ? "true" : "false",
@@ -1563,6 +1579,7 @@ cmd_result_t cmd_store_status_event(void)
         (unsigned)mqtt_connects, last_disc_reason,
         (long long)conn_age_s, (long long)s.pending,
         wd_reason, wd_armed ? "true" : "false", app_version,
+        clock_source, clock_suspect ? "true" : "false",
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
         (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
     if (n < 0 || (size_t)n + 2 > sizeof(payload)) {
