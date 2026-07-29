@@ -88,7 +88,7 @@ esp_err_t event_log_health(evlog_health_t *out);
 /* Rewind the read cursor to the start of file ev-<seq>.log so that record and all
  * newer ones revert to PENDING and re-publish. Pass seq=0 to rewind to the oldest
  * file still on the card (re-publish everything). The target is clamped to the
- * files actually present, the claimed in-flight slot is abandoned, and the cursor
+ * files actually present, the RAM claim window is abandoned, and the cursor
  * is persisted to NVS. Fills *out_seq (the clamped target) and *out_pending (a
  * floor if the count was capped); either may be NULL. Re-publish is at-least-once,
  * so records already delivered are re-sent and deduped downstream on measure_id. */

@@ -238,9 +238,10 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
-/* device.measurement_window(on) — assert/release the measurement-activity gate
- * around a whole measurement cycle so the sync_runner doesn't publish mid-cycle.
- * begin/end are reference-counted; pair every on with exactly one off. */
+/* device.measurement_window(on) — assert/release measurement activity around a
+ * whole cycle. This retains the PM no-light-sleep lock and telemetry semantics;
+ * publishing is held only by nested raw sensor transactions unless the legacy
+ * compile-time gate is enabled. Pair every on with exactly one off. */
 static int l_device_measurement_window(lua_State *L)
 {
     if (lua_toboolean(L, 1)) device_commands_measurement_begin();

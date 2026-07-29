@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -25,6 +26,10 @@
 #define OTA_ID_MAX         64
 #define OTA_CONFIRM_TIMEOUT_S 300     /* wait this long for MQTT before rolling back a new image */
 #define OTA_CONNECT_POLL_MS   1000
+/* The reboot watchdog honours an admitted OTA for 30 minutes. Beyond that the
+ * cheap admission latch is presumed wedged; the global maintenance lock still
+ * protects an operation that is genuinely executing. */
+#define OTA_WATCHDOG_VETO_MAX_US (30LL * 60 * 1000000)
 
 #define NVS_NS      "ota_upd"
 #define KEY_APPLIED "applied_id"      /* id of the last successfully-applied image (set on success) */
@@ -36,6 +41,30 @@ typedef struct {
 
 static ota_update_config_t s_cfg;
 static bool                s_ready;   /* init done; dispatch via the shared worker (s_cfg.submit) */
+/* Admission state is read from the watchdog task while commands mutate it on
+ * MQTT/maintenance tasks. The timestamp is 64-bit on a 32-bit target, so keep
+ * the complete tuple under one spinlock rather than relying on volatile. */
+static bool                s_in_progress;
+static bool                s_veto_expiry_warned;
+static int64_t             s_admitted_at_us;
+static portMUX_TYPE        s_progress_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void ota_set_in_progress(bool active)
+{
+    portENTER_CRITICAL(&s_progress_mux);
+    s_in_progress = active;
+    s_admitted_at_us = active ? esp_timer_get_time() : 0;
+    s_veto_expiry_warned = false;
+    portEXIT_CRITICAL(&s_progress_mux);
+}
+
+static bool ota_is_admitted(void)
+{
+    portENTER_CRITICAL(&s_progress_mux);
+    bool active = s_in_progress;
+    portEXIT_CRITICAL(&s_progress_mux);
+    return active;
+}
 
 /* ── status reporting ──────────────────────────────────────────────────── */
 
@@ -303,11 +332,13 @@ static void ota_run(void *arg)
         ESP_LOGW(TAG, "another maintenance op in progress — OTA id=%s dropped",
                  r->id[0] ? r->id : "");
         ota_report("dropped", r->id, "another maintenance op is in progress");
+        ota_set_in_progress(false);
         free(r);
         return;
     }
     ota_do_update(r);   /* reboots on success; returns (and releases) on failure */
     if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
+    ota_set_in_progress(false);
     free(r);
 }
 
@@ -339,6 +370,10 @@ esp_err_t ota_update_request(const char *url, const char *id)
         ESP_LOGI(TAG, "ota_update id=%s already applied — ignoring", id ? id : "");
         return ESP_OK;
     }
+    if (ota_is_admitted()) {
+        ota_report("dropped", id, "an OTA is already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     /* Heap-copy the request and hand it to the shared worker. The copy is small
      * (~320 B), so it allocates even on a fragmented heap — unlike the old ~8 KB
      * task stack that this dispatch used to need. */
@@ -349,11 +384,42 @@ esp_err_t ota_update_request(const char *url, const char *id)
     }
     strncpy(r->url, url, sizeof r->url - 1);
     if (id != NULL) strncpy(r->id, id, sizeof r->id - 1);
+    /* Latch before queue admission so the watchdog cannot race the interval
+     * between accepting a remote command and the shared worker starting it. */
+    ota_set_in_progress(true);
     if (s_cfg.submit == NULL || !s_cfg.submit(ota_run, r)) {
         /* Worker queue full — an update is already queued/in flight. */
         ota_report("dropped", id, "an OTA is already in progress");
+        ota_set_in_progress(false);
         free(r);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool ota_update_in_progress(void)
+{
+    bool active;
+    bool warn = false;
+    int64_t age_us = 0;
+
+    portENTER_CRITICAL(&s_progress_mux);
+    active = s_in_progress;
+    if (active) {
+        age_us = esp_timer_get_time() - s_admitted_at_us;
+        if (age_us >= OTA_WATCHDOG_VETO_MAX_US) {
+            active = false;  /* expire only the self-healing veto, not admission */
+            if (!s_veto_expiry_warned) {
+                s_veto_expiry_warned = true;
+                warn = true;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_progress_mux);
+
+    if (warn) {
+        ESP_LOGW(TAG, "OTA watchdog veto expired after %lld s; self-healing resumes",
+                 (long long)(age_us / 1000000LL));
+    }
+    return active;
 }

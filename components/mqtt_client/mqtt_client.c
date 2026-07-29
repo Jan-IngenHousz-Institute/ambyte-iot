@@ -1,11 +1,14 @@
 #include "ambyte_mqtt_client.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "mqtt_client.h"
 
 #define TAG                  "mqtt_client"
@@ -22,13 +25,41 @@
 #define INBOUND_MSG_LARGE_MAX  16384
 #define INBOUND_TOPIC_MAX      192
 
+/* Keep this at or above SYNC_CONN_ERROR_THRESHOLD in sync_runner. A cap below
+ * that threshold silently makes the rolling-window watchdog impossible to
+ * satisfy; 64 leaves tuning headroom while this hot-path state stays tiny. */
+#define ERROR_DISC_HISTORY_CAP 64
+
 static esp_mqtt_client_handle_t s_client    = NULL;
 static volatile bool            s_connected = false;
 static bool                     s_started   = false;
 
+/* Error-disconnect history. MQTT callbacks write it while the watchdog reads it
+ * from another task/core, so protect the 64-bit timestamps with a spinlock. A
+ * failed connection can emit ERROR followed by DISCONNECTED; the per-attempt
+ * flag collapses those into one failure episode instead of double-counting it. */
+static int64_t                  s_error_disc_us[ERROR_DISC_HISTORY_CAP];
+static uint32_t                 s_error_disc_head;
+static uint32_t                 s_error_disc_used;
+static bool                     s_connect_failure_counted;
+static portMUX_TYPE             s_error_disc_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Boot-scoped connection telemetry shares the disconnect-history lock so the
+ * watchdog can read a coherent snapshot from the other core. The controlled
+ * reason strings are deliberately short enough to copy while holding it. */
+#define LAST_DISC_REASON_CAP 24
+static uint32_t                 s_successful_connects;
+static int64_t                  s_connected_since_us = -1;
+static int                      s_pending_error_type;
+static char                     s_last_disc_reason[LAST_DISC_REASON_CAP];
+
 /* Outbound ack callback */
 static message_publish_ack_fn s_ack_handler = NULL;
 static void                  *s_ack_ctx     = NULL;
+
+/* Transport-connect callback */
+static message_connect_fn  s_connect_handler = NULL;
+static void               *s_connect_ctx     = NULL;
 
 /* Transport-disconnect callback (MQTT-level; fires even when Wi-Fi stays up) */
 static message_disconnect_fn  s_disconnect_handler = NULL;
@@ -68,9 +99,97 @@ static esp_err_t mqtt_publish_impl(const char *topic, const char *payload,
     return ESP_OK;
 }
 
+/* Store the complete QoS-1 packet in ESP-MQTT's outbox, but leave every socket
+ * write to the mqtt task.  Unlike esp_mqtt_client_publish(), this returns the
+ * packet id without synchronously putting the packet on the wire.  The windowed
+ * drain uses that separation to finish its msg_id latch before a PUBACK can be
+ * consumed; other command/status publishers keep the synchronous port above. */
+static esp_err_t mqtt_enqueue_impl(const char *topic, const char *payload,
+                                   size_t len, int *out_msg_id)
+{
+    if (s_client == NULL || !s_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int msg_id = esp_mqtt_client_enqueue(s_client, topic, payload, (int)len,
+                                         1, 0, true);
+    if (msg_id < 0) {
+        return msg_id == -2 ? ESP_ERR_NO_MEM : ESP_FAIL;
+    }
+    if (out_msg_id != NULL) {
+        *out_msg_id = msg_id;
+    }
+    return ESP_OK;
+}
+
 static bool mqtt_is_connected_impl(void)
 {
     return s_connected;
+}
+
+/* Caller holds s_error_disc_mux. Keeping the state transition and timestamp
+ * insertion under one lock prevents ERROR/DISCONNECTED callbacks on another
+ * core from observing a half-updated connection attempt. */
+static void note_error_disconnect_locked(int64_t now_us)
+{
+    s_error_disc_us[s_error_disc_head] = now_us;
+    s_error_disc_head = (s_error_disc_head + 1U) % ERROR_DISC_HISTORY_CAP;
+    if (s_error_disc_used < ERROR_DISC_HISTORY_CAP) s_error_disc_used++;
+}
+
+static uint32_t mqtt_error_disconnect_count_impl(uint32_t window_s)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t window_us = (int64_t)window_s * 1000000LL;
+    uint32_t count = 0;
+
+    portENTER_CRITICAL(&s_error_disc_mux);
+    for (uint32_t i = 0; i < s_error_disc_used; i++) {
+        int64_t age_us = now_us - s_error_disc_us[i];
+        if (age_us >= 0 && age_us <= window_us) count++;
+    }
+    portEXIT_CRITICAL(&s_error_disc_mux);
+    return count;
+}
+
+static void mqtt_connection_stats_impl(uint32_t *successful_connects,
+                                       int64_t *connection_age_s,
+                                       char *last_disconnect_reason,
+                                       size_t reason_cap)
+{
+    int64_t connected_since_us;
+    bool connected;
+
+    portENTER_CRITICAL(&s_error_disc_mux);
+    connected = s_connected;
+    connected_since_us = s_connected_since_us;
+    if (successful_connects != NULL) *successful_connects = s_successful_connects;
+    if (last_disconnect_reason != NULL && reason_cap > 0) {
+        size_t copy_len = strnlen(s_last_disc_reason, sizeof s_last_disc_reason);
+        if (copy_len >= reason_cap) copy_len = reason_cap - 1;
+        memcpy(last_disconnect_reason, s_last_disc_reason, copy_len);
+        last_disconnect_reason[copy_len] = '\0';
+    }
+    portEXIT_CRITICAL(&s_error_disc_mux);
+
+    if (connection_age_s != NULL) {
+        int64_t age_us = connected && connected_since_us >= 0
+            ? esp_timer_get_time() - connected_since_us : -1;
+        *connection_age_s = age_us >= 0 ? age_us / 1000000LL : -1;
+    }
+}
+
+void mqtt_client_note_wifi_disconnect(uint8_t reason)
+{
+    char classification[LAST_DISC_REASON_CAP];
+    snprintf(classification, sizeof classification, "wifi:%u", (unsigned)reason);
+
+    portENTER_CRITICAL(&s_error_disc_mux);
+    strncpy(s_last_disc_reason, classification, sizeof(s_last_disc_reason) - 1);
+    s_last_disc_reason[sizeof(s_last_disc_reason) - 1] = '\0';
+    s_pending_error_type = -1; /* preserve Wi-Fi cause if stop emits DISCONNECTED */
+    s_connected = false;
+    s_connected_since_us = -1;
+    portEXIT_CRITICAL(&s_error_disc_mux);
 }
 
 static esp_err_t mqtt_set_ack_handler_impl(message_publish_ack_fn handler, void *ctx)
@@ -84,6 +203,13 @@ static esp_err_t mqtt_set_received_handler_impl(message_received_fn handler, voi
 {
     s_msg_handler = handler;
     s_msg_ctx     = ctx;
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_set_connect_handler_impl(message_connect_fn handler, void *ctx)
+{
+    s_connect_handler = handler;
+    s_connect_ctx     = ctx;
     return ESP_OK;
 }
 
@@ -157,13 +283,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
+        portENTER_CRITICAL(&s_error_disc_mux);
         s_connected = true;
+        s_connected_since_us = esp_timer_get_time();
+        s_successful_connects++;
+        s_pending_error_type = 0;
+        s_connect_failure_counted = false;
+        portEXIT_CRITICAL(&s_error_disc_mux);
         ESP_LOGI(TAG, "MQTT connected");
         /* (Re)subscribe to the command topic on every connect — a clean session
          * drops subscriptions, so this must run on each reconnect, not once. */
         if (s_command_topic[0] != '\0') {
             int sub_id = esp_mqtt_client_subscribe(s_client, s_command_topic, 1);
             ESP_LOGI(TAG, "subscribing to %s (msg_id=%d)", s_command_topic, sub_id);
+        }
+        if (s_connect_handler != NULL) {
+            s_connect_handler(s_connect_ctx);
         }
         break;
 
@@ -176,7 +311,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DISCONNECTED:
+        /* Established-session drops include stalled/write-timeout failures. If
+         * a failed CONNECT already emitted TCP_TRANSPORT ERROR, do not count the
+         * immediately-following DISCONNECTED a second time. */
+        portENTER_CRITICAL(&s_error_disc_mux);
+        if (s_connected || !s_connect_failure_counted) {
+            note_error_disconnect_locked(esp_timer_get_time());
+        }
+        if (s_pending_error_type == 0) {
+            memcpy(s_last_disc_reason, "mqtt:disconnect", sizeof("mqtt:disconnect"));
+        }
         s_connected = false;
+        s_connected_since_us = -1;
+        s_pending_error_type = 0;
+        s_connect_failure_counted = false;
+        portEXIT_CRITICAL(&s_error_disc_mux);
         rx_large_free();   /* don't hold a half-assembled message across the gap */
         ESP_LOGW(TAG, "MQTT disconnected");
         /* Clear any in-flight publish slot now, even though Wi-Fi is still up:
@@ -196,6 +345,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT error type=%d", event->error_handle->error_type);
+        char classification[LAST_DISC_REASON_CAP];
+        snprintf(classification, sizeof classification, "mqtt:%d",
+                 event->error_handle->error_type);
+        /* While disconnected, a TCP transport error is a failed broker/TLS
+         * connection attempt. Established-session transport failures are counted
+         * by the DISCONNECTED event that follows. */
+        portENTER_CRITICAL(&s_error_disc_mux);
+        strncpy(s_last_disc_reason, classification, sizeof(s_last_disc_reason) - 1);
+        s_last_disc_reason[sizeof(s_last_disc_reason) - 1] = '\0';
+        s_pending_error_type = event->error_handle->error_type;
+        if (!s_connected && !s_connect_failure_counted &&
+            event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            note_error_disconnect_locked(esp_timer_get_time());
+            s_connect_failure_counted = true;
+        }
+        portEXIT_CRITICAL(&s_error_disc_mux);
         if (s_ack_handler != NULL && event->msg_id > 0) {
             s_ack_handler(event->msg_id, ESP_FAIL, s_ack_ctx);
         }
@@ -239,12 +404,21 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
             },
         },
         .session = {
-            .protocol_ver = MQTT_PROTOCOL_V_5,
-            .keepalive    = 300,   /* s; matched to the STATUS heartbeat. Cuts idle
-                                    * PINGREQ from the 120 s default (~720->~288/day);
-                                    * within AWS IoT's 30-1200 s (broker drops after
-                                    * 1.5x keepalive of true silence). */
+            .protocol_ver               = MQTT_PROTOCOL_V_5,
+            .keepalive                  = 300,     /* s; matched to the STATUS heartbeat. Cuts idle
+                                                    * PINGREQ from the 120 s default (~720->~288/day);
+                                                    * within AWS IoT's 30-1200 s (broker drops after
+                                                    * 1.5x keepalive of true silence). */
+            /* The 1 s default re-sends QoS-1 messages throughout a degraded
+             * PUBACK path, multiplying duplicates ~5-6x and consuming the
+             * bandwidth needed for the original publish to finish. */
+            .message_retransmit_timeout = 10000,
         },
+        /* Keep esp-mqtt's default auto-reconnect. It has no per-attempt veto or
+         * cancellable BEFORE_CONNECT hook; gating TLS handshakes on measurement
+         * activity would require disabling it and adding a separate retry
+         * scheduler. That machinery is intentionally outside the lightweight
+         * publish-gate split, so reconnect timing remains unchanged. */
     };
 
     s_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -278,7 +452,10 @@ void mqtt_client_stop(void)
      * "Client asked to stop, but was not started" warning on every Wi-Fi
      * disconnect attempt when the broker never came up. */
     if (s_client != NULL && s_started) {
+        portENTER_CRITICAL(&s_error_disc_mux);
         s_connected = false;
+        s_connected_since_us = -1;
+        portEXIT_CRITICAL(&s_error_disc_mux);
         s_started   = false;
         esp_mqtt_client_stop(s_client);
     }
@@ -294,9 +471,29 @@ message_publish_fn mqtt_client_get_publish_fn(void)
     return mqtt_publish_impl;
 }
 
+message_enqueue_fn mqtt_client_get_enqueue_fn(void)
+{
+    return mqtt_enqueue_impl;
+}
+
 message_is_connected_fn mqtt_client_get_is_connected_fn(void)
 {
     return mqtt_is_connected_impl;
+}
+
+message_error_disconnect_count_fn mqtt_client_get_error_disconnect_count_fn(void)
+{
+    return mqtt_error_disconnect_count_impl;
+}
+
+message_connection_stats_fn mqtt_client_get_connection_stats_fn(void)
+{
+    return mqtt_connection_stats_impl;
+}
+
+message_set_connect_handler_fn mqtt_client_get_set_connect_handler_fn(void)
+{
+    return mqtt_set_connect_handler_impl;
 }
 
 message_set_publish_ack_handler_fn mqtt_client_get_set_ack_handler_fn(void)

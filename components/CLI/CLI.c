@@ -598,6 +598,19 @@ static int cli_cmd_wifi_reset(int argc, char **argv)
     return 0;
 }
 
+/* wifi_join <ssid> <password> — switch to a different AP at runtime (bench /
+ * field-service use). esp_wifi persists the config, so it survives reboots. */
+static int cli_cmd_wifi_join(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("Usage: wifi_join <ssid> <password>\r\n");
+        return 1;
+    }
+    esp_err_t err = wifi_manager_connect(argv[1], argv[2]);
+    printf("wifi_join \"%s\": %s\r\n", argv[1], esp_err_to_name(err));
+    return (err == ESP_OK) ? 0 : 1;
+}
+
 /* PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]
  *   Drives a PWM on GPIO4 via LEDC. duty accepts floats (e.g. 37.5). freq
  *   defaults to 10000 Hz. enable defaults to 1; pass 0 to stop output. */
@@ -631,7 +644,7 @@ static int cli_cmd_pwm(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
-/* inflight                → print the MQTT in-flight publish slot (msg_id, measure_id, age)
+/* inflight                → print the MQTT publish window + oldest slot
  * inflight stall          → inject a fake stale slot + kick the sync runner; the
  *                           reaper should clear it within one drain cycle. This
  *                           validates the lost-PUBACK wedge fix without having to
@@ -653,11 +666,16 @@ static int cli_cmd_inflight(int argc, char **argv)
 
     int     msg_id = -1;
     int64_t measure_id = -1, age_ms = 0;
+    size_t slots = 0, bytes = 0;
     device_commands_inflight_status(&msg_id, &measure_id, &age_ms);
-    if (msg_id < 0) {
-        printf("in-flight: idle (no publish awaiting PUBACK)\r\n");
+    device_commands_window_status(&slots, &bytes);
+    if (slots == 0) {
+        printf("in-flight: idle (window 0/%u slots, 0/%u bytes)\r\n",
+               (unsigned)PUBLISH_WINDOW_SLOTS, (unsigned)PUBLISH_WINDOW_BYTES);
     } else {
-        printf("in-flight: msg_id=%d measure_id=%lld age=%lld ms\r\n",
+        printf("in-flight: window %u/%u slots, %u/%u bytes; oldest msg_id=%d measure_id=%lld age=%lld ms\r\n",
+               (unsigned)slots, (unsigned)PUBLISH_WINDOW_SLOTS,
+               (unsigned)bytes, (unsigned)PUBLISH_WINDOW_BYTES,
                msg_id, (long long)measure_id, (long long)age_ms);
     }
     return 0;
@@ -1484,6 +1502,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "clear Wi-Fi credentials + provisioning flag and reboot",
         .func    = cli_cmd_wifi_reset,
     };
+    static const esp_console_cmd_t wifi_join_cmd = {
+        .command = "wifi_join",
+        .help    = "wifi_join <ssid> <password>  switch AP at runtime (persists)",
+        .func    = cli_cmd_wifi_join,
+    };
     static const esp_console_cmd_t pwm_cmd = {
         .command = "PWM",
         .help    = "PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]  drive PWM on GPIO4",
@@ -1647,6 +1670,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&wifi_reset_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&wifi_join_cmd);
     if (err != ESP_OK) {
         return err;
     }

@@ -7,9 +7,12 @@
  * proved this write pattern is corruption-free on the field card.
  *
  * Concurrency: every public op runs under s_mtx, serialising the Lua task
- * (store), the sync runner / MQTT ack task (claim/mark), and the CLI (stats).
- * Only one event is ever in flight at a time (device_commands enforces it), so a
- * single in-RAM "inflight" slot is sufficient.
+ * (store), the sync-runner drain (claim plus deferred ack/error marks), the
+ * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), and the CLI
+ * (stats). MQTT/Wi-Fi event tasks never enter this component: device_commands
+ * queues their completions for the drain so FATFS latency cannot stall socket
+ * servicing. The RAM claim window is bounded by the same 16-slot/64-KiB
+ * contract as the publisher; only its contiguous ACKed prefix is durable.
  */
 
 #include "event_log.h"
@@ -48,6 +51,10 @@
 #define EVLOG_MIN_FREE_BYTES (256 * 1024)     /* storage-full watermark: refuse writes below this (audit C1/C2) */
 #define EVLOG_OOM_STUCK_MAX  30               /* NO_MEM retries on one head record → quarantine it (audit D2) */
 
+_Static_assert(PUBLISH_WINDOW_SLOTS > 0 && PUBLISH_WINDOW_SLOTS <= 16,
+               "publish window must fit the firmware's 16-slot ACK table");
+_Static_assert(PUBLISH_WINDOW_BYTES > 0, "publish window byte budget must be non-zero");
+
 #define NVS_NS               "evlog"
 #define NVS_KEY_RD_SEQ       "rd_seq"
 #define NVS_KEY_RD_OFF       "rd_off"
@@ -70,11 +77,29 @@ static long      s_tail_size = 0;
 static uint32_t  s_rd_seq = 1;
 static long      s_rd_off = 0;
 
-/* In-flight slot: the claimed-but-not-yet-acked record starts at the cursor and
- * is s_inflight_len bytes long; mark_synced advances the cursor past it. */
-static bool      s_inflight_active = false;
-static int64_t   s_inflight_id     = 0;
-static long      s_inflight_len     = 0;
+/* RAM-only claim window over the durable read cursor.  Slots are ordered by
+ * (seq,off) and remain in this array until they leave the contiguous ACKed
+ * prefix.  `claimed=false && !acked` is a reverted record and is always returned
+ * before a new offset is admitted; this is what makes a mid-window timeout or
+ * disconnect replay FIFO rather than leaking past the gap.  The cursor, rotated
+ * file deletion, pending count, and NVS persistence NEVER follow the claim tail.
+ * They move only when slot zero is ACKed (or explicitly frontier-quarantined).
+ *
+ * Per-slot token invariant, paired with device_commands' msg-id table: an
+ * unacked claimed record has at most one MQTT latch or one queued completion;
+ * event_log itself is mutated only by the sole sync-runner consumer. */
+typedef struct {
+    int64_t  measure_id;
+    uint32_t seq;
+    long     off;
+    long     len;
+    bool     claimed;
+    bool     acked;
+} evlog_window_slot_t;
+
+static evlog_window_slot_t s_window[PUBLISH_WINDOW_SLOTS];
+static size_t              s_window_count = 0;
+static size_t              s_window_bytes = 0;
 
 /* next_id: hand out from RAM, persist a high-water mark every EVLOG_ID_BLOCK. */
 static int64_t   s_next_id  = 1;
@@ -121,6 +146,34 @@ static long evlog_file_size(uint32_t seq)
     evlog_file_path(path, sizeof path, seq);
     struct stat st;
     return (stat(path, &st) == 0) ? (long)st.st_size : 0;
+}
+
+static void evlog_window_clear_locked(void)
+{
+    memset(s_window, 0, sizeof s_window);
+    s_window_count = 0;
+    s_window_bytes = 0;
+}
+
+static int evlog_window_find_locked(int64_t measure_id)
+{
+    for (size_t i = 0; i < s_window_count; i++) {
+        if (s_window[i].measure_id == measure_id) return (int)i;
+    }
+    return -1;
+}
+
+static void evlog_window_pop_front_locked(void)
+{
+    if (s_window_count == 0) return;
+    size_t len = (size_t)s_window[0].len;
+    if (s_window_count > 1) {
+        memmove(&s_window[0], &s_window[1],
+                (s_window_count - 1U) * sizeof s_window[0]);
+    }
+    s_window_count--;
+    memset(&s_window[s_window_count], 0, sizeof s_window[0]);
+    s_window_bytes = len <= s_window_bytes ? s_window_bytes - len : 0;
 }
 
 static bool parse_ev_name(const char *name, uint32_t *seq)
@@ -200,10 +253,15 @@ static esp_err_t evlog_reopen_tail_locked(void)
 
 /* Copy rec_len raw bytes at the current cursor to quarantine.log (archive-before-skip).
  * Used only by the OOM head-of-line escape, where parse_record has already mangled
- * s_line, so we re-read the raw record from disk. Clobbers s_line. Caller holds s_mtx. */
-static bool evlog_archive_head_locked(long rec_len)
+ * s_line, so we re-read the raw record from disk. Clobbers s_line. Caller holds s_mtx.
+ *
+ * Window-safety contract: expected_measure_id MUST still identify the record at
+ * the persisted cursor frontier. The claim window can parse a later slot, but
+ * this head-only escape may never archive/advance that later slot's length at
+ * s_rd_off. Re-reading and comparing the frontier id makes mismatch fail closed. */
+static bool evlog_archive_head_locked(long rec_len, int64_t expected_measure_id)
 {
-    if (rec_len <= 0 || rec_len > (long)sizeof s_line) return false;
+    if (rec_len <= 0 || rec_len >= (long)sizeof s_line) return false;
     char path[64];
     evlog_file_path(path, sizeof path, s_rd_seq);
     FILE *rf = fopen(path, "rb");
@@ -211,13 +269,21 @@ static bool evlog_archive_head_locked(long rec_len)
     bool ok = false;
     if (fseek(rf, s_rd_off, SEEK_SET) == 0 &&
         fread(s_line, 1, (size_t)rec_len, rf) == (size_t)rec_len) {
-        FILE *qf = fopen(EVLOG_QUARANTINE, "a");
-        if (qf != NULL) {
-            size_t w = fwrite(s_line, 1, (size_t)rec_len, qf);
-            fflush(qf);
-            fsync(fileno(qf));
-            fclose(qf);
-            ok = (w == (size_t)rec_len);
+        s_line[rec_len] = '\0';
+        int64_t frontier_id = (int64_t)strtoll(s_line, NULL, 10);
+        if (s_line[rec_len - 1] != '\n' || frontier_id != expected_measure_id) {
+            ESP_LOGW(TAG, "OOM archive refused: cursor seq=%u off=%ld holds id=%lld, expected id=%lld",
+                     (unsigned)s_rd_seq, s_rd_off, (long long)frontier_id,
+                     (long long)expected_measure_id);
+        } else {
+            FILE *qf = fopen(EVLOG_QUARANTINE, "a");
+            if (qf != NULL) {
+                size_t w = fwrite(s_line, 1, (size_t)rec_len, qf);
+                fflush(qf);
+                fsync(fileno(qf));
+                fclose(qf);
+                ok = (w == (size_t)rec_len);
+            }
         }
     }
     fclose(rf);
@@ -232,6 +298,59 @@ static void evlog_persist_cursor_locked(void)
     nvs_set_u32(h, NVS_KEY_RD_OFF, (uint32_t)s_rd_off);
     nvs_commit(h);
     nvs_close(h);
+}
+
+/* Delete/step over a rotated file only when the durable cursor itself has
+ * reached its EOF.  The claim tail may already be in a later file, but it is
+ * deliberately irrelevant here: a reboot must still find every un-ACKed byte
+ * at or after the cursor.  File-boundary persistence matches the old frequency
+ * (once per drained file) and is safe even between 16-ACK cursor batches. */
+static void evlog_normalize_cursor_locked(void)
+{
+    while (s_rd_seq < s_tail_seq) {
+        char path[64];
+        evlog_file_path(path, sizeof path, s_rd_seq);
+        struct stat st;
+        /* A transient stat failure is not proof of EOF.  Leave the cursor in
+         * place so the normal claim path can distinguish a genuinely missing
+         * file from an I/O failure; treating the old helper's synthetic zero as
+         * EOF here could silently skip a whole rotated file. */
+        if (stat(path, &st) != 0 || s_rd_off < (long)st.st_size) break;
+
+        remove(path);
+        s_rd_seq++;
+        s_rd_off = 0;
+        evlog_persist_cursor_locked();
+    }
+}
+
+/* Advance only the contiguous ACKed prefix.  Out-of-order ACKs merely flip a
+ * slot flag; neither the RAM cursor nor NVS can cross the first unacked slot.
+ * The batched persistence rule is unchanged: an unpersisted RAM advance can
+ * replay duplicates after reboot, but the stored cursor can never skip data. */
+static void evlog_advance_acked_prefix_locked(void)
+{
+    while (s_window_count > 0 && s_window[0].acked) {
+        evlog_window_slot_t front = s_window[0];
+        if (front.seq != s_rd_seq || front.off != s_rd_off) {
+            ESP_LOGE(TAG, "window frontier mismatch: cursor=%u:%ld slot=%u:%ld id=%lld — refusing advance",
+                     (unsigned)s_rd_seq, s_rd_off, (unsigned)front.seq, front.off,
+                     (long long)front.measure_id);
+            break;
+        }
+
+        s_rd_seq = front.seq;
+        s_rd_off = front.off + front.len;
+        s_last_acked_id = front.measure_id;
+        if (s_pending > 0) s_pending--;
+        evlog_window_pop_front_locked();
+
+        if (++s_acks_since_persist >= EVLOG_CURSOR_BATCH) {
+            evlog_persist_cursor_locked();
+            s_acks_since_persist = 0;
+        }
+        evlog_normalize_cursor_locked();
+    }
 }
 
 static void evlog_persist_nid_locked(void)
@@ -543,7 +662,7 @@ static esp_err_t evlog_open_locked(void)
     s_writes_since_flush = 0;
     s_last_flush_tick    = xTaskGetTickCount();
     s_acks_since_persist = 0;
-    s_inflight_active    = false;
+    evlog_window_clear_locked();
 
     ESP_LOGI(TAG, "ready: files %u..%u, cursor seq=%u off=%ld, max_id=%lld, next_id=%lld (pending counting in background)",
              (unsigned)min_seq, (unsigned)max_seq, (unsigned)s_rd_seq, s_rd_off,
@@ -862,56 +981,135 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    /* Claim-order contract:
+     *   1. the oldest reverted, unacked slot already in the window;
+     *   2. otherwise the record immediately after the claim tail;
+     *   3. never a new offset while any reverted slot exists.
+     * ACKed-but-not-prefix slots remain occupied but are never re-published.
+     * This ordering is what repairs a hole before extending the window. */
+    for (size_t i = 0; i < s_window_count; i++) {
+        evlog_window_slot_t *slot = &s_window[i];
+        if (slot->acked || slot->claimed) continue;
+
+        bool is_tail = slot->seq >= s_tail_seq;
+        if (is_tail && evlog_flush_writer_locked() != ESP_OK) {  /* push appends to media first */
+            sdcard_report_io_error();
+            xSemaphoreGive(s_mtx);
+            return ESP_FAIL;
+        }
+
+        char path[64];
+        evlog_file_path(path, sizeof path, slot->seq);
+        FILE *rf = fopen(path, "rb");
+        if (rf == NULL || fseek(rf, slot->off, SEEK_SET) != 0 ||
+            fgets(s_line, sizeof s_line, rf) == NULL) {
+            if (rf != NULL) fclose(rf);
+            ESP_LOGE(TAG, "re-claim failed for id=%lld at %u:%ld — holding window",
+                     (long long)slot->measure_id, (unsigned)slot->seq, slot->off);
+            xSemaphoreGive(s_mtx);
+            return ESP_FAIL;
+        }
+        fclose(rf);
+
+        size_t len = strlen(s_line);
+        int64_t disk_id = (int64_t)strtoll(s_line, NULL, 10);
+        if ((long)len != slot->len || len == 0 || s_line[len - 1] != '\n' ||
+            disk_id != slot->measure_id) {
+            ESP_LOGE(TAG, "re-claim identity mismatch at %u:%ld: id=%lld len=%u, expected id=%lld len=%ld",
+                     (unsigned)slot->seq, slot->off, (long long)disk_id,
+                     (unsigned)len, (long long)slot->measure_id, slot->len);
+            xSemaphoreGive(s_mtx);
+            return ESP_ERR_INVALID_STATE;
+        }
+        esp_err_t parsed = parse_record(s_line, len, out);
+        if (parsed != ESP_OK || out->measure_id != slot->measure_id) {
+            measurement_event_free(out);
+            xSemaphoreGive(s_mtx);
+            return parsed == ESP_OK ? ESP_ERR_INVALID_STATE : parsed;
+        }
+        slot->claimed = true;
+        xSemaphoreGive(s_mtx);
+        return ESP_OK;
+    }
+
+    if (s_window_count >= PUBLISH_WINDOW_SLOTS) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* The scan position follows the claim tail, never the cursor unless the
+     * window is empty.  EOF traversal may move this local position across files,
+     * but only cursor normalization below is permitted to delete one. */
+    evlog_normalize_cursor_locked();
+    uint32_t scan_seq = s_rd_seq;
+    long scan_off = s_rd_off;
+    if (s_window_count > 0) {
+        const evlog_window_slot_t *last = &s_window[s_window_count - 1U];
+        scan_seq = last->seq;
+        scan_off = last->off + last->len;
+    }
+
     esp_err_t result = ESP_ERR_NOT_FOUND;
     for (int guard = 0; guard < 100000; guard++) {
-        bool is_tail = (s_rd_seq >= s_tail_seq);
-        if (is_tail && evlog_flush_writer_locked() != ESP_OK) {  /* push appends to media first */
+        bool at_cursor = s_window_count == 0 && scan_seq == s_rd_seq && scan_off == s_rd_off;
+        bool is_tail = (scan_seq >= s_tail_seq);
+        if (is_tail && evlog_flush_writer_locked() != ESP_OK) {
             sdcard_report_io_error();
             result = ESP_FAIL;
             break;
         }
 
         char path[64];
-        evlog_file_path(path, sizeof path, s_rd_seq);
+        evlog_file_path(path, sizeof path, scan_seq);
         errno = 0;
         FILE *rf = fopen(path, "rb");
         if (rf == NULL) {
-            if (!is_tail) {
-                if (errno == ENOENT) {               /* file genuinely gone (external delete/rotation) */
-                    ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)s_rd_seq);
+            if (!is_tail && errno == ENOENT) {
+                if (at_cursor) {
+                    ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)scan_seq);
                     s_skipped++;
                     s_rd_seq++; s_rd_off = 0;
                     evlog_persist_cursor_locked();
+                    scan_seq = s_rd_seq;
+                    scan_off = s_rd_off;
                     continue;
                 }
-                /* Any other errno is an I/O error, NOT a drained file — never skip it:
-                 * bail and retry after recovery so a transient fault can't lose a whole
-                 * pending file (audit B1). */
+                /* Do not create a later-file slot across a missing-file gap.
+                 * Once the existing window closes, that gap becomes the cursor
+                 * and the audited frontier-only skip above owns the decision. */
+                result = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            if (!is_tail) sdcard_report_io_error();
+            result = is_tail ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+            break;
+        }
+        if (fseek(rf, scan_off, SEEK_SET) != 0) {
+            fclose(rf);
+            result = ESP_ERR_NOT_FOUND;
+            break;
+        }
+
+        char *got = fgets(s_line, sizeof s_line, rf);
+        if (got == NULL) {
+            if (ferror(rf)) {
+                clearerr(rf); fclose(rf);
                 sdcard_report_io_error();
                 result = ESP_FAIL;
                 break;
             }
-            result = ESP_ERR_NOT_FOUND;              /* tail missing — bail */
-            break;
-        }
-        if (fseek(rf, s_rd_off, SEEK_SET) != 0) { fclose(rf); result = ESP_ERR_NOT_FOUND; break; }
-
-        char *got = fgets(s_line, sizeof s_line, rf);
-        if (got == NULL) {                           /* EOF — or a read error */
-            if (ferror(rf)) {                        /* READ ERROR, not EOF: never delete/advance */
-                clearerr(rf); fclose(rf);
-                sdcard_report_io_error();
-                result = ESP_FAIL;                   /* bail; retry after recovery (audit B1) */
-                break;
-            }
             fclose(rf);
-            if (!is_tail) {                          /* genuine EOF → rotated file fully drained → delete */
-                remove(path);
-                s_rd_seq++; s_rd_off = 0;
-                evlog_persist_cursor_locked();
+            if (!is_tail) {
+                if (at_cursor) {
+                    remove(path);
+                    s_rd_seq++; s_rd_off = 0;
+                    evlog_persist_cursor_locked();
+                }
+                scan_seq++;
+                scan_off = 0;
                 continue;
             }
-            result = ESP_ERR_NOT_FOUND;              /* no new record in the tail yet */
+            result = ESP_ERR_NOT_FOUND;
             break;
         }
 
@@ -933,9 +1131,17 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
                     break;
                 }
                 fclose(rf);
+                if (!at_cursor) {
+                    /* A later corrupt record cannot be skipped around the
+                     * unacked frontier.  Let the prefix close, then the normal
+                     * cursor-owned skip path handles it. */
+                    result = ESP_ERR_INVALID_STATE;
+                    break;
+                }
                 ESP_LOGW(TAG, "skipping over-long record seq=%u off=%ld (%ld B)",
-                         (unsigned)s_rd_seq, s_rd_off, skipped);
+                         (unsigned)scan_seq, scan_off, skipped);
                 s_rd_off += skipped;
+                scan_off = s_rd_off;
                 s_skipped++;
                 if (s_pending > 0) s_pending--;
                 evlog_persist_cursor_locked();
@@ -948,24 +1154,43 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
                 break;
             }
             fclose(rf);
-            if (!is_tail) {                          /* torn tail of a closed file → drop it */
+            if (!is_tail && at_cursor) {             /* torn tail of a closed file → drop it */
                 ESP_LOGW(TAG, "partial record at end of rotated %s — dropping", path);
                 remove(path);
                 s_rd_seq++; s_rd_off = 0;
+                scan_seq = s_rd_seq; scan_off = 0;
                 s_skipped++;
                 evlog_persist_cursor_locked();
                 continue;
             }
-            result = ESP_ERR_NOT_FOUND;              /* unflushed partial in tail — try later */
+            result = is_tail ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_STATE;
             break;
         }
         fclose(rf);
 
+        /* Raw-record bytes are a conservative, persistence-owned first gate.
+         * device_commands applies the exact envelope-byte gate before enqueue;
+         * both must fit, so JSON framing can never push the MQTT window over
+         * PUBLISH_WINDOW_BYTES.  A reverted slot bypasses this check because its
+         * bytes are already charged above. */
+        if (s_window_bytes + len > PUBLISH_WINDOW_BYTES) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        int64_t record_id = (int64_t)strtoll(got, NULL, 10);
         esp_err_t pr = parse_record(got, len, out);
         if (pr == ESP_OK) {
-            s_inflight_active = true;
-            s_inflight_id     = out->measure_id;
-            s_inflight_len    = (long)len;
+            evlog_window_slot_t *slot = &s_window[s_window_count++];
+            *slot = (evlog_window_slot_t) {
+                .measure_id = out->measure_id,
+                .seq        = scan_seq,
+                .off        = scan_off,
+                .len        = (long)len,
+                .claimed    = true,
+                .acked      = false,
+            };
+            s_window_bytes += len;
             s_oom_head_id     = 0;   /* made progress — clear OOM strike tracking */
             s_oom_strikes     = 0;
             result = ESP_OK;
@@ -977,14 +1202,14 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
              * loop (audit D2). After EVLOG_OOM_STUCK_MAX strikes on the SAME head,
              * quarantine it by raw line so the drain advances. parse_record has
              * mangled s_line, so archive re-reads the raw record from disk. */
-            int64_t head_id = (int64_t)strtoll(got, NULL, 10);
-            if (head_id == s_oom_head_id) s_oom_strikes++;
-            else { s_oom_head_id = head_id; s_oom_strikes = 1; }
+            if (record_id == s_oom_head_id) s_oom_strikes++;
+            else { s_oom_head_id = record_id; s_oom_strikes = 1; }
             if (s_oom_strikes >= EVLOG_OOM_STUCK_MAX &&
-                evlog_archive_head_locked((long)len)) {
+                evlog_archive_head_locked((long)len, record_id)) {
                 ESP_LOGW(TAG, "OOM-stuck record id=%lld quarantined after %u strikes — drain unblocked",
-                         (long long)head_id, (unsigned)s_oom_strikes);
+                         (long long)record_id, (unsigned)s_oom_strikes);
                 s_rd_off += (long)len;
+                scan_off = s_rd_off;
                 if (s_pending > 0) s_pending--;
                 s_skipped++;
                 s_oom_head_id = 0; s_oom_strikes = 0;
@@ -994,10 +1219,17 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             result = ESP_ERR_NO_MEM;                 /* don't consume — retry next drain */
             break;
         }
-        /* malformed record → skip past it */
+        /* Malformed records may be skipped only when they are at the cursor
+         * frontier.  With claim!=cursor, stop and let earlier slots close first;
+         * advancing s_rd_off here would be the ticket-04 m5 data-loss bug. */
+        if (!at_cursor) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
         ESP_LOGW(TAG, "skipping bad record seq=%u off=%ld len=%u",
                  (unsigned)s_rd_seq, s_rd_off, (unsigned)len);
         s_rd_off += (long)len;
+        scan_off = s_rd_off;
         s_skipped++;
         if (s_pending > 0) s_pending--;
         evlog_persist_cursor_locked();
@@ -1011,16 +1243,17 @@ esp_err_t event_log_mark_event_synced(int64_t measure_id)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (s_inflight_active && measure_id == s_inflight_id) {
-        s_rd_off += s_inflight_len;          /* advance past the published record */
-        s_inflight_active = false;
-        s_last_acked_id   = measure_id;      /* end-to-end delivery high-water (telemetry) */
-        if (s_pending > 0) s_pending--;
-        if (++s_acks_since_persist >= EVLOG_CURSOR_BATCH) {
-            evlog_persist_cursor_locked();
-            s_acks_since_persist = 0;
-        }
+    int idx = evlog_window_find_locked(measure_id);
+    if (idx < 0 || !s_window[idx].claimed || s_window[idx].acked) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
     }
+    /* Clearing `claimed` records that the MQTT latch has already been detached
+     * into the completion queue.  Later ACKed slots remain in-place; only the
+     * helper's slot-zero loop is allowed to advance the cursor. */
+    s_window[idx].claimed = false;
+    s_window[idx].acked = true;
+    evlog_advance_acked_prefix_locked();
     xSemaphoreGive(s_mtx);
     return ESP_OK;
 }
@@ -1029,9 +1262,14 @@ esp_err_t event_log_mark_event_pending(int64_t measure_id)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (s_inflight_active && measure_id == s_inflight_id) {
-        s_inflight_active = false;           /* cursor unchanged → re-read next claim */
+    int idx = evlog_window_find_locked(measure_id);
+    if (idx < 0 || !s_window[idx].claimed || s_window[idx].acked) {
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
     }
+    /* Revert exactly one slot.  Its seq/off/len charge remains in the window,
+     * and claim_next's FIFO scan returns it before admitting any newer offset. */
+    s_window[idx].claimed = false;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
 }
@@ -1042,7 +1280,21 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_SUPPORTED; }
 
-    /* Read the record at the cursor — same read-after-flush handshake as claim. */
+    /* Window-safety contract: quarantine is deliberately a frontier-only
+     * operation. Re-read s_rd_seq/s_rd_off under s_mtx and verify measure_id
+     * before any archive or cursor mutation. When ticket 05 lets claim position
+     * move ahead of the cursor, a stuck non-frontier slot MUST receive
+     * ESP_ERR_INVALID_STATE rather than archive an innocent frontier record. */
+    if (s_window_count > 0 &&
+        (s_window[0].measure_id != measure_id || s_window[0].seq != s_rd_seq ||
+         s_window[0].off != s_rd_off || s_window[0].acked)) {
+        ESP_LOGW(TAG, "quarantine refused for non-frontier id=%lld; frontier id=%lld at %u:%ld",
+                 (long long)measure_id, (long long)s_window[0].measure_id,
+                 (unsigned)s_window[0].seq, s_window[0].off);
+        xSemaphoreGive(s_mtx);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (s_rd_seq >= s_tail_seq) evlog_flush_writer_locked();
     char path[64];
     evlog_file_path(path, sizeof path, s_rd_seq);
@@ -1062,8 +1314,7 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_STATE;
     }
-    /* The head record must be the event the publisher is stuck on — a moved
-     * cursor (ack raced in, rewind, reboot) must not skip an innocent record. */
+    /* Fail closed if the caller's id is not still exactly at the frontier. */
     if ((int64_t)strtoll(s_line, NULL, 10) != measure_id) {
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_STATE;
@@ -1079,11 +1330,21 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
     fclose(qf);
     if (w != len) { xSemaphoreGive(s_mtx); return ESP_FAIL; }
 
-    /* Advance past it — mark_synced without an ack. */
-    s_rd_off += (long)len;
-    s_inflight_active = false;
+    /* Advance past exactly the cursor record without pretending it had a PUBACK.
+     * If it was already claimed as slot zero, remove only that slot; later ACKed
+     * slots may then form a real contiguous prefix and advance normally. */
+    if (s_window_count > 0) {
+        s_rd_seq = s_window[0].seq;
+        s_rd_off = s_window[0].off + s_window[0].len;
+        evlog_window_pop_front_locked();
+    } else {
+        s_rd_off += (long)len;
+    }
     if (s_pending > 0) s_pending--;
+    evlog_advance_acked_prefix_locked();
+    evlog_normalize_cursor_locked();
     evlog_persist_cursor_locked();
+    s_acks_since_persist = 0;
     xSemaphoreGive(s_mtx);
 
     ESP_LOGW(TAG, "quarantined event id=%lld (%u B) -> %s — cursor advanced, drain unblocked",
@@ -1113,10 +1374,12 @@ static esp_err_t event_log_rewind_impl(uint32_t seq, uint32_t *out_seq, int64_t 
      * them). A forward request is clamped back to the current cursor file. */
     if (target > s_rd_seq) target = s_rd_seq;
 
-    s_rd_seq          = target;
-    s_rd_off          = 0;
-    s_inflight_active = false;               /* abandon any claimed slot; a stale PUBACK
-                                              * for it is now a no-op (guarded on active) */
+    s_rd_seq = target;
+    s_rd_off = 0;
+    /* Rewind abandons every RAM-only claim. device_commands_abort_inflight()
+     * clears the peer msg-id table and completion queue before the CLI invokes
+     * this path, so late PUBACKs cannot address the rebuilt window. */
+    evlog_window_clear_locked();
     evlog_persist_cursor_locked();
 
     bool capped = false;

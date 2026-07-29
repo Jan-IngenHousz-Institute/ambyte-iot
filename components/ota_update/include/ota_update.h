@@ -75,6 +75,12 @@ void ota_update_run_boot_confirm(void);
  * before init; ESP_ERR_INVALID_ARG on a bad url/id. */
 esp_err_t ota_update_request(const char *url, const char *id);
 
+/* True from successful queue admission until the OTA job finishes (or reboots
+ * on success), capped at 30 minutes for watchdog-veto purposes. Expiry logs one
+ * warning and does not clear the real admission state; the general maintenance
+ * lock remains the authoritative guard for an operation that is executing. */
+bool ota_update_in_progress(void);
+
 #ifdef __cplusplus
 }
 #endif

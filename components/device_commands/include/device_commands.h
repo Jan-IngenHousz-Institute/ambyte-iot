@@ -49,9 +49,12 @@ typedef struct {
 
     /* Messaging ports (Phase 6A) */
     message_publish_fn                  publish;
+    message_enqueue_fn                  enqueue;          /* non-blocking QoS1 event drain */
     message_is_connected_fn             message_is_connected;
+    message_error_disconnect_count_fn   error_disconnect_count;
+    message_connection_stats_fn         connection_stats;
     message_set_publish_ack_handler_fn  set_publish_ack_handler;
-    message_set_disconnect_handler_fn   set_disconnect_handler;  /* clears in-flight slot on MQTT drop; NULL = only Wi-Fi drop clears it */
+    message_set_disconnect_handler_fn   set_disconnect_handler;  /* reverts the in-flight window on MQTT drop; NULL = only Wi-Fi drop does so */
 
     /* Topic config (Phase 6A) */
     const char                         *topic_root;
@@ -83,6 +86,11 @@ typedef struct {
     esp_err_t                         (*sd_health)(bool *io_lost, uint64_t *free_bytes,
                                                    int64_t *skipped, int64_t *dropped,
                                                    int64_t *last_acked_id);
+
+    /* Sync-runner health probes for STATUS. Function pointers keep the domain
+     * composition acyclic: sync_runner already depends on device_commands. */
+    esp_err_t                         (*last_wd_reboot_reason)(char *out, size_t out_cap);
+    bool                              (*watchdog_armed)(void);
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -91,17 +99,35 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg);
  * an empty string if the MAC was unavailable when device_commands_init ran. */
 const char *device_commands_get_mac(void);
 
-/* Measurement-activity gate. Bracket any latency-sensitive sensor transaction
- * with begin()/end(); the background sync runner pauses publishing while the
- * count is non-zero and drains once it returns to idle. Safe to nest. */
+/* Compile-time escape hatch for field A/B testing. Set to 1 to restore the
+ * legacy sync policy that pauses publishing for the whole measurement window;
+ * the default pauses only for raw sensor transactions (publish_hold below). */
+#ifndef AMBYTE_PUBLISH_GATE_LEGACY
+#define AMBYTE_PUBLISH_GATE_LEGACY 0
+#endif
+
+/* Measurement-activity signal. The Lua whole-cycle bracket and each raw sensor
+ * transaction assert this reference count. It retains the PM no-light-sleep
+ * lock and measurement-end sync notification semantics, but the default publish
+ * gate no longer consults it. Safe to nest. */
 void device_commands_measurement_begin(void);
 void device_commands_measurement_end(void);
 bool device_commands_measurement_active(void);
 
-/* Register a callback fired whenever a measurement event is stored, and when a
- * measurement burst finishes — the sync_runner registers its task-notify here so
- * it can wake and drain on demand instead of polling. NULL clears it. The hook
- * runs in the caller's (storing) task context; keep it cheap (a task notify). */
+/* Narrow publish hold asserted only around raw sensor transactions. This lets
+ * an already-connected MQTT client publish during the rest of a measurement
+ * routine without competing with UART traffic. */
+bool device_commands_publish_hold_active(void);
+
+/* MQTT transport failures observed inside a rolling window. Returns zero when
+ * the transport does not provide health history. Cheap/read-only for watchdog
+ * and STATUS telemetry use. */
+uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s);
+
+/* Register a callback fired whenever a measurement event is stored, a raw
+ * publish hold clears, or a measurement burst finishes. The sync_runner uses it
+ * to wake and drain on demand instead of polling. NULL clears it. The hook runs
+ * in the caller's task context; keep it cheap (a task notify). */
 void device_commands_set_sync_notifier(void (*fn)(void));
 
 /* Phase-1 power gate: true when it's OK to drain the MQTT backlog — i.e. the
@@ -156,6 +182,7 @@ typedef struct {
     bool            wifi_connected;
     bool            provisioned;
     bool            db_online;
+    int64_t         pending;
     bool            power_valid;        /* false if no charger / read failed */
     power_reading_t power;              /* valid only when power_valid */
     bool            publish_gate_open;  /* device_commands_publish_power_ok() */
@@ -322,30 +349,39 @@ cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status);
  * the AMBIT bootloader rolls back to the previous image on its next reboot. */
 cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status);
 
-/* Clear any in-flight publish slot (revert it to PENDING). Called from both the
- * Wi-Fi disconnect handler and, via set_disconnect_handler, the MQTT-level
- * disconnect — so a broker/TLS drop that leaves Wi-Fi associated still frees the
- * slot instead of wedging the drain until reboot. */
+/* Apply queued PUBACK/error/disconnect completions to persistence. The sync
+ * runner is the sole caller/consumer; MQTT and Wi-Fi callbacks only enqueue and
+ * wake it, so their event tasks never wait on event_log's FATFS mutex. Must run
+ * before the next claim. Leaves a failed completion queued for a later retry. */
+esp_err_t cmd_process_pending_acks(void);
+
+/* Detach every unacknowledged publish-window slot and enqueue one PENDING
+ * transition per record. Called from both the Wi-Fi disconnect handler and, via
+ * set_disconnect_handler, the MQTT-level disconnect. This function never
+ * touches persistence; the sync runner applies the transitions through
+ * cmd_process_pending_acks(). */
 void device_commands_on_mqtt_disconnect(void);
 
-/* Clear the in-flight publish slot WITHOUT marking the event pending — the caller
- * has already rewound the persistence cursor (see event_log_rewind), so the event
- * is pending by position. Frees the slot so the drain can re-publish immediately
- * instead of waiting out the reaper. A late PUBACK for the abandoned msg_id is a
- * no-op. Used by the `evlog rewind` CLI command. */
+/* Clear the whole in-flight publish table and completion queue WITHOUT marking
+ * records pending — the caller is about to rewind persistence (see
+ * event_log_rewind), so they become pending by position. Late PUBACKs for the
+ * abandoned ids are no-ops. Used by the `evlog rewind` CLI command. */
 void device_commands_abort_inflight(void);
 
-/* Revert a stale in-flight publish slot to PENDING if it has been latched longer
+/* Revert one stale in-flight publish slot to PENDING if it has been latched longer
  * than max_age_ms. A lost/expired PUBACK (e.g. esp-mqtt outbox expiry) with the
- * connection nominally up leaves no callback, so without this the one-in-flight
- * slot never clears and the whole drain wedges until reboot. Returns true if a
+ * connection nominally up leaves no callback, so without this the frontier can
+ * wedge until reboot. Returns true if a
  * stale slot was reaped. Called by the sync_runner while draining. */
 bool device_commands_reap_stale_inflight(int64_t max_age_ms);
 
-/* Diagnostic: report the in-flight publish slot. *msg_id and *measure_id are -1
- * when idle; *age_ms is ms since the slot was latched (0 when idle). Any
- * out-pointer may be NULL. */
+/* Diagnostic: report the oldest in-flight publish slot. *msg_id and *measure_id
+ * are -1 when idle; *age_ms is ms since that slot was latched. */
 void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *age_ms);
+
+/* Snapshot active/reserved MQTT slot count and exact serialized envelope bytes.
+ * Any out-pointer may be NULL. */
+void device_commands_window_status(size_t *slots, size_t *bytes);
 
 /* Test hook: inject a fake, already-stale in-flight slot (no real measure_id) so
  * the reaper path can be exercised on hardware without engineering a lost PUBACK.
@@ -354,8 +390,7 @@ void device_commands_inject_stale_inflight(void);
 
 /* Milliseconds since the last successful PUBACK (monotonic; seeded to boot time).
  * The connectivity watchdog uses this to detect a device that should be
- * publishing but cannot. Returns 0 if the reading couldn't be taken (treated as
- * healthy so the watchdog never reboots on transient contention). */
+ * publishing but cannot. */
 int64_t device_commands_ms_since_publish_ok(void);
 
 #ifdef __cplusplus

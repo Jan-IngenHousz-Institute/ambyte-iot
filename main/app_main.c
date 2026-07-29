@@ -15,6 +15,7 @@
 #include "device_config.h"
 #include "timezone.h"
 #include "bme280.h"
+#include "bench_diag.h"
 #include "command_router.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
@@ -213,6 +214,17 @@ static void app_maintenance_end(void)
     taskEXIT_CRITICAL(&s_maint_mux);
 }
 
+/* Registered with sync_runner as the all-reboot maintenance veto. This is the
+ * same interlock used by OTA, script exec/update, and AMBIT flash: the narrower
+ * OTA admission flag cannot protect sensor-board firmware writes. */
+static bool app_maintenance_active(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    bool active = s_maint_busy;
+    taskEXIT_CRITICAL(&s_maint_mux);
+    return active;
+}
+
 /* Refcounted MQTT suspend/resume for the maintenance workers (belt-and-suspenders
  * to the maintenance lock above). Raw mqtt_client_stop/start are idempotent but
  * NOT refcounted — this wrapper restarts MQTT only when the LAST holder resumes,
@@ -306,6 +318,14 @@ static bool app_boot_is_complete(void)
     bool done = s_boot_complete;
     taskEXIT_CRITICAL(&s_boot_mux);
     return done;
+}
+
+/* MQTT reconnects can land while the publisher is sleeping on its 30 s safety
+ * fallback. Wake it immediately; sync_runner_notify() is a no-op before start. */
+static void app_on_mqtt_connect(void *ctx)
+{
+    (void)ctx;
+    sync_runner_notify();
 }
 
 /* Open the boot gate: deferred MQTT + the upload drain may start. MUST run on
@@ -620,7 +640,9 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)base; (void)id; (void)data;
+    (void)arg; (void)base; (void)id;
+    const wifi_event_sta_disconnected_t *disconnected = data;
+    mqtt_client_note_wifi_disconnect(disconnected != NULL ? disconnected->reason : 0);
     /* A drop before boot completes cancels any parked MQTT start — the next
      * GOT_IP re-parks (or starts) it as appropriate. */
     taskENTER_CRITICAL(&s_boot_mux);
@@ -1071,7 +1093,10 @@ void app_main(void)
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .sd_health          = persistence_available ? app_sd_health                         : NULL,
         .publish                = mqtt_client_get_publish_fn(),
+        .enqueue                = mqtt_client_get_enqueue_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
+        .error_disconnect_count = mqtt_client_get_error_disconnect_count_fn(),
+        .connection_stats       = mqtt_client_get_connection_stats_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
         .set_disconnect_handler = mqtt_client_get_set_disconnect_handler_fn(),
         .topic_root             = topic_root,
@@ -1087,6 +1112,8 @@ void app_main(void)
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
         .request_gc             = lua_runner_request_gc,
+        .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
+        .watchdog_armed         = sync_runner_watchdog_armed,
     };
     device_commands_init(&cmd_cfg);
 
@@ -1100,10 +1127,16 @@ void app_main(void)
     if (persistence_available) {
         uint32_t heartbeat_s = 300;                       /* default 5 min */
         (void)device_config_get_heartbeat_s(&heartbeat_s); /* NVS override */
+        sync_runner_set_maintenance_probe(app_maintenance_active);
         esp_err_t sr_err = sync_runner_start(heartbeat_s);
         if (sr_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
+        } else {
+            mqtt_client_get_set_connect_handler_fn()(app_on_mqtt_connect, NULL);
         }
+    } else {
+        ESP_LOGW(APP_TAG, "persistence unavailable — background sync, STATUS heartbeat, "
+                          "nightly reboot, and connection/memory/PUBACK self-healing disabled");
     }
 
     /* ── Field-status LED blinker (firmware-owned; Lua no longer drives the
@@ -1138,6 +1171,10 @@ void app_main(void)
      * Everything is initialized and Lua is running — the TLS handshake and
      * backlog drain can no longer compete with the startup sequence. */
     app_open_boot_gate();
+
+#if CONFIG_AMBYTE_BENCH_DIAG
+    ESP_ERROR_CHECK(bench_diag_start());
+#endif
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",
              (unsigned long)esp_get_free_heap_size(),
