@@ -10,6 +10,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -31,6 +32,7 @@
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
+#define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
 
 #define NVS_NS                 "ambit_ota"
 #define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied OTA */
@@ -53,6 +55,7 @@
 typedef struct {
     uint8_t op;                       /* AMBIT_OP_* */
     uint8_t channel;
+    bool    fleet_spread;             /* remote URL OTA only; local CLI stays immediate */
     char    url[AMBIT_OTA_URL_MAX];   /* OTA: download URL; FLASH: /sdcard/ambit_fw/<ver> dir */
     char    id[AMBIT_OTA_ID_MAX];
 } ambit_ota_req_t;
@@ -194,6 +197,23 @@ static void report_busy(const ambit_ota_req_t *r)
     case AMBIT_OP_PROBE:    report_as("ambit_probe",        "busy", r->channel, r->id, detail); break;
     case AMBIT_OP_VERSIONS: report_as("ambit_versions",     "busy", r->channel, r->id, detail); break;
     default:                report_detail("busy", r->channel, r->id, detail);                   break;
+    }
+}
+
+/* Hold the maintenance gate and shared worker during the per-device slot, but
+ * leave MQTT and Lua active until the existing quiesce sequence begins. */
+static void wait_for_fleet_slot(void)
+{
+    uint32_t delay_s = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(AMBIT_OTA_FLEET_JITTER_SLOTS,
+                                                   &delay_s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA MAC unavailable for fleet AMBIT OTA jitter: %s — using 0 s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "fleet AMBIT OTA delay: %lu s", (unsigned long)delay_s);
+    if (delay_s > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000U));
     }
 }
 
@@ -447,6 +467,8 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
      * nothing on receipt. */
     report("accepted", r->channel, r->id);
     vTaskDelay(pdMS_TO_TICKS(500));   /* flush the ack before MQTT drops */
+
+    if (r->fleet_spread) wait_for_fleet_slot();
 
     /* Quiesce: free the UART (stop Lua) and the heap/TLS (stop MQTT). */
     if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
@@ -827,7 +849,8 @@ esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
+esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id,
+                            bool fleet_spread)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
@@ -849,6 +872,7 @@ esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
     memset(&r, 0, sizeof r);
     r.op      = AMBIT_OP_OTA;
     r.channel = channel;
+    r.fleet_spread = fleet_spread;
     strncpy(r.url, url, sizeof r.url - 1);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     return ambit_ota_enqueue(&r);
