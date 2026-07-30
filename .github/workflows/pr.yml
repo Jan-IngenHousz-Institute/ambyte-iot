@@ -1,0 +1,159 @@
+name: Firmware PR
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-pr:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build firmware
+    needs: validate-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install release tooling
+        run: npm install --ignore-scripts --package-lock=false
+
+      - name: Compute release preview
+        id: preview
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Present semantic-release with the PR tree as one squash commit whose
+          # message is the already validated PR title.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B main "${PR_HEAD_SHA}"
+          git reset --soft "${PR_BASE_SHA}"
+          git commit --allow-empty -m "${PR_TITLE}"
+
+          # Match OpenJII's PR preview: env-ci reads these process variables.
+          export GITHUB_REF="refs/heads/main"
+          export GITHUB_EVENT_NAME="push"
+          set +e
+          npx semantic-release --dry-run --no-ci 2>&1 | tee release-preview.log
+          RELEASE_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [[ ${RELEASE_STATUS} -ne 0 ]]; then
+            exit "${RELEASE_STATUS}"
+          fi
+
+          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}' || true)
+          if [[ -n "${VERSION}" ]]; then
+            BUILD_VERSION="${VERSION}"
+            ZIP_NAME="ambyte-iot-v${VERSION}.zip"
+            WILL_RELEASE=true
+          else
+            BUILD_VERSION="pr-${PR_NUMBER}-${PR_HEAD_SHA:0:12}"
+            ZIP_NAME="ambyte-iot-${BUILD_VERSION}.zip"
+            WILL_RELEASE=false
+          fi
+
+          echo "version=${BUILD_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "zip-name=${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "will-release=${WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Firmware release preview"
+            echo
+            if [[ "${WILL_RELEASE}" == "true" ]]; then
+              echo "Merging this PR will publish **v${VERSION}**."
+            else
+              echo "Merging this PR will not create a firmware release."
+            fi
+            echo
+            echo "- Title: \`${PR_TITLE}\`"
+            echo "- Build version: \`${BUILD_VERSION}\`"
+          } | tee release-preview.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: |
+          python -m venv "${RUNNER_TEMP}/platformio"
+          "${RUNNER_TEMP}/platformio/bin/pip" install --disable-pip-version-check platformio==6.1.19
+
+      - name: Build unprovisioned firmware
+        env:
+          AMBYTE_NVS_SKIP: "1"
+          AMBYTE_PROJECT_VER: ${{ steps.preview.outputs.version }}
+        run: "${RUNNER_TEMP}/platformio/bin/pio run -e esp32-s3-devkitm-1"
+
+      - name: Verify version and create flash ZIP
+        env:
+          FIRMWARE_VERSION: ${{ steps.preview.outputs.version }}
+          ZIP_NAME: ${{ steps.preview.outputs.zip-name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_DIR=".pio/build/esp32-s3-devkitm-1"
+          BUILD_FILES=(
+            firmware.bin
+            bootloader.bin
+            partitions.bin
+            ota_data_initial.bin
+            flasher_args.json
+          )
+          for FILE in "${BUILD_FILES[@]}"; do
+            test -f "${BUILD_DIR}/${FILE}"
+          done
+          test ! -f "${BUILD_DIR}/nvs.bin"
+
+          "${RUNNER_TEMP}/platformio/bin/pio" pkg exec -p tool-esptoolpy -- \
+            esptool.py image_info --version 2 "${BUILD_DIR}/firmware.bin" \
+            | tee app-info.txt
+          grep -F "App version: ${FIRMWARE_VERSION}" app-info.txt
+
+          mkdir -p dist
+          cp "${BUILD_DIR}/firmware.bin" dist/firmware.bin
+          cp release-preview.md dist/release-preview.md
+          mkdir -p dist/bundle/bootloader dist/bundle/partition_table
+          cp "${BUILD_DIR}/firmware.bin" dist/bundle/ambyte-iot.bin
+          cp "${BUILD_DIR}/bootloader.bin" dist/bundle/bootloader/bootloader.bin
+          cp "${BUILD_DIR}/partitions.bin" dist/bundle/partition_table/partition-table.bin
+          cp "${BUILD_DIR}/ota_data_initial.bin" dist/bundle/ota_data_initial.bin
+          cp "${BUILD_DIR}/flasher_args.json" dist/bundle/flasher_args.json
+          (cd dist/bundle && zip -9 -r "../${ZIP_NAME}" .)
+          rm -rf dist/bundle
+
+      - name: Upload firmware candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-${{ github.event.pull_request.head.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

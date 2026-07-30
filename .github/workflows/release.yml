@@ -1,0 +1,107 @@
+name: Release firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install release tooling
+        run: npm install --ignore-scripts --package-lock=false
+
+      - name: Determine next release
+        id: preview
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx semantic-release --dry-run --no-ci 2>&1 | tee release-preview.log
+          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}' || true)
+          if [[ -n "${VERSION}" ]]; then
+            echo "will-release=true" >> "${GITHUB_OUTPUT}"
+            echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "will-release=false" >> "${GITHUB_OUTPUT}"
+            echo "No firmware release is required." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Locate PR firmware artifact
+        id: artifact
+        if: steps.preview.outputs.will-release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUBJECT=$(git log -1 --pretty=%s)
+          PR_NUMBER=$(printf '%s' "${SUBJECT}" | sed -nE 's/.*\(#([0-9]+)\).*/\1/p')
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "::error::Release commit subject has no squash PR number: ${SUBJECT}"
+            exit 1
+          fi
+          HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
+          ARTIFACT_NAME="firmware-${HEAD_SHA}"
+          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "::error::No live PR artifact named ${ARTIFACT_NAME}"
+            exit 1
+          fi
+          echo "name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download PR firmware artifact
+        if: steps.preview.outputs.will-release == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: release-assets
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.artifact.outputs.run-id }}
+
+      - name: Verify release assets
+        if: steps.preview.outputs.will-release == 'true'
+        env:
+          VERSION: ${{ steps.preview.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release-assets/firmware.bin
+          test -f "release-assets/ambyte-iot-v${VERSION}.zip"
+
+      - name: Publish GitHub release
+        if: steps.preview.outputs.will-release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      - name: Release summary
+        if: steps.preview.outputs.will-release == 'true'
+        run: echo "Published firmware v${{ steps.preview.outputs.version }} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
