@@ -10,9 +10,9 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -346,23 +346,19 @@ static esp_err_t maint_latch_reboot(const char *reason, bool write_day,
     return err;
 }
 
-/* FNV-1a makes the full STA MAC contribute to a stable, inexpensive fleet
- * spread; modulo 90 places each unit in the first 90 minutes of the window. */
+/* The shared helper preserves the original full-MAC FNV-1a mapping. Reboot
+ * policy keeps ownership of its warning and zero-minute failure fallback. */
 static uint32_t nightly_jitter_minutes(void)
 {
-    uint8_t mac[6] = {0};
-    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t jitter_min = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(SYNC_NIGHT_JITTER_SPAN_MIN,
+                                                   &jitter_min);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "STA MAC unavailable for reboot jitter: %s — using 0 min",
                  esp_err_to_name(err));
         return 0;
     }
-    uint32_t hash = 2166136261U;
-    for (size_t i = 0; i < sizeof mac; i++) {
-        hash ^= mac[i];
-        hash *= 16777619U;
-    }
-    return hash % SYNC_NIGHT_JITTER_SPAN_MIN;
+    return jitter_min;
 }
 
 static bool watchdog_guard_allows(const char *key, const char *label,

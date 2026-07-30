@@ -13,6 +13,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -26,10 +27,15 @@
 #define OTA_ID_MAX         64
 #define OTA_CONFIRM_TIMEOUT_S 300     /* wait this long for MQTT before rolling back a new image */
 #define OTA_CONNECT_POLL_MS   1000
+#define OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
 /* The reboot watchdog honours an admitted OTA for 30 minutes. Beyond that the
  * cheap admission latch is presumed wedged; the global maintenance lock still
  * protects an operation that is genuinely executing. */
 #define OTA_WATCHDOG_VETO_MAX_US (30LL * 60 * 1000000)
+
+_Static_assert(OTA_WATCHDOG_VETO_MAX_US >
+               ((int64_t)(OTA_FLEET_JITTER_SLOTS - 1U) * 1000000LL),
+               "OTA watchdog veto must cover the maximum fleet jitter");
 
 #define NVS_NS      "ota_upd"
 #define KEY_APPLIED "applied_id"      /* id of the last successfully-applied image (set on success) */
@@ -147,6 +153,23 @@ static bool wait_persistence_ok(uint32_t timeout_s)
     return s_cfg.persistence_healthy();
 }
 
+/* Reserve the already-admitted maintenance worker while leaving MQTT and the
+ * measurement workload running. A MAC-read failure deliberately falls back to
+ * slot zero, matching the existing nightly-reboot policy. */
+static void wait_for_fleet_slot(void)
+{
+    uint32_t delay_s = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(OTA_FLEET_JITTER_SLOTS, &delay_s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA MAC unavailable for fleet OTA jitter: %s — using 0 s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "fleet OTA delay: %lu s", (unsigned long)delay_s);
+    if (delay_s > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000U));
+    }
+}
+
 /* ── applied-id latch (NVS) ─────────────────────────────────────────────
  * The id of the last image that was *successfully* written + booted. Set only
  * on success (right before reboot), so a FAILED download never burns the id —
@@ -204,6 +227,8 @@ static void ota_do_update(const ota_request_t *r)
 
     ota_report("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(500));   /* let the accepted report flush before comms drop */
+
+    wait_for_fleet_slot();
 
     /* Quiesce the heap for the download (the board can't hold two TLS sessions):
      * stop the Lua measurement task (its 8 KB AMBIT buffer + transient tables

@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -40,6 +41,7 @@
 
 #define SCRIPT_DL_BUF          4096     /* HTTP chunk size — small on purpose (no large contiguous alloc) */
 #define SCRIPT_HTTP_TIMEOUT_MS 20000
+#define SCRIPT_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
 
 typedef struct {
     uint8_t op;
@@ -130,6 +132,23 @@ static void report_exec(const char *id, bool ok, const char *result)
         "\"result\":\"%s\"}",
         s_cfg.device_id ? s_cfg.device_id : "", esc_id, ok ? "true" : "false", esc_res);
     if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
+}
+
+/* Keep the maintenance gate/worker reserved during the stable per-device slot.
+ * MQTT and measurements remain active until the URL handler quiesces below. */
+static void wait_for_fleet_slot(void)
+{
+    uint32_t delay_s = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(SCRIPT_FLEET_JITTER_SLOTS,
+                                                   &delay_s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA MAC unavailable for fleet script jitter: %s — using 0 s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "fleet script URL delay: %lu s", (unsigned long)delay_s);
+    if (delay_s > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000U));
+    }
 }
 
 /* ── OP_UPDATE: replace /sdcard/main.lua ──────────────────────────────────── */
@@ -418,6 +437,8 @@ static void do_update_url_impl(const script_req_t *r)
      * comms drop, mirroring the OTA path's accepted-ack flush. */
     report_script("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
+
+    wait_for_fleet_slot();
 
     /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
      * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a

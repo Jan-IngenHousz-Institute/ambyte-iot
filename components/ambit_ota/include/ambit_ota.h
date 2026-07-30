@@ -64,10 +64,14 @@ esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg);
  * raw.githubusercontent.com/… or a release-asset link, NOT a /blob//tree/ page).
  * `id` correlates status reports and dedupes a retained MQTT trigger (latched
  * only on success, so a failed attempt retries under the same id); pass NULL
- * from the CLI to never dedupe. Non-blocking: the worker quiesces, downloads,
- * streams, and the AMBIT reboots. ESP_ERR_INVALID_STATE before init;
- * ESP_ERR_INVALID_ARG on a bad channel/url; ESP_ERR_NO_MEM if one is in flight. */
-esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id);
+ * from the CLI to never dedupe. `fleet_spread` explicitly marks a remote fleet
+ * request: true waits in the stable 0-899 second device slot after acceptance,
+ * while false keeps local CLI requests immediate. Source is never inferred from
+ * `id`. Non-blocking: the worker quiesces, downloads, streams, and the AMBIT
+ * reboots. ESP_ERR_INVALID_STATE before init; ESP_ERR_INVALID_ARG on a bad
+ * channel/url; ESP_ERR_NO_MEM if one is in flight. */
+esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id,
+                            bool fleet_spread);
 
 /* Queue a fleet version sweep: read each channel's AMBIT firmware version (cmd
  * 33/2) and publish one `ambit_versions` JSON report (+ log per channel). Runs

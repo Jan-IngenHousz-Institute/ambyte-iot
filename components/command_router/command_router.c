@@ -109,7 +109,7 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_ota id=%s bad/missing 'channel' (0-3 or \"all\") — ignoring",
                      id ? id : "");
         } else {
-            esp_err_t err = ambit_ota_request(ch, url, id);
+            esp_err_t err = ambit_ota_request(ch, url, id, true /* remote fleet spread */);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ambit_ota id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
             } else {
