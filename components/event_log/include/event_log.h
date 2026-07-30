@@ -6,6 +6,17 @@
 #include "esp_err.h"
 #include "persistence_port.h"
 
+/* Compile-time storage limits shared with the AMBIT producer and MQTT publisher.
+ * event_log_init selects NORMAL when PSRAM enumerates and FALLBACK otherwise;
+ * the active runtime cap is kept private to event_log.c. A record whose byte
+ * length is >= the selected RECORD_CAP is refused, leaving the line-buffer guard
+ * available for framing/NUL safety. */
+#define EVLOG_LINE_CAP_NORMAL       65568U
+#define EVLOG_LINE_CAP_FALLBACK     12288U
+#define EVLOG_RECORD_GUARD_BYTES    16U
+#define EVLOG_RECORD_CAP_NORMAL     (EVLOG_LINE_CAP_NORMAL - EVLOG_RECORD_GUARD_BYTES)
+#define EVLOG_RECORD_CAP_FALLBACK   (EVLOG_LINE_CAP_FALLBACK - EVLOG_RECORD_GUARD_BYTES)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,6 +46,11 @@ extern "C" {
  * boot-time repair.
  */
 esp_err_t event_log_init(void);
+
+/* Register the composition-root hook that clears the MQTT correlation window
+ * after a successful SD reopen rebuilds this component from the durable cursor.
+ * NULL clears it. The callback runs after event_log releases its mutex. */
+void event_log_set_reset_notifier(void (*fn)(void));
 
 /* Called by the SD hot-plug monitor when the card is pulled/reinserted. */
 esp_err_t event_log_on_sd_lost(void);
@@ -88,7 +104,7 @@ esp_err_t event_log_health(evlog_health_t *out);
 /* Rewind the read cursor to the start of file ev-<seq>.log so that record and all
  * newer ones revert to PENDING and re-publish. Pass seq=0 to rewind to the oldest
  * file still on the card (re-publish everything). The target is clamped to the
- * files actually present, the claimed in-flight slot is abandoned, and the cursor
+ * files actually present, the RAM claim window is abandoned, and the cursor
  * is persisted to NVS. Fills *out_seq (the clamped target) and *out_pending (a
  * floor if the count was capped); either may be NULL. Re-publish is at-least-once,
  * so records already delivered are re-sent and deduped downstream on measure_id. */

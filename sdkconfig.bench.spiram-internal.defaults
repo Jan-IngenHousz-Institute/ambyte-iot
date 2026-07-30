@@ -1,0 +1,2 @@
+# Bisect A: do not preferentially allocate Wi-Fi/lwIP buffers from PSRAM.
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set

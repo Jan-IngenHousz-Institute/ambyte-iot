@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 
 #include "device_commands.h"
+#include "event_log.h"
 #include "ambit_protocol.h"   /* AMBIT_ASYNC_* run-state constants for ambit.poll */
 #include "time_sync.h"
 #include "timezone.h"
@@ -238,9 +239,10 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
-/* device.measurement_window(on) — assert/release the measurement-activity gate
- * around a whole measurement cycle so the sync_runner doesn't publish mid-cycle.
- * begin/end are reference-counted; pair every on with exactly one off. */
+/* device.measurement_window(on) — assert/release measurement activity around a
+ * whole cycle. This retains the PM no-light-sleep lock and telemetry semantics;
+ * publishing is held only by nested raw sensor transactions unless the legacy
+ * compile-time gate is enabled. Pair every on with exactly one off. */
 static int l_device_measurement_window(lua_State *L)
 {
     if (lua_toboolean(L, 1)) device_commands_measurement_begin();
@@ -1073,7 +1075,20 @@ static const char *ambit_array_tag(uint8_t idx)
  * state (an exec snippet may call ambit.run/fetch while main.lua measures), so
  * its build+store window is serialized by s_ambit_payload_mtx — created lazily
  * under a spinlock because the first contender may be either task. */
-#define AMBIT_RUN_PAYLOAD_CAP (64000)
+/* event_log's normal EVLOG_RECORD_CAP_NORMAL is exported from event_log.h. A
+ * successful payload can use
+ * at most 63999 of this 64000-B buffer; the generated record's conservative
+ * maximum is 63999 payload + 104 fixed header + 522 arrun command + 895
+ * metadata + 2 framing = 65522 B, leaving 30 B below the store cap. */
+#define AMBIT_RUN_PAYLOAD_CAP  64000
+/* Contracted from 1024 B to make the cap chain provable. Firmware-built metadata
+ * remains safe (reviewed 16-segment worst case: 790 B), but a 16-segment run now
+ * leaves only ~105 B for user opts.metadata instead of ~233 B. If the merged
+ * object exceeds this cap, ambit_meta_merge_user drops the entire user block and
+ * emits a WARN; this is an API-visible compatibility limit for field main.lua. */
+#define AMBIT_RUN_METADATA_CAP 896
+_Static_assert(AMBIT_RUN_PAYLOAD_CAP < EVLOG_RECORD_CAP_NORMAL,
+               "AMBIT payload cap must remain below the normal event-log record cap");
 static char *s_ambit_payload;
 static SemaphoreHandle_t s_ambit_payload_mtx;
 static portMUX_TYPE      s_payload_mtx_init_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -1131,7 +1146,7 @@ static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
 
 /* Per-channel state stashed by ambit.trigger for the eventual ambit.fetch store:
  * the run metadata (segments JSON) and the measurement start time. */
-static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][1024];
+static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][AMBIT_RUN_METADATA_CAP];
 static char    s_ambit_cmd[UART_SENSOR_NUM_CHANNELS][AMBIT_CMD_ASCII_CAP];
 static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
 
@@ -1242,19 +1257,56 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
     /* Run metadata, built from the packed segment array, with the channel's
      * config (gains/currents/cal_version) spliced into the same object. */
     {
+        bool segments_ok = true;
         int off = snprintf(metadata_json, meta_cap, "{\"segments\":[");
-        for (int i = 0; i < nseg && off > 0 && off < (int)meta_cap; i++) {
+        if (off < 0 || off >= (int)meta_cap) segments_ok = false;
+        for (int i = 0; i < nseg && segments_ok; i++) {
             const uint8_t *line = run_arr + i * 8;
-            off += snprintf(metadata_json + off, meta_cap - off,
-                            "%s{\"pulses\":%u,\"freq\":%u,\"actinic\":%u}", (i == 0) ? "" : ",",
-                            ((unsigned)line[2] << 8) | line[3],
-                            ((unsigned)line[4] << 8) | line[5], (unsigned)line[6]);
+            size_t rem = meta_cap - (size_t)off;
+            int wrote = snprintf(metadata_json + off, rem,
+                                 "%s{\"pulses\":%u,\"freq\":%u,\"actinic\":%u}",
+                                 (i == 0) ? "" : ",",
+                                 ((unsigned)line[2] << 8) | line[3],
+                                 ((unsigned)line[4] << 8) | line[5],
+                                 (unsigned)line[6]);
+            if (wrote < 0 || (size_t)wrote >= rem) segments_ok = false;
+            else off += wrote;
         }
-        /* Reserve room for "]," + config kvs + "}" + NUL (≤ ~100 B). */
-        if (off < 0 || off > (int)meta_cap - 100) off = (int)meta_cap - 100;
-        off += snprintf(metadata_json + off, meta_cap - off, "],");
-        off += ambit_config_kvs(&info, metadata_json + off, meta_cap - off);
-        snprintf(metadata_json + off, meta_cap - off, "}");
+
+        /* Keep 100 B for config fields and closure. If the segment list ever
+         * outgrows that structural reserve, replace it with an explicit valid
+         * sentinel object instead of clamping into the middle of a JSON token. */
+        if (segments_ok && off <= (int)meta_cap - 100) {
+            size_t rem = meta_cap - (size_t)off;
+            int wrote = snprintf(metadata_json + off, rem, "],");
+            if (wrote < 0 || (size_t)wrote >= rem) segments_ok = false;
+            else off += wrote;
+        } else {
+            segments_ok = false;
+        }
+        if (!segments_ok) {
+            off = snprintf(metadata_json, meta_cap,
+                           "{\"segments\":null,\"metadata_truncated\":true,");
+        }
+
+        bool metadata_ok = off > 0 && off < (int)meta_cap;
+        if (metadata_ok) {
+            size_t rem = meta_cap - (size_t)off;
+            int wrote = ambit_config_kvs(&info, metadata_json + off, rem);
+            if (wrote < 0 || (size_t)wrote >= rem) metadata_ok = false;
+            else off += wrote;
+        }
+        if (metadata_ok) {
+            size_t rem = meta_cap - (size_t)off;
+            int wrote = snprintf(metadata_json + off, rem, "}");
+            if (wrote != 1 || (size_t)wrote >= rem) metadata_ok = false;
+        }
+        if (!metadata_ok) {
+            /* meta_cap is a fixed 896 B today, so this final literal always fits;
+             * keep it valid even if a future config field breaks the reserve. */
+            snprintf(metadata_json, meta_cap,
+                     "{\"segments\":null,\"metadata_truncated\":true}");
+        }
     }
     return run_arr;
 }
@@ -1418,7 +1470,7 @@ static int l_ambit_run(lua_State *L)
         lua_pop(L, 1);
     }
 
-    char metadata_json[1024];
+    char metadata_json[AMBIT_RUN_METADATA_CAP];
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg, metadata_json, sizeof metadata_json);
     ambit_meta_merge_user(L, 3, metadata_json, sizeof metadata_json);
 

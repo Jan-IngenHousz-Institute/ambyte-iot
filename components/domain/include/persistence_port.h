@@ -19,6 +19,18 @@ typedef enum {
     MEASUREMENT_SYNC_SYNCED   = 2,
 } measurement_sync_state_t;
 
+/* Firmware 1.0.6 publish-window defaults.  Sixteen slots cover roughly ten
+ * good-link PUBACK round trips inside a short connection without approaching
+ * AWS IoT's 100-message limit; the independent 64-KiB byte ceiling bounds the
+ * ESP-MQTT outbox when records vary from small STATUS events to array traces.
+ * Both remain compile-time knobs until field data justifies runtime tuning. */
+#ifndef PUBLISH_WINDOW_SLOTS
+#define PUBLISH_WINDOW_SLOTS 16U
+#endif
+#ifndef PUBLISH_WINDOW_BYTES
+#define PUBLISH_WINDOW_BYTES 65536U
+#endif
+
 /* Origin tags (schema v2). Firmware-assigned — never user strings. */
 #define MEASUREMENT_TAG_MEASUREMENT "MEASUREMENT"   /* script-originated data    */
 #define MEASUREMENT_TAG_STATUS      "STATUS"        /* background status report  */
@@ -92,8 +104,13 @@ typedef esp_err_t (*measurement_next_id_fn)(int64_t *out_id);
  * available (SD mounted). */
 typedef esp_err_t (*measurement_store_event_fn)(const measurement_event_desc_t *desc);
 
-/* Claim the oldest PENDING event, flip it INFLIGHT, return it (heap strings —
- * free with measurement_event_free). ESP_ERR_NOT_FOUND when none pending. */
+/* Claim order is strict over the durable cursor: first return the oldest
+ * reverted/unacked slot already in the bounded window, otherwise append the
+ * record immediately after the claim tail. A new offset may never pass a
+ * reverted gap. ACKed-but-not-prefix slots stay occupied until the contiguous
+ * frontier closes. Returned strings are heap-owned; free with
+ * measurement_event_free. ESP_ERR_NOT_FOUND means no record is currently
+ * available; ESP_ERR_INVALID_STATE may mean the slot/byte window is full. */
 typedef esp_err_t (*measurement_claim_next_event_fn)(measurement_event_t *out);
 
 typedef esp_err_t (*measurement_mark_event_synced_fn)(int64_t measure_id);

@@ -1,0 +1,2 @@
+# Bisect C: disable dynamic frequency scaling/power management.
+# CONFIG_PM_ENABLE is not set

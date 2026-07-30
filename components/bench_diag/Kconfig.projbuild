@@ -1,0 +1,19 @@
+menu "Ambyte bench diagnostics"
+
+config AMBYTE_BENCH_DIAG
+    bool "Enable root-cause bench diagnostics"
+    default n
+    help
+        Starts a low-priority task which reports heap-capability, lwIP socket,
+        lwIP protocol, and Wi-Fi buffer diagnostics once per minute. This is a
+        bench-only facility and is disabled in production builds.
+
+config AMBYTE_BENCH_WIFI_PS_NONE
+    bool "Force Wi-Fi power save off for the bench"
+    depends on AMBYTE_BENCH_DIAG
+    default n
+    help
+        After Wi-Fi has started, override the production WIFI_PS_MIN_MODEM mode
+        with WIFI_PS_NONE. Use only for the Wi-Fi power-save bisect run.
+
+endmenu

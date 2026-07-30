@@ -1,0 +1,2 @@
+# Bisect B: bench_diag overrides WIFI_PS_MIN_MODEM after esp_wifi_start().
+CONFIG_AMBYTE_BENCH_WIFI_PS_NONE=y

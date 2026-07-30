@@ -18,6 +18,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_MQTT_PROTOCOL_5=y
 # CONFIG_MQTT_PROTOCOL_311 is not set
+# Incremental packet ids prevent a random-id collision from applying a PUBACK to
+# the wrong queued record and silently advancing the persistence cursor.
+CONFIG_MQTT_MSG_ID_INCREMENTAL=y
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_HEAP_POISONING_LIGHT=y

@@ -15,7 +15,9 @@
 #include "device_config.h"
 #include "timezone.h"
 #include "bme280.h"
+#include "bench_diag.h"
 #include "command_router.h"
+#include "clock_trust.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
@@ -28,7 +30,9 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_pm.h"
+#include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
@@ -70,6 +74,55 @@
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
  * recovery if the RTC is set/validated after boot). */
 #define APP_RTC_SYNC_INTERVAL_S 3600U
+
+/* esp-idf's default SNTP hook is weak, which lets us enforce the same 2024
+ * validity floor as the publisher BEFORE settimeofday() can move the clock.
+ * The esp_netif_sntp callback runs only after the default hook, which would be
+ * too late: even a rejected packet could transiently stamp/store 1970 events.
+ * Immediate stepping is intentional. Event timestamps are captured at store
+ * time, and a queued event is immutable; elapsed-time caveats are audited in
+ * ticket 09's report rather than hidden here.
+ * CAVEATS (ticket-09 review n4/n5): overriding this weak symbol suppresses
+ * IDF's sync-notification dispatch, so esp_netif_sntp_sync_wait() would block
+ * forever — never use it in this firmware. And because the override always
+ * calls settimeofday, EVERY sync (hourly re-syncs included, ms-scale) is an
+ * immediate step, not a slew; smooth_sync=false below is not a per-sync choice. */
+void sntp_sync_time(struct timeval *tv)
+{
+    if (tv == NULL || tv->tv_sec < (time_t)CLOCK_TRUST_VALID_FLOOR_S) {
+        ESP_LOGE(APP_TAG, "SNTP sample rejected below 2024 floor: %lld",
+                 (long long)(tv != NULL ? tv->tv_sec : 0));
+        return;
+    }
+
+    if (settimeofday(tv, NULL) != 0) {
+        ESP_LOGE(APP_TAG, "SNTP settimeofday failed for epoch %lld",
+                 (long long)tv->tv_sec);
+        return;
+    }
+    sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
+    clock_trust_note_sntp();
+
+    /* Make the correction survive a reboot/power interruption. The RTC setter
+     * is UTC-pure (no process-global TZ changes) and reads the calendar back;
+     * failure does not undo the accepted system-clock correction. */
+    esp_err_t rtc_err = pcf2131tfy_rtc_set_epoch(tv->tv_sec);
+    if (rtc_err != ESP_OK && rtc_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(APP_TAG, "SNTP correction could not be written to RTC: %s",
+                 esp_err_to_name(rtc_err));
+    }
+    /* Authoritative write: SNTP may LOWER a poisoned floor (a clock that ran
+     * fast poisons the monotonic hwm; without this, every boot re-adopts the
+     * future value and the following SNTP step backwards re-wedges all
+     * wall-clock deadlines — observed on the bench 2026-07-29). */
+    esp_err_t hwm_err = clock_trust_set_hwm_authoritative(tv->tv_sec);
+    if (hwm_err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "SNTP correction could not refresh time high-water: %s",
+                 esp_err_to_name(hwm_err));
+    }
+    ESP_LOGI(APP_TAG, "SNTP synchronized epoch %lld; write-back attempted",
+             (long long)tv->tv_sec);
+}
 
 /* Replace the first occurrence of `token` in NUL-terminated `buf` (capacity
  * `cap`) with `repl`, in place. No-op if the token is absent or the result
@@ -213,6 +266,17 @@ static void app_maintenance_end(void)
     taskEXIT_CRITICAL(&s_maint_mux);
 }
 
+/* Registered with sync_runner as the all-reboot maintenance veto. This is the
+ * same interlock used by OTA, script exec/update, and AMBIT flash: the narrower
+ * OTA admission flag cannot protect sensor-board firmware writes. */
+static bool app_maintenance_active(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    bool active = s_maint_busy;
+    taskEXIT_CRITICAL(&s_maint_mux);
+    return active;
+}
+
 /* Refcounted MQTT suspend/resume for the maintenance workers (belt-and-suspenders
  * to the maintenance lock above). Raw mqtt_client_stop/start are idempotent but
  * NOT refcounted — this wrapper restarts MQTT only when the LAST holder resumes,
@@ -308,6 +372,14 @@ static bool app_boot_is_complete(void)
     return done;
 }
 
+/* MQTT reconnects can land while the publisher is sleeping on its 30 s safety
+ * fallback. Wake it immediately; sync_runner_notify() is a no-op before start. */
+static void app_on_mqtt_connect(void *ctx)
+{
+    (void)ctx;
+    sync_runner_notify();
+}
+
 /* Open the boot gate: deferred MQTT + the upload drain may start. MUST run on
  * EVERY app_main exit path that is reachable after the Wi-Fi connect kick-off —
  * an early `return` that skips it parks MQTT forever (on_got_ip defers while
@@ -353,12 +425,32 @@ static esp_err_t app_init_i2c_and_sensors(void)
         flash_time = 0;
     }
 
+    bool start_rtc_periodic_sync = false;
+    bool rtc_trust_mismatch = false;
     if (pcf2131tfy_rtc_is_ready()) {
+        bool osf_stopped = false;
+        esp_err_t osf_err = pcf2131tfy_rtc_get_oscillator_stopped(&osf_stopped);
         /* Push the RTC into the ESP-IDF system clock so gettimeofday / time(NULL)
          * return real UTC (every measurement startTicks + MQTT timestamp depends
          * on this). A never-set RTC reports its time as invalid (OSF) and is
          * skipped. */
         bool clock_ok = (pcf2131tfy_rtc_sync_system_clock() == ESP_OK);
+        /* OSF=true should make the read invalid; OSF=false should make a
+         * well-formed calendar readable. Any disagreement means the hardware
+         * trust flag did not describe the calendar we actually consumed. Keep
+         * that evidence sticky in STATUS even if a fallback later repairs it.
+         * NOTE: this cross-check catches OTHER trust failures, not the observed
+         * 2026-07-29 bench case (oscillator paused during a power cut and
+         * resumed with OSF clear — reads valid, time silently behind). That
+         * failure is invisible here BY CONSTRUCTION; the clock_trust high-water
+         * floor below is the only defence. Do not weaken the HWM guard on the
+         * assumption that OSF covers it. */
+        rtc_trust_mismatch = osf_err != ESP_OK || (osf_stopped == clock_ok);
+        if (rtc_trust_mismatch) {
+            ESP_LOGE(APP_TAG, "RTC TRUST MISMATCH: OSF=%s read=%s (%s)",
+                     osf_stopped ? "stopped" : "clear",
+                     clock_ok ? "valid" : "invalid", esp_err_to_name(osf_err));
+        }
         if (clock_ok) {
             ESP_LOGI(APP_TAG, "system clock synced from RTC");
         }
@@ -382,9 +474,7 @@ static esp_err_t app_init_i2c_and_sensors(void)
             ESP_LOGW(APP_TAG, "RTC time invalid/unreadable — system clock not set; "
                               "set the RTC and it will auto-sync (no reboot needed)");
         }
-        /* Re-sync periodically: corrects drift over long uptimes and recovers the
-         * clock without a reboot if the RTC is set/validated after boot. */
-        pcf2131tfy_rtc_start_periodic_sync(APP_RTC_SYNC_INTERVAL_S);
+        start_rtc_periodic_sync = true;
     } else if (flash_time != 0 && time(NULL) < (time_t)flash_time) {
         /* No RTC at all (dev board): seed the system clock from the flash time
          * so timestamps beat 1970. Not battery-backed — resets every reboot. */
@@ -392,6 +482,36 @@ static esp_err_t app_init_i2c_and_sensors(void)
         settimeofday(&tv, NULL);
         ESP_LOGW(APP_TAG, "no RTC — system clock seeded from flash time %lu "
                           "(volatile; resets on reboot)", (unsigned long)flash_time);
+    }
+
+    /* The RTC's OSF was not reliable on the bench brownout. A durable hourly
+     * high-water therefore acts as a monotonic lower bound even when the RTC
+     * looks valid. If adopted, write the same floor to the RTC before enabling
+     * its periodic readback; otherwise an offline unit could roll back again at
+     * the first hourly RTC sync. */
+    bool adopted_hwm = false;
+    time_t hwm_floor = 0;
+    esp_err_t trust_err = clock_trust_boot_guard(rtc_trust_mismatch,
+                                                 &adopted_hwm, &hwm_floor);
+    if (trust_err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "clock high-water guard unavailable: %s",
+                 esp_err_to_name(trust_err));
+    } else if (adopted_hwm && pcf2131tfy_rtc_is_ready()) {
+        esp_err_t floor_err = pcf2131tfy_rtc_set_epoch(hwm_floor);
+        if (floor_err != ESP_OK) {
+            /* System clock remains at the safe floor. Suppress RTC readback
+             * until reboot/SNTP rather than re-introducing the stale calendar. */
+            start_rtc_periodic_sync = false;
+            ESP_LOGE(APP_TAG, "high-water adopted but RTC floor write failed (%s); "
+                                  "periodic RTC sync disabled",
+                     esp_err_to_name(floor_err));
+        }
+    }
+
+    if (start_rtc_periodic_sync) {
+        /* Re-sync periodically: corrects drift over long uptimes and recovers the
+         * clock without a reboot if the RTC is set/validated after boot. */
+        pcf2131tfy_rtc_start_periodic_sync(APP_RTC_SYNC_INTERVAL_S);
     }
 
     /* Install the DST rule for the configured IANA timezone so the RTC-based
@@ -601,9 +721,38 @@ static void app_start_cli(void)
 
 /* ── Wi-Fi → MQTT lifecycle handlers ─────────────────────────────── */
 
+static bool s_sntp_started;
+
+static void app_start_sntp_once(void)
+{
+    if (s_sntp_started) return;
+
+    /* Initialize only after GOT_IP: starting earlier just creates DNS/UDP churn
+     * against a link that cannot answer. One pool server is enough; lwIP keeps
+     * polling at CONFIG_LWIP_SNTP_UPDATE_DELAY (currently one hour), repairing
+     * normal RTC drift after the first mandatory online correction. */
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    config.wait_for_sync = false;
+    config.smooth_sync = false;
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err == ESP_OK) {
+        s_sntp_started = true;
+        ESP_LOGI(APP_TAG, "SNTP started (pool.ntp.org, immediate mode)");
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        /* Another composition owner initialized esp_netif_sntp first. Treat it
+         * as running; repeated GOT_IP events must never restart/reset service. */
+        s_sntp_started = true;
+        ESP_LOGW(APP_TAG, "SNTP already initialized");
+    } else {
+        ESP_LOGW(APP_TAG, "SNTP start failed: %s; retrying on next GOT_IP",
+                 esp_err_to_name(err));
+    }
+}
+
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    app_start_sntp_once();
     taskENTER_CRITICAL(&s_boot_mux);
     bool defer = !s_boot_complete;
     if (defer) {
@@ -620,7 +769,9 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)base; (void)id; (void)data;
+    (void)arg; (void)base; (void)id;
+    const wifi_event_sta_disconnected_t *disconnected = data;
+    mqtt_client_note_wifi_disconnect(disconnected != NULL ? disconnected->reason : 0);
     /* A drop before boot completes cancels any parked MQTT start — the next
      * GOT_IP re-parks (or starts) it as appropriate. */
     taskENTER_CRITICAL(&s_boot_mux);
@@ -1072,6 +1223,8 @@ void app_main(void)
         .sd_health          = persistence_available ? app_sd_health                         : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
+        .error_disconnect_count = mqtt_client_get_error_disconnect_count_fn(),
+        .connection_stats       = mqtt_client_get_connection_stats_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
         .set_disconnect_handler = mqtt_client_get_set_disconnect_handler_fn(),
         .topic_root             = topic_root,
@@ -1087,8 +1240,16 @@ void app_main(void)
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
         .request_gc             = lua_runner_request_gc,
+        .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
+        .watchdog_armed         = sync_runner_watchdog_armed,
     };
     device_commands_init(&cmd_cfg);
+    if (persistence_available) {
+        /* SD restore rebuilds event_log's volatile claim window. Clear the peer
+         * MQTT latch/queue through a registered callback rather than coupling
+         * the infrastructure component directly to device_commands. */
+        event_log_set_reset_notifier(device_commands_on_persistence_reset);
+    }
 
     /* ── CLI ──────────────────────────────────────────────────────────
      * Console first: everything below (sync runner, AMBIT firmware sync, Lua)
@@ -1100,10 +1261,16 @@ void app_main(void)
     if (persistence_available) {
         uint32_t heartbeat_s = 300;                       /* default 5 min */
         (void)device_config_get_heartbeat_s(&heartbeat_s); /* NVS override */
+        sync_runner_set_maintenance_probe(app_maintenance_active);
         esp_err_t sr_err = sync_runner_start(heartbeat_s);
         if (sr_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
+        } else {
+            mqtt_client_get_set_connect_handler_fn()(app_on_mqtt_connect, NULL);
         }
+    } else {
+        ESP_LOGW(APP_TAG, "persistence unavailable — background sync, STATUS heartbeat, "
+                          "nightly reboot, and connection/memory/PUBACK self-healing disabled");
     }
 
     /* ── Field-status LED blinker (firmware-owned; Lua no longer drives the
@@ -1138,6 +1305,10 @@ void app_main(void)
      * Everything is initialized and Lua is running — the TLS handshake and
      * backlog drain can no longer compete with the startup sequence. */
     app_open_boot_gate();
+
+#if CONFIG_AMBYTE_BENCH_DIAG
+    ESP_ERROR_CHECK(bench_diag_start());
+#endif
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",
              (unsigned long)esp_get_free_heap_size(),

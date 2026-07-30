@@ -19,3 +19,9 @@ planning-internalDocs/
 databricks/
 log_debug/
 dataset.csv
+
+# PlatformIO writes one full sdkconfig per additive bench environment. The
+# maintained inputs are sdkconfig.bench*.defaults; these generated files are not.
+sdkconfig.bench
+sdkconfig.bench-*
+graphify-out/

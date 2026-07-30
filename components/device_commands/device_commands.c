@@ -1,4 +1,5 @@
 #include "device_commands.h"
+#include "event_log.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -10,8 +11,10 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "clock_trust.h"
 #include "timezone.h"
 
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
@@ -22,7 +25,7 @@
 #include "wifi_manager.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #define TAG "dev_cmd"
@@ -30,10 +33,36 @@
 #define MQTT_TOPIC_MAX        256
 #define MQTT_PAYLOAD_MAX     (128U * 1024U)   /* AWS IoT max payload */
 
+/* Bench-gated large-publish ceiling. The default derives from the normal store
+ * cap plus 4 KiB of JSON-envelope headroom, so producer/store changes cannot
+ * silently make a valid record hit the publish-policy archive path. A
+ * conservative field build can set
+ * -DAMBYTE_PUBLISH_MAX_BYTES=16384 until chunking exists. This gate is distinct
+ * from the larger store cap: lowering it archives an over-cap event to the
+ * event-log quarantine sidecar, increments s_oversize_skipped, and advances the
+ * FIFO instead of silently dropping data or head-of-line blocking forever. */
+#ifndef AMBYTE_PUBLISH_MAX_BYTES
+#define AMBYTE_PUBLISH_MAX_BYTES (EVLOG_RECORD_CAP_NORMAL + 4096U)
+#define AMBYTE_PUBLISH_CAP_IS_DEFAULT 1
+#else
+#define AMBYTE_PUBLISH_CAP_IS_DEFAULT 0
+#endif
+
+#define DC_EVENT_ENVELOPE_FMT \
+        "{\"sample\":[{" \
+            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld," \
+            "\"timestamp_local\":\"%s\"," \
+            "\"published\":\"%s\",\"channel\":%s,\"device\":%s," \
+            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s" \
+        "}]," \
+        "\"timestamp\":\"%s\",%s%s" \
+        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+
 /* Large-publish heap gate (Track 1) — see the gate in cmd_mqtt_publish_next_event.
- * An arrun-trace envelope (~5–9 KB) needs a contiguous outbox copy plus a
- * transient ~4.4 KB mbedTLS write buffer; a burst of small publishes fragments the
- * heap so the largest free block can fall below that even with ample total free. */
+ * An arrun envelope can now approach 64 KiB and needs an outbox copy plus a
+ * transient mbedTLS write buffer. The large mallocs route to PSRAM, while the
+ * internal/DMA pools still need contiguous TLS/lwIP headroom. */
 #define DC_LARGE_PUBLISH_BYTES     3072U   /* envelopes above this get the heap gate */
 #define DC_PUBLISH_HEAP_HEADROOM   2048U   /* floor slack atop the envelope copy (payload_json is freed pre-publish; TLS write ~2.4 KB) */
 #define DC_PUBLISH_SETTLE_MS       300U    /* let the requested GC + transient frees land before re-checking */
@@ -45,38 +74,156 @@
  * ~8300 events behind it on a unit whose largest free block never recovers. */
 #define DC_PUBLISH_STUCK_MAX       30
 
+/* Window 16 + a full disconnect flush + margin. Producers still drop the newest
+ * completion on overflow: the corresponding latch is restored, so its event-log
+ * slot remains unadvanced and is eventually reaped/replayed. */
+#define DC_ACK_QUEUE_DEPTH         32
+
+_Static_assert(PUBLISH_WINDOW_SLOTS > 0 && PUBLISH_WINDOW_SLOTS <= 16,
+               "device-command ACK table supports at most 16 publish slots");
+_Static_assert(DC_ACK_QUEUE_DEPTH >= (2U * PUBLISH_WINDOW_SLOTS),
+               "ACK queue must hold a full window plus disconnect-flush headroom");
+_Static_assert(AMBYTE_PUBLISH_MAX_BYTES > 0 && AMBYTE_PUBLISH_MAX_BYTES < MQTT_PAYLOAD_MAX,
+               "publish cap must be non-zero and below the broker payload limit");
+#if AMBYTE_PUBLISH_CAP_IS_DEFAULT
+_Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
+               "default publish cap must exceed the normal store cap");
+#endif
+
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
-/* In-flight publish tracking. The sync runner claims a batch of measurement
- * groups, the MQTT layer publishes them as one message, and the broker's
- * PUBACK matches by msg_id back to the listed measure_ids. The mutex
- * serialises read/mutate access across the Lua task, sync runner, and the
- * MQTT event task that fires on_publish_ack. */
-static SemaphoreHandle_t s_inflight_mtx = NULL;
-static StaticSemaphore_t s_inflight_mtx_storage;
-/* One event in flight at a time (one measure_id = one MQTT message). */
-static int64_t s_inflight_measure_id = -1;
-static int     s_inflight_msg_id     = -1;
-/* Monotonic (esp_timer) ms when the slot was latched; 0 when idle. Used by
- * device_commands_reap_stale_inflight() to break a wedge from a lost PUBACK. */
-static int64_t s_inflight_since_ms   = 0;
+/* In-flight publish tracking. This spinlock protects ONLY the small RAM table:
+ * no allocation, logging, MQTT call, event-log call, or other I/O may occur
+ * inside it. Consequently the esp-mqtt task can resolve msg_id -> measure_id in
+ * a bounded critical section even while event_log's unrelated s_mtx is held for
+ * seconds by FATFS. Task context only: this path is NOT
+ * ISR-safe (portENTER_CRITICAL plus xQueueSend, not the FromISR variants). */
+static portMUX_TYPE s_inflight_mtx = portMUX_INITIALIZER_UNLOCKED;
+
+/* msg_id < 0 means the slot is reserved around esp_mqtt_client_publish(). The
+ * reservation is installed BEFORE the synchronous socket write begins. If a
+ * sub-ms PUBACK races the publish return on the other core, the ACK callback
+ * parks it under the same lock; finalization resolves the returned id and emits
+ * exactly one completion. */
+typedef struct {
+    bool      used;
+    int64_t   measure_id;
+    int       msg_id;
+    int64_t   since_ms;
+    size_t    envelope_bytes;
+} dc_inflight_slot_t;
+
+static dc_inflight_slot_t s_inflight[PUBLISH_WINDOW_SLOTS];
+
+/* Only sync_runner calls publish, so at most one negative-id reservation exists.
+ * Keep two unmatched callbacks beside that reservation: a command/status publish
+ * can be ACKed in the same API-unlock gap immediately before OUR fast PUBACK.
+ * One park entry dropped the second callback and recreated the 60 s duplicate;
+ * two entries distinguish the unrelated id once publish() returns ours. */
+#define DC_EARLY_ACK_PARKS 2U
+typedef struct {
+    int       msg_id;
+    esp_err_t status;
+} dc_early_ack_t;
+static dc_early_ack_t s_early_acks[DC_EARLY_ACK_PARKS];
+static size_t         s_early_ack_count;
 /* Monotonic ms of the last successful PUBACK (end-to-end publish success). The
  * connectivity watchdog uses "time since" this to detect a device that should be
  * publishing but can't, and reboot it. Seeded to boot time in init. */
 static int64_t s_last_publish_ok_ms  = 0;
 
+typedef enum {
+    DC_ACK_PUBACK = 0,
+    DC_ACK_PUBLISH_ERROR,
+    DC_ACK_DISCONNECT,
+} dc_ack_kind_t;
+
+/* Completion crosses from the esp-mqtt task to the sole sync-runner consumer.
+ * Carry measure_id as well as msg_id: the producer resolves the volatile latch
+ * under s_inflight_mtx, while ONLY the consumer is allowed to touch event_log. */
+typedef struct {
+    int64_t       measure_id;
+    int           msg_id;
+    esp_err_t     status;
+    dc_ack_kind_t kind;
+} dc_ack_completion_t;
+
+static QueueHandle_t s_ack_queue = NULL;
+static StaticQueue_t s_ack_queue_control;
+static dc_ack_completion_t s_ack_queue_storage[DC_ACK_QUEUE_DEPTH];
+/* Producer-side overflow telemetry. Incremented under s_inflight_mtx; drained,
+ * cleared, and logged only by sync_runner so esp-mqtt never pays console latency. */
+static uint32_t s_ack_drops = 0;
+
+/* Genuine per-record failure streaks for the event-log window. Only the sole
+ * sync-runner task touches this table. Success for B clears B alone; A's
+ * poison-record evidence survives interleaving and can quarantine only when A
+ * reaches the cursor frontier. */
+typedef struct {
+    int64_t measure_id;
+    uint8_t failures;
+} dc_stuck_slot_t;
+static dc_stuck_slot_t s_stuck[PUBLISH_WINDOW_SLOTS];
+/* Publish-cap skips are intentionally separate from poison-record retry counts:
+ * these records are valid and preserved on SD, merely unsupported by this
+ * build's link-size policy. Sole sync-runner writer, so no lock is required. */
+static uint32_t s_oversize_skipped = 0;
+static int64_t  s_oversize_warned_id = 0;
+
 /* Monotonic milliseconds since boot — independent of the wall clock (which jumps
  * on RTC sync), so it measures elapsed in-flight time correctly. */
 static inline int64_t mono_ms(void) { return esp_timer_get_time() / 1000; }
 
-/* Measurement-activity gate. Incremented around every UART sensor transaction
- * so the background sync runner can pause publishing while a measurement is in
- * progress (it drains during idle/sleep instead). A counter (not a bool) so
- * overlapping reads don't clear it early. Single 32-bit access is atomic on
- * the ESP32; the sync runner only reads it. */
+/* All helpers with `_locked` in the name require s_inflight_mtx. */
+static int inflight_find_free_locked(void)
+{
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (!s_inflight[i].used) return (int)i;
+    }
+    return -1;
+}
+
+static int inflight_find_msg_locked(int msg_id)
+{
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (s_inflight[i].used && s_inflight[i].msg_id == msg_id) return (int)i;
+    }
+    return -1;
+}
+
+static void inflight_clear_locked(size_t idx)
+{
+    memset(&s_inflight[idx], 0, sizeof s_inflight[idx]);
+}
+
+static void early_acks_clear_locked(void)
+{
+    memset(s_early_acks, 0, sizeof s_early_acks);
+    s_early_ack_count = 0;
+}
+
+static void inflight_usage_locked(size_t *slots, size_t *bytes)
+{
+    size_t n = 0, b = 0;
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (!s_inflight[i].used) continue;
+        n++;
+        b += s_inflight[i].envelope_bytes;
+    }
+    if (slots != NULL) *slots = n;
+    if (bytes != NULL) *bytes = b;
+}
+
+/* Measurement activity spans both the Lua whole-cycle bracket and each raw
+ * sensor transaction. It owns the PM no-light-sleep lock and telemetry signal.
+ * The narrower publish hold below covers only raw transactions, allowing MQTT
+ * publishing during the rest of a measurement routine. Both are counters (not
+ * bools) so nested brackets don't clear them early. Single 32-bit access is
+ * atomic on the ESP32; the sync runner only reads them. */
 static volatile int s_measurement_active = 0;
+static volatile int s_publish_hold = 0;
 /* Phase 2: held across a measurement window so the SoC can't light-sleep mid
  * AMBIT UART / I2C read. NULL if PM is disabled (begin/end then no-op). */
 static esp_pm_lock_handle_t s_no_ls_lock = NULL;
@@ -92,11 +239,63 @@ static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
     return r;
 }
 
+/* Append one optional STATUS block transactionally. The sizing pass avoids a
+ * scratch buffer: if the entire block plus the final '}' will not fit, leave
+ * the payload untouched, log exactly one warning for that block, and let the
+ * heartbeat continue with the remaining optional blocks. */
+static bool status_append_optional(char *payload, size_t cap, size_t *len,
+                                   const char *block, const char *fmt, ...)
+{
+    va_list ap, sizing;
+    va_start(ap, fmt);
+    va_copy(sizing, ap);
+    int needed = vsnprintf(NULL, 0, fmt, sizing);
+    va_end(sizing);
+
+    size_t available = (*len + 2 <= cap) ? cap - *len - 2 : 0;
+    if (needed < 0 || (size_t)needed > available) {
+        ESP_LOGW(TAG, "STATUS optional block '%s' omitted (needs=%d, available=%u)",
+                 block, needed, (unsigned)available);
+        va_end(ap);
+        return false;
+    }
+
+    int wrote = vsnprintf(payload + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    if (wrote != needed) {
+        payload[*len] = '\0';
+        ESP_LOGW(TAG, "STATUS optional block '%s' omitted (format failed)", block);
+        return false;
+    }
+    *len += (size_t)wrote;
+    return true;
+}
+
+/* STATUS string sources are controlled and short, but PROJECT_VER can still
+ * contain punctuation supplied by the build. Keep the value JSON-safe without
+ * allocating or introducing an escaping-size worst case. */
+static void status_copy_json_safe(char *dst, size_t cap, const char *src)
+{
+    if (cap == 0) return;
+    size_t n = 0;
+    while (src != NULL && src[n] != '\0' && n + 1 < cap) {
+        unsigned char c = (unsigned char)src[n];
+        dst[n] = (c >= 0x20 && c != '"' && c != '\\') ? (char)c : '_';
+        n++;
+    }
+    dst[n] = '\0';
+}
+
 /* ── Sync-runner wake hook ───────────────────────────────────────────────
  * The sole publisher (sync_runner) registers a task-notify here so it can sleep
- * until there's work instead of polling. Fired after every stored event and when
- * a measurement burst finishes (so a drain deferred during the burst resumes). */
+ * until there's work instead of polling. Fired after every stored event, after
+ * a raw publish hold clears, and when a measurement burst finishes. */
 static void (*s_sync_notifier)(void) = NULL;
+
+static void device_commands_publish_hold_begin(void);
+static void device_commands_publish_hold_end(void);
+static void sensor_transaction_begin(void);
+static void sensor_transaction_end(void);
 
 void device_commands_set_sync_notifier(void (*fn)(void)) { s_sync_notifier = fn; }
 
@@ -106,28 +305,105 @@ static inline void notify_sync(void)
     if (fn != NULL) fn();
 }
 
-/* Internal ack handler — called by mqtt_client on MQTT_EVENT_PUBLISHED */
+/* Non-blocking producer shared by PUBACK/error and disconnect callbacks. Queue
+ * send/receive use zero wait: socket servicing must never wait for the drain.
+ * Thirty-two entries cover a full ACK window plus a concurrent full disconnect
+ * flush. If a future change violates that capacity contract, drop the NEW
+ * completion without ever receiving from this producer task. Its latch is then
+ * restored, so the record remains unadvanced and eventually replays; this
+ * fail-closed policy can duplicate data but cannot skip it. */
+static bool enqueue_ack_completion(const dc_ack_completion_t *completion)
+{
+    if (s_ack_queue == NULL) return false;
+
+    if (xQueueSend(s_ack_queue, completion, 0) != pdTRUE) {
+        portENTER_CRITICAL(&s_inflight_mtx);
+        if (s_ack_drops != UINT32_MAX) s_ack_drops++;
+        portEXIT_CRITICAL(&s_inflight_mtx);
+        notify_sync();  /* drain logs the drop and re-claims the unadvanced record */
+        return false;
+    }
+
+    /* Enqueue happens-before the wake: a runner that returned after its PUBACK
+     * poll cap will see and apply this completion before it attempts a claim. */
+    notify_sync();
+    return true;
+}
+
+/* Internal ack handler — called by mqtt_client on its esp-mqtt task. This
+ * function deliberately does only a bounded RAM-latch lookup, a zero-wait queue
+ * send, and a task notify. In particular it must never call an s_cfg event-log
+ * function: those take event_log's s_mtx across potentially 5 s FATFS I/O. */
 static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
 {
     (void)ctx;
-    if (s_inflight_mtx == NULL) return;
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+    dc_ack_completion_t completion = {
+        .measure_id = -1,
+        .msg_id     = msg_id,
+        .status     = status,
+        .kind       = status == ESP_OK ? DC_ACK_PUBACK : DC_ACK_PUBLISH_ERROR,
+    };
 
-    if (s_inflight_msg_id < 0 || msg_id != s_inflight_msg_id) {
-        xSemaphoreGive(s_inflight_mtx);
-        return; /* Unknown ack — ignore (e.g. raw cmd_mqtt_publish) */
+    bool matched = false;
+    bool parked = false;
+    bool park_overflow = false;
+    int matched_idx = -1;
+    dc_inflight_slot_t detached = {0};
+    int64_t acked_at_ms = status == ESP_OK ? mono_ms() : 0;
+    portENTER_CRITICAL(&s_inflight_mtx);
+    matched_idx = inflight_find_msg_locked(msg_id);
+    if (matched_idx >= 0) {
+        detached = s_inflight[matched_idx];
+        completion.measure_id = detached.measure_id;
+        inflight_clear_locked((size_t)matched_idx);
+        if (status == ESP_OK) s_last_publish_ok_ms = acked_at_ms;
+        matched = true;
+    } else {
+        /* esp_mqtt_client_publish unlocks its API mutex just before returning.
+         * On the other core, a local/sub-ms broker can therefore deliver PUBACK
+         * while our slot still carries the reserved msg_id=-1. There is only one
+         * publisher (sync_runner), hence at most one reservation. Preserve up to
+         * two distinct early ids so an unrelated raw-publish ACK cannot consume
+         * the only park position ahead of ours. */
+        for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+            if (!s_inflight[i].used || s_inflight[i].msg_id >= 0) continue;
+            for (size_t j = 0; j < s_early_ack_count; j++) {
+                if (s_early_acks[j].msg_id == msg_id) {
+                    parked = true;  /* duplicate callback; one completion suffices */
+                    break;
+                }
+            }
+            if (!parked && s_early_ack_count < DC_EARLY_ACK_PARKS) {
+                s_early_acks[s_early_ack_count++] = (dc_early_ack_t) {
+                    .msg_id = msg_id,
+                    .status = status,
+                };
+                parked = true;
+            } else if (!parked) {
+                park_overflow = true;
+            }
+            break;
+        }
     }
-    int64_t mid = s_inflight_measure_id;
-    s_inflight_measure_id = -1;
-    s_inflight_msg_id     = -1;
-    s_inflight_since_ms   = 0;
-    if (status == ESP_OK) s_last_publish_ok_ms = mono_ms();  /* connectivity-watchdog heartbeat */
-    xSemaphoreGive(s_inflight_mtx);
+    portEXIT_CRITICAL(&s_inflight_mtx);
 
-    if (status == ESP_OK && s_cfg.mark_event_synced != NULL) {
-        s_cfg.mark_event_synced(mid);
-    } else if (s_cfg.mark_event_pending != NULL) {
-        s_cfg.mark_event_pending(mid);
+    if (park_overflow) {
+        /* A third distinct callback in the publish() API-unlock gap is not
+         * correlatable with the single reservation. Preserve the fail-closed
+         * behavior (60 s reap + duplicate) but leave a field/bench breadcrumb. */
+        ESP_LOGW(TAG, "early-ACK park full: dropped distinct msg_id=%d status=%s; reservation will replay",
+                 msg_id, esp_err_to_name(status));
+    }
+    if (parked || !matched) return;
+    if (!enqueue_ack_completion(&completion)) {
+        /* Preserve fail-closed replay on the structurally-unexpected overflow:
+         * restore the mutual-exclusion token instead of losing both latch and
+         * completion. A later duplicate PUBACK or the 60-s reaper retries it. */
+        portENTER_CRITICAL(&s_inflight_mtx);
+        int restore_idx = !s_inflight[matched_idx].used
+            ? matched_idx : inflight_find_free_locked();
+        if (restore_idx >= 0) s_inflight[restore_idx] = detached;
+        portEXIT_CRITICAL(&s_inflight_mtx);
     }
 }
 
@@ -144,12 +420,35 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     if (cfg == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_cfg = *cfg;
-    s_initialized = true;
-
-    if (s_inflight_mtx == NULL) {
-        s_inflight_mtx = xSemaphoreCreateMutexStatic(&s_inflight_mtx_storage);
+    /* The delivery transition is a three-function contract. Accept persistence
+     * fully wired or fully absent, never a partial setup where a successful
+     * PUBACK could accidentally fall through to mark_event_pending. */
+    bool any_delivery_fn = cfg->claim_next_event != NULL ||
+                           cfg->mark_event_synced != NULL ||
+                           cfg->mark_event_pending != NULL;
+    bool all_delivery_fns = cfg->claim_next_event != NULL &&
+                            cfg->mark_event_synced != NULL &&
+                            cfg->mark_event_pending != NULL;
+    if (any_delivery_fn && !all_delivery_fns) {
+        ESP_LOGE(TAG, "incomplete persistence delivery callbacks");
+        return ESP_ERR_INVALID_ARG;
     }
+    s_cfg = *cfg;
+    if (s_ack_queue == NULL) {
+        s_ack_queue = xQueueCreateStatic(DC_ACK_QUEUE_DEPTH,
+                                         sizeof(dc_ack_completion_t),
+                                         (uint8_t *)s_ack_queue_storage,
+                                         &s_ack_queue_control);
+        if (s_ack_queue == NULL) return ESP_ERR_NO_MEM;
+    }
+    portENTER_CRITICAL(&s_inflight_mtx);
+    memset(s_inflight, 0, sizeof s_inflight);
+    early_acks_clear_locked();
+    s_ack_drops = 0;
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    memset(s_stuck, 0, sizeof s_stuck);
+    xQueueReset(s_ack_queue);
+    s_initialized = true;
     /* Start the watchdog "last success" clock at boot, so a device that boots
      * with a backlog and never connects is given the full timeout before reboot. */
     s_last_publish_ok_ms = mono_ms();
@@ -165,8 +464,8 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     if (s_cfg.set_publish_ack_handler != NULL) {
         s_cfg.set_publish_ack_handler(on_publish_ack, NULL);
     }
-    /* Clear the in-flight slot on an MQTT-level disconnect too, not just a Wi-Fi
-     * drop — otherwise a broker/TLS drop with Wi-Fi still up wedges the drain. */
+    /* Revert the in-flight window on an MQTT-level disconnect too, not just a
+     * Wi-Fi drop — otherwise broker/TLS loss with Wi-Fi up wedges the drain. */
     if (s_cfg.set_disconnect_handler != NULL) {
         s_cfg.set_disconnect_handler(on_mqtt_disconnect_cb, NULL);
     }
@@ -192,6 +491,85 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     ESP_LOGI(TAG, "  device_version: %s", s_cfg.device_version  ? s_cfg.device_version  : "(null)");
     ESP_LOGI(TAG, "  device_firm:    %s", s_cfg.device_firmware ? s_cfg.device_firmware : "(null)");
     ESP_LOGI(TAG, "  timezone:       %s", (s_cfg.timezone && s_cfg.timezone[0]) ? s_cfg.timezone : "(unset)");
+    return ESP_OK;
+}
+
+esp_err_t cmd_process_pending_acks(void)
+{
+    if (s_ack_queue == NULL) return ESP_ERR_INVALID_STATE;
+
+    uint32_t ack_drops;
+    portENTER_CRITICAL(&s_inflight_mtx);
+    ack_drops = s_ack_drops;
+    s_ack_drops = 0;
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (ack_drops > 0) {
+        ESP_LOGE(TAG, "ack queue full: dropped %u newest completion(s); "
+                      "records remain unadvanced and will replay",
+                 (unsigned)ack_drops);
+    }
+
+    dc_ack_completion_t completion;
+    while (xQueuePeek(s_ack_queue, &completion, 0) == pdTRUE) {
+        /* Sole-consumer contract: sync_runner is the only task that calls this
+         * function. Applying PENDING/SYNCED here serializes completion with the
+         * next claim and with note_publish_stuck(), so a deferred failure cannot
+         * race a re-claim of the same measure_id. This is the synchronization;
+         * do not move event-log calls back into an MQTT callback when ticket 05
+         * replaces the scalar latch with a window. */
+        esp_err_t err;
+        if (completion.status == ESP_OK) {
+            err = s_cfg.mark_event_synced != NULL
+                ? s_cfg.mark_event_synced(completion.measure_id)
+                : ESP_ERR_NOT_SUPPORTED;
+        } else if (s_cfg.mark_event_pending != NULL) {
+            err = s_cfg.mark_event_pending(completion.measure_id);
+        } else {
+            err = ESP_ERR_NOT_SUPPORTED;
+        }
+
+        /* Init rejects a partial persistence callback set, so NOT_SUPPORTED is
+         * unreachable in the normal configured drain. Keep it terminal anyway as
+         * a defensive boundary for offline/test ports and future compositions. */
+        bool terminal = err == ESP_ERR_INVALID_STATE || err == ESP_ERR_NOT_SUPPORTED;
+        if (err != ESP_OK && !terminal) {
+            /* TIMEOUT/I/O failures are transient: leave the head in place and
+             * stop so the later wake/fallback retries without claiming around an
+             * unapplied completion. */
+            ESP_LOGW(TAG, "deferred %s msg_id=%d id=%lld apply failed (%s) — will retry",
+                     completion.status == ESP_OK ? "PUBACK" : "pending-mark",
+                     completion.msg_id, (long long)completion.measure_id,
+                     esp_err_to_name(err));
+            return err;
+        }
+        if (terminal) {
+            /* Persistence reset/reopen deliberately abandons its RAM window.
+             * INVALID_STATE means this id is already absent/advanced/reverted;
+             * NOT_SUPPORTED means the backing store is offline. Retrying either
+             * forever would pin the queue head and stop all future claims. Drop
+             * the stale completion; the durable cursor is the replay authority. */
+            ESP_LOGW(TAG, "dropping stale deferred %s msg_id=%d id=%lld after persistence reset (%s)",
+                     completion.status == ESP_OK ? "PUBACK" : "pending-mark",
+                     completion.msg_id, (long long)completion.measure_id,
+                     esp_err_to_name(err));
+        }
+
+        dc_ack_completion_t removed;
+        if (xQueueReceive(s_ack_queue, &removed, 0) != pdTRUE) {
+            /* A persistence-reset/CLI-rewind callback may have reset the queue
+             * after our peek. It also cleared every correlation latch, so there
+             * is no completion left to preserve and claiming may safely resume. */
+            ESP_LOGW(TAG, "ack queue reset while applying id=%lld; durable cursor will replay",
+                     (long long)completion.measure_id);
+            return ESP_OK;
+        }
+        if (!terminal) {
+            ESP_LOGD(TAG, "processed deferred %s msg_id=%d id=%lld",
+                     completion.kind == DC_ACK_PUBACK ? "PUBACK" :
+                     (completion.kind == DC_ACK_DISCONNECT ? "disconnect" : "publish error"),
+                     completion.msg_id, (long long)completion.measure_id);
+        }
+    }
     return ESP_OK;
 }
 
@@ -339,6 +717,7 @@ cmd_result_t cmd_set_rtc(int64_t epoch_utc)
     if (err != ESP_OK) {
         return make_result(err, "RTC set failed: %s", esp_err_to_name(err));
     }
+    clock_trust_note_rtc();
     char iso[32];
     struct tm tm_utc;
     time_t t = (time_t)epoch_utc;
@@ -625,35 +1004,54 @@ cmd_result_t cmd_store_event(const measurement_event_desc_t *desc)
 /* Publish the next pending event as one MQTT message (one measure_id = one
  * message). Keeps the cloud's `sample:[…]` wrapper; the event's quantities are
  * nested under `data`. */
-/* Consecutive defer/failure counter for the event at the FIFO head. Only real
- * publish problems count (the not-connected path returns before claiming, so a
- * flaky link never trips this). At the cap the event is quarantined via the
- * persistence port — archived on SD, cursor advanced, drain unblocked. Single
- * caller task (sync_runner is the sole publisher), so plain statics suffice. */
-static int64_t s_stuck_id = -1;
-static int     s_stuck_n  = 0;
-
-static void note_publish_stuck(int64_t mid)
+static dc_stuck_slot_t *stuck_slot(int64_t mid, bool create)
 {
-    if (mid != s_stuck_id) {
-        s_stuck_id = mid;
-        s_stuck_n  = 0;
+    dc_stuck_slot_t *free_slot = NULL;
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (s_stuck[i].measure_id == mid) return &s_stuck[i];
+        if (free_slot == NULL && s_stuck[i].measure_id == 0) free_slot = &s_stuck[i];
     }
-    s_stuck_n++;
-    if (s_stuck_n < DC_PUBLISH_STUCK_MAX || s_cfg.quarantine_event == NULL) return;
+    if (create && free_slot != NULL) {
+        free_slot->measure_id = mid;
+        return free_slot;
+    }
+    return NULL;
+}
+
+static void clear_publish_stuck(int64_t mid)
+{
+    dc_stuck_slot_t *slot = stuck_slot(mid, false);
+    if (slot != NULL) memset(slot, 0, sizeof *slot);
+}
+
+/* Count only record-local heap/publish failures, keyed independently for every
+ * measure_id in the window. A later record's success clears only its own entry.
+ * Quarantine still fails closed for a non-frontier id; the capped counter stays
+ * live and retries once that record becomes the cursor frontier. */
+static unsigned note_publish_stuck(int64_t mid)
+{
+    dc_stuck_slot_t *slot = stuck_slot(mid, true);
+    if (slot == NULL) {
+        ESP_LOGE(TAG, "stuck-counter table full for id=%lld — holding record", (long long)mid);
+        return 0;
+    }
+    if (slot->failures < UINT8_MAX) slot->failures++;
+    if (slot->failures < DC_PUBLISH_STUCK_MAX || s_cfg.quarantine_event == NULL) {
+        return slot->failures;
+    }
 
     esp_err_t err = s_cfg.quarantine_event(mid);
     if (err == ESP_OK) {
         ESP_LOGE(TAG, "event id=%lld quarantined after %d consecutive failed publish "
                       "attempts — archived on SD, drain unblocked",
-                 (long long)mid, s_stuck_n);
-        s_stuck_id = -1;
-        s_stuck_n  = 0;
+                 (long long)mid, (int)slot->failures);
+        memset(slot, 0, sizeof *slot);
     } else {
         ESP_LOGW(TAG, "quarantine of stuck event id=%lld failed (%s) — will retry",
                  (long long)mid, esp_err_to_name(err));
-        s_stuck_n--;   /* hold at the cap; retry the quarantine next cycle */
+        slot->failures = DC_PUBLISH_STUCK_MAX - 1U;
     }
+    return slot->failures;
 }
 
 cmd_result_t cmd_mqtt_publish_next_event(void)
@@ -664,26 +1062,24 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
     /* Don't even claim an event if the broker isn't connected — Wi-Fi/MQTT
      * may be down and we'd just shove bytes at a dead pipe (the esp-mqtt
-     * client silently enqueues / drops them). Keeps events PENDING for the
+     * client would reject/drop them). Keeps events PENDING for the
      * next cycle and lets sync_runner_drain exit silently. */
     if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
     /* Power gate lives solely in sync_runner_is_allowed() now — sync_runner is
      * the only caller of this function (Lua can no longer publish directly), so
-     * one check there is sufficient and unbypassable. */
-    if (s_inflight_mtx == NULL) {
-        return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");
-    }
-
-    /* One event in flight at a time. */
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        return make_result(ESP_ERR_TIMEOUT, "inflight mutex busy");
-    }
-    bool busy = (s_inflight_msg_id >= 0);
-    xSemaphoreGive(s_inflight_mtx);
-    if (busy) {
-        return make_result(ESP_ERR_INVALID_STATE, "previous event still in flight");
+     * one check there is sufficient and unbypassable.  Count admission is checked
+     * before touching FATFS; byte admission is exact once the envelope exists. */
+    size_t active_slots = 0, outstanding_bytes = 0;
+    portENTER_CRITICAL(&s_inflight_mtx);
+    inflight_usage_locked(&active_slots, &outstanding_bytes);
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (active_slots >= PUBLISH_WINDOW_SLOTS || outstanding_bytes >= PUBLISH_WINDOW_BYTES) {
+        return make_result(ESP_ERR_INVALID_STATE,
+                           "publish window full (%u/%u slots, %u/%u bytes)",
+                           (unsigned)active_slots, (unsigned)PUBLISH_WINDOW_SLOTS,
+                           (unsigned)outstanding_bytes, (unsigned)PUBLISH_WINDOW_BYTES);
     }
 
     measurement_event_t e;
@@ -774,48 +1170,94 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
 
-    size_t cap = strlen(e.payload_json) + (meta ? strlen(meta) : 4)
-               + strlen(chanbuf) + strlen(devbuf) + strlen(cmdfield) + strlen(e.tag)
-               + strlen(battpart) + strlen(tzpart)
-               + strlen(fw) + strlen(dn) + strlen(dv)
-               + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts) + sizeof(meas_local)
-               + 320;                            /* fixed keys + numbers + punctuation */
+    /* Size the exact serialized envelope before any large allocation. This lets
+     * a lowered publish cap identify a valid 64-KiB stored record and archive it
+     * without first tripping the ordinary internal/DMA heap gate. */
+    int n = snprintf(NULL, 0, DC_EVENT_ENVELOPE_FMT,
+        (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
+        meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
+        meta ? meta : "null", e.payload_json,
+        meas_ts, battpart, tzpart,
+        s_mac_str, dn, dv, fw);
+    if (n < 0) {
+        free(cmdbuf);
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
+        return make_result(ESP_FAIL, "envelope sizing failed");
+    }
+    size_t payload_len = (size_t)n;
+    size_t cap = payload_len + 1U;
 
-    /* Large-payload heap gate. Attempting a big publish into a fragmented heap
-     * fails the TLS write and drops the MQTT session, wedging the FIFO drain. For a
-     * large envelope: request a scripting-VM GC (serviced in the Lua task) and let
-     * transient buffers settle, re-check, and if the largest free block still can't
-     * hold the payload + TLS headroom (or total free is too tight for the payload +
-     * its outbox copy), DEFER — revert to PENDING and end the cycle so it retries
-     * when the heap recovers, instead of failing the publish and dropping MQTT. */
-    if (cap > DC_LARGE_PUBLISH_BYTES) {
-        /* Floor, not a tight fit: the event's JSON is freed right after the
-         * envelope is built (below) and the TLS write buffer is now ~2.4 KB
-         * (OUT_CONTENT_LEN=2048), so the publish no longer needs a ~15 KB block.
-         * We only need the envelope copy to allocate (cap, contiguous) plus rough
-         * total room for the outbox copy. Defer only when the heap is genuinely
-         * too low — attempting then would fail the TLS write and drop MQTT. */
-        size_t need_block = cap + DC_PUBLISH_HEAP_HEADROOM;
-        size_t need_free  = 2U * cap + DC_PUBLISH_HEAP_HEADROOM;
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        size_t freeb   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        if (largest < need_block || freeb < need_free) {
-            if (s_cfg.request_gc != NULL) s_cfg.request_gc();
-            vTaskDelay(pdMS_TO_TICKS(DC_PUBLISH_SETTLE_MS));
-            largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-            freeb   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    /* This policy branch is intended for builds that deliberately lower the
+     * publish ceiling (for example 16 KiB) below the normal store capability.
+     * The derived default includes envelope headroom above every stored record. */
+    if (payload_len > AMBYTE_PUBLISH_MAX_BYTES) {
+        int64_t mid = e.measure_id;
+        free(cmdbuf);
+        esp_err_t pending_err = s_cfg.mark_event_pending(mid);
+        if (s_oversize_warned_id != mid) {
+            ESP_LOGW(TAG, "event id=%lld envelope %u B exceeds AMBYTE_PUBLISH_MAX_BYTES=%u — preserving in quarantine sidecar",
+                     (long long)mid, (unsigned)payload_len,
+                     (unsigned)AMBYTE_PUBLISH_MAX_BYTES);
+            s_oversize_warned_id = mid;
         }
-        if (largest < need_block || freeb < need_free) {
-            free(cmdbuf);
-            s_cfg.mark_event_pending(e.measure_id);
-            int64_t mid = e.measure_id;
+        if (pending_err != ESP_OK) {
             measurement_event_free(&e);
-            note_publish_stuck(mid);   /* repeated defers of one event → quarantine */
-            return make_result(ESP_ERR_NO_MEM,
-                               "large publish deferred (heap): id=%lld ~%uB largest=%u free=%u (attempt %d/%d)",
-                               (long long)mid, (unsigned)cap, (unsigned)largest, (unsigned)freeb,
-                               s_stuck_n, DC_PUBLISH_STUCK_MAX);
+            return make_result(pending_err,
+                               "publish-cap event id=%lld could not revert claim: %s",
+                               (long long)mid, esp_err_to_name(pending_err));
         }
+
+        esp_err_t quarantine_err = s_cfg.quarantine_event != NULL
+            ? s_cfg.quarantine_event(mid) : ESP_ERR_NOT_SUPPORTED;
+        measurement_event_free(&e);
+        if (quarantine_err == ESP_OK) {
+            s_oversize_skipped++;
+            clear_publish_stuck(mid);
+            return make_result(ESP_OK,
+                               "publish-cap skip id=%lld (%u>%u B): archived on SD (oversize_skipped=%u)",
+                               (long long)mid, (unsigned)payload_len,
+                               (unsigned)AMBYTE_PUBLISH_MAX_BYTES,
+                               (unsigned)s_oversize_skipped);
+        }
+        return make_result(quarantine_err,
+                           "publish-cap event id=%lld waiting for frontier/archive: %s",
+                           (long long)mid, esp_err_to_name(quarantine_err));
+    }
+
+    /* Window-aware heap gate. MALLOC_CAP_8BIT totals include PSRAM and therefore
+     * cannot prove that lwIP/Wi-Fi/TLS allocations fit. Charge the already queued
+     * envelopes plus this allocation and fixed TLS headroom against BOTH largest
+     * internal-DRAM and DMA-capable blocks. Large envelopes get one Lua-GC/settle
+     * retry; a failure reverts only this event-log slot. */
+    size_t heap_need = outstanding_bytes + cap + DC_PUBLISH_HEAP_HEADROOM;
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    bool heap_tight = largest_internal < heap_need || largest_dma < heap_need;
+    if (heap_tight && cap > DC_LARGE_PUBLISH_BYTES) {
+        if (s_cfg.request_gc != NULL) s_cfg.request_gc();
+        vTaskDelay(pdMS_TO_TICKS(DC_PUBLISH_SETTLE_MS));
+        portENTER_CRITICAL(&s_inflight_mtx);
+        inflight_usage_locked(NULL, &outstanding_bytes);
+        portEXIT_CRITICAL(&s_inflight_mtx);
+        heap_need = outstanding_bytes + cap + DC_PUBLISH_HEAP_HEADROOM;
+        largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        heap_tight = largest_internal < heap_need || largest_dma < heap_need;
+    }
+    if (heap_tight) {
+        free(cmdbuf);
+        s_cfg.mark_event_pending(e.measure_id);
+        int64_t mid = e.measure_id;
+        measurement_event_free(&e);
+        /* If earlier envelopes are what make the pool tight, this is ordinary
+         * window backpressure, not evidence that `mid` is poisonous. */
+        unsigned attempt = outstanding_bytes == 0 ? note_publish_stuck(mid) : 0;
+        return make_result(ESP_ERR_NO_MEM,
+                           "publish deferred (window heap): id=%lld need=%uB int_largest=%u dma_largest=%u (attempt %u/%u)",
+                           (long long)mid, (unsigned)heap_need,
+                           (unsigned)largest_internal, (unsigned)largest_dma,
+                           attempt, (unsigned)DC_PUBLISH_STUCK_MAX);
     }
 
     char *payload = malloc(cap);
@@ -826,16 +1268,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
     }
 
-    int n = snprintf(payload, cap,
-        "{\"sample\":[{"
-            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld,"
-            "\"timestamp_local\":\"%s\","
-            "\"published\":\"%s\",\"channel\":%s,\"device\":%s,"
-            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s"
-        "}],"
-        "\"timestamp\":\"%s\",%s%s"
-        "\"device_id\":\"%s\",\"device_name\":\"%s\","
-        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}",
+    n = snprintf(payload, cap, DC_EVENT_ENVELOPE_FMT,
         (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
         meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
         meta ? meta : "null", e.payload_json,
@@ -851,13 +1284,34 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                            n, (unsigned)cap);
     }
 
-    size_t payload_len = (size_t)n;
+    /* Exact MQTT-window admission uses the serialized envelope length, not the
+     * raw event-log line. If 15 small envelopes leave less room than this one,
+     * revert this ONE claim and wait for completions; the event-log FIFO returns
+     * it before admitting a newer offset, so the window cannot wedge or skip.
+     * An empty MQTT window deliberately admits one envelope even above the
+     * nominal byte budget; it serializes the link just like event_log's lone
+     * maximum record. Once any envelope is outstanding, the budget is strict. */
+    portENTER_CRITICAL(&s_inflight_mtx);
+    inflight_usage_locked(&active_slots, &outstanding_bytes);
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (active_slots >= PUBLISH_WINDOW_SLOTS ||
+        (outstanding_bytes > 0 &&
+         outstanding_bytes + payload_len > PUBLISH_WINDOW_BYTES)) {
+        int64_t mid = e.measure_id;
+        free(payload);
+        s_cfg.mark_event_pending(mid);
+        measurement_event_free(&e);
+        return make_result(ESP_ERR_INVALID_STATE,
+                           "publish window byte/slot budget deferred id=%lld (%u/%u slots, %u+%u/%u bytes)",
+                           (long long)mid, (unsigned)active_slots,
+                           (unsigned)PUBLISH_WINDOW_SLOTS, (unsigned)outstanding_bytes,
+                           (unsigned)payload_len, (unsigned)PUBLISH_WINDOW_BYTES);
+    }
 
     /* The envelope now holds its own copy of the event's JSON, so free the claimed
-     * event's heap strings (~payload_len B: payload_json + metadata + cmd_raw)
+     * event's heap strings (up to the 64-KiB record cap: payload + metadata + cmd)
      * BEFORE the publish. Otherwise they sit alongside esp-mqtt's outbox copy and
-     * the mbedTLS write buffer — the ~4.6 KB payload_json alone is what pushes a
-     * large arrun trace past the largest free block. Only the heap pointers are
+     * the mbedTLS write buffer. Only the heap pointers are
      * freed/nulled; e.measure_id/tag/channel (scalar + fixed arrays) stay valid for
      * the logging, latch, and return below, and the later measurement_event_free
      * calls become safe no-ops. */
@@ -874,10 +1328,10 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
              topic, (long long)e.measure_id, e.tag,
              e.channel[0] ? e.channel : "-", (unsigned)payload_len);
 
-    /* Heap probe for large payloads (arrun traces ~5–9 KB): a QoS1 publish needs
-     * a contiguous outbox copy (~payload_len) plus a transient TLS write buffer,
-     * so the largest free block — not total free — is what gates it. Logged
-     * before the attempt (and again on failure) to size the Track 1 heap work. */
+    /* Heap probe for large payloads (arrun traces can approach 64 KiB): QoS1
+     * retains an outbox copy while TLS writes sequential fragments. Large copies
+     * follow the PSRAM malloc policy, but capability-specific largest blocks are
+     * still logged to diagnose internal/DMA starvation. */
     if (payload_len > 2048) {
         ESP_LOGW(TAG, "large publish %u B (id=%lld): heap free=%u largest=%u",
                  (unsigned)payload_len, (long long)e.measure_id,
@@ -885,34 +1339,127 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
 
+    /* Reserve the correlation token BEFORE publish. esp_mqtt_client_publish()
+     * writes this QoS-1 packet synchronously on the drain task, so sixteen
+     * back-to-back calls genuinely reach the wire without waiting for PUBACKs.
+     * It then marks each outbox item TRANSMITTED, which keeps ticket 01's 10 s
+     * message_retransmit_timeout policy effective. The API mutex unlocks just
+     * before return, hence the early-ACK parks still close the cross-core gap. */
+    int slot_idx = -1;
+    int64_t latched_at_ms = mono_ms();
+    portENTER_CRITICAL(&s_inflight_mtx);
+    slot_idx = inflight_find_free_locked();
+    if (slot_idx >= 0) {
+        early_acks_clear_locked();
+        s_inflight[slot_idx] = (dc_inflight_slot_t) {
+            .used           = true,
+            .measure_id     = e.measure_id,
+            .msg_id         = -1,
+            .since_ms       = latched_at_ms,
+            .envelope_bytes = payload_len,
+        };
+    }
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (slot_idx < 0) {
+        int64_t mid = e.measure_id;
+        free(payload);
+        s_cfg.mark_event_pending(mid);
+        return make_result(ESP_ERR_INVALID_STATE, "publish window filled before send id=%lld",
+                           (long long)mid);
+    }
+
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, payload_len, &msg_id);
     free(payload);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "publish failed id=%lld (%u B): heap free=%u largest=%u",
+        bool owned_reservation = false;
+        portENTER_CRITICAL(&s_inflight_mtx);
+        if (s_inflight[slot_idx].used &&
+            s_inflight[slot_idx].measure_id == e.measure_id &&
+            s_inflight[slot_idx].msg_id < 0) {
+            inflight_clear_locked((size_t)slot_idx);
+            early_acks_clear_locked();
+            owned_reservation = true;
+        }
+        portEXIT_CRITICAL(&s_inflight_mtx);
+
+        ESP_LOGW(TAG, "publish failed id=%lld (%u B): int_largest=%u dma_largest=%u",
                  (long long)e.measure_id, (unsigned)payload_len,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        s_cfg.mark_event_pending(e.measure_id);
-        note_publish_stuck(e.measure_id);   /* repeated failures of one event → quarantine */
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        /* publish() aborts the connection on a synchronous write failure. If its
+         * nested disconnect callback detached the reservation, that queued
+         * completion owns the PENDING transition. Otherwise this sync-runner
+         * call still owns the claim and reverts it directly. */
+        if (owned_reservation) s_cfg.mark_event_pending(e.measure_id);
+        /* The stuck counter quarantines poison records, not healthy records caught
+         * in a network outage. The transport reports INVALID_STATE when the
+         * connection vanished before/during publish; it may also drop between the call
+         * and this check. Only a failure while still connected is record-local. */
+        bool transport_refused = err == ESP_ERR_INVALID_STATE ||
+            (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected());
+        if (!transport_refused) {
+            note_publish_stuck(e.measure_id);   /* live-link per-record failure */
+        }
         measurement_event_free(&e);
         return make_result(err, "event publish failed: %s", esp_err_to_name(err));
     }
-    /* A publish went out — whatever was stuck is moving again. */
-    s_stuck_id = -1;
-    s_stuck_n  = 0;
 
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        s_inflight_measure_id = e.measure_id;
-        s_inflight_msg_id     = msg_id;
-        s_inflight_since_ms   = mono_ms();
-        xSemaphoreGive(s_inflight_mtx);
-    } else {
-        ESP_LOGW(TAG, "inflight latch failed; event may be re-published on retry");
+    /* Finalize the reservation. If the PUBACK was already parked, detach the
+     * slot into the normal completion queue now. Otherwise publishing proceeds
+     * with the concrete msg_id installed. */
+    bool reservation_present = false;
+    bool early_matched = false;
+    dc_inflight_slot_t detached = {0};
+    dc_ack_completion_t early_completion = {
+        .measure_id = e.measure_id,
+        .msg_id = msg_id,
+        .status = ESP_OK,
+        .kind = DC_ACK_PUBACK,
+    };
+    int64_t finalized_at_ms = mono_ms();
+    portENTER_CRITICAL(&s_inflight_mtx);
+    if (s_inflight[slot_idx].used &&
+        s_inflight[slot_idx].measure_id == e.measure_id &&
+        s_inflight[slot_idx].msg_id < 0) {
+        reservation_present = true;
+        s_inflight[slot_idx].msg_id = msg_id;
+        for (size_t i = 0; i < s_early_ack_count; i++) {
+            if (s_early_acks[i].msg_id == msg_id) {
+                detached = s_inflight[slot_idx];
+                early_completion.status = s_early_acks[i].status;
+                early_completion.kind = s_early_acks[i].status == ESP_OK
+                    ? DC_ACK_PUBACK : DC_ACK_PUBLISH_ERROR;
+                inflight_clear_locked((size_t)slot_idx);
+                if (early_completion.status == ESP_OK) s_last_publish_ok_ms = finalized_at_ms;
+                early_matched = true;
+                break;
+            }
+        }
+        early_acks_clear_locked();
     }
+    portEXIT_CRITICAL(&s_inflight_mtx);
 
     int64_t mid = e.measure_id;
     measurement_event_free(&e);
+    /* A positive msg_id is a successful wire write even if its nested
+     * disconnect callback already detached the reservation. Clear only this
+     * record's poison streak before the race-owned early return (review m8). */
+    clear_publish_stuck(mid);  /* B success cannot erase A's streak. */
+    if (!reservation_present) {
+        return make_result(ESP_ERR_INVALID_STATE,
+                           "publish id=%lld raced disconnect; pending completion owns replay",
+                           (long long)mid);
+    }
+
+    if (early_matched && !enqueue_ack_completion(&early_completion)) {
+        detached.msg_id = msg_id;
+        portENTER_CRITICAL(&s_inflight_mtx);
+        int restore_idx = !s_inflight[slot_idx].used
+            ? slot_idx : inflight_find_free_locked();
+        if (restore_idx >= 0) s_inflight[restore_idx] = detached;
+        portEXIT_CRITICAL(&s_inflight_mtx);
+    }
     return make_result(ESP_OK, "published event id=%lld msg_id=%d", (long long)mid, msg_id);
 }
 
@@ -928,8 +1475,8 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     out->wifi_connected = wifi_manager_is_connected();
     (void)wifi_manager_is_provisioned(&out->provisioned);
 
-    int64_t total = 0, pending = 0, next_id = 0;
-    (void)cmd_db_status(&out->db_online, &total, &pending, &next_id);
+    int64_t total = 0, next_id = 0;
+    (void)cmd_db_status(&out->db_online, &total, &out->pending, &next_id);
 
     if (s_cfg.read_power != NULL && s_cfg.read_power(&out->power) == ESP_OK) {
         out->power_valid = true;
@@ -973,36 +1520,82 @@ cmd_result_t cmd_store_status_event(void)
         return r;
     }
 
-    /* Base status, then power and env each append their block when the read
-     * succeeded — so the payload reflects exactly which subsystems were live
-     * this cycle. Env keys/format match the device.bme280 measurement event. */
-    char payload[640];
+    uint32_t mqtt_connects = 0;
+    int64_t conn_age_s = -1;
+    char last_disc_reason[24] = {0};
+    if (s_cfg.connection_stats != NULL) {
+        s_cfg.connection_stats(&mqtt_connects, &conn_age_s,
+                               last_disc_reason, sizeof last_disc_reason);
+    }
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    char app_version[32];
+    status_copy_json_safe(app_version, sizeof app_version,
+                          app != NULL ? app->version : "");
+    bool wd_armed = s_cfg.watchdog_armed != NULL && s_cfg.watchdog_armed();
+    char wd_reason[16] = {0};
+    if (s_cfg.last_wd_reboot_reason != NULL) {
+        (void)s_cfg.last_wd_reboot_reason(wd_reason, sizeof wd_reason);
+    }
+    const char *clock_source = "rtc";
+    bool clock_suspect = false;
+    clock_trust_get_status(&clock_source, &clock_suspect);
+
+    /* Schema split (2026-07-28, Dominik): the sample's `data` object carries only
+     * MEASUREMENTS (the BME280 environment readings); all device-health/info
+     * fields live in the sample's `metadata` object, and `device` carries the
+     * MAC. Platform charts device health from metadata, science from data.
+     * The bounded base always fits. Optional SD and power blocks are appended
+     * transactionally below. Two buffers ≈ the previous single 1024 B one, so
+     * the wd-task stack budget is unchanged. */
+    /* Worst-case budget (ticket-09 review, host-measured against the actual
+     * format strings): base 571 + SD 158 + power 160 + '}' + NUL = 891 B →
+     * only 5 B spare in this 896-B buffer at true format maxima (%.3f of a
+     * pathological negative mV reading renders 10 chars ×3; the u32 currents
+     * render 10 digits). With physically plausible field values the payload is
+     * ~756 B (~140 B headroom). DO NOT add fields against the 140 B figure:
+     * budget against the 5 B one, or grow the buffer — an overflow doesn't
+     * corrupt (status_append_optional drops the offending block with a WARN)
+     * but silently costs the power block on outlier readings. env_data's
+     * separate 128 B keeps the wd-task stack buffers at ~1 KiB total. */
+    char payload[896];
     int n = snprintf(payload, sizeof(payload),
-        "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s",
+        "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
+        "\"uptime_s\":%lld,\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
+        "\"psram_size_kb\":%u,\"heap_dma_largest_kb\":%u,\"mqtt_reconnects\":%u,"
+        "\"last_disc_reason\":\"%.23s\",\"conn_age_s\":%lld,\"pending\":%lld,"
+        "\"last_wd_reboot_reason\":\"%.15s\",\"wd_armed\":%s,\"app_version\":\"%.31s\","
+        "\"clock_src\":\"%.4s\",\"clock_suspect\":%s,"
+        "\"heap_int_free_kb\":%u,\"heap_int_largest_kb\":%u",
         s.wifi_connected ? "true" : "false",
         s.provisioned ? "true" : "false",
         s.db_online ? "true" : "false",
-        s.publish_gate_open ? "true" : "false");
-    /* Internal-DRAM heap telemetry — once PSRAM joins the default heap the total
-     * "heap free" hides internal-DRAM fragmentation. SD DMA, the TLS write, and
-     * any MALLOC_CAP_INTERNAL alloc draw only from this pool, so report its free +
-     * largest block: the number to watch to confirm PSRAM actually relieves the
-     * internal fragmentation (bench gate) and to catch DRAM pressure in the field. */
-    if (n > 0 && n < (int)sizeof(payload)) {
-        n += snprintf(payload + n, sizeof(payload) - n,
-            ",\"heap_int_free_kb\":%u,\"heap_int_largest_kb\":%u",
-            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+        s.publish_gate_open ? "true" : "false",
+        (long long)(esp_timer_get_time() / 1000000LL),
+        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+        (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
+        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
+        (unsigned)mqtt_connects, last_disc_reason,
+        (long long)conn_age_s, (long long)s.pending,
+        wd_reason, wd_armed ? "true" : "false", app_version,
+        clock_source, clock_suspect ? "true" : "false",
+        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    if (n < 0 || (size_t)n + 2 > sizeof(payload)) {
+        return make_result(ESP_FAIL, "status base payload build failed");
     }
+    size_t payload_len = (size_t)n;
+
     /* SD/persistence health — surfaces the audit's silent-loss counters so a
      * degrading card is visible before the cliff (free space, skipped/dropped
      * records, delivery high-water, io-lost). */
-    if (n > 0 && n < (int)sizeof(payload) && s_cfg.sd_health != NULL) {
+    if (s_cfg.sd_health != NULL) {
         bool sd_io_lost = false;
         uint64_t sd_free = 0;
         int64_t sd_skipped = 0, sd_dropped = 0, last_acked = 0;
         if (s_cfg.sd_health(&sd_io_lost, &sd_free, &sd_skipped, &sd_dropped, &last_acked) == ESP_OK) {
-            n += snprintf(payload + n, sizeof(payload) - n,
+            (void)status_append_optional(payload, sizeof payload, &payload_len, "sd",
                 ",\"sd_free_kb\":%llu,\"sd_skipped\":%lld,\"sd_dropped\":%lld,"
                 "\"last_acked_id\":%lld,\"sd_io_lost\":%s",
                 (unsigned long long)(sd_free / 1024),
@@ -1010,8 +1603,8 @@ cmd_result_t cmd_store_status_event(void)
                 sd_io_lost ? "true" : "false");
         }
     }
-    if (n > 0 && n < (int)sizeof(payload) && s.power_valid) {
-        n += snprintf(payload + n, sizeof(payload) - n,
+    if (s.power_valid) {
+        (void)status_append_optional(payload, sizeof payload, &payload_len, "power",
             ",\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"
             "\"input_ma\":%u,\"charge_ma\":%u,\"input_present\":%s,\"charge_status\":%u",
             (double)s.power.battery_mv / 1000.0,
@@ -1022,16 +1615,22 @@ cmd_result_t cmd_store_status_event(void)
             s.power.input_present ? "true" : "false",
             (unsigned)s.power.charge_status);
     }
-    if (n > 0 && n < (int)sizeof(payload) && s.env_valid) {
-        n += snprintf(payload + n, sizeof(payload) - n,
-            ",\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f",
+    payload[payload_len++] = '}';
+    payload[payload_len] = '\0';
+
+    /* `data` = measurements only: the BME280 environment readings. Empty object
+     * when the sensor read failed this cycle — data consumers never see device
+     * health here. */
+    char env_data[128];
+    if (s.env_valid) {
+        int en = snprintf(env_data, sizeof env_data,
+            "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f}",
             s.temperature_c, s.humidity_percent, s.pressure_pa);
-    }
-    if (n > 0 && n < (int)sizeof(payload)) {
-        n += snprintf(payload + n, sizeof(payload) - n, "}");
-    }
-    if (n < 0 || (size_t)n >= sizeof(payload)) {
-        return make_result(ESP_FAIL, "status payload build failed");
+        if (en < 0 || (size_t)en >= sizeof env_data) {
+            strcpy(env_data, "{}");
+        }
+    } else {
+        strcpy(env_data, "{}");
     }
 
     int64_t mid = 0;
@@ -1042,11 +1641,13 @@ cmd_result_t cmd_store_status_event(void)
 
     int64_t now = now_ms();
     measurement_event_desc_t d = {
-        .measure_id   = mid,
-        .tag          = MEASUREMENT_TAG_STATUS,
-        .start_ms     = now,
-        .end_ms       = now,
-        .payload_json = payload,
+        .measure_id    = mid,
+        .device        = s_mac_str,          /* device = MAC (2026-07-28 ask) */
+        .tag           = MEASUREMENT_TAG_STATUS,
+        .start_ms      = now,
+        .end_ms        = now,
+        .metadata_json = payload,            /* device health/info */
+        .payload_json  = env_data,           /* measurements only */
     };
     err = s_cfg.store_event(&d);
     if (err != ESP_OK) {
@@ -1074,10 +1675,10 @@ cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
     if (cmd == NULL || out == NULL || out_len == NULL || out_cap < 2) {
         return make_result(ESP_ERR_INVALID_ARG, "stream_query: bad args");
     }
-    device_commands_measurement_begin();
+    sensor_transaction_begin();
     esp_err_t err = s_cfg.uart_stream_query(channel, cmd, "\n", sentinel,
                                             out, out_cap, out_len, timeout_ms);
-    device_commands_measurement_end();
+    sensor_transaction_end();
     if (err == ESP_ERR_TIMEOUT) {
         return make_result(ESP_ERR_TIMEOUT, "stream timeout (no '%s')", sentinel ? sentinel : "");
     }
@@ -1089,55 +1690,119 @@ cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
 
 void device_commands_on_mqtt_disconnect(void)
 {
-    if (s_inflight_mtx == NULL) return;
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
-    int64_t mid = s_inflight_measure_id;
-    bool had = (mid >= 0 && s_inflight_msg_id >= 0);
-    s_inflight_measure_id = -1;
-    s_inflight_msg_id     = -1;
-    s_inflight_since_ms   = 0;
-    xSemaphoreGive(s_inflight_mtx);
+    /* This callback runs on esp-mqtt/sys_evt stacks and can be nested inside the
+     * sync-runner's synchronous publish() failure. A 16-element detach array
+     * consumed ~960 B in the review build. Detach and enqueue ONE slot per lock
+     * acquisition instead: queue order remains table order, no I/O occurs under
+     * the portMUX, and this frame stays small on all three callers. */
+    while (true) {
+        size_t detached_idx = PUBLISH_WINDOW_SLOTS;
+        dc_inflight_slot_t detached = {0};
+        portENTER_CRITICAL(&s_inflight_mtx);
+        for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+            if (!s_inflight[i].used) continue;
+            detached_idx = i;
+            detached = s_inflight[i];
+            inflight_clear_locked(i);
+            if (detached.msg_id < 0) early_acks_clear_locked();
+            break;
+        }
+        portEXIT_CRITICAL(&s_inflight_mtx);
+        if (detached_idx == PUBLISH_WINDOW_SLOTS) break;
 
-    if (had && s_cfg.mark_event_pending != NULL) {
-        s_cfg.mark_event_pending(mid);
+        dc_ack_completion_t completion = {
+            .measure_id = detached.measure_id,
+            .msg_id     = detached.msg_id,
+            .status     = ESP_FAIL,
+            .kind       = DC_ACK_DISCONNECT,
+        };
+        if (!enqueue_ack_completion(&completion)) {
+            portENTER_CRITICAL(&s_inflight_mtx);
+            int restore_idx = !s_inflight[detached_idx].used
+                ? (int)detached_idx : inflight_find_free_locked();
+            if (restore_idx >= 0) s_inflight[restore_idx] = detached;
+            portEXIT_CRITICAL(&s_inflight_mtx);
+            /* Do not detach the restored slot again in a tight loop while the
+             * queue is full. Its token remains fail-closed for the reaper. */
+            break;
+        }
     }
+}
+
+void device_commands_on_persistence_reset(void)
+{
+    /* event_log has discarded its volatile claim window after an SD reopen.
+     * Atomically discard the peer correlation tokens, then reset stale queued
+     * completions. The durable cursor will re-claim every unresolved record;
+     * late callbacks find no msg-id match and are harmless duplicates. */
+    portENTER_CRITICAL(&s_inflight_mtx);
+    memset(s_inflight, 0, sizeof s_inflight);
+    early_acks_clear_locked();
+    s_ack_drops = 0;
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (s_ack_queue != NULL) xQueueReset(s_ack_queue);
+    notify_sync();
 }
 
 void device_commands_abort_inflight(void)
 {
-    if (s_inflight_mtx == NULL) return;
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
-    s_inflight_measure_id = -1;
-    s_inflight_msg_id     = -1;
-    s_inflight_since_ms   = 0;
-    xSemaphoreGive(s_inflight_mtx);
+    portENTER_CRITICAL(&s_inflight_mtx);
+    memset(s_inflight, 0, sizeof s_inflight);
+    early_acks_clear_locked();
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    /* CLI task versus sync-runner consumer: xQueueReset may race a consumer that
+     * already peeked/applied the head. That race is benign — its final receive
+     * returns INVALID_STATE, the runner retries, and rewind still owns the cursor. */
+    if (s_ack_queue != NULL) xQueueReset(s_ack_queue);
     /* Deliberately does NOT mark_event_pending: the caller (evlog rewind) has
      * already moved the persistence cursor, so the event is pending by position.
-     * A late PUBACK for the abandoned msg_id is a harmless no-op (the slot and the
-     * event_log claim are both cleared). */
+     * Drop deferred completions too; a late PUBACK for the abandoned msg_id is a
+     * harmless no-op because the RAM latch and event_log claim are both cleared. */
 }
 
 bool device_commands_reap_stale_inflight(int64_t max_age_ms)
 {
-    if (s_inflight_mtx == NULL) return false;
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
     bool    stale = false;
     int64_t mid   = -1;
-    if (s_inflight_msg_id >= 0 && (mono_ms() - s_inflight_since_ms) >= max_age_ms) {
-        stale = true;
-        mid   = s_inflight_measure_id;
-        s_inflight_measure_id = -1;
-        s_inflight_msg_id     = -1;
-        s_inflight_since_ms   = 0;
+    int64_t now   = mono_ms();
+    int stale_idx = -1;
+    dc_inflight_slot_t detached = {0};
+    portENTER_CRITICAL(&s_inflight_mtx);
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (s_inflight[i].used && (now - s_inflight[i].since_ms) >= max_age_ms) {
+            stale = true;
+            stale_idx = (int)i;
+            detached = s_inflight[i];
+            mid = detached.measure_id;
+            inflight_clear_locked(i);
+            if (detached.msg_id < 0) early_acks_clear_locked();
+            break;  /* one slot per call; drain immediately loops and re-checks */
+        }
     }
-    xSemaphoreGive(s_inflight_mtx);
+    portEXIT_CRITICAL(&s_inflight_mtx);
 
     if (stale) {
         ESP_LOGW(TAG, "reaped stale in-flight publish (id=%lld) — no PUBACK in %lld ms, will re-publish",
                  (long long)mid, (long long)max_age_ms);
         /* mid < 0 = an injected test slot (no real event): clear only. */
         if (mid >= 0 && s_cfg.mark_event_pending != NULL) {
-            s_cfg.mark_event_pending(mid);
+            esp_err_t err = s_cfg.mark_event_pending(mid);
+            if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_NOT_SUPPORTED) {
+                /* event_log reset/offline is terminal for this volatile token.
+                 * Restoring it would wedge the reaper forever; the durable
+                 * cursor will replay the record when persistence is available. */
+                ESP_LOGW(TAG, "discarding stale latch id=%lld after persistence reset (%s)",
+                         (long long)mid, esp_err_to_name(err));
+            } else if (err != ESP_OK) {
+                /* Keep one retry token if persistence was temporarily busy;
+                 * otherwise the claimed event-log slot could become orphaned. */
+                portENTER_CRITICAL(&s_inflight_mtx);
+                int restore_idx = !s_inflight[stale_idx].used
+                    ? stale_idx : inflight_find_free_locked();
+                if (restore_idx >= 0) s_inflight[restore_idx] = detached;
+                portEXIT_CRITICAL(&s_inflight_mtx);
+                return false;
+            }
         }
     }
     return stale;
@@ -1145,15 +1810,9 @@ bool device_commands_reap_stale_inflight(int64_t max_age_ms)
 
 int64_t device_commands_ms_since_publish_ok(void)
 {
-    int64_t t = 0;
-    if (s_inflight_mtx != NULL &&
-        xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        t = s_last_publish_ok_ms;
-        xSemaphoreGive(s_inflight_mtx);
-    } else {
-        return 0;   /* couldn't read — report "healthy" so the watchdog never
-                     * reboots on a transient mutex contention. */
-    }
+    portENTER_CRITICAL(&s_inflight_mtx);
+    int64_t t = s_last_publish_ok_ms;
+    portEXIT_CRITICAL(&s_inflight_mtx);
     return mono_ms() - t;
 }
 
@@ -1162,34 +1821,60 @@ void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *
     int     mi  = -1;
     int64_t me  = -1;
     int64_t age = 0;
-    if (s_inflight_mtx != NULL &&
-        xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        mi  = s_inflight_msg_id;
-        me  = s_inflight_measure_id;
-        age = (s_inflight_msg_id >= 0) ? (mono_ms() - s_inflight_since_ms) : 0;
-        xSemaphoreGive(s_inflight_mtx);
+    int64_t now = mono_ms();
+    portENTER_CRITICAL(&s_inflight_mtx);
+    for (size_t i = 0; i < PUBLISH_WINDOW_SLOTS; i++) {
+        if (!s_inflight[i].used) continue;
+        int64_t candidate_age = now - s_inflight[i].since_ms;
+        if (me < 0 || candidate_age > age) {
+            mi = s_inflight[i].msg_id;
+            me = s_inflight[i].measure_id;
+            age = candidate_age;
+        }
     }
+    portEXIT_CRITICAL(&s_inflight_mtx);
     if (msg_id)     *msg_id     = mi;
     if (measure_id) *measure_id = me;
     if (age_ms)     *age_ms     = age;
 }
 
-void device_commands_inject_stale_inflight(void)
+void device_commands_window_status(size_t *slots, size_t *bytes)
 {
-    if (s_inflight_mtx == NULL) return;
-    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
-    s_inflight_measure_id = -1;          /* no real event — reaper won't touch data */
-    s_inflight_msg_id     = 0x7FFFFFFF;  /* bogus msg_id no PUBACK will ever match */
-    /* Back-date the latch a full 10 min so age >= any reap threshold immediately,
-     * independent of current uptime (age == mono_ms() - since_ms == 10 min here). */
-    s_inflight_since_ms   = mono_ms() - (10 * 60 * 1000);
-    xSemaphoreGive(s_inflight_mtx);
-    ESP_LOGW(TAG, "injected fake stale in-flight slot (test hook) — expect a reap on next drain");
+    size_t n = 0, b = 0;
+    portENTER_CRITICAL(&s_inflight_mtx);
+    inflight_usage_locked(&n, &b);
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (slots != NULL) *slots = n;
+    if (bytes != NULL) *bytes = b;
 }
 
-/* ── Measurement-activity gate ──────────────────────────────────────────
- * The sync runner consults device_commands_measurement_active() and pauses
- * publishing while a UART measurement is in progress, draining during idle. */
+void device_commands_inject_stale_inflight(void)
+{
+    int64_t stale_since_ms = mono_ms() - (10 * 60 * 1000);
+    bool inserted = false;
+    portENTER_CRITICAL(&s_inflight_mtx);
+    int idx = inflight_find_free_locked();
+    if (idx >= 0) {
+        s_inflight[idx] = (dc_inflight_slot_t) {
+            .used       = true,
+            .measure_id = -1,          /* no real event — reaper touches no data */
+            .msg_id     = 0x7FFFFFFF,  /* bogus id no PUBACK will ever match */
+            .since_ms   = stale_since_ms,
+        };
+        inserted = true;
+    }
+    portEXIT_CRITICAL(&s_inflight_mtx);
+    if (inserted) {
+        ESP_LOGW(TAG, "injected fake stale in-flight slot (test hook) — expect a reap on next drain");
+    } else {
+        ESP_LOGW(TAG, "cannot inject stale slot: publish window is full");
+    }
+}
+
+/* ── Measurement activity + narrow publish hold ─────────────────────────
+ * Measurement activity retains its whole-cycle PM/telemetry semantics. The
+ * sync runner normally consults publish_hold instead; the legacy escape hatch
+ * switches it back to measurement_active at compile time. */
 void device_commands_measurement_begin(void)
 {
     /* Acquire the PM lock on the outermost begin (0->1) so light sleep can't gate
@@ -1207,6 +1892,40 @@ void device_commands_measurement_end(void)
     if (s_measurement_active == 0) notify_sync();  /* burst done — let the runner drain */
 }
 bool device_commands_measurement_active(void) { return s_measurement_active > 0; }
+
+static void device_commands_publish_hold_begin(void)
+{
+    s_publish_hold++;
+}
+
+static void device_commands_publish_hold_end(void)
+{
+    if (s_publish_hold > 0 && --s_publish_hold == 0) {
+        /* A raw transaction can end while the outer Lua measurement bracket is
+         * still active. Wake the runner here so the newly narrow gate matters. */
+        notify_sync();
+    }
+}
+
+bool device_commands_publish_hold_active(void) { return s_publish_hold > 0; }
+
+static void sensor_transaction_begin(void)
+{
+    device_commands_measurement_begin();
+    device_commands_publish_hold_begin();
+}
+
+static void sensor_transaction_end(void)
+{
+    device_commands_publish_hold_end();
+    device_commands_measurement_end();
+}
+
+uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s)
+{
+    return s_cfg.error_disconnect_count != NULL
+        ? s_cfg.error_disconnect_count(window_s) : 0;
+}
 
 /* ── UART sensor commands — raw interface (Phase 7) ─────────────── */
 
@@ -1235,10 +1954,10 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
     if (channel >= UART_SENSOR_NUM_CHANNELS) {
         return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
     }
-    device_commands_measurement_begin();
+    sensor_transaction_begin();
     esp_err_t err = s_cfg.uart_query(channel, cmd, extra, extra_len,
                                      expect_raw, response, timeout_ms);
-    device_commands_measurement_end();
+    sensor_transaction_end();
     if (err != ESP_OK) {
         return make_result(err, "UART ch%u query failed: %s",
                            channel, esp_err_to_name(err));
@@ -1263,9 +1982,9 @@ cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
     if (channel >= UART_SENSOR_NUM_CHANNELS) {
         return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
     }
-    device_commands_measurement_begin();
+    sensor_transaction_begin();
     esp_err_t err = s_cfg.uart_ping(channel, connected);
-    device_commands_measurement_end();
+    sensor_transaction_end();
     if (err != ESP_OK) {
         return make_result(err, "UART ch%u ping failed: %s",
                            channel, esp_err_to_name(err));
@@ -1324,7 +2043,7 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
     out_resp[0] = '\0';
 
     /* First attempt — full timeout budget. */
-    device_commands_measurement_begin();
+    sensor_transaction_begin();
     esp_err_t err = s_cfg.uart_text_query(channel, cmd, terminator,
                                           out_resp, resp_cap, resp_len, timeout_ms);
 
@@ -1350,7 +2069,7 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
             }
         }
     }
-    device_commands_measurement_end();
+    sensor_transaction_end();
 
     /* On hard error (other than timeout) propagate. */
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
@@ -2009,4 +2728,3 @@ cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status)
     uint8_t cmd[8] = { AMBIT_CMD_OTA_CONFIRM, 0, 0, 0, 0, 0, 0, 0 };
     return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
 }
-

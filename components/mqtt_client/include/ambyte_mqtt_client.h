@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "messaging_port.h"
@@ -30,9 +31,16 @@ bool      mqtt_client_is_running(void);   /* true once start() has been called a
 
 message_publish_fn                  mqtt_client_get_publish_fn(void);
 message_is_connected_fn             mqtt_client_get_is_connected_fn(void);
+message_error_disconnect_count_fn   mqtt_client_get_error_disconnect_count_fn(void);
+message_connection_stats_fn         mqtt_client_get_connection_stats_fn(void);
+message_set_connect_handler_fn      mqtt_client_get_set_connect_handler_fn(void);
 message_set_publish_ack_handler_fn  mqtt_client_get_set_ack_handler_fn(void);
 message_set_received_handler_fn     mqtt_client_get_set_received_handler_fn(void);
 message_set_disconnect_handler_fn   mqtt_client_get_set_disconnect_handler_fn(void);
+
+/* Feed the Wi-Fi event's reason code into the MQTT-owned last-disconnect latch.
+ * Call before stopping the client so STATUS retains the more useful cause. */
+void mqtt_client_note_wifi_disconnect(uint8_t reason);
 
 #ifdef __cplusplus
 }
