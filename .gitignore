@@ -3,6 +3,12 @@
 .env
 __pycache__/
 build/
+/dist/
+/node_modules/
+/release-assets/
+/release-preview.log
+/release-preview.md
+/releases/
 temp_inipreview.txt
 dom_ludo_prototype_ambyte_thing_certs/
 docs/ble-provisioning-cmd.txt
