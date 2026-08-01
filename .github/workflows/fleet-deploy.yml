@@ -17,6 +17,11 @@ name: Fleet deploy (OTA)
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Target account/fleet (the whole fleet lives on dev today; prod is provisioned for the migration)"
+        type: choice
+        options: [dev, prod]
+        default: dev
       release_tag:
         description: "Release tag to deploy (e.g. v1.2.0), or 'latest'"
         type: string
@@ -63,11 +68,12 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.release_tag }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    name: Deploy ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
     runs-on: ubuntu-latest
-    # Protection rules (required reviewers for live runs) live on this
-    # environment; also pin the OIDC trust policy to it. See the README.
-    environment: fleet-deploy
+    # Per-account GitHub environments carry the protection rules (required
+    # reviewers) and the AWS_FLEET_DEPLOY_ROLE_ARN secret; each account's
+    # IAM role trusts exactly its own environment. See the README.
+    environment: fleet-deploy-${{ inputs.environment }}
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -110,6 +116,9 @@ jobs:
           role-to-assume: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
           aws-region: eu-central-1
           role-session-name: fleet-deploy-${{ github.run_id }}
+          # a full campaign (jitter + degraded-link downloads) can outlive
+          # the default 1 h credentials; the role allows 2 h sessions
+          role-duration-seconds: 7200
 
       - name: Run fleet deploy
         env:

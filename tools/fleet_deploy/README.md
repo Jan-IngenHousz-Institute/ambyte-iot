@@ -84,45 +84,58 @@ python tools/fleet_deploy/fleet_deploy.py \
 Drop `--dry-run` to deploy. `--devices "E8:F6:0A:B1:1D:D4"` targets the
 bench unit directly.
 
-## GitHub Actions setup (one-time)
+## GitHub Actions setup (provisioned 2026-08-01)
 
-1. Create the `fleet-deploy` GitHub **environment** (Settings -> Environments)
-   and add **required reviewers**: the job deploys to production hardware,
-   and `workflow_dispatch` runs whichever ref's copy of the workflow and
-   script was selected, so an approval gate is the only thing between a
-   modified feature-branch script and the fleet. Store the secret below as
-   an environment secret. Dispatch from `main` unless deliberately testing.
-2. Create the IAM role the workflow assumes via OIDC and set the
-   environment secret `AWS_FLEET_DEPLOY_ROLE_ARN` to its ARN. The role
-   needs:
+Dev vs prod follows the org's account split (jii-infra Control Tower;
+open-jii's per-env `iam-oidc` pattern). The `environment` workflow input
+selects the target; everything below already exists:
 
-- trust policy for `token.actions.githubusercontent.com` pinned to this
-  environment:
-  `sub = repo:Jan-IngenHousz-Institute/ambyte-iot:environment:fleet-deploy`
-- permissions:
+| | dev | prod |
+|---|---|---|
+| AWS account | OpenJII-DEV `084375565727` | OpenJII-PROD `494249241400` |
+| GitHub environment | `fleet-deploy-dev` | `fleet-deploy-prod` |
+| IAM role (via OIDC) | `GithubActionsAmbyteFleetDeploy` | `GithubActionsAmbyteFleetDeploy` |
+| Secret `AWS_FLEET_DEPLOY_ROLE_ARN` | set (env-scoped) | set (env-scoped) |
+
+Both GitHub environments have **required reviewers**: the job deploys to
+real hardware, and `workflow_dispatch` runs whichever ref's copy of the
+workflow and script was selected, so the approval gate is the only thing
+between a modified feature-branch script and the fleet. Dispatch from
+`main` unless deliberately testing. The whole fleet connects to the dev
+IoT Core today; prod is pre-provisioned for the platform migration.
+
+Each account's role reuses that account's existing GitHub OIDC provider
+(created by open-jii's `iam-oidc` module) and trusts exactly its own
+environment
+(`sub = repo:Jan-IngenHousz-Institute/ambyte-iot:environment:fleet-deploy-<env>`,
+2 h max session to cover long campaigns). Reference permissions policy
+(account-scoped; attached as inline policy `fleet-deploy`):
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Effect": "Allow",
-      "Action": ["logs:StartQuery", "logs:GetQueryResults"],
-      "Resource": "arn:aws:logs:eu-central-1:*:log-group:AWSIotLogsV2:*" },
-    { "Effect": "Allow",
-      "Action": ["iot:DescribeEndpoint"],
+    { "Sid": "DiscoverDevices", "Effect": "Allow",
+      "Action": ["logs:StartQuery"],
+      "Resource": "arn:aws:logs:eu-central-1:<account>:log-group:AWSIotLogsV2:*" },
+    { "Sid": "QueryResults", "Effect": "Allow",
+      "Action": ["logs:GetQueryResults"],
       "Resource": "*" },
-    { "Effect": "Allow",
-      "Action": ["iot:Connect"],
-      "Resource": "arn:aws:iot:eu-central-1:*:client/fleet-deploy-*" },
-    { "Effect": "Allow",
-      "Action": ["iot:Publish"],
-      "Resource": "arn:aws:iot:eu-central-1:*:topic/device/scripts/v1/Ambyte/2/*" },
-    { "Effect": "Allow",
-      "Action": ["iot:Subscribe"],
-      "Resource": "arn:aws:iot:eu-central-1:*:topicfilter/experiment/data_ingest/v1/*" },
-    { "Effect": "Allow",
-      "Action": ["iot:Receive"],
-      "Resource": "arn:aws:iot:eu-central-1:*:topic/experiment/data_ingest/v1/*" }
+    { "Sid": "IotEndpoint", "Effect": "Allow",
+      "Action": "iot:DescribeEndpoint",
+      "Resource": "*" },
+    { "Sid": "IotConnect", "Effect": "Allow",
+      "Action": "iot:Connect",
+      "Resource": "arn:aws:iot:eu-central-1:<account>:client/fleet-deploy-*" },
+    { "Sid": "CommandPublish", "Effect": "Allow",
+      "Action": "iot:Publish",
+      "Resource": "arn:aws:iot:eu-central-1:<account>:topic/device/scripts/v1/Ambyte/2/*" },
+    { "Sid": "StatusSubscribe", "Effect": "Allow",
+      "Action": "iot:Subscribe",
+      "Resource": "arn:aws:iot:eu-central-1:<account>:topicfilter/experiment/data_ingest/v1/*" },
+    { "Sid": "StatusReceive", "Effect": "Allow",
+      "Action": "iot:Receive",
+      "Resource": "arn:aws:iot:eu-central-1:<account>:topic/experiment/data_ingest/v1/*" }
   ]
 }
 ```
