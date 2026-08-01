@@ -34,6 +34,7 @@
 #include "esp_pm.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
@@ -893,7 +894,7 @@ void app_main(void)
      * when device_id has no {MAC} (e.g. a fixed AMBYTE_DEVICE_ID). */
     subst_token(device_id, sizeof(device_id), "{MAC}", mac_str);
     static char protocol_id[32], device_name[64], device_version[16],
-                device_firmware[16], firmware_version[16], timezone[48];
+                device_firmware[16], timezone[48];
     if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
         protocol_id[0] = '\0';
     }
@@ -910,9 +911,6 @@ void app_main(void)
     }
     if (device_config_get_device_firmware(device_firmware, sizeof(device_firmware)) != ESP_OK) {
         device_firmware[0] = '\0';
-    }
-    if (device_config_get_firmware_version(firmware_version, sizeof(firmware_version)) != ESP_OK) {
-        firmware_version[0] = '\0';
     }
     if (device_config_get_timezone(timezone, sizeof(timezone)) != ESP_OK) {
         timezone[0] = '\0';
@@ -976,7 +974,12 @@ void app_main(void)
         .publish          = mqtt_client_get_publish_fn(),
         .status_topic     = status_topic,
         .device_id        = device_id,
-        .firmware_version = firmware_version,
+        /* The COMPILED version of the running image, not the NVS
+         * `firmware_ver` provisioning string: that string is written once at
+         * USB flash time and never by OTA, so after any OTA it lies (the
+         * fleet ponged "1"/"1.0.2" while running newer images). pong.fw is
+         * what fleet_deploy targets version cohorts on — it must be true. */
+        .firmware_version = esp_app_get_description()->version,
     };
     if (command_router_init(&cr_cfg) == ESP_OK) {
         mqtt_client_get_set_received_handler_fn()(command_router_get_received_fn(), NULL);
