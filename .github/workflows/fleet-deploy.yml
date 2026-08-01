@@ -1,0 +1,149 @@
+name: Fleet deploy (OTA)
+
+# Manually triggered, targeted OTA rollout of a published firmware release.
+# The heavy lifting lives in tools/fleet_deploy/fleet_deploy.py; this workflow
+# resolves the release tag, authenticates to AWS, and runs it.
+#
+# Targeting recipes (the inputs compose):
+#   all devices                  -> version_op=any, percentage=100
+#   all devices on a version     -> version_op=eq,  version=1.0.5
+#   30% of all devices           -> version_op=any, percentage=30
+#   30% below a version          -> version_op=lt,  version=1.2.0, percentage=30
+#
+# dry_run defaults to TRUE: the first run of any campaign should be a preview.
+# Re-running the same tag live is always safe (devices latch the campaign id
+# on success; sweeps only catch stragglers).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to deploy (e.g. v1.2.0), or 'latest'"
+        type: string
+        default: "latest"
+      version_op:
+        description: "Version filter against each device's reported fw"
+        type: choice
+        options: [any, eq, lt, lte, gt, gte]
+        default: any
+      version:
+        description: "Reference version for the filter (e.g. 1.0.5); ignored for 'any'"
+        type: string
+        default: ""
+      percentage:
+        description: "Percent of matching devices to target (1-100, deterministic cohort)"
+        type: string
+        default: "100"
+      devices:
+        description: "Optional explicit device list (MACs or AMBYTE_<MAC>, comma/space separated); skips discovery"
+        type: string
+        default: ""
+      discovery_window_minutes:
+        description: "How far back to look for active devices"
+        type: string
+        default: "1440"
+      dry_run:
+        description: "Preview the plan without publishing anything"
+        type: boolean
+        default: true
+      allow_downgrade:
+        description: "Also command devices reporting a NEWER fw than the release (default: skip them)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC role assumption for AWS
+
+# One rollout at a time. Two concurrent campaigns publishing different ids
+# to overlapping cohorts would race each other's OTA admission.
+concurrency:
+  group: fleet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.release_tag }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    # Protection rules (required reviewers for live runs) live on this
+    # environment; also pin the OIDC trust policy to it. See the README.
+    environment: fleet-deploy
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${TAG}" == "latest" ]]; then
+            TAG=$(gh release view --repo "${REPO}" --json tagName -q .tagName)
+          fi
+          # The tag must be a published release carrying a firmware.bin asset.
+          gh release view "${TAG}" --repo "${REPO}" --json assets \
+            -q '.assets[].name' | grep -qx 'firmware.bin' \
+            || { echo "::error::release ${TAG} has no firmware.bin asset"; exit 1; }
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Deploying release ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/fleet_deploy/requirements.txt
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r tools/fleet_deploy/requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: fleet-deploy-${{ github.run_id }}
+
+      - name: Run fleet deploy
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION_OP: ${{ inputs.version_op }}
+          VERSION: ${{ inputs.version }}
+          PERCENTAGE: ${{ inputs.percentage }}
+          DEVICES: ${{ inputs.devices }}
+          WINDOW_MINUTES: ${{ inputs.discovery_window_minutes }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --repo "${REPO}"
+            --tag "${TAG}"
+            --version-op "${VERSION_OP}"
+            --percentage "${PERCENTAGE}"
+            --window-minutes "${WINDOW_MINUTES}"
+            --results-json results.json
+          )
+          [[ -n "${VERSION}" ]] && ARGS+=(--version "${VERSION}")
+          [[ -n "${DEVICES}" ]] && ARGS+=(--devices "${DEVICES}")
+          [[ "${DRY_RUN}" == "true" ]] && ARGS+=(--dry-run)
+          [[ "${ALLOW_DOWNGRADE}" == "true" ]] && ARGS+=(--allow-downgrade)
+          python tools/fleet_deploy/fleet_deploy.py "${ARGS[@]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fleet-deploy-results-${{ github.run_id }}
+          path: results.json
+          if-no-files-found: warn
+          retention-days: 90

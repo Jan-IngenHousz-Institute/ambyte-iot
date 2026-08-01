@@ -1,0 +1,5 @@
+# fleet_deploy.py runtime deps. awsiotsdk pulls in awscrt (the MQTT-over-
+# WebSocket client); boto3 covers CloudWatch Logs Insights + IoT endpoint
+# lookup + SigV4 credentials.
+boto3>=1.34
+awsiotsdk>=1.21
