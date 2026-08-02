@@ -580,11 +580,31 @@ static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
                                          bool *clock_ok, int64_t *pending_out,
                                          int64_t *since_out)
 {
+    /* Last time the power gate was observed CLOSED (esp_timer ms). Starvation
+     * must be measured from whichever came last: the last PUBACK or the last
+     * closed-gate moment. Field night 2026-08-02 (first fleet night on 1.3.0):
+     * battery devices close the gate at dusk while the schedule keeps queueing,
+     * so ms_since_publish_ok spans the whole night; at dawn the gate reopens
+     * with pending > 0 and "since" already hours past the timeout, and any
+     * watchdog tick that lands before the first morning PUBACK reboots a
+     * perfectly healthy device (3 devices latched "nopuback" that night).
+     * Clamping to time-since-gate-open restarts the 1 h observation window at
+     * reopen; a genuine wedge with the gate open still reboots on schedule. */
+    static int64_t s_gate_blocked_ms;
+
     bool    a = device_commands_publish_power_ok();
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
     int64_t pending = 0;
     (void)cmd_db_status(NULL, NULL, &pending, NULL);
     int64_t since = device_commands_ms_since_publish_ok();
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (!a) {
+        s_gate_blocked_ms = now_ms;
+    } else if (s_gate_blocked_ms > 0) {
+        int64_t since_gate_open = now_ms - s_gate_blocked_ms;
+        if (since_gate_open < since) since = since_gate_open;
+    }
 
     if (allowed)     *allowed     = a;
     if (clock_ok)    *clock_ok    = c;
