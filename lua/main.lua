@@ -3,7 +3,7 @@ local NUM_CHANNELS = 4                              -- AMBIT channels to scan (0
 
 -- ── Protocols (segment tables passed to ambit.run) ────────────────────────
 local SS = {                                        -- steady-state probe (1 line)
-    { pulses = 58, freq =1, actinic = 0 },
+    { pulses = 59, freq =1, actinic = 0 },
 }
 
 local MPF = {                                       -- multi-phase saturating flash
