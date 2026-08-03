@@ -24,6 +24,7 @@
 #include "script_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
@@ -34,7 +35,6 @@
 #include "esp_pm.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
-#include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
@@ -970,6 +970,7 @@ void app_main(void)
     }
 
     /* Route inbound commands (ping/ota_update/script_update) to the command router. */
+    const esp_app_desc_t *running_app = esp_app_get_description();
     command_router_config_t cr_cfg = {
         .publish          = mqtt_client_get_publish_fn(),
         .status_topic     = status_topic,
@@ -979,7 +980,7 @@ void app_main(void)
          * USB flash time and never by OTA, so after any OTA it lies (the
          * fleet ponged "1"/"1.0.2" while running newer images). pong.fw is
          * what fleet_deploy targets version cohorts on — it must be true. */
-        .firmware_version = esp_app_get_description()->version,
+        .firmware_version = running_app != NULL ? running_app->version : "",
     };
     if (command_router_init(&cr_cfg) == ESP_OK) {
         mqtt_client_get_set_received_handler_fn()(command_router_get_received_fn(), NULL);
@@ -1215,7 +1216,10 @@ void app_main(void)
         .set_clock              = pcf2131tfy_rtc_set_epoch,
         .read_power             = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
         .set_status             = ambyte_status_get_set_fn(),
-        .sd_ready               = sd_available ? sdcard_is_mounted : NULL,
+        /* The SD monitor can mount a card that was absent at boot, so keep both
+         * probes wired for the whole session. They fail closed while unmounted. */
+        .sd_ready               = sdcard_is_mounted,
+        .read_script_identity   = script_update_get_identity,
         .next_id            = persistence_available ? event_log_get_next_id_fn()            : NULL,
         .store_event        = persistence_available ? event_log_get_store_event_fn()        : NULL,
         .claim_next_event   = persistence_available ? event_log_get_claim_next_event_fn()   : NULL,

@@ -1,4 +1,4 @@
-name: Release firmware
+name: Release firmware and Lua
 
 on:
   push:
@@ -11,12 +11,12 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: firmware-release
+  group: ambyte-release
   cancel-in-progress: false
 
 jobs:
   release:
-    name: Release firmware
+    name: Release affected units
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
@@ -31,7 +31,7 @@ jobs:
           node-version: "24"
 
       - name: Install release tooling
-        run: npm install --ignore-scripts --package-lock=false
+        run: npm ci --ignore-scripts
 
       - name: Determine next release
         id: preview
@@ -40,19 +40,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npx semantic-release --dry-run --no-ci 2>&1 | tee release-preview.log
-          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}' || true)
-          if [[ -n "${VERSION}" ]]; then
-            echo "will-release=true" >> "${GITHUB_OUTPUT}"
-            echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "will-release=false" >> "${GITHUB_OUTPUT}"
-            echo "No firmware release is required." >> "${GITHUB_STEP_SUMMARY}"
+          preview_unit() {
+            local unit="$1"
+            local workdir="$2"
+            local log="release-preview-${unit}.log"
+            (cd "${workdir}" && "${GITHUB_WORKSPACE}/node_modules/.bin/semantic-release" --dry-run --no-ci) \
+              2>&1 | tee "${log}" >&2
+            grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' "${log}" \
+              | tail -n 1 | awk '{print $6}' || true
+          }
+          FIRMWARE_VERSION=$(preview_unit firmware .)
+          LUA_VERSION=$(preview_unit lua lua)
+          [[ -n "${FIRMWARE_VERSION}" ]] && FIRMWARE_WILL_RELEASE=true || FIRMWARE_WILL_RELEASE=false
+          [[ -n "${LUA_VERSION}" ]] && LUA_WILL_RELEASE=true || LUA_WILL_RELEASE=false
+          [[ "${FIRMWARE_WILL_RELEASE}" == true || "${LUA_WILL_RELEASE}" == true ]] \
+            && ANY_WILL_RELEASE=true || ANY_WILL_RELEASE=false
+          echo "firmware-version=${FIRMWARE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "firmware-will-release=${FIRMWARE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "lua-version=${LUA_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "lua-will-release=${LUA_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "any-will-release=${ANY_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          if [[ "${ANY_WILL_RELEASE}" == false ]]; then
+            echo "No firmware or Lua release is required." >> "${GITHUB_STEP_SUMMARY}"
           fi
 
-      - name: Locate PR firmware artifact
+      - name: Locate PR release artifact
         id: artifact
-        if: steps.preview.outputs.will-release == 'true'
+        if: steps.preview.outputs.any-will-release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -66,7 +80,7 @@ jobs:
             exit 1
           fi
           HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
-          ARTIFACT_NAME="firmware-${HEAD_SHA}"
+          ARTIFACT_NAME="release-${HEAD_SHA}"
           RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id // empty')
           if [[ -z "${RUN_ID}" ]]; then
@@ -76,8 +90,8 @@ jobs:
           echo "name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
           echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
 
-      - name: Download PR firmware artifact
-        if: steps.preview.outputs.will-release == 'true'
+      - name: Download PR release artifact
+        if: steps.preview.outputs.any-will-release == 'true'
         uses: actions/download-artifact@v6
         with:
           name: ${{ steps.artifact.outputs.name }}
@@ -87,21 +101,48 @@ jobs:
           run-id: ${{ steps.artifact.outputs.run-id }}
 
       - name: Verify release assets
-        if: steps.preview.outputs.will-release == 'true'
+        if: steps.preview.outputs.any-will-release == 'true'
         env:
-          VERSION: ${{ steps.preview.outputs.version }}
+          FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-version }}
+          FIRMWARE_WILL_RELEASE: ${{ steps.preview.outputs.firmware-will-release }}
+          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
+          LUA_WILL_RELEASE: ${{ steps.preview.outputs.lua-will-release }}
         shell: bash
         run: |
           set -euo pipefail
-          test -f release-assets/firmware.bin
-          test -f "release-assets/ambyte-iot-v${VERSION}.zip"
+          if [[ "${FIRMWARE_WILL_RELEASE}" == true ]]; then
+            test -f release-assets/firmware.bin
+            test -f "release-assets/ambyte-iot-v${FIRMWARE_VERSION}.zip"
+          fi
+          if [[ "${LUA_WILL_RELEASE}" == true ]]; then
+            test -f release-assets/main.lua
+            test -f release-assets/main.lua.manifest.json
+            test "$(jq -r .script_version release-assets/main.lua.manifest.json)" = "${LUA_VERSION}"
+            test "$(sha256sum release-assets/main.lua | awk '{print $1}')" = \
+              "$(jq -r .sha256 release-assets/main.lua.manifest.json)"
+          fi
 
-      - name: Publish GitHub release
-        if: steps.preview.outputs.will-release == 'true'
+      - name: Publish firmware release
+        if: steps.preview.outputs.firmware-will-release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx semantic-release
 
+      - name: Publish Lua release
+        if: steps.preview.outputs.lua-will-release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cd lua && ../node_modules/.bin/semantic-release
+
       - name: Release summary
-        if: steps.preview.outputs.will-release == 'true'
-        run: echo "Published firmware v${{ steps.preview.outputs.version }} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
+        if: steps.preview.outputs.any-will-release == 'true'
+        env:
+          FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-version }}
+          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
+        run: |
+          if [[ -n "${FIRMWARE_VERSION}" ]]; then
+            echo "Published firmware v${FIRMWARE_VERSION} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [[ -n "${LUA_VERSION}" ]]; then
+            echo "Published Lua lua-v${LUA_VERSION} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
+          fi
