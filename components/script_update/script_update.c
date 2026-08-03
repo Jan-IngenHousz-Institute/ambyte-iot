@@ -283,6 +283,23 @@ esp_err_t script_update_get_identity(script_identity_t *out)
     return ESP_OK;
 }
 
+/* A release command is a duplicate only when both its success latch and its
+ * authoritative byte identity still match. Legacy commands without a checksum
+ * retain id-only dedupe so retained reboot commands cannot loop. This runs on
+ * the maintenance worker, never the MQTT callback task. */
+static bool request_already_active(const script_req_t *r)
+{
+    if (!already_applied(r->id)) return false;
+    if (r->checksum[0] == '\0') return true;
+
+    char active_sha[65] = "";
+    if (!sdcard_io_begin()) return false;
+    esp_err_t err = sha256_file(LUA_PATH, active_sha);
+    sdcard_io_end();
+    if (err != ESP_OK) return false;
+    return strncasecmp(active_sha, r->checksum, 64) == 0;
+}
+
 /* Parse-only syntax check in a bare state (no env needed — nothing executes). */
 static bool syntax_ok(const char *script, char *err, size_t err_cap)
 {
@@ -689,6 +706,18 @@ static void do_exec(const script_req_t *r)
 static void script_run(void *arg)
 {
     script_req_t *r = arg;
+    if (r->op != OP_EXEC && request_already_active(r)) {
+        ESP_LOGI(TAG, "script_update id=%s already active — reporting identity",
+                 r->id);
+        report_script("applied", r->id, "already applied; checksum verified");
+        free(r->text);
+        free(r);
+        return;
+    }
+    if (r->op != OP_EXEC && already_applied(r->id)) {
+        ESP_LOGW(TAG, "script_update id=%s latch matched but active checksum drifted — reapplying",
+                 r->id);
+    }
     /* Global maintenance gate: refuse to overlap another update type. Redundant
      * under the single shared worker (ops are already serialized), kept as
      * belt-and-suspenders. */
@@ -781,11 +810,6 @@ esp_err_t script_update_request(const char *script, const char *checksum, const 
                                 const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update")) return ESP_ERR_INVALID_ARG;
-    /* Retained-topic dedupe: an already-applied id is ignored (success-latched). */
-    if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update id=%s already applied — ignoring", id);
-        return ESP_OK;
-    }
     return request_common(OP_UPDATE, script, checksum, id, reboot,
                           script_version, built_against_fw);
 }
@@ -795,12 +819,6 @@ esp_err_t script_update_url_request(const char *url, const char *checksum, const
                                     const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update(url)")) return ESP_ERR_INVALID_ARG;
-    /* Same success-latch dedupe as the inline path (stops a retained url command
-     * from re-downloading + re-rebooting on every reconnect). */
-    if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update(url) id=%s already applied — ignoring", id);
-        return ESP_OK;
-    }
     return request_common(OP_UPDATE_URL, url, checksum, id, reboot,
                           script_version, built_against_fw);   /* text holds the URL */
 }
