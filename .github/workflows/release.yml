@@ -41,7 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           preview_unit() {
-            local unit="$1" workdir="$2" log="release-preview-${unit}.log"
+            local unit="$1"
+            local workdir="$2"
+            local log="release-preview-${unit}.log"
             (cd "${workdir}" && "${GITHUB_WORKSPACE}/node_modules/.bin/semantic-release" --dry-run --no-ci) \
               2>&1 | tee "${log}" >&2
             grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' "${log}" \

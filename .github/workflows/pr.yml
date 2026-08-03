@@ -67,7 +67,9 @@ jobs:
           export GITHUB_EVENT_NAME="push"
 
           preview_unit() {
-            local unit="$1" workdir="$2" log="release-preview-${unit}.log"
+            local unit="$1"
+            local workdir="$2"
+            local log="release-preview-${unit}.log"
             set +e
             (cd "${workdir}" && "${GITHUB_WORKSPACE}/node_modules/.bin/semantic-release" --dry-run --no-ci) \
               2>&1 | tee "${log}" >&2
