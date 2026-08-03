@@ -43,6 +43,18 @@ jobs:
       - name: Test release scoping
         run: npm run test:release
 
+      - name: Detect firmware build scope
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --name-only "${PR_BASE_SHA}" "${PR_HEAD_SHA}" \
+            | node tools/release/pr-build-scope.js \
+            | tee -a "${GITHUB_OUTPUT}"
+
       - name: Compute release preview
         id: preview
         env:
@@ -133,21 +145,29 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Test Lua manifest tooling
-        run: python -m unittest tests.test_build_lua_release
+      - name: Test Python tooling
+        run: python -m unittest discover -s tests -v
+
+      - name: Prepare release artifact
+        run: |
+          mkdir -p dist
+          cp release-preview.md dist/release-preview.md
 
       - name: Install PlatformIO
+        if: steps.scope.outputs.firmware-build-required == 'true'
         run: |
           python -m venv "${RUNNER_TEMP}/platformio"
           "${RUNNER_TEMP}/platformio/bin/pip" install --disable-pip-version-check platformio==6.1.19
 
       - name: Build unprovisioned firmware
+        if: steps.scope.outputs.firmware-build-required == 'true'
         env:
           AMBYTE_NVS_SKIP: "1"
           AMBYTE_PROJECT_VER: ${{ steps.preview.outputs.firmware-build-version }}
         run: "${RUNNER_TEMP}/platformio/bin/pio run -e esp32-s3-devkitm-1"
 
       - name: Verify version and create flash ZIP
+        if: steps.scope.outputs.firmware-build-required == 'true'
         env:
           FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-build-version }}
           ZIP_NAME: ${{ steps.preview.outputs.zip-name }}
@@ -174,7 +194,6 @@ jobs:
 
           mkdir -p dist
           cp "${BUILD_DIR}/firmware.bin" dist/firmware.bin
-          cp release-preview.md dist/release-preview.md
           mkdir -p dist/bundle/bootloader dist/bundle/partition_table
           cp "${BUILD_DIR}/firmware.bin" dist/bundle/ambyte-iot.bin
           cp "${BUILD_DIR}/bootloader.bin" dist/bundle/bootloader/bootloader.bin

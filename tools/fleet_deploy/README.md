@@ -1,4 +1,4 @@
-# Fleet deploy (OTA)
+# Fleet deploy (OTA and Lua)
 
 Targeted, staged rollouts of a published firmware release to the Ambyte
 fleet, from GitHub Actions (**Actions -> Fleet deploy (OTA) -> Run
@@ -158,3 +158,28 @@ discovery reads it.
 A run exits non-zero when at least one device reports `failed`, or when the
 campaign hit an error mid-tracking (partial results are still written to
 `results.json` and the summary).
+
+## Deploying a Lua release
+
+Use **Actions -> Fleet deploy (Lua) -> Run workflow**. Its targeting form
+matches Fleet deploy (OTA): environment, release tag or `latest`, firmware
+predicate, deterministic percentage, optional exact devices, and discovery
+window. It also controls whether the device reboots after the swap. Dry-run is
+the default; it publishes correlated ping commands to discover firmware
+versions but publishes no `script_update` command.
+
+`latest` considers only published `lua-v*` releases. Before connecting to IoT,
+the deploy tool verifies the manifest schema, tag and version identity,
+immutable asset URL, byte count, and SHA-256. `built_against_fw` is reported as
+provenance and is not an automatic compatibility constraint.
+
+For a local exact-device preview:
+
+```sh
+python tools/fleet_deploy/lua_deploy.py \
+    --profile <sso-profile> --tag lua-v1.0.0 \
+    --devices "E8:F6:0A:B1:1D:D4" --dry-run
+```
+
+Drop `--dry-run` to publish. The result artifact and job summary classify each
+target as `accepted`, `applied`, `failed`, `busy`, or `no_reply`.

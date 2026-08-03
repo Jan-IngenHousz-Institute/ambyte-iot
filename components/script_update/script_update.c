@@ -783,7 +783,8 @@ esp_err_t script_update_request(const char *script, const char *checksum, const 
     if (reboot_needs_id(id, reboot, "script_update")) return ESP_ERR_INVALID_ARG;
     /* Retained-topic dedupe: an already-applied id is ignored (success-latched). */
     if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update id=%s already applied — ignoring", id);
+        ESP_LOGI(TAG, "script_update id=%s already applied — reporting active identity", id);
+        report_script("applied", id, "already applied");
         return ESP_OK;
     }
     return request_common(OP_UPDATE, script, checksum, id, reboot,
@@ -798,7 +799,8 @@ esp_err_t script_update_url_request(const char *url, const char *checksum, const
     /* Same success-latch dedupe as the inline path (stops a retained url command
      * from re-downloading + re-rebooting on every reconnect). */
     if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update(url) id=%s already applied — ignoring", id);
+        ESP_LOGI(TAG, "script_update(url) id=%s already applied — reporting active identity", id);
+        report_script("applied", id, "already applied");
         return ESP_OK;
     }
     return request_common(OP_UPDATE_URL, url, checksum, id, reboot,

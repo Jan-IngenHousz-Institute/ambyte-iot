@@ -1,0 +1,148 @@
+name: Fleet deploy (Lua)
+
+# Manually deploys one immutable, published Lua release to a targeted cohort.
+# Release publication stays separate; this workflow only selects devices and
+# publishes the manifest's verified script_update command.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target account/fleet"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      release_tag:
+        description: "Lua release tag (e.g. lua-v1.0.0), or 'latest'"
+        type: string
+        default: "latest"
+      version_op:
+        description: "Firmware-version filter reported by each device"
+        type: choice
+        options: [any, eq, lt, lte, gt, gte]
+        default: any
+      version:
+        description: "Reference firmware version; ignored for 'any'"
+        type: string
+        default: ""
+      percentage:
+        description: "Percent of matching devices to target (1-100, deterministic)"
+        type: string
+        default: "100"
+      devices:
+        description: "Optional MACs or AMBYTE_<MAC> IDs, comma/space separated"
+        type: string
+        default: ""
+      discovery_window_minutes:
+        description: "How far back to look for active devices"
+        type: string
+        default: "1440"
+      reboot:
+        description: "Reboot after the script swap"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Ping and preview targets without publishing script_update"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+# OTA and Lua swaps share the device maintenance admission gate. Serialize all
+# fleet mutation workflows so overlapping campaigns cannot race one another.
+concurrency:
+  group: fleet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    environment: fleet-deploy-${{ inputs.environment }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve Lua release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${TAG}" == "latest" ]]; then
+            TAG=$(gh release list --repo "${REPO}" --limit 100 \
+              --json tagName,isDraft,isPrerelease,publishedAt \
+              --jq '[.[] | select(.isDraft == false and .isPrerelease == false and (.tagName | test("^lua-v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.-]+)?$")))] | sort_by(.publishedAt) | last | .tagName // empty')
+          fi
+          [[ "${TAG}" =~ ^lua-v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] \
+            || { echo "::error::${TAG:-no release} is not a published Lua release tag"; exit 1; }
+          ASSETS=$(gh release view "${TAG}" --repo "${REPO}" --json assets -q '.assets[].name')
+          grep -qx 'main.lua' <<<"${ASSETS}" \
+            || { echo "::error::release ${TAG} has no main.lua asset"; exit 1; }
+          grep -qx 'main.lua.manifest.json' <<<"${ASSETS}" \
+            || { echo "::error::release ${TAG} has no Lua manifest asset"; exit 1; }
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Deploying Lua release ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/fleet_deploy/requirements.txt
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r tools/fleet_deploy/requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: fleet-deploy-lua-${{ github.run_id }}
+          role-duration-seconds: 7200
+
+      - name: Run Lua fleet deploy
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION_OP: ${{ inputs.version_op }}
+          VERSION: ${{ inputs.version }}
+          PERCENTAGE: ${{ inputs.percentage }}
+          DEVICES: ${{ inputs.devices }}
+          WINDOW_MINUTES: ${{ inputs.discovery_window_minutes }}
+          REBOOT: ${{ inputs.reboot }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --repo "${REPO}"
+            --tag "${TAG}"
+            --version-op "${VERSION_OP}"
+            --percentage "${PERCENTAGE}"
+            --window-minutes "${WINDOW_MINUTES}"
+            --results-json results.json
+          )
+          [[ -n "${VERSION}" ]] && ARGS+=(--version "${VERSION}")
+          [[ -n "${DEVICES}" ]] && ARGS+=(--devices "${DEVICES}")
+          [[ "${REBOOT}" == "true" ]] && ARGS+=(--reboot) || ARGS+=(--no-reboot)
+          [[ "${DRY_RUN}" == "true" ]] && ARGS+=(--dry-run)
+          python tools/fleet_deploy/lua_deploy.py "${ARGS[@]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fleet-deploy-lua-results-${{ github.run_id }}
+          path: results.json
+          if-no-files-found: warn
+          retention-days: 90
