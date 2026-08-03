@@ -2164,6 +2164,25 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
 #define AMBIT_INFO_NUM_CH 4
 static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
 
+/* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
+ * name lives in the calibration blob, and the identity fetch used to treat a
+ * failed calibration read as final — caching valid=true with an empty name, so
+ * every measurement was labeled the generic "ambit" until the next reconnect or
+ * reboot. After the v1.4.1 fleet OTA, 11 Ambits latched that way at once (the
+ * post-reboot fetch races the AMBIT's own settling). Two-layer cure:
+ *   1. retry the calibration read a few times inside the fetch itself;
+ *   2. if it still fails, mark it pending here and keep re-trying on later
+ *      lookups, rate-limited so a truly nameless/legacy AMBIT can't turn every
+ *      measurement into a UART round-trip.
+ * Same single-writer story as s_ambit_info (measurement/Lua task), so no lock. */
+#define AMBIT_CAL_FETCH_TRIES     3      /* attempts inside one identity fetch */
+#define AMBIT_CAL_RETRY_DELAY_MS  150    /* pause between those attempts */
+#define AMBIT_CAL_RETRY_PERIOD_MS 60000  /* floor between later re-attempts */
+static struct {
+    bool    pending;          /* identity cached but calibration (name) unread */
+    int64_t next_attempt_ms;  /* earliest time for the next re-attempt */
+} s_ambit_cal_retry[AMBIT_INFO_NUM_CH];
+
 /* Cmd 1 — Set photodetector gains on the ADPD6100.
  * Values 1-6 map to gain levels (0 = skip / keep current).
  * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
@@ -2406,6 +2425,22 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     }
 }
 
+/* One calibration-read attempt: on success fill the cal-derived fields of *e
+ * (cal_version, actinic_coef, ambit_name) and return true, leaving *cal for the
+ * DEVICE_INFO emit. On failure *e is untouched. */
+static bool ambit_cal_read(uint8_t ch, ambit_device_info_t *e, ambit_calibration_t *cal)
+{
+    size_t cgot = 0;
+    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION,
+                                         (uint8_t *)cal, sizeof *cal, &cgot);
+    if (cr.status != ESP_OK || cgot < sizeof *cal) return false;
+    e->cal_version  = esp_rom_crc32_le(0, (const uint8_t *)cal, sizeof *cal);
+    e->actinic_coef = cal->actinic_coef;
+    memset(e->ambit_name, 0, sizeof e->ambit_name);
+    memcpy(e->ambit_name, cal->ambit_name, sizeof e->ambit_name - 1);
+    return true;
+}
+
 static esp_err_t ambit_info_fetch(uint8_t ch)
 {
     /* FW info (MAC + version) is mandatory; calibration (→ cal_version) best-effort. */
@@ -2427,17 +2462,20 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
              (unsigned)fw.major, (unsigned)fw.minor, (unsigned)fw.batch);
 
     /* cal_version = CRC32 of the calibration struct → changes whenever the sensor
-     * is recalibrated. The struct has no native version field. */
+     * is recalibrated. The struct has no native version field.
+     * Retried: the name lives in this blob, and a single boot-time timeout here
+     * used to stick the channel with the generic "ambit" label for hours (see
+     * s_ambit_cal_retry above). */
     ambit_calibration_t cal;
-    size_t cgot = 0;
     bool have_cal = false;
-    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &cgot);
-    if (cr.status == ESP_OK && cgot >= sizeof cal) {
-        have_cal        = true;
-        e.cal_version   = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
-        e.actinic_coef  = cal.actinic_coef;
-        memcpy(e.ambit_name, cal.ambit_name, sizeof e.ambit_name - 1);
+    for (int attempt = 0; attempt < AMBIT_CAL_FETCH_TRIES && !have_cal; attempt++) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(AMBIT_CAL_RETRY_DELAY_MS));
+        have_cal = ambit_cal_read(ch, &e, &cal);
     }
+    /* Never latch a missing calibration as final: keep the identity usable
+     * (fw/MAC below) but leave the name pending so later lookups re-try. */
+    s_ambit_cal_retry[ch].pending         = !have_cal;
+    s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
 
     /* Preserve gains/currents tracked since the last (re)connect — the identity
      * fetch must not clobber them (they live in the same cache struct). */
@@ -2465,6 +2503,21 @@ cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
             memset(out, 0, sizeof *out);
             return make_result(err, "AMBIT%u device_info fetch failed", ch + 1);
         }
+    } else if (s_ambit_cal_retry[ch].pending &&
+               now_ms() >= s_ambit_cal_retry[ch].next_attempt_ms) {
+        /* Identity is cached but the calibration (and with it the name) never
+         * arrived — measurements are going out labeled "ambit". Re-try on the
+         * lookups that normal measurement traffic already makes, at most once
+         * per AMBIT_CAL_RETRY_PERIOD_MS, and re-announce identity once the name
+         * finally lands so the platform can correct itself. */
+        s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
+        ambit_calibration_t cal;
+        if (ambit_cal_read(ch, &s_ambit_info[ch], &cal)) {
+            s_ambit_cal_retry[ch].pending = false;
+            ambit_emit_device_info(ch, &s_ambit_info[ch], &cal, true);
+            ESP_LOGW(TAG, "AMBIT%u name recovered late: %s", ch + 1,
+                     s_ambit_info[ch].ambit_name);
+        }
     }
     *out = s_ambit_info[ch];
     return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx",
@@ -2480,6 +2533,9 @@ void cmd_ambit_device_info_invalidate(uint8_t ch)
         s_ambit_info[ch].valid        = false;
         s_ambit_info[ch].gains_set    = false;
         s_ambit_info[ch].currents_set = false;
+        /* The next fetch owns its own calibration retries. */
+        s_ambit_cal_retry[ch].pending         = false;
+        s_ambit_cal_retry[ch].next_attempt_ms = 0;
     }
 }
 
