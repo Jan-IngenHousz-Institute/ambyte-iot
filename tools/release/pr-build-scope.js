@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { pathToFileURL } from "node:url";
+import { isRelevantFile } from "./path-scoped.js";
 
 export const firmwareBuildRequired = (files) =>
-  files.some((file) => file !== "lua" && !file.startsWith("lua/"));
+  files.length === 0 || files.some((file) => isRelevantFile(file, "firmware"));
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   let input = "";

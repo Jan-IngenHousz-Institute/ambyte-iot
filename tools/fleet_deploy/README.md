@@ -173,6 +173,10 @@ the deploy tool verifies the manifest schema, tag and version identity,
 immutable asset URL, byte count, and SHA-256. `built_against_fw` is reported as
 provenance and is not an automatic compatibility constraint.
 
+For both workflows, `latest` means the highest stable semantic version inside
+that release family: `v*` for OTA and `lua-v*` for Lua. It does not depend on
+which release happened to be published most recently.
+
 For a local exact-device preview:
 
 ```sh
@@ -183,3 +187,16 @@ python tools/fleet_deploy/lua_deploy.py \
 
 Drop `--dry-run` to publish. The result artifact and job summary classify each
 target as `accepted`, `applied`, `failed`, `busy`, or `no_reply`.
+
+| Lua outcome | Meaning | Action |
+|---|---|---|
+| `applied` | Device reported the manifest's expected active SHA-256 | none |
+| `applied (sha mismatch)` | Device said applied but reported different or unavailable active bytes | inspect the SD card and re-run; the workflow fails |
+| `failed` | Download, verification, syntax check, or swap failed | fix the reported cause and re-run |
+| `busy` | Device explicitly refused because another maintenance operation was active | re-run later |
+| `accepted` | Device accepted but no terminal result arrived in the wait window | inspect telemetry, then sweep again |
+| `no_reply` | No correlated acknowledgement arrived | confirm connectivity and sweep again |
+
+A live run fails when any device reports `failed`/a SHA mismatch, or when no
+target confirms the expected SHA as applied. This prevents an all-busy or
+all-silent campaign from appearing successful.

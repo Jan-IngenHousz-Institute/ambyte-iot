@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -13,6 +14,18 @@ DEPLOY_ACTION = (ROOT / ".github/actions/fleet-deploy/action.yml").read_text(
     encoding="utf-8"
 )
 PR_WORKFLOW = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
+
+
+def workflow_input_default(workflow: str, input_name: str) -> bool:
+    block = re.search(
+        rf"(?m)^      {re.escape(input_name)}:\n((?:        .*\n)+)", workflow
+    )
+    if block is None:
+        raise AssertionError(f"workflow input {input_name!r} is missing")
+    default = re.search(r"(?m)^        default: (true|false)$", block.group(1))
+    if default is None:
+        raise AssertionError(f"workflow input {input_name!r} has no boolean default")
+    return default.group(1) == "true"
 
 
 class LuaWorkflowTest(unittest.TestCase):
@@ -35,22 +48,19 @@ class LuaWorkflowTest(unittest.TestCase):
                 self.assertIn(f"      {input_name}:\n", LUA_WORKFLOW)
                 self.assertIn(forwarding, LUA_WORKFLOW)
 
-        self.assertIn("      dry_run:\n", LUA_WORKFLOW)
-        self.assertIn("        default: true\n", LUA_WORKFLOW)
+        self.assertTrue(workflow_input_default(LUA_WORKFLOW, "dry_run"))
         self.assertIn("environment: fleet-deploy-${{ inputs.environment }}", LUA_WORKFLOW)
         self.assertIn("uses: ./.github/actions/fleet-deploy", LUA_WORKFLOW)
         self.assertIn("kind: lua", LUA_WORKFLOW)
 
     def test_shared_action_scopes_latest_and_requires_kind_assets(self) -> None:
         self.assertIn("gh release list", DEPLOY_ACTION)
-        self.assertIn("TAG_PATTERN='^v[0-9]+", DEPLOY_ACTION)
-        self.assertIn("TAG_PATTERN='^lua-v[0-9]+", DEPLOY_ACTION)
+        self.assertIn("release_selection.py --kind \"${KIND}\"", DEPLOY_ACTION)
         self.assertIn("REQUIRED_ASSETS=(firmware.bin)", DEPLOY_ACTION)
         self.assertIn(
             "REQUIRED_ASSETS=(main.lua main.lua.manifest.json)", DEPLOY_ACTION
         )
-        self.assertIn("isDraft == false", DEPLOY_ACTION)
-        self.assertIn("isPrerelease == false", DEPLOY_ACTION)
+        self.assertIn("jq -e '.isDraft == false'", DEPLOY_ACTION)
         self.assertNotIn(
             'gh release view --repo "${REPO}" --json tagName', DEPLOY_ACTION
         )
@@ -67,6 +77,11 @@ class LuaWorkflowTest(unittest.TestCase):
 
     def test_pr_firmware_steps_are_path_gated(self) -> None:
         self.assertIn("node tools/release/pr-build-scope.js", PR_WORKFLOW)
+        self.assertIn(
+            'git diff --no-renames --name-only "${PR_BASE_SHA}...${PR_HEAD_SHA}"',
+            PR_WORKFLOW,
+        )
+        self.assertIn('git reset --soft "${PR_MERGE_BASE}"', PR_WORKFLOW)
         condition = "if: steps.scope.outputs.firmware-build-required == 'true'"
         self.assertEqual(PR_WORKFLOW.count(condition), 3)
         self.assertIn("python -m unittest discover -s tests -v", PR_WORKFLOW)

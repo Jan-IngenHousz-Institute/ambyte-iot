@@ -24,17 +24,15 @@ from typing import Any, Callable
 
 try:  # Package import in tests; sibling import when invoked as a script.
     from . import fleet_deploy as fleet
+    from .release_selection import LUA_TAG_RE
 except ImportError:  # pragma: no cover - exercised by CLI invocation
     import fleet_deploy as fleet
+    from release_selection import LUA_TAG_RE
 
 
 MANIFEST_NAME = "main.lua.manifest.json"
 ASSET_NAME = "main.lua"
 MANIFEST_SCHEMA_VERSION = 1
-LUA_TAG_RE = re.compile(
-    r"^lua-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SCRIPT_TERMINAL_STATES = {"applied", "failed", "busy"}
@@ -402,8 +400,12 @@ def fleet_script_update(
     return tracker.results(), error
 
 
-def classify(record: dict[str, Any]) -> str:
+def classify(record: dict[str, Any], expected_sha256: str | None = None) -> str:
     state = record.get("state")
+    if state == "applied" and expected_sha256 is not None:
+        reported = record.get("script_sha256")
+        if not isinstance(reported, str) or reported.lower() != expected_sha256.lower():
+            return "applied (sha mismatch)"
     if state in SCRIPT_TERMINAL_STATES:
         return str(state)
     if record.get("accepted"):
@@ -473,7 +475,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manifest, _asset = fetch_release(args.repo, args.tag)
     except (ManifestError, OSError, RuntimeError) as exc:
-        parser.error(_redact_text(str(exc)))
+        error = _redact_text(str(exc))
+        write_results(
+            args.results_json,
+            {
+                "tag": args.tag,
+                "dry_run": args.dry_run,
+                "results": {},
+                "error": error,
+            },
+        )
+        write_summary(
+            os.environ.get("GITHUB_STEP_SUMMARY"),
+            ["## Fleet deploy (Lua): validation failed", "", f"**{error}**"],
+        )
+        print(f"Release validation failed: {error}", file=sys.stderr)
+        return 2
     print(
         f"  Lua {manifest['script_version']}: {manifest['size_bytes']} bytes, "
         f"sha256={manifest['sha256']} (built against fw "
@@ -494,6 +511,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if not universe:
         print("No devices to target.")
+        write_results(
+            args.results_json,
+            {
+                "tag": args.tag,
+                "campaign_id": manifest["script_update"]["id"],
+                "sha256": manifest["sha256"],
+                "script_version": manifest["script_version"],
+                "dry_run": args.dry_run,
+                "universe": 0,
+                "cohort": [],
+                "results": {},
+                "error": None,
+            },
+        )
+        write_summary(
+            os.environ.get("GITHUB_STEP_SUMMARY"),
+            [f"## Fleet deploy (Lua): {args.tag}", "", "No devices to target."],
+        )
         return 0
 
     print(f"Pinging {len(universe)} device(s) (up to {args.ping_wait}s) ...")
@@ -580,8 +615,8 @@ def main(argv: list[str] | None = None) -> int:
         f"- Universe {len(universe)} -> matching {len(selected['matching'])} -> "
         f"cohort {len(cohort)}",
         "",
-        "| device | fw before | outcome | detail |",
-        "|---|---|---|---|",
+        "| device | fw before | outcome | Lua version | script SHA-256 | metadata verified | detail |",
+        "|---|---|---|---|---|---|---|",
     ]
     if args.dry_run:
         summary_lines[6:6] = [
@@ -590,14 +625,26 @@ def main(argv: list[str] | None = None) -> int:
         ]
     for device in cohort:
         if args.dry_run:
-            outcome, detail = "would deploy", ""
+            outcome, detail, reported_version, reported_sha, metadata_verified = (
+                "would deploy",
+                "",
+                "",
+                "",
+                "",
+            )
         else:
             record = plan["results"].get(device, {})
-            outcome = classify(record)
+            outcome = classify(record, manifest["sha256"])
             detail = record.get("detail") or ""
+            reported_version = record.get("script_version") or ""
+            reported_sha = record.get("script_sha256") or ""
+            metadata_verified = record.get("script_metadata_verified")
+            if metadata_verified is None:
+                metadata_verified = ""
         summary_lines.append(
             f"| {device} | {firmware_by_device.get(device) or 'silent'} | "
-            f"{outcome} | {detail} |"
+            f"{outcome} | {reported_version} | {reported_sha} | "
+            f"{metadata_verified} | {detail} |"
         )
     if plan["error"]:
         summary_lines.extend(
@@ -610,10 +657,17 @@ def main(argv: list[str] | None = None) -> int:
     failed = [
         device
         for device, record in plan["results"].items()
-        if classify(record) == "failed"
+        if classify(record, manifest["sha256"]) in {"failed", "applied (sha mismatch)"}
     ]
     if failed:
-        print(f"\n{len(failed)} device(s) FAILED: {', '.join(failed)}")
+        print(f"\n{len(failed)} device(s) failed identity/application checks: "
+              f"{', '.join(failed)}")
+        return 1
+    if not args.dry_run and cohort and not any(
+        classify(record, manifest["sha256"]) == "applied"
+        for record in plan["results"].values()
+    ):
+        print("\nNo target confirmed the expected Lua SHA-256 as applied.")
         return 1
     print("\nDone.")
     return 0

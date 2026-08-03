@@ -17,4 +17,6 @@ test("any non-Lua path retains the firmware build gate", () => {
     true,
   );
   assert.equal(firmwareBuildRequired([".github/workflows/pr.yml"]), true);
+  assert.equal(firmwareBuildRequired(["components/old.c", "lua/old.c"]), true);
+  assert.equal(firmwareBuildRequired([]), true);
 });

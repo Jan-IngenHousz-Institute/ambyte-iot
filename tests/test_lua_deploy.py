@@ -149,6 +149,57 @@ class TargetingTest(unittest.TestCase):
         ping.assert_called_once()
         update.assert_not_called()
 
+    def test_live_run_requires_at_least_one_verified_applied_sha(self) -> None:
+        manifest = release_fixture()
+        cases = [
+            (
+                "verified",
+                {
+                    "accepted": True,
+                    "state": "applied",
+                    "script_sha256": manifest["sha256"],
+                    "script_version": manifest["script_version"],
+                    "script_metadata_verified": True,
+                },
+                0,
+            ),
+            (
+                "mismatch",
+                {
+                    "accepted": True,
+                    "state": "applied",
+                    "script_sha256": "0" * 64,
+                },
+                1,
+            ),
+            ("busy", {"accepted": False, "state": "busy"}, 1),
+            ("silent", {"accepted": False, "state": None}, 1),
+        ]
+        for name, record, expected in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    lua_deploy, "fetch_release", return_value=(manifest, b"return 42\n")
+                ),
+                mock.patch.object(
+                    lua_deploy.fleet, "boto_session", return_value=object()
+                ),
+                mock.patch.object(
+                    lua_deploy.fleet,
+                    "fleet_ping",
+                    return_value={DEVICE_A: "1.0.0"},
+                ),
+                mock.patch.object(
+                    lua_deploy,
+                    "fleet_script_update",
+                    return_value=({DEVICE_A: record}, None),
+                ),
+                mock.patch.object(lua_deploy, "write_results"),
+                mock.patch.object(lua_deploy, "write_summary"),
+            ):
+                result = lua_deploy.main(["--tag", TAG, "--devices", DEVICE_A])
+            self.assertEqual(result, expected)
+
 
 class StatusTest(unittest.TestCase):
     def test_correlates_topic_and_campaign_and_ignores_duplicate_out_of_order(self) -> None:
@@ -195,7 +246,15 @@ class StatusTest(unittest.TestCase):
 
     def test_classification(self) -> None:
         cases = [
-            ({"state": "applied", "accepted": True}, "applied"),
+            (
+                {"state": "applied", "accepted": True, "script_sha256": "a" * 64},
+                "applied",
+            ),
+            (
+                {"state": "applied", "accepted": True, "script_sha256": "b" * 64},
+                "applied (sha mismatch)",
+            ),
+            ({"state": "applied", "accepted": True}, "applied (sha mismatch)"),
             ({"state": "failed", "accepted": True}, "failed"),
             ({"state": "busy", "accepted": False}, "busy"),
             ({"state": None, "accepted": True}, "accepted"),
@@ -203,7 +262,7 @@ class StatusTest(unittest.TestCase):
         ]
         for record, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(lua_deploy.classify(record), expected)
+                self.assertEqual(lua_deploy.classify(record, "a" * 64), expected)
 
     def test_partial_results_survive_publish_error_and_error_is_redacted(self) -> None:
         class Future:
