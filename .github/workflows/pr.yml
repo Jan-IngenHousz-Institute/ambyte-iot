@@ -76,8 +76,7 @@ jobs:
             local status=${PIPESTATUS[0]}
             set -e
             if [[ ${status} -ne 0 ]]; then return "${status}"; fi
-            grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' "${log}" \
-              | tail -n 1 | awk '{print $6}' || true
+            node "${GITHUB_WORKSPACE}/tools/release/next-version.js" "${log}"
           }
 
           FIRMWARE_VERSION=$(preview_unit firmware .)
