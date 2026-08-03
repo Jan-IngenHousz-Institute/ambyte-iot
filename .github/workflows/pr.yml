@@ -1,4 +1,4 @@
-name: Firmware PR
+name: Firmware and Lua PR
 
 on:
   pull_request:
@@ -18,7 +18,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
-    name: Build firmware
+    name: Preview and build release units
     needs: validate-pr
     runs-on: ubuntu-latest
     permissions:
@@ -38,7 +38,10 @@ jobs:
           node-version: "24"
 
       - name: Install release tooling
-        run: npm install --ignore-scripts --package-lock=false
+        run: npm ci --ignore-scripts
+
+      - name: Test release scoping
+        run: npm run test:release
 
       - name: Compute release preview
         id: preview
@@ -59,48 +62,78 @@ jobs:
           git reset --soft "${PR_BASE_SHA}"
           git commit --allow-empty -m "${PR_TITLE}"
 
-          # Match OpenJII's PR preview: env-ci reads these process variables.
+          # Match openJII's PR preview: env-ci reads these process variables.
           export GITHUB_REF="refs/heads/main"
           export GITHUB_EVENT_NAME="push"
-          set +e
-          npx semantic-release --dry-run --no-ci 2>&1 | tee release-preview.log
-          RELEASE_STATUS=${PIPESTATUS[0]}
-          set -e
-          if [[ ${RELEASE_STATUS} -ne 0 ]]; then
-            exit "${RELEASE_STATUS}"
-          fi
 
-          VERSION=$(grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' release-preview.log | tail -n 1 | awk '{print $6}' || true)
-          if [[ -n "${VERSION}" ]]; then
-            BUILD_VERSION="${VERSION}"
-            ZIP_NAME="ambyte-iot-v${VERSION}.zip"
-            WILL_RELEASE=true
+          preview_unit() {
+            local unit="$1" workdir="$2" log="release-preview-${unit}.log"
+            set +e
+            (cd "${workdir}" && "${GITHUB_WORKSPACE}/node_modules/.bin/semantic-release" --dry-run --no-ci) \
+              2>&1 | tee "${log}" >&2
+            local status=${PIPESTATUS[0]}
+            set -e
+            if [[ ${status} -ne 0 ]]; then return "${status}"; fi
+            grep -Eo 'The next release version is [0-9]+\.[0-9]+\.[0-9]+' "${log}" \
+              | tail -n 1 | awk '{print $6}' || true
+          }
+
+          FIRMWARE_VERSION=$(preview_unit firmware .)
+          LUA_VERSION=$(preview_unit lua lua)
+          FIRMWARE_WILL_RELEASE=false
+          LUA_WILL_RELEASE=false
+          if [[ -n "${FIRMWARE_VERSION}" ]]; then
+            BUILD_VERSION="${FIRMWARE_VERSION}"
+            ZIP_NAME="ambyte-iot-v${FIRMWARE_VERSION}.zip"
+            FIRMWARE_WILL_RELEASE=true
           else
             BUILD_VERSION="pr-${PR_NUMBER}-${PR_HEAD_SHA:0:12}"
             ZIP_NAME="ambyte-iot-${BUILD_VERSION}.zip"
-            WILL_RELEASE=false
+          fi
+          if [[ -n "${LUA_VERSION}" ]]; then LUA_WILL_RELEASE=true; fi
+
+          if [[ -n "${FIRMWARE_VERSION}" ]]; then
+            LUA_BUILT_AGAINST_FW="${FIRMWARE_VERSION}"
+          else
+            LUA_BUILT_AGAINST_FW=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1 | sed 's/^v//')
+          fi
+          if [[ -z "${LUA_BUILT_AGAINST_FW}" ]]; then
+            echo "::error::Cannot determine the firmware version Lua was built against"
+            exit 1
           fi
 
-          echo "version=${BUILD_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "firmware-build-version=${BUILD_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "firmware-version=${FIRMWARE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "firmware-will-release=${FIRMWARE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "lua-version=${LUA_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "lua-will-release=${LUA_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "lua-built-against-fw=${LUA_BUILT_AGAINST_FW}" >> "${GITHUB_OUTPUT}"
           echo "zip-name=${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "will-release=${WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
           {
-            echo "## Firmware release preview"
+            echo "## Release preview"
             echo
-            if [[ "${WILL_RELEASE}" == "true" ]]; then
-              echo "Merging this PR will publish **v${VERSION}**."
+            if [[ "${FIRMWARE_WILL_RELEASE}" == "true" ]]; then
+              echo "- Firmware: **v${FIRMWARE_VERSION}**"
             else
-              echo "Merging this PR will not create a firmware release."
+              echo "- Firmware: no release"
+            fi
+            if [[ "${LUA_WILL_RELEASE}" == "true" ]]; then
+              echo "- Lua: **lua-v${LUA_VERSION}** (built against firmware ${LUA_BUILT_AGAINST_FW})"
+            else
+              echo "- Lua: no release"
             fi
             echo
             echo "- Title: \`${PR_TITLE}\`"
-            echo "- Build version: \`${BUILD_VERSION}\`"
+            echo "- Firmware build version: \`${BUILD_VERSION}\`"
           } | tee release-preview.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Test Lua manifest tooling
+        run: python -m unittest tests.test_build_lua_release
 
       - name: Install PlatformIO
         run: |
@@ -110,12 +143,12 @@ jobs:
       - name: Build unprovisioned firmware
         env:
           AMBYTE_NVS_SKIP: "1"
-          AMBYTE_PROJECT_VER: ${{ steps.preview.outputs.version }}
+          AMBYTE_PROJECT_VER: ${{ steps.preview.outputs.firmware-build-version }}
         run: "${RUNNER_TEMP}/platformio/bin/pio run -e esp32-s3-devkitm-1"
 
       - name: Verify version and create flash ZIP
         env:
-          FIRMWARE_VERSION: ${{ steps.preview.outputs.version }}
+          FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-build-version }}
           ZIP_NAME: ${{ steps.preview.outputs.zip-name }}
         shell: bash
         run: |
@@ -150,10 +183,32 @@ jobs:
           (cd dist/bundle && zip -9 -r "../${ZIP_NAME}" .)
           rm -rf dist/bundle
 
-      - name: Upload firmware candidate
+      - name: Build Lua release candidate
+        if: steps.preview.outputs.lua-will-release == 'true'
+        env:
+          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
+          BUILT_AGAINST_FW: ${{ steps.preview.outputs.lua-built-against-fw }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4
+          luac5.4 -p lua/main.lua
+          python tools/build_lua_release.py \
+            --output-dir dist \
+            --version "${LUA_VERSION}" \
+            --built-against-fw "${BUILT_AGAINST_FW}" \
+            --repository "${REPOSITORY}"
+          test "$(jq -r .script_version dist/main.lua.manifest.json)" = "${LUA_VERSION}"
+          test "$(jq -r .built_against_fw dist/main.lua.manifest.json)" = "${BUILT_AGAINST_FW}"
+          test "$(sha256sum dist/main.lua | awk '{print $1}')" = \
+            "$(jq -r .sha256 dist/main.lua.manifest.json)"
+
+      - name: Upload release candidate
         uses: actions/upload-artifact@v6
         with:
-          name: firmware-${{ github.event.pull_request.head.sha }}
+          name: release-${{ github.event.pull_request.head.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 30

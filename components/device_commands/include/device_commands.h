@@ -11,6 +11,7 @@
 #include "messaging_port.h"
 #include "persistence_port.h"
 #include "sensing_port.h"
+#include "script_identity_port.h"
 #include "uart_sensor_port.h"
 
 #ifdef __cplusplus
@@ -46,6 +47,7 @@ typedef struct {
     /* SD-card readiness probe (used by Lua main.lua to gate measurement
      * rounds when the card is out). NULL = SD layer absent. */
     bool                       (*sd_ready)(void);
+    script_identity_read_fn      read_script_identity; /* active main.lua + verified release provenance */
 
     /* Messaging ports (Phase 6A) */
     message_publish_fn                  publish;

@@ -1540,25 +1540,36 @@ cmd_result_t cmd_store_status_event(void)
     const char *clock_source = "rtc";
     bool clock_suspect = false;
     clock_trust_get_status(&clock_source, &clock_suspect);
+    script_identity_t script_identity = {0};
+    bool script_identity_valid = s_cfg.read_script_identity != NULL &&
+                                 s_cfg.read_script_identity(&script_identity) == ESP_OK;
+    if (script_identity_valid) {
+        status_copy_json_safe(script_identity.sha256, sizeof script_identity.sha256,
+                              script_identity.sha256);
+        status_copy_json_safe(script_identity.version, sizeof script_identity.version,
+                              script_identity.version);
+        status_copy_json_safe(script_identity.built_against_fw,
+                              sizeof script_identity.built_against_fw,
+                              script_identity.built_against_fw);
+        status_copy_json_safe(script_identity.installed_on_fw,
+                              sizeof script_identity.installed_on_fw,
+                              script_identity.installed_on_fw);
+    }
 
     /* Schema split (2026-07-28, Dominik): the sample's `data` object carries only
      * MEASUREMENTS (the BME280 environment readings); all device-health/info
      * fields live in the sample's `metadata` object, and `device` carries the
      * MAC. Platform charts device health from metadata, science from data.
-     * The bounded base always fits. Optional SD and power blocks are appended
-     * transactionally below. Two buffers ≈ the previous single 1024 B one, so
-     * the wd-task stack budget is unchanged. */
-    /* Worst-case budget (ticket-09 review, host-measured against the actual
-     * format strings): base 571 + SD 158 + power 160 + '}' + NUL = 891 B →
-     * only 5 B spare in this 896-B buffer at true format maxima (%.3f of a
-     * pathological negative mV reading renders 10 chars ×3; the u32 currents
-     * render 10 digits). With physically plausible field values the payload is
-     * ~756 B (~140 B headroom). DO NOT add fields against the 140 B figure:
-     * budget against the 5 B one, or grow the buffer — an overflow doesn't
-     * corrupt (status_append_optional drops the offending block with a WARN)
-     * but silently costs the power block on outlier readings. env_data's
-     * separate 128 B keeps the wd-task stack buffers at ~1 KiB total. */
-    char payload[896];
+     * The bounded base always fits. Optional script, SD, and power blocks are
+     * appended transactionally below. */
+    /* Worst-case budget: prior base+SD+power was 891 B. Script identity adds at
+     * most 286 B (64-char digest, three 31-char versions, names/quotes/bool),
+     * producing 1,177 B. The 1,280-B buffer leaves 103 B at declared maxima;
+     * optional blocks still fail closed through status_append_optional. Together
+     * with env_data and script_identity this grows the 6-KiB wd-task frame by
+     * <600 B. Identity hashing also uses a short-lived 1-KiB heap buffer so the
+     * heartbeat task does not consume that space on its stack. */
+    char payload[1280];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
         "\"uptime_s\":%lld,\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
@@ -1586,6 +1597,16 @@ cmd_result_t cmd_store_status_event(void)
         return make_result(ESP_FAIL, "status base payload build failed");
     }
     size_t payload_len = (size_t)n;
+
+    if (script_identity_valid) {
+        (void)status_append_optional(payload, sizeof payload, &payload_len, "script",
+            ",\"script_sha256\":\"%.64s\",\"script_version\":\"%.31s\","
+            "\"script_built_against_fw\":\"%.31s\",\"script_installed_on_fw\":\"%.31s\","
+            "\"script_metadata_verified\":%s",
+            script_identity.sha256, script_identity.version,
+            script_identity.built_against_fw, script_identity.installed_on_fw,
+            script_identity.release_metadata_verified ? "true" : "false");
+    }
 
     /* SD/persistence health — surfaces the audit's silent-loss counters so a
      * degrading card is visible before the cliff (free space, skipped/dropped

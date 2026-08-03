@@ -39,8 +39,12 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **version.txt is load-bearing**: STATUS telemetry reports the compiled `app_version` (the
   NVS `device_firmware`/`device_version` strings are junk — whole fleet says "1"). Bump it
   every release; IDF reads it at CMake *configure* time (touch CMakeLists.txt to force).
+- **Two release units**: firmware keeps `vX.Y.Z`; `lua/**` releases independently as
+  `lua-vX.Y.Z`. The path filter must be applied to commit analysis *and* release notes so a
+  Lua-only commit cannot bump firmware later. Lua assets carry SHA + built-against firmware.
 - STATUS schema (since 1.0.6): sample `data` = environment readings only; device health lives
-  in sample `metadata`; `device` = MAC. Heartbeat every 5 min from the watchdog task.
+  in sample `metadata`; `device` = MAC. Heartbeat every 5 min from the watchdog task. Script
+  release metadata is trusted only while its stored SHA matches `/sdcard/main.lua`.
 
 ## Key dates / incident context (2026-07)
 

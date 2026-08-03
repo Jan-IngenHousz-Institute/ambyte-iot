@@ -205,13 +205,18 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         const cJSON *jurl    = cJSON_GetObjectItemCaseSensitive(root, "url");
         const cJSON *jsum    = cJSON_GetObjectItemCaseSensitive(root, "checksum");
         const cJSON *jreboot = cJSON_GetObjectItemCaseSensitive(root, "reboot");
+        const cJSON *jver    = cJSON_GetObjectItemCaseSensitive(root, "script_version");
+        const cJSON *jbuilt  = cJSON_GetObjectItemCaseSensitive(root, "built_against_fw");
         const char *script   = cJSON_IsString(jscript) ? jscript->valuestring : NULL;
         const char *url      = cJSON_IsString(jurl)    ? jurl->valuestring    : NULL;
         const char *checksum = cJSON_IsString(jsum)    ? jsum->valuestring    : NULL;
+        const char *script_version = cJSON_IsString(jver) ? jver->valuestring : NULL;
+        const char *built_against_fw = cJSON_IsString(jbuilt) ? jbuilt->valuestring : NULL;
         bool reboot = true;   /* default: reboot into the new script */
         if (cJSON_IsBool(jreboot)) reboot = cJSON_IsTrue(jreboot);
         if (url != NULL && url[0] != '\0') {
-            esp_err_t err = script_update_url_request(url, checksum, id, reboot);
+            esp_err_t err = script_update_url_request(url, checksum, id, reboot,
+                                                      script_version, built_against_fw);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "script_update(url) id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
@@ -222,7 +227,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         } else if (script == NULL || script[0] == '\0') {
             ESP_LOGW(TAG, "script_update id=%s missing 'script'/'url' — ignoring", id ? id : "");
         } else {
-            esp_err_t err = script_update_request(script, checksum, id, reboot);
+            esp_err_t err = script_update_request(script, checksum, id, reboot,
+                                                  script_version, built_against_fw);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "script_update id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));

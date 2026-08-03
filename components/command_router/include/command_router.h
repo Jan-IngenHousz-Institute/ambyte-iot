@@ -17,6 +17,8 @@ extern "C" {
  *
  * Command shape:
  *   { "type": "ping" | "ota_update" | "script_update", "id": "<unique>", ... }
+ * script_update release messages may add `script_version` and `built_against_fw`;
+ * older command payloads remain valid.
  * State-changing commands carry a unique `id`; the router persists the last applied
  * id in NVS and no-ops a repeat (idempotency — safe with a retained trigger).
  */
