@@ -1567,10 +1567,11 @@ cmd_result_t cmd_store_status_event(void)
      * digits; every string block at its cap):
      *   base + SD + power + '}' + NUL         891 B
      *   script identity (digest+3 versions)   286 B
-     *   AMBIT identity, 4 × ~135 B            540 B
+     *   AMBIT identity, 4 × 138 B             552 B   (host-measured)
      *                                       ------
-     *                                        1717 B
-     * The 2,048-B buffer leaves ~331 B spare. DO NOT add fields against
+     *                                        1729 B
+     * The 2,048-B buffer leaves 319 B spare. On the bench (2 AMBITs, real
+     * values) the ambit blocks total 232 B. DO NOT add fields against
      * typical-value headroom: budget against these maxima, or grow the buffer.
      * An overflow doesn't corrupt (status_append_optional drops the offending
      * block with a WARN) but silently costs that block on outlier readings.
