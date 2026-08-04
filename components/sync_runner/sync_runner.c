@@ -101,7 +101,13 @@
  * NVS cursor survive, so nothing is lost). Runs as a SEPARATE task from the drain
  * so it also catches a wedged/dead drain task. */
 #define SYNC_WD_TASK_NAME     "sync_wdog"
-#define SYNC_WD_TASK_STACK    6144
+/* 6144 + 1536: the STATUS metadata buffer (cmd_store_status_event) grew from
+ * 896 B to 2048 B (script identity + per-channel AMBIT identity blocks), and
+ * script_identity_t also sits on this frame. A stack overflow here would take
+ * out the task that performs the self-healing reboots, so the growth is
+ * over-covered rather than trimmed to the calculated minimum; confirm the
+ * high-water mark on hardware before trimming. */
+#define SYNC_WD_TASK_STACK    7680
 #define SYNC_WD_TASK_PRIO     2                      /* mostly sleeps */
 
 /* Once the byte/slot window binds, yield briefly while the MQTT task delivers

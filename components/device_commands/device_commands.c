@@ -1560,16 +1560,24 @@ cmd_result_t cmd_store_status_event(void)
      * MEASUREMENTS (the BME280 environment readings); all device-health/info
      * fields live in the sample's `metadata` object, and `device` carries the
      * MAC. Platform charts device health from metadata, science from data.
-     * The bounded base always fits. Optional script, SD, and power blocks are
-     * appended transactionally below. */
-    /* Worst-case budget: prior base+SD+power was 891 B. Script identity adds at
-     * most 286 B (64-char digest, three 31-char versions, names/quotes/bool),
-     * producing 1,177 B. The 1,280-B buffer leaves 103 B at declared maxima;
-     * optional blocks still fail closed through status_append_optional. Together
-     * with env_data and script_identity this grows the 6-KiB wd-task frame by
-     * <600 B. Identity hashing also uses a short-lived 1-KiB heap buffer so the
-     * heartbeat task does not consume that space on its stack. */
-    char payload[1280];
+     * The bounded base always fits. Optional script, SD, power, and per-channel
+     * AMBIT blocks are appended transactionally below. */
+    /* Worst-case budget at declared format maxima (%.3f of a pathological
+     * negative mV reading renders 10 chars ×3; the u32 currents render 10
+     * digits; every string block at its cap):
+     *   base + SD + power + '}' + NUL         891 B
+     *   script identity (digest+3 versions)   286 B
+     *   AMBIT identity, 4 × ~135 B            540 B
+     *                                       ------
+     *                                        1717 B
+     * The 2,048-B buffer leaves ~331 B spare. DO NOT add fields against
+     * typical-value headroom: budget against these maxima, or grow the buffer.
+     * An overflow doesn't corrupt (status_append_optional drops the offending
+     * block with a WARN) but silently costs that block on outlier readings.
+     * This buffer lives on the wd-task frame — SYNC_WD_TASK_STACK covers its
+     * growth from the original 896 B. Identity hashing uses a short-lived 1-KiB
+     * heap buffer so the heartbeat task does not carry it on the stack. */
+    char payload[2048];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
         "\"uptime_s\":%lld,\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
@@ -1635,6 +1643,30 @@ cmd_result_t cmd_store_status_event(void)
             (unsigned)s.power.charge_ma,
             s.power.input_present ? "true" : "false",
             (unsigned)s.power.charge_status);
+    }
+
+    /* Per-channel AMBIT identity (fleet inventory: which sensor + which fw is
+     * on which channel). CACHE-ONLY — never triggers a UART fetch from the
+     * heartbeat (a fetch is 2×5 s blocking + channel-mutex contention with
+     * Lua); boot sync populates the cache. Absent/unread channels are simply
+     * omitted. One transactional block per channel so a single outlier only
+     * drops itself. ambit_name comes from the AMBIT's NVS = untrusted bytes;
+     * event_log does NOT sanitize metadata_json, so it goes through
+     * status_copy_json_safe (fw/id/cal are ambyte-formatted and safe). */
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        ambit_device_info_t ai;
+        if (!cmd_ambit_device_info_cached(ch, &ai)) {
+            continue;
+        }
+        char safe_name[20];
+        status_copy_json_safe(safe_name, sizeof safe_name, ai.ambit_name);
+        char block[16];
+        snprintf(block, sizeof block, "ambit%u", ch);
+        (void)status_append_optional(payload, sizeof payload, &payload_len, block,
+            ",\"ambit%u_fw\":\"%.15s\",\"ambit%u_hw\":%u,\"ambit%u_name\":\"%s\","
+            "\"ambit%u_id\":\"%.17s\",\"ambit%u_cal\":\"%08lx\"",
+            ch, ai.fw_version, ch, (unsigned)ai.hw_rev, ch, safe_name,
+            ch, ai.device_id, ch, (unsigned long)ai.cal_version);
     }
     payload[payload_len++] = '}';
     payload[payload_len] = '\0';
@@ -2460,6 +2492,7 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
              (unsigned)((m >> 24) & 0xFF), (unsigned)((m >> 32) & 0xFF), (unsigned)((m >> 40) & 0xFF));
     snprintf(e.fw_version, sizeof e.fw_version, "%u.%u.%u",
              (unsigned)fw.major, (unsigned)fw.minor, (unsigned)fw.batch);
+    e.hw_rev = fw.hw_rev;   /* 0 on pre-0.1.0 images (they never wrote the byte) */
 
     /* cal_version = CRC32 of the calibration struct → changes whenever the sensor
      * is recalibrated. The struct has no native version field.
@@ -2522,6 +2555,15 @@ cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
     *out = s_ambit_info[ch];
     return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx",
                        ch + 1, out->device_id, out->fw_version, (unsigned long)out->cal_version);
+}
+
+bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out)
+{
+    if (ch >= AMBIT_INFO_NUM_CH || out == NULL || !s_ambit_info[ch].valid) {
+        return false;
+    }
+    *out = s_ambit_info[ch];
+    return true;
 }
 
 void cmd_ambit_device_info_invalidate(uint8_t ch)
