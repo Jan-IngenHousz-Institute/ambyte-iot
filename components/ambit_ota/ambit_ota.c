@@ -260,10 +260,29 @@ static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t
 
     int64_t clen   = esp_http_client_fetch_headers(c);
     int     status = esp_http_client_get_status_code(c);
+
+    /* GitHub release-asset URLs answer 302 to a signed CDN URL (objects.
+     * githubusercontent.com) — follow a bounded number of redirects so a plain
+     * release asset link works as the OTA source. The cert bundle validates
+     * each hop; the 4 KiB buffers fit GitHub's long signed URLs. */
+    for (int hops = 0;
+         hops < 3 && (status == 301 || status == 302 || status == 303 ||
+                      status == 307 || status == 308);
+         hops++) {
+        if (esp_http_client_set_redirection(c) != ESP_OK) {
+            break;
+        }
+        esp_http_client_close(c);
+        err = esp_http_client_open(c, 0);
+        if (err != ESP_OK) {
+            esp_http_client_cleanup(c);
+            return err;
+        }
+        clen   = esp_http_client_fetch_headers(c);
+        status = esp_http_client_get_status_code(c);
+    }
     if (status != 200) {
-        ESP_LOGE(TAG, "HTTP status %d (expected 200)%s", status,
-                 (status >= 300 && status < 400)
-                     ? " — redirect; use a direct raw.githubusercontent.com URL" : "");
+        ESP_LOGE(TAG, "HTTP status %d (expected 200 after redirects)", status);
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
         return ESP_FAIL;
@@ -431,6 +450,12 @@ static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
         cmd_result_t cr = cmd_ambit_ota_confirm(ch, &st);
         if (cr.status == ESP_OK && st == 0) {
             ESP_LOGW(TAG, "AMBIT%u image confirmed — rollback cancelled", ch + 1);
+            /* Running fw changed: refresh the identity cache so STATUS and
+             * event provenance report the new version (Lua is suspended, the
+             * bus is ours — safe to fetch inline). */
+            cmd_ambit_device_info_invalidate(ch);
+            ambit_device_info_t inf;
+            (void)cmd_ambit_device_info(ch, &inf);
             return true;
         }
         ESP_LOGW(TAG, "OTA_CONFIRM try %d: %s st=%u", tries + 1, esp_err_to_name(cr.status), st);

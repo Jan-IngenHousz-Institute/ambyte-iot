@@ -634,6 +634,22 @@ int ambit_flash_boot_sync(void)
         boot_absent_clear_all();
     }
 
+    /* Populate the per-channel identity cache (device_id, fw, hw_rev, cal) for
+     * every present channel while the UART bus is exclusively ours. The STATUS
+     * heartbeat reads this cache and must never fetch on the watchdog task, and
+     * without this pass a unit whose schedule never touches a channel would
+     * report nothing. Runs BEFORE the SD-target check so identity is available
+     * even with no staged flash image (the common fleet case). */
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        bool connected = false;
+        (void)cmd_uart_ping(ch, &connected);
+        if (!connected) {
+            continue;
+        }
+        ambit_device_info_t inf;
+        (void)cmd_ambit_device_info(ch, &inf);
+    }
+
     ambit_flash_target_t tgt;
     if (ambit_flash_find_target(&tgt) != ESP_OK) {
         ESP_LOGI(TAG, "boot sync: no SD target image under %s — skipping", AMBIT_FW_ROOT);
@@ -829,6 +845,11 @@ int ambit_flash_boot_sync(void)
             boot_fail_clear(ch);   /* clears the pre-attempt bump above */
             flashed++;
             ESP_LOGW(TAG, "  ch%u: now running v%s (verified)", ch, ver);
+            /* The unit rebooted into new firmware: refresh the identity cache
+             * (fw/hw_rev changed; a CH_BARE unit was never cached at all). */
+            cmd_ambit_device_info_invalidate(ch);
+            ambit_device_info_t inf;
+            (void)cmd_ambit_device_info(ch, &inf);
         } else {
             ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s — "
                           "already counted)", ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);

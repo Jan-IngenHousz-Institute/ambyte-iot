@@ -288,6 +288,7 @@ typedef struct {
     bool     valid;
     char     device_id[18];   /* "AA:BB:CC:DD:EE:FF" from the AMBIT efuse MAC */
     char     fw_version[16];   /* "major.minor.batch" */
+    uint8_t  hw_rev;           /* AMBIT hardware revision (0 = unknown / pre-0.1.0 fw) */
     uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
     char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
     float    actinic_coef;     /* PAR(µmol)→DAC byte = actinic_coef × PAR; 0 if cal unread */
@@ -301,6 +302,10 @@ typedef struct {
  * (one-time UART cost, then free). *out is zeroed + valid=false on a fetch
  * failure (gains/currents fields still reflect any tracked set commands). */
 cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out);
+/* Cache-only read: true + *out when the channel's identity is cached, false
+ * without touching the UART otherwise. For callers that must never block on a
+ * fetch (the STATUS heartbeat runs on the watchdog task). */
+bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out);
 /* Drop a channel's identity cache AND tracked gains/currents so the next read
  * re-fetches and re-announces — call on (re)connect / swap. */
 void cmd_ambit_device_info_invalidate(uint8_t ch);
