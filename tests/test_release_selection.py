@@ -48,6 +48,26 @@ class ReleaseSelectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             release_selection.parse_tag("lua-v1.0.0.x", "lua")
 
+    def test_ambit_uses_v_tags_and_latest_is_stable_only(self) -> None:
+        releases = [
+            {"tagName": "v1.1.1", "isDraft": False, "isPrerelease": False},
+            {
+                "tagName": "v1.1.2-recovery.1",
+                "isDraft": False,
+                "isPrerelease": True,
+            },
+            {"tagName": "lua-v9.0.0", "isDraft": False, "isPrerelease": False},
+        ]
+        self.assertEqual(
+            release_selection.select_latest(releases, "ambit"), "v1.1.1"
+        )
+        self.assertEqual(
+            release_selection.parse_tag("v1.1.2-recovery.1", "ambit"),
+            release_selection.parse_tag("v1.1.2-recovery.1", "ota"),
+        )
+        with self.assertRaisesRegex(ValueError, "no published stable ambit release"):
+            release_selection.select_latest([], "ambit")
+
 
 if __name__ == "__main__":
     unittest.main()

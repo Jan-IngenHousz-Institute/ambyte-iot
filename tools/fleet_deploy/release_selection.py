@@ -22,7 +22,12 @@ SEMVER_SUFFIX = (
 )
 FIRMWARE_TAG_RE = re.compile(rf"^v{SEMVER_SUFFIX}$")
 LUA_TAG_RE = re.compile(rf"^lua-v{SEMVER_SUFFIX}$")
-TAG_PATTERNS = {"ota": FIRMWARE_TAG_RE, "lua": LUA_TAG_RE}
+AMBIT_TAG_RE = FIRMWARE_TAG_RE
+TAG_PATTERNS = {
+    "ambit": AMBIT_TAG_RE,
+    "ota": FIRMWARE_TAG_RE,
+    "lua": LUA_TAG_RE,
+}
 
 
 def parse_tag(tag: str, kind: str):

@@ -1,9 +1,9 @@
 name: Fleet deploy utility
-description: Resolve, authenticate, target, run, and report an OTA or Lua fleet deployment
+description: Resolve, authenticate, target, run, and report an OTA, Lua, or AMBIT fleet deployment
 
 inputs:
   kind:
-    description: Deployment kind (`ota` or `lua`)
+    description: Deployment kind (`ota`, `lua`, or `ambit`)
     required: true
   repository:
     description: GitHub owner/repository containing release assets
@@ -32,9 +32,21 @@ inputs:
     description: Preview without publishing the mutating update command
     required: true
   allow-downgrade:
-    description: OTA only; permit targets newer than the selected firmware
+    description: OTA/AMBIT; permit targets newer than the selected firmware
     required: false
     default: "false"
+  allow-prerelease:
+    description: AMBIT only; permit an explicitly selected prerelease tag
+    required: false
+    default: "false"
+  force-reflash:
+    description: AMBIT only; reapply an already-current numeric version (explicit devices only)
+    required: false
+    default: "false"
+  ambit-final-seconds:
+    description: AMBIT only; terminal observation budget including jitter and four-channel streaming
+    required: false
+    default: "3600"
   reboot:
     description: Lua only; reboot after a successful swap
     required: false
@@ -80,6 +92,7 @@ runs:
         REPO: ${{ inputs.repository }}
         KIND: ${{ inputs.kind }}
         TAG: ${{ inputs.release-tag }}
+        ALLOW_PRERELEASE: ${{ inputs.allow-prerelease }}
       shell: bash
       run: |
         set -euo pipefail
@@ -89,6 +102,9 @@ runs:
             ;;
           lua)
             REQUIRED_ASSETS=(main.lua main.lua.manifest.json)
+            ;;
+          ambit)
+            REQUIRED_ASSETS=(manifest.json)
             ;;
           *)
             echo "::error::unknown fleet deployment kind: ${KIND}"
@@ -106,9 +122,25 @@ runs:
             --tag "${TAG}" >/dev/null
         fi
 
-        RELEASE=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft,assets)
-        jq -e '.isDraft == false' <<<"${RELEASE}" >/dev/null \
-          || { echo "::error::release ${TAG} is still a draft"; exit 1; }
+        RELEASE=$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+          "/repos/${REPO}/releases/tags/${TAG}")
+        jq -e '.draft == false and .published_at != null' <<<"${RELEASE}" >/dev/null \
+          || { echo "::error::release ${TAG} is not published"; exit 1; }
+        if [[ "${KIND}" == "ambit" ]]; then
+          gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}" --jq '.private == false' | grep -Fx true >/dev/null \
+            || { echo "::error::AMBIT release repository is not public"; exit 1; }
+          jq -e '.immutable == true' <<<"${RELEASE}" >/dev/null \
+            || { echo "::error::AMBIT release ${TAG} is not immutable"; exit 1; }
+          case "${ALLOW_PRERELEASE}" in
+            true) ;;
+            false)
+              jq -e '.prerelease == false' <<<"${RELEASE}" >/dev/null \
+                || { echo "::error::AMBIT prerelease requires explicit opt-in"; exit 1; }
+              ;;
+            *) echo "::error::allow-prerelease must be true or false"; exit 2 ;;
+          esac
+        fi
         ASSETS=$(jq -r '.assets[].name' <<<"${RELEASE}")
         for ASSET in "${REQUIRED_ASSETS[@]}"; do
           grep -Fqx "${ASSET}" <<<"${ASSETS}" \
@@ -143,6 +175,9 @@ runs:
         WINDOW_MINUTES: ${{ inputs.discovery-window-minutes }}
         DRY_RUN: ${{ inputs.dry-run }}
         ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
+        ALLOW_PRERELEASE: ${{ inputs.allow-prerelease }}
+        FORCE_REFLASH: ${{ inputs.force-reflash }}
+        AMBIT_FINAL_SECONDS: ${{ inputs.ambit-final-seconds }}
         REBOOT: ${{ inputs.reboot }}
       shell: bash
       run: |
@@ -171,6 +206,13 @@ runs:
           lua)
             [[ "${REBOOT}" == "true" ]] && ARGS+=(--reboot) || ARGS+=(--no-reboot)
             python tools/fleet_deploy/lua_deploy.py "${ARGS[@]}"
+            ;;
+          ambit)
+            [[ "${ALLOW_DOWNGRADE}" == "true" ]] && ARGS+=(--allow-downgrade)
+            [[ "${ALLOW_PRERELEASE}" == "true" ]] && ARGS+=(--allow-prerelease)
+            [[ "${FORCE_REFLASH}" == "true" ]] && ARGS+=(--force-reflash)
+            ARGS+=(--final-seconds "${AMBIT_FINAL_SECONDS}")
+            python tools/fleet_deploy/ambit_deploy.py "${ARGS[@]}"
             ;;
         esac
 

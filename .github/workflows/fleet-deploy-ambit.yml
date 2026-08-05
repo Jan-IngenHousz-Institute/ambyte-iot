@@ -1,0 +1,96 @@
+name: Fleet deploy (AMBIT via Ambyte)
+
+# Manually deploys an immutable public AMBIT application release through a
+# protected Ambyte fleet environment. The fixed public source is deliberately
+# not an input: consumers must never fall back to the private audit repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target account/fleet"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      release_tag:
+        description: "AMBIT release tag (vX.Y.Z), or latest stable"
+        type: string
+        default: "latest"
+      version_op:
+        description: "Optional Ambyte gateway firmware-version filter"
+        type: choice
+        options: [any, eq, lt, lte, gt, gte]
+        default: any
+      version:
+        description: "Reference Ambyte firmware version; ignored for any"
+        type: string
+        default: ""
+      percentage:
+        description: "Percent of matching gateways (deterministic cohort)"
+        type: string
+        default: "100"
+      devices:
+        description: "Optional MACs or AMBYTE_<MAC> IDs, comma/space separated"
+        type: string
+        default: ""
+      discovery_window_minutes:
+        description: "How far back to look for active gateways"
+        type: string
+        default: "1440"
+      dry_run:
+        description: "Preflight versions and preview without AMBIT OTA"
+        type: boolean
+        default: true
+      allow_downgrade:
+        description: "Allow channel=all when a gateway has a newer AMBIT"
+        type: boolean
+        default: false
+      allow_prerelease:
+        description: "Allow an explicitly named prerelease (latest stays stable)"
+        type: boolean
+        default: false
+      force_reflash:
+        description: "Reapply an already-current numeric version (requires explicit devices and 100%)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: fleet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy AMBIT ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    environment: fleet-deploy-${{ inputs.environment }}
+    # Covers the 60-minute terminal budget plus post-OTA version verification.
+    # The shared action's OIDC session remains 7200 s (120 minutes).
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Deploy immutable public AMBIT release
+        uses: ./.github/actions/fleet-deploy
+        with:
+          kind: ambit
+          repository: Jan-IngenHousz-Institute/ambit
+          release-tag: ${{ inputs.release_tag }}
+          version-op: ${{ inputs.version_op }}
+          version: ${{ inputs.version }}
+          percentage: ${{ inputs.percentage }}
+          devices: ${{ inputs.devices }}
+          discovery-window-minutes: ${{ inputs.discovery_window_minutes }}
+          dry-run: ${{ inputs.dry_run }}
+          allow-downgrade: ${{ inputs.allow_downgrade }}
+          allow-prerelease: ${{ inputs.allow_prerelease }}
+          force-reflash: ${{ inputs.force_reflash }}
+          ambit-final-seconds: "3600"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-role-arn: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
