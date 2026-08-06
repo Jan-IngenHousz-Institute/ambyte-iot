@@ -31,3 +31,7 @@ dataset.csv
 sdkconfig.bench
 sdkconfig.bench-*
 graphify-out/
+
+# PyInstaller writes its spec next to the invocation (flash-gui-build.yml);
+# build/ and /dist/ are already ignored above.
+ambyte-flash-gui.spec
