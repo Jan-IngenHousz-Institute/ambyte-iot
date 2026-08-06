@@ -1,8 +1,8 @@
-# Fleet deploy (OTA and Lua)
+# Fleet deploy (Ambyte OTA, Lua, and AMBIT OTA)
 
-Targeted, staged rollouts of a published firmware release to the Ambyte
-fleet, from GitHub Actions (**Actions -> Fleet deploy (OTA) -> Run
-workflow**) or locally.
+Targeted, staged rollouts to the Ambyte fleet, from the three manual GitHub
+Actions workflows (**Fleet deploy (OTA)**, **Fleet deploy (Lua)**, and **Fleet
+deploy (AMBIT via Ambyte)**) or locally.
 
 This is the productionized successor of the manual `utility-fleetOTA`
 notebook flow: same mechanism (one `ota_update` MQTT publish per device, no
@@ -159,6 +159,95 @@ A run exits non-zero when at least one device reports `failed`, or when the
 campaign hit an error mid-tracking (partial results are still written to
 `results.json` and the summary).
 
+## Deploying AMBIT firmware through Ambytes
+
+Use **Actions -> Fleet deploy (AMBIT via Ambyte) -> Run workflow**. The release
+source is fixed to the public `Jan-IngenHousz-Institute/ambit` repository.
+`latest` selects the highest stable `vX.Y.Z` release; it never selects a
+prerelease. An exact `vX.Y.Z-suffix` tag is accepted only when
+`allow_prerelease` is explicitly enabled. Dry-run, the default, performs the
+read-only gateway ping and correlated `ambit_versions` preflight but never
+publishes `ambit_ota`.
+
+Before AWS access or MQTT publication, the runner anonymously fetches the
+GitHub REST release representation and fails closed unless it is public,
+published, non-draft, immutable, and allowed by the prerelease policy. It then:
+
+1. Downloads `manifest.json` and requires `manifest.version` to equal the tag
+   without `v`.
+2. Selects the application named by `manifest.ota.file` and requires exactly
+   one matching `flash` entry at offset `0x10000`, with integer size and a
+   lowercase SHA-256.
+3. Requires the GitHub asset's REST size and `sha256:<digest>` to match the
+   manifest, downloads its anonymous `browser_download_url`, and verifies its
+   byte count, SHA-256, and ESP application magic byte `0xE9`.
+
+Gateway discovery, the optional Ambyte firmware predicate, explicit-device
+targeting, and deterministic percentage slicing are shared with the other fleet
+workflows. After selecting that cohort, the runner sends a unique correlated
+`ambit_versions` query to each gateway and records every channel's presence and
+numeric `major.minor.patch` version. A prerelease such as
+`v1.1.2-recovery.1` therefore expects the device-reported numeric identity
+`1.1.2`. A complete all-absent response is retried after a bounded cold-wake
+delay because bench testing showed that the first sweep can be a false
+negative. Both correlated attempts are retained. Only two complete all-absent
+reports establish `no_ambit_present`; an absent-first retry that is busy,
+missing, or malformed is ambiguous and blocks the whole run. Missing replies,
+busy gateways, and unparseable present-channel versions likewise block instead
+of silently narrowing a live cohort.
+
+The execution unit is a gateway, not an individual sensor channel. Every
+eligible gateway receives exactly one command:
+
+```json
+{"type":"ambit_ota","id":"<unique-run-id>","channel":"all","url":"<verified-public-app-asset>"}
+```
+
+This matters for mixed gateways: if one channel is old and another is already
+current, the current channel can be reflashed because the firmware accepts only
+the all-channel fleet sweep. If any present channel is newer, the entire gateway
+is skipped unless `allow_downgrade` is explicit. An all-current cohort is a
+clean success. For recovery, `force_reflash` may reapply the same numeric
+version, but defaults false and is rejected unless `devices` names the exact
+gateways and `percentage` is 100. It does not bypass newer-version protection;
+`allow_downgrade` is still required when any selected channel is newer.
+
+The result artifact preserves the exact release proof, cohort and gateway
+firmware map, every correlated preflight attempt and its effective versions,
+per-gateway decision/skip reason, unique command ID, acceptance, all four
+per-channel outcomes, and the overall terminal. The host deliberately expects
+the firmware's `channel=all` status path to report channels 0 through 3,
+including `absent`, followed by the overall terminal after MQTT recovery.
+
+The terminal observation budget is 3600 seconds: it covers 0..899 seconds of
+firmware jitter, degraded HTTPS/SD transfer, four sequential channel streams,
+and MQTT recovery. The workflow job allows 90 minutes and its OIDC credentials
+last 7200 seconds. After terminal tracking finishes or times out, the runner
+always sends a new correlated `ambit_versions` query to every gateway that
+received `ambit_ota`. Results record the expected numeric target and actual
+version of every present channel. A matching version change can confirm success
+when best-effort terminal reports were lost, but it never masks an explicitly
+reported present-channel failure/absence. A forced same-version reflash cannot
+be proven by version effect, so it requires the complete successful terminal
+set. Otherwise the gateway is `indeterminate` and the live run fails.
+
+Empty universes/cohorts, any unresolved preflight ambiguity, live zero
+reachable/zero present, post-OTA mismatches or missing verification, and every
+present-channel failure/timeout fail closed. These checks also make an empty
+dry-run cohort fail instead of presenting a misleading successful preview.
+Partial evidence survives publish, tracking, and verification errors.
+
+For a local exact-gateway preview:
+
+```sh
+python tools/fleet_deploy/ambit_deploy.py \
+    --profile <sso-profile> --tag v1.1.1 \
+    --devices "E8:F6:0A:B1:1D:D4" --dry-run
+```
+
+Do not use this workflow for bare, bricked, or pre-cooperative-OTA AMBITs; they
+require the ROM-flasher recovery path.
+
 ## Deploying a Lua release
 
 Use **Actions -> Fleet deploy (Lua) -> Run workflow**. Its targeting form
@@ -173,9 +262,10 @@ the deploy tool verifies the manifest schema, tag and version identity,
 immutable asset URL, byte count, and SHA-256. `built_against_fw` is reported as
 provenance and is not an automatic compatibility constraint.
 
-For both workflows, `latest` means the highest stable semantic version inside
-that release family: `v*` for OTA and `lua-v*` for Lua. It does not depend on
-which release happened to be published most recently.
+For all workflows, `latest` means the highest stable semantic version inside
+that repository/release family: `v*` for Ambyte OTA and AMBIT OTA, and
+`lua-v*` for Lua. It does not depend on which release happened to be published
+most recently.
 
 For a local exact-device preview:
 

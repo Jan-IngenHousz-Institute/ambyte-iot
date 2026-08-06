@@ -60,7 +60,9 @@ class LuaWorkflowTest(unittest.TestCase):
         self.assertIn(
             "REQUIRED_ASSETS=(main.lua main.lua.manifest.json)", DEPLOY_ACTION
         )
-        self.assertIn("jq -e '.isDraft == false'", DEPLOY_ACTION)
+        self.assertIn(
+            "jq -e '.draft == false and .published_at != null'", DEPLOY_ACTION
+        )
         self.assertNotIn(
             'gh release view --repo "${REPO}" --json tagName', DEPLOY_ACTION
         )
