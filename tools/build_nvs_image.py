@@ -98,6 +98,43 @@ OPTIONAL_FIELDS = [
 # offset. Mirrors flash/flash.py's DEFAULT_TIMEZONE; override via AMBYTE_TIMEZONE.
 DEFAULT_TIMEZONE = "Europe/Amsterdam"
 
+SUPPORTED_TIMEZONES = {
+    "Europe/Amsterdam",
+    "Europe/Brussels",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Madrid",
+    "Europe/Rome",
+    "Europe/Vienna",
+    "Europe/Zurich",
+    "Europe/Copenhagen",
+    "Europe/Stockholm",
+    "Europe/Oslo",
+    "Europe/Prague",
+    "Europe/Warsaw",
+    "Europe/Budapest",
+    "Europe/London",
+    "Europe/Dublin",
+    "Europe/Lisbon",
+    "Europe/Helsinki",
+    "Europe/Athens",
+    "Europe/Bucharest",
+    "UTC",
+    "Etc/UTC",
+}
+
+
+def canonical_timezone(value: str) -> str:
+    """Return the firmware-supported canonical timezone or fail the build."""
+    candidate = value.strip()
+    candidate = {"AMT": DEFAULT_TIMEZONE, "Z": "UTC"}.get(candidate, candidate)
+    if candidate not in SUPPORTED_TIMEZONES:
+        supported = ", ".join(sorted(SUPPORTED_TIMEZONES))
+        raise ValueError(
+            f"AMBYTE_TIMEZONE={value!r} is unsupported; use one of: {supported}"
+        )
+    return candidate
+
 
 def _find_idf() -> Path:
     idf = os.environ.get("IDF_PATH") or os.path.expanduser(
@@ -280,6 +317,11 @@ def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
     for env_var, ns, key, kind in OPTIONAL_FIELDS:
         raw = os.environ.get(env_var)
         if raw:
+            if env_var == "AMBYTE_TIMEZONE":
+                try:
+                    raw = canonical_timezone(raw)
+                except ValueError as exc:
+                    raise SystemExit(str(exc)) from exc
             out[(ns, key)] = (kind, raw)
 
     # Timezone default: bake Europe/Amsterdam when unset so on-device scheduling

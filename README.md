@@ -178,6 +178,20 @@ Missing required fields cause a loud non-zero exit listing them — never a sile
 2. `.env` entry at repo root (auto-loaded, gitignored, quotes stripped, `#` comments ignored)
 3. For cert slots: explicit `AMBYTE_CA_CERT` / `AMBYTE_DEV_CERT` / `AMBYTE_DEV_KEY`, else bundle auto-discovery
 
+### Timezone contract and legacy migration
+
+`AMBYTE_TIMEZONE` must be one of the IANA zones supported by
+[`components/timezone/timezone.c`](components/timezone/timezone.c); the default
+is `Europe/Amsterdam`. Provisioning fails closed on an unsupported value. The
+runtime `cfg set timezone <value>` command applies the same validation.
+
+Firmware v1.6.1 and later migrates the historical JII shorthand `AMT` to
+`Europe/Amsterdam` in NVS at boot. It also maps `Z` to `UTC` and trims surrounding
+whitespace. If a different invalid legacy value is found, the original NVS value
+is retained for diagnosis but omitted from MQTT telemetry, preventing one device
+from aborting the cloud enrichment pipeline. The OpenJII pipeline independently
+validates incoming timezones and preserves rows whose timezone is invalid.
+
 ### Cert bundle layout
 
 Put each thing's AWS IoT PEM files in its own subdirectory under [device_certs/](device_certs/) (gitignored):
