@@ -11,6 +11,14 @@ test("Lua-only PRs skip the firmware build", () => {
   );
 });
 
+test("flash-GUI-only PRs skip the firmware build", () => {
+  assert.equal(firmwareBuildRequired(["flash_gui/gui.py"]), false);
+  assert.equal(
+    firmwareBuildRequired(["flash_gui/gui.py", "lua/main.lua"]),
+    false,
+  );
+});
+
 test("any non-Lua path retains the firmware build gate", () => {
   assert.equal(
     firmwareBuildRequired(["lua/main.lua", "components/lua_runner/lua_runner.c"]),

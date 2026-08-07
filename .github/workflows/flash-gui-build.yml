@@ -1,0 +1,144 @@
+# Build the ambyte on-boarding GUI (flash_gui/) as a standalone executable for
+# Windows, Linux and macOS.
+#
+# The flash GUI is host-side tooling and deliberately belongs to NO release
+# unit (tools/release/path-scoped.js excludes flash_gui/** from firmware
+# commit analysis, mirroring the lua/** rule) — so its distribution lives
+# here, not in the semantic-release pipeline:
+#
+#   * every PR / main push touching flash_gui/** runs the unit tests and a
+#     matrix build, publishing the executables as workflow artifacts;
+#   * pushing a tag `flash-gui-v*` additionally attaches them to a GitHub
+#     release under that tag (the firmware pipeline's tagFormat is plain
+#     `v${version}`, so these tags never collide with it).
+name: Build flash GUI executables
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["flash-gui-v*"]
+    paths:
+      - "flash_gui/**"
+      - ".github/workflows/flash-gui-build.yml"
+  pull_request:
+    paths:
+      - "flash_gui/**"
+      - ".github/workflows/flash-gui-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r flash_gui/requirements.txt pytest
+
+      - name: Run flash_gui tests
+        run: python -m pytest flash_gui/tests -q
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            binary: dist/ambyte-flash-gui.exe
+          - os: ubuntu-latest
+            label: linux
+            binary: dist/ambyte-flash-gui
+          - os: macos-latest
+            label: macos
+            # --windowed on macOS emits an .app bundle; ship that (zipped),
+            # not the bare Mach-O next to it.
+            binary: dist/ambyte-flash-gui.app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r flash_gui/requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: bash
+        run: |
+          # --add-data separator is OS-specific (';' on Windows, ':' elsewhere).
+          SEP=":"
+          [[ "$RUNNER_OS" == "Windows" ]] && SEP=";"
+          # vendor/nvs_partition_gen.py is loaded from its file path at
+          # runtime (never imported statically), so PyInstaller's analysis
+          # cannot discover it — bundle it explicitly. esptool ships flasher
+          # stub JSONs as package data; --collect-all pulls those in.
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name ambyte-flash-gui \
+            --paths . \
+            --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
+            --collect-all esptool \
+            flash_gui/launcher.py
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          case "${{ matrix.label }}" in
+            macos)
+              # ditto preserves the .app bundle structure + exec bits.
+              ditto -c -k --keepParent "dist/ambyte-flash-gui.app" \
+                "out/ambyte-flash-gui-macos.zip"
+              ;;
+            linux)
+              chmod +x dist/ambyte-flash-gui
+              tar -czf out/ambyte-flash-gui-linux.tar.gz -C dist ambyte-flash-gui
+              ;;
+            windows)
+              7z a out/ambyte-flash-gui-windows.zip ./dist/ambyte-flash-gui.exe
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ambyte-flash-gui-${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to release
+    # Only for flash-gui-v* tags: makes the executables publicly downloadable
+    # without a GitHub login (workflow artifacts require one).
+    if: startsWith(github.ref, 'refs/tags/flash-gui-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ambyte-flash-gui-*
+          merge-multiple: true
+          path: out
+
+      - name: Create GitHub release with executables
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: out/*
+          fail_on_unmatched_files: true

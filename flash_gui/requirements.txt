@@ -1,0 +1,5 @@
+# python -m pip install -r requirements.txt   (Python 3.10+, Tkinter included
+# with the standard python.org installers; on Debian/Ubuntu: apt install python3-tk)
+esptool>=5.0
+pyserial>=3.5
+tzlocal>=5.0
