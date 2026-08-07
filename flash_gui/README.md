@@ -94,11 +94,11 @@ RTC).
   `x-api-key`. Device-registry endpoints are additionally gated by the
   `iot-devices` feature flag per user — a 403 means the flag is off for your
   account.
-- **TODO (`config.py`)**: the **prod** AWS IoT broker endpoint is not
-  publicly discoverable; resolve it with
-  `aws iot describe-endpoint --endpoint-type iot:Data-ATS` against the prod
-  account and fill it in before provisioning prod boards. The GUI refuses to
-  start a prod procedure until then.
+- The AWS IoT broker endpoints in `config.py` are account-specific and not
+  discoverable via any openJII API; they were resolved with
+  `aws iot describe-endpoint --endpoint-type iot:Data-ATS` against each
+  account. If an environment's endpoint ever changes, update it there — the
+  GUI refuses to start a procedure for an environment whose endpoint is unset.
 
 ## Files
 

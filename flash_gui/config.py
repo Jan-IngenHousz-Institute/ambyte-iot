@@ -70,12 +70,7 @@ ENVIRONMENTS: dict[str, Environment] = {
         key="prod",
         api_url="https://api.openjii.org",
         web_url="https://openjii.org",
-        # TODO(prod-broker): fill in the prod AWS IoT ATS endpoint (different
-        # AWS account => different xxxxxxxx-ats prefix). Resolve it with:
-        #   aws iot describe-endpoint --endpoint-type iot:Data-ATS
-        # against the prod account, then set e.g.
-        #   mqtt_uri="mqtts://XXXXXXXXXXXXXX-ats.iot.eu-central-1.amazonaws.com:8883"
-        mqtt_uri=None,
+        mqtt_uri="mqtts://a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com:8883",
     ),
 }
 
