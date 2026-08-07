@@ -18,7 +18,8 @@ from flash_gui.nvs_builder import (AMAZON_ROOT_CA1,            # noqa: E402
                                    NvsBuildError, ProvisioningPlan,
                                    build_nvs_csv, build_nvs_image)
 from flash_gui.procedure import PreflightInfo, clean_device_name  # noqa: E402
-from flash_gui.release_fetch import ReleaseError, ReleaseImages   # noqa: E402
+from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
+                                     pick_firmware_release)
 
 
 MAC = "E8:F6:0A:B1:1F:34"
@@ -171,6 +172,51 @@ def test_release_missing_file_raises(tmp_path):
     manifest = {"flash_files": {"0x0": "missing.bin"}}
     with pytest.raises(ReleaseError):
         _ = ReleaseImages("v1.6.0", "1.6.0", tmp_path, manifest).flash_files
+
+
+# ── firmware release picker ──────────────────────────────────────────────────
+def _rel(tag, assets=("ambyte-iot-" + "v1.0.0" + ".zip",), published="2026-01-01T00:00:00Z",
+         prerelease=False, draft=False):
+    return {"tag_name": tag, "prerelease": prerelease, "draft": draft,
+            "published_at": published,
+            "assets": [{"name": a} for a in assets]}
+
+
+def test_picker_skips_flash_gui_and_lua_releases():
+    # The exact incident: flash-gui-v0.1.0 published AFTER v1.6.1 hijacked
+    # /releases/latest and carried no firmware zip.
+    releases = [
+        _rel("flash-gui-v0.1.0", assets=("ambyte-flash-gui-windows.zip",),
+             published="2026-08-07T07:27:43Z"),
+        _rel("lua-v1.2.0", assets=("lua-release.zip",),
+             published="2026-08-07T00:00:00Z"),
+        _rel("v1.6.1", assets=("firmware.bin", "ambyte-iot-v1.6.1.zip"),
+             published="2026-08-06T22:03:47Z"),
+        _rel("v1.6.0", assets=("firmware.bin", "ambyte-iot-v1.6.0.zip"),
+             published="2026-08-05T19:40:47Z"),
+    ]
+    assert pick_firmware_release(releases)["tag_name"] == "v1.6.1"
+
+
+def test_picker_skips_prerelease_draft_and_assetless():
+    releases = [
+        _rel("v2.0.0", prerelease=True, published="2026-09-01T00:00:00Z"),
+        _rel("v1.9.0", draft=True, published="2026-08-30T00:00:00Z"),
+        _rel("v1.8.0", assets=("firmware.bin",),   # zip missing
+             published="2026-08-20T00:00:00Z"),
+        _rel("v1.7.0", assets=("ambyte-iot-v1.7.0.zip",),
+             published="2026-08-10T00:00:00Z"),
+    ]
+    assert pick_firmware_release(releases)["tag_name"] == "v1.7.0"
+
+
+def test_picker_returns_none_when_no_firmware_release():
+    releases = [
+        _rel("flash-gui-v0.1.0", assets=("ambyte-flash-gui-linux.tar.gz",)),
+        _rel("lua-v1.0.0", assets=("lua.zip",)),
+    ]
+    assert pick_firmware_release(releases) is None
+    assert pick_firmware_release([]) is None
 
 
 # ── timezone helpers ─────────────────────────────────────────────────────────

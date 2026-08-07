@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import urllib.error
 import urllib.request
@@ -37,6 +38,34 @@ USER_AGENT = "ambyte-flash-gui"
 
 class ReleaseError(RuntimeError):
     """Anything that prevents resolving a flashable release."""
+
+
+def pick_firmware_release(releases: list) -> dict | None:
+    """The newest published FIRMWARE release from a /releases listing.
+
+    The repo's release stream carries more than firmware: lua-v* script
+    releases and flash-gui-v* tool releases share it, and GitHub's
+    /releases/latest simply returns the most recently published one — the day
+    flash-gui-v0.1.0 was tagged, "latest" stopped carrying a firmware zip and
+    every flasher in the field broke. So: scan the list, keep only non-draft,
+    non-prerelease entries whose tag is a plain firmware `vX.Y.Z` AND that
+    actually ship the flash-bundle asset, and take the newest by publish date.
+    """
+    def is_firmware(rel: dict) -> bool:
+        if rel.get("draft") or rel.get("prerelease"):
+            return False
+        tag = rel.get("tag_name") or ""
+        if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+            return False
+        return any(
+            (a.get("name") or "").startswith(ASSET_PREFIX)
+            and (a.get("name") or "").endswith(ASSET_SUFFIX)
+            for a in rel.get("assets") or [])
+
+    candidates = [r for r in releases if isinstance(r, dict) and is_firmware(r)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: r.get("published_at") or "")
 
 
 def _auth_headers() -> dict[str, str]:
@@ -115,22 +144,25 @@ class ReleaseImages:
 def fetch_latest(log=print) -> ReleaseImages:
     """Download (or reuse from cache) the newest published firmware release.
 
-    /releases/latest excludes drafts and prereleases on purpose: a bench rc
-    must never reach a field board by default.
+    Deliberately NOT /releases/latest: that endpoint returns the most recently
+    published release of ANY kind, and this repo also publishes lua-v* and
+    flash-gui-v* releases. pick_firmware_release() filters to real firmware
+    releases (vX.Y.Z + flash-bundle asset, no drafts/prereleases).
     """
-    release = _get_json(f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases/latest")
+    releases = _get_json(
+        f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100")
+    release = pick_firmware_release(releases if isinstance(releases, list)
+                                    else [])
+    if release is None:
+        raise ReleaseError(
+            f"no firmware release (vX.Y.Z with an {ASSET_PREFIX}*{ASSET_SUFFIX} "
+            f"asset) found among the newest 100 releases of {FIRMWARE_REPO}.")
     tag = release.get("tag_name") or "(untagged)"
 
-    asset = None
-    for cand in release.get("assets", []):
-        name = cand.get("name", "")
-        if name.startswith(ASSET_PREFIX) and name.endswith(ASSET_SUFFIX):
-            asset = cand
-            break
-    if asset is None:
-        raise ReleaseError(
-            f"release {tag} has no {ASSET_PREFIX}*{ASSET_SUFFIX} asset — it may "
-            "be a Lua-only release; a firmware release is required.")
+    asset = next(
+        cand for cand in release.get("assets", [])
+        if (cand.get("name") or "").startswith(ASSET_PREFIX)
+        and (cand.get("name") or "").endswith(ASSET_SUFFIX))
 
     dest = CACHE_DIR / "releases" / tag
     stamp = dest / STAMP

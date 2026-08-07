@@ -142,3 +142,9 @@ jobs:
           name: ${{ github.ref_name }}
           files: out/*
           fail_on_unmatched_files: true
+          # Never let a GUI release become the repo's "Latest": consumers of
+          # /releases/latest (and the repo landing page) must keep seeing the
+          # newest FIRMWARE release. flash_gui's own fetcher additionally
+          # filters by tag+asset (pick_firmware_release), belt and braces.
+          prerelease: true
+          make_latest: false
