@@ -104,8 +104,10 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id);
  * dedupes. A persistently-FAILING id is refused after 3 attempts (returns
  * ESP_ERR_INVALID_STATE) so a retained trigger with a bad version/unstaged SD
  * can't loop the disruptive sweep forever — fix the cause, retry under a new id.
- * The SD folder must already hold the 4 region files — this path does not
- * download. */
+ * The worker creates a missing canonical root/version directory before its
+ * file preflight, so operators can stage a recovery bundle on older SD cards.
+ * It still fails before touching the AMBIT unless all 4 region files are
+ * present and non-empty; this path does not download them. */
 esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id);
 
 #ifdef __cplusplus

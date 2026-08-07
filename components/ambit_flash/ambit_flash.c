@@ -12,6 +12,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -228,6 +230,20 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
         ESP_LOGE(TAG, "SD card not available — insert it into the ambyte "
                       "(reboot if it was hot-swapped)");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Recovery folders were historically installed by the factory SD image.
+     * Some field cards predate that layout, which made remote recovery
+     * impossible even when operators could stage the four exact files. Create
+     * only the canonical root/version directories here, before touching the
+     * target. Missing files still fail closed in the preflight below. */
+    if (mkdir(AMBIT_FW_ROOT, 0777) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "cannot create %s", AMBIT_FW_ROOT);
+        return ESP_FAIL;
+    }
+    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "cannot create recovery directory %s", dir);
+        return ESP_FAIL;
     }
 
     /* Fail fast: all four region files must be present + non-empty BEFORE we touch
