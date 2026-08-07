@@ -408,6 +408,19 @@ def classify(rec):
     return "no_reply"
 
 
+def deployment_failure_reason(rec, expected_version):
+    """Return why a commanded device lacks exact terminal proof, else None."""
+    outcome = classify(rec)
+    if outcome != "succeeded":
+        return outcome
+    reported = parse_version(rec.get("fw") or "")
+    if expected_version is not None and (
+        reported is None or cmp_version(reported, expected_version) != 0
+    ):
+        return "target_version_not_confirmed"
+    return None
+
+
 def write_summary(path, lines):
     if not path:
         return
@@ -579,7 +592,11 @@ def main():
                                    args.batch, args.stagger)
         plan["results"] = results
         plan["error"] = error
-        failed = [d for d, r in results.items() if classify(r) == "failed"]
+        failed = [
+            d
+            for d, record in results.items()
+            if deployment_failure_reason(record, release_version) is not None
+        ]
     elif not matching:
         print("\nNo devices match the version filter; nothing to deploy.")
     elif up_to_date and not newer:
@@ -630,7 +647,11 @@ def main():
         print(f"\nCampaign error: {plan['error']}")
         return 1
     if failed:
-        print(f"\n{len(failed)} device(s) FAILED: {', '.join(failed)}")
+        details = ", ".join(
+            f"{device} ({deployment_failure_reason(plan['results'][device], release_version)})"
+            for device in failed
+        )
+        print(f"\n{len(failed)} device(s) lack exact terminal proof: {details}")
         return 1
     print("\nDone.")
     return 0

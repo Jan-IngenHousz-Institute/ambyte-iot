@@ -34,6 +34,11 @@ percentage cohorts, and a written outcome per device.
    state (`success` / `failed` / `dropped`), writing a per-device table to
    the job summary and a `results.json` artifact.
 
+A live run succeeds only when every commanded gateway reports terminal
+`success` and the exact target firmware version. Missing replies,
+accepted-without-final reports, dropped/failed terminals, absent version fields,
+and version mismatches fail the job while preserving the partial artifact.
+
 Safety properties, all firmware-side: dual-slot OTA with ~300 s
 auto-rollback (a broken image cannot brick a device), NVS untouched
 (provisioning + event cursor survive), applied-id latch (re-running a
