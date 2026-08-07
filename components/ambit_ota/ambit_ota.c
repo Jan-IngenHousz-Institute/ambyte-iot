@@ -587,10 +587,24 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
 
 /* ── fleet version report ─────────────────────────────────────────────────
  * Sweep all channels (cmd 33/2), log a per-channel line, and publish one JSON
- * report. Runs on the worker task (off the MQTT loop). No quiesce — the version
- * read is a quick UART transaction the uart_sensors mutex serializes with Lua. */
+ * report. Runs on the worker task (off the MQTT loop).
+ *
+ * The normal Lua schedule starts a 59-second SS run every minute. AMBIT is
+ * deliberately quiet on the shared UART while that run owns its binary router,
+ * so mutex serialization alone produces false "absent" inventory for almost
+ * the entire minute. Stop Lua, allow the already-triggered autonomous run to
+ * finish, then sweep in the resulting deterministic idle window. The longest
+ * normal trace is the 59-pulse/1 Hz SS run (~59.3 s including setup); 65 s keeps
+ * margin without approaching the host's 90 s correlated-query deadline. */
+#define AMBIT_VERSION_SETTLE_MS 65000U
+
 static void ambit_do_versions(const char *id)
 {
+    if (s_cfg.workload_suspend != NULL) {
+        s_cfg.workload_suspend();
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_SETTLE_MS));
+    }
+
     char esc_id[AMBIT_OTA_ID_MAX * 2 + 1] = "";
     json_escape(esc_id, sizeof esc_id, id);
 
@@ -632,6 +646,8 @@ static void ambit_do_versions(const char *id)
             s_cfg.publish(s_cfg.status_topic, buf, (size_t)o, &msg_id);
         }
     }
+
+    if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
 }
 
 /* ── ROM-bootloader probe sweep ───────────────────────────────────────────

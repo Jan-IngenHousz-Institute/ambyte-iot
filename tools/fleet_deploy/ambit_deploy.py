@@ -488,64 +488,139 @@ def retry_absent_preflight(
     dict[str, dict[str, Any]],
     dict[str, Any] | None,
 ]:
-    """Retry a cold-wake all-absent sweep and reconcile it fail closed.
+    """Retry inconclusive inventory and reconcile channel evidence fail closed.
 
-    Bench evidence shows that one complete four-channel absent report can be a
-    false negative immediately after idle/OTA. A second correlated sweep may
-    establish presence or confirm absence. If it does neither, the effective
-    report is marked ambiguous so it can never silently broaden a live run.
+    A measuring AMBIT is deliberately silent on the shared UART. A version
+    sweep that overlaps SS/MPF can therefore report that channel as absent or
+    present-without-version even though the application is healthy. Cold wake
+    has the same observable result. Retry every report that is not four proven
+    versions, then merge only compatible positive evidence. Absence requires
+    two matching observations; a missing retry or conflicting version remains
+    ambiguous and blocks live deployment.
     """
-    absent_only = sorted(
+
+    def proven_version(entry: dict[str, Any]) -> str | None:
+        if not entry.get("present"):
+            return None
+        version = entry.get("version")
+        return version if fleet.parse_version(version or "") is not None else None
+
+    expected_channels = {str(channel) for channel in CHANNELS}
+
+    def report_has_four_proven_versions(report: dict[str, Any]) -> bool:
+        channels = report.get("channels", {})
+        return (
+            report.get("state") == "complete"
+            and set(channels) == expected_channels
+            and all(
+                proven_version(channels[channel]) is not None
+                for channel in expected_channels
+            )
+        )
+
+    retry_devices = sorted(
         device
         for device in devices
-        if (report := initial_reports.get(device)) is not None
-        and report.get("state") == "complete"
-        and not any(
-            entry.get("present")
-            for entry in report.get("channels", {}).values()
-        )
+        if (report := initial_reports.get(device)) is None
+        or not report_has_four_proven_versions(report)
     )
     effective = dict(initial_reports)
-    if not absent_only:
+    if not retry_devices:
         return effective, None
 
     if delay_seconds:
         print(
-            f"No AMBIT was reported on {len(absent_only)} gateway(s); "
-            f"waiting {delay_seconds:g}s for a cold-wake retry ..."
+            f"AMBIT inventory was inconclusive on {len(retry_devices)} gateway(s); "
+            f"waiting {delay_seconds:g}s before a measurement-safe retry ..."
         )
         sleep(delay_seconds)
     retry_id = _new_id("ambit-preflight-retry", release_version)
     retry_reports, retry_error = versions_query(
-        session, absent_only, retry_id, wait_seconds
+        session, retry_devices, retry_id, wait_seconds
     )
-    for device in absent_only:
+    for device in retry_devices:
+        initial = initial_reports.get(device)
         retry = retry_reports.get(device)
-        if retry is not None and retry.get("state") == "complete":
-            present = any(
-                entry.get("present")
-                for entry in retry.get("channels", {}).values()
-            )
+        if retry is None or retry.get("state") != "complete":
             effective[device] = {
-                **retry,
+                "state": "ambiguous",
+                "channels": (initial or {}).get("channels", {}),
+                "detail": "inventory retry did not return a complete report",
+                "initial_state": initial.get("state") if initial else "no_reply",
+                "retry_state": retry.get("state") if retry else "no_reply",
+            }
+            continue
+
+        retry_channels = retry.get("channels", {})
+        if initial is None or initial.get("state") != "complete":
+            if report_has_four_proven_versions(retry):
+                effective[device] = {
+                    **retry,
+                    "preflight_source_attempt": 2,
+                    "absence_confirmed_after_retry": False,
+                }
+            else:
+                effective[device] = {
+                    "state": "ambiguous",
+                    "channels": retry_channels,
+                    "detail": (
+                        "only the retry replied and one or more channels were "
+                        "absent or unversioned"
+                    ),
+                    "initial_state": initial.get("state") if initial else "no_reply",
+                    "retry_state": retry.get("state"),
+                }
+            continue
+
+        initial_channels = initial.get("channels", {})
+        merged: dict[str, dict[str, Any]] = {}
+        conflicts: list[str] = []
+        unknown: list[str] = []
+        for channel in map(str, CHANNELS):
+            first = initial_channels.get(channel, {"present": False, "version": None})
+            second = retry_channels.get(channel, {"present": False, "version": None})
+            known = [
+                version
+                for entry in (first, second)
+                if (version := proven_version(entry)) is not None
+            ]
+            if len(set(known)) > 1:
+                conflicts.append(channel)
+                merged[channel] = {"present": True, "version": None}
+            elif known:
+                merged[channel] = {"present": True, "version": known[-1]}
+            elif first.get("present") or second.get("present"):
+                unknown.append(channel)
+                merged[channel] = {"present": True, "version": None}
+            else:
+                # Two complete reports both observed absence.
+                merged[channel] = {"present": False, "version": None}
+
+        if conflicts or unknown:
+            detail_parts = []
+            if conflicts:
+                detail_parts.append("conflicting versions on channels " + ",".join(conflicts))
+            if unknown:
+                detail_parts.append("unversioned present channels " + ",".join(unknown))
+            effective[device] = {
+                "state": "ambiguous",
+                "channels": merged,
+                "detail": "; ".join(detail_parts),
+                "initial_state": initial.get("state"),
+                "retry_state": retry.get("state"),
+            }
+        else:
+            present = any(entry["present"] for entry in merged.values())
+            effective[device] = {
+                "state": "complete",
+                "channels": merged,
                 "preflight_source_attempt": 2,
                 "absence_confirmed_after_retry": not present,
             }
-            continue
-        effective[device] = {
-            "state": "ambiguous",
-            "channels": initial_reports[device].get("channels", {}),
-            "detail": (
-                "initial sweep reported all channels absent, but retry did not "
-                "confirm presence or absence"
-            ),
-            "initial_state": initial_reports[device].get("state"),
-            "retry_state": retry.get("state") if retry else "no_reply",
-        }
     return effective, {
         "attempt": 2,
         "id": retry_id,
-        "devices": absent_only,
+        "devices": retry_devices,
         "reports": retry_reports,
         "error": retry_error,
     }
@@ -1033,8 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--absent-retry-delay-seconds",
         type=float,
-        default=3,
-        help="bounded cold-wake delay before confirming an all-absent preflight",
+        default=65,
+        help="bounded delay before retrying cold-wake or measurement-busy inventory",
     )
     parser.add_argument("--verify-seconds", type=int, default=120)
     parser.add_argument("--ack-seconds", type=int, default=90)
@@ -1303,6 +1378,7 @@ def main(argv: list[str] | None = None) -> int:
         "post_verify_wait_seconds": args.verify_seconds,
         "post_verify_id": None,
         "post_verify_versions": {},
+        "post_verify_attempts": [],
         "post_verify_error": None,
         "verification": {},
         "results": {},
@@ -1359,9 +1435,37 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"\nVerifying AMBIT versions on {len(to_deploy)} executed gateway(s) ..."
         )
-        post_reports, post_error = fleet_ambit_versions(
+        initial_post_reports, post_error = fleet_ambit_versions(
             session, to_deploy, post_verify_id, args.verify_seconds
         )
+        post_attempts = [
+            {
+                "attempt": 1,
+                "id": post_verify_id,
+                "devices": to_deploy,
+                "reports": initial_post_reports,
+                "error": post_error,
+            }
+        ]
+        post_reports, post_retry_attempt = retry_absent_preflight(
+            session,
+            to_deploy,
+            initial_post_reports,
+            manifest["version"],
+            args.verify_seconds,
+            args.absent_retry_delay_seconds,
+            versions_query=fleet_ambit_versions,
+            sleep=time.sleep,
+        )
+        if post_retry_attempt is not None:
+            post_attempts.append(post_retry_attempt)
+            post_retry_error = post_retry_attempt["error"]
+            if post_retry_error:
+                post_error = (
+                    f"{post_error}; retry: {post_retry_error}"
+                    if post_error
+                    else f"retry: {post_retry_error}"
+                )
         verification, failures = assess_post_verification(
             to_deploy,
             decisions,
@@ -1371,6 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         plan["post_verify_id"] = post_verify_id
         plan["post_verify_versions"] = post_reports
+        plan["post_verify_attempts"] = post_attempts
         plan["post_verify_error"] = post_error
         plan["verification"] = verification
         plan["live_failures"] = failures
