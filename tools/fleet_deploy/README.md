@@ -248,6 +248,54 @@ python tools/fleet_deploy/ambit_deploy.py \
 Do not use this workflow for bare, bricked, or pre-cooperative-OTA AMBITs; they
 require the ROM-flasher recovery path.
 
+### Pre-publication AMBIT candidate canary (DEV only)
+
+The existing **Fleet deploy (AMBIT via Ambyte)** workflow exposes a rigorously
+isolated `candidate` mode for a branch candidate whose GitHub release does not
+exist yet. The existing workflow path is important: dispatch the workflow with
+`ref=ops/ambit-v1.1.4-candidate-canary` so GitHub loads the branch definition
+before the candidate mode is merged. Candidate mode is bound directly to the
+protected `fleet-deploy-dev` environment and accepts exactly one
+canonical `AMBYTE_AA:BB:CC:DD:EE:FF` gateway, one numeric `X.Y.Z` target, one
+public HTTPS image URL, its exact byte size, its exact lowercase SHA-256, and a
+dry-run flag that defaults true. Because the default-branch workflow path is
+reused, its release-mode environment, discovery, percentage, device-list,
+downgrade, force-reflash, prerelease, version-filter, and release-selection
+controls remain visible in the dispatch form. Candidate mode fails before AWS
+unless all of those shared controls stay at their safe defaults; it neither
+forwards nor silently interprets them, and its persisted proof contains no
+broad cohort path.
+
+Both the candidate job and its persisted proof reject any runtime ref other
+than `refs/heads/ops/ambit-v1.1.4-candidate-canary`; copying or dispatching the
+mode from another branch cannot pass preparation or deployment.
+
+Before the workflow configures AWS credentials, its candidate-only runner
+downloads the URL exactly once. Credentials, queries, fragments, redirects,
+non-default ports, local/non-global literal addresses, content encodings, and
+size/SHA/magic mismatches are rejected. The verified local image and a
+supply-chain proof are persisted before AWS; the deployment phase re-hashes the
+local bytes without downloading again. The proof pins the one device, DEV
+environment, percentage 100, candidate version, source URL, byte size, SHA-256,
+ESP `0xE9` magic, and non-discovery/non-downgrade/non-force invariants.
+
+The AWS phase reuses the normal correlated ping, `ambit_versions`, one
+`channel=all` `ambit_ota`, terminal tracker, and independent post-OTA version
+verification. A live result succeeds only when every preflight-present channel
+is still present and reports the target numeric version. Dry-run performs the
+read-only ping/version preflight but cannot call the OTA publisher.
+
+Raw calibration preservation snapshots are intentionally not claimed by this
+candidate path. The current deployed Ambyte contract caps
+`lua_exec_result.result` at `SCRIPT_RESULT_MAX=192` bytes (191 payload
+characters), while one roughly 136–140 byte calibration struct needs 272–280
+characters as lowercase hex. A single fixed `lua_exec` would therefore truncate
+even one channel. The safe future hook points are (1) after the single gateway's
+preflight is complete and immediately before `fleet_ambit_ota`, and (2) after
+`assess_post_verification` confirms versions and before final success is
+persisted. Do not substitute multi-call chunking and present it as an atomic
+before/after proof.
+
 ## Deploying a Lua release
 
 Use **Actions -> Fleet deploy (Lua) -> Run workflow**. Its targeting form

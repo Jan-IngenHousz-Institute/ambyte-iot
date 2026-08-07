@@ -7,6 +7,11 @@ name: Fleet deploy (AMBIT via Ambyte)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Published release, or branch-only pre-publication candidate canary"
+        type: choice
+        options: [release, candidate]
+        default: release
       environment:
         description: "Target account/fleet"
         type: choice
@@ -53,6 +58,26 @@ on:
         description: "Reapply an already-current numeric version (requires explicit devices and 100%)"
         type: boolean
         default: false
+      candidate_device_id:
+        description: "Candidate mode only: exactly one canonical AMBYTE_AA:BB:CC:DD:EE:FF ID"
+        type: string
+        default: ""
+      candidate_version:
+        description: "Candidate mode only: exact numeric AMBIT version expected after OTA (X.Y.Z)"
+        type: string
+        default: ""
+      candidate_image_url:
+        description: "Candidate mode only: temporary public HTTPS image URL"
+        type: string
+        default: ""
+      candidate_image_size:
+        description: "Candidate mode only: exact application byte size"
+        type: string
+        default: ""
+      candidate_image_sha256:
+        description: "Candidate mode only: exact lowercase application SHA-256"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -64,6 +89,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: inputs.mode == 'release'
     name: Deploy AMBIT ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
     runs-on: ubuntu-latest
     environment: fleet-deploy-${{ inputs.environment }}
@@ -94,3 +120,160 @@ jobs:
           ambit-final-seconds: "3600"
           github-token: ${{ secrets.GITHUB_TOKEN }}
           aws-role-arn: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
+
+  # This path is intentionally a separate job instead of a mode in the shared
+  # immutable-release action. The workflow path already exists on origin/main,
+  # so a dispatch with ref=ops/ambit-v1.1.4-candidate-canary can load this branch
+  # definition before the candidate tooling is merged.
+  candidate-canary:
+    if: inputs.mode == 'candidate'
+    name: DEV candidate ${{ inputs.candidate_version }} to ${{ inputs.candidate_device_id }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    environment: fleet-deploy-dev
+    timeout-minutes: 90
+    steps:
+      - name: Checkout branch candidate tooling
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/fleet_deploy/requirements.txt
+
+      - name: Enforce candidate DEV isolation
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          DISPATCH_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION_OP: ${{ inputs.version_op }}
+          VERSION_FILTER: ${{ inputs.version }}
+          PERCENTAGE: ${{ inputs.percentage }}
+          RELEASE_DEVICES: ${{ inputs.devices }}
+          DISCOVERY_WINDOW: ${{ inputs.discovery_window_minutes }}
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade }}
+          ALLOW_PRERELEASE: ${{ inputs.allow_prerelease }}
+          FORCE_REFLASH: ${{ inputs.force_reflash }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${TARGET_ENVIRONMENT}" == "dev" ]] || {
+            echo "::error::candidate mode requires environment=dev and fleet-deploy-dev"
+            exit 2
+          }
+          [[ "${DISPATCH_REF}" == "refs/heads/ops/ambit-v1.1.4-candidate-canary" ]] || {
+            echo "::error::candidate mode is pinned to refs/heads/ops/ambit-v1.1.4-candidate-canary"
+            exit 2
+          }
+          [[ "${RELEASE_TAG}" == "latest" ]] || {
+            echo "::error::candidate mode requires release_tag=latest (unused safe default)"
+            exit 2
+          }
+          [[ "${VERSION_OP}" == "any" ]] || {
+            echo "::error::candidate mode requires version_op=any"
+            exit 2
+          }
+          [[ -z "${VERSION_FILTER}" ]] || {
+            echo "::error::candidate mode requires an empty release version filter"
+            exit 2
+          }
+          [[ "${PERCENTAGE}" == "100" ]] || {
+            echo "::error::candidate mode requires percentage=100"
+            exit 2
+          }
+          [[ -z "${RELEASE_DEVICES}" ]] || {
+            echo "::error::candidate mode forbids the release-mode devices list"
+            exit 2
+          }
+          [[ "${DISCOVERY_WINDOW}" == "1440" ]] || {
+            echo "::error::candidate mode requires the unused discovery window default"
+            exit 2
+          }
+          [[ "${ALLOW_DOWNGRADE}" == "false" ]] || {
+            echo "::error::candidate mode forbids allow_downgrade"
+            exit 2
+          }
+          [[ "${ALLOW_PRERELEASE}" == "false" ]] || {
+            echo "::error::candidate mode forbids allow_prerelease"
+            exit 2
+          }
+          [[ "${FORCE_REFLASH}" == "false" ]] || {
+            echo "::error::candidate mode forbids force_reflash"
+            exit 2
+          }
+
+      - name: Download and verify exact candidate before AWS
+        env:
+          DEVICE_ID: ${{ inputs.candidate_device_id }}
+          CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+          IMAGE_URL: ${{ inputs.candidate_image_url }}
+          IMAGE_SIZE: ${{ inputs.candidate_image_size }}
+          IMAGE_SHA256: ${{ inputs.candidate_image_sha256 }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DISPATCH_REF: ${{ github.ref }}
+          PREPARED_DIR: ${{ runner.temp }}/ambit-candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(
+            prepare
+            --environment dev
+            --git-ref "${DISPATCH_REF}"
+            --device-id "${DEVICE_ID}"
+            --candidate-version "${CANDIDATE_VERSION}"
+            --image-url "${IMAGE_URL}"
+            --image-size "${IMAGE_SIZE}"
+            --image-sha256 "${IMAGE_SHA256}"
+            --prepared-dir "${PREPARED_DIR}"
+            --proof-json candidate-supply-chain-proof.json
+            --results-json results.json
+          )
+          case "${DRY_RUN}" in
+            true) ARGS+=(--dry-run) ;;
+            false) ;;
+            *) echo "::error::dry_run must be true or false"; exit 2 ;;
+          esac
+          python tools/fleet_deploy/ambit_candidate_deploy.py "${ARGS[@]}"
+
+      - name: Install fleet dependencies
+        shell: bash
+        run: pip install --disable-pip-version-check -r tools/fleet_deploy/requirements.txt
+
+      # Deliberately after download, exact size/SHA verification, ESP 0xE9
+      # validation, and supply-chain proof persistence.
+      - name: Configure DEV AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          role-session-name: fleet-deploy-ambit-candidate-${{ github.run_id }}
+          role-duration-seconds: 7200
+
+      - name: Run isolated single-gateway candidate canary
+        env:
+          PREPARED_DIR: ${{ runner.temp }}/ambit-candidate
+          DISPATCH_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/fleet_deploy/ambit_candidate_deploy.py deploy \
+            --environment dev \
+            --git-ref "${DISPATCH_REF}" \
+            --prepared-dir "${PREPARED_DIR}" \
+            --proof-json candidate-supply-chain-proof.json \
+            --results-json results.json \
+            --final-seconds 3600
+
+      - name: Upload candidate canary evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ambit-candidate-canary-results-${{ github.run_id }}
+          path: |
+            results.json
+            candidate-supply-chain-proof.json
+          if-no-files-found: warn
+          retention-days: 90
