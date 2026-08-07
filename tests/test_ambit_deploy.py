@@ -350,6 +350,86 @@ class ColdWakePreflightTest(unittest.TestCase):
         self.assertEqual(effective[DEVICE_A]["state"], "complete")
         self.assertTrue(effective[DEVICE_A]["absence_confirmed_after_retry"])
 
+    def test_partial_measurement_busy_report_merges_retry_versions(self) -> None:
+        initial = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": {
+                    "0": {"present": True, "version": "1.2.2"},
+                    "1": {"present": True, "version": None},
+                    "2": {"present": False, "version": None},
+                    "3": {"present": False, "version": None},
+                },
+            }
+        }
+        retry = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": {
+                    "0": {"present": False, "version": None},
+                    "1": {"present": True, "version": "1.2.2"},
+                    "2": {"present": True, "version": "1.2.2"},
+                    "3": {"present": False, "version": None},
+                },
+            }
+        }
+        effective, attempt = ambit_deploy.retry_absent_preflight(
+            object(),
+            [DEVICE_A],
+            initial,
+            "1.2.3",
+            90,
+            0,
+            versions_query=mock.Mock(return_value=(retry, None)),
+        )
+        self.assertEqual(attempt["devices"], [DEVICE_A])
+        self.assertEqual(
+            effective[DEVICE_A]["channels"],
+            {
+                "0": {"present": True, "version": "1.2.2"},
+                "1": {"present": True, "version": "1.2.2"},
+                "2": {"present": True, "version": "1.2.2"},
+                "3": {"present": False, "version": None},
+            },
+        )
+        self.assertEqual(effective[DEVICE_A]["state"], "complete")
+
+    def test_conflicting_positive_versions_remain_ambiguous(self) -> None:
+        initial = {DEVICE_A: {"state": "complete", "channels": channels("1.2.1")}}
+        retry = {DEVICE_A: {"state": "complete", "channels": channels("1.2.2")}}
+        effective, _ = ambit_deploy.retry_absent_preflight(
+            object(),
+            [DEVICE_A],
+            initial,
+            "1.2.3",
+            90,
+            0,
+            versions_query=mock.Mock(return_value=(retry, None)),
+        )
+        self.assertEqual(effective[DEVICE_A]["state"], "ambiguous")
+        self.assertIn("conflicting versions", effective[DEVICE_A]["detail"])
+
+    def test_four_proven_versions_do_not_retry(self) -> None:
+        report = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.2", "1.2.2", "1.2.2", "1.2.2"),
+            }
+        }
+        query = mock.Mock()
+        effective, attempt = ambit_deploy.retry_absent_preflight(
+            object(),
+            [DEVICE_A],
+            report,
+            "1.2.3",
+            90,
+            15,
+            versions_query=query,
+        )
+        self.assertEqual(effective, report)
+        self.assertIsNone(attempt)
+        query.assert_not_called()
+
 
 class StatusTrackerTest(unittest.TestCase):
     def test_correlates_campaign_gateway_channels_and_overall(self) -> None:
@@ -515,11 +595,16 @@ class RunnerTest(unittest.TestCase):
         args = ambit_deploy.build_parser().parse_args(["--tag", TAG])
         self.assertEqual(args.final_seconds, 3600)
         self.assertEqual(args.verify_seconds, 120)
-        self.assertEqual(args.absent_retry_delay_seconds, 3)
+        self.assertEqual(args.absent_retry_delay_seconds, 65)
 
     def test_dry_run_preflights_but_never_publishes_ambit_ota(self) -> None:
         manifest, proof = verified_fixture()
-        report = {DEVICE_A: {"state": "complete", "channels": channels("1.2.2")}}
+        report = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.2", "1.2.2", "1.2.2", "1.2.2"),
+            }
+        }
         with tempfile.TemporaryDirectory() as temporary:
             result_path = Path(temporary) / "results.json"
             with (
@@ -541,7 +626,12 @@ class RunnerTest(unittest.TestCase):
 
     def test_all_up_to_date_is_clean_live_success(self) -> None:
         manifest, proof = verified_fixture()
-        report = {DEVICE_A: {"state": "complete", "channels": channels("1.2.3")}}
+        report = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.3", "1.2.3", "1.2.3", "1.2.3"),
+            }
+        }
         with (
             mock.patch.object(ambit_deploy, "fetch_release", return_value=(manifest, b"", proof)),
             mock.patch.object(ambit_deploy.fleet, "boto_session", return_value=object()),
@@ -575,7 +665,12 @@ class RunnerTest(unittest.TestCase):
 
     def test_force_reflash_exact_current_device_is_planned(self) -> None:
         manifest, proof = verified_fixture()
-        report = {DEVICE_A: {"state": "complete", "channels": channels("1.2.3")}}
+        report = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.3", "1.2.3", "1.2.3", "1.2.3"),
+            }
+        }
         with tempfile.TemporaryDirectory() as temporary:
             result_path = Path(temporary) / "results.json"
             with (
@@ -843,7 +938,12 @@ class RunnerTest(unittest.TestCase):
 
     def test_present_channel_failure_makes_live_run_fail(self) -> None:
         manifest, proof = verified_fixture()
-        report = {DEVICE_A: {"state": "complete", "channels": channels("1.2.2")}}
+        report = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.2", "1.2.2", "1.2.2", "1.2.2"),
+            }
+        }
         results = {
             DEVICE_A: {
                 "accepted": True,
@@ -868,8 +968,18 @@ class RunnerTest(unittest.TestCase):
 
     def test_post_verify_effect_rescues_dropped_terminal_reports(self) -> None:
         manifest, proof = verified_fixture()
-        before = {DEVICE_A: {"state": "complete", "channels": channels("1.2.2")}}
-        after = {DEVICE_A: {"state": "complete", "channels": channels("1.2.3")}}
+        before = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.2", "1.2.2", "1.2.2", "1.2.2"),
+            }
+        }
+        after = {
+            DEVICE_A: {
+                "state": "complete",
+                "channels": channels("1.2.3", "1.2.3", "1.2.3", "1.2.3"),
+            }
+        }
         timeout_results = ambit_deploy.AmbitStatusTracker(
             [DEVICE_A], "campaign"
         ).results()
@@ -1046,6 +1156,24 @@ class MqttOperationTest(unittest.TestCase):
         )
         self.assertIn('res[c] == OTA_ABSENT ? "absent"', reporting_block)
         self.assertIn("c, r->id", reporting_block)
+
+    def test_firmware_versions_create_measurement_safe_idle_window(self) -> None:
+        source = (ROOT / "components/ambit_ota/ambit_ota.c").read_text(
+            encoding="utf-8"
+        )
+        body = source.split("static void ambit_do_versions", 1)[1].split(
+            "static void ambit_do_probe", 1
+        )[0]
+        suspend = body.index("s_cfg.workload_suspend();")
+        settle = body.index("vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_SETTLE_MS));")
+        sweep = body.index("for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++)")
+        publish = body.index("s_cfg.publish(s_cfg.status_topic")
+        resume = body.index("s_cfg.workload_resume()")
+        self.assertLess(suspend, settle)
+        self.assertLess(settle, sweep)
+        self.assertLess(sweep, publish)
+        self.assertLess(publish, resume)
+        self.assertIn("#define AMBIT_VERSION_SETTLE_MS 65000U", source)
 
 
 if __name__ == "__main__":

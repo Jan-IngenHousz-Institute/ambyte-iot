@@ -188,13 +188,14 @@ workflows. After selecting that cohort, the runner sends a unique correlated
 `ambit_versions` query to each gateway and records every channel's presence and
 numeric `major.minor.patch` version. A prerelease such as
 `v1.1.2-recovery.1` therefore expects the device-reported numeric identity
-`1.1.2`. A complete all-absent response is retried after a bounded cold-wake
-delay because bench testing showed that the first sweep can be a false
-negative. Both correlated attempts are retained. Only two complete all-absent
-reports establish `no_ambit_present`; an absent-first retry that is busy,
-missing, or malformed is ambiguous and blocks the whole run. Missing replies,
-busy gateways, and unparseable present-channel versions likewise block instead
-of silently narrowing a live cohort.
+`1.1.2`. Current gateway firmware stops the Lua schedule and waits for any
+already-triggered SS/MPF run to finish before reading versions, so a scheduled
+measurement cannot masquerade as missing hardware. The runner additionally
+retries incomplete, busy, absent, or unversioned inventory after a bounded idle
+delay and reconciles compatible positive version evidence. Both correlated
+attempts are retained. Absence requires two complete observations; a missing,
+incomplete, unversioned, or conflicting retry becomes `ambiguous_preflight` and
+blocks the whole run instead of silently narrowing a live cohort.
 
 The execution unit is a gateway, not an individual sensor channel. Every
 eligible gateway receives exactly one command:
