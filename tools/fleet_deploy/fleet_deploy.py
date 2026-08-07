@@ -280,7 +280,7 @@ def fleet_ota(session, devices, campaign_id, url,
               ack_seconds, final_seconds, batch_size, stagger_seconds):
     """Fan one ota_update out and track every device to a terminal state.
     -> ({clientId: {"ack": bool, "state": str|None, "detail": str|None,
-                    "fw": str|None}}, error_string_or_None)
+                    "fw": str|None}}, error_string_or_None, final_deadline)
 
     Never raises after fan-out has begun: once commands may have reached
     live devices, partial results MUST survive to the report, so errors are
@@ -292,6 +292,7 @@ def fleet_ota(session, devices, campaign_id, url,
     acked = {d: False for d in devices}
     final = {d: None for d in devices}
     error = None
+    final_deadline = time.time() + final_seconds
 
     conn = mqtt_connection(
         session, STATUS_TOPIC,
@@ -375,7 +376,7 @@ def fleet_ota(session, devices, campaign_id, url,
                    "detail": (final[d] or {}).get("detail"),
                    "fw": (final[d] or {}).get("fw")}
                for d in devices}
-    return results, error
+    return results, error, final_deadline
 
 
 # -- release asset ------------------------------------------------------------
@@ -408,17 +409,83 @@ def classify(rec):
     return "no_reply"
 
 
-def deployment_failure_reason(rec, expected_version):
-    """Return why a commanded device lacks exact terminal proof, else None."""
+def deployment_failure_reason(rec, expected_version, verified_version=None):
+    """Return why a commanded device lacks exact proof, else ``None``.
+
+    A fresh correlated pong may prove the running target after the OTA status
+    message was lost (for example on a saturated cellular uplink). It may not
+    erase an explicit device-side failure or rollback.
+    """
     outcome = classify(rec)
-    if outcome != "succeeded":
+    if outcome in {"failed", "dropped"}:
         return outcome
     reported = parse_version(rec.get("fw") or "")
-    if expected_version is not None and (
-        reported is None or cmp_version(reported, expected_version) != 0
-    ):
+    if outcome == "succeeded":
+        if expected_version is None or (
+            reported is not None
+            and cmp_version(reported, expected_version) == 0
+        ):
+            return None
         return "target_version_not_confirmed"
-    return None
+    verified = parse_version(verified_version or "")
+    if expected_version is not None and verified is not None:
+        if cmp_version(verified, expected_version) == 0:
+            return None
+        return "post_verify_target_mismatch"
+    return outcome
+
+
+def verify_missing_by_effect(session, results, expected_version, deadline,
+                             ping_wait, retry_seconds):
+    """Poll unresolved commands until target identity or the final deadline.
+
+    The first OTA acknowledgement is emitted before the device's 0..899 second
+    fleet jitter. If that best-effort message is lost, terminal tracking can
+    stop at the acknowledgement deadline while the OTA is still legitimately
+    waiting to start. Therefore an old-version pong is provisional until the
+    original final deadline; an explicit failed/dropped terminal is never
+    eligible for recovery here.
+    """
+    pending = {
+        device
+        for device, record in results.items()
+        if classify(record) in {"no_reply", "accepted_no_final"}
+    }
+    latest = {}
+    attempts = []
+    if not pending or expected_version is None:
+        return latest, attempts
+
+    print("\nVerifying missing terminal reports by effect ...")
+    while pending:
+        queried = len(pending)
+        attempt_error = None
+        observed = {}
+        try:
+            observed = fleet_ping(session, sorted(pending), ping_wait)
+            latest.update(observed)
+        except Exception as exc:
+            attempt_error = f"{type(exc).__name__}: {exc}"
+        attempts.append({"observed": observed, "error": attempt_error})
+
+        still_pending = set()
+        for device in pending:
+            parsed = parse_version(latest.get(device) or "")
+            if parsed is None or cmp_version(parsed, expected_version) != 0:
+                still_pending.add(device)
+        pending = still_pending
+        status = (
+            f"error={attempt_error}"
+            if attempt_error
+            else f"replies={len(observed)}/{queried}"
+        )
+        print(f"  effect check {len(attempts)}: {status}; "
+              f"awaiting target={len(pending)}")
+        if not pending or time.time() >= deadline:
+            break
+        time.sleep(min(retry_seconds, max(0, deadline - time.time())))
+
+    return latest, attempts
 
 
 def write_summary(path, lines):
@@ -459,6 +526,9 @@ def main():
     ap.add_argument("--final-seconds", type=int, default=2100,
                     help="covers the firmware's 0-899 s MAC jitter + download "
                          "on a degraded link + reboot + <=300 s self-confirm")
+    ap.add_argument("--verify-retry-seconds", type=int, default=60,
+                    help="interval between verify-by-effect pings after every "
+                         "OTA acknowledgement was lost")
     ap.add_argument("--batch", type=int, default=10)
     ap.add_argument("--stagger", type=int, default=30)
     ap.add_argument("--allow-downgrade", action="store_true",
@@ -472,6 +542,8 @@ def main():
 
     if not 1 <= args.percentage <= 100:
         ap.error("--percentage must be 1-100")
+    if args.verify_retry_seconds <= 0:
+        ap.error("--verify-retry-seconds must be positive")
     ref_version = None
     if args.version_op != "any":
         ref_version = parse_version(args.version or "")
@@ -577,6 +649,8 @@ def main():
         "newer_skipped": newer,
         "silent_on_ping": silent,
         "fw_map": fw_map,
+        "post_verify_fw_map": {},
+        "post_verify_attempts": [],
         "results": {},
         "error": None,
     }
@@ -587,15 +661,31 @@ def main():
     elif to_deploy:
         verify_firmware_url(url)
         print(f"\nDeploying to {len(to_deploy)} device(s) ...")
-        results, error = fleet_ota(session, to_deploy, campaign_id, url,
-                                   args.ack_seconds, args.final_seconds,
-                                   args.batch, args.stagger)
+        results, error, final_deadline = fleet_ota(
+            session, to_deploy, campaign_id, url,
+            args.ack_seconds, args.final_seconds,
+            args.batch, args.stagger,
+        )
         plan["results"] = results
         plan["error"] = error
+        verified, attempts = verify_missing_by_effect(
+            session,
+            results,
+            release_version,
+            final_deadline,
+            args.ping_wait,
+            args.verify_retry_seconds,
+        )
+        plan["post_verify_fw_map"] = verified
+        plan["post_verify_attempts"] = attempts
         failed = [
             d
             for d, record in results.items()
-            if deployment_failure_reason(record, release_version) is not None
+            if deployment_failure_reason(
+                record,
+                release_version,
+                plan["post_verify_fw_map"].get(d),
+            ) is not None
         ]
     elif not matching:
         print("\nNo devices match the version filter; nothing to deploy.")
@@ -631,16 +721,40 @@ def main():
             outcome, detail = "would deploy", ""
         else:
             rec = plan["results"].get(d, {})
-            outcome = classify(rec) if rec else "not attempted"
+            if not rec:
+                outcome = "not attempted"
+            else:
+                reason = deployment_failure_reason(
+                    rec,
+                    release_version,
+                    plan["post_verify_fw_map"].get(d),
+                )
+                if reason is None and classify(rec) != "succeeded":
+                    outcome = "confirmed by effect"
+                elif reason is None:
+                    outcome = "succeeded"
+                else:
+                    outcome = reason
             detail = rec.get("detail") or ""
             if rec.get("fw"):
                 detail = (detail + f" now fw={rec['fw']}").strip()
+            verified_fw = plan["post_verify_fw_map"].get(d)
+            if verified_fw:
+                detail = (detail + f" verified fw={verified_fw}").strip()
         lines.append(f"| {d} | {fw_map.get(d) or 'silent'} | {outcome} | {detail} |")
     if silent:
         lines += ["", f"Silent on ping ({len(silent)}): " + ", ".join(silent)]
     if plan["error"]:
         lines += ["", f"**Campaign error (tracking incomplete): "
                       f"{plan['error']}**"]
+    verify_errors = [
+        attempt["error"]
+        for attempt in plan["post_verify_attempts"]
+        if attempt["error"]
+    ]
+    if verify_errors:
+        lines += ["", "**Post-OTA verification error(s): "
+                      + "; ".join(sorted(set(verify_errors))) + "**"]
     write_summary(summary_path, lines)
 
     if plan["error"]:
@@ -648,7 +762,7 @@ def main():
         return 1
     if failed:
         details = ", ".join(
-            f"{device} ({deployment_failure_reason(plan['results'][device], release_version)})"
+            f"{device} ({deployment_failure_reason(plan['results'][device], release_version, plan['post_verify_fw_map'].get(device))})"
             for device in failed
         )
         print(f"\n{len(failed)} device(s) lack exact terminal proof: {details}")

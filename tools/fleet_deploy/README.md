@@ -34,10 +34,22 @@ percentage cohorts, and a written outcome per device.
    state (`success` / `failed` / `dropped`), writing a per-device table to
    the job summary and a `results.json` artifact.
 
-A live run succeeds only when every commanded gateway reports terminal
-`success` and the exact target firmware version. Missing replies,
-accepted-without-final reports, dropped/failed terminals, absent version fields,
-and version mismatches fail the job while preserving the partial artifact.
+A live run succeeds only when every commanded gateway proves the exact target
+firmware through either its terminal `success` report or the independent
+post-OTA ping. Missing replies, accepted-without-final reports, dropped/failed
+terminals, absent version fields, and version mismatches fail the job. The
+fresh ping may close only a wholly missing terminal report; an incomplete or
+contradictory terminal report remains a failure.
+
+After terminal tracking, the runner sends correlated pings only to gateways
+missing a terminal report. Because the device announces acceptance before its
+0..899-second fleet jitter, an old-version pong is provisional: the runner
+retries through the original final deadline. An exact target version may then
+recover a status message lost on a saturated uplink, while an explicit `failed`
+or `dropped` terminal always fails. Exact terminal success remains authoritative
+for older firmware whose pong identity predates the compiled-version fix. The
+artifact records terminal evidence, every verification attempt, and the latest
+post-OTA firmware map.
 
 Safety properties, all firmware-side: dual-slot OTA with ~300 s
 auto-rollback (a broken image cannot brick a device), NVS untouched
@@ -157,12 +169,13 @@ discovery reads it.
 | `skipped (newer fw)` | Device reports a newer version; downgrade blocked | use `allow_downgrade` if intended |
 | `dropped` | Device rejected: busy with maintenance / OTA / OOM | re-run later |
 | `failed` | Download or apply failed (detail says why); device rolled back | fix cause, re-run |
-| `accepted_no_final` | Accepted but no terminal report in the wait window (slow link, long jitter slot, or the misrouted-status-topic units) | verify via telemetry `fw`, or re-run: it no-ops if it landed |
-| `no_reply` | No ack received. Usually offline at publish time; rarely the device applied anyway but its best-effort ack was lost | sweep re-run later (no-ops if it landed) |
+| `accepted_no_final` | Accepted but no terminal report in the wait window (slow link, long jitter slot, or the misrouted-status-topic units) | the automatic post-OTA ping must prove the target; otherwise inspect connectivity and retry |
+| `no_reply` | No ack received. Usually offline at publish time; rarely the device applied anyway but its best-effort ack was lost | the automatic post-OTA ping may prove it landed; otherwise sweep later |
 
-A run exits non-zero when at least one device reports `failed`, or when the
-campaign hit an error mid-tracking (partial results are still written to
-`results.json` and the summary).
+A run exits non-zero for explicit failure/rollback, a campaign error, or any
+commanded gateway still lacking exact target-version proof after the fresh
+post-OTA ping. Partial results are always written to `results.json` and the
+summary.
 
 ## Deploying AMBIT firmware through Ambytes
 
