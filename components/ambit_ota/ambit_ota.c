@@ -758,6 +758,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
             res[c] = (ferr == ESP_OK) ? FL_OK : FL_FAIL;
             if (ferr == ESP_OK) {
                 ok_count++;
+                cmd_ambit_device_info_invalidate(c);
                 ESP_LOGW(TAG, "AMBIT%u: FLASH OK (%d regions, %u B)",
                          c + 1, fr.regions_written, (unsigned)fr.total_bytes);
             } else {
@@ -773,6 +774,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         res[r->channel] = (ferr == ESP_OK) ? FL_OK
                         : (ferr == ESP_ERR_TIMEOUT) ? FL_BUSY : FL_FAIL;
         ok = (ferr == ESP_OK);
+        if (ok) cmd_ambit_device_info_invalidate(r->channel);
         ESP_LOGW(TAG, "AMBIT%u: flash %s", r->channel + 1, ok ? "OK" : "FAILED");
     }
 
