@@ -54,6 +54,47 @@ static const struct { const char *iana; const char *posix; } k_zones[] = {
     { "Etc/UTC",           "UTC0" },
 };
 
+esp_err_t timezone_canonicalize(const char *input, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) return ESP_ERR_INVALID_ARG;
+    output[0] = '\0';
+    if (input == NULL) return ESP_OK;
+
+    while (*input == ' ' || *input == '\t' || *input == '\r' || *input == '\n') input++;
+    size_t len = strlen(input);
+    while (len > 0) {
+        char c = input[len - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        len--;
+    }
+    if (len == 0) return ESP_OK;
+
+    const char *canonical = input;
+    size_t canonical_len = len;
+    if (len == 3 && strncmp(input, "AMT", len) == 0) {
+        canonical = "Europe/Amsterdam";
+        canonical_len = strlen(canonical);
+    } else if (len == 1 && input[0] == 'Z') {
+        canonical = "UTC";
+        canonical_len = strlen(canonical);
+    }
+
+    bool supported = false;
+    for (size_t i = 0; i < sizeof(k_zones) / sizeof(k_zones[0]); i++) {
+        if (strlen(k_zones[i].iana) == canonical_len &&
+            strncmp(canonical, k_zones[i].iana, canonical_len) == 0) {
+            supported = true;
+            break;
+        }
+    }
+    if (!supported) return ESP_ERR_INVALID_ARG;
+    if (canonical_len + 1 > output_size) return ESP_ERR_INVALID_SIZE;
+
+    memcpy(output, canonical, canonical_len);
+    output[canonical_len] = '\0';
+    return ESP_OK;
+}
+
 static const char *posix_for(const char *iana)
 {
     if (iana == NULL || iana[0] == '\0') return NULL;
@@ -65,21 +106,23 @@ static const char *posix_for(const char *iana)
 
 void timezone_apply(const char *iana)
 {
-    const char *posix = posix_for(iana);
+    char canonical[48];
+    esp_err_t canonical_err = timezone_canonicalize(iana, canonical, sizeof(canonical));
+    if (canonical_err != ESP_OK) {
+        s_applied = false;
+        ESP_LOGE(TAG, "rejecting invalid timezone '%s'", iana != NULL ? iana : "(null)");
+        return;
+    }
+    const char *posix = posix_for(canonical);
     if (posix == NULL) {
         s_applied = false;
-        if (iana != NULL && iana[0] != '\0') {
-            ESP_LOGW(TAG, "no POSIX rule for timezone '%s' — scheduler uses the "
-                          "fixed fallback offset (add it to k_zones for DST)", iana);
-        } else {
-            ESP_LOGI(TAG, "no timezone configured — scheduler uses the fallback offset");
-        }
+        ESP_LOGI(TAG, "no timezone configured — scheduler uses the fallback offset");
         return;
     }
     setenv("TZ", posix, 1);
     tzset();
     s_applied = true;
-    ESP_LOGI(TAG, "timezone '%s' -> TZ=%s (DST-aware scheduling)", iana, posix);
+    ESP_LOGI(TAG, "timezone '%s' -> TZ=%s (DST-aware scheduling)", canonical, posix);
 }
 
 int32_t timezone_utc_offset_seconds(int64_t utc)

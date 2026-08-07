@@ -1,6 +1,9 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +29,15 @@ extern "C" {
  * leaves the offset on the time_sync fallback. Call at boot and whenever the
  * timezone config changes. */
 void timezone_apply(const char *iana);
+
+/* Validate and canonicalize a configured timezone before it is persisted or
+ * published. Whitespace is trimmed, the historical JII shorthand "AMT" is
+ * migrated to "Europe/Amsterdam", and "Z" is canonicalized to "UTC". Only
+ * zones supported by this firmware's POSIX-rule table are accepted. Empty or
+ * NULL input represents an unset timezone and succeeds with an empty output.
+ * Returns ESP_ERR_INVALID_ARG for an unknown timezone and
+ * ESP_ERR_INVALID_SIZE when the destination is too small. */
+esp_err_t timezone_canonicalize(const char *input, char *output, size_t output_size);
 
 /* Local-minus-UTC offset in seconds for the instant `utc`, DST-resolved from the
  * applied zone. Returns the time_sync fallback offset when no zone is applied. */
