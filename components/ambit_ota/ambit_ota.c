@@ -37,6 +37,12 @@
  * setup. Stopping Lua prevents a new trigger; this delay lets an already-started
  * AMBIT run finish before maintenance probes the deliberately-silent UART. */
 #define AMBIT_IDLE_SETTLE_MS   65000U
+/* Presence ping and cmd 33/2 are separate UART transactions. Field sweeps show
+ * that the first identity reply can occasionally be dropped even after a valid
+ * ping, especially on channel 0. Retry once inside the already-quiesced window;
+ * two failed reads still report the channel as present but unversioned. */
+#define AMBIT_VERSION_READ_ATTEMPTS 2U
+#define AMBIT_VERSION_RETRY_MS      250U
 
 #define NVS_NS                 "ambit_ota"
 #define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied OTA */
@@ -616,6 +622,26 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
  * normal trace is the 59-pulse/1 Hz SS run (~59.3 s including setup); 65 s keeps
  * margin without approaching the host's 90 s correlated-query deadline. */
 
+static bool ambit_read_fw_version(uint8_t ch, ambit_fw_info_t *fw)
+{
+    for (uint32_t attempt = 0; attempt < AMBIT_VERSION_READ_ATTEMPTS; attempt++) {
+        size_t len = 0;
+        memset(fw, 0, sizeof *fw);
+        cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW,
+                                             (uint8_t *)fw, sizeof *fw, &len);
+        if (r.status == ESP_OK && len >= sizeof *fw) return true;
+
+        ESP_LOGW(TAG, "AMBIT%u version read %lu/%u failed: %s (%u bytes)",
+                 ch + 1, (unsigned long)(attempt + 1),
+                 (unsigned)AMBIT_VERSION_READ_ATTEMPTS,
+                 esp_err_to_name(r.status), (unsigned)len);
+        if (attempt + 1U < AMBIT_VERSION_READ_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_RETRY_MS));
+        }
+    }
+    return false;
+}
+
 static void ambit_do_versions(const char *id)
 {
     ambit_quiesce_for_idle();
@@ -634,15 +660,12 @@ static void ambit_do_versions(const char *id)
         bool connected = false;
         cmd_result_t pr = cmd_uart_ping(c, &connected);
         if (pr.status == ESP_OK && connected) {
-            uint8_t vb[64];
-            size_t  len = 0;
-            cmd_result_t r = cmd_ambit_get_info(c, AMBIT_INFO_FW, vb, sizeof vb, &len);
-            if (r.status == ESP_OK && len >= sizeof(ambit_fw_info_t)) {
-                const ambit_fw_info_t *fw = (const ambit_fw_info_t *)vb;
-                ESP_LOGW(TAG, "AMBIT%u: v%u.%u.%u", c + 1, fw->major, fw->minor, fw->batch);
+            ambit_fw_info_t fw;
+            if (ambit_read_fw_version(c, &fw)) {
+                ESP_LOGW(TAG, "AMBIT%u: v%u.%u.%u", c + 1, fw.major, fw.minor, fw.batch);
                 o += snprintf(buf + o, sizeof buf - o,
                     "%s{\"ch\":%u,\"present\":true,\"version\":\"%u.%u.%u\"}",
-                    sep, c, fw->major, fw->minor, fw->batch);
+                    sep, c, fw.major, fw.minor, fw.batch);
             } else {
                 ESP_LOGW(TAG, "AMBIT%u: present, no version", c + 1);
                 o += snprintf(buf + o, sizeof buf - o, "%s{\"ch\":%u,\"present\":true}", sep, c);
