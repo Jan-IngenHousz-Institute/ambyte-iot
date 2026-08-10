@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include "esp_err.h"
+#include "uart_stream_support.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,19 +118,29 @@ typedef esp_err_t (*uart_sensor_text_query_fn)(uint8_t channel,
                                                size_t     *resp_len,
                                                uint32_t    timeout_ms);
 
-/* uart_sensor_stream_query_fn — send an ASCII command and accumulate MANY
- * response lines until a line containing `sentinel` (e.g. "Done") arrives or
- * `timeout_ms` elapses. Pre-wakes the port. The whole multi-line response is
- * written to `out` (NUL-terminated, truncated at out_cap-1). Used for the
- * AMBIT PLOTTING run (streamed "T:..,F:.." lines + "Done"). */
+/* A stream sink consumes response bytes incrementally while the sensor-channel
+ * lock is held. It must not call back into a sensor command. Each call is
+ * bounded so a sink can make one record atomic; returning an error rejects that
+ * whole call and aborts after all earlier calls remain delivered. */
+typedef esp_err_t (*uart_sensor_stream_write_fn)(const uint8_t *data,
+                                                 size_t len,
+                                                 void *ctx);
+
+/* uart_sensor_stream_query_fn — send an ASCII command and relay MANY response
+ * lines until a line containing `sentinel` (e.g. "Done" or an openJII frame
+ * token) arrives or `timeout_ms` elapses. Pre-wakes the port. Bytes, including
+ * the terminating newline, are passed to `write` in order rather than collected
+ * in one response-sized allocation; *out_len is the number accepted by the
+ * sink. No callback exceeds UART_STREAM_CHUNK_MAX bytes. `deadline_us` is an
+ * already-started absolute wall-clock deadline shared with outer arbitration. */
 typedef esp_err_t (*uart_sensor_stream_query_fn)(uint8_t channel,
                                                  const char *cmd,
                                                  const char *terminator,
                                                  const char *sentinel,
-                                                 char       *out,
-                                                 size_t      out_cap,
+                                                 uart_sensor_stream_write_fn write,
+                                                 void       *write_ctx,
                                                  size_t     *out_len,
-                                                 uint32_t    timeout_ms);
+                                                 int64_t     deadline_us);
 
 #ifdef __cplusplus
 }

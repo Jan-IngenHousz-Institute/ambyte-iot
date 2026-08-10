@@ -33,10 +33,19 @@ extern "C" {
  * docs/append-log-persistence-plan.md).
  *
  * Storage model: /sdcard/events/ holds rotating files ev-000001.log, … (monotonic
- * seq). One newline-terminated, tab-delimited record per event (format v2,
+ * seq). One newline-terminated, tab-delimited record per event (record format v2,
  * 9 fields; v1 7-field records are skipped as malformed — planned wipe/drain
  * at the v2 deploy, see docs/payload-v2-plan.md):
  *   <measure_id>\t<channel>\t<device>\t<tag>\t<cmd_raw>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
+ * The record layout is deliberately schema-neutral: new firmware writes the
+ * complete canonical ambit.trace/3, ambyte.telemetry/1, or ambit.device/1 object
+ * in the payload column and leaves metadata empty. New firmware also keeps a
+ * permanent lossless v2 trace fallback for missing v3 prerequisites or an
+ * unrepresentable time model; those rows use the same split metadata/payload
+ * columns as old v2 rows and continue through the legacy publisher unchanged.
+ * The producer's binding maximum is 65,192 B (62,999 payload + 1,535 metadata
+ * + 543 command + 113 fixed header + 2 framing), leaving 360 B below the
+ * exported 65,552-B normal record cap.
  * The tail file is appended to (store) with PERIODIC flush; a fresh read handle
  * after fsync serves claims (the read+append handshake the per-file-cache FATFS
  * build needs). The read cursor and a next_id high-water mark live in NVS
@@ -81,7 +90,7 @@ esp_err_t event_log_quarantine_event(int64_t measure_id);
 esp_err_t event_log_db_stats(bool *available, int64_t *total,
                              int64_t *pending, int64_t *next_id);
 
-/* Richer health snapshot for the STATUS heartbeat — makes the silent-loss sites
+/* Richer health snapshot for the TELEMETRY heartbeat — makes the silent-loss sites
  * observable in the field. `skipped` counts records/files the drain passed without
  * publishing (external delete, corrupt/over-long line, OOM-quarantine); `dropped`
  * counts records refused at store (too-large, storage-full, short-write);

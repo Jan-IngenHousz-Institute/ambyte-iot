@@ -81,14 +81,14 @@ typedef struct {
      * still heap-gates and defers if the largest free block is too small). */
     void                              (*request_gc)(void);
 
-    /* Optional SD/persistence telemetry for the STATUS heartbeat, so silent-loss
+    /* Optional SD/persistence telemetry for the TELEMETRY heartbeat, so silent-loss
      * sites become visible in the field. Fills any non-NULL out-param; returns
      * ESP_OK if the event-log health snapshot was read. NULL = omit the SD fields. */
     esp_err_t                         (*sd_health)(bool *io_lost, uint64_t *free_bytes,
                                                    int64_t *skipped, int64_t *dropped,
                                                    int64_t *last_acked_id);
 
-    /* Sync-runner health probes for STATUS. Function pointers keep the domain
+    /* Sync-runner health probes for TELEMETRY. Function pointers keep the domain
      * composition acyclic: sync_runner already depends on device_commands. */
     esp_err_t                         (*last_wd_reboot_reason)(char *out, size_t out_cap);
     bool                              (*watchdog_armed)(void);
@@ -122,7 +122,7 @@ bool device_commands_publish_hold_active(void);
 
 /* MQTT transport failures observed inside a rolling window. Returns zero when
  * the transport does not provide health history. Cheap/read-only for watchdog
- * and STATUS telemetry use. */
+ * and TELEMETRY heartbeat use. */
 uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s);
 
 /* Register a callback fired whenever a measurement event is stored, a raw
@@ -195,8 +195,8 @@ typedef struct {
 
 cmd_result_t cmd_status_report(device_status_snapshot_t *out);
 
-/* Store one STATUS heartbeat event (tag STATUS, onboard provenance) built from
- * cmd_status_report. Called by sync_runner on its heartbeat period — status
+/* Store one ambyte.telemetry/1 heartbeat event (tag TELEMETRY, onboard provenance)
+ * built from cmd_status_report. Called by sync_runner on its heartbeat period — status
  * reporting is firmware-owned so a broken/missing main.lua can't silence it.
  * Does not wake the sync runner (the caller is the sync runner). */
 cmd_result_t cmd_store_status_event(void);
@@ -205,17 +205,20 @@ cmd_result_t cmd_store_status_event(void);
  * 0 = never read. Cheap probe (no I2C) for the status-LED blinker. */
 uint32_t device_commands_last_battery_mv(void);
 
-/* Store one measurement event from a v2 descriptor (see persistence_port.h).
+/* Store one measurement event descriptor (see persistence_port.h). Canonical v3
+ * objects live whole in payload_json; old/generic rows retain the v2 split fields.
  * desc->payload_json and desc->tag are required; channel/device/cmd_raw/
  * metadata_json may be NULL/"". Requires the SD-backed event log. */
 cmd_result_t cmd_store_event(const measurement_event_desc_t *desc);
 
-/* Send an ASCII command and read multiple response lines until one contains
- * `sentinel` (or timeout). Pre-wakes the port. Used for the AMBIT PLOTTING run.
- * `out` is NUL-terminated; *out_len excludes the NUL. */
+/* Send an ASCII command and relay response bytes until a newline-terminated
+ * line contains `sentinel` (or timeout). Pre-wakes the port. This diagnostic
+ * transport never stores; `write` receives the exact sensor bytes in order,
+ * including the terminating newline, without a response-sized allocation. */
 cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
                                    const char *sentinel, uint32_t timeout_ms,
-                                   char *out, size_t out_cap, size_t *out_len);
+                                   uart_sensor_stream_write_fn write,
+                                   void *write_ctx, size_t *out_len);
 cmd_result_t cmd_next_measure_id(int64_t *out_id);
 
 /* MQTT commands (Phase 6A) */
@@ -277,9 +280,9 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
  * Two halves with different lifecycles:
  *  - identity/calibration (valid, device_id, fw_version, cal_version, ambit_name,
  *    actinic_coef): STATIC per connection. Fetched once via cmd 33 (FW + calib)
- *    and cached; a measurement reads them with zero UART cost. On the first
- *    successful fetch after a (re)connect the firmware emits one DEVICE_INFO
- *    event carrying the full calibration.
+ *    and cached; a measurement reads them with zero UART cost. A complete
+ *    ambit.device/1 event is emitted only when the persisted stable identity /
+ *    firmware / calibration tuple changes, not merely on reconnect.
  *  - gains/currents: MUTABLE, but only the ambyte changes them (cmd 1/cmd 2;
  *    the AMBIT has no read-back). Tracked at set-time, so they're known without
  *    a query. Reset to "unset" on (re)connect (the AMBIT booted with its own
@@ -292,6 +295,7 @@ typedef struct {
     uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
     char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
     float    actinic_coef;     /* PAR(µmol)→DAC byte = actinic_coef × PAR; 0 if cal unread */
+    float    tick_factor;      /* true AMBIT sample-period scale; 0 if cal unread */
     bool     gains_set;        /* true once the ambyte has set gains this connection */
     uint8_t  gains[6];         /* fluo, fluoref, ir, irref, sun, leaf (cmd 1 order) */
     bool     currents_set;     /* true once the ambyte has set currents this connection */
@@ -304,10 +308,10 @@ typedef struct {
 cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out);
 /* Cache-only read: true + *out when the channel's identity is cached, false
  * without touching the UART otherwise. For callers that must never block on a
- * fetch (the STATUS heartbeat runs on the watchdog task). */
+ * fetch (the TELEMETRY heartbeat runs on the watchdog task). */
 bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out);
 /* Drop a channel's identity cache AND tracked gains/currents so the next read
- * re-fetches and re-announces — call on (re)connect / swap. */
+ * re-fetches. Stable-tuple persistence decides whether inventory changed. */
 void cmd_ambit_device_info_invalidate(uint8_t ch);
 
 /* Measurements (FSM response) */

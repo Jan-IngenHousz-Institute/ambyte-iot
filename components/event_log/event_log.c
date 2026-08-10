@@ -39,10 +39,11 @@
 
 #define EVLOG_DIR            "/sdcard/events"
 #define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
-/* lua_runner's AMBIT_RUN_PAYLOAD_CAP is 64000. Its generated-record maxima are
- * 63999 payload + 104 fixed header + 522 arrun command + 895 metadata + 2
- * framing = 65522 B, below EVLOG_RECORD_CAP_NORMAL with 30 B spare. The producer
- * has a static assertion against the exported cap in event_log.h. */
+/* lua_runner's binding case is the permanent new-firmware v2 fallback:
+ * 62,999 payload + 1,535 metadata + 543 arrun command + 113 fixed header +
+ * 2 framing = 65,192 B, strictly below EVLOG_RECORD_CAP_NORMAL (65,552) with
+ * 360 B spare. Canonical v3 rows leave metadata empty and are smaller. The
+ * producer names every term and proves the positive margin with static asserts. */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
 #define EVLOG_FLUSH_EVERY_N  1                /* fsync each record: at ~0.4 writes/s the write-amp is trivial and

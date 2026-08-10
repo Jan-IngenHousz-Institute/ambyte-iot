@@ -22,7 +22,7 @@ typedef enum {
 /* Firmware 1.0.6 publish-window defaults.  Sixteen slots cover roughly ten
  * good-link PUBACK round trips inside a short connection without approaching
  * AWS IoT's 100-message limit; the independent 64-KiB byte ceiling bounds the
- * ESP-MQTT outbox when records vary from small STATUS events to array traces.
+ * ESP-MQTT outbox when records vary from small TELEMETRY events to array traces.
  * Both remain compile-time knobs until field data justifies runtime tuning. */
 #ifndef PUBLISH_WINDOW_SLOTS
 #define PUBLISH_WINDOW_SLOTS 16U
@@ -31,11 +31,14 @@ typedef enum {
 #define PUBLISH_WINDOW_BYTES 65536U
 #endif
 
-/* Origin tags (schema v2). Firmware-assigned — never user strings. */
+/* Origin tags. Firmware-assigned — never user strings. STATUS remains defined
+ * so old on-card v2 backlogs publish byte-for-byte; new periodic and explicit
+ * gateway snapshots use TELEMETRY. */
 #define MEASUREMENT_TAG_MEASUREMENT "MEASUREMENT"   /* script-originated data    */
 #define MEASUREMENT_TAG_STATUS      "STATUS"        /* background status report  */
+#define MEASUREMENT_TAG_TELEMETRY   "TELEMETRY"     /* ambyte.telemetry/1         */
 #define MEASUREMENT_TAG_DEVICE_INFO "DEVICE_INFO"   /* sensor identity + calib.,
-                                                     * once per connection       */
+                                                     * stable tuple changes      */
 
 /* One row per measurement *event*. All quantities measured together (a BME280
  * read's T/H/P, or an AMBIT run's leaf_temp/fluor/fluoRef arrays) live in one
