@@ -242,9 +242,9 @@ Lua **never** touches MQTT. [components/sync_runner](components/sync_runner) is 
 
 A firmware-owned STATUS heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. It stores a `tag=STATUS` event with Wi-Fi/provisioned/DB/publish-gate flags plus MP2731 power keys and onboard BME280 T/H/P when those reads succeed.
 
-### Payload schema v2
+### Payload schema
 
-Each stored event becomes exactly one MQTT message under the v2 envelope. `tag` is a firmware-controlled origin enum (`MEASUREMENT` / `STATUS` / `DEVICE_INFO`); `channel` (`uart_<n>` / null) replaces the old `sensor` field; `device` is best-effort sensor self-identification (AMBIT `ambit_name`); `cmd_raw` is the command in the target device's own vocabulary (replayable). The envelope `timestamp` is the **measurement** time, so battery-queued events carry their capture time, not publish time. Full spec: [docs/mqtt-payload.md](docs/mqtt-payload.md) (v2) and [docs/payload-v2-plan.md](docs/payload-v2-plan.md).
+Each stored event becomes exactly one MQTT message. `tag` is a firmware-controlled origin enum (`MEASUREMENT` / `STATUS` / `DEVICE_INFO`); `channel` (`uart_<n>` / null) identifies the port; `device` is best-effort sensor self-identification (AMBIT `ambit_name`). The envelope `timestamp` is the **measurement** time, so battery-queued events carry their capture time, not publish time. The firmware on `main` emits schema **v2**; the normative contract for the **v3** measurement object (self-describing `series` with an in-payload time model, `time`/`protocol` groups, `schema` tag) is [docs/mqtt-payload.md](docs/mqtt-payload.md), including the v2→v3 mapping and dual-read rule.
 
 ---
 
