@@ -15,10 +15,13 @@ CI (`.github/workflows/flash-gui-build.yml`) builds standalone executables for
 Windows, Linux and macOS with PyInstaller — no Python install needed on the
 operator's machine:
 
-- every PR / main push touching `flash_gui/**` publishes them as workflow
-  artifacts (30-day retention, GitHub login required);
-- pushing a tag `flash-gui-v*` (e.g. `flash-gui-v0.1.0`) attaches them to a
-  public GitHub release under that tag. The flash GUI belongs to **no**
+- every PR touching `flash_gui/**` builds them once as workflow artifacts,
+  keyed by the PR head SHA (30-day retention, GitHub login required);
+- the merge push to `main` downloads, verifies, and promotes those exact PR
+  artifacts instead of rebuilding them;
+- pushing a tag `flash-gui-v*` (e.g. `flash-gui-v0.1.1`) attaches the promoted
+  `main` artifacts to a public GitHub release without rebuilding. The flash
+  GUI belongs to **no**
   semantic-release unit — `flash_gui/**` commits never bump the firmware
   version (`tools/release/path-scoped.js`), so these tags are cut by hand.
 

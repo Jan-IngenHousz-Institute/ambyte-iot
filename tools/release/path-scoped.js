@@ -26,11 +26,13 @@ const releaseUnit = () => {
 
 const normalized = (file) => file.split(path.sep).join("/");
 
-// Paths that belong to NO release unit: the desktop flash GUI is host-side
-// tooling with its own build pipeline (flash-gui-build.yml) — a feat/fix there
-// must not bump the firmware version any more than a Lua commit may.
+// Paths that belong to NO release unit: the desktop flash GUI and its build
+// workflow are host-side tooling. A feat/fix there must not bump or rebuild
+// firmware any more than a Lua-only commit may.
 const isUnreleased = (candidate) =>
-  candidate === "flash_gui" || candidate.startsWith("flash_gui/");
+  candidate === "flash_gui" ||
+  candidate.startsWith("flash_gui/") ||
+  candidate === ".github/workflows/flash-gui-build.yml";
 
 export const isRelevantFile = (file, unit = releaseUnit()) => {
   const candidate = normalized(file);

@@ -14,7 +14,11 @@ test("Lua-only PRs skip the firmware build", () => {
 test("flash-GUI-only PRs skip the firmware build", () => {
   assert.equal(firmwareBuildRequired(["flash_gui/gui.py"]), false);
   assert.equal(
-    firmwareBuildRequired(["flash_gui/gui.py", "lua/main.lua"]),
+    firmwareBuildRequired([
+      "flash_gui/gui.py",
+      ".github/workflows/flash-gui-build.yml",
+      "lua/main.lua",
+    ]),
     false,
   );
 });
