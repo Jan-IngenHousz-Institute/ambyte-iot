@@ -34,6 +34,7 @@ extern "C" {
 typedef struct {
     void (*workload_suspend)(void);   /* stop the Lua task during the update; NULL = skip */
     void (*workload_resume)(void);    /* restart it afterward; NULL = skip */
+    void (*ping_cache_invalidate)(void); /* force maintenance probes onto the wire */
     void (*comms_suspend)(void);      /* mqtt_client_stop — free TLS heap for the HTTPS download */
     void (*comms_resume)(void);       /* mqtt_client_start — after the update */
 
@@ -64,10 +65,14 @@ esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg);
  * raw.githubusercontent.com/… or a release-asset link, NOT a /blob//tree/ page).
  * `id` correlates status reports and dedupes a retained MQTT trigger (latched
  * only on success, so a failed attempt retries under the same id); pass NULL
- * from the CLI to never dedupe. Non-blocking: the worker quiesces, downloads,
- * streams, and the AMBIT reboots. ESP_ERR_INVALID_STATE before init;
- * ESP_ERR_INVALID_ARG on a bad channel/url; ESP_ERR_NO_MEM if one is in flight. */
-esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id);
+ * from the CLI to never dedupe. `fleet_spread` explicitly marks a remote fleet
+ * request: true waits in the stable 0-899 second device slot after acceptance,
+ * while false keeps local CLI requests immediate. Source is never inferred from
+ * `id`. Non-blocking: the worker quiesces, downloads, streams, and the AMBIT
+ * reboots. ESP_ERR_INVALID_STATE before init; ESP_ERR_INVALID_ARG on a bad
+ * channel/url; ESP_ERR_NO_MEM if one is in flight. */
+esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id,
+                            bool fleet_spread);
 
 /* Queue a fleet version sweep: read each channel's AMBIT firmware version (cmd
  * 33/2) and publish one `ambit_versions` JSON report (+ log per channel). Runs
@@ -100,8 +105,10 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id);
  * dedupes. A persistently-FAILING id is refused after 3 attempts (returns
  * ESP_ERR_INVALID_STATE) so a retained trigger with a bad version/unstaged SD
  * can't loop the disruptive sweep forever — fix the cause, retry under a new id.
- * The SD folder must already hold the 4 region files — this path does not
- * download. */
+ * The worker creates a missing canonical root/version directory before its
+ * file preflight, so operators can stage a recovery bundle on older SD cards.
+ * It still fails before touching the AMBIT unless all 4 region files are
+ * present and non-empty; this path does not download them. */
 esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id);
 
 #ifdef __cplusplus

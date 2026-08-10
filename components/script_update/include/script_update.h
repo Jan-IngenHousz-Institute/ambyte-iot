@@ -5,13 +5,14 @@
 
 #include "esp_err.h"
 #include "messaging_port.h"
+#include "script_identity_port.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * Remote Lua control over MQTT (docs/device-script-delivery.md, Stage 4):
+ * Remote Lua control over MQTT (docs/lua-releases.md):
  *
  *  - script_update: replace /sdcard/main.lua with an inline-delivered script
  *    and restart the Lua runner. The script is syntax-checked BEFORE the SD is
@@ -62,10 +63,13 @@ esp_err_t script_update_init(const script_update_config_t *cfg);
  * successful swap so the new script runs from a fresh boot; false keeps the old
  * in-place behaviour (stop + swap + restart just the Lua runner). Either way the
  * id is latched on success FIRST, so a retained trigger can't loop the reboot.
- * Reports {"type":"script_status",...,"state":"applied"|"failed"}.
+ * `script_version` and `built_against_fw` are optional release provenance;
+ * legacy senders may pass NULL. Reports script_status with the active script
+ * hash, verified provenance, install firmware, and current compiled firmware.
  * ESP_ERR_INVALID_STATE before init; ESP_ERR_NO_MEM if busy or out of memory. */
 esp_err_t script_update_request(const char *script, const char *checksum, const char *id,
-                                bool reboot);
+                                bool reboot, const char *script_version,
+                                const char *built_against_fw);
 
 /* Queue a main.lua replacement fetched from `url` (HTTPS, streamed to SD in 4 KB
  * chunks). Unlike the inline variant this needs NO large contiguous MQTT/TLS
@@ -73,9 +77,14 @@ esp_err_t script_update_request(const char *script, const char *checksum, const 
  * to defragment, downloads, verifies (`checksum` = sha256 hex of the file, optional)
  * and syntax-checks, then swaps + reboots/restarts. Requires workload_suspend/
  * resume in the config (else ESP_ERR_INVALID_STATE-style "unavailable" report).
- * `id`/`reboot` semantics match script_update_request. */
+ * `id`/`reboot`/release-provenance semantics match script_update_request. */
 esp_err_t script_update_url_request(const char *url, const char *checksum, const char *id,
-                                    bool reboot);
+                                    bool reboot, const char *script_version,
+                                    const char *built_against_fw);
+
+/* Hash the active /sdcard/main.lua and return release provenance only when the
+ * stored release digest matches the file. Suitable as a script_identity_read_fn. */
+esp_err_t script_update_get_identity(script_identity_t *out);
 
 /* Queue a snippet for immediate execution (lua_runner_exec, 120 s budget).
  * Reports {"type":"lua_exec_result",...,"ok":…,"result":"…"}. */

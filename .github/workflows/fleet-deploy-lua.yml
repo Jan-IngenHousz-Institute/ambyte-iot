@@ -1,0 +1,85 @@
+name: Fleet deploy (Lua)
+
+# Manually deploys one immutable, published Lua release to a targeted cohort.
+# Release publication stays separate; this workflow only selects devices and
+# publishes the manifest's verified script_update command.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target account/fleet"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      release_tag:
+        description: "Lua release tag (e.g. lua-v1.0.0), or 'latest'"
+        type: string
+        default: "latest"
+      version_op:
+        description: "Firmware-version filter reported by each device"
+        type: choice
+        options: [any, eq, lt, lte, gt, gte]
+        default: any
+      version:
+        description: "Reference firmware version; ignored for 'any'"
+        type: string
+        default: ""
+      percentage:
+        description: "Percent of matching devices to target (1-100, deterministic)"
+        type: string
+        default: "100"
+      devices:
+        description: "Optional MACs or AMBYTE_<MAC> IDs, comma/space separated"
+        type: string
+        default: ""
+      discovery_window_minutes:
+        description: "How far back to look for active devices"
+        type: string
+        default: "1440"
+      reboot:
+        description: "Reboot after the script swap"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Ping and preview targets without publishing script_update"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+# OTA and Lua swaps share the device maintenance admission gate. Serialize all
+# fleet mutation workflows so overlapping campaigns cannot race one another.
+concurrency:
+  group: fleet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    environment: fleet-deploy-${{ inputs.environment }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Deploy Lua release
+        uses: ./.github/actions/fleet-deploy
+        with:
+          kind: lua
+          repository: ${{ github.repository }}
+          release-tag: ${{ inputs.release_tag }}
+          version-op: ${{ inputs.version_op }}
+          version: ${{ inputs.version }}
+          percentage: ${{ inputs.percentage }}
+          devices: ${{ inputs.devices }}
+          discovery-window-minutes: ${{ inputs.discovery_window_minutes }}
+          dry-run: ${{ inputs.dry_run }}
+          reboot: ${{ inputs.reboot }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-role-arn: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}

@@ -2,14 +2,20 @@
   "name": "ambyte-release-automation",
   "private": true,
   "version": "1.0.0",
+  "type": "module",
   "description": "Minimal semantic-release tooling for Ambyte firmware",
   "repository": {
     "type": "git",
     "url": "https://github.com/Jan-IngenHousz-Institute/ambyte-iot.git"
   },
+  "scripts": {
+    "test:release": "node --test tools/release/*.test.js"
+  },
   "devDependencies": {
     "@semantic-release/github": "11.0.6",
     "conventional-changelog-conventionalcommits": "8.0.0",
-    "semantic-release": "25.0.5"
+    "semantic-release": "25.0.5",
+    "semantic-release-monorepo": "8.0.2",
+    "semantic-release-plugin-decorators": "4.0.0"
   }
 }

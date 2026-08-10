@@ -1,0 +1,245 @@
+# Build the ambyte on-boarding GUI (flash_gui/) as a standalone executable for
+# Windows, Linux and macOS.
+#
+# The flash GUI is host-side tooling and deliberately belongs to NO release
+# unit (tools/release/path-scoped.js excludes flash_gui/** from firmware
+# commit analysis, mirroring the lua/** rule) — so its distribution lives
+# here, not in the semantic-release pipeline:
+#
+#   * PRs build each executable once, keyed by the PR head SHA;
+#   * the matching main push promotes those exact PR artifacts without
+#     rebuilding them;
+#   * pushing a tag `flash-gui-v*` attaches the promoted main artifact to a
+#     GitHub release without rebuilding it again (the firmware pipeline's
+#     tagFormat is plain `v${version}`, so these tags never collide with it).
+name: Build flash GUI executables
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["flash-gui-v*"]
+    paths:
+      - "flash_gui/**"
+      - ".github/workflows/flash-gui-build.yml"
+  pull_request:
+    paths:
+      - "flash_gui/**"
+      - ".github/workflows/flash-gui-build.yml"
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  test:
+    name: Unit tests
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r flash_gui/requirements.txt pytest
+
+      - name: Run flash_gui tests
+        run: python -m pytest flash_gui/tests -q
+
+  build:
+    name: Build (${{ matrix.label }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            binary: dist/ambyte-flash-gui.exe
+            asset: ambyte-flash-gui-windows.exe
+          - os: ubuntu-latest
+            label: linux
+            binary: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-linux
+          - os: macos-latest
+            label: macos
+            # Release assets must be files, so ship the standalone Mach-O
+            # executable rather than wrapping the .app directory in a zip.
+            binary: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r flash_gui/requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: bash
+        run: |
+          # --add-data separator is OS-specific (';' on Windows, ':' elsewhere).
+          SEP=":"
+          [[ "$RUNNER_OS" == "Windows" ]] && SEP=";"
+          # vendor/nvs_partition_gen.py is loaded from its file path at
+          # runtime (never imported statically), so PyInstaller's analysis
+          # cannot discover it — bundle it explicitly. esptool ships flasher
+          # stub JSONs as package data; --collect-all pulls those in.
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name ambyte-flash-gui \
+            --paths . \
+            --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
+            --collect-all esptool \
+            flash_gui/launcher.py
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "${{ matrix.binary }}" "out/${{ matrix.asset }}"
+          if [[ "${{ matrix.label }}" != "windows" ]]; then
+            chmod +x "out/${{ matrix.asset }}"
+          fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ambyte-flash-gui-${{ matrix.label }}-${{ env.SOURCE_SHA }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  promote:
+    name: Promote PR executables
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+
+      - name: Locate PR executable artifacts
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUBJECT=$(git log -1 --pretty=%s)
+          PR_NUMBER=$(printf '%s' "${SUBJECT}" | sed -nE 's/.*\(#([0-9]+)\).*/\1/p')
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "::error::GUI commit subject has no squash PR number: ${SUBJECT}"
+            exit 1
+          fi
+          HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
+          ARTIFACT_NAME="ambyte-flash-gui-linux-${HEAD_SHA}"
+          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+            | jq -r --arg head "${HEAD_SHA}" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $head)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "::error::No live PR GUI artifacts for head ${HEAD_SHA}"
+            exit 1
+          fi
+          echo "head-sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+          echo "Promoting GUI executables from PR #${PR_NUMBER} (${HEAD_SHA})." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Download PR executables
+        uses: actions/download-artifact@v6
+        with:
+          pattern: ambyte-flash-gui-*-${{ steps.artifact.outputs.head-sha }}
+          merge-multiple: true
+          path: out
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.artifact.outputs.run-id }}
+
+      - name: Verify promoted executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/ambyte-flash-gui-macos
+          test -s out/ambyte-flash-gui-linux
+          test -s out/ambyte-flash-gui-windows.exe
+
+      - name: Upload promoted executables
+        uses: actions/upload-artifact@v6
+        with:
+          name: ambyte-flash-gui-${{ github.sha }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to release
+    # Only for flash-gui-v* tags: makes the executables publicly downloadable
+    # without a GitHub login (workflow artifacts require one).
+    if: startsWith(github.ref, 'refs/tags/flash-gui-v')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Locate promoted main artifact
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_NAME="ambyte-flash-gui-${COMMIT_SHA}"
+          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+            | jq -r --arg head "${COMMIT_SHA}" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $head)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "::error::No promoted GUI artifact for main commit ${COMMIT_SHA}"
+            exit 1
+          fi
+          echo "name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download promoted executables
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: out
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.artifact.outputs.run-id }}
+
+      - name: Verify release executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/ambyte-flash-gui-macos
+          test -s out/ambyte-flash-gui-linux
+          test -s out/ambyte-flash-gui-windows.exe
+
+      - name: Create GitHub release with executables
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: out/*
+          fail_on_unmatched_files: true
+          # Never let a GUI release become the repo's "Latest": consumers of
+          # /releases/latest (and the repo landing page) must keep seeing the
+          # newest FIRMWARE release. flash_gui's own fetcher additionally
+          # filters by tag+asset (pick_firmware_release), belt and braces.
+          prerelease: true
+          make_latest: false

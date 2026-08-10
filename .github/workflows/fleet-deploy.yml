@@ -1,0 +1,98 @@
+name: Fleet deploy (OTA)
+
+# Manually triggered, targeted OTA rollout of a published firmware release.
+# The heavy lifting lives in tools/fleet_deploy/fleet_deploy.py; this workflow
+# resolves the release tag, authenticates to AWS, and runs it.
+#
+# Targeting recipes (the inputs compose):
+#   all devices                  -> version_op=any, percentage=100
+#   all devices on a version     -> version_op=eq,  version=1.0.5
+#   30% of all devices           -> version_op=any, percentage=30
+#   30% below a version          -> version_op=lt,  version=1.2.0, percentage=30
+#
+# dry_run defaults to TRUE: the first run of any campaign should be a preview.
+# Re-running the same tag live is always safe (devices latch the campaign id
+# on success; sweeps only catch stragglers).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target account/fleet (the whole fleet lives on dev today; prod is provisioned for the migration)"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      release_tag:
+        description: "Release tag to deploy (e.g. v1.2.0), or 'latest'"
+        type: string
+        default: "latest"
+      version_op:
+        description: "Version filter against each device's reported fw"
+        type: choice
+        options: [any, eq, lt, lte, gt, gte]
+        default: any
+      version:
+        description: "Reference version for the filter (e.g. 1.0.5); ignored for 'any'"
+        type: string
+        default: ""
+      percentage:
+        description: "Percent of matching devices to target (1-100, deterministic cohort)"
+        type: string
+        default: "100"
+      devices:
+        description: "Optional explicit device list (MACs or AMBYTE_<MAC>, comma/space separated); skips discovery"
+        type: string
+        default: ""
+      discovery_window_minutes:
+        description: "How far back to look for active devices"
+        type: string
+        default: "1440"
+      dry_run:
+        description: "Preview the plan without publishing anything"
+        type: boolean
+        default: true
+      allow_downgrade:
+        description: "Also command devices reporting a NEWER fw than the release (default: skip them)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC role assumption for AWS
+
+# One rollout at a time. Two concurrent campaigns publishing different ids
+# to overlapping cohorts would race each other's OTA admission.
+concurrency:
+  group: fleet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-latest
+    # Per-account GitHub environments carry the protection rules (required
+    # reviewers) and the AWS_FLEET_DEPLOY_ROLE_ARN secret; each account's
+    # IAM role trusts exactly its own environment. See the README.
+    environment: fleet-deploy-${{ inputs.environment }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Deploy firmware release
+        uses: ./.github/actions/fleet-deploy
+        with:
+          kind: ota
+          repository: ${{ github.repository }}
+          release-tag: ${{ inputs.release_tag }}
+          version-op: ${{ inputs.version_op }}
+          version: ${{ inputs.version }}
+          percentage: ${{ inputs.percentage }}
+          devices: ${{ inputs.devices }}
+          discovery-window-minutes: ${{ inputs.discovery_window_minutes }}
+          dry-run: ${{ inputs.dry_run }}
+          allow-downgrade: ${{ inputs.allow_downgrade }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-role-arn: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}

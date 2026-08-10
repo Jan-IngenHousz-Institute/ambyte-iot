@@ -5,10 +5,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -33,6 +35,10 @@
 
 #define NVS_NS         "script_upd"
 #define KEY_APPLIED    "applied_id"
+#define KEY_SCRIPT_SHA  "script_sha"
+#define KEY_SCRIPT_VER  "script_ver"
+#define KEY_BUILT_FW    "built_fw"
+#define KEY_INSTALL_FW  "install_fw"
 
 #define OP_UPDATE     0
 #define OP_EXEC       1
@@ -40,12 +46,15 @@
 
 #define SCRIPT_DL_BUF          4096     /* HTTP chunk size — small on purpose (no large contiguous alloc) */
 #define SCRIPT_HTTP_TIMEOUT_MS 20000
+#define SCRIPT_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
 
 typedef struct {
     uint8_t op;
     bool    reboot;            /* OP_UPDATE only: reboot after a successful swap (default) */
     char    id[SCRIPT_ID_MAX];
     char    checksum[65];      /* optional sha256 hex ('\0' = absent) */
+    char    script_version[SCRIPT_IDENTITY_VERSION_LEN];
+    char    built_against_fw[SCRIPT_IDENTITY_VERSION_LEN];
     char   *text;              /* heap-dup'd script/snippet — freed by the worker */
 } script_req_t;
 
@@ -54,12 +63,37 @@ static bool                   s_ready;   /* init done; dispatch via the shared w
 
 /* ── dedupe latch (NVS, success only — same semantics as the OTAs) ────────── */
 
-static void latch_set(const char *id)
+static void identity_set(const script_req_t *r, const char *sha256)
 {
-    if (id == NULL || id[0] == '\0') return;
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    if (nvs_set_str(h, KEY_APPLIED, id) == ESP_OK) nvs_commit(h);
+    const esp_app_desc_t *app = esp_app_get_description();
+    const char *installed_on = app != NULL ? app->version : "";
+
+    /* The retained-command dedupe is a reboot-safety invariant, not telemetry.
+     * Commit it independently before provenance: a full NVS must never let one
+     * optional identity key suppress KEY_APPLIED and create a reboot loop. */
+    esp_err_t latch_err = ESP_OK;
+    if (r->id[0] != '\0') {
+        latch_err = nvs_set_str(h, KEY_APPLIED, r->id);
+        if (latch_err == ESP_OK) latch_err = nvs_commit(h);
+        if (latch_err != ESP_OK) {
+            ESP_LOGE(TAG, "could not persist script dedupe latch: %s",
+                     esp_err_to_name(latch_err));
+        }
+    }
+
+    /* Keep the provenance tuple atomic. In particular, never commit a new SHA
+     * alongside an old version if one of the later writes runs out of space. */
+    esp_err_t err = nvs_set_str(h, KEY_SCRIPT_SHA, sha256 != NULL ? sha256 : "");
+    if (err == ESP_OK) err = nvs_set_str(h, KEY_SCRIPT_VER, r->script_version);
+    if (err == ESP_OK) err = nvs_set_str(h, KEY_BUILT_FW, r->built_against_fw);
+    if (err == ESP_OK) err = nvs_set_str(h, KEY_INSTALL_FW, installed_on);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "script applied but provenance was not persisted: %s",
+                 esp_err_to_name(err));
+    }
     nvs_close(h);
 }
 
@@ -108,13 +142,28 @@ static void publish_json(const char *msg, int n)
 static void report_script(const char *state, const char *id, const char *detail)
 {
     char esc_id[SCRIPT_ID_MAX * 2 + 1] = "", esc_detail[192] = "";
+    char esc_sha[129] = "", esc_ver[65] = "", esc_built[65] = "", esc_installed[65] = "";
+    char esc_fw[65] = "";
+    script_identity_t identity = {0};
+    bool identity_ok = script_update_get_identity(&identity) == ESP_OK;
+    const esp_app_desc_t *app = esp_app_get_description();
     json_escape(esc_id, sizeof esc_id, id);
     json_escape(esc_detail, sizeof esc_detail, detail);
-    char msg[448];
+    json_escape(esc_sha, sizeof esc_sha, identity.sha256);
+    json_escape(esc_ver, sizeof esc_ver, identity.version);
+    json_escape(esc_built, sizeof esc_built, identity.built_against_fw);
+    json_escape(esc_installed, sizeof esc_installed, identity.installed_on_fw);
+    json_escape(esc_fw, sizeof esc_fw, app != NULL ? app->version : "");
+    char msg[1024];
     int n = snprintf(msg, sizeof msg,
         "{\"type\":\"script_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"state\":\"%s\""
-        "%s%s%s}",
+        ",\"app_version\":\"%s\",\"script_sha256\":\"%s\",\"script_version\":\"%s\""
+        ",\"script_built_against_fw\":\"%s\",\"script_installed_on_fw\":\"%s\""
+        ",\"script_metadata_verified\":%s%s%s%s}",
         s_cfg.device_id ? s_cfg.device_id : "", esc_id, state,
+        esc_fw, identity_ok ? esc_sha : "", identity_ok ? esc_ver : "",
+        identity_ok ? esc_built : "", identity_ok ? esc_installed : "",
+        identity_ok && identity.release_metadata_verified ? "true" : "false",
         detail ? ",\"detail\":\"" : "", esc_detail, detail ? "\"" : "");
     if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
 }
@@ -132,19 +181,123 @@ static void report_exec(const char *id, bool ok, const char *result)
     if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
 }
 
+/* Keep the maintenance gate/worker reserved during the stable per-device slot.
+ * MQTT and measurements remain active until the URL handler quiesces below. */
+static void wait_for_fleet_slot(void)
+{
+    uint32_t delay_s = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(SCRIPT_FLEET_JITTER_SLOTS,
+                                                   &delay_s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA MAC unavailable for fleet script jitter: %s — using 0 s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "fleet script URL delay: %lu s", (unsigned long)delay_s);
+    if (delay_s > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000U));
+    }
+}
+
 /* ── OP_UPDATE: replace /sdcard/main.lua ──────────────────────────────────── */
 
 /* SHA-256(text) == checksum (hex, case-insensitive)? */
-static bool checksum_ok(const char *text, const char *checksum)
+static bool sha256_text(const char *text, char hex[65])
 {
     unsigned char digest[32];
     if (mbedtls_sha256((const unsigned char *)text, strlen(text), digest, 0) != 0) {
         return false;
     }
-    char hex[65];
     for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", digest[i]);
     hex[64] = '\0';
-    return strncasecmp(hex, checksum, 64) == 0 && strlen(checksum) == 64;
+    return true;
+}
+
+static esp_err_t sha256_file(const char *path, char hex[65])
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
+    uint8_t *buf = malloc(1024);
+    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    esp_err_t err = ESP_OK;
+    while (1) {
+        size_t n = fread(buf, 1, 1024, f);
+        if (n > 0) mbedtls_sha256_update(&sha, buf, n);
+        if (n < 1024) {
+            if (ferror(f)) err = ESP_FAIL;
+            break;
+        }
+    }
+    unsigned char digest[32];
+    if (err == ESP_OK) mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    free(buf);
+    fclose(f);
+    if (err != ESP_OK) return err;
+    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", digest[i]);
+    hex[64] = '\0';
+    return ESP_OK;
+}
+
+static void nvs_read_string(nvs_handle_t h, const char *key, char *out, size_t out_cap)
+{
+    if (out_cap == 0) return;
+    out[0] = '\0';
+    size_t len = out_cap;
+    if (nvs_get_str(h, key, out, &len) != ESP_OK) out[0] = '\0';
+}
+
+esp_err_t script_update_get_identity(script_identity_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof *out);
+    if (!sdcard_io_begin()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = sha256_file(LUA_PATH, out->sha256);
+    sdcard_io_end();
+    if (err != ESP_OK) return err;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return ESP_OK; /* exact hash is still useful without release metadata */
+    }
+    char stored_sha[65] = "";
+    nvs_read_string(h, KEY_SCRIPT_SHA, stored_sha, sizeof stored_sha);
+    if (strlen(stored_sha) == 64 && strncasecmp(stored_sha, out->sha256, 64) == 0) {
+        nvs_read_string(h, KEY_SCRIPT_VER, out->version, sizeof out->version);
+        nvs_read_string(h, KEY_BUILT_FW, out->built_against_fw, sizeof out->built_against_fw);
+        nvs_read_string(h, KEY_INSTALL_FW, out->installed_on_fw, sizeof out->installed_on_fw);
+        /* Legacy pushes record the exact digest but carry no release tuple.
+         * Keep those distinguishable from a manifest-backed Lua release. */
+        if (out->version[0] != '\0' && out->built_against_fw[0] != '\0') {
+            out->release_metadata_verified = true;
+        } else {
+            out->version[0] = '\0';
+            out->built_against_fw[0] = '\0';
+            out->installed_on_fw[0] = '\0';
+        }
+    }
+    nvs_close(h);
+    return ESP_OK;
+}
+
+/* A release command is a duplicate only when both its success latch and its
+ * authoritative byte identity still match. Legacy commands without a checksum
+ * retain id-only dedupe so retained reboot commands cannot loop. This runs on
+ * the maintenance worker, never the MQTT callback task. */
+static bool request_already_active(const script_req_t *r)
+{
+    if (!already_applied(r->id)) return false;
+    if (r->checksum[0] == '\0') return true;
+
+    char active_sha[65] = "";
+    if (!sdcard_io_begin()) return false;
+    esp_err_t err = sha256_file(LUA_PATH, active_sha);
+    sdcard_io_end();
+    if (err != ESP_OK) return false;
+    return strncasecmp(active_sha, r->checksum, 64) == 0;
 }
 
 /* Parse-only syntax check in a bare state (no env needed — nothing executes). */
@@ -205,11 +358,36 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (c == NULL) return ESP_FAIL;
 
-    esp_err_t err = esp_http_client_open(c, 0);
-    if (err != ESP_OK) { esp_http_client_cleanup(c); return err; }
-
-    int64_t clen   = esp_http_client_fetch_headers(c);
-    int     status = esp_http_client_get_status_code(c);
+    esp_err_t err = ESP_OK;
+    int64_t clen = -1;
+    int status = -1;
+    /* The native open/read streaming API does not run the blocking client's
+     * automatic redirect loop. GitHub release assets always answer with a 302
+     * to release-assets.githubusercontent.com, so follow redirects explicitly
+     * before opening the destination file. */
+    for (int redirects = 0; redirects <= 5; redirects++) {
+        err = esp_http_client_open(c, 0);
+        if (err != ESP_OK) break;
+        clen = esp_http_client_fetch_headers(c);
+        if (clen < 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        status = esp_http_client_get_status_code(c);
+        if (status < 300 || status >= 400) break;
+        if (redirects == 5) {
+            err = ESP_ERR_HTTP_MAX_REDIRECT;
+            break;
+        }
+        err = esp_http_client_set_redirection(c);
+        esp_http_client_close(c);
+        if (err != ESP_OK) break;
+    }
+    if (err != ESP_OK) {
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return err;
+    }
     if (status != 200) {
         ESP_LOGE(TAG, "download HTTP status %d (need 200 — use a direct raw URL, not a /blob/ page)",
                  status);
@@ -297,6 +475,7 @@ static void do_update_impl(const script_req_t *r)
     const size_t len = strlen(r->text);
     ESP_LOGW(TAG, "script_update id=%s: %u bytes", r->id[0] ? r->id : "(none)", (unsigned)len);
     char detail[160];
+    char got[65];
 
     /* On-receipt ack: tell the operator the command was received before doing any
      * work (syntax check + SD write + Lua stop can take a few seconds, and the
@@ -304,7 +483,12 @@ static void do_update_impl(const script_req_t *r)
      * path, so this lands immediately. */
     report_script("accepted", r->id, NULL);
 
-    if (r->checksum[0] != '\0' && !checksum_ok(r->text, r->checksum)) {
+    if (!sha256_text(r->text, got)) {
+        report_script("failed", r->id, "sha256 failed");
+        return;
+    }
+    if (r->checksum[0] != '\0' &&
+        (strlen(r->checksum) != 64 || strncasecmp(got, r->checksum, 64) != 0)) {
         ESP_LOGE(TAG, "checksum mismatch — script rejected");
         report_script("failed", r->id, "sha256 mismatch");
         return;
@@ -360,7 +544,7 @@ static void do_update_impl(const script_req_t *r)
      * ordered startup). Latch FIRST so a retained trigger dedupes on reconnect
      * and can't loop the reboot (same guard as ota_update). */
     if (r->reboot) {
-        latch_set(r->id);
+        identity_set(r, got);
         ESP_LOGW(TAG, "main.lua replaced (%u bytes); previous kept as %s — rebooting to run it",
                  (unsigned)len, LUA_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)len);
@@ -378,7 +562,7 @@ static void do_update_impl(const script_req_t *r)
         return;
     }
 
-    latch_set(r->id);
+    identity_set(r, got);
     ESP_LOGW(TAG, "main.lua replaced (%u bytes) + runner restarted; previous kept as %s",
              (unsigned)len, LUA_PATH_BAK);
     snprintf(detail, sizeof detail, "%u bytes", (unsigned)len);
@@ -419,6 +603,8 @@ static void do_update_url_impl(const script_req_t *r)
     report_script("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
 
+    wait_for_fleet_slot();
+
     /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
      * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a
      * clean, contiguous heap on this PSRAM-less board. MQTT is resumed before we
@@ -456,7 +642,7 @@ static void do_update_url_impl(const script_req_t *r)
                 (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
                 snprintf(detail, sizeof detail, "rename failed");
             } else {
-                latch_set(r->id);   /* before any reboot: dedupes a retained trigger */
+                identity_set(r, got); /* before any reboot: dedupes retained trigger + records provenance */
                 applied = true;
             }
         }
@@ -520,6 +706,18 @@ static void do_exec(const script_req_t *r)
 static void script_run(void *arg)
 {
     script_req_t *r = arg;
+    if (r->op != OP_EXEC && request_already_active(r)) {
+        ESP_LOGI(TAG, "script_update id=%s already active — reporting identity",
+                 r->id);
+        report_script("applied", r->id, "already applied; checksum verified");
+        free(r->text);
+        free(r);
+        return;
+    }
+    if (r->op != OP_EXEC && already_applied(r->id)) {
+        ESP_LOGW(TAG, "script_update id=%s latch matched but active checksum drifted — reapplying",
+                 r->id);
+    }
     /* Global maintenance gate: refuse to overlap another update type. Redundant
      * under the single shared worker (ops are already serialized), kept as
      * belt-and-suspenders. */
@@ -568,7 +766,8 @@ esp_err_t script_update_init(const script_update_config_t *cfg)
 }
 
 static esp_err_t request_common(uint8_t op, const char *text,
-                                const char *checksum, const char *id, bool reboot)
+                                const char *checksum, const char *id, bool reboot,
+                                const char *script_version, const char *built_against_fw)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (text == NULL || text[0] == '\0') return ESP_ERR_INVALID_ARG;
@@ -579,6 +778,12 @@ static esp_err_t request_common(uint8_t op, const char *text,
     r.reboot = reboot;
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     if (checksum != NULL) strncpy(r.checksum, checksum, sizeof r.checksum - 1);
+    if (script_version != NULL) {
+        strncpy(r.script_version, script_version, sizeof r.script_version - 1);
+    }
+    if (built_against_fw != NULL) {
+        strncpy(r.built_against_fw, built_against_fw, sizeof r.built_against_fw - 1);
+    }
     r.text = strdup(text);
     if (r.text == NULL) return ESP_ERR_NO_MEM;
 
@@ -587,7 +792,7 @@ static esp_err_t request_common(uint8_t op, const char *text,
     return err;
 }
 
-/* A reboot with no id can't be deduped (latch_set/already_applied are no-ops for
+/* A reboot with no id can't be deduped (identity_set/already_applied are no-ops for
  * an empty id), so a RETAINED reboot=true command would re-apply + reboot on every
  * reconnect — a boot loop. Require an id to reboot. */
 static bool reboot_needs_id(const char *id, bool reboot, const char *what)
@@ -601,31 +806,24 @@ static bool reboot_needs_id(const char *id, bool reboot, const char *what)
 }
 
 esp_err_t script_update_request(const char *script, const char *checksum, const char *id,
-                                bool reboot)
+                                bool reboot, const char *script_version,
+                                const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update")) return ESP_ERR_INVALID_ARG;
-    /* Retained-topic dedupe: an already-applied id is ignored (success-latched). */
-    if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update id=%s already applied — ignoring", id);
-        return ESP_OK;
-    }
-    return request_common(OP_UPDATE, script, checksum, id, reboot);
+    return request_common(OP_UPDATE, script, checksum, id, reboot,
+                          script_version, built_against_fw);
 }
 
 esp_err_t script_update_url_request(const char *url, const char *checksum, const char *id,
-                                    bool reboot)
+                                    bool reboot, const char *script_version,
+                                    const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update(url)")) return ESP_ERR_INVALID_ARG;
-    /* Same success-latch dedupe as the inline path (stops a retained url command
-     * from re-downloading + re-rebooting on every reconnect). */
-    if (already_applied(id)) {
-        ESP_LOGI(TAG, "script_update(url) id=%s already applied — ignoring", id);
-        return ESP_OK;
-    }
-    return request_common(OP_UPDATE_URL, url, checksum, id, reboot);   /* text holds the URL */
+    return request_common(OP_UPDATE_URL, url, checksum, id, reboot,
+                          script_version, built_against_fw);   /* text holds the URL */
 }
 
 esp_err_t script_update_exec_request(const char *code, const char *id)
 {
-    return request_common(OP_EXEC, code, NULL, id, false);   /* exec is never deduped/rebooted */
+    return request_common(OP_EXEC, code, NULL, id, false, NULL, NULL); /* exec is never deduped/rebooted */
 }

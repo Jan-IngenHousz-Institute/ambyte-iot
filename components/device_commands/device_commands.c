@@ -1540,25 +1540,45 @@ cmd_result_t cmd_store_status_event(void)
     const char *clock_source = "rtc";
     bool clock_suspect = false;
     clock_trust_get_status(&clock_source, &clock_suspect);
+    script_identity_t script_identity = {0};
+    bool script_identity_valid = s_cfg.read_script_identity != NULL &&
+                                 s_cfg.read_script_identity(&script_identity) == ESP_OK;
+    if (script_identity_valid) {
+        status_copy_json_safe(script_identity.sha256, sizeof script_identity.sha256,
+                              script_identity.sha256);
+        status_copy_json_safe(script_identity.version, sizeof script_identity.version,
+                              script_identity.version);
+        status_copy_json_safe(script_identity.built_against_fw,
+                              sizeof script_identity.built_against_fw,
+                              script_identity.built_against_fw);
+        status_copy_json_safe(script_identity.installed_on_fw,
+                              sizeof script_identity.installed_on_fw,
+                              script_identity.installed_on_fw);
+    }
 
     /* Schema split (2026-07-28, Dominik): the sample's `data` object carries only
      * MEASUREMENTS (the BME280 environment readings); all device-health/info
      * fields live in the sample's `metadata` object, and `device` carries the
      * MAC. Platform charts device health from metadata, science from data.
-     * The bounded base always fits. Optional SD and power blocks are appended
-     * transactionally below. Two buffers ≈ the previous single 1024 B one, so
-     * the wd-task stack budget is unchanged. */
-    /* Worst-case budget (ticket-09 review, host-measured against the actual
-     * format strings): base 571 + SD 158 + power 160 + '}' + NUL = 891 B →
-     * only 5 B spare in this 896-B buffer at true format maxima (%.3f of a
-     * pathological negative mV reading renders 10 chars ×3; the u32 currents
-     * render 10 digits). With physically plausible field values the payload is
-     * ~756 B (~140 B headroom). DO NOT add fields against the 140 B figure:
-     * budget against the 5 B one, or grow the buffer — an overflow doesn't
-     * corrupt (status_append_optional drops the offending block with a WARN)
-     * but silently costs the power block on outlier readings. env_data's
-     * separate 128 B keeps the wd-task stack buffers at ~1 KiB total. */
-    char payload[896];
+     * The bounded base always fits. Optional script, SD, power, and per-channel
+     * AMBIT blocks are appended transactionally below. */
+    /* Worst-case budget at declared format maxima (%.3f of a pathological
+     * negative mV reading renders 10 chars ×3; the u32 currents render 10
+     * digits; every string block at its cap):
+     *   base + SD + power + '}' + NUL         891 B
+     *   script identity (digest+3 versions)   286 B
+     *   AMBIT identity, 4 × 138 B             552 B   (host-measured)
+     *                                       ------
+     *                                        1729 B
+     * The 2,048-B buffer leaves 319 B spare. On the bench (2 AMBITs, real
+     * values) the ambit blocks total 232 B. DO NOT add fields against
+     * typical-value headroom: budget against these maxima, or grow the buffer.
+     * An overflow doesn't corrupt (status_append_optional drops the offending
+     * block with a WARN) but silently costs that block on outlier readings.
+     * This buffer lives on the wd-task frame — SYNC_WD_TASK_STACK covers its
+     * growth from the original 896 B. Identity hashing uses a short-lived 1-KiB
+     * heap buffer so the heartbeat task does not carry it on the stack. */
+    char payload[2048];
     int n = snprintf(payload, sizeof(payload),
         "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
         "\"uptime_s\":%lld,\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
@@ -1587,6 +1607,16 @@ cmd_result_t cmd_store_status_event(void)
     }
     size_t payload_len = (size_t)n;
 
+    if (script_identity_valid) {
+        (void)status_append_optional(payload, sizeof payload, &payload_len, "script",
+            ",\"script_sha256\":\"%.64s\",\"script_version\":\"%.31s\","
+            "\"script_built_against_fw\":\"%.31s\",\"script_installed_on_fw\":\"%.31s\","
+            "\"script_metadata_verified\":%s",
+            script_identity.sha256, script_identity.version,
+            script_identity.built_against_fw, script_identity.installed_on_fw,
+            script_identity.release_metadata_verified ? "true" : "false");
+    }
+
     /* SD/persistence health — surfaces the audit's silent-loss counters so a
      * degrading card is visible before the cliff (free space, skipped/dropped
      * records, delivery high-water, io-lost). */
@@ -1614,6 +1644,30 @@ cmd_result_t cmd_store_status_event(void)
             (unsigned)s.power.charge_ma,
             s.power.input_present ? "true" : "false",
             (unsigned)s.power.charge_status);
+    }
+
+    /* Per-channel AMBIT identity (fleet inventory: which sensor + which fw is
+     * on which channel). CACHE-ONLY — never triggers a UART fetch from the
+     * heartbeat (a fetch is 2×5 s blocking + channel-mutex contention with
+     * Lua); boot sync populates the cache. Absent/unread channels are simply
+     * omitted. One transactional block per channel so a single outlier only
+     * drops itself. ambit_name comes from the AMBIT's NVS = untrusted bytes;
+     * event_log does NOT sanitize metadata_json, so it goes through
+     * status_copy_json_safe (fw/id/cal are ambyte-formatted and safe). */
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        ambit_device_info_t ai;
+        if (!cmd_ambit_device_info_cached(ch, &ai)) {
+            continue;
+        }
+        char safe_name[20];
+        status_copy_json_safe(safe_name, sizeof safe_name, ai.ambit_name);
+        char block[16];
+        snprintf(block, sizeof block, "ambit%u", ch);
+        (void)status_append_optional(payload, sizeof payload, &payload_len, block,
+            ",\"ambit%u_fw\":\"%.15s\",\"ambit%u_hw\":%u,\"ambit%u_name\":\"%s\","
+            "\"ambit%u_id\":\"%.17s\",\"ambit%u_cal\":\"%08lx\"",
+            ch, ai.fw_version, ch, (unsigned)ai.hw_rev, ch, safe_name,
+            ch, ai.device_id, ch, (unsigned long)ai.cal_version);
     }
     payload[payload_len++] = '}';
     payload[payload_len] = '\0';
@@ -2143,6 +2197,25 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
 #define AMBIT_INFO_NUM_CH 4
 static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
 
+/* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
+ * name lives in the calibration blob, and the identity fetch used to treat a
+ * failed calibration read as final — caching valid=true with an empty name, so
+ * every measurement was labeled the generic "ambit" until the next reconnect or
+ * reboot. After the v1.4.1 fleet OTA, 11 Ambits latched that way at once (the
+ * post-reboot fetch races the AMBIT's own settling). Two-layer cure:
+ *   1. retry the calibration read a few times inside the fetch itself;
+ *   2. if it still fails, mark it pending here and keep re-trying on later
+ *      lookups, rate-limited so a truly nameless/legacy AMBIT can't turn every
+ *      measurement into a UART round-trip.
+ * Same single-writer story as s_ambit_info (measurement/Lua task), so no lock. */
+#define AMBIT_CAL_FETCH_TRIES     3      /* attempts inside one identity fetch */
+#define AMBIT_CAL_RETRY_DELAY_MS  150    /* pause between those attempts */
+#define AMBIT_CAL_RETRY_PERIOD_MS 60000  /* floor between later re-attempts */
+static struct {
+    bool    pending;          /* identity cached but calibration (name) unread */
+    int64_t next_attempt_ms;  /* earliest time for the next re-attempt */
+} s_ambit_cal_retry[AMBIT_INFO_NUM_CH];
+
 /* Cmd 1 — Set photodetector gains on the ADPD6100.
  * Values 1-6 map to gain levels (0 = skip / keep current).
  * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
@@ -2385,6 +2458,22 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     }
 }
 
+/* One calibration-read attempt: on success fill the cal-derived fields of *e
+ * (cal_version, actinic_coef, ambit_name) and return true, leaving *cal for the
+ * DEVICE_INFO emit. On failure *e is untouched. */
+static bool ambit_cal_read(uint8_t ch, ambit_device_info_t *e, ambit_calibration_t *cal)
+{
+    size_t cgot = 0;
+    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION,
+                                         (uint8_t *)cal, sizeof *cal, &cgot);
+    if (cr.status != ESP_OK || cgot < sizeof *cal) return false;
+    e->cal_version  = esp_rom_crc32_le(0, (const uint8_t *)cal, sizeof *cal);
+    e->actinic_coef = cal->actinic_coef;
+    memset(e->ambit_name, 0, sizeof e->ambit_name);
+    memcpy(e->ambit_name, cal->ambit_name, sizeof e->ambit_name - 1);
+    return true;
+}
+
 static esp_err_t ambit_info_fetch(uint8_t ch)
 {
     /* FW info (MAC + version) is mandatory; calibration (→ cal_version) best-effort. */
@@ -2404,19 +2493,23 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
              (unsigned)((m >> 24) & 0xFF), (unsigned)((m >> 32) & 0xFF), (unsigned)((m >> 40) & 0xFF));
     snprintf(e.fw_version, sizeof e.fw_version, "%u.%u.%u",
              (unsigned)fw.major, (unsigned)fw.minor, (unsigned)fw.batch);
+    e.hw_rev = fw.hw_rev;   /* 0 on pre-0.1.0 images (they never wrote the byte) */
 
     /* cal_version = CRC32 of the calibration struct → changes whenever the sensor
-     * is recalibrated. The struct has no native version field. */
+     * is recalibrated. The struct has no native version field.
+     * Retried: the name lives in this blob, and a single boot-time timeout here
+     * used to stick the channel with the generic "ambit" label for hours (see
+     * s_ambit_cal_retry above). */
     ambit_calibration_t cal;
-    size_t cgot = 0;
     bool have_cal = false;
-    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &cgot);
-    if (cr.status == ESP_OK && cgot >= sizeof cal) {
-        have_cal        = true;
-        e.cal_version   = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
-        e.actinic_coef  = cal.actinic_coef;
-        memcpy(e.ambit_name, cal.ambit_name, sizeof e.ambit_name - 1);
+    for (int attempt = 0; attempt < AMBIT_CAL_FETCH_TRIES && !have_cal; attempt++) {
+        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(AMBIT_CAL_RETRY_DELAY_MS));
+        have_cal = ambit_cal_read(ch, &e, &cal);
     }
+    /* Never latch a missing calibration as final: keep the identity usable
+     * (fw/MAC below) but leave the name pending so later lookups re-try. */
+    s_ambit_cal_retry[ch].pending         = !have_cal;
+    s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
 
     /* Preserve gains/currents tracked since the last (re)connect — the identity
      * fetch must not clobber them (they live in the same cache struct). */
@@ -2444,10 +2537,34 @@ cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
             memset(out, 0, sizeof *out);
             return make_result(err, "AMBIT%u device_info fetch failed", ch + 1);
         }
+    } else if (s_ambit_cal_retry[ch].pending &&
+               now_ms() >= s_ambit_cal_retry[ch].next_attempt_ms) {
+        /* Identity is cached but the calibration (and with it the name) never
+         * arrived — measurements are going out labeled "ambit". Re-try on the
+         * lookups that normal measurement traffic already makes, at most once
+         * per AMBIT_CAL_RETRY_PERIOD_MS, and re-announce identity once the name
+         * finally lands so the platform can correct itself. */
+        s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
+        ambit_calibration_t cal;
+        if (ambit_cal_read(ch, &s_ambit_info[ch], &cal)) {
+            s_ambit_cal_retry[ch].pending = false;
+            ambit_emit_device_info(ch, &s_ambit_info[ch], &cal, true);
+            ESP_LOGW(TAG, "AMBIT%u name recovered late: %s", ch + 1,
+                     s_ambit_info[ch].ambit_name);
+        }
     }
     *out = s_ambit_info[ch];
     return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx",
                        ch + 1, out->device_id, out->fw_version, (unsigned long)out->cal_version);
+}
+
+bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out)
+{
+    if (ch >= AMBIT_INFO_NUM_CH || out == NULL || !s_ambit_info[ch].valid) {
+        return false;
+    }
+    *out = s_ambit_info[ch];
+    return true;
 }
 
 void cmd_ambit_device_info_invalidate(uint8_t ch)
@@ -2459,6 +2576,9 @@ void cmd_ambit_device_info_invalidate(uint8_t ch)
         s_ambit_info[ch].valid        = false;
         s_ambit_info[ch].gains_set    = false;
         s_ambit_info[ch].currents_set = false;
+        /* The next fetch owns its own calibration retries. */
+        s_ambit_cal_retry[ch].pending         = false;
+        s_ambit_cal_retry[ch].next_attempt_ms = 0;
     }
 }
 

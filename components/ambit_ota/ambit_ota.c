@@ -10,6 +10,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -31,6 +32,17 @@
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
+#define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
+/* main.lua's longest normal autonomous trace is SS: 59 pulses at 1 Hz plus
+ * setup. Stopping Lua prevents a new trigger; this delay lets an already-started
+ * AMBIT run finish before maintenance probes the deliberately-silent UART. */
+#define AMBIT_IDLE_SETTLE_MS   65000U
+/* Presence ping and cmd 33/2 are separate UART transactions. Field sweeps show
+ * that the first identity reply can occasionally be dropped even after a valid
+ * ping, especially on channel 0. Retry once inside the already-quiesced window;
+ * two failed reads still report the channel as present but unversioned. */
+#define AMBIT_VERSION_READ_ATTEMPTS 2U
+#define AMBIT_VERSION_RETRY_MS      250U
 
 #define NVS_NS                 "ambit_ota"
 #define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied OTA */
@@ -53,6 +65,7 @@
 typedef struct {
     uint8_t op;                       /* AMBIT_OP_* */
     uint8_t channel;
+    bool    fleet_spread;             /* remote URL OTA only; local CLI stays immediate */
     char    url[AMBIT_OTA_URL_MAX];   /* OTA: download URL; FLASH: /sdcard/ambit_fw/<ver> dir */
     char    id[AMBIT_OTA_ID_MAX];
 } ambit_ota_req_t;
@@ -197,6 +210,23 @@ static void report_busy(const ambit_ota_req_t *r)
     }
 }
 
+/* Hold the maintenance gate and shared worker during the per-device slot, but
+ * leave MQTT and Lua active until the existing quiesce sequence begins. */
+static void wait_for_fleet_slot(void)
+{
+    uint32_t delay_s = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(AMBIT_OTA_FLEET_JITTER_SLOTS,
+                                                   &delay_s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "STA MAC unavailable for fleet AMBIT OTA jitter: %s — using 0 s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGW(TAG, "fleet AMBIT OTA delay: %lu s", (unsigned long)delay_s);
+    if (delay_s > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000U));
+    }
+}
+
 /* ── HTTP GET → file on SD ────────────────────────────────────────────────
  * Streaming download (the image is too big to buffer in RAM). Requires a
  * direct-200 URL (raw.githubusercontent.com/… or a pre-resolved link); a 3xx
@@ -240,10 +270,29 @@ static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t
 
     int64_t clen   = esp_http_client_fetch_headers(c);
     int     status = esp_http_client_get_status_code(c);
+
+    /* GitHub release-asset URLs answer 302 to a signed CDN URL (objects.
+     * githubusercontent.com) — follow a bounded number of redirects so a plain
+     * release asset link works as the OTA source. The cert bundle validates
+     * each hop; the 4 KiB buffers fit GitHub's long signed URLs. */
+    for (int hops = 0;
+         hops < 3 && (status == 301 || status == 302 || status == 303 ||
+                      status == 307 || status == 308);
+         hops++) {
+        if (esp_http_client_set_redirection(c) != ESP_OK) {
+            break;
+        }
+        esp_http_client_close(c);
+        err = esp_http_client_open(c, 0);
+        if (err != ESP_OK) {
+            esp_http_client_cleanup(c);
+            return err;
+        }
+        clen   = esp_http_client_fetch_headers(c);
+        status = esp_http_client_get_status_code(c);
+    }
     if (status != 200) {
-        ESP_LOGE(TAG, "HTTP status %d (expected 200)%s", status,
-                 (status >= 300 && status < 400)
-                     ? " — redirect; use a direct raw.githubusercontent.com URL" : "");
+        ESP_LOGE(TAG, "HTTP status %d (expected 200 after redirects)", status);
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
         return ESP_FAIL;
@@ -411,12 +460,32 @@ static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
         cmd_result_t cr = cmd_ambit_ota_confirm(ch, &st);
         if (cr.status == ESP_OK && st == 0) {
             ESP_LOGW(TAG, "AMBIT%u image confirmed — rollback cancelled", ch + 1);
+            /* Running fw changed: refresh the identity cache so STATUS and
+             * event provenance report the new version (Lua is suspended, the
+             * bus is ours — safe to fetch inline). */
+            cmd_ambit_device_info_invalidate(ch);
+            ambit_device_info_t inf;
+            (void)cmd_ambit_device_info(ch, &inf);
             return true;
         }
         ESP_LOGW(TAG, "OTA_CONFIRM try %d: %s st=%u", tries + 1, esp_err_to_name(cr.status), st);
     }
     ESP_LOGE(TAG, "AMBIT%u confirm failed — image will roll back on its next reboot", ch + 1);
     return false;
+}
+
+/* Establish a deterministic maintenance window for identity and OTA sweeps.
+ * lua_runner_stop() can only unwind the host task; a trigger already accepted
+ * by an AMBIT continues autonomously and keeps its binary router quiet until the
+ * trace completes. Once that maximum interval has elapsed, discard cached ping
+ * failures captured during the run so every presence decision reaches the wire. */
+static void ambit_quiesce_for_idle(void)
+{
+    if (s_cfg.workload_suspend != NULL) {
+        s_cfg.workload_suspend();
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_IDLE_SETTLE_MS));
+    }
+    if (s_cfg.ping_cache_invalidate != NULL) s_cfg.ping_cache_invalidate();
 }
 
 /* ── one OTA request (single channel, or a sweep of all present channels) ──── */
@@ -448,8 +517,11 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
     report("accepted", r->channel, r->id);
     vTaskDelay(pdMS_TO_TICKS(500));   /* flush the ack before MQTT drops */
 
-    /* Quiesce: free the UART (stop Lua) and the heap/TLS (stop MQTT). */
-    if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
+    if (r->fleet_spread) wait_for_fleet_slot();
+
+    /* Quiesce: stop new measurements, wait for an autonomous run already in
+     * progress, force fresh presence probes, then free the TLS heap. */
+    ambit_quiesce_for_idle();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
     vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -540,10 +612,40 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
 
 /* ── fleet version report ─────────────────────────────────────────────────
  * Sweep all channels (cmd 33/2), log a per-channel line, and publish one JSON
- * report. Runs on the worker task (off the MQTT loop). No quiesce — the version
- * read is a quick UART transaction the uart_sensors mutex serializes with Lua. */
+ * report. Runs on the worker task (off the MQTT loop).
+ *
+ * The normal Lua schedule starts a 59-second SS run every minute. AMBIT is
+ * deliberately quiet on the shared UART while that run owns its binary router,
+ * so mutex serialization alone produces false "absent" inventory for almost
+ * the entire minute. Stop Lua, allow the already-triggered autonomous run to
+ * finish, then sweep in the resulting deterministic idle window. The longest
+ * normal trace is the 59-pulse/1 Hz SS run (~59.3 s including setup); 65 s keeps
+ * margin without approaching the host's 90 s correlated-query deadline. */
+
+static bool ambit_read_fw_version(uint8_t ch, ambit_fw_info_t *fw)
+{
+    for (uint32_t attempt = 0; attempt < AMBIT_VERSION_READ_ATTEMPTS; attempt++) {
+        size_t len = 0;
+        memset(fw, 0, sizeof *fw);
+        cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW,
+                                             (uint8_t *)fw, sizeof *fw, &len);
+        if (r.status == ESP_OK && len >= sizeof *fw) return true;
+
+        ESP_LOGW(TAG, "AMBIT%u version read %lu/%u failed: %s (%u bytes)",
+                 ch + 1, (unsigned long)(attempt + 1),
+                 (unsigned)AMBIT_VERSION_READ_ATTEMPTS,
+                 esp_err_to_name(r.status), (unsigned)len);
+        if (attempt + 1U < AMBIT_VERSION_READ_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_RETRY_MS));
+        }
+    }
+    return false;
+}
+
 static void ambit_do_versions(const char *id)
 {
+    ambit_quiesce_for_idle();
+
     char esc_id[AMBIT_OTA_ID_MAX * 2 + 1] = "";
     json_escape(esc_id, sizeof esc_id, id);
 
@@ -558,15 +660,12 @@ static void ambit_do_versions(const char *id)
         bool connected = false;
         cmd_result_t pr = cmd_uart_ping(c, &connected);
         if (pr.status == ESP_OK && connected) {
-            uint8_t vb[64];
-            size_t  len = 0;
-            cmd_result_t r = cmd_ambit_get_info(c, AMBIT_INFO_FW, vb, sizeof vb, &len);
-            if (r.status == ESP_OK && len >= sizeof(ambit_fw_info_t)) {
-                const ambit_fw_info_t *fw = (const ambit_fw_info_t *)vb;
-                ESP_LOGW(TAG, "AMBIT%u: v%u.%u.%u", c + 1, fw->major, fw->minor, fw->batch);
+            ambit_fw_info_t fw;
+            if (ambit_read_fw_version(c, &fw)) {
+                ESP_LOGW(TAG, "AMBIT%u: v%u.%u.%u", c + 1, fw.major, fw.minor, fw.batch);
                 o += snprintf(buf + o, sizeof buf - o,
                     "%s{\"ch\":%u,\"present\":true,\"version\":\"%u.%u.%u\"}",
-                    sep, c, fw->major, fw->minor, fw->batch);
+                    sep, c, fw.major, fw.minor, fw.batch);
             } else {
                 ESP_LOGW(TAG, "AMBIT%u: present, no version", c + 1);
                 o += snprintf(buf + o, sizeof buf - o, "%s{\"ch\":%u,\"present\":true}", sep, c);
@@ -585,6 +684,8 @@ static void ambit_do_versions(const char *id)
             s_cfg.publish(s_cfg.status_topic, buf, (size_t)o, &msg_id);
         }
     }
+
+    if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
 }
 
 /* ── ROM-bootloader probe sweep ───────────────────────────────────────────
@@ -711,6 +812,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
             res[c] = (ferr == ESP_OK) ? FL_OK : FL_FAIL;
             if (ferr == ESP_OK) {
                 ok_count++;
+                cmd_ambit_device_info_invalidate(c);
                 ESP_LOGW(TAG, "AMBIT%u: FLASH OK (%d regions, %u B)",
                          c + 1, fr.regions_written, (unsigned)fr.total_bytes);
             } else {
@@ -726,6 +828,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         res[r->channel] = (ferr == ESP_OK) ? FL_OK
                         : (ferr == ESP_ERR_TIMEOUT) ? FL_BUSY : FL_FAIL;
         ok = (ferr == ESP_OK);
+        if (ok) cmd_ambit_device_info_invalidate(r->channel);
         ESP_LOGW(TAG, "AMBIT%u: flash %s", r->channel + 1, ok ? "OK" : "FAILED");
     }
 
@@ -827,7 +930,8 @@ esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
+esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id,
+                            bool fleet_spread)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
@@ -849,6 +953,7 @@ esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id)
     memset(&r, 0, sizeof r);
     r.op      = AMBIT_OP_OTA;
     r.channel = channel;
+    r.fleet_spread = fleet_spread;
     strncpy(r.url, url, sizeof r.url - 1);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     return ambit_ota_enqueue(&r);

@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "timezone.h"
 
 #define TAG          "device_cfg"
 #define NVS_NS       "device_cfg"
@@ -34,6 +35,32 @@ esp_err_t device_config_init(void)
         return err;
     }
     s_initialized = true;
+
+    /* One-time OTA-safe migration for early provisioning images that used AMT
+     * as shorthand for Amsterdam. Do not rewrite unknown values: retain them in
+     * NVS for diagnosis, while device_config_get_timezone() below fails closed
+     * so they can never enter an MQTT envelope. */
+    char stored[64];
+    size_t stored_len = sizeof(stored);
+    err = nvs_get_str(s_handle, KEY_TIMEZONE, stored, &stored_len);
+    if (err == ESP_OK) {
+        char canonical[48];
+        esp_err_t tzerr = timezone_canonicalize(stored, canonical, sizeof(canonical));
+        if (tzerr == ESP_OK && strcmp(stored, canonical) != 0) {
+            tzerr = nvs_set_str(s_handle, KEY_TIMEZONE, canonical);
+            if (tzerr == ESP_OK) tzerr = nvs_commit(s_handle);
+            if (tzerr == ESP_OK) {
+                ESP_LOGW(TAG, "timezone migrated '%s' -> '%s'", stored, canonical);
+            } else {
+                ESP_LOGE(TAG, "timezone migration failed: %s", esp_err_to_name(tzerr));
+                return tzerr;
+            }
+        } else if (tzerr != ESP_OK) {
+            ESP_LOGE(TAG, "invalid stored timezone '%s' — omitted from telemetry", stored);
+        }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "timezone migration read failed: %s", esp_err_to_name(err));
+    }
     ESP_LOGI(TAG, "device_config initialised");
     return ESP_OK;
 }
@@ -105,7 +132,12 @@ esp_err_t device_config_set_status_topic(const char *val)
 
 esp_err_t device_config_get_timezone(char *buf, size_t len)
 {
-    return cfg_get(KEY_TIMEZONE, buf, len);
+    if (buf == NULL || len == 0) return ESP_ERR_INVALID_ARG;
+    buf[0] = '\0';
+    char stored[64];
+    esp_err_t err = cfg_get(KEY_TIMEZONE, stored, sizeof(stored));
+    if (err != ESP_OK) return err;
+    return timezone_canonicalize(stored, buf, len);
 }
 
 esp_err_t device_config_get_flash_time(uint32_t *out)
@@ -124,7 +156,10 @@ esp_err_t device_config_get_heartbeat_s(uint32_t *out)
 
 esp_err_t device_config_set_timezone(const char *val)
 {
-    return cfg_set(KEY_TIMEZONE, val);
+    char canonical[48];
+    esp_err_t err = timezone_canonicalize(val, canonical, sizeof(canonical));
+    if (err != ESP_OK) return err;
+    return cfg_set(KEY_TIMEZONE, canonical);
 }
 
 esp_err_t device_config_get_device_id(char *buf, size_t len)

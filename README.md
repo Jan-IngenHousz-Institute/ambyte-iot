@@ -41,7 +41,7 @@ pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 
 # 4. Put a measurement schedule on the SD card
-cp docs/exampleMain.lua  /path/to/AMBYTE_SD/main.lua
+cp lua/main.lua  /path/to/AMBYTE_SD/main.lua
 ```
 
 The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/sdcard/main.lua`, stores measurements to the SD `event_log`, and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock.
@@ -178,6 +178,20 @@ Missing required fields cause a loud non-zero exit listing them — never a sile
 2. `.env` entry at repo root (auto-loaded, gitignored, quotes stripped, `#` comments ignored)
 3. For cert slots: explicit `AMBYTE_CA_CERT` / `AMBYTE_DEV_CERT` / `AMBYTE_DEV_KEY`, else bundle auto-discovery
 
+### Timezone contract and legacy migration
+
+`AMBYTE_TIMEZONE` must be one of the IANA zones supported by
+[`components/timezone/timezone.c`](components/timezone/timezone.c); the default
+is `Europe/Amsterdam`. Provisioning fails closed on an unsupported value. The
+runtime `cfg set timezone <value>` command applies the same validation.
+
+Firmware v1.6.1 and later migrates the historical JII shorthand `AMT` to
+`Europe/Amsterdam` in NVS at boot. It also maps `Z` to `UTC` and trims surrounding
+whitespace. If a different invalid legacy value is found, the original NVS value
+is retained for diagnosis but omitted from MQTT telemetry, preventing one device
+from aborting the cloud enrichment pipeline. The OpenJII pipeline independently
+validates incoming timezones and preserves rows whose timezone is invalid.
+
 ### Cert bundle layout
 
 Put each thing's AWS IoT PEM files in its own subdirectory under [device_certs/](device_certs/) (gitignored):
@@ -240,7 +254,7 @@ Lua **never** touches MQTT. [components/sync_runner](components/sync_runner) is 
 
 ### STATUS heartbeat
 
-A firmware-owned STATUS heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. It stores a `tag=STATUS` event with Wi-Fi/provisioned/DB/publish-gate flags plus MP2731 power keys and onboard BME280 T/H/P when those reads succeed.
+A firmware-owned STATUS heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. It stores a `tag=STATUS` event with Wi-Fi/provisioned/DB/publish-gate flags, MP2731 power keys, onboard BME280 T/H/P, compiled `app_version`, and the active script identity (`script_sha256`, independently released `script_version`, `script_built_against_fw`, and `script_installed_on_fw`). Release metadata is included only when its persisted digest still matches the actual SD file.
 
 ### Payload schema
 
@@ -259,8 +273,8 @@ The **AMBIT** is an external multispeq-style measurement device (leaf photosynth
 
 ### AMBIT firmware update — two independent paths
 
-- **Strategy B — cooperative app-OTA over UART** ([components/ambit_ota](components/ambit_ota)): the ambyte downloads a C3 `.bin` from HTTPS to SD, then streams it in ≤200-byte CRC16 chunks (cmds 25–29) into the AMBIT's spare OTA slot with C3-side rollback. Needs a **running, cooperating** AMBIT. Trigger: CLI `ambit_ota <ch> <url>` or MQTT `{type:ambit_ota}` (`ch` can be `all`/0xFF).
-- **Strategy A — ROM-bootloader UART flasher** ([components/ambit_flash](components/ambit_flash) + vendored [components/esp_serial_flasher](components/esp_serial_flasher)): the **universal** path for **bare / bricked / pre-OTA** units. It drives the C3 hardware straps (shared `CHIP_EN` reset on IO1, per-channel `GPIO9` boot strap) to force one target into the ROM download mode, then flashes 4 region images from `/sdcard/ambit_fw/<ver>/` (`bootloader.bin@0x0`, `partitions.bin@0x8000`, `boot_app0.bin@0xe000`, `app.bin@0x10000`) with per-region MD5 verify. **NVS at `0x9000` is never written**, so per-unit AMBIT calibration survives. CLI: `ambit_probe`, `ambit_dl`, `ambit_flash <ch> <ver>`.
+- **Strategy B — cooperative app-OTA over UART** ([components/ambit_ota](components/ambit_ota)): the ambyte downloads a C3 `.bin` from HTTPS to SD, then streams it in ≤200-byte CRC16 chunks (cmds 25–29) into the AMBIT's spare OTA slot with C3-side rollback. Needs a **running, cooperating** AMBIT. Trigger: CLI `ambit_ota <ch> <url>` or MQTT `{type:ambit_ota}` (`ch` can be `all`/0xFF). The protected manual **Fleet deploy (AMBIT via Ambyte)** workflow verifies an immutable public `Jan-IngenHousz-Institute/ambit` release and manifest, deterministically selects gateways, preflights every channel with correlated `ambit_versions`, tracks all-channel OTA outcomes, and verifies executed gateways by version effect. Firmware creates a measurement-safe idle window before each version sweep; the host also retries and reconciles incomplete, busy, absent, or unversioned inventory without accepting conflicting evidence. Same-version recovery reflashes require an explicit device list. See [fleet deploy documentation](tools/fleet_deploy/README.md#deploying-ambit-firmware-through-ambytes).
+- **Strategy A — ROM-bootloader UART flasher** ([components/ambit_flash](components/ambit_flash) + vendored [components/esp_serial_flasher](components/esp_serial_flasher)): the **universal** path for **bare / bricked / pre-OTA** units. It drives the C3 hardware straps (shared `CHIP_EN` reset on IO1, per-channel `GPIO9` boot strap) to force one target into the ROM download mode, then flashes 4 region images from `/sdcard/ambit_fw/<ver>/` (`bootloader.bin@0x0`, `partitions.bin@0x8000`, `boot_app0.bin@0xe000`, `app.bin@0x10000`) with per-region MD5 verify. Missing canonical recovery directories are created before the file preflight, allowing old SD cards to be staged remotely; all four non-empty files are still required before the AMBIT is touched. **NVS at `0x9000` is never written**, so per-unit AMBIT calibration survives. A successful flash invalidates the cached AMBIT identity so later STATUS/events report the new firmware. CLI: `ambit_probe`, `ambit_dl`, `ambit_flash <ch> <ver>`.
 - **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. Read-only + bus-mutex-serialised so safe with Lua active.
 - **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before Lua starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on the same power condition as MQTT publishing (skips to the next powered boot on battery) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
 
@@ -283,9 +297,10 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 [components/script_update](components/script_update), dispatched by `command_router`:
 
-- `{type:script_update,id,script,checksum?}` — sha256 (if given) → Lua syntax check → write `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → restart runner → NVS id latch on success only. Inline cap 16 KiB.
+- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. The immutable Lua release manifest contains this ready-to-publish object.
+- Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
 - `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
-- CLI twins: `lua start|stop|status|exec`. See [device-script-delivery.md](device-script-delivery.md).
+- Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
 
 ---
 
@@ -299,17 +314,13 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ## SD card
 
-- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). To iterate: edit on the host, swap the card, reset — no reflash. (Or push a new script over MQTT via `script_update`.)
+- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). The canonical released source is [lua/main.lua](lua/main.lua). For a manual iteration, copy it to the card and reset; for a traceable rollout, use the independently versioned Lua release manifest.
 - Behaviour when the script is missing: no SD mounted → Lua task skipped, CLI+MQTT continue; SD mounted but no `main.lua` → task starts, fails the load, exits cleanly.
 - **Hot pull/reinsert recovery** ([components/sd_card](components/sd_card)): no card-detect pin, so a monitor polls `sdmmc_get_status` (CMD13, 2000 ms) plus a **lock-free error-driven loss latch** (writers call `sdcard_report_io_error/ok` and gate on `sdcard_io_lost()`) — needed because CMD13 alone loses the race to a task stuck in a multi-second failing transfer (priority inversion, the historic sdmmc `0x107` flood). On loss the Lua runner stops and `event_log_on_sd_lost` fires; on reinsert `event_log_on_sd_restored` runs and Lua restarts. `sd_logger` buffers WARN/ERROR in a RAM ring while the card is absent and flushes on remount.
 
 Lua binding tables exposed to scripts (see the `luaL_Reg` arrays in `lua_runner.c`): `device.*` (rtc/status/power/sd_ready/sleep_ms/log/PWM/…), `uart.*` (raw transport), `db.*` (`store_event`/`next_id`, for custom/derived events), `ambit.*` (ping/spec/leaf_temp/run/trigger/poll/fetch/run_mpf/set_gains/set_currents/blink/calibrate/actinic/set_metadata), and `sync.*` (interval/clock/weekly/sunrise-sunset scheduling from lat/lon + tz). The old `mqtt` Lua table was removed — scripts no longer publish.
 
-Example schedules in [docs/](docs/):
-
-- [docs/exampleMain.lua](docs/exampleMain.lua) — minimal starter schedule.
-- [docs/sync.lua](docs/sync.lua) — reference for the `sync.*` scheduling surface (interval/clock/weekly/sunrise-sunset).
-- [docs/crashtest-main.lua](docs/crashtest-main.lua) — the crash-test cadence (SS @ 10 s + MPF @ 1 min) cited in the roadmap.
+The production field schedule is [lua/main.lua](lua/main.lua). The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
 
 ---
 
@@ -392,7 +403,7 @@ LICENSE              # CERN-OHL-S v2
 | MQTT connects then immediately disconnects | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 | Telemetry stops but no data loss / device on external power | In-flight slot may have stalled — check the `inflight` CLI command; the 60 s reaper + MQTT-disconnect clear should recover it, else the 1 h watchdog reboots |
 | Events pile up in `event_log`, nothing publishes | Expected on battery (power gate) or before the clock is valid (< 2024) — verify external power and RTC/clock |
-| `Lua runner not started: SD card not mounted` | Insert an SD card with `main.lua` at the root (copy [docs/exampleMain.lua](docs/exampleMain.lua)) |
+| `Lua runner not started: SD card not mounted` | Insert an SD card with `main.lua` at the root (copy [lua/main.lua](lua/main.lua)) |
 | `failed to load /sdcard/main.lua` | SD mounted but file missing/unreadable — check the card has `main.lua` at the root |
 | sdmmc `0x107` errors after pulling the SD card | Hot-plug recovery should latch the loss and remount on reinsert; if it floods, this path needs the HW pull/reinsert verification still pending (see Status) |
 | Wrong PAR / spectral values on an AMBIT | Check AMBIT calibration / `spec_coef`; version drift (`ambit_check`) may indicate a stale AMBIT firmware |

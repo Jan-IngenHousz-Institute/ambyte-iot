@@ -81,7 +81,11 @@ typedef struct {
     uint32_t size;
     uint64_t mac;
     char     fw_date[12];
-    char     reserved[12];
+    /* hw_rev claims the first formerly-reserved byte (ambit fw >= 0.1.0 writes
+     * it; older images never wrote these bytes, so they read as 0 = unknown).
+     * Same offsets, same 48-byte total — the wire layout is unchanged. */
+    uint8_t  hw_rev;
+    char     reserved[11];
     uint8_t  checksum;
 } ambit_fw_info_t;           /* expected ~48 bytes */
 

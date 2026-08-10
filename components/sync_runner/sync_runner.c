@@ -10,9 +10,9 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -101,7 +101,13 @@
  * NVS cursor survive, so nothing is lost). Runs as a SEPARATE task from the drain
  * so it also catches a wedged/dead drain task. */
 #define SYNC_WD_TASK_NAME     "sync_wdog"
-#define SYNC_WD_TASK_STACK    6144
+/* 6144 + 1536: the STATUS metadata buffer (cmd_store_status_event) grew from
+ * 896 B to 2048 B (script identity + per-channel AMBIT identity blocks), and
+ * script_identity_t also sits on this frame. A stack overflow here would take
+ * out the task that performs the self-healing reboots, so the growth is
+ * over-covered rather than trimmed to the calculated minimum; confirm the
+ * high-water mark on hardware before trimming. */
+#define SYNC_WD_TASK_STACK    7680
 #define SYNC_WD_TASK_PRIO     2                      /* mostly sleeps */
 
 /* Once the byte/slot window binds, yield briefly while the MQTT task delivers
@@ -346,23 +352,19 @@ static esp_err_t maint_latch_reboot(const char *reason, bool write_day,
     return err;
 }
 
-/* FNV-1a makes the full STA MAC contribute to a stable, inexpensive fleet
- * spread; modulo 90 places each unit in the first 90 minutes of the window. */
+/* The shared helper preserves the original full-MAC FNV-1a mapping. Reboot
+ * policy keeps ownership of its warning and zero-minute failure fallback. */
 static uint32_t nightly_jitter_minutes(void)
 {
-    uint8_t mac[6] = {0};
-    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t jitter_min = 0;
+    esp_err_t err = fleet_jitter_slot_for_sta_mac(SYNC_NIGHT_JITTER_SPAN_MIN,
+                                                   &jitter_min);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "STA MAC unavailable for reboot jitter: %s — using 0 min",
                  esp_err_to_name(err));
         return 0;
     }
-    uint32_t hash = 2166136261U;
-    for (size_t i = 0; i < sizeof mac; i++) {
-        hash ^= mac[i];
-        hash *= 16777619U;
-    }
-    return hash % SYNC_NIGHT_JITTER_SPAN_MIN;
+    return jitter_min;
 }
 
 static bool watchdog_guard_allows(const char *key, const char *label,
@@ -584,11 +586,31 @@ static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
                                          bool *clock_ok, int64_t *pending_out,
                                          int64_t *since_out)
 {
+    /* Last time the power gate was observed CLOSED (esp_timer ms). Starvation
+     * must be measured from whichever came last: the last PUBACK or the last
+     * closed-gate moment. Field night 2026-08-02 (first fleet night on 1.3.0):
+     * battery devices close the gate at dusk while the schedule keeps queueing,
+     * so ms_since_publish_ok spans the whole night; at dawn the gate reopens
+     * with pending > 0 and "since" already hours past the timeout, and any
+     * watchdog tick that lands before the first morning PUBACK reboots a
+     * perfectly healthy device (3 devices latched "nopuback" that night).
+     * Clamping to time-since-gate-open restarts the 1 h observation window at
+     * reopen; a genuine wedge with the gate open still reboots on schedule. */
+    static int64_t s_gate_blocked_ms;
+
     bool    a = device_commands_publish_power_ok();
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
     int64_t pending = 0;
     (void)cmd_db_status(NULL, NULL, &pending, NULL);
     int64_t since = device_commands_ms_since_publish_ok();
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (!a) {
+        s_gate_blocked_ms = now_ms;
+    } else if (s_gate_blocked_ms > 0) {
+        int64_t since_gate_open = now_ms - s_gate_blocked_ms;
+        if (since_gate_open < since) since = since_gate_open;
+    }
 
     if (allowed)     *allowed     = a;
     if (clock_ok)    *clock_ok    = c;

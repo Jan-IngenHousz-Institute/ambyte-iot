@@ -1018,7 +1018,8 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
         }
         ch = (uint8_t)c;
     }
-    esp_err_t err = ambit_ota_request(ch, argv[2], NULL /* CLI: no dedupe id */);
+    esp_err_t err = ambit_ota_request(ch, argv[2], NULL /* CLI: no dedupe id */,
+                                      false /* local request: no fleet spread */);
     if (err != ESP_OK) {
         printf("ambit_ota: could not queue (%s)\r\n", esp_err_to_name(err));
         return 1;

@@ -31,8 +31,9 @@ esp_err_t device_config_get_device_name(char *buf, size_t len);
 esp_err_t device_config_get_device_version(char *buf, size_t len);
 esp_err_t device_config_get_device_firmware(char *buf, size_t len);
 esp_err_t device_config_get_firmware_version(char *buf, size_t len);
-/* IANA timezone name (e.g. "Europe/Amsterdam") echoed in the MQTT envelope so
- * the cloud derives local-time columns. Optional. */
+/* Canonical, firmware-supported IANA timezone name (e.g. "Europe/Amsterdam")
+ * echoed in the MQTT envelope so the cloud derives local-time columns.
+ * Optional. Invalid stored values fail closed instead of being returned. */
 esp_err_t device_config_get_timezone(char *buf, size_t len);
 /* UTC epoch of the provisioning-image build (written by tools/build_nvs_image.py
  * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
@@ -54,6 +55,8 @@ esp_err_t device_config_set_device_name(const char *val);
 esp_err_t device_config_set_device_version(const char *val);
 esp_err_t device_config_set_device_firmware(const char *val);
 esp_err_t device_config_set_firmware_version(const char *val);
+/* Trims/canonicalizes supported values (including legacy AMT ->
+ * Europe/Amsterdam) and rejects unknown zones with ESP_ERR_INVALID_ARG. */
 esp_err_t device_config_set_timezone(const char *val);
 
 #ifdef __cplusplus
