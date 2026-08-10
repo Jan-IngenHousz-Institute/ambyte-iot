@@ -57,14 +57,17 @@ jobs:
           - os: windows-latest
             label: windows
             binary: dist/ambyte-flash-gui.exe
+            asset: ambyte-flash-gui-windows.exe
           - os: ubuntu-latest
             label: linux
             binary: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-linux
           - os: macos-latest
             label: macos
-            # --windowed on macOS emits an .app bundle; ship that (zipped),
-            # not the bare Mach-O next to it.
-            binary: dist/ambyte-flash-gui.app
+            # Release assets must be files, so ship the standalone Mach-O
+            # executable rather than wrapping the .app directory in a zip.
+            binary: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -98,20 +101,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p out
-          case "${{ matrix.label }}" in
-            macos)
-              # ditto preserves the .app bundle structure + exec bits.
-              ditto -c -k --keepParent "dist/ambyte-flash-gui.app" \
-                "out/ambyte-flash-gui-macos.zip"
-              ;;
-            linux)
-              chmod +x dist/ambyte-flash-gui
-              tar -czf out/ambyte-flash-gui-linux.tar.gz -C dist ambyte-flash-gui
-              ;;
-            windows)
-              7z a out/ambyte-flash-gui-windows.zip ./dist/ambyte-flash-gui.exe
-              ;;
-          esac
+          cp "${{ matrix.binary }}" "out/${{ matrix.asset }}"
+          if [[ "${{ matrix.label }}" != "windows" ]]; then
+            chmod +x "out/${{ matrix.asset }}"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
