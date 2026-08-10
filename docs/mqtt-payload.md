@@ -69,9 +69,8 @@ shapes — v3 changes only the MEASUREMENT sample element.
     "name": "SS",                       // free-form label (Lua/user metadata); OPTIONAL
     "id": "b1946ac9-…",                 // registered openJII protocol id; OPTIONAL —
                                         //   present only when the run was launched from
-                                        //   a platform protocol. On the lean ingest
-                                        //   topic (no {protocolId} segment) this is the
-                                        //   pipeline's ONLY protocol attribution.
+                                        //   a platform protocol. See the delivery note
+                                        //   below: no Ambyte-side mechanism exists yet.
     "cmd": "arrun 1,0,2,0,0,59,0,1,0,1",// replayable device-vocabulary command
     "segments": [                       // decoded stimulus, one per arrun line
       { "pulses": 59, "freq": 1, "actinic": 0 }   // actinic = post-PAR→DAC byte
@@ -99,6 +98,17 @@ Notes:
 - Everything under `protocol` describes the **requested** stimulus. An
   interrupted run is not currently marked; consumers detect it by series
   lengths shorter than `segments` promise.
+- **`protocol.id` delivery is future work on the Ambyte path.** On the lean
+  ingest topic (no `{protocolId}` segment) this field is the pipeline's only
+  protocol attribution — but today **no mechanism delivers a protocol id to
+  an Ambyte**: the cloud→device script channel (`DeviceScriptMessage`) has no
+  backend sender and carries no protocol id, and the NVS `protocol_id` key is
+  static and unused. Until script delivery lands (and gains a `protocolId`
+  field the Ambyte stores per job and surfaces via the Lua job metadata key
+  `opts.metadata.protocol_id`), Ambyte-path measurements omit `protocol.id`
+  and land with NULL protocol attribution on the lean topic — deliberately
+  visible here rather than silently "optional". Direct/app-path producers
+  fill it from the workbook's protocol context, which exists today.
 
 ## 4. Sensor-known vs transport-filled fields
 
@@ -106,7 +116,7 @@ The measurement object is produced twice; fields split by who can know them:
 
 | class | fields | Ambyte path | direct/app path |
 |---|---|---|---|
-| sensor-known (bit-identical from both producers) | `schema`, `device`, `series`, `protocol.segments`, `protocol.cal_version`, `protocol.tick_factor`, `time.duration_ms` | decoded from the binary FSM arrays | emitted by the AMBIT firmware itself |
+| sensor-known (identical from both producers, given §5's encoding rules) | `schema`, `device`, `series`, `protocol.segments`, `protocol.cal_version`, `protocol.tick_factor`, `time.duration_ms` | series decoded from the binary FSM arrays; `segments` from the sent run bytes; `cal_version`/`tick_factor` from the cal-struct read (cmd 33) | emitted by the AMBIT firmware itself |
 | transport-filled (the sensor has no wall clock or ID counter) | `time.start_utc`, `time.end_utc`, `measure_id`, `channel`, `tag`, `protocol.name`, `protocol.id`, `protocol.cmd`, `protocol.gains`, `protocol.currents` | Ambyte clock, event log, Lua job metadata | host app (phone/browser) clock and protocol context |
 
 `measure_id` and `channel` are therefore **optional**: a host without an event
@@ -147,10 +157,31 @@ Fixed mapping from the AMBIT's FSM array index (send order in `PAM.cpp` /
 | 8 *(new)* | — | → `leaf_temp.t` | — | env sample offsets, ms since run start (additive AMBIT array) |
 
 Unit names come from the SenML units registry (RFC 8428): `count`, `Cel`.
-Unknown future indices keep the `arr<idx>` fallback. There is still **no
-derived `fluo` series** — the ratio is `fluo_630_signal[i] / fluo_630_ref[i]`
-downstream (ref 0 → 0). Values are uint16-clamped on the wire: a sample equal
-to **65535 means saturated**.
+Unknown future indices keep the `arr<idx>` fallback — under v3 an unknown
+array is emitted as a series object with `u: "count"` and (`t0`,`dt`) of the
+main sample clock. (Note: an idx-8-aware AMBIT publishing through a pre-v3
+Ambyte shows up as a v2 `arr8` key — those ARE device-recorded env offsets,
+and the compat view may use them.) There is still **no derived `fluo`
+series** — the ratio is `fluo_630_signal[i] / fluo_630_ref[i]` downstream
+(ref 0 → 0).
+
+### Value encoding rules (normative for both producers)
+
+Two independent emitters must produce byte-identical values; therefore:
+
+- **`count` series values are integers in 0…65535.** Producers MUST clamp to
+  65535 before emitting — the clamp is part of the contract, not a wire
+  artifact. (On the Ambyte path the binary wire already clamps; the AMBIT's
+  direct JSON emitter must clamp itself, since its internal values exceed
+  uint16.) A value of exactly **65535 means saturated**.
+- **`leaf_temp` values**: fixed two fractional digits (`25.29`, `24.60`) —
+  the source is centi-°C.
+- **`dt`, `t0`, `t` values**: seconds, rendered as `%.4f` with trailing
+  zeros then a trailing dot stripped (`0.854`, `2`, `42.8`, `6.832`).
+  Consumers must not assume more than 0.1 ms resolution.
+- Plain decimal JSON numbers only — no exponent notation, no `NaN`/`Infinity`.
+  An unavailable field is omitted, never null (JSON `null` is reserved for
+  the envelope's v2-era `channel`/`device` semantics).
 
 ## 6. Time model (normative)
 
@@ -162,8 +193,9 @@ t_ms(i) = time.start_utc + 1000 · (
           | t0 + i · dt              otherwise )
 ```
 
-with `t`, `t0`, `dt` in **seconds relative to run start**. Precedence:
-explicit `t` wins over (`t0`,`dt`).
+with `t`, `t0`, `dt` in **seconds relative to run start**. A series carries
+exactly one of the two forms: explicit `t`, or regular (`t0`,`dt`). There is
+no third encoding.
 
 **True sample period.** The nominal `freq` (Hz) in `protocol.segments` is not
 the real point rate; the true period is `dt = tick_factor / freq` seconds
@@ -172,19 +204,11 @@ the real point rate; the true period is `dt = tick_factor / freq` seconds
 
 **Multi-segment runs.** Series arrays concatenate across segments. When all
 segments share one `dt`, a single (`t0`,`dt`) covers the run. When segment
-frequencies differ, the series carries a piecewise descriptor instead:
-
-```jsonc
-"fluo_630_signal": {
-  "u": "count",
-  "seg": [ { "t0": 0.0,    "dt": 0.854,  "n": 59 },
-           { "t0": 50.386, "dt": 0.0854, "n": 100 } ],
-  "v": [ /* 159 values */ ]
-}
-```
-
-Segment *k+1*'s `t0` = segment *k*'s `t0 + n·dt` (contiguous timeline).
-Precedence overall: `t` > `seg` > (`t0`,`dt`).
+frequencies differ, the producer emits **explicit `t`** for the whole series
+(segment *k*'s samples continue the timeline: segment *k+1* starts at segment
+*k*'s `t0 + n_k·dt_k`). Explicit `t` costs bytes only on mixed-frequency
+runs, and keeps every consumer two-form — a piecewise descriptor was
+considered and rejected (decision log, §11).
 
 **Subsampled ambient channels.** With subsampling = 2 the ambient series are
 the mean of 8 consecutive pulses; the producer emits
@@ -197,18 +221,34 @@ self-describing.
 `dt = 0.854/1 = 0.854 s` → `fluo_630_signal[10]` is at
 `1785965160359 + 1000·(0 + 10·0.854)` = `1785965168899` (epoch ms).
 
-**Env timestamps.** `leaf_temp` cadence is irregular (≈ one sample per
-`8/freq` s, gated by sleep/actinic conditions), so it always uses explicit
-`t`. The offsets come from the AMBIT's array idx 8. Until the sensor firmware
-ships idx 8, the Ambyte emits **estimated** offsets from its gating model and
-flags them:
+**Env timestamps.** `leaf_temp` cadence is irregular, so it always uses
+explicit `t`. The offsets come from the AMBIT's array idx 8 (device-recorded).
+Until the sensor firmware ships idx 8, the producer emits **estimated**
+offsets and flags them:
 
 ```jsonc
 "leaf_temp": { "u": "Cel", "t": [0, 8.6, …], "t_est": true, "v": [ … ] }
 ```
 
-`t_est: true` = times are model-derived, ±1 sampling interval; absence of
-`t_est` = device-recorded.
+The estimator is **normative** (the v2 compat view, §8, must produce the same
+numbers). Given `n` = the number of `leaf_temp` values actually received,
+`freq₁` = the first segment's nominal frequency, and
+`duration_s = time.duration_ms / 1000`:
+
+```
+Δ = max(2.0, 8/freq₁)                    // firmware env cadence model
+if n > 1 and (n-1)·Δ > duration_s:       // clamp into the measured window
+    Δ = duration_s / (n-1)
+t_est[k] = k·Δ                           // k = 0 … n-1
+```
+
+The anchor is the firmware's pre-loop env sample at run start (`t = 0`);
+in-run samples are gated by a 2000 ms minimum spacing on a loop that wakes
+every `8/freq` s, hence `Δ = max(2.0, 8/freq₁)`. Runs that are ineligible for
+in-run env sampling (actinic ≥ 50, `freq ≥ 50`, or env disabled) produce
+exactly one sample at `t = 0`. Estimated times are accurate to about ±Δ;
+`t_est` absent means device-recorded. Consumers needing better than ±Δ must
+require idx-8 firmware.
 
 ## 7. Removed vs v2 (and where it went)
 
@@ -247,6 +287,12 @@ attribution on that topic comes exclusively from `protocol.id` (§3).
 Reference 59-point run: v2 ≈ 2.45 KB, v3 ≈ 2.55 KB (+4%). Caps that bound the
 design: `AMBIT_RUN_PAYLOAD_CAP` 64 000 B (run buffer),
 `AMBYTE_PUBLISH_MAX_BYTES` ≈ 68 KiB (build cap), 128 KiB AWS IoT hard limit.
+**Watch the metadata cap:** the Ambyte's per-event metadata blob is capped at
+`AMBIT_RUN_METADATA_CAP` 896 B; a worst-case 16-segment run plus
+`tick_factor` + `protocol.id` leaves only ~30 B headroom before user metadata
+(`protocol.name`) is silently dropped — the builder change (T4) must either
+raise the cap or fail loudly, and `protocol.cmd` (≤ ~522 B) must stay in the
+record's command column, not move into the metadata blob.
 gzip of `sample` (`_sample_encoding: "gzip+base64"`, already supported by the
 pipeline) is the deferred headroom lever; not part of v3.
 
@@ -258,6 +304,9 @@ pipeline) is the deferred headroom lever; not part of v3.
 | 2026-08-10 | `protocol.name` stays free-form; optional `protocol.id` joins the openJII `protocols` table and is the sole protocol attribution on the lean ingest topic. |
 | 2026-08-10 | `v` int replaced by self-identifying `schema` string; dual-read keyed on its presence. |
 | 2026-08-10 | Raw `timing` dropped from the payload; sensor duration surfaces as `time.duration_ms`. `timestamp_local` and `published` dropped as derivable/observable. |
+| 2026-08-10 | Time encodings are exactly two: explicit `t`, or regular (`t0`,`dt`). A piecewise per-segment descriptor (`seg`) was considered and rejected — mixed-frequency multi-segment runs emit explicit `t` instead, keeping every consumer two-form. |
+| 2026-08-10 | The `count` saturation clamp (65535) and the number-formatting rules (§5) are contract requirements on producers, not wire artifacts. |
+| 2026-08-10 | `t_est` estimator formula (§6) is normative so the firmware fallback and the SQL compat view agree. |
 
 ## 12. On-disk record
 
