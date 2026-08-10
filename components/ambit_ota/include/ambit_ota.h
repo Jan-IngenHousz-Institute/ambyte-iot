@@ -34,6 +34,7 @@ extern "C" {
 typedef struct {
     void (*workload_suspend)(void);   /* stop the Lua task during the update; NULL = skip */
     void (*workload_resume)(void);    /* restart it afterward; NULL = skip */
+    void (*ping_cache_invalidate)(void); /* force maintenance probes onto the wire */
     void (*comms_suspend)(void);      /* mqtt_client_stop — free TLS heap for the HTTPS download */
     void (*comms_resume)(void);       /* mqtt_client_start — after the update */
 

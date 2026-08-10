@@ -33,6 +33,10 @@
 #define AMBIT_OTA_ID_MAX       64
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
 #define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
+/* main.lua's longest normal autonomous trace is SS: 59 pulses at 1 Hz plus
+ * setup. Stopping Lua prevents a new trigger; this delay lets an already-started
+ * AMBIT run finish before maintenance probes the deliberately-silent UART. */
+#define AMBIT_IDLE_SETTLE_MS   65000U
 
 #define NVS_NS                 "ambit_ota"
 #define KEY_APPLIED            "applied_id"   /* id of the last *successfully* applied OTA */
@@ -464,6 +468,20 @@ static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
     return false;
 }
 
+/* Establish a deterministic maintenance window for identity and OTA sweeps.
+ * lua_runner_stop() can only unwind the host task; a trigger already accepted
+ * by an AMBIT continues autonomously and keeps its binary router quiet until the
+ * trace completes. Once that maximum interval has elapsed, discard cached ping
+ * failures captured during the run so every presence decision reaches the wire. */
+static void ambit_quiesce_for_idle(void)
+{
+    if (s_cfg.workload_suspend != NULL) {
+        s_cfg.workload_suspend();
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_IDLE_SETTLE_MS));
+    }
+    if (s_cfg.ping_cache_invalidate != NULL) s_cfg.ping_cache_invalidate();
+}
+
 /* ── one OTA request (single channel, or a sweep of all present channels) ──── */
 
 static void ambit_do_ota(const ambit_ota_req_t *r)
@@ -495,8 +513,9 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
 
     if (r->fleet_spread) wait_for_fleet_slot();
 
-    /* Quiesce: free the UART (stop Lua) and the heap/TLS (stop MQTT). */
-    if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
+    /* Quiesce: stop new measurements, wait for an autonomous run already in
+     * progress, force fresh presence probes, then free the TLS heap. */
+    ambit_quiesce_for_idle();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
     vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -596,14 +615,10 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
  * finish, then sweep in the resulting deterministic idle window. The longest
  * normal trace is the 59-pulse/1 Hz SS run (~59.3 s including setup); 65 s keeps
  * margin without approaching the host's 90 s correlated-query deadline. */
-#define AMBIT_VERSION_SETTLE_MS 65000U
 
 static void ambit_do_versions(const char *id)
 {
-    if (s_cfg.workload_suspend != NULL) {
-        s_cfg.workload_suspend();
-        vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_SETTLE_MS));
-    }
+    ambit_quiesce_for_idle();
 
     char esc_id[AMBIT_OTA_ID_MAX * 2 + 1] = "";
     json_escape(esc_id, sizeof esc_id, id);

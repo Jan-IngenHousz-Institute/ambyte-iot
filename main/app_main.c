@@ -1016,6 +1016,7 @@ void app_main(void)
     ambit_ota_config_t ambit_ota_cfg = {
         .workload_suspend  = app_workload_suspend,
         .workload_resume   = app_workload_resume,
+        .ping_cache_invalidate = uart_sensors_invalidate_ping_cache,
         .comms_suspend     = app_comms_suspend,
         .comms_resume      = app_comms_resume,
         .maintenance_begin = app_maintenance_begin,
