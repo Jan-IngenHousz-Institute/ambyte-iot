@@ -18,6 +18,10 @@ test("firmware release excludes all lua paths", () => {
 test("the flash GUI belongs to no release unit", () => {
   assert.equal(isRelevantFile("flash_gui/gui.py", "firmware"), false);
   assert.equal(isRelevantFile("flash_gui/vendor/nvs_partition_gen.py", "firmware"), false);
+  assert.equal(
+    isRelevantFile(".github/workflows/flash-gui-build.yml", "firmware"),
+    false,
+  );
   assert.equal(isRelevantFile("flash_gui/gui.py", "lua"), false);
   // Not to be confused with on-device flash paths.
   assert.equal(isRelevantFile("components/ambit_flash/ambit_flash.c", "firmware"), true);
