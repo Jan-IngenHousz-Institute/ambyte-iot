@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flash_gui import config                                   # noqa: E402
+from flash_gui import openjii_client, release_fetch, tls       # noqa: E402
 from flash_gui.ambyte_serial import expand_mac_token           # noqa: E402
 from flash_gui.nvs_builder import (AMAZON_ROOT_CA1,            # noqa: E402
                                    NvsBuildError, ProvisioningPlan,
@@ -24,6 +25,59 @@ from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
 
 MAC = "E8:F6:0A:B1:1F:34"
 THING = "ambyte_E8:F6:0A:B1:1F:34"
+
+
+# ── frozen-app TLS trust ────────────────────────────────────────────────────
+def test_tls_context_adds_bundled_ca_to_platform_roots(monkeypatch):
+    class FakeContext:
+        def __init__(self):
+            self.loaded_cafile = None
+
+        def load_verify_locations(self, *, cafile):
+            self.loaded_cafile = cafile
+
+    context = FakeContext()
+    tls.ssl_context.cache_clear()
+    monkeypatch.setattr(tls.ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr(tls.certifi, "where", lambda: "/bundle/cacert.pem")
+
+    assert tls.ssl_context() is context
+    assert context.loaded_cafile == "/bundle/cacert.pem"
+    tls.ssl_context.cache_clear()
+
+
+@pytest.mark.parametrize("module", [openjii_client, release_fetch])
+def test_https_clients_pass_portable_tls_context(monkeypatch, module):
+    sentinel = object()
+    seen = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{}'
+
+    def fake_urlopen(_request, **kwargs):
+        seen.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(module, "ssl_context", lambda: sentinel)
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+
+    if module is openjii_client:
+        client = openjii_client.OpenJIIClient(config.ENVIRONMENTS["dev"],
+                                              "jii_test")
+        client._request("GET", "/health")
+    else:
+        release_fetch._get_json("https://api.github.com/test")
+
+    assert seen["context"] is sentinel
 
 
 def make_plan(**over) -> ProvisioningPlan:
