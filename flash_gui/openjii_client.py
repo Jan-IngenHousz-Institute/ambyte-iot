@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import CERTS_DIR, OPENJII_DEVICE_TYPE, Environment
+from .tls import ssl_context
 
 USER_AGENT = "ambyte-flash-gui"
 
@@ -89,7 +90,8 @@ class OpenJIIClient:
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(
+                    req, timeout=timeout, context=ssl_context()) as resp:
                 raw = resp.read().decode("utf-8") or ""
                 return resp.status, (json.loads(raw) if raw.strip() else None)
         except urllib.error.HTTPError as exc:

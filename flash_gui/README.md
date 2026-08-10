@@ -25,6 +25,11 @@ operator's machine:
 The binaries are unsigned: expect a SmartScreen "unrecognized app" prompt on
 Windows and a Gatekeeper right-click-Open dance on macOS.
 
+The executables bundle Mozilla's CA root store through `certifi`; HTTPS does
+not depend on Python's build-machine certificate paths existing on the
+operator's computer. Platform roots are retained as well, so managed machines
+can continue to trust locally installed proxy certificates.
+
 ## Operator flow (10 boards in a row)
 
 Once per session:

@@ -25,6 +25,7 @@ import zipfile
 from pathlib import Path
 
 from .config import CACHE_DIR, FIRMWARE_REPO
+from .tls import ssl_context
 
 API_ROOT = "https://api.github.com"
 ASSET_PREFIX = "ambyte-iot-v"
@@ -82,7 +83,8 @@ def _auth_headers() -> dict[str, str]:
 def _get_json(url: str) -> dict:
     req = urllib.request.Request(url, headers=_auth_headers())
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(
+                req, timeout=30, context=ssl_context()) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -207,7 +209,9 @@ def _download(url: str, dest: Path, expect_size: int | None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as out:
+        with urllib.request.urlopen(
+                req, timeout=120, context=ssl_context()) as resp, \
+                tmp.open("wb") as out:
             shutil.copyfileobj(resp, out)
     except urllib.error.URLError as exc:
         tmp.unlink(missing_ok=True)
