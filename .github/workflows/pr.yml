@@ -146,6 +146,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install PlatformIO
+        run: |
+          python -m venv "${RUNNER_TEMP}/platformio"
+          "${RUNNER_TEMP}/platformio/bin/pip" install --disable-pip-version-check platformio==6.1.19
+
+      - name: Bootstrap PlatformIO project packages
+        run: "${RUNNER_TEMP}/platformio/bin/pio pkg install -e esp32-s3-devkitm-1"
+
       - name: Test Python tooling
         run: python -m unittest discover -s tests -v
 
@@ -153,12 +161,6 @@ jobs:
         run: |
           mkdir -p dist
           cp release-preview.md dist/release-preview.md
-
-      - name: Install PlatformIO
-        if: steps.scope.outputs.firmware-build-required == 'true'
-        run: |
-          python -m venv "${RUNNER_TEMP}/platformio"
-          "${RUNNER_TEMP}/platformio/bin/pip" install --disable-pip-version-check platformio==6.1.19
 
       - name: Build unprovisioned firmware
         if: steps.scope.outputs.firmware-build-required == 'true'

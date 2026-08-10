@@ -85,7 +85,12 @@ class LuaWorkflowTest(unittest.TestCase):
         )
         self.assertIn('git reset --soft "${PR_MERGE_BASE}"', PR_WORKFLOW)
         condition = "if: steps.scope.outputs.firmware-build-required == 'true'"
-        self.assertEqual(PR_WORKFLOW.count(condition), 3)
+        self.assertEqual(PR_WORKFLOW.count(condition), 2)
+        package_bootstrap = PR_WORKFLOW.index(
+            'pio pkg install -e esp32-s3-devkitm-1'
+        )
+        host_tests = PR_WORKFLOW.index("python -m unittest discover -s tests -v")
+        self.assertLess(package_bootstrap, host_tests)
         self.assertIn("python -m unittest discover -s tests -v", PR_WORKFLOW)
         self.assertIn("cp release-preview.md dist/release-preview.md", PR_WORKFLOW)
 
