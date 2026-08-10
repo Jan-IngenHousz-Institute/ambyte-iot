@@ -38,6 +38,12 @@ void      uart_sensors_flash_session_end(uint8_t ch);
 esp_err_t uart_sensors_enter_download(uint8_t ch);   /* session must be held */
 esp_err_t uart_sensors_run_app(uint8_t ch);          /* session must be held */
 
+/* Forget positive and negative ping results for every channel. Maintenance
+ * operations call this only after stopping Lua and waiting for autonomous AMBIT
+ * measurements to finish, so their presence checks always reach the wire rather
+ * than reusing a five-minute negative result captured while an AMBIT was busy. */
+void uart_sensors_invalidate_ping_cache(void);
+
 /* Port-adapter getters — return function pointers wired into device_commands */
 uart_sensor_query_fn       uart_sensors_get_query_fn(void);
 uart_sensor_ping_fn        uart_sensors_get_ping_fn(void);

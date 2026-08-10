@@ -663,6 +663,14 @@ static esp_err_t do_status(uint8_t channel, uart_sensor_state_t *out)
     return ESP_OK;
 }
 
+void uart_sensors_invalidate_ping_cache(void)
+{
+    if (!s_inited) return;
+    for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++) {
+        s_ch[channel].ping_ts = 0;
+    }
+}
+
 /* ── Init ──────────────────────────────────────────────────────────── */
 
 esp_err_t uart_sensors_init(void)

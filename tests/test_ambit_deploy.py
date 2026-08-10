@@ -1161,19 +1161,55 @@ class MqttOperationTest(unittest.TestCase):
         source = (ROOT / "components/ambit_ota/ambit_ota.c").read_text(
             encoding="utf-8"
         )
+        helper = source.split("static void ambit_quiesce_for_idle", 1)[1].split(
+            "static void ambit_do_ota", 1
+        )[0]
+        suspend = helper.index("s_cfg.workload_suspend();")
+        settle = helper.index("vTaskDelay(pdMS_TO_TICKS(AMBIT_IDLE_SETTLE_MS));")
+        invalidate = helper.index("s_cfg.ping_cache_invalidate()")
+        self.assertLess(suspend, settle)
+        self.assertLess(settle, invalidate)
+
         body = source.split("static void ambit_do_versions", 1)[1].split(
             "static void ambit_do_probe", 1
         )[0]
-        suspend = body.index("s_cfg.workload_suspend();")
-        settle = body.index("vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_SETTLE_MS));")
+        quiesce = body.index("ambit_quiesce_for_idle();")
         sweep = body.index("for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++)")
         publish = body.index("s_cfg.publish(s_cfg.status_topic")
         resume = body.index("s_cfg.workload_resume()")
-        self.assertLess(suspend, settle)
-        self.assertLess(settle, sweep)
+        self.assertLess(quiesce, sweep)
         self.assertLess(sweep, publish)
         self.assertLess(publish, resume)
-        self.assertIn("#define AMBIT_VERSION_SETTLE_MS 65000U", source)
+        self.assertIn("#define AMBIT_IDLE_SETTLE_MS   65000U", source)
+
+    def test_firmware_ota_waits_for_idle_and_invalidates_ping_cache(self) -> None:
+        source = (ROOT / "components/ambit_ota/ambit_ota.c").read_text(
+            encoding="utf-8"
+        )
+        body = source.split("static void ambit_do_ota", 1)[1].split(
+            "static void ambit_do_versions", 1
+        )[0]
+        jitter = body.index("wait_for_fleet_slot()")
+        quiesce = body.index("ambit_quiesce_for_idle();")
+        comms = body.index("s_cfg.comms_suspend()")
+        download = body.index("http_get_to_file(")
+        ping = body.index("cmd_uart_ping(c, &connected)")
+        self.assertLess(jitter, quiesce)
+        self.assertLess(quiesce, comms)
+        self.assertLess(comms, download)
+        self.assertLess(download, ping)
+
+        uart_source = (ROOT / "components/uart_sensors/uart_sensors.c").read_text(
+            encoding="utf-8"
+        )
+        invalidator = uart_source.split(
+            "void uart_sensors_invalidate_ping_cache", 1
+        )[1].split("/* ── Init", 1)[0]
+        self.assertIn(
+            "for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++)",
+            invalidator,
+        )
+        self.assertIn("s_ch[channel].ping_ts = 0;", invalidator)
 
 
 if __name__ == "__main__":
