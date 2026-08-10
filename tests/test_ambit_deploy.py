@@ -1182,6 +1182,20 @@ class MqttOperationTest(unittest.TestCase):
         self.assertLess(publish, resume)
         self.assertIn("#define AMBIT_IDLE_SETTLE_MS   65000U", source)
 
+        retry = source.split("static bool ambit_read_fw_version", 1)[1].split(
+            "static void ambit_do_versions", 1
+        )[0]
+        self.assertIn(
+            "attempt < AMBIT_VERSION_READ_ATTEMPTS", retry
+        )
+        read = retry.index("cmd_ambit_get_info(")
+        delay = retry.index("vTaskDelay(pdMS_TO_TICKS(AMBIT_VERSION_RETRY_MS));")
+        self.assertLess(read, delay)
+        self.assertIn("#define AMBIT_VERSION_READ_ATTEMPTS 2U", source)
+        self.assertIn("#define AMBIT_VERSION_RETRY_MS      250U", source)
+        self.assertIn("ambit_read_fw_version(c, &fw)", body)
+        self.assertNotIn("cmd_ambit_get_info(", body)
+
     def test_firmware_ota_waits_for_idle_and_invalidates_ping_cache(self) -> None:
         source = (ROOT / "components/ambit_ota/ambit_ota.c").read_text(
             encoding="utf-8"
