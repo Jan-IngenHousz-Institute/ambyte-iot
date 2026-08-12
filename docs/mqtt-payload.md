@@ -687,8 +687,48 @@ production-builder fixture locks both exact sizes and that bound.
 
 The increase is required schema/identity, protocol/time, and self-describing
 series naming/unit/time-model overhead. gzip of `sample`
-(`_sample_encoding: "gzip+base64"`, already supported by the pipeline) remains
-the deferred headroom lever and is not part of v3.
+(`_sample_encoding: "gzip+base64"`, already supported by the pipeline) is the
+headroom lever and is implemented as an opt-in transport switch (§14a); it is
+not part of the v3 payload schema itself.
+
+## 14a. Transport gzip (opt-in, default off)
+
+The publisher can gzip the v3 `sample` before the envelope is built. The
+switch is the NVS-backed config key `publish_gzip` (`cfg set publish_gzip 1`,
+read per publish, no reboot needed) and it **defaults to off**: fleets publish
+plain v3 JSON until the OpenJII ingest confirms gzip support for this producer,
+then the flag flips without a firmware change.
+
+With the flag on, a canonical v3 event publishes as:
+
+```json
+{
+  "sample": "<base64(gzip("[<canonical v3 object>]"))>",
+  "_sample_encoding": "gzip+base64",
+  "timestamp": "…", "device_id": "…", "device_name": "…",
+  "device_version": "…", "device_firmware": "…"
+}
+```
+
+Contract points:
+
+- The compressed text is exactly the plain envelope's `sample` array
+  (`[<object>]`), so Silver's existing `decompress_sample_value`
+  (`gzip.decompress(base64.b64decode(sample))`) restores one identical shape
+  for both transport modes. Only `sample`/`_sample_encoding` differ; the outer
+  envelope stays plain JSON for broker routing and raw storage.
+- Fail-open to plain: any compression failure (allocation, compressor error)
+  or a not-strictly-smaller result publishes the ordinary plain v3 envelope.
+  Enabling the flag can therefore never lose, delay, or grow a measurement.
+- Scope: canonical v3 families only. The frozen v2 backlog/fallback path and
+  the on-disk event_log record never compress; the flag changes transport
+  encoding, not storage.
+- Mechanism: RFC 1952 gzip (header `1f 8b 08 00 … ff`, CRC-32 + ISIZE trailer)
+  around a raw-DEFLATE body from the ESP32-S3 ROM tdefl compressor (128
+  probes ≈ zlib level 6 — the benchmarked setting: the 60-point compact v3
+  fixture measured 1,707 B plain vs 920 B gzip+base64). Framing, CRC-32, and
+  base64 live in the host-tested domain module `payload_gzip.c`; the publish
+  cap, heap gate, and MQTT window all account the real compressed envelope.
 
 Caps that bound the design: `AMBIT_RUN_PAYLOAD_CAP` 63,000 B (62,999 payload
 bytes), `AMBYTE_PUBLISH_MAX_BYTES` ≈ 68 KiB (build cap), and the 128 KiB AWS IoT
@@ -713,6 +753,7 @@ unstorable. `protocol.cmd` (≤ ~522 B) stays in the record's command column.
 | 2026-08-10 | `ambit.trace/3.sensor_id` is the stable inventory join key; heartbeat attached-sensor references are cache-only and carry no required live-presence state. |
 | 2026-08-10 | The production type-2 59-point full-envelope size gate is ≤ 13%; measured raw-wire v2→v3 growth is 1,866→2,076 B (+11.25%). gzip remains deferred. |
 | 2026-08-10 | New firmware's lossless v2 trace fallback and the existing `ambit.spec`, `ambit.temp`, and `db.store_event` v2 families are permanent; platform dual-read support has no retirement date. |
+| 2026-08-12 | Transport gzip of the v3 `sample` (`_sample_encoding: "gzip+base64"`, §14a) ships behind the NVS flag `publish_gzip`, default OFF, fail-open to plain JSON; the compressed text is byte-identical to the plain `sample` array so Silver's existing decoder needs no change. Chosen over SenML JSON/CBOR after exact same-trace benchmarks (920 B vs 1,740/1,900 B gzipped). |
 
 ## 16. On-disk record
 

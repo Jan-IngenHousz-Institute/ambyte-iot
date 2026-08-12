@@ -260,6 +260,8 @@ A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (de
 
 Each stored event becomes exactly one MQTT message. New AMBIT runs, gateway heartbeats, and sensor inventory changes store complete canonical `ambit.trace/3`, `ambyte.telemetry/1`, and `ambit.device/1` objects in the existing event-log payload column; the publisher places that object directly in the unchanged outer `sample` envelope. Old v2 SD backlog and generic Lua events retain the legacy v2 builder, so queued data is not rewritten. `channel` (`uart_<n>` / null) identifies the port and `device` is the human sensor name or gateway identity. The normative fields, units, time models, formatting, and dual-read rule are in [docs/mqtt-payload.md](docs/mqtt-payload.md).
 
+Transport gzip is opt-in and **off by default**: `cfg set publish_gzip 1` makes canonical v3 publishes carry `sample` as `base64(gzip(...))` with the pipeline's existing `_sample_encoding: "gzip+base64"` marker (deflate from the ESP32-S3 ROM tdefl, kept only when strictly smaller, fail-open to plain JSON). Details in docs/mqtt-payload.md §14a.
+
 ---
 
 ## AMBIT integration

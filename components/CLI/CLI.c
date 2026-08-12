@@ -1448,6 +1448,7 @@ static const cfg_entry_t s_cfg_table[] = {
     { "device_firmware",  device_config_get_device_firmware,  device_config_set_device_firmware },
     { "firmware_version", device_config_get_firmware_version, device_config_set_firmware_version },
     { "timezone",         device_config_get_timezone,         device_config_set_timezone },
+    { "publish_gzip",     device_config_get_publish_gzip,     device_config_set_publish_gzip },
 };
 
 static const cfg_entry_t *cfg_find(const char *key)

@@ -12,8 +12,15 @@
 
 #include "ambit_protocol.h"
 #include "clock_trust.h"
+#include "payload_gzip.h"
 #include "payload_v3.h"
 #include "timezone.h"
+
+/* ESP32-S3 ROM miniz: the tdefl DEFLATE compressor lives in mask ROM (see
+ * esp32s3.rom.ld), so transport gzip costs no flash. ROM miniz is built with
+ * MINIZ_NO_MALLOC — the *_mem_to_heap conveniences are unusable — so the
+ * publish path drives tdefl_init/tdefl_compress with its own heap buffers. */
+#include "miniz.h"
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -63,6 +70,19 @@
 
 #define DC_V3_EVENT_ENVELOPE_FMT \
         "{\"sample\":[%s],\"timestamp\":\"%s\",%s%s" \
+        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+
+/* Gzip transport variant of the v3 envelope, emitted only while the runtime
+ * publish_gzip switch is on AND the compressed form is strictly smaller.
+ * `sample` becomes base64(gzip("[<canonical v3 object>]")) — the exact JSON
+ * text the plain envelope would splice — and `_sample_encoding` is the marker
+ * the OpenJII Silver layer already reverses for the mobile uploader
+ * (decompress_sample_value). The outer envelope stays plain JSON so broker
+ * routing and raw storage are unaffected. */
+#define DC_V3_GZ_EVENT_ENVELOPE_FMT \
+        "{\"sample\":\"%s\",\"_sample_encoding\":\"gzip+base64\"," \
+        "\"timestamp\":\"%s\",%s%s" \
         "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
         "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
 
@@ -1028,6 +1048,65 @@ static unsigned note_publish_stuck(int64_t mid)
     return slot->failures;
 }
 
+/* Raw-DEFLATE provider for payload_gzip using the ROM tdefl compressor. 128
+ * probes ≈ zlib level 6 (the exact benchmarked setting: 690 B for the 60-point
+ * compact v3 fixture vs 733 B at level 1). The compressor state is a large
+ * single-shot heap block (~160 KiB with the ROM's TDEFL_LESS_MEMORY build), so
+ * SPIRAM_MALLOC_ALWAYSINTERNAL routes it to PSRAM and it never competes with
+ * the internal/DMA pools the publish heap gate protects. */
+static bool dc_rom_deflate(void *ctx, const uint8_t *src, size_t src_len,
+                           uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    (void)ctx;
+    tdefl_compressor *comp = malloc(sizeof(tdefl_compressor));
+    if (comp == NULL) return false;
+    bool ok = tdefl_init(comp, NULL, NULL, 128) == TDEFL_STATUS_OKAY;
+    size_t in_len = src_len;
+    size_t produced = out_cap;
+    if (ok) {
+        ok = tdefl_compress(comp, src, &in_len, out, &produced, TDEFL_FINISH)
+                 == TDEFL_STATUS_DONE
+             && in_len == src_len;
+    }
+    free(comp);
+    if (!ok) return false;
+    *out_len = produced;
+    return true;
+}
+
+/* base64(gzip("[<payload_json>]")) for the gzip transport envelope, or NULL on
+ * any allocation/compression failure — the caller then publishes the plain v3
+ * envelope, so a failed gzip can never lose or delay a measurement. All
+ * buffers are transient and freed here; only the returned base64 string (heap,
+ * caller frees) outlives the call. */
+static char *dc_gzip_sample_b64(const char *payload_json)
+{
+    size_t payload_len = strlen(payload_json);
+    size_t src_len = payload_len + 2U; /* wrapping "[" + "]" */
+    char *src = malloc(src_len);
+    if (src == NULL) return NULL;
+    src[0] = '[';
+    memcpy(src + 1, payload_json, payload_len);
+    src[src_len - 1U] = ']';
+
+    size_t scratch_cap = payload_gzip_stream_cap(payload_gzip_deflate_bound(src_len));
+    uint8_t *scratch = malloc(scratch_cap);
+    size_t b64_cap = payload_gzip_base64_cap(scratch_cap);
+    char *b64 = malloc(b64_cap);
+    bool ok = scratch != NULL && b64 != NULL &&
+              payload_gzip_encode_base64((const uint8_t *)src, src_len,
+                                         dc_rom_deflate, NULL,
+                                         scratch, scratch_cap,
+                                         b64, b64_cap, NULL);
+    free(scratch);
+    free(src);
+    if (!ok) {
+        free(b64);
+        return NULL;
+    }
+    return b64;
+}
+
 cmd_result_t cmd_mqtt_publish_next_event(void)
 {
     if (!s_initialized || s_cfg.publish == NULL ||
@@ -1152,6 +1231,20 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
 
+    /* Transport gzip attempt (canonical v3 only — the frozen v2 backlog path
+     * never changes shape). Runs before sizing so the publish cap, heap gate
+     * and MQTT window all see the real envelope length. Failure or a
+     * not-smaller result falls back to the plain envelope. */
+    char *gz_b64 = NULL;
+    if (canonical_v3 && s_cfg.publish_gzip_enabled != NULL &&
+        s_cfg.publish_gzip_enabled()) {
+        gz_b64 = dc_gzip_sample_b64(e.payload_json);
+        if (gz_b64 == NULL) {
+            ESP_LOGW(TAG, "event id=%lld gzip transport failed — publishing plain v3",
+                     (long long)e.measure_id);
+        }
+    }
+
     /* Size the exact serialized envelope before any large allocation. This lets
      * a lowered publish cap identify a valid 64-KiB stored record and archive it
      * without first tripping the ordinary internal/DMA heap gate. */
@@ -1160,6 +1253,19 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         n = snprintf(NULL, 0, DC_V3_EVENT_ENVELOPE_FMT,
                      e.payload_json, meas_ts, battpart, tzpart,
                      s_mac_str, dn, dv, fw);
+        if (gz_b64 != NULL) {
+            int n_gz = snprintf(NULL, 0, DC_V3_GZ_EVENT_ENVELOPE_FMT,
+                                gz_b64, meas_ts, battpart, tzpart,
+                                s_mac_str, dn, dv, fw);
+            /* Keep gzip only when strictly smaller: base64 costs 4/3× and tiny
+             * telemetry objects can lose to their own gzip header. */
+            if (n_gz >= 0 && (n < 0 || n_gz < n)) {
+                n = n_gz;
+            } else {
+                free(gz_b64);
+                gz_b64 = NULL;
+            }
+        }
     } else {
         n = snprintf(NULL, 0, DC_EVENT_ENVELOPE_FMT,
             (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
@@ -1170,6 +1276,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
     if (n < 0) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(ESP_FAIL, "envelope sizing failed");
@@ -1183,6 +1290,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (payload_len > AMBYTE_PUBLISH_MAX_BYTES) {
         int64_t mid = e.measure_id;
         free(cmdbuf);
+        free(gz_b64);
         esp_err_t pending_err = s_cfg.mark_event_pending(mid);
         if (s_oversize_warned_id != mid) {
             ESP_LOGW(TAG, "event id=%lld envelope %u B exceeds AMBYTE_PUBLISH_MAX_BYTES=%u — preserving in quarantine sidecar",
@@ -1236,6 +1344,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
     if (heap_tight) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         int64_t mid = e.measure_id;
         measurement_event_free(&e);
@@ -1252,12 +1361,17 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     char *payload = malloc(cap);
     if (payload == NULL) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
     }
 
-    if (canonical_v3) {
+    if (canonical_v3 && gz_b64 != NULL) {
+        n = snprintf(payload, cap, DC_V3_GZ_EVENT_ENVELOPE_FMT,
+                     gz_b64, meas_ts, battpart, tzpart,
+                     s_mac_str, dn, dv, fw);
+    } else if (canonical_v3) {
         n = snprintf(payload, cap, DC_V3_EVENT_ENVELOPE_FMT,
                      e.payload_json, meas_ts, battpart, tzpart,
                      s_mac_str, dn, dv, fw);
@@ -1270,6 +1384,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
             s_mac_str, dn, dv, fw);
     }
     free(cmdbuf);
+    free(gz_b64);
 
     if (n < 0 || (size_t)n >= cap) {
         free(payload);

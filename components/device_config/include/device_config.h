@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -58,6 +59,17 @@ esp_err_t device_config_set_firmware_version(const char *val);
 /* Trims/canonicalizes supported values (including legacy AMT ->
  * Europe/Amsterdam) and rejects unknown zones with ESP_ERR_INVALID_ARG. */
 esp_err_t device_config_set_timezone(const char *val);
+
+/* Transport gzip of the published v3 measurement `sample`
+ * (`_sample_encoding: "gzip+base64"`). Absent defaults to DISABLED so a fleet
+ * keeps publishing plain JSON until the OpenJII ingest confirms gzip support;
+ * flip per device with `cfg set publish_gzip 1` (no reboot needed). The bool
+ * reader is RAM-cached for the per-publish check in the MQTT drain path; the
+ * string get/set pair serves the CLI cfg table ("0"/"1", set also accepts
+ * on/off/true/false). */
+bool device_config_publish_gzip_enabled(void);
+esp_err_t device_config_get_publish_gzip(char *buf, size_t len);
+esp_err_t device_config_set_publish_gzip(const char *val);
 
 #ifdef __cplusplus
 }

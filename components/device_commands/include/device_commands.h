@@ -92,6 +92,14 @@ typedef struct {
      * composition acyclic: sync_runner already depends on device_commands. */
     esp_err_t                         (*last_wd_reboot_reason)(char *out, size_t out_cap);
     bool                              (*watchdog_armed)(void);
+
+    /* Transport gzip switch for canonical v3 publishes, read per publish so a
+     * `cfg set publish_gzip 1` takes effect without a reboot (wired to
+     * device_config_publish_gzip_enabled). NULL or false = plain JSON — the
+     * deploy-now default until the OpenJII ingest confirms gzip support. Only
+     * the envelope encoding changes; storage and the legacy v2 path never
+     * compress. */
+    bool                              (*publish_gzip_enabled)(void);
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);

@@ -1250,6 +1250,7 @@ void app_main(void)
         .request_gc             = lua_runner_request_gc,
         .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
         .watchdog_armed         = sync_runner_watchdog_armed,
+        .publish_gzip_enabled   = device_config_publish_gzip_enabled,
     };
     device_commands_init(&cmd_cfg);
     if (persistence_available) {
