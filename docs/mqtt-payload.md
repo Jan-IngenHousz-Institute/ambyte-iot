@@ -669,10 +669,14 @@ log merely because they contain device state, and are outside this contract.
 
 ## 13. Topic
 
-Unchanged by this document. The lean ingest topic
-(`experiment/data_ingest/v1/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}`,
-openJII `feat/lean-ingest-topic`) carries **no protocol segment** — protocol
-attribution on that topic comes exclusively from `protocol.id` (§3).
+The lean ingest topic
+(`experiment/data_ingest/v1/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}`)
+is the canonical channel since openJII `e38cdd45b` (merged 2026-08-12): it
+carries **no protocol segment** — protocol attribution on that topic comes
+exclusively from `protocol.id` (§3). The firmware publishes measurements to the
+provisioned `topic_root` verbatim; the historical hardcoded `/1234` protocolId
+suffix (which put every publish on the now-transitional legacy 8-segment
+channel with a fabricated id) is removed.
 
 ## 14. Size budget
 
@@ -754,6 +758,7 @@ unstorable. `protocol.cmd` (≤ ~522 B) stays in the record's command column.
 | 2026-08-10 | The production type-2 59-point full-envelope size gate is ≤ 13%; measured raw-wire v2→v3 growth is 1,866→2,076 B (+11.25%). gzip remains deferred. |
 | 2026-08-10 | New firmware's lossless v2 trace fallback and the existing `ambit.spec`, `ambit.temp`, and `db.store_event` v2 families are permanent; platform dual-read support has no retirement date. |
 | 2026-08-12 | Transport gzip of the v3 `sample` (`_sample_encoding: "gzip+base64"`, §14a) ships behind the NVS flag `publish_gzip`, default OFF, fail-open to plain JSON; the compressed text is byte-identical to the plain `sample` array so Silver's existing decoder needs no change. Chosen over SenML JSON/CBOR after exact same-trace benchmarks (920 B vs 1,740/1,900 B gzipped). |
+| 2026-08-12 | Measurements publish on the lean 7-segment topic (`topic_root` verbatim, §13), complying with openJII `e38cdd45b`; the hardcoded `/1234` legacy protocolId suffix is removed. Attribution is payload-only (`protocol.id`). |
 
 ## 16. On-disk record
 

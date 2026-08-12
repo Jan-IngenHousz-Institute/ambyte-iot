@@ -1431,8 +1431,15 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         ESP_LOGW(TAG, "event payload %u bytes exceeds %u; may be rejected",
                  (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
     }
+    /* Lean ingest topic: publish to the provisioned 7-segment topic_root
+     * (…/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}) with NO
+     * trailing protocolId segment. openJII e38cdd45b made that shape canonical
+     * ("new publishers must use the shape without protocolId"); the old
+     * hardcoded "/1234" suffix put every publish on the transitional legacy
+     * channel with a fabricated protocol id. Protocol attribution now travels
+     * in the payload (`protocol.id`, optional), never in the topic. */
     char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/1234", s_cfg.topic_root ? s_cfg.topic_root : "");
+    snprintf(topic, sizeof(topic), "%s", s_cfg.topic_root ? s_cfg.topic_root : "");
 
     ESP_LOGI(TAG, "publish event -> %s (id=%lld, tag=%s, ch=%s, %u bytes)",
              topic, (long long)e.measure_id, e.tag,
