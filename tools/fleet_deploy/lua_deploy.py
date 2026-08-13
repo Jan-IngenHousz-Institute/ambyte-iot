@@ -226,6 +226,7 @@ class ScriptStatusTracker:
     """Correlate status-topic device, campaign ID, and first terminal report."""
 
     def __init__(self, devices: list[str], campaign_id: str):
+        self._devices = list(devices)
         self._devices_by_identity = fleet.device_index(devices)
         self._campaign_id = campaign_id
         self._accepted = {device: False for device in devices}

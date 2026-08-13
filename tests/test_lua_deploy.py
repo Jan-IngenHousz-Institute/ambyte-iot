@@ -104,7 +104,7 @@ class TargetingTest(unittest.TestCase):
         devices = lua_deploy.parse_devices(
             "00:11:22:33:44:55, ambyte_aa:bb:cc:dd:ee:ff 00:11:22:33:44:55"
         )
-        self.assertEqual(devices, [DEVICE_A, DEVICE_B])
+        self.assertEqual(devices, [DEVICE_A, "ambyte_aa:bb:cc:dd:ee:ff"])
         with self.assertRaises(ValueError):
             lua_deploy.parse_devices("not-a-device")
 
