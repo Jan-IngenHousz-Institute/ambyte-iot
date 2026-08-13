@@ -202,6 +202,20 @@ class TargetingTest(unittest.TestCase):
 
 
 class StatusTest(unittest.TestCase):
+    def test_correlates_status_case_insensitively_but_keeps_requested_route(self) -> None:
+        lower = DEVICE_A.replace("AMBYTE_", "ambyte_")
+        tracker = lua_deploy.ScriptStatusTracker([lower], TAG)
+        terminal = {
+            "type": "script_status",
+            "id": TAG,
+            "state": "applied",
+            "script_sha256": "a" * 64,
+        }
+        self.assertEqual(
+            tracker.record(STATUS_A, json.dumps(terminal)), (lower, "applied")
+        )
+        self.assertEqual(tracker.results()[lower]["state"], "applied")
+
     def test_correlates_topic_and_campaign_and_ignores_duplicate_out_of_order(self) -> None:
         tracker = lua_deploy.ScriptStatusTracker([DEVICE_A], TAG)
         ignored = [

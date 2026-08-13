@@ -322,7 +322,7 @@ def parse_devices(value: str) -> list[str]:
             devices.append(normalized)
     if invalid:
         raise ValueError(f"unrecognized device tokens: {invalid}")
-    return sorted(set(devices))
+    return fleet.unique_devices(devices)
 
 
 def select_cohort(
@@ -405,6 +405,7 @@ def fleet_ambit_versions(
     )
     received: queue.Queue[tuple[str, bytes | str]] = queue.Queue()
     reports: dict[str, dict[str, Any]] = {}
+    devices_by_identity = fleet.device_index(devices)
     error = None
     connection = None
 
@@ -419,8 +420,10 @@ def fleet_ambit_versions(
             return
         if data.get("id") != query_id:
             return
-        device = fleet.device_from_status_topic(topic)
-        if device not in devices or device in reports:
+        device = fleet.requested_device_from_status_topic(
+            topic, devices_by_identity
+        )
+        if device is None or device in reports:
             return
         report = _parse_versions_report(data)
         if report is not None:
@@ -743,7 +746,7 @@ class AmbitStatusTracker:
     """Correlate gateway, campaign, per-channel terminals, and overall terminal."""
 
     def __init__(self, devices: list[str], campaign_id: str):
-        self._devices = set(devices)
+        self._devices_by_identity = fleet.device_index(devices)
         self._campaign_id = campaign_id
         self._records = {
             device: {
@@ -765,8 +768,10 @@ class AmbitStatusTracker:
             return None
         if data.get("id") != self._campaign_id:
             return None
-        device = fleet.device_from_status_topic(topic)
-        if device not in self._devices:
+        device = fleet.requested_device_from_status_topic(
+            topic, self._devices_by_identity
+        )
+        if device is None:
             return None
         channel = data.get("channel")
         state = data.get("state")

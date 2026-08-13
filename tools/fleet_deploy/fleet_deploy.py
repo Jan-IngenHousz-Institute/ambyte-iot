@@ -58,7 +58,9 @@ import urllib.request
 COMMAND_TOPIC_FMT = "device/scripts/v1/Ambyte/2/{device}"
 STATUS_TOPIC = "experiment/data_ingest/v1/+/multispeq/v1.0/+/status"
 LOG_GROUP = "AWSIotLogsV2"
-CLIENT_ID_RE = re.compile(r"^AMBYTE_[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+CLIENT_ID_RE = re.compile(
+    r"^AMBYTE_[0-9A-F]{2}(:[0-9A-F]{2}){5}$", re.IGNORECASE
+)
 
 # Terminal OTA states (components/ota_update/ota_update.c ota_report calls).
 # "dropped" = rejected before acceptance (busy / OOM / maintenance), a retry
@@ -121,20 +123,52 @@ VERSION_OPS = {
 
 
 def normalize_device(s):
-    """Accept 'AMBYTE_<MAC>' or a bare MAC; -> canonical clientId or None."""
-    s = s.strip().upper()
+    """Validate a client ID without changing its MQTT topic casing.
+
+    AWS IoT client IDs and topics are case-sensitive. Some fielded devices use
+    ``AMBYTE_`` while others use ``ambyte_``. Discovery must preserve the exact
+    observed spelling so commands reach the subscription the device actually
+    created. A bare MAC retains the historical uppercase-prefix default.
+    """
+    s = s.strip()
     if not s:
         return None
-    if not s.startswith("AMBYTE_"):
+    if s[:7].casefold() != "ambyte_":
         s = "AMBYTE_" + s
-    return s if CLIENT_ID_RE.match(s) else None
+    return s if CLIENT_ID_RE.fullmatch(s) else None
+
+
+def device_identity_key(device):
+    """Case-insensitive identity key; never use this value as an MQTT route."""
+    return device.casefold()
+
+
+def unique_devices(devices):
+    """Dedupe identities case-insensitively while preserving the first route."""
+    unique = {}
+    for device in devices:
+        unique.setdefault(device_identity_key(device), device)
+    return sorted(unique.values(), key=device_identity_key)
+
+
+def device_index(devices):
+    """Map case-insensitive identities back to exact requested MQTT routes."""
+    return {device_identity_key(device): device for device in devices}
+
+
+def requested_device_from_status_topic(topic, devices_by_identity):
+    """Resolve a status-topic client ID to the caller's exact route spelling."""
+    observed = device_from_status_topic(topic)
+    if observed is None:
+        return None
+    return devices_by_identity.get(device_identity_key(observed))
 
 
 def selection_key(client_id):
     """Stable pseudo-random order for percentage slicing. No salt, on
     purpose: a later, larger percentage must be a superset of the earlier
     cohort."""
-    return hashlib.sha256(client_id.encode()).hexdigest()
+    return hashlib.sha256(device_identity_key(client_id).encode()).hexdigest()
 
 
 # -- AWS plumbing -------------------------------------------------------------
@@ -157,8 +191,8 @@ def discover_active_devices(session, window_minutes):
         queryString=(
             "fields @timestamp, clientId"
             ' | filter eventType = "Publish-In"'
-            " | stats count() as publishCount by clientId"
-            " | sort clientId asc"
+            " | stats count() as publishCount, max(@timestamp) as lastSeen by clientId"
+            " | sort lastSeen desc"
         ),
     )
     while True:
@@ -174,7 +208,10 @@ def discover_active_devices(session, window_minutes):
         dev = normalize_device(fields.get("clientId") or "")
         if dev:
             devices.append(dev)
-    return sorted(set(devices))
+    # The first spelling wins because the query is newest-first. This handles a
+    # device that changed prefix casing across firmware generations without
+    # sending duplicate commands to both case-sensitive topics.
+    return unique_devices(devices)
 
 
 def mqtt_connection(session, sub_topic, on_message, client_id="fleet-deploy"):
@@ -242,6 +279,7 @@ def fleet_ping(session, devices, wait_seconds):
     payload = json.dumps({"type": "ping", "id": ping_id})
     received = queue.Queue()
     alive = {}
+    devices_by_identity = device_index(devices)
 
     conn = mqtt_connection(
         session, STATUS_TOPIC,
@@ -267,8 +305,8 @@ def fleet_ping(session, devices, wait_seconds):
                 continue
             if data.get("id") != ping_id:
                 continue
-            dev = device_from_status_topic(topic)
-            if dev in devices and dev not in alive:
+            dev = requested_device_from_status_topic(topic, devices_by_identity)
+            if dev is not None and dev not in alive:
                 alive[dev] = data.get("fw")
                 print(f"  pong  {dev}  fw={data.get('fw')}")
     finally:
@@ -291,6 +329,7 @@ def fleet_ota(session, devices, campaign_id, url,
     received = queue.Queue()
     acked = {d: False for d in devices}
     final = {d: None for d in devices}
+    devices_by_identity = device_index(devices)
     error = None
     final_deadline = time.time() + final_seconds
 
@@ -346,8 +385,8 @@ def fleet_ota(session, devices, campaign_id, url,
                 continue
             if data.get("id") != campaign_id:
                 continue
-            dev = device_from_status_topic(topic)
-            if dev not in acked:
+            dev = requested_device_from_status_topic(topic, devices_by_identity)
+            if dev is None:
                 continue
             state = data.get("state")
             if state == "accepted":
@@ -569,7 +608,7 @@ def main():
             (universe if dev else bad).append(dev or tok)
         if bad:
             ap.error(f"unrecognized device tokens: {bad}")
-        universe = sorted(set(universe))
+        universe = unique_devices(universe)
         print(f"Explicit device list: {len(universe)} device(s)")
     else:
         print(f"Discovering devices active in the last "
