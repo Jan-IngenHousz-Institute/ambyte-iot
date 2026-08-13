@@ -182,7 +182,7 @@ def parse_devices(value: str) -> list[str]:
             devices.append(normalized)
     if invalid:
         raise ValueError(f"unrecognized device tokens: {invalid}")
-    return sorted(set(devices))
+    return fleet.unique_devices(devices)
 
 
 def select_cohort(
@@ -226,7 +226,8 @@ class ScriptStatusTracker:
     """Correlate status-topic device, campaign ID, and first terminal report."""
 
     def __init__(self, devices: list[str], campaign_id: str):
-        self._devices = set(devices)
+        self._devices = list(devices)
+        self._devices_by_identity = fleet.device_index(devices)
         self._campaign_id = campaign_id
         self._accepted = {device: False for device in devices}
         self._terminal: dict[str, dict[str, Any] | None] = {
@@ -244,8 +245,10 @@ class ScriptStatusTracker:
             return None
         if data.get("id") != self._campaign_id:
             return None
-        device = fleet.device_from_status_topic(topic)
-        if device not in self._devices:
+        device = fleet.requested_device_from_status_topic(
+            topic, self._devices_by_identity
+        )
+        if device is None:
             return None
         state = data.get("state")
         if state == "accepted":
