@@ -45,8 +45,19 @@
  * has a static assertion against the exported cap in event_log.h. */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
-#define EVLOG_FLUSH_EVERY_N  1                /* fsync each record: at ~0.4 writes/s the write-amp is trivial and
-                                               * the brownout-loss window shrinks to one record (audit G3/B2) */
+#define EVLOG_FLUSH_EVERY_N  8                /* fsync every N records. Was 1 (per-record) to shrink the
+                                               * brownout-loss window to one record (audit G3/B2) — but each
+                                               * fsync rewrites the FAT sector + dir entry IN PLACE, so at the
+                                               * field cadence that was thousands of in-place metadata writes
+                                               * per day, each one a corruption window if power dies mid-write
+                                               * (FATFS has no journal; consumer-card FTLs can tear a whole
+                                               * erase block on power loss). Batching trades ≤8 records /
+                                               * ≤1.5 s of loss — which at-least-once delivery already
+                                               * tolerates — for ~8× less FAT exposure; a corrupted FAT loses
+                                               * the ENTIRE backlog + main.lua. The low-battery persistence
+                                               * park (app_main) closes the predictable-brownout case. Claims
+                                               * of tail records still flush first, so publishing never sees a
+                                               * stale tail. */
 #define EVLOG_CURSOR_BATCH   16               /* persist read cursor every N acks */
 #define EVLOG_ID_BLOCK       64               /* reserve next_id in blocks → 1 NVS write / 64 ids */
 #define EVLOG_SCAN_MAX_LINES 20000            /* bound the boot pending-count (stat only) */
