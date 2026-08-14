@@ -76,9 +76,13 @@ bool sdcard_io_lost(void);
 bool sdcard_io_begin(void);
 void sdcard_io_end(void);
 
-// Suspend the hot-plug monitor task (used by the pre-reboot handler so a teardown
-// can't race the final flush/unmount). No resume — the reboot follows.
+// Suspend / resume the hot-plug monitor task. The pre-reboot handler suspends it
+// so a teardown can't race the final flush/unmount (and never resumes — the reboot
+// follows). The low-battery persistence guard suspends it across a park (so the
+// monitor can't remount the card that was just deliberately unmounted) and resumes
+// it once power recovers.
 void sdcard_monitor_suspend(void);
+void sdcard_monitor_resume(void);
 
 #ifdef __cplusplus
 }

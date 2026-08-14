@@ -33,6 +33,12 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **Cap chain (compile-verified)**: `AMBIT_RUN_PAYLOAD_CAP` (64,000) < `EVLOG_RECORD_CAP_NORMAL`
   (65,552) < `AMBYTE_PUBLISH_MAX_BYTES` (record+4 KiB). PSRAM-absent boots fall back to the
   12 KB record cap at runtime.
+- **SD is treated as corruption-prone**: FATFS has no journal, so FAT-metadata writes are
+  batched (event_log fsyncs every 8 records, not per record), the SDMMC bus runs at 20 MHz
+  (40 MHz was marginal on this wiring), and the low-battery power guard in app_main parks the
+  whole SD stack (Lua stop → flush/close → unmount) below 3300 mV on battery so a dying
+  battery can't brown out mid-FAT-write. New SD writers must use sdcard_io_begin/end AND
+  survive the park/unpark cycle (see sd_logger_pause for the pattern).
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

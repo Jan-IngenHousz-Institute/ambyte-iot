@@ -616,6 +616,137 @@ static void app_prepare_reboot(void)
     (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
 }
 
+/* ── Low-battery persistence guard ─────────────────────────────────────────
+ * FATFS is not power-safe, and the one reset the app_prepare_reboot shutdown
+ * handler can never cover is the battery dying: brownout/POR skip every handler,
+ * and on a solar unit that happens on a schedule (every deep-discharge night).
+ * Until now the device kept writing the event log right up to the brownout —
+ * so each battery death rolled the dice on a FAT-metadata write in flight, which
+ * is the leading candidate for the fleet's recurring corrupt-card bricks (a
+ * corrupt FAT takes the whole backlog AND main.lua with it).
+ *
+ * This guard watches the MP2731 while on battery and, once the voltage sits
+ * below the park floor, performs a controlled shutdown of everything that
+ * touches the card — stop Lua (the producer), flush + close the event log and
+ * SD logger, unmount — well before the rail can collapse. Measurements stopping
+ * early costs a few readings that could not have been persisted safely anyway;
+ * parking also sheds load, which stretches the remaining charge. When external
+ * power returns (or the battery recovers), it remounts and restarts the same
+ * way the hot-plug path does.
+ *
+ * Thresholds: the park floor sits below the LED low-battery warning (3500 mV)
+ * but above where the pack protection / 3V3 regulator lets go; the resume level
+ * needs real headroom above the floor because unloading the pack rebounds its
+ * voltage ~100 mV — resuming on rebound would park/unpark in a thrash loop.
+ * In practice a parked unit un-parks the next morning via input_present. */
+#define PWRGUARD_POLL_MS     15000   /* MP2731 poll cadence (one cheap I2C read) */
+#define PWRGUARD_PARK_MV      3300   /* on-battery floor: park persistence below this */
+#define PWRGUARD_PARK_N          3   /* consecutive low reads (45 s) — rides out sag/ADC steps */
+#define PWRGUARD_RESUME_MV    3600   /* battery-only resume level (> park + rebound) */
+#define PWRGUARD_RESUME_N        4   /* consecutive good reads (60 s) before un-parking */
+/* The un-park path runs esp_vfs_fat_sdmmc_mount + event_log reopen + Lua start —
+ * the same heavy fan-out the SD monitor carries 12 KB for; 8 KB was marginal
+ * there. Created once at boot while the heap is still clean. */
+#define PWRGUARD_TASK_STACK  12288
+
+static power_read_fn s_pwrguard_read;         /* MP2731 read fn, set before task start */
+static volatile bool s_pwrguard_parked;       /* guard state; also vetoes self-reboots (below) */
+
+static void app_power_guard_task(void *arg)
+{
+    (void)arg;
+    int low_n = 0, good_n = 0;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(PWRGUARD_POLL_MS));
+
+        power_reading_t p;
+        if (s_pwrguard_read(&p) != ESP_OK || p.battery_mv == 0) {
+            continue;   /* charger unreadable — hold the current state, never guess */
+        }
+
+        if (!s_pwrguard_parked) {
+            low_n = (!p.input_present && p.battery_mv < PWRGUARD_PARK_MV) ? low_n + 1 : 0;
+            if (low_n < PWRGUARD_PARK_N) continue;
+            low_n = 0;
+            /* Never yank the card out from under an OTA/AMBIT-flash/script op
+             * (they read /sdcard mid-write); the battery keeps sagging, so the
+             * next poll re-trips the moment the op ends. */
+            if (app_maintenance_active()) continue;
+
+            ESP_LOGW(APP_TAG, "battery %umV on battery power — parking SD persistence "
+                              "before brownout can tear the FAT", (unsigned)p.battery_mv);
+            /* Same teardown order as app_prepare_reboot: monitor first so no
+             * remount/teardown can race the flush + unmount below. */
+            sdcard_monitor_suspend();
+            app_on_sd_state_change(false);   /* stop Lua, flush + close the event log */
+            sd_logger_pause();               /* drain ring, fsync + close (resumable) */
+            esp_err_t err = ESP_OK;
+            for (int i = 0; i < 5; i++) {    /* TIMEOUT = in-flight FATFS op draining */
+                err = sdcard_unmount();
+                if (err != ESP_ERR_TIMEOUT) break;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            if (err != ESP_OK) {
+                /* Writers are already halted, so a failed final unmount leaves an
+                 * idle-clean volume — log it, stay parked, don't re-arm writes. */
+                ESP_LOGW(APP_TAG, "park: unmount incomplete (%s)", esp_err_to_name(err));
+            }
+            s_pwrguard_parked = true;
+            good_n = 0;
+        } else {
+            good_n = (p.input_present || p.battery_mv >= PWRGUARD_RESUME_MV) ? good_n + 1 : 0;
+            if (good_n < PWRGUARD_RESUME_N) continue;
+            good_n = 0;
+
+            ESP_LOGW(APP_TAG, "power recovered (battery %umV, input %s) — resuming SD persistence",
+                     (unsigned)p.battery_mv, p.input_present ? "present" : "absent");
+            sd_logger_resume();
+            /* Remount HERE (not via the monitor): the monitor was suspended while
+             * it believed the card mounted, so an un-parked remount on its own
+             * probe would look like no transition and the restore callback would
+             * never fire. Mount, run the same restore the hot-plug path uses, and
+             * only then wake the monitor to a state matching its last observation.
+             * If the mount fails (card pulled while parked), the resumed monitor's
+             * own retry/transition machinery takes over. */
+            if (sdcard_mount() == ESP_OK) {
+                app_on_sd_state_change(true);   /* reopen event log, restart Lua */
+            } else {
+                ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
+            }
+            sdcard_monitor_resume();
+            s_pwrguard_parked = false;
+            low_n = 0;
+        }
+    }
+}
+
+static void app_start_power_guard(void)
+{
+    if (!mp2731_is_ready()) {
+        /* Dev board / no charger: no battery to brown out, nothing to guard. */
+        return;
+    }
+    s_pwrguard_read = mp2731_get_power_read_fn();
+    if (xTaskCreate(app_power_guard_task, "pwr_guard", PWRGUARD_TASK_STACK,
+                    NULL, 2, NULL) != pdPASS) {
+        ESP_LOGW(APP_TAG, "low-battery persistence guard NOT started (task alloc failed)");
+        return;
+    }
+    ESP_LOGI(APP_TAG, "low-battery persistence guard armed (park <%dmV, resume >=%dmV/ext)",
+             PWRGUARD_PARK_MV, PWRGUARD_RESUME_MV);
+}
+
+/* Self-reboot veto handed to sync_runner (nightly maintenance + the conn/memory/
+ * PUBACK watchdogs). Maintenance ops veto as before; a low-battery park now
+ * vetoes too — an esp_restart on a parked unit would remount the SD at boot and
+ * resume writing on a critically low battery, re-opening the exact mid-FAT-write
+ * corruption window the park exists to close. Lifts when the guard un-parks. */
+static bool app_self_reboot_veto(void)
+{
+    return app_maintenance_active() || s_pwrguard_parked;
+}
+
 /* ── SD/persistence health for the OTA boot-confirm gate ───────────────────
  * The OTA rollback gate was MQTT-only, so an image that reconnects but breaks SD
  * mounting / the event log would be kept, stranding the unit measurement-dead. The
@@ -1201,6 +1332,13 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "could not register SD pre-reboot flush handler");
     }
 
+    /* ── Low-battery persistence guard ─────────────────────────────────
+     * The shutdown handler above covers every esp_restart(); this covers the one
+     * reset it can't — the battery dying under the FAT. Started here (after the
+     * monitor + shutdown hook, before the heap fills) so its 12 KB stack and the
+     * park/unpark machinery are guaranteed to exist on every battery unit. */
+    app_start_power_guard();
+
     /* ── Hardware inventory ───────────────────────────────────────── */
     ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s UART=%s",
              bme280_is_ready() ? "OK" : "ABSENT",
@@ -1269,7 +1407,8 @@ void app_main(void)
     if (persistence_available) {
         uint32_t heartbeat_s = 300;                       /* default 5 min */
         (void)device_config_get_heartbeat_s(&heartbeat_s); /* NVS override */
-        sync_runner_set_maintenance_probe(app_maintenance_active);
+        /* Veto = maintenance op in flight OR low-battery park (see app_self_reboot_veto). */
+        sync_runner_set_maintenance_probe(app_self_reboot_veto);
         esp_err_t sr_err = sync_runner_start(heartbeat_s);
         if (sr_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
