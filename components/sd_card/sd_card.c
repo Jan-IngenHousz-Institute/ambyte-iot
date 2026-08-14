@@ -112,7 +112,13 @@ static void sdcard_unlock(void)
 static void sdcard_fill_default_host_slot(void)
 {
     s_sdcard.host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
-    s_sdcard.host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    /* 20 MHz, not SDMMC_FREQ_HIGHSPEED (40 MHz): HIGHSPEED was marginal on this
+     * wiring — healthy cards threw lone transient CMD13/0x107 errors (that is why
+     * both the probe debounce and the io-fail threshold below exist). Every such
+     * timeout that lands mid-FAT/dir-entry update is a torn-metadata (corruption)
+     * window even with power good. The event workload peaks at a few KiB/s, so
+     * 40 MHz bought nothing but the error rate. */
+    s_sdcard.host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
     s_sdcard.slot = (sdmmc_slot_config_t)SDMMC_SLOT_CONFIG_DEFAULT();
     s_sdcard.slot.clk = s_sdcard_pins.clk;
@@ -393,11 +399,23 @@ void sdcard_io_end(void)
     portEXIT_CRITICAL_SAFE(&s_io_lock);
 }
 
-/* Suspend the hot-plug monitor so it cannot run a teardown concurrently with the
- * pre-reboot flush/unmount (audit R-9). Called first in the shutdown handler. */
+/* Suspend the hot-plug monitor so it cannot run a teardown/remount concurrently
+ * with an app-driven flush/unmount (audit R-9). Called first by the pre-reboot
+ * shutdown handler (never resumed — the reboot follows) and by the low-battery
+ * persistence guard (resumed once power recovers). */
 void sdcard_monitor_suspend(void)
 {
     if (s_monitor_task != NULL) vTaskSuspend(s_monitor_task);
+}
+
+/* Re-enable the hot-plug monitor after a low-battery park. Callers remount first
+ * (so the monitor wakes to a state that matches its last observation and fires no
+ * spurious transition) or leave the card out and let the monitor's own remount
+ * retry drive the state callback. Safe in either order: the monitor re-reads the
+ * mounted state at the top of every probe. */
+void sdcard_monitor_resume(void)
+{
+    if (s_monitor_task != NULL) vTaskResume(s_monitor_task);
 }
 
 /* CMD13 poll debounce: a marginal HIGHSPEED bus can throw a lone transient CMD13

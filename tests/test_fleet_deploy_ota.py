@@ -1,7 +1,90 @@
+import json
+import sys
+import types
 import unittest
 from unittest import mock
 
 from tools.fleet_deploy import fleet_deploy
+
+
+class DeviceCasingTest(unittest.TestCase):
+    LOWER = "ambyte_20:6E:F1:FB:60:B4"
+    UPPER = "AMBYTE_20:6E:F1:FB:60:B4"
+
+    def test_validation_preserves_exact_route_and_identity_is_case_insensitive(self):
+        self.assertEqual(fleet_deploy.normalize_device(self.LOWER), self.LOWER)
+        self.assertEqual(fleet_deploy.normalize_device(self.UPPER), self.UPPER)
+        self.assertEqual(
+            fleet_deploy.unique_devices([self.LOWER, self.UPPER]), [self.LOWER]
+        )
+        self.assertEqual(
+            fleet_deploy.selection_key(self.LOWER),
+            fleet_deploy.selection_key(self.UPPER),
+        )
+
+    def test_discovery_keeps_newest_observed_route_casing(self):
+        class Logs:
+            def start_query(inner, **kwargs):
+                self.assertIn("max(@timestamp) as lastSeen", kwargs["queryString"])
+                self.assertIn("sort lastSeen desc", kwargs["queryString"])
+                return {"queryId": "q"}
+
+            def get_query_results(inner, **kwargs):
+                return {
+                    "status": "Complete",
+                    "results": [
+                        [{"field": "clientId", "value": self.LOWER}],
+                        [{"field": "clientId", "value": self.UPPER}],
+                    ],
+                }
+
+        session = types.SimpleNamespace(client=lambda service: Logs())
+        self.assertEqual(fleet_deploy.discover_active_devices(session, 60), [self.LOWER])
+
+    def test_ping_publishes_exact_route_and_correlates_other_case_reply(self):
+        holder = {}
+
+        class Future:
+            def result(inner):
+                return None
+
+        class Connection:
+            def __init__(inner, callback):
+                inner.callback = callback
+                inner.topics = []
+
+            def publish(inner, *, topic, payload, qos):
+                inner.topics.append(topic)
+                ping = json.loads(payload)
+                inner.callback(
+                    "experiment/data_ingest/v1/x/multispeq/v1.0/"
+                    + self.UPPER
+                    + "/status",
+                    json.dumps({"type": "pong", "id": ping["id"], "fw": "1.6.6"}).encode(),
+                    False,
+                    qos,
+                    False,
+                )
+                return Future(), 1
+
+            def disconnect(inner):
+                return Future()
+
+        def connection(session, topic, callback, client_id="fleet-deploy"):
+            holder["connection"] = Connection(callback)
+            return holder["connection"]
+
+        fake_mqtt = types.SimpleNamespace(QoS=types.SimpleNamespace(AT_LEAST_ONCE=1))
+        with mock.patch.object(fleet_deploy, "mqtt_connection", side_effect=connection), mock.patch.dict(
+            sys.modules, {"awscrt": types.SimpleNamespace(mqtt=fake_mqtt)}
+        ):
+            result = fleet_deploy.fleet_ping(object(), [self.LOWER], 1)
+
+        self.assertEqual(result, {self.LOWER: "1.6.6"})
+        self.assertEqual(
+            holder["connection"].topics,
+            [fleet_deploy.COMMAND_TOPIC_FMT.format(device=self.LOWER)],
+        )
 
 
 class TerminalProofTest(unittest.TestCase):
