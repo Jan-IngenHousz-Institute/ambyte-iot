@@ -298,7 +298,7 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 [components/script_update](components/script_update), dispatched by `command_router`:
 
-- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. The immutable Lua release manifest contains this ready-to-publish object.
+- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable Lua release catalog has a manifest containing this ready-to-publish object.
 - Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
 - `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
 - Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
@@ -315,13 +315,13 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ## SD card
 
-- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). The canonical released source is [lua/main.lua](lua/main.lua). For a manual iteration, copy it to the card and reset; for a traceable rollout, use the independently versioned Lua release manifest.
+- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). Released sources live in the [Lua catalog](lua): `main.lua` is the default and `legacy_1Hz_spec.lua` is the opt-in cmd 31 experiment. For a manual iteration, copy the chosen source to the card as `main.lua` and reset; for a traceable rollout, select it in the independently versioned Lua deploy workflow.
 - Behaviour when the script is missing: no SD mounted → Lua task skipped, CLI+MQTT continue; SD mounted but no `main.lua` → task starts, fails the load, exits cleanly.
 - **Hot pull/reinsert recovery** ([components/sd_card](components/sd_card)): no card-detect pin, so a monitor polls `sdmmc_get_status` (CMD13, 2000 ms) plus a **lock-free error-driven loss latch** (writers call `sdcard_report_io_error/ok` and gate on `sdcard_io_lost()`) — needed because CMD13 alone loses the race to a task stuck in a multi-second failing transfer (priority inversion, the historic sdmmc `0x107` flood). On loss the Lua runner stops and `event_log_on_sd_lost` fires; on reinsert `event_log_on_sd_restored` runs and Lua restarts. `sd_logger` buffers WARN/ERROR in a RAM ring while the card is absent and flushes on remount.
 
 Lua binding tables exposed to scripts (see the `luaL_Reg` arrays in `lua_runner.c`): `device.*` (rtc/status/power/sd_ready/sleep_ms/log/PWM/…), `uart.*` (raw transport), `db.*` (`store_event`/`next_id`, for custom/derived events), `ambit.*` (ping/spec/leaf_temp/run/trigger/poll/fetch/run_mpf/set_gains/set_currents/blink/calibrate/actinic/set_metadata), and `sync.*` (interval/clock/weekly/sunrise-sunset scheduling from lat/lon + tz). The old `mqtt` Lua table was removed — scripts no longer publish.
 
-The production field schedule is [lua/main.lua](lua/main.lua). The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
+The production field schedule is [lua/main.lua](lua/main.lua), with [lua/legacy_1Hz_spec.lua](lua/legacy_1Hz_spec.lua) available for the selected legacy-sensor cohort. The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
 
 ---
 

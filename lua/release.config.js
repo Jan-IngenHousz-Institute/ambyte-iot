@@ -20,8 +20,10 @@ export default {
       "@semantic-release/github",
       {
         assets: [
-          { path: "../release-assets/main.lua", label: "Ambyte field Lua script" },
-          { path: "../release-assets/main.lua.manifest.json", label: "Lua release manifest" },
+          { path: "../release-assets/main.lua", label: "Default Ambyte field script" },
+          { path: "../release-assets/main.lua.manifest.json", label: "Default Lua manifest" },
+          { path: "../release-assets/legacy_1Hz_spec.lua", label: "Legacy cmd 31 1 Hz field script" },
+          { path: "../release-assets/legacy_1Hz_spec.lua.manifest.json", label: "Legacy cmd 31 1 Hz Lua manifest" },
         ],
         successComment: false,
         failComment: false,

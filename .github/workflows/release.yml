@@ -114,11 +114,16 @@ jobs:
             test -f "release-assets/ambyte-iot-v${FIRMWARE_VERSION}.zip"
           fi
           if [[ "${LUA_WILL_RELEASE}" == true ]]; then
-            test -f release-assets/main.lua
-            test -f release-assets/main.lua.manifest.json
-            test "$(jq -r .script_version release-assets/main.lua.manifest.json)" = "${LUA_VERSION}"
-            test "$(sha256sum release-assets/main.lua | awk '{print $1}')" = \
-              "$(jq -r .sha256 release-assets/main.lua.manifest.json)"
+            LUA_SCRIPTS=(main legacy_1Hz_spec)
+            for SCRIPT in "${LUA_SCRIPTS[@]}"; do
+              test -f "release-assets/${SCRIPT}.lua"
+              MANIFEST="release-assets/${SCRIPT}.lua.manifest.json"
+              test -f "${MANIFEST}"
+              test "$(jq -r .script_name "${MANIFEST}")" = "${SCRIPT}"
+              test "$(jq -r .script_version "${MANIFEST}")" = "${LUA_VERSION}"
+              test "$(sha256sum "release-assets/${SCRIPT}.lua" | awk '{print $1}')" = \
+                "$(jq -r .sha256 "${MANIFEST}")"
+            done
           fi
 
       - name: Publish firmware release

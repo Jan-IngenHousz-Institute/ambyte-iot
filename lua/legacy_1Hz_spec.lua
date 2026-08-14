@@ -25,14 +25,13 @@
 --     exposure that produced a reading is not recoverable from the sample.
 --     If the experiment needs exposure provenance, it needs cmd 35.
 --
--- This is NOT the released fleet script. `main.lua` is the versioned release
--- asset; this file is deployed deliberately to a selected subset of Ambytes as
--- their /sdcard/main.lua. Those devices therefore:
+-- This is an opt-in released fleet script. It is packaged beside `main.lua`
+-- under the same lua-vX.Y.Z release and deployed deliberately to a selected
+-- subset of Ambytes as their /sdcard/main.lua. Those devices therefore:
 --   * stop producing SS / MPF / arrun traces — a 1 Hz cadence has no room for
 --     one, and this script runs nothing else;
---   * report a script identity whose SHA does not match the release manifest.
---     That is the intended signal that the unit is on the experiment, not a
---     fault to be "fixed" by re-pushing the release script.
+--   * report this asset's versioned SHA from legacy_1Hz_spec.lua.manifest.json,
+--     distinct from the default main.lua asset in the same release.
 --
 -- Topology assumed: ONE Ambit on one Ambyte. Cmd 31 is synchronous and holds
 -- the channel for the whole wake→command→response exchange, so a second board
