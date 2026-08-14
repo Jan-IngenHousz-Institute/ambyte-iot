@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -563,36 +564,61 @@ static esp_err_t app_init_sdcard(void)
     return ESP_OK;
 }
 
+/* Byte-compare two small files (scripts are a few KB). Any read error counts as
+ * "different", which errs toward importing — the safe direction for recovery. */
+static bool app_scripts_identical(const char *a, const char *b)
+{
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    bool same = (fa != NULL && fb != NULL);
+    while (same) {
+        char ba[256], bb[256];
+        size_t na = fread(ba, 1, sizeof ba, fa);
+        size_t nb = fread(bb, 1, sizeof bb, fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) same = false;
+        else if (na < sizeof ba) break;              /* simultaneous EOF, all equal */
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
 /* Hot-plug callback: fired by the sd_monitor task on every mount-state
- * transition. Drives the persistence layer AND the Lua runner so the script
- * is paused while the card is out and re-launched fresh when it returns —
- * which is the cleanest way to avoid running measurements against a closed
- * DB and to pick up any edits to /sdcard/main.lua on reinsert. */
+ * transition. With the event store and main.lua both on INTERNAL flash, SD loss
+ * no longer stops anything — measurement, storage, and publishing continue; only
+ * the archive/log/AMBIT-firmware roles pause (each self-gates on mount state).
+ * An INSERT is the manual offline-recovery moment: a card carrying main.lua
+ * (written on a laptop, for a unit with no internet) is imported into the
+ * internal home and the runner restarted on it. */
 static void app_on_sd_state_change(bool mounted)
 {
-    if (mounted) {
-        /* DB first (the script will hit cmd_store_event almost immediately). */
-        event_log_on_sd_restored();
-        /* During boot (e.g. an SD bounce while the AMBIT firmware sync is
-         * mid-flash) leave Lua to the boot sequence — starting it here would
-         * break ambit_flash_boot_sync's pre-Lua exclusive-UART assumption. */
-        if (!app_boot_is_complete()) {
-            ESP_LOGW(APP_TAG, "SD restored during boot — Lua start left to the boot sequence");
-            return;
-        }
-        esp_err_t err = lua_runner_start();
-        if (err == ESP_OK) {
-            ESP_LOGI(APP_TAG, "Lua runner restarted (SD inserted)");
-        } else if (err != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(APP_TAG, "Lua runner restart failed: %s", esp_err_to_name(err));
-        }
-    } else {
-        /* Stop the script first so no in-flight ambit.run tries to write into
-         * the DB while we're closing it. 5 s is enough for the script to
-         * unwind from a sleep / short read; longer UART reads will finish in
-         * the background and the task will exit on its own. */
-        lua_runner_stop(5000);
-        event_log_on_sd_lost();
+    if (!mounted) {
+        ESP_LOGW(APP_TAG, "SD out — archive/logs paused; measurement + publishing unaffected");
+        return;
+    }
+
+    struct stat st;
+    bool sd_has_script = (stat("/sdcard/main.lua", &st) == 0 && st.st_size > 0);
+    /* During boot (e.g. an SD bounce while the AMBIT firmware sync is mid-flash)
+     * leave Lua to the boot sequence — starting it here would break
+     * ambit_flash_boot_sync's pre-Lua exclusive-UART assumption. */
+    if (!app_boot_is_complete()) {
+        ESP_LOGI(APP_TAG, "SD mounted during boot — recovery import deferred to boot sequence");
+        return;
+    }
+    if (!sd_has_script) {
+        return;                     /* archive-only card: keeper task handles it */
+    }
+    if (app_scripts_identical("/sdcard/main.lua", "/littlefs/main.lua")) {
+        return;                     /* recovery card already applied — don't churn Lua */
+    }
+    ESP_LOGW(APP_TAG, "SD carries a different main.lua — importing (offline recovery) and restarting Lua");
+    lua_runner_stop(5000);
+    (void)lua_runner_import_script("/sdcard/main.lua");
+    /* The SD copy is left in place (a tech may carry one card to many devices);
+     * the byte-compare above makes re-inserts and reboots no-ops. */
+    esp_err_t err = lua_runner_start();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(APP_TAG, "Lua restart after import failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -626,13 +652,13 @@ static void app_prepare_reboot(void)
  * corrupt FAT takes the whole backlog AND main.lua with it).
  *
  * This guard watches the MP2731 while on battery and, once the voltage sits
- * below the park floor, performs a controlled shutdown of everything that
- * touches the card — stop Lua (the producer), flush + close the event log and
- * SD logger, unmount — well before the rail can collapse. Measurements stopping
- * early costs a few readings that could not have been persisted safely anyway;
- * parking also sheds load, which stretches the remaining charge. When external
- * power returns (or the battery recovers), it remounts and restarts the same
- * way the hot-plug path does.
+ * below the park floor, parks the SD CARD ONLY — flush + close the sd_logger
+ * file, unmount — well before the rail can collapse. Since the event store
+ * moved to internal littlefs (power-loss-safe), Lua, storage, and publishing
+ * all keep running to the very end: riding the battery down now PRESERVES
+ * measurements instead of risking the volume that holds them. When external
+ * power returns (or the battery recovers), the card is remounted and the
+ * archive/log roles resume.
  *
  * Thresholds: the park floor sits below the LED low-battery warning (3500 mV)
  * but above where the pack protection / 3V3 regulator lets go; the resume level
@@ -674,12 +700,16 @@ static void app_power_guard_task(void *arg)
              * next poll re-trips the moment the op ends. */
             if (app_maintenance_active()) continue;
 
-            ESP_LOGW(APP_TAG, "battery %umV on battery power — parking SD persistence "
-                              "before brownout can tear the FAT", (unsigned)p.battery_mv);
-            /* Same teardown order as app_prepare_reboot: monitor first so no
-             * remount/teardown can race the flush + unmount below. */
+            ESP_LOGW(APP_TAG, "battery %umV on battery power — parking the SD (FAT) "
+                              "before brownout can tear it; measurement continues on "
+                              "the internal store", (unsigned)p.battery_mv);
+            /* Park scope shrank with the internal store: Lua, the event log, and
+             * publishing all keep running — littlefs on internal flash is
+             * power-loss-safe, so riding the battery down now PRESERVES data
+             * instead of risking it. Only the journal-less FAT card needs to be
+             * out of harm's way. Monitor first so no remount/teardown can race
+             * the flush + unmount below (same order as app_prepare_reboot). */
             sdcard_monitor_suspend();
-            app_on_sd_state_change(false);   /* stop Lua, flush + close the event log */
             sd_logger_pause();               /* drain ring, fsync + close (resumable) */
             esp_err_t err = ESP_OK;
             for (int i = 0; i < 5; i++) {    /* TIMEOUT = in-flight FATFS op draining */
@@ -704,14 +734,10 @@ static void app_power_guard_task(void *arg)
             sd_logger_resume();
             /* Remount HERE (not via the monitor): the monitor was suspended while
              * it believed the card mounted, so an un-parked remount on its own
-             * probe would look like no transition and the restore callback would
-             * never fire. Mount, run the same restore the hot-plug path uses, and
-             * only then wake the monitor to a state matching its last observation.
-             * If the mount fails (card pulled while parked), the resumed monitor's
-             * own retry/transition machinery takes over. */
-            if (sdcard_mount() == ESP_OK) {
-                app_on_sd_state_change(true);   /* reopen event log, restart Lua */
-            } else {
+             * probe would look like no transition. Nothing else needs restoring —
+             * the event store and Lua never stopped. If the mount fails (card
+             * pulled while parked), the resumed monitor's retry takes over. */
+            if (sdcard_mount() != ESP_OK) {
                 ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
             }
             sdcard_monitor_resume();
@@ -747,44 +773,18 @@ static bool app_self_reboot_veto(void)
     return app_maintenance_active() || s_pwrguard_parked;
 }
 
-/* ── SD/persistence health for the OTA boot-confirm gate ───────────────────
- * The OTA rollback gate was MQTT-only, so an image that reconnects but breaks SD
- * mounting / the event log would be kept, stranding the unit measurement-dead. The
- * sticky NVS flag "sd_card/ever_ok" (set the first time persistence comes up on any
- * image) lets the gate tell "this unit is known to have a working card" — where a
- * new image failing to bring persistence up is a REGRESSION → roll back — from a
- * genuinely card-less unit, which must not be blocked on SD. */
-static bool app_sd_ever_ok_get(void)
-{
-    uint8_t v = 0;
-    nvs_handle_t h;
-    if (nvs_open("sd_card", NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, "ever_ok", &v);
-        nvs_close(h);
-    }
-    return v != 0;
-}
-
-static void app_sd_ever_ok_set(void)
-{
-    if (app_sd_ever_ok_get()) return;
-    nvs_handle_t h;
-    if (nvs_open("sd_card", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, "ever_ok", 1);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-
-/* Wired into ota_update_config_t.persistence_healthy — polled by the boot-confirm
- * gate after MQTT reconnects, before an image is marked valid. */
+/* ── Persistence health for the OTA boot-confirm gate ──────────────────────
+ * Wired into ota_update_config_t.persistence_healthy — polled by the boot-confirm
+ * gate after MQTT reconnects, before an image is marked valid. The store is on
+ * internal flash now, so "persistence up" is unconditional on every healthy
+ * unit: an image that cannot bring the internal event log up IS a regression,
+ * no card-less-unit escape hatch needed. (The old "sd_card/ever_ok" NVS flag and
+ * its SD-mounted arms are gone with the SD dependency; the stale NVS key is
+ * simply ignored.) */
 static bool app_persistence_healthy(void)
 {
     bool avail = false;
-    if (event_log_db_stats(&avail, NULL, NULL, NULL) == ESP_OK && avail) return true;
-    if (sdcard_is_mounted()) return false;      /* card present but persistence down → regression */
-    if (app_sd_ever_ok_get()) return false;     /* known-good card, not mounted now → regression */
-    return true;                                /* genuinely card-less unit → don't block OTA on SD */
+    return event_log_db_stats(&avail, NULL, NULL, NULL) == ESP_OK && avail;
 }
 
 /* SD/persistence telemetry for the STATUS heartbeat (wired into
@@ -793,8 +793,10 @@ static bool app_persistence_healthy(void)
 static esp_err_t app_sd_health(bool *io_lost, uint64_t *free_bytes,
                                int64_t *skipped, int64_t *dropped, int64_t *last_acked_id)
 {
-    if (io_lost)    *io_lost = sdcard_io_lost();
-    if (free_bytes) { *free_bytes = 0; (void)sdcard_free_bytes(free_bytes); }
+    if (io_lost)    *io_lost = sdcard_io_lost();     /* SD (archive) subsystem state */
+    /* free_bytes now reports the INTERNAL store headroom — that is the number the
+     * storage-full watermark + eviction act on; SD fullness only delays archiving. */
+    if (free_bytes) { *free_bytes = 0; (void)event_log_free_bytes(free_bytes); }
     evlog_health_t h;
     if (event_log_health(&h) != ESP_OK) return ESP_FAIL;
     if (skipped)       *skipped       = h.skipped;
@@ -821,14 +823,84 @@ static esp_err_t app_init_littlefs(void)
     return ESP_OK;
 }
 
-static void app_start_lua_runner(bool sd_available)
+/* Mount the internal event store: littlefs on the 9.4 MiB "storage" partition,
+ * unused since the v1 layout (its `fat` subtype byte is legacy; esp_littlefs
+ * finds it by LABEL with SUBTYPE_ANY, so the partition table — which cannot be
+ * OTA'd — stays byte-identical for the fleet). format_if_mount_failed=true is
+ * correct here, unlike on the SD: the first boot after this OTA finds stale FAT
+ * bytes that were never reachable by any code path, not field data. */
+static esp_err_t app_init_evstore(void)
 {
-    /* Lua script lives on the SD card (/sdcard/main.lua). Without SD the
-     * loader would fail with a confusing "file not found"; skip cleanly
-     * instead and surface the real reason in one line. */
-    if (!sd_available) {
-        ESP_LOGW(APP_TAG, "Lua runner not started: SD card not mounted");
-        return;
+    esp_vfs_littlefs_conf_t conf = {
+        .base_path = EVSTORE_MOUNT,
+        .partition_label = EVSTORE_PARTITION,
+        .format_if_mount_failed = true,
+        .grow_on_mount = true,
+    };
+
+    esp_err_t err = esp_vfs_littlefs_register(&conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "event-store mount failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    uint64_t freeb = 0;
+    (void)event_log_free_bytes(&freeb);
+    ESP_LOGI(APP_TAG, "event store mounted at " EVSTORE_MOUNT " (%llu B free)",
+             (unsigned long long)freeb);
+    return ESP_OK;
+}
+
+/* ── SD keeper task ─────────────────────────────────────────────────────────
+ * The one place the event pipeline still touches the SD, on a slow cadence and
+ * always in bulk: (1) legacy migration — drain the pre-internal-store
+ * /sdcard/events backlog into the internal store (oldest-first, a few files per
+ * pass so this task never hogs the store mutex); (2) bulk archive — once
+ * EVLOG_ARCHIVE_EVERY_N stores accumulate, copy every fully-synced retained file
+ * to /sdcard/archive in one burst. Both are keeper-paced, so a dead/absent/
+ * parked SD costs nothing but a skipped pass — measurement and publishing never
+ * notice. Priority 2 (with the other background housekeeping). */
+#define SD_KEEPER_PERIOD_MS       60000
+#define SD_KEEPER_MIGRATE_FILES   4       /* per pass: bounds mutex hold + task burst */
+#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no Lua/mount fan-out */
+
+static void app_sd_keeper_task(void *arg)
+{
+    (void)arg;
+    bool migration_done_logged = false;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SD_KEEPER_PERIOD_MS));
+        if (!sdcard_is_mounted()) continue;
+
+        size_t migrated = event_log_import_sd_backlog(SD_KEEPER_MIGRATE_FILES);
+        if (migrated > 0) {
+            migration_done_logged = false;
+        } else if (!migration_done_logged) {
+            migration_done_logged = true;   /* quiet once the legacy dir is empty */
+        }
+
+        if (event_log_archive_pending()) {
+            size_t archived = 0;
+            (void)event_log_archive_to_sd(&archived);
+        }
+    }
+}
+
+static void app_start_lua_runner(void)
+{
+    /* Script home is internal (/littlefs/main.lua). A unit that has never
+     * received a script (fresh flash, no OTA yet) falls back to the SD card —
+     * the manual offline-recovery source — importing it into the internal home
+     * first so the next boot no longer needs the card. */
+    if (!lua_runner_script_present()) {
+        struct stat st;
+        if (stat("/sdcard/main.lua", &st) == 0 && st.st_size > 0 &&
+            lua_runner_import_script("/sdcard/main.lua") == ESP_OK) {
+            ESP_LOGW(APP_TAG, "no internal main.lua — imported from SD (offline recovery)");
+        } else {
+            ESP_LOGW(APP_TAG, "Lua runner not started: no main.lua (deliver via "
+                              "script_update OTA or an SD recovery card)");
+            return;
+        }
     }
 
     const esp_err_t err = lua_runner_start();
@@ -1279,31 +1351,30 @@ void app_main(void)
     if (err == ESP_OK) {
         sd_available = true;
     } else {
-        ESP_LOGW(APP_TAG, "SD card unavailable, buffering to LittleFS only");
+        ESP_LOGW(APP_TAG, "SD card unavailable — archive/log roles offline; "
+                          "measurement + publishing unaffected (internal store)");
     }
 
-    /* ── LittleFS ─────────────────────────────────────────────────── */
+    /* ── LittleFS (script home) ───────────────────────────────────── */
     bool lfs_available = false;
     err = app_init_littlefs();
     if (err == ESP_OK) {
         lfs_available = true;
     } else {
-        ESP_LOGE(APP_TAG, "LittleFS unavailable, persistence disabled");
+        ESP_LOGE(APP_TAG, "LittleFS unavailable — main.lua home missing");
     }
 
-    /* ── Persistence (append-only event log) ──────────────────────── */
+    /* ── Persistence (append-only event log on the INTERNAL store) ──
+     * No SD/littlefs gating: the store partition is soldered down. If the mount
+     * or the open fails, that is a real fault worth failing loudly, not a
+     * missing-card condition to degrade around. */
     bool persistence_available = false;
-    if (lfs_available) {
+    err = app_init_evstore();
+    if (err == ESP_OK) {
         err = event_log_init();
         if (err == ESP_OK) {
             persistence_available = true;
-            ESP_LOGI(APP_TAG, "Persistence layer ready");
-            /* Record that this unit has a working SD/persistence so the OTA boot
-             * gate can treat a future image that can't bring it up as a regression. */
-            bool avail = false;
-            if (event_log_db_stats(&avail, NULL, NULL, NULL) == ESP_OK && avail) {
-                app_sd_ever_ok_set();
-            }
+            ESP_LOGI(APP_TAG, "Persistence layer ready (internal store)");
         } else {
             ESP_LOGW(APP_TAG, "Persistence init failed: %s", esp_err_to_name(err));
         }
@@ -1320,6 +1391,18 @@ void app_main(void)
         esp_err_t mon_err = sdcard_start_monitor(2000, app_on_sd_state_change);
         if (mon_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "SD monitor failed to start: %s", esp_err_to_name(mon_err));
+        }
+    }
+
+    /* ── SD keeper (legacy-backlog migration + bulk archive) ──────────
+     * Started only when persistence is up — both of its jobs write into or read
+     * out of the internal store. Missing-task fallback: nothing breaks, the
+     * store just retains synced files until eviction bounds them. */
+    if (persistence_available) {
+        if (xTaskCreate(app_sd_keeper_task, "sd_keeper", SD_KEEPER_TASK_STACK,
+                        NULL, 2, NULL) != pdPASS) {
+            ESP_LOGW(APP_TAG, "SD keeper not started (task alloc failed) — "
+                              "no SD archive/migration this session");
         }
     }
 
@@ -1446,7 +1529,7 @@ void app_main(void)
     }
 
     /* ── Start the measurement loop ───────────────────────────────── */
-    app_start_lua_runner(sd_available);
+    app_start_lua_runner();
 
     /* ── Boot complete: release MQTT + the upload drain ───────────────
      * Everything is initialized and Lua is running — the TLS handshake and

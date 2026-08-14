@@ -575,7 +575,7 @@ esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb)
     esp_log_level_set("sdmmc_req",     ESP_LOG_NONE);
 
     /* 12 KB stack: the remount path goes through esp_vfs_fat_sdmmc_mount +
-     * FATFS, and the cb fans out to event_log_on_sd_restored() + lua_runner_start()
+     * FATFS, and the cb can fan out to a script import + lua_runner_start()
      * (FATFS reopen is a heavy stack user). 4 KB overflowed; 8 KB was marginal.
      * Static (BSS) storage so a fragmented heap can never fail to start the only
      * task that can recover a lost card (audit D4). */

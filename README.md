@@ -1,6 +1,6 @@
 # Ambyte IoT
 
-ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on the SD card, and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. The measurement schedule is a **Lua script on the SD card** (`/sdcard/main.lua`) — no reflash to change what/when the device measures. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
+ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. The measurement schedule is a **Lua script** (`/littlefs/main.lua`, delivered by flashing or MQTT `script_update`; an SD card carrying `main.lua` is the manual offline-recovery source) — no reflash to change what/when the device measures. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
 
 Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on the host from `.env` + a `device_certs/<bundle>/` PEM set and flashed into the NVS partition next to the firmware — **no BLE companion app, no runtime provisioning round-trip** (BLE provisioning is deprecated/compiled out).
 
@@ -16,8 +16,8 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **External sensor** | AMBIT (multispeq-style), ESP8685 / ESP32-C3, up to 4 channels over a shared UART/FFC link |
 | **Onboard sensors** | BME280 (T/H/P), PCF2131 RTC, MP2731 battery charger / power-path (all I2C) |
 | **Transport** | MQTT v5 over mutual TLS → AWS IoT Core (device cert + private key from NVS) |
-| **Storage** | Append-only `event_log` on FAT/SD (`/sdcard/events/`); read cursor + `next_id` high-water mark in NVS. **SQLite has been removed.** |
-| **Scripting** | Lua 5.4 VM running `/sdcard/main.lua`; hot-updatable over MQTT |
+| **Storage** | Append-only `event_log` on internal littlefs (`/evstore/events/`, the 9.4 MiB `storage` partition); read cursor + `next_id` HWM in NVS; SD = bulk archive (`/sdcard/archive/`) + logs + AMBIT firmware. **SQLite has been removed.** |
+| **Scripting** | Lua 5.4 VM running `/littlefs/main.lua`; hot-updatable over MQTT |
 | **Power** | Radio publishing gated on external power (MP2731); DFS clock scaling 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
 | **License** | CERN Open Hardware Licence Version 2 — Strongly Reciprocal (see [LICENSE](LICENSE)) |
@@ -40,11 +40,13 @@ cp .env.example .env && $EDITOR .env          # Wi-Fi creds, MQTT URI, topic roo
 pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 
-# 4. Put a measurement schedule on the SD card
+# 4. Seed a measurement schedule (first flash only): put main.lua on an SD card —
+#    the device imports it into its internal home (/littlefs/main.lua) at boot and
+#    no longer needs the card. Subsequent updates go over MQTT (script_update).
 cp lua/main.lua  /path/to/AMBYTE_SD/main.lua
 ```
 
-The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/sdcard/main.lua`, stores measurements to the SD `event_log`, and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock.
+The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/littlefs/main.lua`, stores measurements to the internal `event_log` (`/evstore`), and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock. Synced records are bulk-archived to the SD card (when present) once per 1000 stores.
 
 ---
 
@@ -88,7 +90,8 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 - **sync_runner** — the only MQTT publisher; also emits the STATUS heartbeat and runs a connectivity watchdog.
 - **lua_runner** — runs `/sdcard/main.lua` once, self-deletes on return/stop, restarts on SD reinsert. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement isn't preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
-- **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks SD persistence (stops Lua, flushes + closes the event log and SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write — the reset path no shutdown handler can cover, and the prime suspect for field card corruption. Un-parks (remount + restore + Lua restart) after 60 s of external power or battery ≥ 3600 mV.
+- **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
+- **sd_keeper** — the only event-pipeline SD writer: migrates a legacy `/sdcard/events` backlog into the internal store (post-OTA, oldest-first, duplicate-safe) and bulk-archives fully-synced files to `/sdcard/archive/arc-<first_id>.log` once per 1000 stores.
 - **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap).
 - **mqtt_client / wifi** run on the esp-mqtt / esp-netif event loops.
 
@@ -230,7 +233,8 @@ uv run python tools/build_nvs_image.py --out ./nvs.bin
 Stress-testing 4 AMBIT channels every few seconds corrupted the SQLite events DB on consumer microSD cards (SQLite's in-place page/header rewrites are hostile to FATFS), and recovery leaked into an OOM spiral that killed MQTT. The workload is a store-and-forward FIFO, not relational queries. So SQLite was replaced — behind the same `persistence_port.h` interface — by [components/event_log](components/event_log) (a prior TXT-file logger had run for months on the same cards without corruption).
 
 - **On-disk format v2:** rotating tab-delimited files `/sdcard/events/ev-NNNNNN.log` (rolled past 256 KiB), one newline-terminated record per event, 9 fields: `measure_id · channel · device · tag · cmd_raw · start_ms · end_ms · metadata · payload`.
-- **Durability:** writes are appends only; read cursor + `next_id` high-water mark live in NVS. Batched flush (every 8 records / 1500 ms), deliberately **not** per-event fsync — every fsync rewrites FAT metadata in place, and each of those is a corruption window if power dies mid-write; losing ≤8 records to a brownout is recoverable (at-least-once), losing the FAT is not. A brownout-torn final record is truncated back to the last newline at open; a short write is rolled back with `ftruncate`. Drained rotated files are deleted. The low-battery power guard (above) parks the whole SD stack before a dying battery can interrupt a write.
+- **Durability:** the store is littlefs on the internal 9.4 MiB `storage` partition (`/evstore`) — copy-on-write, power-loss-safe: a brownout can lose at most the ≤8 records since the last batched flush (every 8 records / 1500 ms), never tear framing or the filesystem. Read cursor + `next_id` HWM live in NVS. Fully-synced rotated files are **retained** for the bulk SD archive and **evicted oldest-first when space runs low** — unsynced records always win; writes are refused only when nothing synced remains to evict.
+- **SD card role:** bulk archive (`/sdcard/archive/`, one burst per 1000 stores), WARN/ERROR logs, AMBIT firmware images, and offline `main.lua` recovery. A dead, absent, or corrupted card no longer affects measurement or publishing.
 - **IDs:** `measure_id` is monotonic int64, HWM persisted to NVS every 64 ids and **re-seeded above the SD log's max on boot** (NVS is wiped on every reflash, but the SD log survives, and openJII dedupes on `(device_id, measure_id)`).
 
 ### Inspecting / decoding telemetry

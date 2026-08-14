@@ -4,8 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_err.h"
@@ -42,7 +44,13 @@
  * dual-core; see docs/measurement-flow-plan.md.) */
 #define LUA_RUNNER_TASK_CORE 1
 #define LUA_QUERY_MAX_RECORDS 64
-#define LUA_SCRIPT_PATH "/sdcard/main.lua"
+/* Canonical script home is INTERNAL flash (littlefs): the script arrives via
+ * flashing or MQTT script_update, so the SD card — the old home — is only a
+ * manual recovery source for offline units (see lua_runner_import_script). An
+ * SD pull/corruption can no longer stop the measurement loop. */
+#define LUA_SCRIPT_PATH     "/littlefs/main.lua"
+#define LUA_SCRIPT_PATH_NEW "/littlefs/main.lua.new"
+#define LUA_SCRIPT_PATH_BAK "/littlefs/main.lua.bak"
 
 /* Bundled scheduler library (components/lua_runner/sched.lua), generated into a
  * C byte array at configure time (see CMakeLists) and loaded before the user
@@ -1926,6 +1934,54 @@ done:
         xSemaphoreGive(s_done_sem);
     }
     vTaskDelete(NULL);
+}
+
+/* Copy an external script (normally /sdcard/main.lua — the manual offline
+ * recovery path: no internet, tech writes a card on a laptop, inserts it) into
+ * the canonical internal home. Staged copy + atomic rename, previous script kept
+ * as .bak — the same swap discipline script_update uses, so a reset mid-import
+ * can never leave the device script-less. No syntax check here: a broken import
+ * fails loudly at the next start and the .bak remains for manual recovery. */
+esp_err_t lua_runner_import_script(const char *src_path)
+{
+    if (src_path == NULL) return ESP_ERR_INVALID_ARG;
+    FILE *in = fopen(src_path, "rb");
+    if (in == NULL) return ESP_ERR_NOT_FOUND;
+
+    FILE *out = fopen(LUA_SCRIPT_PATH_NEW, "wb");
+    if (out == NULL) { fclose(in); return ESP_FAIL; }
+
+    char buf[512];
+    size_t n, total = 0;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+        total += n;
+    }
+    if (ok && ferror(in)) ok = false;
+    if (ok && (fflush(out) != 0 || fsync(fileno(out)) != 0)) ok = false;
+    fclose(in);
+    fclose(out);
+    if (!ok || total == 0) {
+        remove(LUA_SCRIPT_PATH_NEW);
+        return ESP_FAIL;
+    }
+
+    remove(LUA_SCRIPT_PATH_BAK);
+    rename(LUA_SCRIPT_PATH, LUA_SCRIPT_PATH_BAK);   /* ENOENT on first install: fine */
+    if (rename(LUA_SCRIPT_PATH_NEW, LUA_SCRIPT_PATH) != 0) {
+        remove(LUA_SCRIPT_PATH_NEW);
+        return ESP_FAIL;
+    }
+    ESP_LOGW(LUA_RUNNER_TAG, "imported %s -> %s (%u bytes; previous kept as .bak)",
+             src_path, LUA_SCRIPT_PATH, (unsigned)total);
+    return ESP_OK;
+}
+
+bool lua_runner_script_present(void)
+{
+    struct stat st;
+    return stat(LUA_SCRIPT_PATH, &st) == 0 && st.st_size > 0;
 }
 
 esp_err_t lua_runner_start(void)
