@@ -5,13 +5,20 @@ Firmware and the field measurement script are independent release units in one r
 | Unit | Paths | Tag | Assets |
 |---|---|---|---|
 | Firmware | Everything except `lua/**` | `vX.Y.Z` | `firmware.bin`, flash ZIP |
-| Field Lua | `lua/**` | `lua-vX.Y.Z` | `main.lua`, `main.lua.manifest.json` |
+| Field Lua catalog | `lua/**` | `lua-vX.Y.Z` | One `.lua` asset and manifest per script |
 
 The PR workflow squashes the proposed tree with the validated PR title, then previews both units. A change under `lua/**` can therefore publish Lua without creating a firmware release; a mixed PR can publish both. The main-branch workflow downloads the already verified PR artifact and publishes only the affected unit(s).
 
+Every Lua release contains the complete script catalog. A change to any catalog script creates one new `lua-vX.Y.Z` release in which every selectable script has its own immutable asset and manifest:
+
+| Workflow choice | Release assets | Intended use |
+|---|---|---|
+| `main` | `main.lua`, `main.lua.manifest.json` | Default multi-channel measurement schedule |
+| `legacy_1Hz_spec` | `legacy_1Hz_spec.lua`, `legacy_1Hz_spec.lua.manifest.json` | One-channel, 1 Hz cmd 31 acquisition |
+
 ## Rollout payload
 
-The Lua manifest contains a ready-to-publish `script_update` object:
+Each Lua manifest contains a ready-to-publish `script_update` object. For example, the default script uses:
 
 ```json
 {
@@ -24,7 +31,11 @@ The Lua manifest contains a ready-to-publish `script_update` object:
 }
 ```
 
+The alternate manifest points to `legacy_1Hz_spec.lua` and uses a distinct campaign ID such as `lua-v1.0.0:legacy_1Hz_spec`. Both are installed by the device as `/sdcard/main.lua`; the release asset name only selects the source payload.
+
 Publish that object through the same device selection and command-topic mechanism used for firmware OTA. The device downloads in chunks, verifies the digest, parses the script without executing it, stages and flushes `main.lua.new`, retains `main.lua.bak`, atomically swaps, persists release identity, and reboots by default.
+
+For the normal operator path, open **Actions → Fleet deploy (Lua) → Run workflow**, choose the release tag and the **Released Lua script** field, target the cohort, leave **dry run** enabled for the preview, then rerun live when the selection is correct.
 
 `built_against_fw` is provenance: it identifies the firmware API surface used when the Lua asset was released. It is not an automatically inferred minimum-compatible version.
 

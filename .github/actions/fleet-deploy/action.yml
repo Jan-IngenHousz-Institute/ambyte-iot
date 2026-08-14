@@ -11,6 +11,10 @@ inputs:
   release-tag:
     description: Exact release tag, or `latest` within the selected kind
     required: true
+  script-name:
+    description: Lua only; released asset name without the .lua suffix
+    required: false
+    default: main
   version-op:
     description: Firmware-version predicate
     required: true
@@ -93,6 +97,7 @@ runs:
         KIND: ${{ inputs.kind }}
         TAG: ${{ inputs.release-tag }}
         ALLOW_PRERELEASE: ${{ inputs.allow-prerelease }}
+        SCRIPT_NAME: ${{ inputs.script-name }}
       shell: bash
       run: |
         set -euo pipefail
@@ -101,7 +106,9 @@ runs:
             REQUIRED_ASSETS=(firmware.bin)
             ;;
           lua)
-            REQUIRED_ASSETS=(main.lua main.lua.manifest.json)
+            [[ "${SCRIPT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+              || { echo "::error::invalid Lua script name: ${SCRIPT_NAME}"; exit 2; }
+            REQUIRED_ASSETS=("${SCRIPT_NAME}.lua" "${SCRIPT_NAME}.lua.manifest.json")
             ;;
           ambit)
             REQUIRED_ASSETS=(manifest.json)
@@ -179,6 +186,7 @@ runs:
         FORCE_REFLASH: ${{ inputs.force-reflash }}
         AMBIT_FINAL_SECONDS: ${{ inputs.ambit-final-seconds }}
         REBOOT: ${{ inputs.reboot }}
+        SCRIPT_NAME: ${{ inputs.script-name }}
       shell: bash
       run: |
         set -euo pipefail
@@ -205,6 +213,7 @@ runs:
             ;;
           lua)
             [[ "${REBOOT}" == "true" ]] && ARGS+=(--reboot) || ARGS+=(--no-reboot)
+            ARGS+=(--script-name "${SCRIPT_NAME}")
             python tools/fleet_deploy/lua_deploy.py "${ARGS[@]}"
             ;;
           ambit)
