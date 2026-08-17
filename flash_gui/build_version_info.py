@@ -8,12 +8,17 @@ blank PE, and Defender's ML models score that as more suspicious than an
 otherwise identical binary carrying real publisher metadata. This is not a
 substitute for an Authenticode signature, only the part of the gap that is free.
 
+Deliberately carries no version number. The release job publishes the artifact
+promoted from main rather than rebuilding at tag time, so a version compiled in
+here could not be corrected to match the `flash-gui-v*` tag, and a hand-bumped
+constant just drifts (it sat at 0.1.0 across two releases). The tag and the zip
+filename identify the build; FixedFileInfo needs the numeric fields to exist, so
+they are zeroed rather than filled with something false.
+
 Usage: python -m flash_gui.build_version_info <output-path>
 """
 
 import sys
-
-from flash_gui import __version__
 
 COMPANY = "Jan Ingenhousz Institute"
 PRODUCT = "Ambyte Flash GUI"
@@ -23,8 +28,8 @@ FILENAME = "ambyte-flash-gui.exe"
 
 TEMPLATE = """VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers={vers},
-    prodvers={vers},
+    filevers=(0, 0, 0, 0),
+    prodvers=(0, 0, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -37,12 +42,10 @@ TEMPLATE = """VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', {company!r}),
         StringStruct('FileDescription', {description!r}),
-        StringStruct('FileVersion', {dotted!r}),
         StringStruct('InternalName', 'ambyte-flash-gui'),
         StringStruct('LegalCopyright', {copyright!r}),
         StringStruct('OriginalFilename', {filename!r}),
         StringStruct('ProductName', {product!r}),
-        StringStruct('ProductVersion', {dotted!r}),
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
@@ -51,18 +54,8 @@ TEMPLATE = """VSVersionInfo(
 """
 
 
-def version_tuple(version):
-    """`"0.2.1"` -> `(0, 2, 1, 0)`. Windows requires exactly four integers."""
-    numeric = version.split("+", 1)[0].split("-", 1)[0]
-    parts = [int(part) for part in numeric.split(".")[:4]]
-    return tuple(parts + [0] * (4 - len(parts)))
-
-
-def render(version=__version__):
-    vers = version_tuple(version)
+def render():
     return TEMPLATE.format(
-        vers=vers,
-        dotted=".".join(str(part) for part in vers),
         company=COMPANY,
         product=PRODUCT,
         description=DESCRIPTION,

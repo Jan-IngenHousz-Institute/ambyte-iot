@@ -13,5 +13,3 @@ USB-Serial-JTAG console.
 Run with:  python -m flash_gui
 """
 
-# Keep in step with the flash-gui-v* tag; feeds the Windows PE version resource.
-__version__ = "0.2.1"
