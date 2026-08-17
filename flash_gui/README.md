@@ -87,7 +87,8 @@ RTC, selected Lua script).
 6. **Lua script** — asks the firmware to stream the selected immutable release
    asset to the SD card. The firmware checks SHA-256 and Lua syntax, keeps the
    previous file as `/sdcard/main.lua.bak`, atomically installs it as
-   `/sdcard/main.lua`, and restarts Lua in place.
+   `/sdcard/main.lua`, and restarts Lua in place. Verification keeps the same
+   serial connection open while this asynchronous operation completes.
 7. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`,
    and the active Lua file identity, then reports PASS/FAIL per item. On
    failure, **Retry provisioning** repairs name/timezone and retries the Lua
