@@ -16,8 +16,10 @@ clearly-reported state:
   4. flash        release images + nvs.bin in one esptool session; a mid-way
                   failure leaves the chip in the ROM bootloader = re-flashable
   5. rtc          wait for the freshly booted console, set the exact UTC epoch
-  6. lua          install the selected latest-catalog release asset through the
-                  firmware's verified URL updater; previous script kept as .bak
+  6. lua          push the selected latest-catalog release asset down this
+                  console (no device network needed) and let the firmware verify
+                  + swap it; falls back to the firmware's URL updater on older
+                  firmware. Previous script kept as .bak either way
   7. verify       read back name / timezone / RTC / Lua identity; per-item
                   pass/fail
 
@@ -34,13 +36,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ambyte_serial, esptool_ops
-from .ambyte_serial import ConsoleError, expand_mac_token
+from .ambyte_serial import (ConsoleError, UnsupportedConsoleCommand,
+                            expand_mac_token)
 from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
                      MAX_NAME_LEN, NVS_OFFSET, PROTOCOL_ID, Environment,
                      default_command_topic, default_status_topic)
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient
-from .release_fetch import LuaScriptRelease, ReleaseImages
+from . import release_fetch
+from .release_fetch import (LuaScriptRelease, ReleaseError,
+                            ReleaseImages)
 
 # Accept the RTC as correct within this window of host-now. Generous: it
 # covers console latency and a slow verify loop, but still catches a
@@ -391,20 +396,51 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 "Lua script", True,
                 f"{script.asset_name} from {script.tag}; sha256={script.sha256}")
 
-        _require_network(con, ctx.wifi_ssid, log=log)
-
-        log(f"Installing {script.asset_name} from {script.tag} "
-            f"({script.size_bytes} bytes)...")
+        # Preferred: stream the script down this console, so the board needs no
+        # network of its own to be onboarded. Falls back to asking the device to
+        # download it when the firmware predates the push commands.
+        pushed = False
+        blob = None
         try:
-            con.lua_install(
-                script.asset_url,
-                script.sha256,
-                script.campaign_id,
-                script.script_version,
-                script.built_against_fw,
-            )
-        except ConsoleError as exc:
-            raise ProcedureError("lua", str(exc)) from exc
+            blob = release_fetch.script_bytes(script, log=log)
+        except ReleaseError as exc:
+            log(f"Cannot read {script.asset_name} locally ({exc}); "
+                "falling back to a device-side download.")
+
+        if blob is not None:
+            log(f"Pushing {script.asset_name} from {script.tag} "
+                f"({len(blob)} bytes) over serial...")
+            try:
+                con.lua_push(
+                    blob,
+                    script.sha256,
+                    script.campaign_id,
+                    script.script_version,
+                    script.built_against_fw,
+                    log=log,
+                )
+                pushed = True
+            except UnsupportedConsoleCommand:
+                log("This firmware cannot accept a serial push; "
+                    "falling back to a device-side download.")
+            except ConsoleError as exc:
+                raise ProcedureError("lua", str(exc)) from exc
+
+        if not pushed:
+            # Only this path needs the board on the network.
+            _require_network(con, ctx.wifi_ssid, log=log)
+            log(f"Installing {script.asset_name} from {script.tag} "
+                f"({script.size_bytes} bytes)...")
+            try:
+                con.lua_install(
+                    script.asset_url,
+                    script.sha256,
+                    script.campaign_id,
+                    script.script_version,
+                    script.built_against_fw,
+                )
+            except ConsoleError as exc:
+                raise ProcedureError("lua", str(exc)) from exc
 
         deadline = time.time() + LUA_INSTALL_DEADLINE_S
         last_detail = "the previous script is still active"

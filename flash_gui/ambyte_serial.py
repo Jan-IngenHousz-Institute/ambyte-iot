@@ -21,6 +21,7 @@ Console facts this module is built on (components/CLI/CLI.c):
 
 from __future__ import annotations
 
+import base64
 import re
 import time
 from dataclasses import dataclass, field
@@ -44,6 +45,15 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 # that connected bit on IP_EVENT_STA_GOT_IP, not on association, so "connected"
 # already means the board holds a DHCP lease.
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
+_LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
+# NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
+# driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
+# USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT and which the REPL does not let us size
+# (esp_console_dev_usb_serial_jtag_config_t is an empty struct). Overrun it and
+# the line never reaches the parser, so the command simply never answers.
+# Measured on hardware: a 224-character line works, 264 hangs. 144 raw bytes
+# encodes to 192, so the line is 200 characters, comfortably clear of 256.
+LUA_PUT_CHUNK_BYTES = 144
 FAILURE_MARK = "Command returned non-zero error code"
 
 # The firmware expands this token at boot; over `cfg get` it comes back raw.
@@ -52,6 +62,15 @@ MAC_TOKEN = "{MAC}"
 
 class ConsoleError(RuntimeError):
     """Console unreachable or a command failed."""
+
+
+class UnsupportedConsoleCommand(ConsoleError):
+    """The firmware does not implement this command.
+
+    Distinct from a failure so callers can fall back rather than give up: a board
+    flashed with a release older than the serial-push commands is fine, it just
+    has to install its script the old way.
+    """
 
 
 def expand_mac_token(value: str, mac: str) -> str:
@@ -241,6 +260,58 @@ class AmbyteConsole:
         reply = self.command(cmd, timeout=10.0)
         if "lua install queued:" not in reply or FAILURE_MARK in reply:
             raise ConsoleError(f"Lua install request failed:\n{reply[-500:]}")
+
+    def lua_push(self, blob: bytes, sha256: str, campaign_id: str,
+                 script_version: str, built_against_fw: str,
+                 log=None) -> None:
+        """Stream a script down this console and install it, no device network.
+
+        Raises UnsupportedConsoleCommand when the firmware predates the push
+        commands, so the caller can fall back to the URL installer.
+        """
+        args = (sha256, campaign_id, script_version, built_against_fw)
+        if any(not value or any(ch.isspace() for ch in value) for value in args):
+            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
+
+        reply = self.command("lua begin", timeout=10.0)
+        if "lua begin: ready" not in reply:
+            # Older firmware answers the `lua <start|stop|...>` usage line and a
+            # non-zero exit; that is a capability signal, not a failure.
+            if "Usage: lua" in reply or FAILURE_MARK in reply:
+                raise UnsupportedConsoleCommand(
+                    "this firmware has no `lua begin`/`lua put`")
+            raise ConsoleError(f"lua begin failed:\n{reply[-500:]}")
+
+        sent = 0
+        for offset in range(0, len(blob), LUA_PUT_CHUNK_BYTES):
+            chunk = blob[offset:offset + LUA_PUT_CHUNK_BYTES]
+            encoded = base64.b64encode(chunk).decode("ascii")
+            reply = self.command(f"lua put {encoded}", timeout=15.0)
+            match = _LUA_PUT_RE.search(reply)
+            if match is None or FAILURE_MARK in reply:
+                self._lua_abort_quietly()
+                raise ConsoleError(f"lua put failed at byte {sent}:\n{reply[-500:]}")
+            sent += len(chunk)
+            # The device reports the staged file's own size, so a silently
+            # dropped chunk is caught here rather than by the digest at commit.
+            if int(match.group(1)) != sent:
+                self._lua_abort_quietly()
+                raise ConsoleError(
+                    f"device staged {match.group(1)} bytes after {sent} were sent")
+            if log is not None:
+                log(f"Pushed {sent}/{len(blob)} bytes of {script_version}.")
+
+        reply = self.command("lua commit " + " ".join(args), timeout=15.0)
+        if "lua commit queued:" not in reply or FAILURE_MARK in reply:
+            self._lua_abort_quietly()
+            raise ConsoleError(f"lua commit failed:\n{reply[-500:]}")
+
+    def _lua_abort_quietly(self) -> None:
+        """Drop a half-pushed staging file; never mask the original error."""
+        try:
+            self.command("lua abort", timeout=10.0)
+        except ConsoleError:
+            pass
 
     def lua_release(self, timeout: float = 10.0) -> LuaReleaseStatus:
         """Read the active /sdcard/main.lua identity and runner state."""
