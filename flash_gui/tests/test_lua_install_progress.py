@@ -39,6 +39,9 @@ class _FakeConsole:
     def lua_install(self, *args, **kwargs):
         return None
 
+    def wifi_connected(self, timeout=10.0):
+        return True
+
     def lua_release(self, timeout=10.0):
         reply = self._replies.pop(0) if self._replies else self._stale()
         if isinstance(reply, Exception):
@@ -73,6 +76,7 @@ def wired(monkeypatch):
             size_bytes=6731, campaign_id="lua-v1.2.0")
         ctx = object.__new__(procedure.SessionContext)
         ctx.lua_script = script
+        ctx.wifi_ssid = "protoMUSIC-GATEWAY"
         run_state = object.__new__(procedure.DeviceRun)
         run_state.port = "COM7"
         return procedure.install_lua_script(ctx, run_state, log=messages.append)
@@ -123,3 +127,60 @@ def test_success_still_returns_immediately_without_noise(wired):
     item = run(_FakeConsole([good]))
     assert item.passed
     assert not [m for m in messages if m.startswith("Still waiting")]
+
+# ── network precheck ─────────────────────────────────────────────────────────
+class _WifiConsole(_FakeConsole):
+    def __init__(self, states, replies=()):
+        super().__init__(replies)
+        self._states = list(states)
+        self.installed = False
+
+    def wifi_connected(self, timeout=10.0):
+        state = self._states.pop(0) if self._states else self._states_last
+        self._states_last = state
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    def lua_install(self, *a, **k):
+        self.installed = True
+
+
+def test_no_ip_fails_fast_instead_of_after_the_full_install_deadline(wired):
+    run, messages, clock = wired
+    started = clock.now
+    console = _WifiConsole([False] * 200)
+    with pytest.raises(ProcedureError, match="never got an IP"):
+        run(console)
+    # Fails on the Wi-Fi budget, not the 360 s install budget.
+    assert clock.now - started < procedure.LUA_INSTALL_DEADLINE_S
+    assert clock.now - started >= procedure.LUA_WIFI_DEADLINE_S
+    # And crucially, never queued a download that could not have worked.
+    assert not console.installed
+
+
+def test_late_association_still_proceeds(wired):
+    run, messages, _clock = wired
+    # Offline for the first few polls, as after a reboot, then up.
+    console = _WifiConsole([False, False, True])
+    with pytest.raises(ProcedureError):   # install itself never converges
+        run(console)
+    assert console.installed
+    assert any("with an IP" in m for m in messages)
+
+
+def test_firmware_that_does_not_report_wifi_is_not_blocked(wired):
+    run, messages, _clock = wired
+    console = _WifiConsole([None])
+    with pytest.raises(ProcedureError):
+        run(console)
+    assert console.installed, "older firmware must not be treated as offline"
+
+
+def test_flaky_console_read_is_not_treated_as_a_network_verdict(wired):
+    run, messages, _clock = wired
+    console = _WifiConsole([ConsoleError("no prompt back")])
+    with pytest.raises(ProcedureError):
+        run(console)
+    assert console.installed
+    assert any("Could not read Wi-Fi state" in m for m in messages)

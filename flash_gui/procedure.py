@@ -65,6 +65,12 @@ LUA_INSTALL_SETTLE_S = 15.0
 # operator cannot attach a serial monitor to check because the GUI holds the
 # port. Report what the device is reporting instead.
 LUA_INSTALL_PROGRESS_S = 15.0
+# The device fetches the script itself over HTTPS, so no Wi-Fi means no install.
+# Association is not instant after the reboot in step 5, so wait briefly rather
+# than failing on the first read; but wait here, where the cause is obvious,
+# instead of burning the full LUA_INSTALL_DEADLINE_S on a board that was never
+# going to download anything.
+LUA_WIFI_DEADLINE_S = 60.0
 
 
 class ProcedureError(RuntimeError):
@@ -303,6 +309,48 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
             pass
 
 
+def _require_network(con, ssid: str, log=print) -> None:
+    """Fail fast when the board has no IP, before queueing a download.
+
+    `status` reports "Wi-Fi: connected" off the firmware's CONNECTED bit, which
+    is set on IP_EVENT_STA_GOT_IP rather than on association, so this really
+    does mean "associated and holding a DHCP lease".
+
+    A board that reaches this state can still fail to reach GitHub, since a
+    gateway with no uplink (or broken DNS) looks identical from here. This only
+    removes the case that is knowable up front.
+    """
+    deadline = time.time() + LUA_WIFI_DEADLINE_S
+    announced = False
+    while True:
+        try:
+            state = con.wifi_connected()
+        except ConsoleError as exc:
+            # Never turn a flaky console read into a network verdict.
+            log(f"Could not read Wi-Fi state ({exc}); continuing anyway.")
+            return
+        if state is None:
+            return  # Firmware too old to report it; not our call to block.
+        if state:
+            log(f"Device is on Wi-Fi '{ssid}' with an IP.")
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise ProcedureError(
+                "lua",
+                f"the board never got an IP on '{ssid}' within "
+                f"{LUA_WIFI_DEADLINE_S:.0f}s, so it cannot download the Lua "
+                "script. Check the SSID and password for "
+                "this session, and that the access point is in range and "
+                "handing out addresses. Nothing was changed on the board; "
+                "use Retry provisioning once the network is up.")
+        if not announced:
+            log(f"Waiting for the board to join '{ssid}' "
+                f"(up to {LUA_WIFI_DEADLINE_S:.0f}s)...")
+            announced = True
+        time.sleep(3.0)
+
+
 def install_lua_script(ctx: SessionContext, run: DeviceRun,
                        log=print) -> VerifyItem:
     """Install and positively verify the selected released Lua asset.
@@ -342,6 +390,8 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
             return VerifyItem(
                 "Lua script", True,
                 f"{script.asset_name} from {script.tag}; sha256={script.sha256}")
+
+        _require_network(con, ctx.wifi_ssid, log=log)
 
         log(f"Installing {script.asset_name} from {script.tag} "
             f"({script.size_bytes} bytes)...")

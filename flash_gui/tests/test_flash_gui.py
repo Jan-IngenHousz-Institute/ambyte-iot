@@ -452,6 +452,9 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
         def lua_install(self, *args):
             self.install_args = args
 
+        def wifi_connected(self, timeout=10.0):
+            return True
+
         def close(self):
             self.close_count += 1
 
@@ -468,7 +471,7 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
     monkeypatch.setattr(procedure.time, "sleep", lambda _seconds: None)
 
     result = procedure.install_lua_script(
-        SimpleNamespace(lua_script=script),
+        SimpleNamespace(lua_script=script, wifi_ssid="test-ap"),
         SimpleNamespace(port="/dev/ttyACM0"),
         log=lambda _message: None,
     )

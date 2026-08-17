@@ -5,13 +5,13 @@
 
 Console facts this module is built on (components/CLI/CLI.c):
   * prompt is exactly "ambyte> "; the REPL comes up ~20-35 s after reset
-  * linenoise echoes input and emits ANSI refresh/hint sequences — responses
+  * linenoise echoes input and emits ANSI refresh/hint sequences, so responses
     are found by searching the whole (ANSI-stripped) reply, never by anchoring
     on the echo line
-  * a handler failure prints "Command returned non-zero error code" — success
+  * a handler failure prints "Command returned non-zero error code"; success
     is the absence of that line (plus per-command success patterns)
   * `cfg get` returns the RAW NVS string: a fleet-default board legitimately
-    answers `device_name = AMBYTE_{MAC}` — the firmware expands the {MAC}
+    answers `device_name = AMBYTE_{MAC}`, and the firmware expands the {MAC}
     token at boot, in RAM only
   * `rtc set <epoch>` (UTC seconds) applies immediately; `rtc` reads UTC
   * opening the port must not assert DTR/RTS: esptool drives those lines to
@@ -40,6 +40,10 @@ _LUA_RELEASE_RE = re.compile(
     r"built_against_fw=(\S+)\s+installed_on_fw=(\S+)\s+"
     r"verified=(true|false)\s+running=(true|false)")
 _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
+# `status` prints " - Wi-Fi: connected (provisioned: yes)". The firmware sets
+# that connected bit on IP_EVENT_STA_GOT_IP, not on association, so "connected"
+# already means the board holds a DHCP lease.
+_WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
 FAILURE_MARK = "Command returned non-zero error code"
 
 # The firmware expands this token at boot; over `cfg get` it comes back raw.
@@ -176,6 +180,15 @@ class AmbyteConsole:
         m = _STATUS_MAC_RE.search(self.status())
         return m.group(1).upper() if m else None
 
+    def wifi_connected(self, timeout: float = 10.0) -> bool | None:
+        """Whether the board has an IP, or None if it does not say.
+
+        None means "do not block on this": an older firmware whose `status`
+        omits the line must not be treated as offline.
+        """
+        m = _WIFI_RE.search(self.status(timeout))
+        return None if m is None else m.group(1).lower() == "connected"
+
     def cfg_get(self, key: str, timeout: float = 5.0) -> str | None:
         """Raw NVS value, or None when unset/unreadable."""
         reply = self.command(f"cfg get {key}", timeout)
@@ -184,7 +197,7 @@ class AmbyteConsole:
         for line in reply.splitlines():
             line = line.strip()
             m = re.match(_CFG_GET_RE_TMPL.format(key=re.escape(key)), line)
-            # Skip the echo line ("cfg get <key>") — it carries no '='.
+            # Skip the echo line ("cfg get <key>"), it carries no '='.
             if m and not line.startswith("cfg get"):
                 value = m.group(1).strip()
                 return None if value.startswith("(unset") else value
@@ -262,7 +275,7 @@ class AmbyteConsole:
 # ── high-level helpers ──────────────────────────────────────────────────────
 def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResult:
     """Pre-flash check: is a live ambyte console on this port, and what name
-    does it carry? Short timeout by design — an unflashed/foreign board simply
+    does it carry? Short timeout by design: an unflashed/foreign board simply
     times out and the caller falls back to esptool for the MAC."""
     result = ProbeResult()
     for _ in range(1 + retries):
@@ -295,7 +308,7 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
 
     The ESP32-S3 native USB-Serial-JTAG re-enumerates to a NEW port name on
     every reset (and leaves ghost ports behind), and the CLI task only starts
-    ~20-35 s into boot — so rescan every live JTAG port until one answers with
+    ~20-35 s into boot, so rescan every live JTAG port until one answers with
     the prompt, retrying across re-enumerations until the deadline.
     """
     deadline = time.time() + deadline_s
@@ -348,5 +361,5 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
     if con is not None:
         con.close()
     raise ConsoleError(
-        f"no ambyte console answered within {deadline_s:.0f}s — the board may "
+        f"no ambyte console answered within {deadline_s:.0f}s; the board may "
         "still be booting, or the USB port re-enumerated to a different name.")
