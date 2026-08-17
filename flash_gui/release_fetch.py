@@ -18,6 +18,7 @@ of exiting; the GUI turns that into a message.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,8 @@ RELEASES_CACHE = CACHE_DIR / "releases.json"
 # manifest fetched once for a given URL can never change. Caching them forever
 # is what lets a warm PC bootstrap a whole onboarding session offline.
 MANIFEST_CACHE = CACHE_DIR / "lua_manifests.json"
+# Script bodies, keyed by digest so a name can never collide across releases.
+SCRIPTS_CACHE_DIR = CACHE_DIR / "lua_scripts"
 # Short enough that a release published mid-session is picked up, long enough
 # to collapse the two startup fetches into one request.
 RELEASES_TTL_SECONDS = 300
@@ -543,6 +546,36 @@ def _download(url: str, dest: Path, expect_size: int | None) -> None:
         tmp.unlink(missing_ok=True)
         raise ReleaseError(f"asset truncated: got {got} bytes, expected {expect_size}.")
     tmp.replace(dest)
+
+
+def script_bytes(script: LuaScriptRelease, log=print) -> bytes:
+    """The script's exact released bytes, cached and digest-checked.
+
+    Cached under the release digest so the name can never collide across
+    releases, and re-verified on every read: a truncated or tampered cache entry
+    is discarded rather than pushed to a board. This is what lets the GUI stream
+    a script to a device that has no network of its own.
+    """
+    cached = SCRIPTS_CACHE_DIR / f"{script.sha256}.lua"
+    if cached.is_file():
+        blob = cached.read_bytes()
+        if hashlib.sha256(blob).hexdigest() == script.sha256:
+            return blob
+        log(f"Cached {script.asset_name} failed its digest check; refetching.")
+        cached.unlink(missing_ok=True)
+
+    log(f"Fetching {script.asset_name} ({script.size_bytes} bytes) from "
+        f"{script.tag}...")
+    SCRIPTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _download(script.asset_url, cached, script.size_bytes)
+    blob = cached.read_bytes()
+    got = hashlib.sha256(blob).hexdigest()
+    if got != script.sha256:
+        cached.unlink(missing_ok=True)
+        raise ReleaseError(
+            f"{script.asset_name} sha256 {got} does not match the manifest's "
+            f"{script.sha256}")
+    return blob
 
 
 def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:

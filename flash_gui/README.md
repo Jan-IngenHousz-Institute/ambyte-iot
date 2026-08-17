@@ -83,6 +83,22 @@ price:
 macOS builds are not notarized either: expect the Gatekeeper right-click-Open
 dance.
 
+### The Lua script is pushed, not downloaded
+
+The GUI streams the selected script down the console it already holds open
+(`lua begin` / `lua put` / `lua commit`), so **the board needs no network to be
+onboarded**. The bytes are cached and digest-checked on the PC; the firmware
+re-hashes what it received, syntax-checks it, and keeps the previous script as
+`main.lua.bak`, exactly as it does for a remote install.
+
+Chunks are base64 and 366 bytes each, sized against the console's 512-byte line
+limit. Each `lua put` replies with the staged file's own size, so a dropped chunk
+is caught as it happens rather than at the final digest check.
+
+If the board runs firmware older than these commands, the GUI says so and falls
+back to the old behaviour of asking the device to download the script itself.
+That fallback is the only path that needs the board on Wi-Fi.
+
 ### GitHub rate limits
 
 The GUI reads the repo's release list to find the firmware and the Lua catalog.
