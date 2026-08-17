@@ -17,13 +17,21 @@ operator's machine:
 
 - every PR touching `flash_gui/**` builds them once as workflow artifacts,
   keyed by the PR head SHA (30-day retention, GitHub login required);
-- the merge push to `main` downloads, verifies, and promotes those exact PR
-  artifacts instead of rebuilding them;
-- pushing a tag `flash-gui-v*` (e.g. `flash-gui-v0.1.1`) attaches the promoted
-  `main` artifacts to a public GitHub release without rebuilding. The flash
-  GUI belongs to **no**
-  semantic-release unit — `flash_gui/**` commits never bump the firmware
-  version (`tools/release/path-scoped.js`), so these tags are cut by hand.
+- the merge to `main` waits for that PR run, downloads and verifies those exact
+  artifacts, signs the Windows bundle if signing is configured, and publishes
+  them as a public GitHub release. Nothing is rebuilt at release time, so the
+  bytes users download are the bytes CI tested on the PR.
+
+**Every merge to `main` cuts a release.** There is no manual tag step. The tag
+is patch-incremented from the highest existing `flash-gui-v*` tag, so merging a
+GUI change is the whole release process. Releases are always marked
+`prerelease` and never `latest`, so `/releases/latest` keeps resolving to the
+newest *firmware* release. The flash GUI belongs to **no** semantic-release
+unit, and `flash_gui/**` commits never bump the firmware version
+(`tools/release/path-scoped.js`).
+
+If you need a minor or major bump rather than a patch, create the tag by hand
+before merging and CI will continue from it.
 
 Release assets are one zip per platform (`*-windows.zip`, `*-linux.zip`,
 `*-macos.zip`), each holding a PyInstaller `--onedir` bundle. Unzip it and run
