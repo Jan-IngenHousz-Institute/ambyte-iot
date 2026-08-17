@@ -91,9 +91,13 @@ onboarded**. The bytes are cached and digest-checked on the PC; the firmware
 re-hashes what it received, syntax-checks it, and keeps the previous script as
 `main.lua.bak`, exactly as it does for a remote install.
 
-Chunks are base64 and 366 bytes each, sized against the console's 512-byte line
-limit. Each `lua put` replies with the staged file's own size, so a dropped chunk
-is caught as it happens rather than at the final digest check.
+Chunks are base64 and 144 bytes each, giving a 200-character command line. The
+binding limit is **not** the console's 512-byte `max_cmdline_length` but the
+USB-Serial-JTAG driver's 256-byte `rx_buffer_size`, which ESP-IDF fixes and the
+REPL does not expose; a longer line is swallowed and the command never answers.
+Measured on hardware: a 224-character line works, 264 hangs. Each `lua put`
+replies with the staged file's own size, so a dropped chunk is caught as it
+happens rather than at the final digest check.
 
 If the board runs firmware older than these commands, the GUI says so and falls
 back to the old behaviour of asking the device to download the script itself.

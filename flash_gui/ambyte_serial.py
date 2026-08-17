@@ -46,10 +46,14 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 # already means the board holds a DHCP lease.
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
 _LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
-# The console's max_cmdline_length is 512 (CLI.c). 366 raw bytes base64-encodes
-# to 488 characters, so "lua put " + chunk + CRLF is 498: under the limit with
-# enough headroom that a future prefix change cannot silently truncate a chunk.
-LUA_PUT_CHUNK_BYTES = 366
+# NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
+# driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
+# USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT and which the REPL does not let us size
+# (esp_console_dev_usb_serial_jtag_config_t is an empty struct). Overrun it and
+# the line never reaches the parser, so the command simply never answers.
+# Measured on hardware: a 224-character line works, 264 hangs. 144 raw bytes
+# encodes to 192, so the line is 200 characters, comfortably clear of 256.
+LUA_PUT_CHUNK_BYTES = 144
 FAILURE_MARK = "Command returned non-zero error code"
 
 # The firmware expands this token at boot; over `cfg get` it comes back raw.

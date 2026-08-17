@@ -78,13 +78,16 @@ def test_push_streams_every_byte_and_commits():
     assert not console.aborted
 
 
-def test_chunks_fit_the_512_byte_console_line():
+def test_chunks_fit_the_usb_jtag_rx_buffer():
     console = _console()
     console.lua_push(BLOB, SHA, "lua-v1.2.0", "1.2.0", "v1.8.1")
     puts = [c for c in console.commands if c.startswith("lua put ")]
     assert puts, "nothing was pushed"
-    # CLI.c sets max_cmdline_length = 512; the CRLF is on top of the line.
-    assert max(len(c) for c in puts) <= 500
+    # NOT max_cmdline_length (512). ESP-IDF fixes the USB-Serial-JTAG driver's
+    # rx_buffer_size at 256 and the REPL does not expose it, so a longer line is
+    # swallowed and the command never answers. Measured on hardware: 224 works,
+    # 264 hangs. Keep well clear, including the CRLF.
+    assert max(len(c) for c in puts) + 2 <= 224
 
 
 def test_old_firmware_is_reported_as_unsupported_not_broken():
