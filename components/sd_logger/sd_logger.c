@@ -60,6 +60,16 @@ static bool            s_started;
 static volatile bool   s_stop_req;
 static volatile bool   s_stopped;
 
+/* Low-battery park handshake: pause() asks the writer to drain + close the file
+ * and then HOLD (keep buffering to the RAM ring, touch no FATFS) until resume().
+ * Unlike the card-loss path this is a clean close — the card is still healthy, so
+ * nothing is abandoned/leaked, and a park can safely happen every night. Unlike
+ * prepare_shutdown() the writer does not park forever, so the logger survives the
+ * park/unpark cycle. Both flags are owned by the writer task except the request
+ * bit itself. */
+static volatile bool   s_pause_req;
+static volatile bool   s_paused;
+
 static inline size_t ring_used(void)
 {
     return (s_head + SD_LOGGER_RING_BYTES - s_tail) % SD_LOGGER_RING_BYTES;
@@ -230,6 +240,35 @@ static void writer_task(void *arg)
             vTaskDelay(portMAX_DELAY);   /* parked — the reboot follows shortly */
         }
 
+        /* Low-battery park: drain + fsync + close ONCE, then hold with no FATFS
+         * traffic until resumed (the ring keeps buffering; overflow drops newest).
+         * The close is io_begin-gated like every other FATFS touch; if the gate
+         * refuses (card lost / teardown pending mid-park) the handle is abandoned
+         * exactly like the loss branch below — fclose on a freed volume is a UAF. */
+        if (s_pause_req) {
+            if (!s_paused) {
+                if (s_fp != NULL) {
+                    if (!sdcard_io_lost() && sdcard_is_mounted() && sdcard_io_begin()) {
+                        size_t n;
+                        while ((n = ring_pop(buf, sizeof buf)) > 0) {
+                            if (fwrite(buf, 1, n, s_fp) != n) break;
+                        }
+                        fflush(s_fp);
+                        fsync(fileno(s_fp));
+                        close_log();
+                        sdcard_io_end();
+                    } else {
+                        s_fp = NULL; s_file_open = false;   /* abandon, as on loss */
+                    }
+                }
+                dirty = false;
+                s_paused = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
+            continue;
+        }
+        if (s_paused) s_paused = false;   /* resumed — fall through to normal service */
+
         /* Check the lock-free loss latch BEFORE sdcard_is_mounted(): when a card is
          * pulled this is the fast loop that re-arms the failing I/O, so it must stop
          * the instant loss is latched. Do NOT close_log() here — fclose would touch a
@@ -312,6 +351,24 @@ esp_err_t sd_logger_init(void)
              SD_LOGGER_DIR, SD_LOGGER_BASENAME,
              SD_LOGGER_MAX_FILES, SD_LOGGER_FILE_BYTES / 1024);
     return ESP_OK;
+}
+
+void sd_logger_pause(void)
+{
+    if (!s_started) return;
+    s_pause_req = true;
+    /* Bounded wait for the writer to drain + close (it polls at SD_LOGGER_POLL_MS),
+     * so the caller can unmount immediately after; if the writer is stuck in a slow
+     * failing op the caller's unmount drain covers the remainder. */
+    for (int i = 0; i < 100 && !s_paused; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void sd_logger_resume(void)
+{
+    if (!s_started) return;
+    s_pause_req = false;   /* writer clears s_paused and reopens on its next cycle */
 }
 
 void sd_logger_prepare_shutdown(void)

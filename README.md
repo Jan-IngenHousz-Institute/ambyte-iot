@@ -88,6 +88,7 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 - **sync_runner** — the only MQTT publisher; also emits the STATUS heartbeat and runs a connectivity watchdog.
 - **lua_runner** — runs `/sdcard/main.lua` once, self-deletes on return/stop, restarts on SD reinsert. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement isn't preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
+- **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks SD persistence (stops Lua, flushes + closes the event log and SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write — the reset path no shutdown handler can cover, and the prime suspect for field card corruption. Un-parks (remount + restore + Lua restart) after 60 s of external power or battery ≥ 3600 mV.
 - **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap).
 - **mqtt_client / wifi** run on the esp-mqtt / esp-netif event loops.
 
@@ -229,7 +230,7 @@ uv run python tools/build_nvs_image.py --out ./nvs.bin
 Stress-testing 4 AMBIT channels every few seconds corrupted the SQLite events DB on consumer microSD cards (SQLite's in-place page/header rewrites are hostile to FATFS), and recovery leaked into an OOM spiral that killed MQTT. The workload is a store-and-forward FIFO, not relational queries. So SQLite was replaced — behind the same `persistence_port.h` interface — by [components/event_log](components/event_log) (a prior TXT-file logger had run for months on the same cards without corruption).
 
 - **On-disk format v2:** rotating tab-delimited files `/sdcard/events/ev-NNNNNN.log` (rolled past 256 KiB), one newline-terminated record per event, 9 fields: `measure_id · channel · device · tag · cmd_raw · start_ms · end_ms · metadata · payload`.
-- **Durability:** writes are appends only; read cursor + `next_id` high-water mark live in NVS. Periodic flush (every 1500 ms / 8 records), not per-event fsync. A torn final record is skipped on read (no boot-time repair); a short write is rolled back with `ftruncate`. Drained rotated files are deleted.
+- **Durability:** writes are appends only; read cursor + `next_id` high-water mark live in NVS. Batched flush (every 8 records / 1500 ms), deliberately **not** per-event fsync — every fsync rewrites FAT metadata in place, and each of those is a corruption window if power dies mid-write; losing ≤8 records to a brownout is recoverable (at-least-once), losing the FAT is not. A brownout-torn final record is truncated back to the last newline at open; a short write is rolled back with `ftruncate`. Drained rotated files are deleted. The low-battery power guard (above) parks the whole SD stack before a dying battery can interrupt a write.
 - **IDs:** `measure_id` is monotonic int64, HWM persisted to NVS every 64 ids and **re-seeded above the SD log's max on boot** (NVS is wiped on every reflash, but the SD log survives, and openJII dedupes on `(device_id, measure_id)`).
 
 ### Inspecting / decoding telemetry
@@ -297,7 +298,7 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 [components/script_update](components/script_update), dispatched by `command_router`:
 
-- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. The immutable Lua release manifest contains this ready-to-publish object.
+- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable Lua release catalog has a manifest containing this ready-to-publish object.
 - Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
 - `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
 - Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
@@ -314,13 +315,13 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ## SD card
 
-- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). The canonical released source is [lua/main.lua](lua/main.lua). For a manual iteration, copy it to the card and reset; for a traceable rollout, use the independently versioned Lua release manifest.
+- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). Released sources live in the [Lua catalog](lua): `main.lua` is the default and `legacy_1Hz_spec.lua` is the opt-in cmd 31 experiment. For a manual iteration, copy the chosen source to the card as `main.lua` and reset; for a traceable rollout, select it in the independently versioned Lua deploy workflow.
 - Behaviour when the script is missing: no SD mounted → Lua task skipped, CLI+MQTT continue; SD mounted but no `main.lua` → task starts, fails the load, exits cleanly.
 - **Hot pull/reinsert recovery** ([components/sd_card](components/sd_card)): no card-detect pin, so a monitor polls `sdmmc_get_status` (CMD13, 2000 ms) plus a **lock-free error-driven loss latch** (writers call `sdcard_report_io_error/ok` and gate on `sdcard_io_lost()`) — needed because CMD13 alone loses the race to a task stuck in a multi-second failing transfer (priority inversion, the historic sdmmc `0x107` flood). On loss the Lua runner stops and `event_log_on_sd_lost` fires; on reinsert `event_log_on_sd_restored` runs and Lua restarts. `sd_logger` buffers WARN/ERROR in a RAM ring while the card is absent and flushes on remount.
 
 Lua binding tables exposed to scripts (see the `luaL_Reg` arrays in `lua_runner.c`): `device.*` (rtc/status/power/sd_ready/sleep_ms/log/PWM/…), `uart.*` (raw transport), `db.*` (`store_event`/`next_id`, for custom/derived events), `ambit.*` (ping/spec/leaf_temp/run/trigger/poll/fetch/run_mpf/set_gains/set_currents/blink/calibrate/actinic/set_metadata), and `sync.*` (interval/clock/weekly/sunrise-sunset scheduling from lat/lon + tz). The old `mqtt` Lua table was removed — scripts no longer publish.
 
-The production field schedule is [lua/main.lua](lua/main.lua). The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
+The production field schedule is [lua/main.lua](lua/main.lua), with [lua/legacy_1Hz_spec.lua](lua/legacy_1Hz_spec.lua) available for the selected legacy-sensor cohort. The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
 
 ---
 

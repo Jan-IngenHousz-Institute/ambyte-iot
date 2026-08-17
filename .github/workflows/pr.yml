@@ -215,16 +215,23 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq lua5.4
-          luac5.4 -p lua/main.lua
-          python tools/build_lua_release.py \
-            --output-dir dist \
-            --version "${LUA_VERSION}" \
-            --built-against-fw "${BUILT_AGAINST_FW}" \
-            --repository "${REPOSITORY}"
-          test "$(jq -r .script_version dist/main.lua.manifest.json)" = "${LUA_VERSION}"
-          test "$(jq -r .built_against_fw dist/main.lua.manifest.json)" = "${BUILT_AGAINST_FW}"
-          test "$(sha256sum dist/main.lua | awk '{print $1}')" = \
-            "$(jq -r .sha256 dist/main.lua.manifest.json)"
+          LUA_SCRIPTS=(main legacy_1Hz_spec)
+          for SCRIPT in "${LUA_SCRIPTS[@]}"; do
+            luac5.4 -p "lua/${SCRIPT}.lua"
+            python tools/build_lua_release.py \
+              --source "lua/${SCRIPT}.lua" \
+              --asset-name "${SCRIPT}.lua" \
+              --output-dir dist \
+              --version "${LUA_VERSION}" \
+              --built-against-fw "${BUILT_AGAINST_FW}" \
+              --repository "${REPOSITORY}"
+            MANIFEST="dist/${SCRIPT}.lua.manifest.json"
+            test "$(jq -r .script_name "${MANIFEST}")" = "${SCRIPT}"
+            test "$(jq -r .script_version "${MANIFEST}")" = "${LUA_VERSION}"
+            test "$(jq -r .built_against_fw "${MANIFEST}")" = "${BUILT_AGAINST_FW}"
+            test "$(sha256sum "dist/${SCRIPT}.lua" | awk '{print $1}')" = \
+              "$(jq -r .sha256 "${MANIFEST}")"
+          done
 
       - name: Upload release candidate
         uses: actions/upload-artifact@v6
