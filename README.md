@@ -20,7 +20,7 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **Scripting** | Lua 5.4 VM running `/sdcard/main.lua`; hot-updatable over MQTT |
 | **Power** | Radio publishing gated on external power (MP2731); DFS clock scaling 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
-| **License** | CERN Open Hardware Licence Version 2 — Strongly Reciprocal (see [LICENSE](LICENSE)) |
+| **License** | Firmware and hardware: CERN-OHL-S v2 ([LICENSE](LICENSE)). Host-side software: GPL-3.0 ([LICENSE.GPL-3.0](LICENSE.GPL-3.0)) |
 
 ---
 
@@ -385,7 +385,8 @@ ambyteiot_ambit_demo.ipynb / ambit-demo-workbook.jii  # telemetry decode/analysi
 .env / .env.example  # provisioning defaults
 platformio.ini       # PlatformIO env + pre: hook
 partitions.csv       # dual-OTA 16 MB layout
-LICENSE              # CERN-OHL-S v2
+LICENSE              # CERN-OHL-S v2 (hardware design + firmware)
+LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 ```
 
 > **Legacy / unused:** `littlefs` is mounted but no measurement data is written there (the event store is on FAT/SD); `spike_log` is a dev-only SD soak gated behind the `SPIKE_LOG` build flag. There is **no** `sqlite3` or `persistence` component in the built firmware — neither is present in the tree.
@@ -467,4 +468,23 @@ records), `evlog`/`inflight`/`netwd` CLI, dropped the derived `fluo` payload key
 
 ## License
 
-This project is released under the **CERN Open Hardware Licence Version 2 — Strongly Reciprocal (CERN-OHL-S v2)**. See [LICENSE](LICENSE) for the full text.
+This repository is dual-licensed, split by what the code is rather than where it sits:
+
+| Scope | Licence | Text |
+| --- | --- | --- |
+| Hardware design and firmware: `components/`, `main/`, `lua/`, `test/`, `CMakeLists.txt`, `partitions.csv`, `platformio.ini`, `sdkconfig*` | CERN Open Hardware Licence Version 2, Strongly Reciprocal (CERN-OHL-S v2) | [LICENSE](LICENSE) |
+| Host-side software: `flash_gui/`, `tools/`, `tests/`, `release.config.js` | GNU General Public License v3.0 | [LICENSE.GPL-3.0](LICENSE.GPL-3.0) |
+
+CERN-OHL-S is a hardware licence, so it does not cleanly govern the host-side
+Python and JavaScript. GPL-3.0 matches [openJII](https://github.com/Jan-IngenHousz-Institute/open-jii)
+and keeps the same strong reciprocity as CERN-OHL-S v2, which CERN designed as
+the hardware analogue of the GPL.
+
+Every GPL-3.0 source file carries an `SPDX-License-Identifier` header, so the
+split survives files being moved or copied out of the repo. The one exception is
+`flash_gui/vendor/nvs_partition_gen.py`, which is Espressif's and stays
+Apache-2.0 under its own SPDX header.
+
+The distributed `flash_gui` executables bundle [esptool](https://github.com/espressif/esptool)
+(GPL-2.0-or-later) and `certifi` (MPL-2.0), so the shipped binaries are covered
+by GPL-3.0 as a combined work.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Build one immutable Lua asset and its rollout manifest."""
 
 from __future__ import annotations

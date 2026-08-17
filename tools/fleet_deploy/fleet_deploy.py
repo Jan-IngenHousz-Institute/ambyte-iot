@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Fleet OTA deploy: targeted, staged firmware rollouts over AWS IoT.
 
 One MQTT publish per device (there is no broadcast topic and IoT Jobs is not

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+// SPDX-License-Identifier: GPL-3.0-only
 
 import { pathToFileURL } from "node:url";
 import { isRelevantFile } from "./path-scoped.js";
