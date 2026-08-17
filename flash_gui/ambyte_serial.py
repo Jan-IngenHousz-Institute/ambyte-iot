@@ -297,27 +297,53 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
     """
     deadline = time.time() + deadline_s
     said_wait = False
+    con: AmbyteConsole | None = None
+    active_port: str | None = None
     while time.time() < deadline:
-        cands = ([preferred_port] if preferred_port else []) + \
-            [p for p in esp_jtag_ports() if p != preferred_port]
-        for cand in cands:
+        if con is None:
+            cands = ([preferred_port] if preferred_port else []) + \
+                [p for p in esp_jtag_ports() if p != preferred_port]
+            for cand in cands:
+                try:
+                    con = AmbyteConsole(cand)
+                    active_port = cand
+                    break
+                except (OSError, serial.SerialException):
+                    continue           # ghost / not ready / busy
+
+        if con is not None:
             try:
-                con = AmbyteConsole(cand)
-            except (OSError, serial.SerialException):
-                continue               # ghost / not ready / busy
-            try:
-                if con.wait_prompt(timeout=3.0):
+                # Keep this handle open across polling slices. Opening the
+                # ESP32-S3 USB console can reset the board; repeatedly closing
+                # and reopening it every three seconds traps startup in a boot
+                # loop before the CLI has time to appear.
+                remaining = max(0.1, deadline - time.time())
+                if con.wait_prompt(timeout=min(3.0, remaining)):
                     if log:
-                        log(f"Console up on {cand}.")
+                        log(f"Console up on {active_port}.")
                     return con
             except ConsoleError:
-                pass
-            con.close()
+                con.close()
+                con = None
+                active_port = None
+                continue
+
+            # A real USB disconnect makes the open descriptor unusable and is
+            # normally raised above. This explicit presence check also handles
+            # platforms that leave a quiet ghost descriptor behind.
+            if active_port not in esp_jtag_ports():
+                con.close()
+                con = None
+                active_port = None
+
         if log and not said_wait:
             log("Waiting for the board's console (it starts ~20-35 s after "
                 "boot; the USB port may re-enumerate)...")
             said_wait = True
-        time.sleep(1.5)
+        if con is None:
+            time.sleep(1.5)
+    if con is not None:
+        con.close()
     raise ConsoleError(
         f"no ambyte console answered within {deadline_s:.0f}s — the board may "
         "still be booting, or the USB port re-enumerated to a different name.")

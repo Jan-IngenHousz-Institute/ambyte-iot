@@ -384,6 +384,37 @@ def test_console_parses_lua_release_and_queues_immutable_install():
     assert commands[-1][0].startswith("lua install https://example.test/")
 
 
+def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
+    """Polling must not reset the ESP32 by reopening its USB console."""
+    created = []
+
+    class SlowConsole:
+        def __init__(self, port):
+            self.port = port
+            self.polls = 0
+            self.closed = False
+            created.append(self)
+
+        def wait_prompt(self, timeout):
+            self.polls += 1
+            return self.polls == 3
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(procedure.ambyte_serial, "AmbyteConsole", SlowConsole)
+    monkeypatch.setattr(
+        procedure.ambyte_serial, "esp_jtag_ports", lambda: ["/dev/ttyACM0"])
+
+    console = procedure.ambyte_serial.connect_after_boot(
+        "/dev/ttyACM0", deadline_s=30.0)
+
+    assert console is created[0]
+    assert len(created) == 1
+    assert console.polls == 3
+    assert not console.closed
+
+
 def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch):
     script = LuaScriptRelease(
         tag="lua-v1.2.3",
