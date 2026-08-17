@@ -9,7 +9,7 @@ clearly-reported state:
   1. check        pre-flash serial probe (2 s, one retry) → stored name;
                   fallback: MAC via esptool (works on unflashed chips)
      [GUI prompts for the device name here]
-  2. credentials  openJII register + issue/rotate — BEFORE flashing, so an
+  2. credentials  openJII register + issue/rotate, BEFORE flashing, so an
                   API failure means nothing was written to the board at all
   3. nvs          bake the per-board NVS image (identity, certs, Wi-Fi,
                   timezone, MQTT, flash_time)
@@ -60,6 +60,17 @@ LUA_INSTALL_DEADLINE_S = 360.0
 # syntax-check, swap, and restart before asking the SD-backed identity reader.
 # Querying immediately can block the CLI behind the same SD operation.
 LUA_INSTALL_SETTLE_S = 15.0
+# Nothing was printed between "install queued" and the verdict, so a healthy
+# 6-minute wait for a slow download looked identical to a hung flasher, and the
+# operator cannot attach a serial monitor to check because the GUI holds the
+# port. Report what the device is reporting instead.
+LUA_INSTALL_PROGRESS_S = 15.0
+# The device fetches the script itself over HTTPS, so no Wi-Fi means no install.
+# Association is not instant after the reboot in step 5, so wait briefly rather
+# than failing on the first read; but wait here, where the cause is obvious,
+# instead of burning the full LUA_INSTALL_DEADLINE_S on a board that was never
+# going to download anything.
+LUA_WIFI_DEADLINE_S = 60.0
 
 
 class ProcedureError(RuntimeError):
@@ -147,9 +158,9 @@ def preflight(port: str, log=print) -> PreflightInfo:
         log(f"Found running ambyte firmware, MAC {mac}.")
     else:
         if probe.is_ambyte:
-            log("Console answered but gave no MAC — reading it via esptool.")
+            log("Console answered but gave no MAC, reading it via esptool.")
         else:
-            log("No console answer — treating as unflashed; reading the MAC "
+            log("No console answer, treating as unflashed; reading the MAC "
                 "via esptool (this resets the board).")
         try:
             mac = esptool_ops.read_mac(port, log=None)
@@ -161,7 +172,7 @@ def preflight(port: str, log=print) -> PreflightInfo:
     if probe.device_name:
         expanded = expand_mac_token(probe.device_name, mac)
         # The fleet default AMBYTE_{MAC}/AMBYTE_<mac> is "unnamed" for the
-        # purpose of the rename prompt — the proposal falls back to it anyway.
+        # purpose of the rename prompt; the proposal falls back to it anyway.
         if expanded != f"AMBYTE_{mac.upper()}":
             stored = expanded
         log(f"Stored device name: {expanded}")
@@ -184,7 +195,7 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
         raise ProcedureError(
             "credentials",
             f"the MQTT broker endpoint for '{ctx.env.key}' is not configured "
-            "(see the TODO in flash_gui/config.py) — refusing to provision a "
+            "(see the TODO in flash_gui/config.py), refusing to provision a "
             "board that could never connect.")
 
     log("Requesting device identity + certificate from openJII...")
@@ -298,6 +309,48 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
             pass
 
 
+def _require_network(con, ssid: str, log=print) -> None:
+    """Fail fast when the board has no IP, before queueing a download.
+
+    `status` reports "Wi-Fi: connected" off the firmware's CONNECTED bit, which
+    is set on IP_EVENT_STA_GOT_IP rather than on association, so this really
+    does mean "associated and holding a DHCP lease".
+
+    A board that reaches this state can still fail to reach GitHub, since a
+    gateway with no uplink (or broken DNS) looks identical from here. This only
+    removes the case that is knowable up front.
+    """
+    deadline = time.time() + LUA_WIFI_DEADLINE_S
+    announced = False
+    while True:
+        try:
+            state = con.wifi_connected()
+        except ConsoleError as exc:
+            # Never turn a flaky console read into a network verdict.
+            log(f"Could not read Wi-Fi state ({exc}); continuing anyway.")
+            return
+        if state is None:
+            return  # Firmware too old to report it; not our call to block.
+        if state:
+            log(f"Device is on Wi-Fi '{ssid}' with an IP.")
+            return
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise ProcedureError(
+                "lua",
+                f"the board never got an IP on '{ssid}' within "
+                f"{LUA_WIFI_DEADLINE_S:.0f}s, so it cannot download the Lua "
+                "script. Check the SSID and password for "
+                "this session, and that the access point is in range and "
+                "handing out addresses. Nothing was changed on the board; "
+                "use Retry provisioning once the network is up.")
+        if not announced:
+            log(f"Waiting for the board to join '{ssid}' "
+                f"(up to {LUA_WIFI_DEADLINE_S:.0f}s)...")
+            announced = True
+        time.sleep(3.0)
+
+
 def install_lua_script(ctx: SessionContext, run: DeviceRun,
                        log=print) -> VerifyItem:
     """Install and positively verify the selected released Lua asset.
@@ -338,6 +391,8 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 "Lua script", True,
                 f"{script.asset_name} from {script.tag}; sha256={script.sha256}")
 
+        _require_network(con, ctx.wifi_ssid, log=log)
+
         log(f"Installing {script.asset_name} from {script.tag} "
             f"({script.size_bytes} bytes)...")
         try:
@@ -353,7 +408,19 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
 
         deadline = time.time() + LUA_INSTALL_DEADLINE_S
         last_detail = "the previous script is still active"
-        log("Lua install queued; waiting for download and verification...")
+        log(f"Lua install queued; the device downloads and verifies it over "
+            f"Wi-Fi (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
+        next_progress = time.time() + LUA_INSTALL_SETTLE_S + LUA_INSTALL_PROGRESS_S
+
+        def report_progress() -> None:
+            nonlocal next_progress
+            now = time.time()
+            if now < next_progress:
+                return
+            next_progress = now + LUA_INSTALL_PROGRESS_S
+            log(f"Still waiting for {script.asset_name} "
+                f"({deadline - now:.0f}s left): {last_detail}.")
+
         time.sleep(LUA_INSTALL_SETTLE_S)
         while time.time() < deadline:
             try:
@@ -364,6 +431,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 # close/reopen can reset the ESP32 and abort the in-flight swap.
                 last_detail = str(exc)
                 if "went away" not in last_detail:
+                    report_progress()
                     time.sleep(2.0)
                     continue
 
@@ -388,10 +456,15 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 return VerifyItem(
                     "Lua script", True,
                     f"{script.asset_name} from {script.tag}; sha256={current.sha256}")
+            # Short digests: the log pane is narrow, and 64 hex chars per line
+            # every 15 s buries the part that changes. The full sha256 is in the
+            # success line and in the VerifyItem detail.
             last_detail = (
-                f"active sha256={current.sha256}, version="
-                f"{current.script_version or '(untracked)'}, "
-                f"verified={current.verified}, running={current.running}")
+                f"device still on {current.script_version or '(untracked)'}"
+                f"/{current.sha256[:12]}, want {script.script_version}"
+                f"/{script.sha256[:12]} (verified={current.verified}, "
+                f"running={current.running})")
+            report_progress()
             time.sleep(2.0)
 
         raise ProcedureError(
@@ -406,7 +479,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
 def _repair_cfg(con: ambyte_serial.AmbyteConsole, plan: ProvisioningPlan,
                 log=print) -> bool:
     """Fix a wrong device_name/timezone over the console. Returns True when
-    something was changed — cfg values are only read at boot, so the caller
+    something was changed: cfg values are only read at boot, so the caller
     must then reboot + reconnect."""
     changed = False
     raw_name = con.cfg_get("device_name") or ""

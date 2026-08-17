@@ -49,6 +49,10 @@ USER_AGENT = "ambyte-flash-gui"
 # NATed office shares one budget across every operator.
 RELEASES_URL = f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100"
 RELEASES_CACHE = CACHE_DIR / "releases.json"
+# Release assets are immutable (the repo publishes immutable releases), so a
+# manifest fetched once for a given URL can never change. Caching them forever
+# is what lets a warm PC bootstrap a whole onboarding session offline.
+MANIFEST_CACHE = CACHE_DIR / "lua_manifests.json"
 # Short enough that a release published mid-session is picked up, long enough
 # to collapse the two startup fetches into one request.
 RELEASES_TTL_SECONDS = 300
@@ -207,28 +211,53 @@ def _get_json(url: str) -> Any:
         raise ReleaseError(f"cannot reach GitHub ({exc.reason})") from exc
 
 
-def _load_releases_cache() -> dict | None:
+def _read_cache_file(path: Path) -> Any:
     try:
-        with open(RELEASES_CACHE, encoding="utf-8") as handle:
-            cached = json.load(handle)
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
     except (OSError, ValueError):
         return None
+
+
+def _write_cache_file(path: Path, payload: Any) -> None:
+    # A cache we cannot write is not a reason to fail a flash.
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _cached_manifest(url: str) -> Any:
+    """A Lua release manifest, fetched at most once per URL, ever.
+
+    Falls back to the stored copy when GitHub is unreachable, so a bench that
+    has already seen this release keeps working with no connectivity.
+    """
+    store = _read_cache_file(MANIFEST_CACHE)
+    store = store if isinstance(store, dict) else {}
+    if url in store:
+        return store[url]
+    manifest = _get_json(url)
+    store[url] = manifest
+    _write_cache_file(MANIFEST_CACHE, store)
+    return manifest
+
+
+def _load_releases_cache() -> dict | None:
+    cached = _read_cache_file(RELEASES_CACHE)
     if isinstance(cached, dict) and isinstance(cached.get("releases"), list):
         return cached
     return None
 
 
 def _store_releases_cache(releases: list, etag: str | None) -> None:
-    # A cache we cannot write is not a reason to fail a flash.
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = RELEASES_CACHE.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"fetched_at": time.time(), "etag": etag,
-                       "releases": releases}, handle)
-        tmp.replace(RELEASES_CACHE)
-    except OSError:
-        pass
+    _write_cache_file(RELEASES_CACHE,
+                      {"fetched_at": time.time(), "etag": etag,
+                       "releases": releases})
 
 
 def _release_list(log=print) -> list:
@@ -251,8 +280,15 @@ def _release_list(log=print) -> list:
     def fall_back(reason: str) -> list:
         if not cached:
             raise ReleaseError(reason)
-        log(f"{reason} Using the release list cached "
-            f"{int(max(age, 0) // 60)} min ago.")
+        # A missing or implausible fetched_at must not render as "cached
+        # 29782919 min ago"; say nothing rather than something absurd.
+        if 0 <= age < 86400:
+            when = f"cached {int(age // 60)} min ago"
+        elif 0 <= age < 86400 * 30:
+            when = f"cached {int(age // 86400)} day(s) ago"
+        else:
+            when = "previously cached"
+        log(f"{reason} Using the {when} release list.")
         return cached["releases"]
 
     req = urllib.request.Request(RELEASES_URL, headers=headers)
@@ -260,8 +296,19 @@ def _release_list(log=print) -> list:
         with urllib.request.urlopen(
                 req, timeout=30, context=ssl_context()) as resp:
             releases = json.loads(resp.read().decode("utf-8"))
-            _store_releases_cache(releases, resp.headers.get("ETag"))
-            return releases
+            if isinstance(releases, list) and releases:
+                _store_releases_cache(releases, resp.headers.get("ETag"))
+                return releases
+            # HTTP 200 with [] is what GitHub serves during a releases-API
+            # incident: on 2026-08-17 every repository on github.com returned an
+            # empty list for an hour while /releases/latest and GraphQL stayed
+            # correct. It is indistinguishable from a repo that has no releases,
+            # so it must never overwrite a cache holding real entries, and it
+            # must not be reported as "no firmware release found".
+            return fall_back(
+                "GitHub returned an empty release list, which normally means an "
+                "API incident rather than a repository without releases (check "
+                "https://www.githubstatus.com).")
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and cached:
             # Unchanged, and free: 304s do not count against the rate limit.
@@ -368,7 +415,7 @@ def fetch_latest_lua_catalog(log=print) -> LuaCatalogRelease:
             raise ReleaseError(
                 f"{tag} asset {asset_name} has no companion manifest")
         manifest_url = manifest_asset.get("browser_download_url") or ""
-        manifest = _get_json(manifest_url)
+        manifest = _cached_manifest(manifest_url)
         scripts.append(_validated_lua_script(tag, assets[asset_name], manifest))
 
     if not scripts:
