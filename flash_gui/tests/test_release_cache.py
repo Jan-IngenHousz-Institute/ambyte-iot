@@ -37,12 +37,6 @@ def _http_error(code, headers=None, body=b"{}"):
         release_fetch.RELEASES_URL, code, "err", headers or {}, io.BytesIO(body))
 
 
-@pytest.fixture(autouse=True)
-def _isolated_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(release_fetch, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(release_fetch, "RELEASES_CACHE", tmp_path / "releases.json")
-
-
 def _count_calls(monkeypatch, responder):
     calls = []
 
@@ -103,6 +97,7 @@ def test_rate_limit_falls_back_to_stale_cache_rather_than_blocking(monkeypatch):
     messages = []
     assert release_fetch._release_list(log=messages.append) == [{"tag_name": "v1.0.0"}]
     assert "rate limit" in messages[0].lower()
+    assert "cached" in messages[0]
 
 
 def test_rate_limit_error_reports_the_reset_time(monkeypatch):
@@ -126,3 +121,68 @@ def test_unrelated_http_error_is_not_reported_as_a_rate_limit(monkeypatch):
     _count_calls(monkeypatch, lambda req: (_ for _ in ()).throw(_http_error(500, headers)))
     with pytest.raises(ReleaseError, match="500"):
         release_fetch._release_list(log=lambda _m: None)
+
+
+def test_empty_listing_never_overwrites_a_good_cache(monkeypatch):
+    """The 2026-08-17 incident: HTTP 200 with [] for every repo on github.com.
+
+    /releases/latest and GraphQL stayed correct throughout, so this is not
+    "unreachable" and the URLError fallback never fires. Treating it as truth
+    reported "no firmware release found" and would have wiped the cache that
+    still had the answer.
+    """
+    _count_calls(monkeypatch, lambda req: _Resp([{"tag_name": "v1.8.1"}]))
+    release_fetch._release_list(log=lambda _m: None)
+    cached = json.loads(release_fetch.RELEASES_CACHE.read_text())
+    cached["fetched_at"] = 0
+    release_fetch.RELEASES_CACHE.write_text(json.dumps(cached))
+
+    _count_calls(monkeypatch, lambda req: _Resp([], etag='W/"empty"'))
+    messages = []
+    assert release_fetch._release_list(log=messages.append) == [{"tag_name": "v1.8.1"}]
+    assert "empty release list" in messages[0]
+    assert "githubstatus" in messages[0]
+    # A zeroed/implausible timestamp must not render as "29782919 min ago".
+    assert "previously cached" in messages[0]
+    # The good entries survive on disk for the next run too.
+    assert json.loads(
+        release_fetch.RELEASES_CACHE.read_text())["releases"] == [{"tag_name": "v1.8.1"}]
+
+
+def test_empty_listing_with_no_cache_blames_the_api_not_the_repo(monkeypatch):
+    _count_calls(monkeypatch, lambda req: _Resp([]))
+    with pytest.raises(ReleaseError) as excinfo:
+        release_fetch._release_list(log=lambda _m: None)
+    message = str(excinfo.value)
+    assert "empty release list" in message
+    assert "API incident" in message
+
+
+def test_manifests_are_fetched_once_and_reused_forever(monkeypatch):
+    """Release assets are immutable, so a manifest URL can never change."""
+    calls = []
+
+    def fake_get(url):
+        calls.append(url)
+        return {"schema_version": 1, "tag": "lua-v1.2.0"}
+
+    monkeypatch.setattr(release_fetch, "_get_json", fake_get)
+    url = "https://example.test/lua-v1.2.0/main.lua.manifest.json"
+    first = release_fetch._cached_manifest(url)
+    second = release_fetch._cached_manifest(url)
+    assert first == second
+    assert len(calls) == 1
+
+    # And it survives a restart: the store is on disk, not in memory.
+    def explode(_url):
+        raise AssertionError("must not refetch a cached manifest")
+
+    monkeypatch.setattr(release_fetch, "_get_json", explode)
+    assert release_fetch._cached_manifest(url) == first
+
+
+def test_a_new_manifest_url_is_still_fetched(monkeypatch):
+    monkeypatch.setattr(release_fetch, "_get_json", lambda url: {"url": url})
+    a = release_fetch._cached_manifest("https://example.test/a.manifest.json")
+    b = release_fetch._cached_manifest("https://example.test/b.manifest.json")
+    assert a != b
