@@ -5,7 +5,7 @@
 
 Adapted from the maintained flash-bundle logic: the release asset
 `ambyte-iot-v<X.Y.Z>.zip` is CI-built from the released commit and carries
-`flasher_args.json`, the build's own manifest — offsets, flash mode/size/freq,
+`flasher_args.json`, the build's own manifest: offsets, flash mode/size/freq,
 chip and reset behaviour are read FROM IT rather than hardcoded, so a future
 partition-table move cannot silently write the app to the wrong address.
 `nvs.bin` is deliberately absent from the asset (no secrets in a public
@@ -13,7 +13,7 @@ artifact); the caller bakes it per board and splices it in at NVS_OFFSET.
 
 Assets are cached under the user config dir keyed by tag + byte size, so a
 session with 10 boards downloads once. Everything raises ReleaseError instead
-of exiting — the GUI turns that into a message.
+of exiting; the GUI turns that into a message.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -43,6 +44,14 @@ MANIFEST = "flasher_args.json"
 # mistaken for a good cache entry.
 STAMP = ".complete.json"
 USER_AGENT = "ambyte-flash-gui"
+# The firmware and Lua fetchers both want this exact listing, so it is fetched
+# once and shared: unauthenticated GitHub allows 60 requests/hour per IP, and a
+# NATed office shares one budget across every operator.
+RELEASES_URL = f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100"
+RELEASES_CACHE = CACHE_DIR / "releases.json"
+# Short enough that a release published mid-session is picked up, long enough
+# to collapse the two startup fetches into one request.
+RELEASES_TTL_SECONDS = 300
 
 
 class ReleaseError(RuntimeError):
@@ -77,7 +86,7 @@ def pick_firmware_release(releases: list) -> dict | None:
 
     The repo's release stream carries more than firmware: lua-v* script
     releases and flash-gui-v* tool releases share it, and GitHub's
-    /releases/latest simply returns the most recently published one — the day
+    /releases/latest simply returns the most recently published one, and the day
     flash-gui-v0.1.0 was tagged, "latest" stopped carrying a firmware zip and
     every flasher in the field broke. So: scan the list, keep only non-draft,
     non-prerelease entries whose tag is a plain firmware `vX.Y.Z` AND that
@@ -146,6 +155,37 @@ def _auth_headers() -> dict[str, str]:
     return headers
 
 
+def _rate_limit_message(headers: Any, detail: str = "") -> str | None:
+    """Operator-readable rate-limit text, or None if this is a different error.
+
+    The old message only said "set GH_TOKEN", which is useless to an operator
+    mid-session who will not stop to mint a PAT. GitHub reports when the window
+    clears, so say it: waiting is usually the answer.
+    """
+    remaining = None
+    reset = None
+    limit = None
+    if headers is not None:
+        remaining = headers.get("X-RateLimit-Remaining")
+        reset = headers.get("X-RateLimit-Reset")
+        limit = headers.get("X-RateLimit-Limit")
+    if remaining != "0" and "rate limit" not in detail.lower():
+        return None
+
+    when = ""
+    try:
+        when = time.strftime("%H:%M", time.localtime(int(reset)))
+    except (TypeError, ValueError):
+        pass
+    return (
+        f"GitHub rate limit reached ({limit or 60} requests/hour, shared by "
+        f"everyone on this network)."
+        + (f" It resets at {when}." if when else "")
+        + " Wait for the reset, or set GH_TOKEN to a GitHub personal access "
+        "token (no scopes needed for a public repo) and restart."
+    )
+
+
 def _get_json(url: str) -> Any:
     req = urllib.request.Request(url, headers=_auth_headers())
     try:
@@ -158,13 +198,86 @@ def _get_json(url: str) -> Any:
             detail = exc.read().decode("utf-8", errors="replace")[:200]
         except Exception:
             pass
-        if exc.code == 403 and "rate limit" in detail.lower():
-            raise ReleaseError(
-                "GitHub rate limit hit. Set GH_TOKEN to a personal access "
-                "token and restart, or reuse an already-cached release.") from exc
+        if exc.code in (403, 429):
+            limited = _rate_limit_message(getattr(exc, "headers", None), detail)
+            if limited:
+                raise ReleaseError(limited) from exc
         raise ReleaseError(f"GitHub API {exc.code} for {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise ReleaseError(f"cannot reach GitHub ({exc.reason})") from exc
+
+
+def _load_releases_cache() -> dict | None:
+    try:
+        with open(RELEASES_CACHE, encoding="utf-8") as handle:
+            cached = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if isinstance(cached, dict) and isinstance(cached.get("releases"), list):
+        return cached
+    return None
+
+
+def _store_releases_cache(releases: list, etag: str | None) -> None:
+    # A cache we cannot write is not a reason to fail a flash.
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = RELEASES_CACHE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"fetched_at": time.time(), "etag": etag,
+                       "releases": releases}, handle)
+        tmp.replace(RELEASES_CACHE)
+    except OSError:
+        pass
+
+
+def _release_list(log=print) -> list:
+    """The repo's newest 100 releases, shared by both fetchers.
+
+    Costs at most one API request per RELEASES_TTL_SECONDS, and usually zero:
+    past the TTL the listing is revalidated with If-None-Match, and GitHub does
+    not count a 304 against the rate limit. When GitHub is unreachable or the
+    limit is already spent, a stale cache beats refusing to flash.
+    """
+    cached = _load_releases_cache()
+    age = time.time() - (cached or {}).get("fetched_at", 0)
+    if cached and 0 <= age < RELEASES_TTL_SECONDS:
+        return cached["releases"]
+
+    headers = _auth_headers()
+    if cached and cached.get("etag"):
+        headers["If-None-Match"] = cached["etag"]
+
+    def fall_back(reason: str) -> list:
+        if not cached:
+            raise ReleaseError(reason)
+        log(f"{reason} Using the release list cached "
+            f"{int(max(age, 0) // 60)} min ago.")
+        return cached["releases"]
+
+    req = urllib.request.Request(RELEASES_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(
+                req, timeout=30, context=ssl_context()) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+            _store_releases_cache(releases, resp.headers.get("ETag"))
+            return releases
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and cached:
+            # Unchanged, and free: 304s do not count against the rate limit.
+            # Re-stamp so the TTL restarts instead of revalidating every call.
+            _store_releases_cache(cached["releases"], cached.get("etag"))
+            return cached["releases"]
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        limited = (_rate_limit_message(getattr(exc, "headers", None), detail)
+                   if exc.code in (403, 429) else None)
+        return fall_back(limited or f"GitHub API {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return fall_back(f"Cannot reach GitHub ({exc.reason}).")
 
 
 def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRelease:
@@ -234,8 +347,7 @@ def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRele
 
 def fetch_latest_lua_catalog(log=print) -> LuaCatalogRelease:
     """Resolve and validate every selectable script in the latest Lua release."""
-    releases = _get_json(
-        f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100")
+    releases = _release_list(log=log)
     release = pick_lua_release(releases if isinstance(releases, list) else [])
     if release is None:
         raise ReleaseError(
@@ -269,7 +381,7 @@ class ReleaseImages:
     """The resolved set of images to write, plus where they came from.
 
     `flash_files` is (offset, path) ordered low→high, exactly as esptool wants
-    it, and NVS is not in it — the caller splices its freshly-baked nvs.bin in.
+    it, and NVS is not in it, so the caller splices its freshly-baked nvs.bin in.
     """
 
     def __init__(self, tag: str, version: str, root: Path, manifest: dict):
@@ -315,8 +427,7 @@ def fetch_latest(log=print) -> ReleaseImages:
     flash-gui-v* releases. pick_firmware_release() filters to real firmware
     releases (vX.Y.Z + flash-bundle asset, no drafts/prereleases).
     """
-    releases = _get_json(
-        f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100")
+    releases = _release_list(log=log)
     release = pick_firmware_release(releases if isinstance(releases, list)
                                     else [])
     if release is None:
@@ -361,7 +472,7 @@ def fetch_latest(log=print) -> ReleaseImages:
     manifest_path = dest / MANIFEST
     if not manifest_path.is_file():
         raise ReleaseError(
-            f"{tag} asset has no {MANIFEST} — cannot determine flash offsets.")
+            f"{tag} asset has no {MANIFEST}, cannot determine flash offsets.")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     version = tag[1:] if tag.startswith("v") else tag
     return ReleaseImages(tag, version, dest, manifest)
@@ -388,7 +499,7 @@ def _download(url: str, dest: Path, expect_size: int | None) -> None:
 
 
 def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
-    # The zip is ours and CI-built, so this is belt-and-braces — but an
+    # The zip is ours and CI-built, so this is belt-and-braces, but an
     # extraction that can write outside its directory only bites once.
     dest = dest.resolve()
     for member in zf.infolist():
