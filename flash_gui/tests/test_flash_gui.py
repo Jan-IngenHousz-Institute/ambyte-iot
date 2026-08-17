@@ -342,10 +342,8 @@ def test_fetch_latest_lua_catalog_validates_and_lists_all_scripts(monkeypatch):
             _lua_manifest(script="legacy_1Hz_spec"),
     }
 
-    def fake_get(url):
-        return responses[url] if url in responses else [release]
-
-    monkeypatch.setattr(release_fetch, "_get_json", fake_get)
+    monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
+    monkeypatch.setattr(release_fetch, "_get_json", lambda url: responses[url])
     catalog = fetch_latest_lua_catalog(log=lambda _message: None)
     assert catalog.tag == "lua-v1.2.3"
     assert [script.asset_name for script in catalog.scripts] == [
@@ -357,9 +355,8 @@ def test_fetch_latest_lua_catalog_rejects_manifest_drift(monkeypatch):
     release = _lua_rel("lua-v1.2.3")
     manifest = _lua_manifest()
     manifest["sha256"] = "not-a-digest"
-    monkeypatch.setattr(
-        release_fetch, "_get_json",
-        lambda url: manifest if url.endswith("manifest.json") else [release])
+    monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
+    monkeypatch.setattr(release_fetch, "_get_json", lambda url: manifest)
     with pytest.raises(ReleaseError, match="sha256"):
         fetch_latest_lua_catalog(log=lambda _message: None)
 

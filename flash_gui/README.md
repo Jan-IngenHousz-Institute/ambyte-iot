@@ -83,6 +83,23 @@ price:
 macOS builds are not notarized either: expect the Gatekeeper right-click-Open
 dance.
 
+### GitHub rate limits
+
+The GUI reads the repo's release list to find the firmware and the Lua catalog.
+Unauthenticated GitHub allows **60 requests/hour per IP**, and an office behind
+one NAT shares that budget across every operator.
+
+The listing is fetched once and shared by both lookups, cached on disk for five
+minutes, and revalidated with `If-None-Match` after that; GitHub does not count
+a `304 Not Modified` against the limit, so repeated starts are effectively free.
+If the limit is hit anyway, or GitHub is unreachable, the last cached listing is
+used and the reason is logged rather than blocking the session, and the error
+names the time the window resets.
+
+To raise the ceiling to 5000/hour, set `GH_TOKEN` (or `GITHUB_TOKEN`) to a
+GitHub personal access token before launching. The repo is public, so the token
+needs **no scopes at all**.
+
 The executables bundle Mozilla's CA root store through `certifi`; HTTPS does
 not depend on Python's build-machine certificate paths existing on the
 operator's computer. Platform roots are retained as well, so managed machines
