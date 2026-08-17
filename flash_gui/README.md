@@ -25,12 +25,55 @@ operator's machine:
   semantic-release unit — `flash_gui/**` commits never bump the firmware
   version (`tools/release/path-scoped.js`), so these tags are cut by hand.
 
-The binaries are unsigned: expect a SmartScreen "unrecognized app" prompt on
-Windows and a Gatekeeper right-click-Open dance on macOS.
+Release assets are one zip per platform (`*-windows.zip`, `*-linux.zip`,
+`*-macos.zip`), each holding a PyInstaller `--onedir` bundle. Unzip it and run
+`ambyte-flash-gui` from inside the extracted folder; the folder must stay
+intact, since the executable loads its Python runtime from its siblings.
 
-Release assets are the raw platform executables (`*-macos`, `*-linux`, and
-`*-windows.exe`), not zip or tar archives. A browser download may strip the
-executable bit on macOS/Linux; restore it with `chmod +x <downloaded-file>`.
+Every release also ships a `SHA256SUMS` asset. Verify before running:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing   # Linux
+shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+```
+
+```powershell
+Get-FileHash .\ambyte-flash-gui-windows.zip -Algorithm SHA256   # Windows
+```
+
+### Antivirus false positives
+
+Windows builds are **not code-signed**, and Microsoft Defender misclassifies
+them, most often as `Trojan:Win32/Sabsik.TE.A!ml` (first seen 2026-08-17 on
+`flash-gui-v0.2.1`). It is a false positive driven by three things at once: no
+signature, near-zero download prevalence, and a program that opens USB serial
+ports and writes certificates. The verdict depends on the machine's
+cloud-protection level, so it fires for some operators and not others on
+byte-identical files.
+
+If it trips, in Windows Security open Protection history, find the entry, and
+choose **Allow** (or **Restore** then **Allow on device**). On a managed laptop
+where that is greyed out, add a folder exclusion under Manage settings and
+re-download into it. Check `SHA256SUMS` first. Do not disable real-time
+protection.
+
+CI does what it can without a certificate: `--onedir` instead of `--onefile`
+(no PE payload unpacked to `%TEMP%` at runtime), and a real Win32 version
+resource with CompanyName/ProductName/FileDescription instead of a blank PE
+(`build_version_info.py`). Both lower the score; neither is a fix.
+
+The only durable fix is an Authenticode signature, and every route to one has a
+price:
+
+| Route | Cost | Blocker |
+| --- | --- | --- |
+| Azure Artifact Signing | ~$10/month | wired into the release job already, gated on the `AZURE_SIGNING_ENDPOINT` Actions variable, so it starts working the moment that variable is set |
+| SignPath Foundation | free | needs an OSI-approved licence for *all* components; `flash_gui/` is now GPL-3.0 but the firmware alongside it is CERN-OHL-S-2.0, so this only becomes viable if the GUI moves to its own repo. The cert also names SignPath Foundation as publisher, not JII |
+| Certum open-source cert | ~EUR 30/year | hardware token, so it cannot sign from a hosted runner |
+| Microsoft submission portal | free | keyed to one file hash, so it has to be redone every build |
+
+macOS builds are not notarized either: expect the Gatekeeper right-click-Open
+dance.
 
 The executables bundle Mozilla's CA root store through `certifi`; HTTPS does
 not depend on Python's build-machine certificate paths existing on the
@@ -167,3 +210,13 @@ dir (`%APPDATA%\ambyte-flash-gui` on Windows, `~/.config/ambyte-flash-gui` on
 Linux, `~/Library/Application Support/ambyte-flash-gui` on macOS). The API key
 and Wi-Fi password are stored there in plain text with owner-only permissions
 — treat that directory as sensitive.
+
+## License
+
+GPL-3.0, matching [openJII](https://github.com/Jan-IngenHousz-Institute/open-jii).
+See [LICENSE.GPL-3.0](../LICENSE.GPL-3.0). The firmware alongside this directory
+is CERN-OHL-S-2.0 instead; the repo root README has the full split.
+
+The packaged executables bundle esptool (GPL-2.0-or-later), pyserial (BSD),
+tzlocal (MIT) and certifi (MPL-2.0), so the shipped bundle is GPL-3.0 as a
+combined work.

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Unit tests for the pure logic in flash_gui (no hardware, no network).
 
 Run from the repo root:  python -m pytest flash_gui/tests -q

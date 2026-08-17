@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Resolve the firmware images to flash from the repo's GitHub releases.
 
 Adapted from the maintained flash-bundle logic: the release asset

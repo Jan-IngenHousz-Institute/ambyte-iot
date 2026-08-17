@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """PyInstaller entry point.
 
 `python -m flash_gui` stays the dev entry (__main__.py, relative imports);

@@ -62,18 +62,18 @@ jobs:
         include:
           - os: windows-latest
             label: windows
-            binary: dist/ambyte-flash-gui.exe
-            asset: ambyte-flash-gui-windows.exe
+            bundle: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-windows.zip
           - os: ubuntu-latest
             label: linux
-            binary: dist/ambyte-flash-gui
-            asset: ambyte-flash-gui-linux
+            bundle: dist/ambyte-flash-gui
+            asset: ambyte-flash-gui-linux.zip
           - os: macos-latest
             label: macos
-            # Release assets must be files, so ship the standalone Mach-O
-            # executable rather than wrapping the .app directory in a zip.
-            binary: dist/ambyte-flash-gui
-            asset: ambyte-flash-gui-macos
+            # --windowed builds a .app alongside the plain onedir folder; ship
+            # the bundle, since Tk needs it to take keyboard focus properly.
+            bundle: dist/ambyte-flash-gui.app
+            asset: ambyte-flash-gui-macos.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -96,21 +96,52 @@ jobs:
           # runtime (never imported statically), so PyInstaller's analysis
           # cannot discover it — bundle it explicitly. esptool ships flasher
           # stub JSONs as package data; --collect-all pulls those in.
-          pyinstaller --noconfirm --clean --onefile --windowed \
+          # A blank PE (no CompanyName/ProductName/FileDescription) scores worse
+          # with Defender's ML models than the same binary carrying publisher
+          # metadata. Windows-only: it is a Win32 version resource.
+          VERSION_FILE=()
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python -m flash_gui.build_version_info version_info.txt
+            cat version_info.txt
+            VERSION_FILE=(--version-file version_info.txt)
+          fi
+          # --onedir, not --onefile: the onefile bootloader unpacks a PE payload
+          # to %TEMP% and executes it, which is the single biggest reason
+          # Defender's ML models score these binaries as droppers.
+          pyinstaller --noconfirm --clean --onedir --windowed \
             --name ambyte-flash-gui \
             --paths . \
             --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
             --collect-all esptool \
+            "${VERSION_FILE[@]}" \
             flash_gui/launcher.py
 
-      - name: Package
+      # onedir means the asset is a directory, and GitHub release assets must be
+      # files, so each platform zips with the tool that preserves its own
+      # metadata: executable bits on Linux, bundle symlinks on macOS.
+      - name: Package (Linux)
+        if: matrix.label == 'linux'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
-          cp "${{ matrix.binary }}" "out/${{ matrix.asset }}"
-          if [[ "${{ matrix.label }}" != "windows" ]]; then
-            chmod +x "out/${{ matrix.asset }}"
-          fi
+          cd dist
+          zip -r -y "../out/${{ matrix.asset }}" ambyte-flash-gui
+
+      - name: Package (macOS)
+        if: matrix.label == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ditto -c -k --keepParent "${{ matrix.bundle }}" "out/${{ matrix.asset }}"
+
+      - name: Package (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Compress-Archive -Path "${{ matrix.bundle }}" -DestinationPath "out/${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v6
         with:
@@ -204,9 +235,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s out/ambyte-flash-gui-macos
-          test -s out/ambyte-flash-gui-linux
-          test -s out/ambyte-flash-gui-windows.exe
+          test -s out/ambyte-flash-gui-macos.zip
+          test -s out/ambyte-flash-gui-linux.zip
+          test -s out/ambyte-flash-gui-windows.zip
 
       - name: Upload promoted executables
         uses: actions/upload-artifact@v6
@@ -221,10 +252,15 @@ jobs:
     # Only for flash-gui-v* tags: makes the executables publicly downloadable
     # without a GitHub login (workflow artifacts require one).
     if: startsWith(github.ref, 'refs/tags/flash-gui-v')
-    runs-on: ubuntu-latest
+    # Windows-only: azure/artifact-signing-action shells out to signtool, so the
+    # signing step cannot run on ubuntu. Signing here rather than in `build`
+    # keeps the certificate off every PR run (and off fork PRs, which get no
+    # secrets): exactly one signing operation per published release.
+    runs-on: windows-latest
     permissions:
       actions: read
       contents: write
+      id-token: write # OIDC federated credential for azure/login
     steps:
       - name: Locate promoted main artifact
         id: artifact
@@ -259,9 +295,74 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s out/ambyte-flash-gui-macos
-          test -s out/ambyte-flash-gui-linux
-          test -s out/ambyte-flash-gui-windows.exe
+          test -s out/ambyte-flash-gui-macos.zip
+          test -s out/ambyte-flash-gui-linux.zip
+          test -s out/ambyte-flash-gui-windows.zip
+
+      # Unsigned PyInstaller output is reliably misclassified by Defender's ML
+      # models (Trojan:Win32/Sabsik.TE.A!ml, 2026-08-17). Reporting each false
+      # positive to Microsoft is keyed to one file hash, so it dies on the next
+      # build; an Authenticode signature is the only fix that survives a rebuild.
+      - name: Azure login
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Unpack Windows bundle for signing
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        shell: pwsh
+        run: Expand-Archive -Path out\ambyte-flash-gui-windows.zip -DestinationPath signing
+
+      - name: Sign Windows bundle
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          # Sign the whole bundle, not just the launcher: Defender scores the
+          # extracted .dll/.pyd files too, and a half-signed directory reads
+          # worse than an unsigned one.
+          files-folder: ${{ github.workspace }}\signing
+          files-folder-filter: exe,dll,pyd
+          files-folder-recurse: true
+          file-digest: SHA256
+          # Without a countersignature the bundle stops verifying the day the
+          # signing certificate expires; with one it stays valid indefinitely.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Repack signed Windows bundle
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        shell: pwsh
+        run: |
+          $exe = 'signing\ambyte-flash-gui\ambyte-flash-gui.exe'
+          $sig = Get-AuthenticodeSignature $exe
+          $sig | Format-List
+          if ($sig.Status -ne 'Valid') {
+            throw "Authenticode signature is $($sig.Status), refusing to publish"
+          }
+          Remove-Item out\ambyte-flash-gui-windows.zip
+          Compress-Archive -Path signing\ambyte-flash-gui -DestinationPath out\ambyte-flash-gui-windows.zip
+
+      - name: Warn that the release is unsigned
+        if: vars.AZURE_SIGNING_ENDPOINT == ''
+        shell: bash
+        run: |
+          echo "::warning title=Unsigned release::AZURE_SIGNING_ENDPOINT is not set, so ambyte-flash-gui-windows.zip ships unsigned and will likely be flagged by Microsoft Defender. See flash_gui/README.md."
+
+      # Generated last so the published sums match the bytes users actually
+      # download: signing rewrites the PE and repacking rewrites the zip.
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum ambyte-flash-gui-*.zip > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub release with executables
         uses: softprops/action-gh-release@v2

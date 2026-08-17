@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Deployment constants + persisted session settings for the flash GUI.
 
 Everything environment-shaped lives here so the rest of the tool never

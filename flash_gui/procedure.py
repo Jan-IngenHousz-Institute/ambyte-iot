@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """The per-device onboarding procedure: flash + provision + verify.
 
 Step order is chosen so that every failure leaves the board in a recoverable,
