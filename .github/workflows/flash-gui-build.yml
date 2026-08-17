@@ -146,14 +146,46 @@ jobs:
             exit 1
           fi
           HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
-          ARTIFACT_NAME="ambyte-flash-gui-linux-${HEAD_SHA}"
-          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
-            | jq -r --arg head "${HEAD_SHA}" \
-              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $head)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+
+          # A squash merge can start this main workflow while the PR workflow
+          # is still building or uploading another platform. Locate that exact
+          # PR run, then wait for it instead of racing artifact visibility.
+          RUN_ID=""
+          for attempt in $(seq 1 12); do
+            RUN_ID=$(gh api --method GET \
+              "repos/${REPO}/actions/workflows/flash-gui-build.yml/runs" \
+              -f event=pull_request \
+              -f head_sha="${HEAD_SHA}" \
+              -f per_page=100 \
+              | jq -r --arg head "${HEAD_SHA}" \
+                '[.workflow_runs[] | select(.head_sha == $head)] | sort_by(.created_at) | last | .id // empty')
+            if [[ -n "${RUN_ID}" ]]; then
+              break
+            fi
+            echo "Attempt ${attempt}/12: waiting for the PR GUI workflow run to appear..."
+            sleep 5
+          done
           if [[ -z "${RUN_ID}" ]]; then
-            echo "::error::No live PR GUI artifacts for head ${HEAD_SHA}"
+            echo "::error::No PR GUI workflow run found for head ${HEAD_SHA}"
             exit 1
           fi
+
+          echo "Waiting for PR GUI workflow run ${RUN_ID} to finish..."
+          gh run watch "${RUN_ID}" --repo "${REPO}" --exit-status
+
+          MISSING=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            | jq -r --arg head "${HEAD_SHA}" '
+              [
+                ("ambyte-flash-gui-linux-" + $head),
+                ("ambyte-flash-gui-macos-" + $head),
+                ("ambyte-flash-gui-windows-" + $head)
+              ] - [.artifacts[] | select(.expired == false) | .name]
+              | join(", ")')
+          if [[ -n "${MISSING}" ]]; then
+            echo "::error::PR GUI workflow ${RUN_ID} is missing artifacts: ${MISSING}"
+            exit 1
+          fi
+
           echo "head-sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
           echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "Promoting GUI executables from PR #${PR_NUMBER} (${HEAD_SHA})." >> "${GITHUB_STEP_SUMMARY}"
