@@ -432,11 +432,14 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
         def __init__(self):
             self.status_reads = 0
             self.install_args = None
+            self.close_count = 0
 
         def lua_release(self, timeout=10.0):
             self.status_reads += 1
             if self.status_reads == 1:
                 raise ConsoleError("main.lua is absent")
+            if self.status_reads == 2:
+                raise ConsoleError("'lua release' got no prompt back within 20s")
             return LuaReleaseStatus(
                 sha256="a" * 64,
                 script_version="1.2.3",
@@ -450,12 +453,18 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
             self.install_args = args
 
         def close(self):
-            pass
+            self.close_count += 1
 
     console = FakeConsole()
+    connects = []
+
+    def connect(*_args, **_kwargs):
+        connects.append(True)
+        return console
+
     monkeypatch.setattr(
         procedure.ambyte_serial, "connect_after_boot",
-        lambda *_args, **_kwargs: console)
+        connect)
     monkeypatch.setattr(procedure.time, "sleep", lambda _seconds: None)
 
     result = procedure.install_lua_script(
@@ -464,6 +473,8 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
         log=lambda _message: None,
     )
     assert result.passed
+    assert len(connects) == 1
+    assert console.close_count == 1  # the normal function-finally close only
     assert console.install_args == (
         script.asset_url, script.sha256, script.campaign_id,
         script.script_version, script.built_against_fw)

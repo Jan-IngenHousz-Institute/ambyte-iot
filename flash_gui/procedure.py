@@ -53,6 +53,10 @@ CONSOLE_BOOT_DEADLINE_S = 180.0
 # degraded Wi-Fi reconnect without turning a safe in-progress update into a
 # false failure.
 LUA_INSTALL_DEADLINE_S = 360.0
+# The URL install is asynchronous. Give the worker time to download, hash,
+# syntax-check, swap, and restart before asking the SD-backed identity reader.
+# Querying immediately can block the CLI behind the same SD operation.
+LUA_INSTALL_SETTLE_S = 15.0
 
 
 class ProcedureError(RuntimeError):
@@ -346,23 +350,33 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
 
         deadline = time.time() + LUA_INSTALL_DEADLINE_S
         last_detail = "the previous script is still active"
+        log("Lua install queued; waiting for download and verification...")
+        time.sleep(LUA_INSTALL_SETTLE_S)
         while time.time() < deadline:
-            time.sleep(2.0)
             try:
-                current = con.lua_release(timeout=15.0)
+                current = con.lua_release(timeout=20.0)
             except ConsoleError as exc:
-                # The in-place path should retain USB, but recover from a
-                # transient re-enumeration instead of abandoning a valid update.
+                # A busy SD identity read or asynchronous firmware log can make
+                # one command miss its prompt. Keep the same serial handle: a
+                # close/reopen can reset the ESP32 and abort the in-flight swap.
                 last_detail = str(exc)
+                if "went away" not in last_detail:
+                    time.sleep(2.0)
+                    continue
+
+                # Reconnect only after a real USB I/O failure.
                 con.close()
-                remaining = deadline - time.time()
-                if remaining <= 0:
+                replacement = None
+                while replacement is None and time.time() < deadline:
+                    remaining = deadline - time.time()
+                    try:
+                        replacement = ambyte_serial.connect_after_boot(
+                            run.port, deadline_s=min(30.0, remaining), log=log)
+                    except ConsoleError as reconnect_exc:
+                        last_detail = str(reconnect_exc)
+                if replacement is None:
                     break
-                try:
-                    con = ambyte_serial.connect_after_boot(
-                        run.port, deadline_s=min(30.0, remaining), log=log)
-                except ConsoleError as reconnect_exc:
-                    last_detail = str(reconnect_exc)
+                con = replacement
                 continue
 
             if matches(current):
@@ -375,6 +389,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 f"active sha256={current.sha256}, version="
                 f"{current.script_version or '(untracked)'}, "
                 f"verified={current.verified}, running={current.running}")
+            time.sleep(2.0)
 
         raise ProcedureError(
             "lua",
