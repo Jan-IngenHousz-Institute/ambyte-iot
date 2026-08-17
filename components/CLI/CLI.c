@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 #include "device_config.h"
 #include "uart_sensors.h"
 #include "lua_runner.h"
+#include "script_update.h"
 #include "sync_runner.h"
 #include "event_log.h"
 #include "time_sync.h"
@@ -1214,7 +1216,7 @@ static int cli_cmd_ambit_check(int argc, char **argv)
 static int cli_cmd_lua(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: lua <start|stop|status|exec <code...>>\r\n");
+        printf("Usage: lua <start|stop|status|release|install|exec>\r\n");
         return 1;
     }
     if (strcmp(argv[1], "start") == 0) {
@@ -1238,6 +1240,52 @@ static int cli_cmd_lua(int argc, char **argv)
         printf("lua script: %s\r\n", lua_runner_is_running() ? "RUNNING" : "stopped");
         return 0;
     }
+    if (strcmp(argv[1], "release") == 0) {
+        script_identity_t identity;
+        esp_err_t err = script_update_get_identity(&identity);
+        if (err != ESP_OK) {
+            printf("lua release unavailable: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua release: sha256=%s version=%s built_against_fw=%s "
+               "installed_on_fw=%s verified=%s running=%s\r\n",
+               identity.sha256,
+               identity.version[0] ? identity.version : "-",
+               identity.built_against_fw[0] ? identity.built_against_fw : "-",
+               identity.installed_on_fw[0] ? identity.installed_on_fw : "-",
+               identity.release_metadata_verified ? "true" : "false",
+               lua_runner_is_running() ? "true" : "false");
+        return 0;
+    }
+    if (strcmp(argv[1], "install") == 0) {
+        if (argc != 7) {
+            printf("Usage: lua install <https-url> <sha256> <id> "
+                   "<script-version> <built-against-fw>\r\n");
+            return 1;
+        }
+        if (strncmp(argv[2], "https://", 8) != 0 || strlen(argv[3]) != 64) {
+            printf("lua install requires an HTTPS URL and 64-digit SHA-256\r\n");
+            return 1;
+        }
+        for (size_t i = 0; i < 64; i++) {
+            if (!isxdigit((unsigned char)argv[3][i])) {
+                printf("lua install SHA-256 must be hexadecimal\r\n");
+                return 1;
+            }
+        }
+        /* The GUI remains attached to this console and verifies the active
+         * identity, so use the in-place path: the existing script-update worker
+         * still stops Lua/MQTT, downloads + hashes + parses, atomically swaps,
+         * preserves .bak, then restarts Lua without another USB re-enumeration. */
+        esp_err_t err = script_update_url_request_immediate(
+            argv[2], argv[3], argv[4], false, argv[5], argv[6]);
+        if (err != ESP_OK) {
+            printf("lua install queue failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua install queued: id=%s\r\n", argv[4]);
+        return 0;
+    }
     if (strcmp(argv[1], "exec") == 0) {
         if (argc < 3) {
             printf("Usage: lua exec <code...>   e.g. lua exec return device.uptime_ms()\r\n");
@@ -1259,7 +1307,8 @@ static int cli_cmd_lua(int argc, char **argv)
         printf("error (%s): %s\r\n", esp_err_to_name(err), result);
         return 1;
     }
-    printf("unknown subcommand '%s' (start|stop|status|exec)\r\n", argv[1]);
+    printf("unknown subcommand '%s' "
+           "(start|stop|status|release|install|exec)\r\n", argv[1]);
     return 1;
 }
 
@@ -1500,7 +1549,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
-        .help    = "lua start|stop|status|exec <code...>  control / poke the Lua script",
+        .help    = "lua start|stop|status|release|install|exec  control / update the Lua script",
         .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {

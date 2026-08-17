@@ -163,6 +163,7 @@ class Settings:
     experiment_name: str = ""
     wifi_ssid: str = ""
     wifi_password: str = ""
+    lua_script_name: str = "main"
     api_keys: dict = field(default_factory=dict)   # env key -> "jii_..." key
 
     @classmethod

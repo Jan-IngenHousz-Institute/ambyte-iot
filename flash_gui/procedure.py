@@ -13,12 +13,14 @@ clearly-reported state:
   4. flash        release images + nvs.bin in one esptool session; a mid-way
                   failure leaves the chip in the ROM bootloader = re-flashable
   5. rtc          wait for the freshly booted console, set the exact UTC epoch
-  6. verify       read back name / timezone / RTC over the console; per-item
+  6. lua          install the selected latest-catalog release asset through the
+                  firmware's verified URL updater; previous script kept as .bak
+  7. verify       read back name / timezone / RTC / Lua identity; per-item
                   pass/fail
 
 Retry paths (no full restart needed):
   * retry_flash()      re-runs steps 4-6 with the already-built images
-  * retry_provision()  re-runs 5-6 only; first repairs a wrong name/timezone
+  * retry_provision()  re-runs 5-7 only; first repairs a wrong name/timezone
                        over the console (`cfg set` + reboot), never re-flashes
 """
 
@@ -35,7 +37,7 @@ from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
                      default_command_topic, default_status_topic)
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient
-from .release_fetch import ReleaseImages
+from .release_fetch import LuaScriptRelease, ReleaseImages
 
 # Accept the RTC as correct within this window of host-now. Generous: it
 # covers console latency and a slow verify loop, but still catches a
@@ -44,6 +46,11 @@ RTC_TOLERANCE_S = 120
 
 # Post-reboot console can take 20-35 s to appear; allow for SD unmount etc.
 CONSOLE_BOOT_DEADLINE_S = 90.0
+# URL installs temporarily stop Lua + MQTT, download over HTTPS, verify, swap,
+# reconnect MQTT, and restart Lua. Normal runs finish in seconds; tolerate a
+# degraded Wi-Fi reconnect without turning a safe in-progress update into a
+# false failure.
+LUA_INSTALL_DEADLINE_S = 360.0
 
 
 class ProcedureError(RuntimeError):
@@ -101,6 +108,7 @@ class SessionContext:
     env: Environment
     client: OpenJIIClient
     release: ReleaseImages
+    lua_script: LuaScriptRelease
     topic_root_template: str       # may contain {thingName}
     timezone: str
     wifi_ssid: str
@@ -279,6 +287,100 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
             con.close()
         except Exception:
             pass
+
+
+def install_lua_script(ctx: SessionContext, run: DeviceRun,
+                       log=print) -> VerifyItem:
+    """Install and positively verify the selected released Lua asset.
+
+    The console only submits an immutable URL + manifest identity. All byte
+    transfer, hashing, syntax validation, atomic SD swap, .bak recovery, and
+    runner restart remain firmware-owned in script_update.
+    """
+    script = ctx.lua_script
+    try:
+        con = ambyte_serial.connect_after_boot(
+            run.port, deadline_s=CONSOLE_BOOT_DEADLINE_S, log=log)
+    except ConsoleError as exc:
+        raise ProcedureError("lua", str(exc)) from exc
+
+    def matches(status: ambyte_serial.LuaReleaseStatus) -> bool:
+        return (
+            status.sha256 == script.sha256
+            and status.script_version == script.script_version
+            and status.built_against_fw == script.built_against_fw
+            and status.verified
+            and status.running
+        )
+
+    try:
+        current = None
+        try:
+            current = con.lua_release()
+        except ConsoleError as exc:
+            # A blank/new SD legitimately has no /sdcard/main.lua identity yet.
+            # Submit the install anyway; unsupported older firmware will reject
+            # the following `lua install` command with an actionable reply.
+            log(f"No active Lua release identity yet ({exc}); installing the selection.")
+
+        if current is not None and matches(current):
+            log(f"Lua {script.asset_name} ({script.tag}) is already active and verified.")
+            return VerifyItem(
+                "Lua script", True,
+                f"{script.asset_name} from {script.tag}; sha256={script.sha256}")
+
+        log(f"Installing {script.asset_name} from {script.tag} "
+            f"({script.size_bytes} bytes)...")
+        try:
+            con.lua_install(
+                script.asset_url,
+                script.sha256,
+                script.campaign_id,
+                script.script_version,
+                script.built_against_fw,
+            )
+        except ConsoleError as exc:
+            raise ProcedureError("lua", str(exc)) from exc
+
+        deadline = time.time() + LUA_INSTALL_DEADLINE_S
+        last_detail = "the previous script is still active"
+        while time.time() < deadline:
+            time.sleep(2.0)
+            try:
+                current = con.lua_release(timeout=15.0)
+            except ConsoleError as exc:
+                # The in-place path should retain USB, but recover from a
+                # transient re-enumeration instead of abandoning a valid update.
+                last_detail = str(exc)
+                con.close()
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    con = ambyte_serial.connect_after_boot(
+                        run.port, deadline_s=min(30.0, remaining), log=log)
+                except ConsoleError as reconnect_exc:
+                    last_detail = str(reconnect_exc)
+                continue
+
+            if matches(current):
+                log(f"Lua install verified: {script.asset_name} from {script.tag}, "
+                    f"sha256={current.sha256}.")
+                return VerifyItem(
+                    "Lua script", True,
+                    f"{script.asset_name} from {script.tag}; sha256={current.sha256}")
+            last_detail = (
+                f"active sha256={current.sha256}, version="
+                f"{current.script_version or '(untracked)'}, "
+                f"verified={current.verified}, running={current.running}")
+
+        raise ProcedureError(
+            "lua",
+            f"{script.asset_name} was not verified within "
+            f"{LUA_INSTALL_DEADLINE_S:.0f}s ({last_detail}); the previous "
+            "main.lua remains recoverable")
+    finally:
+        con.close()
 
 
 def _repair_cfg(con: ambyte_serial.AmbyteConsole, plan: ProvisioningPlan,

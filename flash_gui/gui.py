@@ -29,6 +29,7 @@ STEPS = [
     ("nvs", "NVS image"),
     ("flash", "Flash"),
     ("provision", "RTC + reboot"),
+    ("lua", "Lua script"),
     ("verify", "Verify"),
 ]
 STEP_ICONS = {"pending": "·", "running": "▶", "ok": "✓", "fail": "✗"}
@@ -45,6 +46,7 @@ class App(ttk.Frame):
         self.client: OpenJIIClient | None = None
         self.user_label = tk.StringVar(value="not signed in")
         self.release: release_fetch.ReleaseImages | None = None
+        self.lua_catalog: release_fetch.LuaCatalogRelease | None = None
         self.experiments: list = []
         self.current_run: DeviceRun | None = None
         self.busy = False
@@ -57,6 +59,7 @@ class App(ttk.Frame):
 
         self._refresh_ports()
         self._fetch_release_async()
+        self._fetch_lua_catalog_async()
         if self.settings.api_key(self.settings.environment):
             self._validate_key_async(self.settings.api_key(
                 self.settings.environment), on_startup=True)
@@ -97,26 +100,40 @@ class App(ttk.Frame):
         self.exp_refresh_btn.grid(row=1, column=3, sticky="e", padx=(8, 0),
                                   pady=(6, 0))
 
-        ttk.Label(frame, text="MQTT topic root:").grid(row=2, column=0,
+        ttk.Label(frame, text="Lua script:").grid(row=2, column=0, sticky="w",
+                                                   pady=(6, 0))
+        self.lua_script_var = tk.StringVar()
+        self.lua_script_box = ttk.Combobox(
+            frame, textvariable=self.lua_script_var, state="disabled")
+        self.lua_script_box.grid(row=2, column=1, columnspan=2, sticky="we",
+                                 pady=(6, 0))
+        self.lua_script_box.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_lua_script_selected())
+        self.lua_refresh_btn = ttk.Button(
+            frame, text="Refresh", command=self._fetch_lua_catalog_async)
+        self.lua_refresh_btn.grid(row=2, column=3, sticky="e", padx=(8, 0),
+                                  pady=(6, 0))
+
+        ttk.Label(frame, text="MQTT topic root:").grid(row=3, column=0,
                                                        sticky="w", pady=(6, 0))
         self.topic_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.topic_var).grid(
-            row=2, column=1, columnspan=3, sticky="we", pady=(6, 0))
+            row=3, column=1, columnspan=3, sticky="we", pady=(6, 0))
         ttk.Label(frame, text=f"({TOPIC_IDENTITY_TOKEN} is replaced by each "
                               "board's openJII Thing name)",
-                  foreground="gray").grid(row=3, column=1, columnspan=3,
+                  foreground="gray").grid(row=4, column=1, columnspan=3,
                                           sticky="w")
 
-        ttk.Label(frame, text="Wi-Fi SSID:").grid(row=4, column=0, sticky="w",
+        ttk.Label(frame, text="Wi-Fi SSID:").grid(row=5, column=0, sticky="w",
                                                   pady=(6, 0))
         self.ssid_var = tk.StringVar(value=self.settings.wifi_ssid)
         ttk.Entry(frame, textvariable=self.ssid_var, width=24).grid(
-            row=4, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(frame, text="Password:").grid(row=4, column=2, sticky="e",
+            row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Password:").grid(row=5, column=2, sticky="e",
                                                 pady=(6, 0))
         self.wifi_pass_var = tk.StringVar(value=self.settings.wifi_password)
         ttk.Entry(frame, textvariable=self.wifi_pass_var, show="•",
-                  width=20).grid(row=4, column=3, sticky="we", pady=(6, 0))
+                  width=20).grid(row=5, column=3, sticky="we", pady=(6, 0))
 
     def _build_info_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Detected (read-only)", padding=8)
@@ -134,6 +151,8 @@ class App(ttk.Frame):
         self.tz_label.pack(anchor="w")
         self.fw_var = tk.StringVar(value="Firmware release: fetching...")
         ttk.Label(frame, textvariable=self.fw_var).pack(anchor="w")
+        self.lua_release_var = tk.StringVar(value="Lua release: fetching...")
+        ttk.Label(frame, textvariable=self.lua_release_var).pack(anchor="w")
 
     def _build_device_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Device", padding=8)
@@ -219,6 +238,11 @@ class App(ttk.Frame):
             self.busy = busy
             self.onboard_btn.configure(
                 state="disabled" if busy else "normal")
+            self.lua_script_box.configure(
+                state="disabled" if busy or self.lua_catalog is None
+                else "readonly")
+            self.lua_refresh_btn.configure(
+                state="disabled" if busy else "normal")
         self._post(apply)
 
     def _ask_on_main(self, fn):
@@ -264,6 +288,63 @@ class App(ttk.Frame):
                 self._post(self.fw_var.set, f"Firmware release: ERROR — {exc}")
                 self.log(f"Firmware release fetch failed: {exc}")
         threading.Thread(target=work, daemon=True).start()
+
+    def _fetch_lua_catalog_async(self) -> None:
+        self.lua_catalog = None
+        self.lua_script_box.configure(state="disabled", values=[])
+        self.lua_script_var.set("")
+        self.lua_release_var.set("Lua release: fetching...")
+        self.lua_refresh_btn.configure(state="disabled")
+
+        def work():
+            try:
+                catalog = release_fetch.fetch_latest_lua_catalog(log=self.log)
+            except release_fetch.ReleaseError as exc:
+                detail = str(exc)
+                def show_error():
+                    self.lua_release_var.set(f"Lua release: ERROR — {detail}")
+                    if not self.busy:
+                        self.lua_refresh_btn.configure(state="normal")
+                self._post(show_error)
+                self.log(f"Lua release fetch failed: {detail}")
+                return
+
+            def apply():
+                self.lua_catalog = catalog
+                values = [script.asset_name for script in catalog.scripts]
+                self.lua_script_box.configure(
+                    values=values,
+                    state="disabled" if self.busy else "readonly")
+                preferred = f"{self.settings.lua_script_name}.lua"
+                selected = preferred if preferred in values else (
+                    "main.lua" if "main.lua" in values else values[0])
+                self.lua_script_var.set(selected)
+                self._on_lua_script_selected()
+                self.lua_release_var.set(
+                    f"Lua release: {catalog.tag} ({len(values)} scripts)")
+                if not self.busy:
+                    self.lua_refresh_btn.configure(state="normal")
+
+            self._post(apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _selected_lua_script(self) -> release_fetch.LuaScriptRelease | None:
+        if self.lua_catalog is None:
+            return None
+        selected = self.lua_script_var.get()
+        return next(
+            (script for script in self.lua_catalog.scripts
+             if script.asset_name == selected), None)
+
+    def _on_lua_script_selected(self) -> None:
+        script = self._selected_lua_script()
+        if script is None:
+            return
+        self.settings.lua_script_name = script.script_name
+        self.settings.save()
+        self.log(
+            f"Selected Lua script: {script.asset_name} from {script.tag}.")
 
     # ── auth + experiments ───────────────────────────────────────────────
     def _env(self):
@@ -368,6 +449,8 @@ class App(ttk.Frame):
             return "sign in to openJII first (API key)."
         if self.release is None:
             return "the firmware release is not available yet."
+        if self._selected_lua_script() is None:
+            return "the Lua release or script selection is not available yet."
         if not self._current_experiment():
             return "select an experiment first."
         if not self.topic_var.get().strip():
@@ -385,10 +468,13 @@ class App(ttk.Frame):
         self.settings.wifi_ssid = self.ssid_var.get().strip()
         self.settings.wifi_password = self.wifi_pass_var.get()
         self.settings.save()
+        lua_script = self._selected_lua_script()
+        assert lua_script is not None, "_session_ready must validate the Lua selection"
         return SessionContext(
             env=self._env(),
             client=self.client,
             release=self.release,
+            lua_script=lua_script,
             topic_root_template=self.topic_var.get().strip(),
             timezone=self.local_tz,
             wifi_ssid=self.settings.wifi_ssid,
@@ -476,7 +562,13 @@ class App(ttk.Frame):
             results = procedure.provision_and_verify(ctx, run, log=self.log)
         self._set_step("provision", "ok")
 
-        all_ok = all(r.passed for r in results)
+        config_ok = all(r.passed for r in results)
+        if config_ok:
+            self._set_step("lua", "running")
+            results.append(procedure.install_lua_script(ctx, run, log=self.log))
+            self._set_step("lua", "ok")
+
+        all_ok = config_ok and all(r.passed for r in results)
         self._set_step("verify", "ok" if all_ok else "fail")
         summary = "   ".join(
             f"{r.label}: {'PASS' if r.passed else 'FAIL'}" for r in results)
@@ -497,7 +589,7 @@ class App(ttk.Frame):
             self.log("The board is still in a re-flashable state. Fix the "
                      "connection and click 'Retry flash'.")
             self._post(self.retry_flash_btn.configure, {"state": "normal"})
-        elif exc.step in ("provision", "verify"):
+        elif exc.step in ("provision", "lua", "verify"):
             self._post(self.retry_prov_btn.configure, {"state": "normal"})
         self._post(messagebox.showerror, "On-boarding failed", str(exc))
 
