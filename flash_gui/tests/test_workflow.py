@@ -39,6 +39,10 @@ def test_tag_release_downloads_promoted_main_artifact():
     assert "name: Locate promoted main artifact" in WORKFLOW
     assert 'ARTIFACT_NAME="ambyte-flash-gui-${COMMIT_SHA}"' in WORKFLOW
     assert "name: ${{ steps.artifact.outputs.name }}" in WORKFLOW
+    assert "draft: true" in WORKFLOW
+    assert "name: Publish GitHub prerelease" in WORKFLOW
+    assert 'gh release edit "${GITHUB_REF_NAME}"' in WORKFLOW
+    assert "--draft=false" in WORKFLOW
     assert "needs: build\n    runs-on" not in WORKFLOW
 
 
