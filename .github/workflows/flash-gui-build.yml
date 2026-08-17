@@ -269,9 +269,23 @@ jobs:
           name: ${{ github.ref_name }}
           files: out/*
           fail_on_unmatched_files: true
+          # This repository uses immutable releases. Upload every executable
+          # while the release is still mutable, then publish it below.
+          draft: true
           # Never let a GUI release become the repo's "Latest": consumers of
           # /releases/latest (and the repo landing page) must keep seeing the
           # newest FIRMWARE release. flash_gui's own fetcher additionally
           # filters by tag+asset (pick_firmware_release), belt and braces.
           prerelease: true
           make_latest: false
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --prerelease
