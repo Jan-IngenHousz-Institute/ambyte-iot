@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Fleet re-flash: full firmware + NVS, gated by a MAC allow-list.
 
 For each connected ambyte board this script:

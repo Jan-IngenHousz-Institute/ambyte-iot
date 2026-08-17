@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Host timezone detection + the firmware's supported-zone table.
 
 The device carries no tzdata: components/timezone/timezone.c maps a FIXED list

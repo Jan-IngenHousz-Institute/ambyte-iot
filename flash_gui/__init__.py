@@ -1,4 +1,7 @@
-"""ambyte flash GUI — cross-platform flash + provision tool for ambyte boards.
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
+"""ambyte flash GUI: cross-platform flash + provision tool for ambyte boards.
 
 One operator onboards boards one after another: sign in to openJII once (API
 key), pick environment + experiment once, then per board: pick the port, click
@@ -10,4 +13,5 @@ USB-Serial-JTAG console.
 Run with:  python -m flash_gui
 """
 
-__version__ = "0.1.0"
+# Keep in step with the flash-gui-v* tag; feeds the Windows PE version resource.
+__version__ = "0.2.1"

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Talk to the ambyte firmware's USB-Serial-JTAG console (pyserial).
 
 Console facts this module is built on (components/CLI/CLI.c):

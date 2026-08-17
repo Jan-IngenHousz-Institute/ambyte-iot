@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Tkinter GUI: session settings on top, one-button per-device procedure below.
 
 Threading model: all serial/esptool/HTTP work runs on a single worker thread

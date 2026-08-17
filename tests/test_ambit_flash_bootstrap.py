@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Source-contract tests for remote AMBIT ROM recovery bootstrap."""
 
 from pathlib import Path

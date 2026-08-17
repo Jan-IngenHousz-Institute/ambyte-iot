@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+// SPDX-License-Identifier: GPL-3.0-only
+
 /**
  * Path-aware semantic-release hooks, following openJII's monorepo release
  * pattern. The repository has two independent release units without forcing a

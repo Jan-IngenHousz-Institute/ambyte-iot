@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """TLS trust configuration shared by every HTTPS client in the GUI.
 
 Frozen Python applications cannot rely on the build machine's OpenSSL CA

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Bake a per-board NVS provisioning image.
 
 The firmware self-provisions at boot from the NVS partition (0x9000): identity,
