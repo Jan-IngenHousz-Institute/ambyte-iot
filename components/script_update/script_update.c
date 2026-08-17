@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "esp_app_desc.h"
@@ -30,7 +31,9 @@
 #define SCRIPT_REBOOT_DELAY_MS 500   /* let the 'applied' reply flush before esp_restart (matches ota_update) */
 
 #define LUA_PATH       "/sdcard/main.lua"
-#define LUA_PATH_NEW   "/sdcard/main.lua.new"
+/* Public so the console's `lua put` can stage into the same file this installs
+ * from; one definition, not two that can drift. */
+#define LUA_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH
 #define LUA_PATH_BAK   "/sdcard/main.lua.bak"
 
 #define NVS_NS         "script_upd"
@@ -40,9 +43,18 @@
 #define KEY_BUILT_FW    "built_fw"
 #define KEY_INSTALL_FW  "install_fw"
 
-#define OP_UPDATE     0
-#define OP_EXEC       1
-#define OP_UPDATE_URL 2
+#define OP_UPDATE       0
+#define OP_EXEC         1
+#define OP_UPDATE_URL   2
+/* Bytes already staged at main.lua.new by the console (`lua begin`/`lua put`),
+ * so the board needs no network to install a script. */
+#define OP_UPDATE_LOCAL 3
+
+/* The status reply is best-effort: the serial log is authoritative, and an
+ * operator is usually watching it. This used to be 3000 (five minutes), which on
+ * a board that cannot reach its broker meant every failed URL install sat here
+ * burning the caller's deadline after the real work had already finished. */
+#define SCRIPT_RECONNECT_WAIT_TICKS 150   /* 15 s at 100 ms per tick */
 
 #define SCRIPT_DL_BUF          4096     /* HTTP chunk size — small on purpose (no large contiguous alloc) */
 #define SCRIPT_HTTP_TIMEOUT_MS 20000
@@ -211,6 +223,14 @@ static bool sha256_text(const char *text, char hex[65])
     for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", digest[i]);
     hex[64] = '\0';
     return true;
+}
+
+/* Byte length of `path`, or -1 when it cannot be sized (missing/unreadable). */
+static long file_size(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (long)st.st_size;
 }
 
 static esp_err_t sha256_file(const char *path, char hex[65])
@@ -586,6 +606,40 @@ static void do_update_url(const script_req_t *r)
     sdcard_io_end();
 }
 
+/* Everything after the bytes are on the card at LUA_PATH_NEW: verify the digest,
+ * syntax-check, rotate .bak, swap atomically, record provenance. Shared by the
+ * URL worker and the serial-push worker so the ONLY difference between them is
+ * how main.lua.new got written; the dangerous half has exactly one
+ * implementation. Leaves main.lua untouched on every failure path. */
+static bool verify_and_swap_staged(const script_req_t *r, const char *got, size_t n,
+                                   char *detail, size_t detail_cap)
+{
+    if (r->checksum[0] != '\0' &&
+        (strlen(r->checksum) != 64 || strncasecmp(got, r->checksum, 64) != 0)) {
+        ESP_LOGE(TAG, "checksum mismatch, script rejected");
+        remove(LUA_PATH_NEW);
+        snprintf(detail, detail_cap, "sha256 mismatch");
+        return false;
+    }
+    if (!syntax_ok_file(LUA_PATH_NEW, detail, detail_cap)) {
+        ESP_LOGE(TAG, "syntax check failed: %s, main.lua untouched", detail);
+        remove(LUA_PATH_NEW);
+        return false;
+    }
+    ESP_LOGW(TAG, "staged %u bytes, sha256=%s", (unsigned)n, got);
+    /* Swap: previous script survives as main.lua.bak (manual recovery path). */
+    remove(LUA_PATH_BAK);
+    (void)rename(LUA_PATH, LUA_PATH_BAK);
+    if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
+        ESP_LOGE(TAG, "rename to %s failed", LUA_PATH);
+        (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
+        snprintf(detail, detail_cap, "rename failed");
+        return false;
+    }
+    identity_set(r, got); /* before any reboot: dedupes retained trigger + records provenance */
+    return true;
+}
+
 static void do_update_url_impl(const script_req_t *r)
 {
     ESP_LOGW(TAG, "script_update(url) id=%s: %s", r->id[0] ? r->id : "(none)", r->text);
@@ -629,27 +683,9 @@ static void do_update_url_impl(const script_req_t *r)
         if (err != ESP_OK) {
             snprintf(detail, sizeof detail, "download failed (%s)", esp_err_to_name(err));
             ESP_LOGE(TAG, "%s", detail);
-        } else if (r->checksum[0] != '\0' &&
-                   (strlen(r->checksum) != 64 || strncasecmp(got, r->checksum, 64) != 0)) {
-            ESP_LOGE(TAG, "checksum mismatch — script rejected");
-            remove(LUA_PATH_NEW);
-            snprintf(detail, sizeof detail, "sha256 mismatch");
-        } else if (!syntax_ok_file(LUA_PATH_NEW, detail, sizeof detail)) {
-            ESP_LOGE(TAG, "syntax check failed: %s — main.lua untouched", detail);
-            remove(LUA_PATH_NEW);
         } else {
-            ESP_LOGW(TAG, "downloaded %u bytes, sha256=%s", (unsigned)n, got);
-            /* Lua already stopped; swap (previous kept as .bak; atomic on FATFS). */
-            remove(LUA_PATH_BAK);
-            (void)rename(LUA_PATH, LUA_PATH_BAK);
-            if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
-                ESP_LOGE(TAG, "rename to %s failed", LUA_PATH);
-                (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
-                snprintf(detail, sizeof detail, "rename failed");
-            } else {
-                identity_set(r, got); /* before any reboot: dedupes retained trigger + records provenance */
-                applied = true;
-            }
+            /* Lua already stopped; swap is atomic on FATFS. */
+            applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
         }
     }
 
@@ -657,7 +693,8 @@ static void do_update_url_impl(const script_req_t *r)
      * (best-effort — the serial log is authoritative either way). */
     if (s_cfg.comms_resume != NULL) {
         s_cfg.comms_resume();
-        for (int i = 0; i < 3000 && s_cfg.is_connected != NULL && !s_cfg.is_connected(); i++) {
+        for (int i = 0; i < SCRIPT_RECONNECT_WAIT_TICKS && s_cfg.is_connected != NULL
+                        && !s_cfg.is_connected(); i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -680,6 +717,79 @@ static void do_update_url_impl(const script_req_t *r)
     /* In-place: restart the Lua runner on the new script. */
     s_cfg.workload_resume();
     ESP_LOGW(TAG, "main.lua replaced from url (%u bytes) + runner restarted; previous kept as %s",
+             (unsigned)n, LUA_PATH_BAK);
+    snprintf(detail, sizeof detail, "%u bytes", (unsigned)n);
+    report_script("applied", r->id, detail);
+}
+
+/* ── OP_UPDATE_LOCAL: install bytes the console already staged ─────────────── */
+
+static void do_update_local_impl(const script_req_t *r);
+
+/* SD RW-gate wrapper: same reasoning as do_update/do_update_url, the swap writes
+ * and renames on SD so a monitor teardown must not free the volume mid-op. */
+static void do_update_local(const script_req_t *r)
+{
+    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
+    do_update_local_impl(r);
+    sdcard_io_end();
+}
+
+static void do_update_local_impl(const script_req_t *r)
+{
+    ESP_LOGW(TAG, "script_update(local) id=%s", r->id[0] ? r->id : "(none)");
+    char detail[192] = "";
+
+    if (s_cfg.workload_suspend == NULL || s_cfg.workload_resume == NULL) {
+        ESP_LOGE(TAG, "local variant needs workload hooks, not configured");
+        report_script("failed", r->id, "local variant unavailable");
+        return;
+    }
+
+    /* Stop Lua: the file it is executing is about to be swapped. Deliberately NO
+     * comms_suspend, unlike the URL worker: there is no HTTPS download here that
+     * needs the TLS heap, and keeping MQTT up also skips the reconnect wait on
+     * the way out. This path is driven by an operator on the local console. */
+    s_cfg.workload_suspend();
+
+    bool   applied = false;
+    size_t n = 0;
+    char   got[65] = "";
+
+    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+        ESP_LOGE(TAG, "SD not available");
+        snprintf(detail, sizeof detail, "SD card not mounted");
+    } else {
+        long staged = file_size(LUA_PATH_NEW);
+        if (staged <= 0) {
+            snprintf(detail, sizeof detail, "no staged script (lua begin/put first)");
+            ESP_LOGE(TAG, "%s", detail);
+        } else if (sha256_file(LUA_PATH_NEW, got) != ESP_OK) {
+            snprintf(detail, sizeof detail, "cannot hash staged script");
+            ESP_LOGE(TAG, "%s", detail);
+        } else {
+            n = (size_t)staged;
+            applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
+        }
+    }
+
+    if (!applied) {
+        report_script("failed", r->id, detail);
+        s_cfg.workload_resume();   /* restart the old script */
+        return;
+    }
+
+    if (r->reboot) {
+        ESP_LOGW(TAG, "main.lua replaced from serial push (%u bytes); previous kept as %s, rebooting to run it",
+                 (unsigned)n, LUA_PATH_BAK);
+        snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
+        report_script("applied", r->id, detail);
+        vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
+        esp_restart();                                       /* no return */
+    }
+
+    s_cfg.workload_resume();
+    ESP_LOGW(TAG, "main.lua replaced from serial push (%u bytes) + runner restarted; previous kept as %s",
              (unsigned)n, LUA_PATH_BAK);
     snprintf(detail, sizeof detail, "%u bytes", (unsigned)n);
     report_script("applied", r->id, detail);
@@ -737,6 +847,7 @@ static void script_run(void *arg)
     }
     if (r->op == OP_EXEC)            do_exec(r);
     else if (r->op == OP_UPDATE_URL) do_update_url(r);
+    else if (r->op == OP_UPDATE_LOCAL) do_update_local(r);
     else                            do_update(r);
     if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
     free(r->text);
@@ -840,6 +951,18 @@ esp_err_t script_update_url_request_immediate(const char *url, const char *check
     }
     return request_common(OP_UPDATE_URL, url, checksum, id, reboot, false,
                           script_version, built_against_fw);
+}
+
+esp_err_t script_update_local_request(const char *checksum, const char *id,
+                                      bool reboot, const char *script_version,
+                                      const char *built_against_fw)
+{
+    if (reboot_needs_id(id, reboot, "script_update(local)")) return ESP_ERR_INVALID_ARG;
+    /* request_common rejects an empty text, and this op carries no URL or script
+     * body: the bytes are already on the card. Pass the staging path so the
+     * request is self-describing in logs. */
+    return request_common(OP_UPDATE_LOCAL, SCRIPT_UPDATE_STAGING_PATH, checksum, id,
+                          reboot, false, script_version, built_against_fw);
 }
 
 esp_err_t script_update_exec_request(const char *code, const char *id)

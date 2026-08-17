@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include "mbedtls/base64.h"
 
 #include "CLI.h"
 #include "driver/i2c.h"
@@ -30,12 +32,20 @@
 #include "timezone.h"
 #include "i2c_bus.h"
 #include "pcf2131tfy_rtc_api.h"
+#include "sd_card.h"
 #include "sd_logger.h"
 #include "wifi_manager.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
 #include "esp_heap_trace.h"
 #endif
+
+/* `lua put` framing. max_cmdline_length is 512 (see cli_start), so one chunk
+ * decodes to at most 384 bytes; the buffer is sized for the whole line. */
+#define LUA_PUT_CHUNK_MAX 512
+/* A runaway push must not fill the card. The largest released script today is
+ * legacy_1Hz_spec.lua at ~15 KB. */
+#define LUA_PUT_TOTAL_MAX (64U * 1024U)
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
@@ -1216,7 +1226,8 @@ static int cli_cmd_ambit_check(int argc, char **argv)
 static int cli_cmd_lua(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: lua <start|stop|status|release|install|exec>\r\n");
+        printf("Usage: lua <start|stop|status|release|install|begin|put|commit"
+               "|abort|exec>\r\n");
         return 1;
     }
     if (strcmp(argv[1], "start") == 0) {
@@ -1284,6 +1295,114 @@ static int cli_cmd_lua(int argc, char **argv)
             return 1;
         }
         printf("lua install queued: id=%s\r\n", argv[4]);
+        return 0;
+    }
+    /* ── serial push: `lua begin` / `lua put` / `lua commit` / `lua abort` ──
+     * Lets the operator's PC stream a script down this console instead of the
+     * board fetching it over HTTPS, so onboarding needs no device network at all.
+     * Deliberately stateless between commands: each `put` opens, appends, closes
+     * and re-stats, so an abandoned push leaks no handle and holds no SD ref, and
+     * the reported total is the file itself rather than a counter that could
+     * disagree with it. */
+    if (strcmp(argv[1], "begin") == 0) {
+        if (!sdcard_io_begin()) {
+            printf("lua begin: SD unavailable\r\n");
+            return 1;
+        }
+        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "wb");   /* truncates */
+        bool ok = (f != NULL);
+        if (ok) fclose(f);
+        sdcard_io_end();
+        if (!ok) {
+            printf("lua begin: cannot open %s\r\n", SCRIPT_UPDATE_STAGING_PATH);
+            return 1;
+        }
+        printf("lua begin: ready\r\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "put") == 0) {
+        if (argc != 3) {
+            printf("Usage: lua put <base64-chunk>\r\n");
+            return 1;
+        }
+        /* A 512-byte console line decodes to at most 384 bytes. */
+        unsigned char raw[LUA_PUT_CHUNK_MAX];
+        size_t olen = 0;
+        if (mbedtls_base64_decode(raw, sizeof raw, &olen,
+                                  (const unsigned char *)argv[2],
+                                  strlen(argv[2])) != 0) {
+            printf("lua put: invalid base64\r\n");
+            return 1;
+        }
+        if (!sdcard_io_begin()) {
+            printf("lua put: SD unavailable\r\n");
+            return 1;
+        }
+        long before = 0;
+        struct stat st;
+        if (stat(SCRIPT_UPDATE_STAGING_PATH, &st) != 0) {
+            sdcard_io_end();
+            printf("lua put: no staged file, run `lua begin` first\r\n");
+            return 1;
+        }
+        before = (long)st.st_size;
+        if ((size_t)before + olen > LUA_PUT_TOTAL_MAX) {
+            sdcard_io_end();
+            printf("lua put: refusing to exceed %u bytes\r\n", (unsigned)LUA_PUT_TOTAL_MAX);
+            return 1;
+        }
+        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "ab");
+        bool ok = (f != NULL) && fwrite(raw, 1, olen, f) == olen;
+        if (f != NULL) {
+            if (fflush(f) != 0) ok = false;
+            fclose(f);
+        }
+        long after = ok && stat(SCRIPT_UPDATE_STAGING_PATH, &st) == 0
+                     ? (long)st.st_size : -1;
+        sdcard_io_end();
+        if (!ok || after != before + (long)olen) {
+            printf("lua put: write failed\r\n");
+            return 1;
+        }
+        printf("lua put: %ld bytes\r\n", after);
+        return 0;
+    }
+    if (strcmp(argv[1], "commit") == 0) {
+        if (argc != 6) {
+            printf("Usage: lua commit <sha256> <id> <script-version> "
+                   "<built-against-fw>\r\n");
+            return 1;
+        }
+        if (strlen(argv[2]) != 64) {
+            printf("lua commit requires a 64-digit SHA-256\r\n");
+            return 1;
+        }
+        for (size_t i = 0; i < 64; i++) {
+            if (!isxdigit((unsigned char)argv[2][i])) {
+                printf("lua commit SHA-256 must be hexadecimal\r\n");
+                return 1;
+            }
+        }
+        /* reboot=false for the same reason as `lua install`: the GUI stays on
+         * this console to verify the identity, so an in-place runner restart
+         * avoids another USB re-enumeration. */
+        esp_err_t err = script_update_local_request(argv[2], argv[3], false,
+                                                   argv[4], argv[5]);
+        if (err != ESP_OK) {
+            printf("lua commit queue failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua commit queued: id=%s\r\n", argv[3]);
+        return 0;
+    }
+    if (strcmp(argv[1], "abort") == 0) {
+        if (!sdcard_io_begin()) {
+            printf("lua abort: SD unavailable\r\n");
+            return 1;
+        }
+        (void)remove(SCRIPT_UPDATE_STAGING_PATH);
+        sdcard_io_end();
+        printf("lua abort: discarded\r\n");
         return 0;
     }
     if (strcmp(argv[1], "exec") == 0) {
@@ -1549,7 +1668,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
-        .help    = "lua start|stop|status|release|install|exec  control / update the Lua script",
+        .help    = "lua start|stop|status|release|install|begin|put|commit|abort|exec  control / update the Lua script",
         .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
