@@ -82,6 +82,15 @@ esp_err_t script_update_url_request(const char *url, const char *checksum, const
                                     bool reboot, const char *script_version,
                                     const char *built_against_fw);
 
+/* Queue the same verified HTTPS replacement without the deterministic fleet
+ * delay. This is for an operator attached to the local serial console; remote
+ * MQTT callers should keep using script_update_url_request() so a fleet does
+ * not begin TLS downloads simultaneously. */
+esp_err_t script_update_url_request_immediate(const char *url, const char *checksum,
+                                              const char *id, bool reboot,
+                                              const char *script_version,
+                                              const char *built_against_fw);
+
 /* Hash the active /sdcard/main.lua and return release provenance only when the
  * stored release digest matches the file. Suitable as a script_identity_read_fn. */
 esp_err_t script_update_get_identity(script_identity_t *out);

@@ -32,6 +32,10 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _STATUS_MAC_RE = re.compile(r"-\s*MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _RTC_RE = re.compile(r"RTC:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\((\d+)\)")
+_LUA_RELEASE_RE = re.compile(
+    r"lua release:\s+sha256=([0-9A-Fa-f]{64})\s+version=(\S+)\s+"
+    r"built_against_fw=(\S+)\s+installed_on_fw=(\S+)\s+"
+    r"verified=(true|false)\s+running=(true|false)")
 _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 FAILURE_MARK = "Command returned non-zero error code"
 
@@ -66,6 +70,16 @@ class ProbeResult:
     mac: str | None = None
     device_name: str | None = None      # raw NVS value ({MAC} un-expanded)
     raw: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
+class LuaReleaseStatus:
+    sha256: str
+    script_version: str
+    built_against_fw: str
+    installed_on_fw: str
+    verified: bool
+    running: bool
 
 
 class AmbyteConsole:
@@ -201,6 +215,38 @@ class AmbyteConsole:
             raise ConsoleError(f"rtc set confirmation not understood:\n{reply[-300:]}")
         return int(m.group(2))
 
+    def lua_install(self, url: str, sha256: str, campaign_id: str,
+                    script_version: str, built_against_fw: str) -> None:
+        """Queue the firmware's safe URL installer for one released script."""
+        args = (url, sha256, campaign_id, script_version, built_against_fw)
+        if any(not value or any(ch.isspace() for ch in value) for value in args):
+            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
+        cmd = "lua install " + " ".join(args)
+        reply = self.command(cmd, timeout=10.0)
+        if "lua install queued:" not in reply or FAILURE_MARK in reply:
+            raise ConsoleError(f"Lua install request failed:\n{reply[-500:]}")
+
+    def lua_release(self, timeout: float = 10.0) -> LuaReleaseStatus:
+        """Read the active /sdcard/main.lua identity and runner state."""
+        reply = self.command("lua release", timeout=timeout)
+        if FAILURE_MARK in reply:
+            raise ConsoleError(f"Lua release status failed:\n{reply[-500:]}")
+        match = _LUA_RELEASE_RE.search(reply)
+        if match is None:
+            raise ConsoleError(f"Lua release status not understood:\n{reply[-500:]}")
+
+        def value(raw: str) -> str:
+            return "" if raw == "-" else raw
+
+        return LuaReleaseStatus(
+            sha256=match.group(1).lower(),
+            script_version=value(match.group(2)),
+            built_against_fw=value(match.group(3)),
+            installed_on_fw=value(match.group(4)),
+            verified=match.group(5) == "true",
+            running=match.group(6) == "true",
+        )
+
     def reboot(self) -> None:
         """Fire `reboot`; the port will drop and re-enumerate."""
         try:
@@ -240,7 +286,7 @@ def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResu
     return result
 
 
-def connect_after_boot(preferred_port: str | None, deadline_s: float = 90.0,
+def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                        log=None) -> AmbyteConsole:
     """Console session on a freshly rebooted board.
 
@@ -251,27 +297,53 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 90.0,
     """
     deadline = time.time() + deadline_s
     said_wait = False
+    con: AmbyteConsole | None = None
+    active_port: str | None = None
     while time.time() < deadline:
-        cands = ([preferred_port] if preferred_port else []) + \
-            [p for p in esp_jtag_ports() if p != preferred_port]
-        for cand in cands:
+        if con is None:
+            cands = ([preferred_port] if preferred_port else []) + \
+                [p for p in esp_jtag_ports() if p != preferred_port]
+            for cand in cands:
+                try:
+                    con = AmbyteConsole(cand)
+                    active_port = cand
+                    break
+                except (OSError, serial.SerialException):
+                    continue           # ghost / not ready / busy
+
+        if con is not None:
             try:
-                con = AmbyteConsole(cand)
-            except (OSError, serial.SerialException):
-                continue               # ghost / not ready / busy
-            try:
-                if con.wait_prompt(timeout=3.0):
+                # Keep this handle open across polling slices. Opening the
+                # ESP32-S3 USB console can reset the board; repeatedly closing
+                # and reopening it every three seconds traps startup in a boot
+                # loop before the CLI has time to appear.
+                remaining = max(0.1, deadline - time.time())
+                if con.wait_prompt(timeout=min(3.0, remaining)):
                     if log:
-                        log(f"Console up on {cand}.")
+                        log(f"Console up on {active_port}.")
                     return con
             except ConsoleError:
-                pass
-            con.close()
+                con.close()
+                con = None
+                active_port = None
+                continue
+
+            # A real USB disconnect makes the open descriptor unusable and is
+            # normally raised above. This explicit presence check also handles
+            # platforms that leave a quiet ghost descriptor behind.
+            if active_port not in esp_jtag_ports():
+                con.close()
+                con = None
+                active_port = None
+
         if log and not said_wait:
             log("Waiting for the board's console (it starts ~20-35 s after "
                 "boot; the USB port may re-enumerate)...")
             said_wait = True
-        time.sleep(1.5)
+        if con is None:
+            time.sleep(1.5)
+    if con is not None:
+        con.close()
     raise ConsoleError(
         f"no ambyte console answered within {deadline_s:.0f}s — the board may "
         "still be booting, or the USB port re-enumerated to a different name.")

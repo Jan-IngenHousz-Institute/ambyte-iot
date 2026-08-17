@@ -22,7 +22,9 @@ import shutil
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import CACHE_DIR, FIRMWARE_REPO
 from .tls import ssl_context
@@ -30,6 +32,9 @@ from .tls import ssl_context
 API_ROOT = "https://api.github.com"
 ASSET_PREFIX = "ambyte-iot-v"
 ASSET_SUFFIX = ".zip"
+LUA_TAG_RE = re.compile(r"^lua-v(\d+)\.(\d+)\.(\d+)$")
+LUA_ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.lua$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST = "flasher_args.json"
 # Written next to the unpacked images so a half-finished download is never
 # mistaken for a good cache entry.
@@ -39,6 +44,29 @@ USER_AGENT = "ambyte-flash-gui"
 
 class ReleaseError(RuntimeError):
     """Anything that prevents resolving a flashable release."""
+
+
+@dataclass(frozen=True)
+class LuaScriptRelease:
+    """One immutable script choice from a published Lua catalog release."""
+
+    tag: str
+    asset_name: str
+    script_name: str
+    script_version: str
+    built_against_fw: str
+    asset_url: str
+    sha256: str
+    size_bytes: int
+    campaign_id: str
+
+
+@dataclass(frozen=True)
+class LuaCatalogRelease:
+    """The newest stable lua-v* release and its validated script choices."""
+
+    tag: str
+    scripts: tuple[LuaScriptRelease, ...]
 
 
 def pick_firmware_release(releases: list) -> dict | None:
@@ -69,6 +97,41 @@ def pick_firmware_release(releases: list) -> dict | None:
     return max(candidates, key=lambda r: r.get("published_at") or "")
 
 
+def pick_lua_release(releases: list) -> dict | None:
+    """The newest stable lua-v* release containing a usable script catalog.
+
+    A catalog entry is a plain ``*.lua`` asset plus its adjacent
+    ``*.lua.manifest.json`` contract. Releases of other units, prereleases,
+    drafts, and incomplete Lua releases are ignored.
+    """
+
+    def is_lua_catalog(rel: dict) -> bool:
+        if rel.get("draft") or rel.get("prerelease"):
+            return False
+        if LUA_TAG_RE.fullmatch(rel.get("tag_name") or "") is None:
+            return False
+        names = {
+            asset.get("name")
+            for asset in rel.get("assets") or []
+            if isinstance(asset, dict)
+        }
+        return any(
+            isinstance(name, str)
+            and LUA_ASSET_RE.fullmatch(name)
+            and f"{name}.manifest.json" in names
+            for name in names
+        )
+
+    candidates = [r for r in releases if isinstance(r, dict) and is_lua_catalog(r)]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda r: tuple(
+            int(part) for part in LUA_TAG_RE.fullmatch(r["tag_name"]).groups()),
+    )
+
+
 def _auth_headers() -> dict[str, str]:
     # Public repo needs no auth, but unauthenticated GitHub allows only 60
     # requests/hour per IP; GH_TOKEN/GITHUB_TOKEN raises that and costs nothing
@@ -80,7 +143,7 @@ def _auth_headers() -> dict[str, str]:
     return headers
 
 
-def _get_json(url: str) -> dict:
+def _get_json(url: str) -> Any:
     req = urllib.request.Request(url, headers=_auth_headers())
     try:
         with urllib.request.urlopen(
@@ -99,6 +162,104 @@ def _get_json(url: str) -> dict:
         raise ReleaseError(f"GitHub API {exc.code} for {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise ReleaseError(f"cannot reach GitHub ({exc.reason})") from exc
+
+
+def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRelease:
+    """Validate one release asset against its immutable schema-1 manifest."""
+    asset_name = asset.get("name") or ""
+    if LUA_ASSET_RE.fullmatch(asset_name) is None:
+        raise ReleaseError(f"invalid Lua release asset name: {asset_name!r}")
+    if not isinstance(manifest, dict):
+        raise ReleaseError(f"{asset_name}.manifest.json is not a JSON object")
+
+    version = tag.removeprefix("lua-v")
+    script_name = asset_name.removesuffix(".lua")
+    campaign_id = tag if script_name == "main" else f"{tag}:{script_name}"
+    asset_url = asset.get("browser_download_url") or ""
+    sha256 = manifest.get("sha256")
+    size_bytes = manifest.get("size_bytes")
+    built_against_fw = manifest.get("built_against_fw")
+    command = manifest.get("script_update")
+
+    checks = [
+        (manifest.get("schema_version") == 1, "unsupported manifest schema"),
+        (manifest.get("tag") == tag, "manifest tag does not match the release"),
+        (manifest.get("script_name") == script_name,
+         "manifest script_name does not match the asset"),
+        (manifest.get("script_version") == version,
+         "manifest script_version does not match the release"),
+        (isinstance(built_against_fw, str) and bool(built_against_fw),
+         "manifest built_against_fw is missing"),
+        (isinstance(sha256, str) and SHA256_RE.fullmatch(sha256) is not None,
+         "manifest sha256 is invalid"),
+        (isinstance(size_bytes, int) and size_bytes >= 0,
+         "manifest size_bytes is invalid"),
+        (size_bytes == asset.get("size"),
+         "manifest size_bytes does not match the release asset"),
+        (manifest.get("asset_url") == asset_url,
+         "manifest asset_url does not match the release asset"),
+        (isinstance(command, dict), "manifest script_update is missing"),
+    ]
+    for ok, detail in checks:
+        if not ok:
+            raise ReleaseError(f"{asset_name}: {detail}")
+
+    expected_command = {
+        "type": "script_update",
+        "id": campaign_id,
+        "url": asset_url,
+        "checksum": sha256,
+        "script_version": version,
+        "built_against_fw": built_against_fw,
+    }
+    if command != expected_command:
+        raise ReleaseError(
+            f"{asset_name}: manifest script_update does not match its release identity")
+
+    return LuaScriptRelease(
+        tag=tag,
+        asset_name=asset_name,
+        script_name=script_name,
+        script_version=version,
+        built_against_fw=built_against_fw,
+        asset_url=asset_url,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        campaign_id=campaign_id,
+    )
+
+
+def fetch_latest_lua_catalog(log=print) -> LuaCatalogRelease:
+    """Resolve and validate every selectable script in the latest Lua release."""
+    releases = _get_json(
+        f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100")
+    release = pick_lua_release(releases if isinstance(releases, list) else [])
+    if release is None:
+        raise ReleaseError(
+            f"no stable lua-vX.Y.Z catalog with .lua assets and manifests found "
+            f"among the newest 100 releases of {FIRMWARE_REPO}.")
+
+    tag = release["tag_name"]
+    assets = {
+        asset.get("name"): asset
+        for asset in release.get("assets") or []
+        if isinstance(asset, dict) and asset.get("name")
+    }
+    scripts: list[LuaScriptRelease] = []
+    for asset_name in sorted(
+            name for name in assets if LUA_ASSET_RE.fullmatch(name)):
+        manifest_asset = assets.get(f"{asset_name}.manifest.json")
+        if manifest_asset is None:
+            raise ReleaseError(
+                f"{tag} asset {asset_name} has no companion manifest")
+        manifest_url = manifest_asset.get("browser_download_url") or ""
+        manifest = _get_json(manifest_url)
+        scripts.append(_validated_lua_script(tag, assets[asset_name], manifest))
+
+    if not scripts:
+        raise ReleaseError(f"{tag} contains no selectable Lua scripts")
+    log(f"Lua catalog {tag}: {len(scripts)} released script(s).")
+    return LuaCatalogRelease(tag=tag, scripts=tuple(scripts))
 
 
 class ReleaseImages:

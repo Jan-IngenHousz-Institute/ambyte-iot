@@ -50,7 +50,8 @@
 
 typedef struct {
     uint8_t op;
-    bool    reboot;            /* OP_UPDATE only: reboot after a successful swap (default) */
+    bool    reboot;            /* update ops: reboot after a successful swap when requested */
+    bool    fleet_jitter;       /* OP_UPDATE_URL only: stagger remotely triggered fleet work */
     char    id[SCRIPT_ID_MAX];
     char    checksum[65];      /* optional sha256 hex ('\0' = absent) */
     char    script_version[SCRIPT_IDENTITY_VERSION_LEN];
@@ -603,7 +604,11 @@ static void do_update_url_impl(const script_req_t *r)
     report_script("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
 
-    wait_for_fleet_slot();
+    if (r->fleet_jitter) {
+        wait_for_fleet_slot();
+    } else {
+        ESP_LOGI(TAG, "local script URL install: skipping fleet jitter");
+    }
 
     /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
      * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a
@@ -767,6 +772,7 @@ esp_err_t script_update_init(const script_update_config_t *cfg)
 
 static esp_err_t request_common(uint8_t op, const char *text,
                                 const char *checksum, const char *id, bool reboot,
+                                bool fleet_jitter,
                                 const char *script_version, const char *built_against_fw)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
@@ -776,6 +782,7 @@ static esp_err_t request_common(uint8_t op, const char *text,
     memset(&r, 0, sizeof r);
     r.op = op;
     r.reboot = reboot;
+    r.fleet_jitter = fleet_jitter;
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     if (checksum != NULL) strncpy(r.checksum, checksum, sizeof r.checksum - 1);
     if (script_version != NULL) {
@@ -810,7 +817,7 @@ esp_err_t script_update_request(const char *script, const char *checksum, const 
                                 const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update")) return ESP_ERR_INVALID_ARG;
-    return request_common(OP_UPDATE, script, checksum, id, reboot,
+    return request_common(OP_UPDATE, script, checksum, id, reboot, false,
                           script_version, built_against_fw);
 }
 
@@ -819,11 +826,23 @@ esp_err_t script_update_url_request(const char *url, const char *checksum, const
                                     const char *built_against_fw)
 {
     if (reboot_needs_id(id, reboot, "script_update(url)")) return ESP_ERR_INVALID_ARG;
-    return request_common(OP_UPDATE_URL, url, checksum, id, reboot,
+    return request_common(OP_UPDATE_URL, url, checksum, id, reboot, true,
                           script_version, built_against_fw);   /* text holds the URL */
+}
+
+esp_err_t script_update_url_request_immediate(const char *url, const char *checksum,
+                                              const char *id, bool reboot,
+                                              const char *script_version,
+                                              const char *built_against_fw)
+{
+    if (reboot_needs_id(id, reboot, "script_update(url immediate)")) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return request_common(OP_UPDATE_URL, url, checksum, id, reboot, false,
+                          script_version, built_against_fw);
 }
 
 esp_err_t script_update_exec_request(const char *code, const char *id)
 {
-    return request_common(OP_EXEC, code, NULL, id, false, NULL, NULL); /* exec is never deduped/rebooted */
+    return request_common(OP_EXEC, code, NULL, id, false, false, NULL, NULL); /* exec is never deduped/rebooted */
 }

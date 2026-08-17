@@ -48,12 +48,15 @@ Once per session:
 3. Pick the **experiment** from the dropdown (active experiments you are a
    member of). The **MQTT topic root** is pre-filled from it and stays
    editable; `{thingName}` is replaced per board.
-4. Enter the **Wi-Fi SSID/password** the boards should join.
+4. Pick the **Lua script**. The GUI always loads the newest stable `lua-v*`
+   catalog and lists the released `.lua` files it contains; `main.lua` is the
+   default when available.
+5. Enter the **Wi-Fi SSID/password** the boards should join.
 
 Per board: plug it in via USB-C → **Refresh** → pick the port → **On-board
 device** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
-RTC).
+RTC, selected Lua script).
 
 ## What one procedure does
 
@@ -77,13 +80,37 @@ RTC).
    `flasher_args.json`. Only those regions are written — field data in
    coredump/littlefs/storage survives. A mid-way failure leaves the chip in
    the ROM bootloader (re-flashable) and enables **Retry flash**.
-5. **RTC** — waits for the freshly booted console (it appears 20–35 s after
-   reset, and the USB port may re-enumerate) and sets the exact current UTC
-   epoch with `rtc set` (applies immediately).
-6. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`
-   and reports PASS/FAIL per item. On failure, **Retry provisioning** repairs
-   name/timezone over the console (`cfg set` + reboot) and re-verifies —
-   never a re-flash.
+5. **RTC** — waits up to three minutes for the freshly booted console (normally
+   20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
+   keeping one serial handle open so polling cannot repeatedly reset the board,
+   then sets the exact current UTC epoch with `rtc set` (applies immediately).
+6. **Lua script** — asks the firmware to stream the selected immutable release
+   asset to the SD card. The firmware checks SHA-256 and Lua syntax, keeps the
+   previous file as `/sdcard/main.lua.bak`, atomically installs it as
+   `/sdcard/main.lua`, and restarts Lua in place.
+7. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`,
+   and the active Lua file identity, then reports PASS/FAIL per item. On
+   failure, **Retry provisioning** repairs name/timezone and retries the Lua
+   install over the console — never a re-flash.
+
+### Onboarding sequence
+
+```mermaid
+sequenceDiagram
+    participant GUI
+    participant GitHub
+    participant Device
+    GUI->>GitHub: Fetch releases
+    GitHub-->>GUI: Latest firmware + latest lua-v catalog
+    GUI->>GitHub: Fetch manifests for released .lua assets
+    GUI->>Device: Flash firmware + per-device NVS
+    GUI->>Device: Set RTC and verify configuration
+    GUI->>Device: lua install <immutable URL + SHA + release metadata>
+    Device->>GitHub: Stream selected .lua asset
+    Device->>Device: Verify, parse, atomic swap, restart Lua
+    GUI->>Device: Poll active script identity
+    Device-->>GUI: Verified SHA and release metadata
+```
 
 ## Design notes / firmware facts this tool relies on
 
@@ -111,6 +138,10 @@ RTC).
   `aws iot describe-endpoint --endpoint-type iot:Data-ATS` against each
   account. If an environment's endpoint ever changes, update it there — the
   GUI refuses to start a procedure for an environment whose endpoint is unset.
+- Firmware and Lua are independent release streams. The GUI scans the release
+  feed separately for the newest stable firmware `vX.Y.Z` flash bundle and the
+  highest stable `lua-vX.Y.Z` catalog, so a Lua or GUI release can never be
+  mistaken for firmware.
 
 ## Files
 
@@ -120,7 +151,7 @@ flash_gui/
   gui.py             Tkinter app (worker threads, never blocks the UI)
   procedure.py       the per-board state machine + retry paths
   config.py          environments, topic conventions, persisted settings
-  release_fetch.py   GitHub release download + cache
+  release_fetch.py   firmware download/cache + latest Lua catalog validation
   nvs_builder.py     per-board NVS image (identity/certs/Wi-Fi/RTC seed)
   esptool_ops.py     esptool>=5 scripting API (read MAC, flash, NVS-only)
   ambyte_serial.py   firmware console client (probe / cfg / rtc / verify)
