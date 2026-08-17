@@ -286,7 +286,7 @@ def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResu
     return result
 
 
-def connect_after_boot(preferred_port: str | None, deadline_s: float = 90.0,
+def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                        log=None) -> AmbyteConsole:
     """Console session on a freshly rebooted board.
 

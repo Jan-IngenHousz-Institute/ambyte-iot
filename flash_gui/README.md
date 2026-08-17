@@ -80,9 +80,9 @@ RTC, selected Lua script).
    `flasher_args.json`. Only those regions are written — field data in
    coredump/littlefs/storage survives. A mid-way failure leaves the chip in
    the ROM bootloader (re-flashable) and enables **Retry flash**.
-5. **RTC** — waits for the freshly booted console (it appears 20–35 s after
-   reset, and the USB port may re-enumerate) and sets the exact current UTC
-   epoch with `rtc set` (applies immediately).
+5. **RTC** — waits up to three minutes for the freshly booted console (normally
+   20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
+   then sets the exact current UTC epoch with `rtc set` (applies immediately).
 6. **Lua script** — asks the firmware to stream the selected immutable release
    asset to the SD card. The firmware checks SHA-256 and Lua syntax, keeps the
    previous file as `/sdcard/main.lua.bak`, atomically installs it as

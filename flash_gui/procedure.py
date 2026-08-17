@@ -44,8 +44,10 @@ from .release_fetch import LuaScriptRelease, ReleaseImages
 # seconds-vs-milliseconds or timezone-applied-twice class of error.
 RTC_TOLERANCE_S = 120
 
-# Post-reboot console can take 20-35 s to appear; allow for SD unmount etc.
-CONSOLE_BOOT_DEADLINE_S = 90.0
+# A normal post-reboot console appears in 20-35 s, but SD recovery and USB
+# re-enumeration can push field devices past 90 s. Keep rescanning for three
+# minutes before declaring the board unavailable.
+CONSOLE_BOOT_DEADLINE_S = 180.0
 # URL installs temporarily stop Lua + MQTT, download over HTTPS, verify, swap,
 # reconnect MQTT, and restart Lua. Normal runs finish in seconds; tolerate a
 # degraded Wi-Fi reconnect without turning a safe in-progress update into a
