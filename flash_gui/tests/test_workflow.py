@@ -23,8 +23,11 @@ def test_builds_only_for_pull_requests_and_manual_runs():
 def test_main_promotes_the_exact_pr_head_artifacts():
     assert "name: Promote PR executables" in WORKFLOW
     assert 'gh pr view "${PR_NUMBER}"' in WORKFLOW
-    assert 'ARTIFACT_NAME="ambyte-flash-gui-linux-${HEAD_SHA}"' in WORKFLOW
-    assert ".workflow_run.head_sha == $head" in WORKFLOW
+    assert 'gh run watch "${RUN_ID}"' in WORKFLOW
+    assert "--exit-status" in WORKFLOW
+    assert 'actions/runs/${RUN_ID}/artifacts?per_page=100' in WORKFLOW
+    for platform in ("linux", "macos", "windows"):
+        assert f'("ambyte-flash-gui-{platform}-" + $head)' in WORKFLOW
     assert (
         "pattern: ambyte-flash-gui-*-${{ steps.artifact.outputs.head-sha }}"
         in WORKFLOW
