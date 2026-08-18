@@ -74,11 +74,15 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertIn("else if (r->op == OP_UPDATE_LOCAL) do_update_local(r);",
                       SCRIPT_UPDATE)
 
-    def test_takes_the_sd_rw_gate_like_the_other_update_workers(self):
+    def test_no_sd_gate_staging_is_internal(self):
+        # Since main.lua + staging moved to internal littlefs, the local worker
+        # must NOT take the SD RW-gate: a missing archive card cannot fail a
+        # serial push. (The same de-gating applies to the other workers; the
+        # whole component is SD-free.)
         wrapper = SCRIPT_UPDATE.split("static void do_update_local(const script_req_t *r)\n{", 1)[1]
         wrapper = wrapper.split("\n}\n", 1)[0]
-        self.assertIn("sdcard_io_begin()", wrapper)
-        self.assertIn("sdcard_io_end()", wrapper)
+        self.assertNotIn("sdcard_io_begin", wrapper)
+        self.assertNotIn("sdcard_io_begin", SCRIPT_UPDATE)
 
     def test_stops_lua_but_never_touches_mqtt(self):
         body = self._body()
@@ -107,13 +111,15 @@ class ReconnectWaitTest(unittest.TestCase):
 
 class StagingPathTest(unittest.TestCase):
     def test_defined_once_and_shared_with_the_console(self):
-        self.assertIn('#define SCRIPT_UPDATE_STAGING_PATH "/sdcard/main.lua.new"',
+        self.assertIn('#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/main.lua.new"',
                       SCRIPT_UPDATE_H)
         self.assertIn("#define LUA_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH",
                       SCRIPT_UPDATE)
         # The CLI must not hardcode its own copy of the path.
-        self.assertNotIn('"/sdcard/main.lua.new"', CLI)
+        self.assertNotIn('"/littlefs/main.lua.new"', CLI)
         self.assertIn("SCRIPT_UPDATE_STAGING_PATH", CLI)
+        # Internal flash, not the archive card: a cardless board must install.
+        self.assertNotIn('"/sdcard/main.lua.new"', SCRIPT_UPDATE_H)
 
 
 class ConsoleCommandsTest(unittest.TestCase):
@@ -130,12 +136,13 @@ class ConsoleCommandsTest(unittest.TestCase):
         self.assertIn("lua put: refusing to exceed", CLI)
 
     def test_put_keeps_no_state_between_commands(self):
-        # A push abandoned halfway must leak no file handle and hold no SD ref,
-        # so each put opens, appends, closes and re-stats.
+        # A push abandoned halfway must leak no file handle, so each put opens,
+        # appends, closes and re-stats. Staging is on internal littlefs, so no
+        # SD gate may wrap it — a cardless board must accept a push.
         put = CLI.split('strcmp(argv[1], "put") == 0', 1)[1].split("return 0;", 1)[0]
         self.assertIn('fopen(SCRIPT_UPDATE_STAGING_PATH, "ab")', put)
         self.assertIn("fclose(f)", put)
-        self.assertIn("sdcard_io_end()", put)
+        self.assertNotIn("sdcard_io_begin", put)
 
     def test_commit_mirrors_lua_install_and_does_not_reboot(self):
         commit = CLI.split('strcmp(argv[1], "commit") == 0', 1)[1].split("return 0;", 1)[0]
