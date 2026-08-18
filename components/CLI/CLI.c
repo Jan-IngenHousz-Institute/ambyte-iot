@@ -148,6 +148,13 @@ static int cli_cmd_status(int argc, char **argv)
         printf(" - DB: %s\r\n", dres.message);
     }
 
+    /* SD card: archive/log/recovery roles only since the event store and
+     * main.lua moved to internal flash — an absent card is informational,
+     * not a failure. */
+    printf(" - SD card: %s\r\n",
+           sdcard_is_mounted() ? "mounted (archive/logs/AMBIT OTA only)"
+                               : "absent (OK — Lua and the event store are internal)");
+
     /* Battery / input power (MP2731 charger). */
     power_reading_t pw;
     cmd_result_t pres = cmd_read_power(&pw);
