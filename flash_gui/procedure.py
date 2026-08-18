@@ -444,8 +444,15 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
 
         deadline = time.time() + LUA_INSTALL_DEADLINE_S
         last_detail = "the previous script is still active"
-        log(f"Lua install queued; the device downloads and verifies it over "
-            f"Wi-Fi (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
+        if pushed:
+            # The bytes are already staged on the device; what remains is the
+            # firmware's local hash + syntax check + SD swap, and our serial
+            # read-back of `lua release`. No network is involved at all.
+            log(f"Lua install queued; the firmware verifies the pushed script "
+                f"on-device (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
+        else:
+            log(f"Lua install queued; the device downloads and verifies it over "
+                f"Wi-Fi (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
         next_progress = time.time() + LUA_INSTALL_SETTLE_S + LUA_INSTALL_PROGRESS_S
 
         def report_progress() -> None:
