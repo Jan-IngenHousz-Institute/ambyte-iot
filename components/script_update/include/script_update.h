@@ -14,10 +14,11 @@ extern "C" {
 /*
  * Remote Lua control over MQTT (docs/lua-releases.md):
  *
- *  - script_update: replace /sdcard/main.lua with an inline-delivered script
- *    and restart the Lua runner. The script is syntax-checked BEFORE the SD is
- *    touched; the previous main.lua survives as main.lua.bak. Optional sha256
- *    integrity check. NVS id latch (success only) dedupes the retained topic.
+ *  - script_update: replace /littlefs/main.lua with an inline-delivered script
+ *    and restart the Lua runner. The script is syntax-checked BEFORE the
+ *    filesystem is touched; the previous main.lua survives as main.lua.bak.
+ *    Optional sha256 integrity check. NVS id latch (success only) dedupes the
+ *    retained topic.
  *  - lua_exec: run a short Lua snippet immediately in an ephemeral state
  *    (lua_runner_exec) and publish its result — remote-CLI parity.
  *
@@ -82,7 +83,33 @@ esp_err_t script_update_url_request(const char *url, const char *checksum, const
                                     bool reboot, const char *script_version,
                                     const char *built_against_fw);
 
-/* Hash the active /sdcard/main.lua and return release provenance only when the
+/* Queue the same verified HTTPS replacement without the deterministic fleet
+ * delay. This is for an operator attached to the local serial console; remote
+ * MQTT callers should keep using script_update_url_request() so a fleet does
+ * not begin TLS downloads simultaneously. */
+esp_err_t script_update_url_request_immediate(const char *url, const char *checksum,
+                                              const char *id, bool reboot,
+                                              const char *script_version,
+                                              const char *built_against_fw);
+
+/* Where the console's `lua put` stages bytes for script_update_local_request().
+ * Same file the URL variant downloads into, so both share one install path.
+ * On internal littlefs (alongside LUA_PATH), so a serial push works with no SD
+ * card inserted. */
+#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/main.lua.new"
+
+/* Queue a main.lua replacement from bytes ALREADY staged at
+ * SCRIPT_UPDATE_STAGING_PATH by the console. Needs no network at all: the
+ * operator's PC pushed the script over serial, so onboarding works on a bench
+ * with no uplink. Verification is unchanged (sha256 of the staged file against
+ * `checksum`, Lua syntax check, previous script kept as main.lua.bak). Unlike the
+ * URL variant this does not stop MQTT, since nothing here needs the TLS heap.
+ * `id`/`reboot`/release-provenance semantics match script_update_request. */
+esp_err_t script_update_local_request(const char *checksum, const char *id,
+                                      bool reboot, const char *script_version,
+                                      const char *built_against_fw);
+
+/* Hash the active /littlefs/main.lua and return release provenance only when the
  * stored release digest matches the file. Suitable as a script_identity_read_fn. */
 esp_err_t script_update_get_identity(script_identity_t *out);
 

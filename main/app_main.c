@@ -222,7 +222,7 @@ static void app_workload_resume(void)
     taskEXIT_CRITICAL(&s_workload_mux);
     if (!last) return;
 
-    /* Reloads /sdcard/main.lua. If the preceding stop TIMED OUT (script was stuck
+    /* Reloads /littlefs/main.lua. If the preceding stop TIMED OUT (script was stuck
      * in a long C call), the old task is still unwinding and start returns
      * INVALID_STATE — without a retry the measurement loop would silently stay
      * dead until a manual `lua start`/reboot. Retry until the old task exits. */
@@ -1234,7 +1234,7 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
     }
 
-    /* Remote Lua control (Stage 4): MQTT script_update replaces /sdcard/main.lua
+    /* Remote Lua control (Stage 4): MQTT script_update replaces /littlefs/main.lua
      * (syntax-checked, .bak kept) + restarts the runner; MQTT lua_exec runs a
      * snippet in an ephemeral state. Lazy worker — no steady-state heap cost. */
     script_update_config_t script_cfg = {

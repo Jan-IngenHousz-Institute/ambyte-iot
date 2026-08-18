@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Targeted deployment of an immutable Lua release to the Ambyte fleet.
 
 The selected release manifest and Lua asset are downloaded and verified before

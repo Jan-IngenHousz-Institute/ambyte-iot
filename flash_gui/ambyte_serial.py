@@ -1,14 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Talk to the ambyte firmware's USB-Serial-JTAG console (pyserial).
 
 Console facts this module is built on (components/CLI/CLI.c):
   * prompt is exactly "ambyte> "; the REPL comes up ~20-35 s after reset
-  * linenoise echoes input and emits ANSI refresh/hint sequences — responses
+  * linenoise echoes input and emits ANSI refresh/hint sequences, so responses
     are found by searching the whole (ANSI-stripped) reply, never by anchoring
     on the echo line
-  * a handler failure prints "Command returned non-zero error code" — success
+  * a handler failure prints "Command returned non-zero error code"; success
     is the absence of that line (plus per-command success patterns)
   * `cfg get` returns the RAW NVS string: a fleet-default board legitimately
-    answers `device_name = AMBYTE_{MAC}` — the firmware expands the {MAC}
+    answers `device_name = AMBYTE_{MAC}`, and the firmware expands the {MAC}
     token at boot, in RAM only
   * `rtc set <epoch>` (UTC seconds) applies immediately; `rtc` reads UTC
   * opening the port must not assert DTR/RTS: esptool drives those lines to
@@ -18,6 +21,7 @@ Console facts this module is built on (components/CLI/CLI.c):
 
 from __future__ import annotations
 
+import base64
 import re
 import time
 from dataclasses import dataclass, field
@@ -32,7 +36,24 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _STATUS_MAC_RE = re.compile(r"-\s*MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _RTC_RE = re.compile(r"RTC:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\((\d+)\)")
+_LUA_RELEASE_RE = re.compile(
+    r"lua release:\s+sha256=([0-9A-Fa-f]{64})\s+version=(\S+)\s+"
+    r"built_against_fw=(\S+)\s+installed_on_fw=(\S+)\s+"
+    r"verified=(true|false)\s+running=(true|false)")
 _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
+# `status` prints " - Wi-Fi: connected (provisioned: yes)". The firmware sets
+# that connected bit on IP_EVENT_STA_GOT_IP, not on association, so "connected"
+# already means the board holds a DHCP lease.
+_WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
+_LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
+# NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
+# driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
+# USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT and which the REPL does not let us size
+# (esp_console_dev_usb_serial_jtag_config_t is an empty struct). Overrun it and
+# the line never reaches the parser, so the command simply never answers.
+# Measured on hardware: a 224-character line works, 264 hangs. 144 raw bytes
+# encodes to 192, so the line is 200 characters, comfortably clear of 256.
+LUA_PUT_CHUNK_BYTES = 144
 FAILURE_MARK = "Command returned non-zero error code"
 
 # The firmware expands this token at boot; over `cfg get` it comes back raw.
@@ -41,6 +62,15 @@ MAC_TOKEN = "{MAC}"
 
 class ConsoleError(RuntimeError):
     """Console unreachable or a command failed."""
+
+
+class UnsupportedConsoleCommand(ConsoleError):
+    """The firmware does not implement this command.
+
+    Distinct from a failure so callers can fall back rather than give up: a board
+    flashed with a release older than the serial-push commands is fine, it just
+    has to install its script the old way.
+    """
 
 
 def expand_mac_token(value: str, mac: str) -> str:
@@ -66,6 +96,16 @@ class ProbeResult:
     mac: str | None = None
     device_name: str | None = None      # raw NVS value ({MAC} un-expanded)
     raw: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
+class LuaReleaseStatus:
+    sha256: str
+    script_version: str
+    built_against_fw: str
+    installed_on_fw: str
+    verified: bool
+    running: bool
 
 
 class AmbyteConsole:
@@ -159,6 +199,15 @@ class AmbyteConsole:
         m = _STATUS_MAC_RE.search(self.status())
         return m.group(1).upper() if m else None
 
+    def wifi_connected(self, timeout: float = 10.0) -> bool | None:
+        """Whether the board has an IP, or None if it does not say.
+
+        None means "do not block on this": an older firmware whose `status`
+        omits the line must not be treated as offline.
+        """
+        m = _WIFI_RE.search(self.status(timeout))
+        return None if m is None else m.group(1).lower() == "connected"
+
     def cfg_get(self, key: str, timeout: float = 5.0) -> str | None:
         """Raw NVS value, or None when unset/unreadable."""
         reply = self.command(f"cfg get {key}", timeout)
@@ -167,7 +216,7 @@ class AmbyteConsole:
         for line in reply.splitlines():
             line = line.strip()
             m = re.match(_CFG_GET_RE_TMPL.format(key=re.escape(key)), line)
-            # Skip the echo line ("cfg get <key>") — it carries no '='.
+            # Skip the echo line ("cfg get <key>"), it carries no '='.
             if m and not line.startswith("cfg get"):
                 value = m.group(1).strip()
                 return None if value.startswith("(unset") else value
@@ -201,6 +250,90 @@ class AmbyteConsole:
             raise ConsoleError(f"rtc set confirmation not understood:\n{reply[-300:]}")
         return int(m.group(2))
 
+    def lua_install(self, url: str, sha256: str, campaign_id: str,
+                    script_version: str, built_against_fw: str) -> None:
+        """Queue the firmware's safe URL installer for one released script."""
+        args = (url, sha256, campaign_id, script_version, built_against_fw)
+        if any(not value or any(ch.isspace() for ch in value) for value in args):
+            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
+        cmd = "lua install " + " ".join(args)
+        reply = self.command(cmd, timeout=10.0)
+        if "lua install queued:" not in reply or FAILURE_MARK in reply:
+            raise ConsoleError(f"Lua install request failed:\n{reply[-500:]}")
+
+    def lua_push(self, blob: bytes, sha256: str, campaign_id: str,
+                 script_version: str, built_against_fw: str,
+                 log=None) -> None:
+        """Stream a script down this console and install it, no device network.
+
+        Raises UnsupportedConsoleCommand when the firmware predates the push
+        commands, so the caller can fall back to the URL installer.
+        """
+        args = (sha256, campaign_id, script_version, built_against_fw)
+        if any(not value or any(ch.isspace() for ch in value) for value in args):
+            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
+
+        reply = self.command("lua begin", timeout=10.0)
+        if "lua begin: ready" not in reply:
+            # Older firmware answers the `lua <start|stop|...>` usage line and a
+            # non-zero exit; that is a capability signal, not a failure.
+            if "Usage: lua" in reply or FAILURE_MARK in reply:
+                raise UnsupportedConsoleCommand(
+                    "this firmware has no `lua begin`/`lua put`")
+            raise ConsoleError(f"lua begin failed:\n{reply[-500:]}")
+
+        sent = 0
+        for offset in range(0, len(blob), LUA_PUT_CHUNK_BYTES):
+            chunk = blob[offset:offset + LUA_PUT_CHUNK_BYTES]
+            encoded = base64.b64encode(chunk).decode("ascii")
+            reply = self.command(f"lua put {encoded}", timeout=15.0)
+            match = _LUA_PUT_RE.search(reply)
+            if match is None or FAILURE_MARK in reply:
+                self._lua_abort_quietly()
+                raise ConsoleError(f"lua put failed at byte {sent}:\n{reply[-500:]}")
+            sent += len(chunk)
+            # The device reports the staged file's own size, so a silently
+            # dropped chunk is caught here rather than by the digest at commit.
+            if int(match.group(1)) != sent:
+                self._lua_abort_quietly()
+                raise ConsoleError(
+                    f"device staged {match.group(1)} bytes after {sent} were sent")
+            if log is not None:
+                log(f"Pushed {sent}/{len(blob)} bytes of {script_version}.")
+
+        reply = self.command("lua commit " + " ".join(args), timeout=15.0)
+        if "lua commit queued:" not in reply or FAILURE_MARK in reply:
+            self._lua_abort_quietly()
+            raise ConsoleError(f"lua commit failed:\n{reply[-500:]}")
+
+    def _lua_abort_quietly(self) -> None:
+        """Drop a half-pushed staging file; never mask the original error."""
+        try:
+            self.command("lua abort", timeout=10.0)
+        except ConsoleError:
+            pass
+
+    def lua_release(self, timeout: float = 10.0) -> LuaReleaseStatus:
+        """Read the active /sdcard/main.lua identity and runner state."""
+        reply = self.command("lua release", timeout=timeout)
+        if FAILURE_MARK in reply:
+            raise ConsoleError(f"Lua release status failed:\n{reply[-500:]}")
+        match = _LUA_RELEASE_RE.search(reply)
+        if match is None:
+            raise ConsoleError(f"Lua release status not understood:\n{reply[-500:]}")
+
+        def value(raw: str) -> str:
+            return "" if raw == "-" else raw
+
+        return LuaReleaseStatus(
+            sha256=match.group(1).lower(),
+            script_version=value(match.group(2)),
+            built_against_fw=value(match.group(3)),
+            installed_on_fw=value(match.group(4)),
+            verified=match.group(5) == "true",
+            running=match.group(6) == "true",
+        )
+
     def reboot(self) -> None:
         """Fire `reboot`; the port will drop and re-enumerate."""
         try:
@@ -213,7 +346,7 @@ class AmbyteConsole:
 # ── high-level helpers ──────────────────────────────────────────────────────
 def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResult:
     """Pre-flash check: is a live ambyte console on this port, and what name
-    does it carry? Short timeout by design — an unflashed/foreign board simply
+    does it carry? Short timeout by design: an unflashed/foreign board simply
     times out and the caller falls back to esptool for the MAC."""
     result = ProbeResult()
     for _ in range(1 + retries):
@@ -240,38 +373,64 @@ def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResu
     return result
 
 
-def connect_after_boot(preferred_port: str | None, deadline_s: float = 90.0,
+def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                        log=None) -> AmbyteConsole:
     """Console session on a freshly rebooted board.
 
     The ESP32-S3 native USB-Serial-JTAG re-enumerates to a NEW port name on
     every reset (and leaves ghost ports behind), and the CLI task only starts
-    ~20-35 s into boot — so rescan every live JTAG port until one answers with
+    ~20-35 s into boot, so rescan every live JTAG port until one answers with
     the prompt, retrying across re-enumerations until the deadline.
     """
     deadline = time.time() + deadline_s
     said_wait = False
+    con: AmbyteConsole | None = None
+    active_port: str | None = None
     while time.time() < deadline:
-        cands = ([preferred_port] if preferred_port else []) + \
-            [p for p in esp_jtag_ports() if p != preferred_port]
-        for cand in cands:
+        if con is None:
+            cands = ([preferred_port] if preferred_port else []) + \
+                [p for p in esp_jtag_ports() if p != preferred_port]
+            for cand in cands:
+                try:
+                    con = AmbyteConsole(cand)
+                    active_port = cand
+                    break
+                except (OSError, serial.SerialException):
+                    continue           # ghost / not ready / busy
+
+        if con is not None:
             try:
-                con = AmbyteConsole(cand)
-            except (OSError, serial.SerialException):
-                continue               # ghost / not ready / busy
-            try:
-                if con.wait_prompt(timeout=3.0):
+                # Keep this handle open across polling slices. Opening the
+                # ESP32-S3 USB console can reset the board; repeatedly closing
+                # and reopening it every three seconds traps startup in a boot
+                # loop before the CLI has time to appear.
+                remaining = max(0.1, deadline - time.time())
+                if con.wait_prompt(timeout=min(3.0, remaining)):
                     if log:
-                        log(f"Console up on {cand}.")
+                        log(f"Console up on {active_port}.")
                     return con
             except ConsoleError:
-                pass
-            con.close()
+                con.close()
+                con = None
+                active_port = None
+                continue
+
+            # A real USB disconnect makes the open descriptor unusable and is
+            # normally raised above. This explicit presence check also handles
+            # platforms that leave a quiet ghost descriptor behind.
+            if active_port not in esp_jtag_ports():
+                con.close()
+                con = None
+                active_port = None
+
         if log and not said_wait:
             log("Waiting for the board's console (it starts ~20-35 s after "
                 "boot; the USB port may re-enumerate)...")
             said_wait = True
-        time.sleep(1.5)
+        if con is None:
+            time.sleep(1.5)
+    if con is not None:
+        con.close()
     raise ConsoleError(
-        f"no ambyte console answered within {deadline_s:.0f}s — the board may "
+        f"no ambyte console answered within {deadline_s:.0f}s; the board may "
         "still be booting, or the USB port re-enumerated to a different name.")

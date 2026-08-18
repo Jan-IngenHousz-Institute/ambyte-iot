@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """esptool operations, via the esptool>=5 scripting API (no shelling out).
 
 Three entry points:

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+// SPDX-License-Identifier: GPL-3.0-only
+
 import assert from "node:assert/strict";
 import test from "node:test";
 

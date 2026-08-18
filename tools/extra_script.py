@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """PlatformIO extra_script — pre-populate the NVS partition during firmware upload.
 
 Registered in platformio.ini as `extra_scripts = pre:tools/extra_script.py`.

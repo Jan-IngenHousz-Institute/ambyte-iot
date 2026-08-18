@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Spawn the Lua runner task. Loads /sdcard/main.lua, runs it once. The task
+/* Spawn the Lua runner task. Loads /littlefs/main.lua, runs it once. The task
  * self-deletes when the script returns or is stopped. Returns
  * ESP_ERR_INVALID_STATE if a task is already running. */
 esp_err_t lua_runner_start(void);

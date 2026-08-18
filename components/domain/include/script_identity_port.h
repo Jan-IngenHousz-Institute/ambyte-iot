@@ -12,9 +12,9 @@ extern "C" {
 #define SCRIPT_IDENTITY_VERSION_LEN 32
 
 /* Exact active-file identity plus optional release provenance. The SHA is always
- * derived from /sdcard/main.lua. Release fields are returned only when their
- * persisted digest still matches those bytes, so a manual SD-card replacement
- * cannot inherit stale version metadata. */
+ * derived from the active main.lua (internal littlefs). Release fields are
+ * returned only when their persisted digest still matches those bytes, so a
+ * manual file replacement cannot inherit stale version metadata. */
 typedef struct {
     char sha256[SCRIPT_IDENTITY_SHA256_LEN];
     char version[SCRIPT_IDENTITY_VERSION_LEN];

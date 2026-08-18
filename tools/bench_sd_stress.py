@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Overnight SD-stress harness for PR #27 (SD power-loss hardening).
 
 Drives the Ambyte serial console (USB-JTAG CDC, 115200) through repeated

@@ -1,4 +1,7 @@
 @echo off
+REM SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+REM SPDX-License-Identifier: GPL-3.0-only
+
 rem Windows launcher for tools/flash_certs.py — finds a Python and forwards args.
 setlocal enabledelayedexpansion
 set "HERE=%~dp0"

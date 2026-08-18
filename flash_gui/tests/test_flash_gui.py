@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Unit tests for the pure logic in flash_gui (no hardware, no network).
 
 Run from the repo root:  python -m pytest flash_gui/tests -q
@@ -7,20 +10,25 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from flash_gui import config                                   # noqa: E402
+from flash_gui import config, procedure                        # noqa: E402
 from flash_gui import openjii_client, release_fetch, tls       # noqa: E402
-from flash_gui.ambyte_serial import expand_mac_token           # noqa: E402
+from flash_gui.ambyte_serial import (AmbyteConsole, ConsoleError,  # noqa: E402
+                                    LuaReleaseStatus, expand_mac_token)
 from flash_gui.nvs_builder import (AMAZON_ROOT_CA1,            # noqa: E402
                                    NvsBuildError, ProvisioningPlan,
                                    build_nvs_csv, build_nvs_image)
 from flash_gui.procedure import PreflightInfo, clean_device_name  # noqa: E402
 from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
-                                     pick_firmware_release)
+                                     LuaScriptRelease,
+                                     fetch_latest_lua_catalog,
+                                     pick_firmware_release,
+                                     pick_lua_release)
 
 
 MAC = "E8:F6:0A:B1:1F:34"
@@ -271,6 +279,208 @@ def test_picker_returns_none_when_no_firmware_release():
     ]
     assert pick_firmware_release(releases) is None
     assert pick_firmware_release([]) is None
+
+
+# ── Lua release catalog picker ───────────────────────────────────────────────
+def _lua_rel(tag, scripts=("main",), published="2026-01-01T00:00:00Z",
+             prerelease=False, draft=False):
+    assets = []
+    for script in scripts:
+        assets.extend((
+            {"name": f"{script}.lua", "size": 10,
+             "browser_download_url": f"https://example.test/{tag}/{script}.lua"},
+            {"name": f"{script}.lua.manifest.json", "size": 500,
+             "browser_download_url":
+                 f"https://example.test/{tag}/{script}.lua.manifest.json"},
+        ))
+    return {"tag_name": tag, "prerelease": prerelease, "draft": draft,
+            "published_at": published, "assets": assets}
+
+
+def _lua_manifest(tag="lua-v1.2.3", script="main"):
+    version = tag.removeprefix("lua-v")
+    asset_url = f"https://example.test/{tag}/{script}.lua"
+    digest = "a" * 64
+    campaign = tag if script == "main" else f"{tag}:{script}"
+    return {
+        "schema_version": 1,
+        "script_name": script,
+        "script_version": version,
+        "tag": tag,
+        "sha256": digest,
+        "size_bytes": 10,
+        "built_against_fw": "1.7.0",
+        "asset_url": asset_url,
+        "script_update": {
+            "type": "script_update",
+            "id": campaign,
+            "url": asset_url,
+            "checksum": digest,
+            "script_version": version,
+            "built_against_fw": "1.7.0",
+        },
+    }
+
+
+def test_lua_picker_uses_highest_stable_catalog_version():
+    releases = [
+        _lua_rel("lua-v1.9.0", published="2026-09-01T00:00:00Z"),
+        _lua_rel("lua-v2.0.0", published="2026-08-01T00:00:00Z"),
+        _lua_rel("lua-v3.0.0", prerelease=True),
+        _lua_rel("v9.0.0"),
+        _lua_rel("lua-v2.1.0", scripts=()),
+    ]
+    assert pick_lua_release(releases)["tag_name"] == "lua-v2.0.0"
+
+
+def test_fetch_latest_lua_catalog_validates_and_lists_all_scripts(monkeypatch):
+    release = _lua_rel("lua-v1.2.3", scripts=("main", "legacy_1Hz_spec"))
+    responses = {
+        "https://example.test/lua-v1.2.3/main.lua.manifest.json":
+            _lua_manifest(script="main"),
+        "https://example.test/lua-v1.2.3/legacy_1Hz_spec.lua.manifest.json":
+            _lua_manifest(script="legacy_1Hz_spec"),
+    }
+
+    monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
+    monkeypatch.setattr(release_fetch, "_get_json", lambda url: responses[url])
+    catalog = fetch_latest_lua_catalog(log=lambda _message: None)
+    assert catalog.tag == "lua-v1.2.3"
+    assert [script.asset_name for script in catalog.scripts] == [
+        "legacy_1Hz_spec.lua", "main.lua"]
+    assert catalog.scripts[0].campaign_id == "lua-v1.2.3:legacy_1Hz_spec"
+
+
+def test_fetch_latest_lua_catalog_rejects_manifest_drift(monkeypatch):
+    release = _lua_rel("lua-v1.2.3")
+    manifest = _lua_manifest()
+    manifest["sha256"] = "not-a-digest"
+    monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
+    monkeypatch.setattr(release_fetch, "_get_json", lambda url: manifest)
+    with pytest.raises(ReleaseError, match="sha256"):
+        fetch_latest_lua_catalog(log=lambda _message: None)
+
+
+def test_console_parses_lua_release_and_queues_immutable_install():
+    console = object.__new__(AmbyteConsole)
+    commands = []
+
+    def command(cmd, timeout=5.0):
+        commands.append((cmd, timeout))
+        if cmd == "lua release":
+            return ("lua release: sha256=" + "a" * 64
+                    + " version=1.2.3 built_against_fw=1.7.0 "
+                    "installed_on_fw=1.7.1 verified=true running=true\n"
+                    "ambyte> ")
+        return "lua install queued: id=lua-v1.2.3\nambyte> "
+
+    console.command = command
+    status = console.lua_release()
+    assert status.sha256 == "a" * 64
+    assert status.verified and status.running
+    console.lua_install(
+        "https://example.test/lua-v1.2.3/main.lua", "a" * 64,
+        "lua-v1.2.3", "1.2.3", "1.7.0")
+    assert commands[-1][0].startswith("lua install https://example.test/")
+
+
+def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
+    """Polling must not reset the ESP32 by reopening its USB console."""
+    created = []
+
+    class SlowConsole:
+        def __init__(self, port):
+            self.port = port
+            self.polls = 0
+            self.closed = False
+            created.append(self)
+
+        def wait_prompt(self, timeout):
+            self.polls += 1
+            return self.polls == 3
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(procedure.ambyte_serial, "AmbyteConsole", SlowConsole)
+    monkeypatch.setattr(
+        procedure.ambyte_serial, "esp_jtag_ports", lambda: ["/dev/ttyACM0"])
+
+    console = procedure.ambyte_serial.connect_after_boot(
+        "/dev/ttyACM0", deadline_s=30.0)
+
+    assert console is created[0]
+    assert len(created) == 1
+    assert console.polls == 3
+    assert not console.closed
+
+
+def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch):
+    script = LuaScriptRelease(
+        tag="lua-v1.2.3",
+        asset_name="main.lua",
+        script_name="main",
+        script_version="1.2.3",
+        built_against_fw="1.7.0",
+        asset_url="https://example.test/lua-v1.2.3/main.lua",
+        sha256="a" * 64,
+        size_bytes=10,
+        campaign_id="lua-v1.2.3",
+    )
+
+    class FakeConsole:
+        def __init__(self):
+            self.status_reads = 0
+            self.install_args = None
+            self.close_count = 0
+
+        def lua_release(self, timeout=10.0):
+            self.status_reads += 1
+            if self.status_reads == 1:
+                raise ConsoleError("main.lua is absent")
+            if self.status_reads == 2:
+                raise ConsoleError("'lua release' got no prompt back within 20s")
+            return LuaReleaseStatus(
+                sha256="a" * 64,
+                script_version="1.2.3",
+                built_against_fw="1.7.0",
+                installed_on_fw="1.7.1",
+                verified=True,
+                running=True,
+            )
+
+        def lua_install(self, *args):
+            self.install_args = args
+
+        def wifi_connected(self, timeout=10.0):
+            return True
+
+        def close(self):
+            self.close_count += 1
+
+    console = FakeConsole()
+    connects = []
+
+    def connect(*_args, **_kwargs):
+        connects.append(True)
+        return console
+
+    monkeypatch.setattr(
+        procedure.ambyte_serial, "connect_after_boot",
+        connect)
+    monkeypatch.setattr(procedure.time, "sleep", lambda _seconds: None)
+
+    result = procedure.install_lua_script(
+        SimpleNamespace(lua_script=script, wifi_ssid="test-ap"),
+        SimpleNamespace(port="/dev/ttyACM0"),
+        log=lambda _message: None,
+    )
+    assert result.passed
+    assert len(connects) == 1
+    assert console.close_count == 1  # the normal function-finally close only
+    assert console.install_args == (
+        script.asset_url, script.sha256, script.campaign_id,
+        script.script_version, script.built_against_fw)
 
 
 # ── timezone helpers ─────────────────────────────────────────────────────────
