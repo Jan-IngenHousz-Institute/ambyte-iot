@@ -158,29 +158,40 @@ RTC, selected Lua script).
    written to disk *before* anything else can fail
    (`<config>/device_certs/<thing>/`). This happens **before** flashing, so an
    API failure leaves the board untouched.
-3. **NVS bake** — a per-board provisioning image: device name, IANA timezone
-   (from this PC's clock), `flash_time` RTC seed, the board's own cert + key +
-   Amazon Root CA 1, Wi-Fi credentials, MQTT broker (per environment), client
-   id = openJII Thing name (required by the AWS IoT policy), topic root,
-   command/status topics.
+3. **NVS + littlefs bake** — a per-board provisioning image: device name, IANA
+   timezone (from this PC's clock), `flash_time` RTC seed, the board's own
+   cert + key + Amazon Root CA 1, Wi-Fi credentials, MQTT broker (per
+   environment), client id = openJII Thing name (required by the AWS IoT
+   policy), topic root, command/status topics, and the selected Lua release's
+   provenance (sha256/version/campaign). Alongside it, a littlefs image of the
+   internal script partition carrying that release's `main.lua`, built
+   host-side (no mklittlefs needed).
 4. **Flash** — the latest GitHub release (`ambyte-iot-v*.zip`, cached locally,
-   version shown in the GUI) + the NVS image, offsets from the release's own
-   `flasher_args.json`. Only those regions are written — field data in
-   coredump/littlefs/storage survives. A mid-way failure leaves the chip in
+   version shown in the GUI) + the NVS image + the littlefs image, offsets
+   from the release's own `flasher_args.json` plus the fixed NVS/littlefs
+   partition offsets. Only those regions are written — field data in
+   coredump/storage survives. A mid-way failure leaves the chip in
    the ROM bootloader (re-flashable) and enables **Retry flash**.
 5. **RTC** — waits up to three minutes for the freshly booted console (normally
    20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
    keeping one serial handle open so polling cannot repeatedly reset the board,
    then sets the exact current UTC epoch with `rtc set` (applies immediately).
-6. **Lua script** — asks the firmware to stream the selected immutable release
-   asset to the SD card. The firmware checks SHA-256 and Lua syntax, keeps the
-   previous file as `/sdcard/main.lua.bak`, atomically installs it as
-   `/sdcard/main.lua`, and restarts Lua in place. Verification keeps the same
-   serial connection open while this asynchronous operation completes.
+6. **Lua script** — with a firmware that runs main.lua from internal flash
+   (littlefs), the baked image + NVS provenance already verify, so this step
+   usually confirms and moves on. Otherwise it pushes the selected immutable
+   release asset down the console (no device network needed); the firmware
+   checks SHA-256 and Lua syntax, keeps the previous file as `main.lua.bak`,
+   atomically installs it as `main.lua`, and restarts Lua in place. On older
+   firmware without the push commands it falls back to the firmware's URL
+   downloader (the only path that needs the board online). Verification keeps
+   the same serial connection open while this asynchronous operation
+   completes.
 7. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`,
-   and the active Lua file identity, then reports PASS/FAIL per item. On
-   failure, **Retry provisioning** repairs name/timezone and retries the Lua
-   install over the console — never a re-flash.
+   and the active Lua file identity, then reports PASS/FAIL per item. SD card
+   presence is reported for information only — it is not required: the event
+   store and main.lua are internal; a card serves archive/logs/AMBIT OTA only.
+   On failure, **Retry provisioning** repairs name/timezone and retries the
+   Lua install over the console — never a re-flash.
 
 ### Onboarding sequence
 

@@ -115,6 +115,7 @@ jobs:
             --paths . \
             --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
             --collect-all esptool \
+            --collect-all littlefs \
             "${VERSION_FILE[@]}" \
             flash_gui/launcher.py
 
