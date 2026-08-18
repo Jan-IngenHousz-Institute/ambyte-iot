@@ -45,6 +45,7 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 # that connected bit on IP_EVENT_STA_GOT_IP, not on association, so "connected"
 # already means the board holds a DHCP lease.
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
+_SD_RE = re.compile(r"SD card:\s*(mounted|absent)", re.IGNORECASE)
 _LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
 # NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
 # driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
@@ -207,6 +208,16 @@ class AmbyteConsole:
         """
         m = _WIFI_RE.search(self.status(timeout))
         return None if m is None else m.group(1).lower() == "connected"
+
+    def sd_mounted(self, timeout: float = 10.0) -> bool | None:
+        """Whether the archive SD card is mounted, or None if it does not say.
+
+        Since the event store and main.lua live on internal flash, the card is
+        optional — this is for operator information, never a gate. None means
+        the firmware predates the status line.
+        """
+        m = _SD_RE.search(self.status(timeout))
+        return None if m is None else m.group(1).lower() == "mounted"
 
     def cfg_get(self, key: str, timeout: float = 5.0) -> str | None:
         """Raw NVS value, or None when unset/unreadable."""

@@ -198,6 +198,69 @@ def test_nvs_csv_rejects_long_timezone():
         build_nvs_csv(make_plan(timezone="A/" + "b" * 50))
 
 
+# ── Lua provenance in NVS + the littlefs main.lua image ─────────────────────
+LUA_SHA = "ab" * 32
+
+
+def test_nvs_csv_lua_provenance_absent_by_default():
+    csv = build_nvs_csv(make_plan(), flash_time=1786000000)
+    assert "script_upd" not in csv
+
+
+def test_nvs_csv_lua_provenance_rows():
+    csv = build_nvs_csv(make_plan(lua_sha256=LUA_SHA,
+                                  lua_script_version="1.2.0",
+                                  lua_built_against_fw="1.7.0",
+                                  lua_campaign_id="lua-v1.2.0"),
+                        flash_time=1786000000)
+    ns = [ln.split(",")[0] for ln in csv.splitlines() if ",namespace," in ln]
+    assert ns[-1] == "script_upd"
+    assert f'script_sha,data,string,"{LUA_SHA}"' in csv
+    assert 'applied_id,data,string,"lua-v1.2.0"' in csv
+    assert 'script_ver,data,string,"1.2.0"' in csv
+    assert 'built_fw,data,string,"1.7.0"' in csv
+    # install_fw is the firmware release being flashed
+    assert 'install_fw,data,string,"1.6.0"' in csv
+
+
+def test_nvs_csv_lua_provenance_all_or_none():
+    with pytest.raises(NvsBuildError):
+        build_nvs_csv(make_plan(lua_sha256=LUA_SHA))
+
+
+def test_nvs_csv_lua_provenance_bad_sha():
+    with pytest.raises(NvsBuildError):
+        build_nvs_csv(make_plan(lua_sha256="zz",
+                                lua_script_version="1.2.0",
+                                lua_built_against_fw="1.7.0",
+                                lua_campaign_id="lua-v1.2.0"))
+
+
+def test_littlefs_image_roundtrip(tmp_path):
+    from flash_gui.littlefs_image import build_main_lua_image
+    script = b'print("hello from main.lua")\n' * 40
+    out = build_main_lua_image(script, tmp_path / "littlefs.bin")
+    assert out.is_file()
+    assert out.stat().st_size == config.LITTLEFS_PARTITION_SIZE
+    # independent read-back via a fresh mount of the written bytes
+    from littlefs import LittleFS, UserContext
+    ctx = UserContext(buffer=bytearray(out.read_bytes()))
+    fs = LittleFS(context=ctx, mount=True, block_size=4096,
+                  block_count=config.LITTLEFS_PARTITION_SIZE // 4096,
+                  read_size=128, prog_size=128, cache_size=512,
+                  lookahead_size=128, block_cycles=512, name_max=64)
+    with fs.open("main.lua", "rb") as f:
+        assert f.read() == script
+    fs.unmount()
+
+
+def test_littlefs_image_rejects_empty(tmp_path):
+    from flash_gui.littlefs_image import (LittlefsImageError,
+                                          build_main_lua_image)
+    with pytest.raises(LittlefsImageError):
+        build_main_lua_image(b"", tmp_path / "littlefs.bin")
+
+
 def test_nvs_image_generation(tmp_path):
     out = build_nvs_image(make_plan(ca_cert_pem=AMAZON_ROOT_CA1),
                           tmp_path / "nvs.bin", flash_time=1786000000)

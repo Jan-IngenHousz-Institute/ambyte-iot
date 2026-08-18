@@ -91,6 +91,13 @@ class ProvisioningPlan:
     device_firmware: str
     firmware_version: str         # the release version being flashed
     ca_cert_pem: str = AMAZON_ROOT_CA1
+    # Lua release provenance (script_upd namespace): pre-seeds the identity the
+    # firmware would record after an on-device install, so a board flashed with
+    # the littlefs main.lua image verifies as already-installed. All-or-none.
+    lua_sha256: str | None = None
+    lua_script_version: str | None = None
+    lua_built_against_fw: str | None = None
+    lua_campaign_id: str | None = None
 
     def validate(self) -> None:
         required = {
@@ -107,6 +114,17 @@ class ProvisioningPlan:
         if missing:
             raise NvsBuildError("missing provisioning value(s): "
                                 + ", ".join(missing))
+        lua = (self.lua_sha256, self.lua_script_version,
+               self.lua_built_against_fw, self.lua_campaign_id)
+        if any(v is not None for v in lua) and not all(
+                (v or "").strip() for v in lua):
+            raise NvsBuildError("Lua provenance is all-or-none: sha256, "
+                                "script_version, built_against_fw, campaign_id")
+        if self.lua_sha256 is not None:
+            sha = self.lua_sha256.strip()
+            if len(sha) != 64 or any(c not in "0123456789abcdefABCDEF"
+                                     for c in sha):
+                raise NvsBuildError("lua_sha256 must be 64 hex digits")
         if len(self.timezone) > 47:
             raise NvsBuildError(f"timezone '{self.timezone}' exceeds the "
                                 "firmware's 47-char buffer")
@@ -178,6 +196,17 @@ def build_nvs_csv(plan: ProvisioningPlan, flash_time: int | None = None) -> str:
     # Only this flag makes the firmware treat the board as provisioned;
     # console wifi_join deliberately does not set it.
     u("provisioned", "u8", "1")
+
+    if plan.lua_sha256 is not None:
+        # Lua release provenance for the baked-in littlefs main.lua image
+        # (components/script_update NVS keys): `lua release` verifies the
+        # flashed script against these, so the onboarding Lua step is a no-op.
+        ns("script_upd")
+        s("applied_id", plan.lua_campaign_id)
+        s("script_sha", plan.lua_sha256.lower())
+        s("script_ver", plan.lua_script_version)
+        s("built_fw", plan.lua_built_against_fw)
+        s("install_fw", plan.firmware_version)
 
     return "\n".join(lines) + "\n"
 

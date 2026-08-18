@@ -12,9 +12,11 @@ clearly-reported state:
   2. credentials  openJII register + issue/rotate, BEFORE flashing, so an
                   API failure means nothing was written to the board at all
   3. nvs          bake the per-board NVS image (identity, certs, Wi-Fi,
-                  timezone, MQTT, flash_time)
-  4. flash        release images + nvs.bin in one esptool session; a mid-way
-                  failure leaves the chip in the ROM bootloader = re-flashable
+                  timezone, MQTT, flash_time, Lua release provenance) and the
+                  littlefs image carrying the selected main.lua
+  4. flash        release images + nvs.bin + littlefs.bin in one esptool
+                  session; a mid-way failure leaves the chip in the ROM
+                  bootloader = re-flashable
   5. rtc          wait for the freshly booted console, set the exact UTC epoch
   6. lua          push the selected latest-catalog release asset down this
                   console (no device network needed) and let the firmware verify
@@ -39,8 +41,9 @@ from . import ambyte_serial, esptool_ops
 from .ambyte_serial import (ConsoleError, UnsupportedConsoleCommand,
                             expand_mac_token)
 from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
-                     MAX_NAME_LEN, NVS_OFFSET, PROTOCOL_ID, Environment,
-                     default_command_topic, default_status_topic)
+                     LITTLEFS_OFFSET, MAX_NAME_LEN, NVS_OFFSET, PROTOCOL_ID,
+                     Environment, default_command_topic, default_status_topic)
+from .littlefs_image import build_main_lua_image
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient
 from . import release_fetch
@@ -150,6 +153,7 @@ class DeviceRun:
     identity: DeviceIdentity | None = None
     plan: ProvisioningPlan | None = None
     nvs_path: Path | None = None
+    lua_image_path: Path | None = None
     verify_results: list[VerifyItem] = field(default_factory=list)
 
 
@@ -230,6 +234,10 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
         device_version=DEVICE_VERSION,
         device_firmware=DEVICE_FIRMWARE,
         firmware_version=ctx.release.version,
+        lua_sha256=ctx.lua_script.sha256,
+        lua_script_version=ctx.lua_script.script_version,
+        lua_built_against_fw=ctx.lua_script.built_against_fw,
+        lua_campaign_id=ctx.lua_script.campaign_id,
     )
     run.plan = plan
 
@@ -241,11 +249,26 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
         raise ProcedureError("nvs", str(exc)) from exc
     log(f"NVS image ready: {out.name}")
 
+    # Bake main.lua into a littlefs image for the internal script partition:
+    # first boot then finds the selected release already installed (and the NVS
+    # provenance above makes `lua release` verify it), so the Lua step needs no
+    # SD card and no download. Older flashed firmware simply ignores both.
+    log(f"Baking {ctx.lua_script.asset_name} into the littlefs image...")
+    lua_out = CACHE_DIR / "littlefs" / f"littlefs-{run.preflight.mac.replace(':', '')}.bin"
+    try:
+        blob = release_fetch.script_bytes(ctx.lua_script, log=None)
+        run.lua_image_path = build_main_lua_image(blob, lua_out)
+    except Exception as exc:
+        raise ProcedureError("nvs", f"littlefs image: {exc}") from exc
+    log(f"littlefs image ready: {lua_out.name}")
+
 
 # ── step 4: flash ────────────────────────────────────────────────────────────
 def flash(ctx: SessionContext, run: DeviceRun, log=print) -> None:
     assert run.nvs_path, "prepare_provisioning must run first"
     images = list(ctx.release.flash_files) + [(NVS_OFFSET, run.nvs_path)]
+    if run.lua_image_path is not None:
+        images.append((LITTLEFS_OFFSET, run.lua_image_path))
     images.sort(key=lambda item: item[0])
     log(f"Flashing {ctx.release.tag} + provisioning "
         f"({len(images)} images) on {run.port}...")
@@ -299,6 +322,22 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
                 f"(tolerance ±{RTC_TOLERANCE_S}s)"))
         except ConsoleError as exc:
             results.append(VerifyItem("RTC (UTC)", False, str(exc)))
+
+        # Informational, never a failure: since the event store and main.lua
+        # live on internal flash, the SD card only serves archive/logs/AMBIT
+        # OTA. Operators used to read a missing card as an onboarding failure.
+        try:
+            sd = con.sd_mounted()
+        except ConsoleError:
+            sd = None
+        if sd is True:
+            log("SD card: mounted (archive/logs/AMBIT OTA roles only).")
+        elif sd is False:
+            log("SD card: absent — OK, Lua and the event store are internal. "
+                "Insert one only if this unit needs AMBIT OTA or log pulls.")
+        else:
+            log("SD card: not reported by this firmware (older than the "
+                "internal-store release); a push install still works.")
 
         run.verify_results = results
         for item in results:

@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Spawn the Lua runner task. Loads /sdcard/main.lua, runs it once. The task
+/* Spawn the Lua runner task. Loads /littlefs/main.lua, runs it once. The task
  * self-deletes when the script returns or is stopped. Returns
  * ESP_ERR_INVALID_STATE if a task is already running. */
 esp_err_t lua_runner_start(void);
@@ -15,6 +15,14 @@ esp_err_t lua_runner_start(void);
  * (e.g. a long UART read); the task will continue and exit on its own once
  * that call returns. Safe to call when no task is running (no-op). */
 esp_err_t lua_runner_stop(uint32_t wait_ms);
+
+/* Canonical script home is internal flash (/littlefs/main.lua — delivered by
+ * flashing or MQTT script_update). import_script copies an external file
+ * (normally /sdcard/main.lua: the manual offline-recovery drop) into that home
+ * with the staged-rename/.bak swap; script_present reports whether a runnable
+ * script exists internally. */
+esp_err_t lua_runner_import_script(const char *src_path);
+bool lua_runner_script_present(void);
 
 /* True while the script task exists (main.lua loaded and not yet finished/
  * stopped). Probe for the status-LED blinker's "measuring" state. */

@@ -1,7 +1,7 @@
 # CLAUDE.md — ambyte-iot firmware
 
 ESP32-S3 firmware for Ambyte field devices (plant-measurement loggers carrying up to 4 AMBIT
-sensor boards over UART). Data flows: `main.lua` schedule → SD event log (append-only FIFO) →
+sensor boards over UART). Data flows: `main.lua` schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = bulk archive only) →
 QoS1 MQTT → AWS IoT Core (dev: account 084375565727, eu-central-1) → Kinesis/S3 →
 Databricks `open_jii_dev.centrum.clean_data`.
 
@@ -33,12 +33,20 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **Cap chain (compile-verified)**: `AMBIT_RUN_PAYLOAD_CAP` (64,000) < `EVLOG_RECORD_CAP_NORMAL`
   (65,552) < `AMBYTE_PUBLISH_MAX_BYTES` (record+4 KiB). PSRAM-absent boots fall back to the
   12 KB record cap at runtime.
-- **SD is treated as corruption-prone**: FATFS has no journal, so FAT-metadata writes are
-  batched (event_log fsyncs every 8 records, not per record), the SDMMC bus runs at 20 MHz
-  (40 MHz was marginal on this wiring), and the low-battery power guard in app_main parks the
-  whole SD stack (Lua stop → flush/close → unmount) below 3300 mV on battery so a dying
-  battery can't brown out mid-FAT-write. New SD writers must use sdcard_io_begin/end AND
-  survive the park/unpark cycle (see sd_logger_pause for the pattern).
+- **Storage layout (since the internal-store PR)**: events live on INTERNAL littlefs
+  (`/evstore` = the 9.4 MiB `storage` partition — label is load-bearing, partition tables
+  can't be OTA'd); `main.lua` lives on `/littlefs` (delivered by flash/script_update OTA;
+  `/sdcard/main.lua` is only the offline-recovery import source). The SD card is archive +
+  sd_logger + AMBIT firmware only — measurement/publishing must NEVER depend on it.
+- **Retention/eviction invariant**: fully-synced rotated files are retained for the bulk SD
+  archive (one burst per 1000 stores, keeper task) and are the ONLY eviction pool when the
+  store runs low — unsynced records always outrank synced archive copies. Never evict or
+  archive the cursor file or anything at/after it.
+- **SD is treated as corruption-prone**: FATFS has no journal, so the SDMMC bus runs at
+  20 MHz (40 MHz was marginal on this wiring) and the low-battery power guard in app_main
+  parks the SD (sd_logger flush/close → unmount) below 3300 mV on battery. Lua and the event
+  store KEEP RUNNING through a park — internal littlefs is power-loss-safe. New SD writers
+  must use sdcard_io_begin/end AND survive the park/unpark cycle (see sd_logger_pause).
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

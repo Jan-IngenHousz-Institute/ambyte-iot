@@ -43,8 +43,8 @@
 /* `lua put` framing. max_cmdline_length is 512 (see cli_start), so one chunk
  * decodes to at most 384 bytes; the buffer is sized for the whole line. */
 #define LUA_PUT_CHUNK_MAX 512
-/* A runaway push must not fill the card. The largest released script today is
- * legacy_1Hz_spec.lua at ~15 KB. */
+/* A runaway push must not fill the internal partition. The largest released
+ * script today is legacy_1Hz_spec.lua at ~15 KB. */
 #define LUA_PUT_TOTAL_MAX (64U * 1024U)
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
@@ -147,6 +147,13 @@ static int cli_cmd_status(int argc, char **argv)
     } else {
         printf(" - DB: %s\r\n", dres.message);
     }
+
+    /* SD card: archive/log/recovery roles only since the event store and
+     * main.lua moved to internal flash — an absent card is informational,
+     * not a failure. */
+    printf(" - SD card: %s\r\n",
+           sdcard_is_mounted() ? "mounted (archive/logs/AMBIT OTA only)"
+                               : "absent (OK — Lua and the event store are internal)");
 
     /* Battery / input power (MP2731 charger). */
     power_reading_t pw;
@@ -1234,7 +1241,7 @@ static int cli_cmd_lua(int argc, char **argv)
         esp_err_t err = lua_runner_start();
         if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
         else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
-        else                              printf("started (loads /sdcard/main.lua)\r\n");
+        else                              printf("started (loads /littlefs/main.lua)\r\n");
         return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
@@ -1301,18 +1308,14 @@ static int cli_cmd_lua(int argc, char **argv)
      * Lets the operator's PC stream a script down this console instead of the
      * board fetching it over HTTPS, so onboarding needs no device network at all.
      * Deliberately stateless between commands: each `put` opens, appends, closes
-     * and re-stats, so an abandoned push leaks no handle and holds no SD ref, and
-     * the reported total is the file itself rather than a counter that could
-     * disagree with it. */
+     * and re-stats, so an abandoned push leaks no handle, and the reported total
+     * is the file itself rather than a counter that could disagree with it.
+     * Staging is on internal littlefs (SCRIPT_UPDATE_STAGING_PATH), so no SD
+     * gate: a missing archive card must not fail a serial push. */
     if (strcmp(argv[1], "begin") == 0) {
-        if (!sdcard_io_begin()) {
-            printf("lua begin: SD unavailable\r\n");
-            return 1;
-        }
         FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "wb");   /* truncates */
         bool ok = (f != NULL);
         if (ok) fclose(f);
-        sdcard_io_end();
         if (!ok) {
             printf("lua begin: cannot open %s\r\n", SCRIPT_UPDATE_STAGING_PATH);
             return 1;
@@ -1334,20 +1337,14 @@ static int cli_cmd_lua(int argc, char **argv)
             printf("lua put: invalid base64\r\n");
             return 1;
         }
-        if (!sdcard_io_begin()) {
-            printf("lua put: SD unavailable\r\n");
-            return 1;
-        }
         long before = 0;
         struct stat st;
         if (stat(SCRIPT_UPDATE_STAGING_PATH, &st) != 0) {
-            sdcard_io_end();
             printf("lua put: no staged file, run `lua begin` first\r\n");
             return 1;
         }
         before = (long)st.st_size;
         if ((size_t)before + olen > LUA_PUT_TOTAL_MAX) {
-            sdcard_io_end();
             printf("lua put: refusing to exceed %u bytes\r\n", (unsigned)LUA_PUT_TOTAL_MAX);
             return 1;
         }
@@ -1359,7 +1356,6 @@ static int cli_cmd_lua(int argc, char **argv)
         }
         long after = ok && stat(SCRIPT_UPDATE_STAGING_PATH, &st) == 0
                      ? (long)st.st_size : -1;
-        sdcard_io_end();
         if (!ok || after != before + (long)olen) {
             printf("lua put: write failed\r\n");
             return 1;
@@ -1396,12 +1392,7 @@ static int cli_cmd_lua(int argc, char **argv)
         return 0;
     }
     if (strcmp(argv[1], "abort") == 0) {
-        if (!sdcard_io_begin()) {
-            printf("lua abort: SD unavailable\r\n");
-            return 1;
-        }
         (void)remove(SCRIPT_UPDATE_STAGING_PATH);
-        sdcard_io_end();
         printf("lua abort: discarded\r\n");
         return 0;
     }

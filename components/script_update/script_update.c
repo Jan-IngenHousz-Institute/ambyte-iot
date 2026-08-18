@@ -21,7 +21,6 @@
 #include "lua_runner.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
-#include "sd_card.h"
 
 #define TAG "script_upd"
 
@@ -30,11 +29,15 @@
 #define SCRIPT_RESULT_MAX   192
 #define SCRIPT_REBOOT_DELAY_MS 500   /* let the 'applied' reply flush before esp_restart (matches ota_update) */
 
-#define LUA_PATH       "/sdcard/main.lua"
+/* Canonical script home moved to internal flash (littlefs) alongside the
+ * internal event store: script delivery is flashing/OTA, and internal littlefs
+ * survives SD death — a remote script push must never fail because the archive
+ * card is missing. Must match lua_runner's LUA_SCRIPT_PATH. */
+#define LUA_PATH       "/littlefs/main.lua"
 /* Public so the console's `lua put` can stage into the same file this installs
  * from; one definition, not two that can drift. */
 #define LUA_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH
-#define LUA_PATH_BAK   "/sdcard/main.lua.bak"
+#define LUA_PATH_BAK   "/littlefs/main.lua.bak"
 
 #define NVS_NS         "script_upd"
 #define KEY_APPLIED    "applied_id"
@@ -211,7 +214,7 @@ static void wait_for_fleet_slot(void)
     }
 }
 
-/* ── OP_UPDATE: replace /sdcard/main.lua ──────────────────────────────────── */
+/* ── OP_UPDATE: replace the internal main.lua ──────────────────────────────────── */
 
 /* SHA-256(text) == checksum (hex, case-insensitive)? */
 static bool sha256_text(const char *text, char hex[65])
@@ -275,9 +278,9 @@ esp_err_t script_update_get_identity(script_identity_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
-    if (!sdcard_io_begin()) return ESP_ERR_INVALID_STATE;
+    /* main.lua is on internal littlefs now — no unmount can free the volume
+     * mid-read, so the old SD RW-gate (audit R-6) is unnecessary here. */
     esp_err_t err = sha256_file(LUA_PATH, out->sha256);
-    sdcard_io_end();
     if (err != ESP_OK) return err;
 
     nvs_handle_t h;
@@ -314,9 +317,7 @@ static bool request_already_active(const script_req_t *r)
     if (r->checksum[0] == '\0') return true;
 
     char active_sha[65] = "";
-    if (!sdcard_io_begin()) return false;
     esp_err_t err = sha256_file(LUA_PATH, active_sha);
-    sdcard_io_end();
     if (err != ESP_OK) return false;
     return strncasecmp(active_sha, r->checksum, 64) == 0;
 }
@@ -338,8 +339,8 @@ static bool syntax_ok(const char *script, char *err, size_t err_cap)
     return ok;
 }
 
-/* Parse-only syntax check straight from a file (url variant — the script is on
- * the SD, not in RAM). luaL_loadfile compiles without executing. */
+/* Parse-only syntax check straight from a file (url variant — the script is
+ * staged on littlefs, not in RAM). luaL_loadfile compiles without executing. */
 static bool syntax_ok_file(const char *path, char *err, size_t err_cap)
 {
     lua_State *L = luaL_newstate();
@@ -482,13 +483,11 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
 
 static void do_update_impl(const script_req_t *r);
 
-/* SD RW-gate wrapper (audit R-6): the whole op writes main.lua.new + renames it on SD;
- * hold one ref so a monitor teardown can't free the volume mid-write/rename. */
+/* (The audit R-6 SD RW-gate wrapper is gone: the script now lives on internal
+ * littlefs, whose volume is never freed at runtime.) */
 static void do_update(const script_req_t *r)
 {
-    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
     do_update_impl(r);
-    sdcard_io_end();
 }
 
 static void do_update_impl(const script_req_t *r)
@@ -499,7 +498,7 @@ static void do_update_impl(const script_req_t *r)
     char got[65];
 
     /* On-receipt ack: tell the operator the command was received before doing any
-     * work (syntax check + SD write + Lua stop can take a few seconds, and the
+     * work (syntax check + staging write + Lua stop can take a few seconds, and the
      * fleet-OTA notebook waits for an initial reply). MQTT stays up on the inline
      * path, so this lands immediately. */
     report_script("accepted", r->id, NULL);
@@ -519,12 +518,6 @@ static void do_update_impl(const script_req_t *r)
         report_script("failed", r->id, detail);
         return;
     }
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
-        ESP_LOGE(TAG, "SD not available");
-        report_script("failed", r->id, "SD card not mounted");
-        return;
-    }
-
     /* Stage the new script next to the live one, fully flushed before any swap. */
     FILE *f = fopen(LUA_PATH_NEW, "wb");
     if (f == NULL) {
@@ -536,7 +529,7 @@ static void do_update_impl(const script_req_t *r)
     fclose(f);
     if (!wr_ok) {
         remove(LUA_PATH_NEW);
-        report_script("failed", r->id, "SD write failed");
+        report_script("failed", r->id, "staging write failed");
         return;
     }
 
@@ -549,7 +542,7 @@ static void do_update_impl(const script_req_t *r)
     }
 
     /* Swap: previous script survives as main.lua.bak (manual recovery path).
-     * rename() is atomic on FATFS; a missing old main.lua (first install) is fine. */
+     * rename() is atomic on littlefs (power-safe by design); a missing old main.lua (first install) is fine. */
     remove(LUA_PATH_BAK);
     (void)rename(LUA_PATH, LUA_PATH_BAK);
     if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
@@ -560,7 +553,7 @@ static void do_update_impl(const script_req_t *r)
         return;
     }
 
-    /* Reboot path (default): the new main.lua is on the SD and the runner is
+    /* Reboot path (default): the new main.lua is in place and the runner is
      * already stopped — a full restart runs it from a fresh boot (clean heap,
      * ordered startup). Latch FIRST so a retained trigger dedupes on reconnect
      * and can't loop the reboot (same guard as ota_update). */
@@ -590,7 +583,7 @@ static void do_update_impl(const script_req_t *r)
     report_script("applied", r->id, detail);
 }
 
-/* ── OP_UPDATE_URL: download /sdcard/main.lua from a URL ───────────────────────
+/* ── OP_UPDATE_URL: download the internal main.lua from a URL ───────────────────────
  * The command message is tiny (just the URL), so it's received even on a
  * fragmented heap; the heavy transfer is a chunked HTTPS download AFTER Lua is
  * stopped (heap defragmented). This is the reliable path for large scripts —
@@ -598,15 +591,13 @@ static void do_update_impl(const script_req_t *r)
  * heap can't provide. `r->text` holds the URL. */
 static void do_update_url_impl(const script_req_t *r);
 
-/* SD RW-gate wrapper (audit R-6): guards the download-to-SD + syntax read + rename. */
+/* (SD RW-gate wrapper removed — see do_update above.) */
 static void do_update_url(const script_req_t *r)
 {
-    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
     do_update_url_impl(r);
-    sdcard_io_end();
 }
 
-/* Everything after the bytes are on the card at LUA_PATH_NEW: verify the digest,
+/* Everything after the bytes are staged at LUA_PATH_NEW: verify the digest,
  * syntax-check, rotate .bak, swap atomically, record provenance. Shared by the
  * URL worker and the serial-push worker so the ONLY difference between them is
  * how main.lua.new got written; the dangerous half has exactly one
@@ -675,16 +666,13 @@ static void do_update_url_impl(const script_req_t *r)
     size_t n = 0;
     char got[65] = "";
 
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
-        ESP_LOGE(TAG, "SD not available");
-        snprintf(detail, sizeof detail, "SD card not mounted");
-    } else {
+    {
         esp_err_t err = download_to_file_sha256(r->text, LUA_PATH_NEW, got, &n);
         if (err != ESP_OK) {
             snprintf(detail, sizeof detail, "download failed (%s)", esp_err_to_name(err));
             ESP_LOGE(TAG, "%s", detail);
         } else {
-            /* Lua already stopped; swap is atomic on FATFS. */
+            /* Lua already stopped; rename() is atomic on littlefs. */
             applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
         }
     }
@@ -726,13 +714,11 @@ static void do_update_url_impl(const script_req_t *r)
 
 static void do_update_local_impl(const script_req_t *r);
 
-/* SD RW-gate wrapper: same reasoning as do_update/do_update_url, the swap writes
- * and renames on SD so a monitor teardown must not free the volume mid-op. */
+/* (SD RW-gate wrapper removed — see do_update above: staging is on internal
+ * littlefs now, so a missing archive card cannot fail a serial push.) */
 static void do_update_local(const script_req_t *r)
 {
-    if (!sdcard_io_begin()) { report_script("failed", r->id, "SD unavailable"); return; }
     do_update_local_impl(r);
-    sdcard_io_end();
 }
 
 static void do_update_local_impl(const script_req_t *r)
@@ -756,21 +742,16 @@ static void do_update_local_impl(const script_req_t *r)
     size_t n = 0;
     char   got[65] = "";
 
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
-        ESP_LOGE(TAG, "SD not available");
-        snprintf(detail, sizeof detail, "SD card not mounted");
+    long staged = file_size(LUA_PATH_NEW);
+    if (staged <= 0) {
+        snprintf(detail, sizeof detail, "no staged script (lua begin/put first)");
+        ESP_LOGE(TAG, "%s", detail);
+    } else if (sha256_file(LUA_PATH_NEW, got) != ESP_OK) {
+        snprintf(detail, sizeof detail, "cannot hash staged script");
+        ESP_LOGE(TAG, "%s", detail);
     } else {
-        long staged = file_size(LUA_PATH_NEW);
-        if (staged <= 0) {
-            snprintf(detail, sizeof detail, "no staged script (lua begin/put first)");
-            ESP_LOGE(TAG, "%s", detail);
-        } else if (sha256_file(LUA_PATH_NEW, got) != ESP_OK) {
-            snprintf(detail, sizeof detail, "cannot hash staged script");
-            ESP_LOGE(TAG, "%s", detail);
-        } else {
-            n = (size_t)staged;
-            applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
-        }
+        n = (size_t)staged;
+        applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
     }
 
     if (!applied) {
@@ -959,8 +940,8 @@ esp_err_t script_update_local_request(const char *checksum, const char *id,
 {
     if (reboot_needs_id(id, reboot, "script_update(local)")) return ESP_ERR_INVALID_ARG;
     /* request_common rejects an empty text, and this op carries no URL or script
-     * body: the bytes are already on the card. Pass the staging path so the
-     * request is self-describing in logs. */
+     * body: the bytes are already staged on littlefs. Pass the staging path so
+     * the request is self-describing in logs. */
     return request_common(OP_UPDATE_LOCAL, SCRIPT_UPDATE_STAGING_PATH, checksum, id,
                           reboot, false, script_version, built_against_fw);
 }

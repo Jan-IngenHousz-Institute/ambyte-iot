@@ -1,10 +1,20 @@
 #ifndef AMBYTE_EVENT_LOG_H
 #define AMBYTE_EVENT_LOG_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
 #include "persistence_port.h"
+
+/* Internal event store volume: littlefs on the (previously unused) 9.4 MiB
+ * "storage" partition. app_main mounts it at EVSTORE_MOUNT before
+ * event_log_init; the partition label predates this use and MUST NOT change —
+ * partition tables cannot be OTA'd, and esp_littlefs finds it by label with
+ * SUBTYPE_ANY, so the legacy `fat` subtype byte is harmless. */
+#define EVSTORE_MOUNT     "/evstore"
+#define EVSTORE_PARTITION "storage"
 
 /* Compile-time storage limits shared with the AMBIT producer and MQTT publisher.
  * event_log_init selects NORMAL when PSRAM enumerates and FALLBACK otherwise;
@@ -22,28 +32,27 @@ extern "C" {
 #endif
 
 /*
- * Append-only event log — drop-in replacement for the SQLite persistence layer
- * behind the same `persistence_port.h` interface.
+ * Append-only event log behind the `persistence_port.h` interface.
  *
- * Why: SQLite's in-place page + header rewrites on every commit corrupt FATFS/SD
- * under load. The workload is a store-and-forward FIFO, not a relational query,
- * so an append-only log is both the right tool and the proven-robust one (the
- * prior firmware logged to a TXT file on the same card for months without
- * corruption; the Step-0 spike reproduced that result — see
- * docs/append-log-persistence-plan.md).
+ * Why append-only: the workload is a store-and-forward FIFO, not a relational
+ * query — and in-place page rewrites (the SQLite bench experiment; never shipped)
+ * are hostile to flash storage. Why INTERNAL littlefs instead of the SD card
+ * (since the store moved off /sdcard/events): littlefs is copy-on-write and
+ * power-loss-safe, so a brownout can never tear record framing or the filesystem
+ * itself — the FAT-metadata corruption class PR #27 documented is structurally
+ * gone from the measurement path, and the device keeps measuring, storing, and
+ * publishing with no SD card at all.
  *
- * Storage model: /sdcard/events/ holds rotating files ev-000001.log, … (monotonic
- * seq). One newline-terminated, tab-delimited record per event (format v2,
- * 9 fields; v1 7-field records are skipped as malformed — planned wipe/drain
- * at the v2 deploy, see docs/payload-v2-plan.md):
+ * Storage model: EVSTORE_MOUNT/events holds rotating files ev-000001.log, …
+ * (monotonic seq). One newline-terminated, tab-delimited record per event
+ * (format v2, 9 fields):
  *   <measure_id>\t<channel>\t<device>\t<tag>\t<cmd_raw>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
- * The tail file is appended to (store) with PERIODIC flush; a fresh read handle
- * after fsync serves claims (the read+append handshake the per-file-cache FATFS
- * build needs). The read cursor and a next_id high-water mark live in NVS
- * (internal flash), keeping the SD to appends only. mark_synced advances the
- * cursor; a fully-drained rotated file is deleted to reclaim space. The reader
- * skips any record it can't parse, so a power-loss-torn final record needs no
- * boot-time repair.
+ * The read cursor and a next_id high-water mark live in NVS. mark_synced
+ * advances the cursor. RETENTION: a fully-drained (100% synced) rotated file is
+ * kept for the bulk SD archive rather than deleted; when free space runs low the
+ * oldest synced files are EVICTED first — unsynced records always outrank synced
+ * archive copies (a dead SD + slow uplink must never make the store refuse new
+ * measurements while old synced data holds the space).
  */
 esp_err_t event_log_init(void);
 
@@ -52,9 +61,19 @@ esp_err_t event_log_init(void);
  * NULL clears it. The callback runs after event_log releases its mutex. */
 void event_log_set_reset_notifier(void (*fn)(void));
 
-/* Called by the SD hot-plug monitor when the card is pulled/reinserted. */
-esp_err_t event_log_on_sd_lost(void);
-esp_err_t event_log_on_sd_restored(void);
+/* ── SD interchange (keeper-task driven; the store itself never needs the SD) ──
+ * archive_pending: true once EVLOG_ARCHIVE_EVERY_N stores accumulated and the SD
+ * is mounted. archive_to_sd: copy every fully-synced retained file to
+ * /sdcard/archive/arc-<first_measure_id>.log in one burst, then free the internal
+ * copies. import_sd_backlog: one-shot fleet migration — re-append records from
+ * the legacy /sdcard/events backlog (oldest-first, verbatim, measure_ids kept so
+ * duplicates dedup downstream), deleting each SD file only after its records are
+ * fsync'd internally; imports at most max_files per call, returns files done.
+ * free_bytes: free space on the internal store partition (STATUS telemetry). */
+bool      event_log_archive_pending(void);
+esp_err_t event_log_archive_to_sd(size_t *out_archived);
+size_t    event_log_import_sd_backlog(size_t max_files);
+esp_err_t event_log_free_bytes(uint64_t *out_free);
 
 /* Pre-reboot power-safety drain (register once via esp_register_shutdown_handler).
  * Flushes + fsyncs the periodically-buffered tail, persists the read cursor, and
@@ -70,14 +89,15 @@ esp_err_t event_log_mark_event_synced(int64_t measure_id);
 esp_err_t event_log_mark_event_pending(int64_t measure_id);
 
 /* Poison-event escape (measurement_quarantine_fn): append the record at the
- * read cursor — which must carry `measure_id` — to /sdcard/events/quarantine.log,
- * then advance the cursor past it. Skips only after a successful archive write,
- * so quarantined data is preserved on the card (re-ingest manually if wanted). */
+ * read cursor — which must carry `measure_id` — to EVSTORE_MOUNT/events/
+ * quarantine.log, then advance the cursor past it. Skips only after a successful
+ * archive write, so quarantined data is preserved (re-ingest manually if wanted). */
 esp_err_t event_log_quarantine_event(int64_t measure_id);
 
-/* Read-only stats (see measurement_db_stats_fn). *total == *pending: every
- * record physically present in the log is not-yet-synced (synced records are
- * dropped as the cursor advances and drained files are deleted). */
+/* Read-only stats (see measurement_db_stats_fn). *total mirrors *pending — the
+ * publishable backlog. (Synced records are also physically retained until
+ * archived/evicted, but they are dead weight for the publisher and are not
+ * counted here.) */
 esp_err_t event_log_db_stats(bool *available, int64_t *total,
                              int64_t *pending, int64_t *next_id);
 

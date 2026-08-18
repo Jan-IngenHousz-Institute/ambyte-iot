@@ -38,6 +38,12 @@ FIRMWARE_REPO = os.environ.get("AMBYTE_FIRMWARE_REPO",
 NVS_OFFSET = 0x9000
 NVS_PARTITION_SIZE = 0x6000
 
+# littlefs @ 0x620000 size 0x80000 (partitions.csv): the firmware's internal
+# script home. Provisioning bakes main.lua into an image flashed here so a
+# fresh board runs the selected release without an SD seed step.
+LITTLEFS_OFFSET = 0x620000
+LITTLEFS_PARTITION_SIZE = 0x80000
+
 # Espressif USB-Serial-JTAG (the native USB-C console/flash port).
 USB_JTAG_VID = 0x303A
 USB_JTAG_PID = 0x1001
