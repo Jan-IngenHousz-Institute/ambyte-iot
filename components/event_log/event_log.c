@@ -473,6 +473,31 @@ static bool evlog_evict_synced_locked(void)
     return evicted;
 }
 
+/* Full-store recovery, shared by EVERY ENOSPC-class failure path (short write,
+ * flush/fsync failure, rotate-open failure, tail-reopen failure): evict the
+ * oldest fully-synced retained files before anything is dropped or reported as
+ * a media fault. Returns true when the store has headroom again (or never lost
+ * it). On false, s_write_full is latched so later stores fail fast at the
+ * admission check instead of paying a full littlefs free-block scan per attempt.
+ * Caller holds s_mtx. */
+static bool evlog_full_recovery_locked(void)
+{
+    uint64_t freeb = 0;
+    if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+        (void)evlog_evict_synced_locked();
+    }
+    if (evstore_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
+        return true;
+    }
+    if (!s_write_full) {
+        ESP_LOGW(TAG, "store full (%llu B free, nothing synced left to evict) — "
+                      "writes paused until the drain frees space",
+                 (unsigned long long)freeb);
+    }
+    s_write_full = true;
+    return false;
+}
+
 /* Advance only the contiguous ACKed prefix.  Out-of-order ACKs merely flip a
  * slot flag; neither the RAM cursor nor NVS can cross the first unacked slot.
  * The batched persistence rule is unchanged: an unpersisted RAM advance can
@@ -859,11 +884,23 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     }
     /* Self-heal: a prior rotate/open failure may have closed the tail without
      * latching the log offline (see rotate path). Reopen it here rather than
-     * staying dark for the rest of the session (audit D1). */
-    if (s_wf == NULL && evlog_reopen_tail_locked() != ESP_OK) {
-        evstore_report_io_error();
-        xSemaphoreGive(s_mtx);
-        return ESP_ERR_NOT_SUPPORTED;
+     * staying dark for the rest of the session (audit D1). On a FULL partition
+     * the reopen itself ENOSPCs (the file handle needs a metadata block), so
+     * evict synced files and retry once before declaring the store unwritable. */
+    if (s_wf == NULL) {
+        esp_err_t ro = evlog_reopen_tail_locked();
+        if (ro != ESP_OK && evlog_full_recovery_locked()) {
+            ro = evlog_reopen_tail_locked();
+        }
+        if (ro != ESP_OK) {
+            xSemaphoreGive(s_mtx);
+            if (s_write_full) {
+                s_dropped++;
+                return ESP_ERR_NO_MEM;   /* full is not a media fault */
+            }
+            evstore_report_io_error();
+            return ESP_ERR_NOT_SUPPORTED;
+        }
     }
     /* Storage-full admission control: a full card is healthy, so refuse cleanly
      * (no I/O-error report → no unmount/Lua-restart thrash) and let the drain free
@@ -943,19 +980,34 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         char path[64];
         evlog_file_path(path, sizeof path, s_tail_seq);
         s_wf = fopen(path, "a");
-        if (s_wf == NULL) {
-            /* Do NOT latch the log offline: a transient open failure (heap/DMA OOM)
-             * must not disable persistence for the rest of the session. Drop this one
-             * record; the next store's self-heal reopens the (now-incremented) tail
-             * (audit D1). */
-            ESP_LOGE(TAG, "rotate: open %s failed — retrying next store", path);
-            s_dropped++;
-            free(cmd);
-            xSemaphoreGive(s_mtx);
-            evstore_report_io_error();
-            return ESP_FAIL;
+        if (s_wf == NULL && evlog_full_recovery_locked()) {
+            s_wf = fopen(path, "a");   /* eviction freed space — retry once */
         }
-        s_tail_size = 0;
+        if (s_wf == NULL) {
+            /* Still no room (nothing synced left to evict). Roll the sequence
+             * back and keep appending to the previous tail: writer and reader
+             * must never point at a file that does not exist (a phantom tail
+             * reads as "queue drained" to the claim path and deadlocks the
+             * publisher until reboot). The old tail grows past the rotate
+             * threshold until the drain frees space — harmless. */
+            s_tail_seq--;
+            evlog_file_path(path, sizeof path, s_tail_seq);
+            s_wf = fopen(path, "a");
+            if (s_wf == NULL) {
+                /* Do NOT latch the log offline: a transient open failure
+                 * (heap/DMA OOM) must not disable persistence for the rest of
+                 * the session (audit D1). */
+                ESP_LOGE(TAG, "rotate: reopen of previous tail %s failed — dropping record", path);
+                s_dropped++;
+                free(cmd);
+                xSemaphoreGive(s_mtx);
+                evstore_report_io_error();
+                return ESP_FAIL;
+            }
+            ESP_LOGW(TAG, "rotate deferred (store full) — still appending to %s", path);
+        } else {
+            s_tail_size = 0;
+        }
     }
 
     size_t w = 0;
@@ -981,28 +1033,18 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
             ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
         }
         s_dropped++;
-        /* Distinguish a FULL card (healthy — pause writes, keep draining) from a
-         * pulled/dead one (report I/O error → latch → unmount). A false unmount of a
-         * full-but-healthy card causes the remount/Lua-restart thrash (audit C1). */
+        /* Distinguish a FULL store (healthy — pause writes, keep draining) from a
+         * media fault (report I/O error → latch). A false fault report on a
+         * full-but-healthy store causes the remount/Lua-restart thrash (audit C1).
+         * Recovery (evict synced files first) is shared with every other
+         * ENOSPC-class path via evlog_full_recovery_locked(). */
         uint64_t freeb = 0;
         bool full = (errno == ENOSPC) ||
                     (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
         if (full) {
-            /* Evict synced files first — the store must not go read-only while
-             * archive-only data is holding the space unsynced records need. If
-             * eviction freed enough, the NEXT store proceeds normally; this one
-             * was already rolled back and stays dropped. */
-            (void)evlog_evict_synced_locked();
-            if (evstore_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
-                xSemaphoreGive(s_mtx);
-                return ESP_ERR_NO_MEM;   /* space recovered; do not latch write_full */
-            }
-            if (!s_write_full) {
-                ESP_LOGW(TAG, "store full (%llu B free, nothing synced left to evict) — "
-                              "writes paused until the drain frees space",
-                         (unsigned long long)freeb);
-            }
-            s_write_full = true;
+            /* This record was already rolled back and stays dropped; the next
+             * store proceeds when eviction restored headroom. */
+            (void)evlog_full_recovery_locked();
             xSemaphoreGive(s_mtx);
             return ESP_ERR_NO_MEM;      /* full is not a media fault: no report_io_error */
         }
@@ -1020,8 +1062,20 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     if (s_writes_since_flush >= EVLOG_FLUSH_EVERY_N ||
         (now - s_last_flush_tick) >= pdMS_TO_TICKS(EVLOG_FLUSH_PERIOD_MS)) {
         if (evlog_flush_writer_locked() != ESP_OK) {
-            /* The record's bytes reached stdio but fsync failed — treat as an I/O
-             * error so a dying card is caught rather than counting torn data durable. */
+            /* The record's bytes reached stdio but the flush failed. On a FULL
+             * littlefs this is backpressure (the COW commit has no free block
+             * pair), not a dying medium — and this is the path a full store
+             * actually takes, since stdio absorbs the fwrites and the failure
+             * only surfaces here. Evict synced files first; only with space
+             * available is a flush failure a real I/O fault. The record stays
+             * dropped/not-durable either way. */
+            uint64_t freeb = 0;
+            if (evstore_free_bytes(&freeb) == ESP_OK &&
+                freeb < EVLOG_MIN_FREE_BYTES) {
+                (void)evlog_full_recovery_locked();
+                xSemaphoreGive(s_mtx);
+                return ESP_ERR_NO_MEM;
+            }
             xSemaphoreGive(s_mtx);
             evstore_report_io_error();
             return ESP_FAIL;
@@ -1127,6 +1181,28 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         errno = 0;
         FILE *rf = fopen(path, "rb");
         if (rf == NULL) {
+            if (is_tail && errno == ENOENT && s_wf == NULL) {
+                /* Writer-down state: a rotate onto a full store advanced
+                 * s_tail_seq past a file that was never created, and the
+                 * store-side reopen keeps failing. A phantom tail must not read
+                 * as "queue drained" (that idles the publisher until reboot):
+                 * evict to make room, roll the tail back to the newest real
+                 * file, reopen it, and retry the claim once. */
+                (void)evlog_full_recovery_locked();
+                uint32_t min_seq = 0, max_seq = 0;
+                if (evlog_scan_range_locked(&min_seq, &max_seq) &&
+                    max_seq < s_tail_seq) {
+                    ESP_LOGW(TAG, "tail ev-%06u.log missing with writer down — "
+                                  "rolling back to ev-%06u.log",
+                             (unsigned)s_tail_seq, (unsigned)max_seq);
+                    s_tail_seq = max_seq;
+                }
+                if (evlog_reopen_tail_locked() == ESP_OK) {
+                    continue;            /* tail healed — retry the read */
+                }
+                result = ESP_ERR_NOT_FOUND;
+                break;
+            }
             if (!is_tail && errno == ENOENT) {
                 if (at_cursor) {
                     ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)scan_seq);
