@@ -13,6 +13,9 @@ Databricks `open_jii_dev.centrum.clean_data`.
   `bench-pm-none` single-toggle bisect envs) — see `docs/bench/RUNBOOK.md`
 - If littlefs is missing at CMake: `git submodule update --init --recursive components/littlefs`
 - Builds regenerate `sched_lua_embed.h`; keep it out of unrelated diffs
+- Timezone table: `python tools/gen_tz_table.py` regenerates the checked-in
+  `components/timezone/tz_zone_table.inc` + `flash_gui/tz_zone_table.py` from IANA
+  tzdata (never hand-edit them; `tests/test_timezone_config.py` asserts freshness)
 - Serial console: 115200 on `/dev/ttyACM0` (USB-JTAG; opening the port can reset the device).
   Useful CLI: `status`, `netwd [test]`, `inflight`, `evlog`, `cfg`, `wifi_join <ssid> <pass>`,
   `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`

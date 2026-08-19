@@ -145,8 +145,8 @@ class App(ttk.Frame):
         ttk.Label(frame, textvariable=self.clock_var).pack(anchor="w")
         tz_ok = timezones.firmware_supports(self.local_tz)
         tz_note = "" if tz_ok else ("  ⚠ not in the firmware's zone table — "
-                                    "the device will fall back to a fixed "
-                                    "UTC offset for scheduling")
+                                    "the device would reject it, so on-boarding "
+                                    "is blocked (see the log)")
         self.tz_label = ttk.Label(
             frame, text=f"Timezone: {self.local_tz} "
                         f"({timezones.utc_offset_label()}){tz_note}",
@@ -465,6 +465,14 @@ class App(ttk.Frame):
                     "configured (TODO in flash_gui/config.py).")
         if not self._selected_port():
             return "select a serial port."
+        if not timezones.firmware_supports(self.local_tz):
+            # `cfg set timezone` fails closed on an unknown zone, so this would
+            # otherwise be flashed and then fail verification unrepairably.
+            return (f"this PC's timezone '{self.local_tz}' is not in the "
+                    f"firmware's zone table (IANA tzdata "
+                    f"{timezones.FIRMWARE_TZDATA_VERSION}). Set the PC to a "
+                    "standard IANA zone, or regenerate the table with "
+                    "tools/gen_tz_table.py and release firmware built from it.")
         return None
 
     def _make_context(self) -> SessionContext:
