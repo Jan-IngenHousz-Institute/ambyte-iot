@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ambyte_serial, esptool_ops
+from . import ambyte_serial, esptool_ops, timezones
 from .ambyte_serial import (ConsoleError, UnsupportedConsoleCommand,
                             expand_mac_token)
 from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
@@ -199,6 +199,20 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
             f"invalid device name '{run.name}' (max {MAX_NAME_LEN} chars, "
             "printable ASCII, no quotes or backslashes).")
     run.name = name
+
+    # Fail before any openJII registration or flash: the firmware's `cfg set
+    # timezone` validates against its compiled zone table and returns
+    # ESP_ERR_INVALID_ARG for an unknown name, so an unsupported zone can only
+    # end as a "Timezone: FAIL" no retry path can repair (America/La_Paz on the
+    # Europe-only table, 2026-08).
+    if not timezones.firmware_supports(ctx.timezone):
+        raise ProcedureError(
+            "credentials",
+            f"timezone '{ctx.timezone}' is not in the firmware's zone table "
+            f"(IANA tzdata {timezones.FIRMWARE_TZDATA_VERSION}) — the device "
+            "would reject it and fail verification. Set this PC to a standard "
+            "IANA zone, or regenerate the table with tools/gen_tz_table.py and "
+            "release firmware built from it.")
 
     if ctx.env.mqtt_uri is None:
         raise ProcedureError(

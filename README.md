@@ -184,10 +184,30 @@ Missing required fields cause a loud non-zero exit listing them — never a sile
 
 ### Timezone contract and legacy migration
 
-`AMBYTE_TIMEZONE` must be one of the IANA zones supported by
-[`components/timezone/timezone.c`](components/timezone/timezone.c); the default
-is `Europe/Amsterdam`. Provisioning fails closed on an unsupported value. The
-runtime `cfg set timezone <value>` command applies the same validation.
+`AMBYTE_TIMEZONE` must be an IANA zone name present in the firmware's compiled
+zone table, [`components/timezone/tz_zone_table.inc`](components/timezone/tz_zone_table.inc);
+the default is `Europe/Amsterdam`. Provisioning fails closed on an unsupported
+value, and the runtime `cfg set timezone <value>` command applies the same
+validation (`ESP_ERR_INVALID_ARG` on an unknown name).
+
+Since firmware 1.10.1 that table holds the **entire IANA database** — every
+canonical name plus its historical aliases (`Asia/Calcutta`, `US/Pacific`) —
+generated from tzdata by [`tools/gen_tz_table.py`](tools/gen_tz_table.py) and
+checked in (~17 KB of rodata). Before that it was a hand-written Europe-only
+list, so on-boarding a board from a PC set to, say, `America/La_Paz` failed
+verification with no repair path. Regenerate after a tzdata release that changes
+a deployment's rules:
+
+```bash
+python tools/gen_tz_table.py     # rewrites the .inc + flash_gui/tz_zone_table.py
+python -m pytest tests/test_timezone_config.py -q
+```
+
+Names are stored exactly as given: deprecated aliases are accepted but never
+rewritten to their canonical target, so provisioning read-back comparisons hold.
+A zone whose POSIX rule libc refuses is detected at apply time and scheduled on
+the zone's prevailing fixed offset instead (logged as an error), rather than
+silently reverting to the CEST default.
 
 Firmware v1.6.1 and later migrates the historical JII shorthand `AMT` to
 `Europe/Amsterdam` in NVS at boot. It also maps `Z` to `UTC` and trims surrounding

@@ -548,7 +548,14 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
 
 # ── timezone helpers ─────────────────────────────────────────────────────────
 def test_firmware_zone_table():
-    from flash_gui.timezones import firmware_supports
+    from flash_gui.timezones import FIRMWARE_SUPPORTED_ZONES, firmware_supports
     assert firmware_supports("Europe/Amsterdam")
     assert firmware_supports("UTC")
-    assert not firmware_supports("America/Manaus")   # only on the tz-brazil branch
+    # The whole IANA database is compiled into the firmware since 1.10.1 — these
+    # are the on-boardings that used to fail verification unrepairably.
+    assert firmware_supports("America/La_Paz")
+    assert firmware_supports("America/Manaus")
+    assert firmware_supports("Asia/Calcutta")        # deprecated aliases too
+    assert not firmware_supports("Mars/Olympus")
+    assert not firmware_supports("")
+    assert len(FIRMWARE_SUPPORTED_ZONES) > 400
