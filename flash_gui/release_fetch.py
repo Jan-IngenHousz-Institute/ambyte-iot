@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .app_update import InstalledGuiRelease, GuiUpdateStatus, evaluate_update
 from .config import CACHE_DIR, FIRMWARE_REPO
 from .tls import ssl_context
 
@@ -45,9 +47,10 @@ MANIFEST = "flasher_args.json"
 # mistaken for a good cache entry.
 STAMP = ".complete.json"
 USER_AGENT = "ambyte-flash-gui"
-# The firmware and Lua fetchers both want this exact listing, so it is fetched
-# once and shared: unauthenticated GitHub allows 60 requests/hour per IP, and a
-# NATed office shares one budget across every operator.
+# The firmware, Lua and application-update fetchers all want this exact
+# listing, so it is fetched once and shared: unauthenticated GitHub allows 60
+# requests/hour per IP, and a NATed office shares one budget across every
+# operator.
 RELEASES_URL = f"{API_ROOT}/repos/{FIRMWARE_REPO}/releases?per_page=100"
 RELEASES_CACHE = CACHE_DIR / "releases.json"
 # Release assets are immutable (the repo publishes immutable releases), so a
@@ -59,6 +62,12 @@ SCRIPTS_CACHE_DIR = CACHE_DIR / "lua_scripts"
 # Short enough that a release published mid-session is picked up, long enough
 # to collapse the two startup fetches into one request.
 RELEASES_TTL_SECONDS = 300
+# Startup launches the three release consumers on separate threads. Without a
+# lock, all three can miss the empty cache together and each spend one GitHub
+# request before any has written it. Hold the lock across the request so a cold
+# start is still exactly one request; subsequent callers immediately use the
+# freshly written cache.
+_RELEASES_LOCK = threading.Lock()
 
 
 class ReleaseError(RuntimeError):
@@ -264,7 +273,14 @@ def _store_releases_cache(releases: list, etag: str | None) -> None:
 
 
 def _release_list(log=print) -> list:
-    """The repo's newest 100 releases, shared by both fetchers.
+    """The repo's newest 100 releases, shared by every release consumer."""
+
+    with _RELEASES_LOCK:
+        return _release_list_locked(log=log)
+
+
+def _release_list_locked(log=print) -> list:
+    """Fetch/cache implementation; caller must hold ``_RELEASES_LOCK``.
 
     Costs at most one API request per RELEASES_TTL_SECONDS, and usually zero:
     past the TTL the listing is revalidated with If-None-Match, and GitHub does
@@ -328,6 +344,35 @@ def _release_list(log=print) -> list:
         return fall_back(limited or f"GitHub API {exc.code}: {detail}")
     except urllib.error.URLError as exc:
         return fall_back(f"Cannot reach GitHub ({exc.reason}).")
+
+
+def fetch_gui_update(
+    installed: InstalledGuiRelease | None, log=print
+) -> GuiUpdateStatus:
+    """Compare this GUI bundle with the newest complete downloadable one."""
+
+    fallback_messages: list[str] = []
+
+    def capture(message: str) -> None:
+        # Firmware and Lua may safely operate from the last immutable catalog,
+        # but an update banner must not claim "UP TO DATE" when GitHub could
+        # not be checked. _release_list logs only when it falls back to stale
+        # data, so preserve that warning and turn it into an unknown state.
+        fallback_messages.append(message)
+        log(message)
+
+    releases = _release_list(log=capture)
+    if fallback_messages:
+        raise ReleaseError(fallback_messages[-1])
+    try:
+        return evaluate_update(
+            installed, releases if isinstance(releases, list) else []
+        )
+    except ValueError as exc:
+        raise ReleaseError(
+            f"no complete flash-gui-vX.Y.Z release with all platform assets "
+            f"found among the newest 100 releases of {FIRMWARE_REPO}."
+        ) from exc
 
 
 def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRelease:

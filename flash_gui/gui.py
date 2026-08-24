@@ -13,13 +13,14 @@ Queue that the main-thread dialog fills.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter as tk
 import webbrowser
 from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-from . import esptool_ops, procedure, release_fetch, timezones
+from . import app_update, esptool_ops, procedure, release_fetch, timezones
 from .config import ENVIRONMENTS, Settings, default_topic_root
 from .config import TOPIC_IDENTITY_TOKEN
 from .openjii_client import OpenJIIClient, OpenJIIError
@@ -41,8 +42,15 @@ STEP_ICONS = {"pending": "·", "running": "▶", "ok": "✓", "fail": "✗"}
 class App(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=10)
-        master.title("ambyte on-boarding")
-        master.minsize(760, 640)
+        self.installed_gui = app_update.load_installed_release()
+        self.is_packaged = bool(getattr(sys, "frozen", False))
+        title_version = (
+            f"v{self.installed_gui.version}"
+            if self.installed_gui is not None
+            else ("version unknown" if self.is_packaged else "development")
+        )
+        master.title(f"ambyte on-boarding — GUI {title_version}")
+        master.minsize(760, 700)
         self.pack(fill="both", expand=True)
 
         self.settings = Settings.load()
@@ -54,13 +62,16 @@ class App(ttk.Frame):
         self.current_run: DeviceRun | None = None
         self.busy = False
         self.local_tz = timezones.local_iana_zone()
+        self.gui_release_url = app_update.RELEASES_PAGE
 
+        self._build_application_frame()
         self._build_session_frame()
         self._build_info_frame()
         self._build_device_frame()
         self._tick_clock()
 
         self._refresh_ports()
+        self._fetch_gui_update_async()
         self._fetch_release_async()
         self._fetch_lua_catalog_async()
         if self.settings.api_key(self.settings.environment):
@@ -68,6 +79,46 @@ class App(ttk.Frame):
                 self.settings.environment), on_startup=True)
 
     # ── layout ───────────────────────────────────────────────────────────
+    def _build_application_frame(self) -> None:
+        frame = ttk.LabelFrame(self, text="Application version", padding=8)
+        frame.pack(fill="x", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+
+        if self.installed_gui is not None:
+            version_text = f"Running GUI version: {self.installed_gui.version}"
+        elif self.is_packaged:
+            version_text = "Running GUI version: UNKNOWN (legacy package)"
+        else:
+            version_text = "Running from source (development build)"
+        self.app_version_var = tk.StringVar(value=version_text)
+        ttk.Label(
+            frame,
+            textvariable=self.app_version_var,
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        self.app_update_var = tk.StringVar(value="Checking for updates…")
+        self.app_update_label = ttk.Label(
+            frame, textvariable=self.app_update_var, foreground="#555555"
+        )
+        self.app_update_label.grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        self.app_release_btn = ttk.Button(
+            frame,
+            text="Open releases",
+            command=self._open_gui_release,
+            state="disabled",
+        )
+        self.app_release_btn.grid(
+            row=0, column=1, rowspan=2, padx=(12, 0), sticky="e"
+        )
+        self.app_check_btn = ttk.Button(
+            frame, text="Check again", command=self._fetch_gui_update_async
+        )
+        self.app_check_btn.grid(
+            row=0, column=2, rowspan=2, padx=(8, 0), sticky="e"
+        )
+
     def _build_session_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Session (set once)", padding=8)
         frame.pack(fill="x")
@@ -279,7 +330,80 @@ class App(ttk.Frame):
         value = self.port_var.get().strip()
         return value.split(" — ", 1)[0] if value else None
 
-    # ── firmware release ─────────────────────────────────────────────────
+    # ── application + firmware releases ─────────────────────────────────
+    def _fetch_gui_update_async(self) -> None:
+        self.app_update_var.set("Checking for updates…")
+        self.app_update_label.configure(foreground="#555555")
+        self.app_check_btn.configure(state="disabled")
+
+        def work():
+            try:
+                status = release_fetch.fetch_gui_update(
+                    self.installed_gui, log=self.log
+                )
+            except release_fetch.ReleaseError as exc:
+                self._post(self._apply_gui_update_error, str(exc))
+                return
+            self._post(self._apply_gui_update, status)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_gui_update(self, status: app_update.GuiUpdateStatus) -> None:
+        self.gui_release_url = status.release_url
+        if status.state == "current":
+            text = f"UP TO DATE — {status.latest_version} is the latest release"
+            colour = "green"
+            button_text = "View this release"
+        elif status.state == "outdated":
+            text = (
+                f"UPDATE AVAILABLE — download GUI {status.latest_version} "
+                f"(running {status.installed.version})"
+            )
+            colour = "#b24a00"
+            button_text = f"Download {status.latest_version}"
+        elif status.state == "ahead":
+            text = (
+                f"PRE-RELEASE BUILD — latest published GUI is "
+                f"{status.latest_version}"
+            )
+            colour = "#555555"
+            button_text = "View latest release"
+        elif self.is_packaged:
+            self.app_version_var.set(
+                "Running GUI version: UNKNOWN — update recommended"
+            )
+            text = (
+                f"Latest available GUI is {status.latest_version}; this legacy "
+                "build cannot be compared"
+            )
+            colour = "#b24a00"
+            button_text = f"Download {status.latest_version}"
+        else:
+            text = (
+                f"Latest downloadable GUI: {status.latest_version} "
+                "(source run is not versioned)"
+            )
+            colour = "#555555"
+            button_text = "View latest release"
+
+        self.app_update_var.set(text)
+        self.app_update_label.configure(foreground=colour)
+        self.app_release_btn.configure(text=button_text, state="normal")
+        self.app_check_btn.configure(state="normal")
+
+    def _apply_gui_update_error(self, detail: str) -> None:
+        self.gui_release_url = app_update.RELEASES_PAGE
+        self.app_update_var.set(
+            "UPDATE CHECK UNAVAILABLE — open Releases to verify manually"
+        )
+        self.app_update_label.configure(foreground="#b24a00")
+        self.app_release_btn.configure(text="Open releases", state="normal")
+        self.app_check_btn.configure(state="normal")
+        self.log(f"GUI update check failed: {detail}")
+
+    def _open_gui_release(self) -> None:
+        webbrowser.open(self.gui_release_url)
+
     def _fetch_release_async(self) -> None:
         def work():
             try:

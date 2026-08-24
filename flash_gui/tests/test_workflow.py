@@ -40,6 +40,20 @@ def test_release_publishes_the_exact_pr_head_artifacts():
     assert WORKFLOW.count("pyinstaller ") == 1
 
 
+def test_pr_build_embeds_and_release_verifies_gui_identity():
+    assert "name: Determine expected GUI release tag" in WORKFLOW
+    assert "python -m flash_gui.build_release_info" in WORKFLOW
+    assert '--source-sha "${SOURCE_SHA}"' in WORKFLOW
+    assert '--add-data "release_info.json${SEP}flash_gui"' in WORKFLOW
+    assert "name: Verify packaged GUI release identity" in WORKFLOW
+    assert "EXPECTED_TAG: ${{ steps.version.outputs.tag }}" in WORKFLOW
+    assert "EXPECTED_SOURCE_SHA: ${{ steps.artifact.outputs.head-sha }}" in WORKFLOW
+    assert 'endswith(' in WORKFLOW
+    assert '"/flash_gui/release_info.json"' in WORKFLOW
+    assert "group: flash-gui-release" in WORKFLOW
+    assert "cancel-in-progress: false" in WORKFLOW
+
+
 def test_every_merge_to_main_releases_without_a_hand_cut_tag():
     assert "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in WORKFLOW
     # A tag trigger would mean a human has to remember to push one.

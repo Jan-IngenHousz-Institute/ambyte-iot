@@ -4,8 +4,8 @@
 """The shared release listing: one request per TTL, free revalidation.
 
 Unauthenticated GitHub allows 60 requests/hour per IP, shared by every operator
-behind an office NAT, and the flasher used to spend two of them per start on the
-same URL.
+behind an office NAT, and the flasher used to spend multiple requests per start
+on the same URL.
 """
 
 import io
@@ -48,12 +48,12 @@ def _count_calls(monkeypatch, responder):
     return calls
 
 
-def test_both_fetchers_share_a_single_request(monkeypatch):
+def test_all_release_consumers_share_a_single_request(monkeypatch):
     calls = _count_calls(monkeypatch, lambda req: _Resp([{"tag_name": "v1.0.0"}]))
     first = release_fetch._release_list(log=lambda _m: None)
     second = release_fetch._release_list(log=lambda _m: None)
     assert first == second == [{"tag_name": "v1.0.0"}]
-    # The firmware and Lua fetchers used to cost one request each.
+    # Firmware, Lua and GUI-update workers all enter through this locked cache.
     assert len(calls) == 1
 
 

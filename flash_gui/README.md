@@ -38,6 +38,30 @@ Release assets are one zip per platform (`*-windows.zip`, `*-linux.zip`,
 `ambyte-flash-gui` from inside the extracted folder; the folder must stay
 intact, since the executable loads its Python runtime from its siblings.
 
+### GUI version and updates
+
+The top of the application always identifies what is running and shows one of
+these explicit states: **UP TO DATE**, **UPDATE AVAILABLE**, **PRE-RELEASE
+BUILD**, or **UPDATE CHECK UNAVAILABLE**. Packaged builds show their version in
+both the window title and the application banner. Old packages without embedded
+identity are labelled **UNKNOWN — update recommended**; source checkouts are
+labelled as development builds rather than pretending to have a release
+version.
+
+When an update exists, **Download X.Y.Z** opens that exact GitHub release page
+so the operator can choose the correct platform zip. This is intentionally not
+an in-place self-update: the distributed application is a multi-file `--onedir`
+bundle, and replacing files while they are running without an installer,
+signature verification and rollback would be less safe than one clear click to
+the immutable release.
+
+The version is not hand-maintained in source. The PR build predicts the next
+`flash-gui-v*` tag, embeds that tag plus the PR source SHA in every platform
+bundle, and the main release job verifies all three embedded identities against
+the tag it is about to publish. If another GUI release lands between build and
+merge, publication fails instead of shipping a bundle that claims the wrong
+version; rerunning the PR build refreshes the prediction.
+
 Every release also ships a `SHA256SUMS` asset. Verify before running:
 
 ```bash
@@ -105,16 +129,17 @@ That fallback is the only path that needs the board on Wi-Fi.
 
 ### GitHub rate limits
 
-The GUI reads the repo's release list to find the firmware and the Lua catalog.
-Unauthenticated GitHub allows **60 requests/hour per IP**, and an office behind
-one NAT shares that budget across every operator.
+The GUI reads the repo's release list to find the firmware, the Lua catalog and
+the latest GUI version. Unauthenticated GitHub allows **60 requests/hour per
+IP**, and an office behind one NAT shares that budget across every operator.
 
-The listing is fetched once and shared by both lookups, cached on disk for five
-minutes, and revalidated with `If-None-Match` after that; GitHub does not count
-a `304 Not Modified` against the limit, so repeated starts are effectively free.
-If the limit is hit anyway, or GitHub is unreachable, the last cached listing is
-used and the reason is logged rather than blocking the session, and the error
-names the time the window resets.
+The listing is fetched once and shared by all three startup lookups, cached on
+disk for five minutes, and revalidated with `If-None-Match` after that; a lock
+prevents the startup threads from racing into duplicate requests. GitHub does
+not count a `304 Not Modified` against the limit, so repeated starts are
+effectively free. If the limit is hit anyway, or GitHub is unreachable, the
+last cached listing is used and the reason is logged rather than blocking the
+session, and the error names the time the window resets.
 
 To raise the ceiling to 5000/hour, set `GH_TOKEN` (or `GITHUB_TOKEN`) to a
 GitHub personal access token before launching. The repo is public, so the token
