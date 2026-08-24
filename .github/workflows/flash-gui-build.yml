@@ -152,10 +152,10 @@ jobs:
             "${VERSION_FILE[@]}" \
             flash_gui/launcher.py
 
-      # Importing littlefs is not enough: its CFFI-backed UserContext callbacks
-      # are wired differently inside a frozen process, and a missing callback
-      # only surfaces when formatting/mounting a real image. Execute that exact
-      # onboarding seam inside every packaged platform before uploading it.
+      # A unit import is not enough: 0.2.9 failed only on a cold script cache,
+      # where a silent logger was called before littlefs even started. Exercise
+      # the exact cold-fetch + digest + image/read-back sequence inside every
+      # packaged platform before uploading it.
       - name: Smoke-test packaged littlefs image
         shell: bash
         run: |

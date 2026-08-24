@@ -601,6 +601,14 @@ def script_bytes(script: LuaScriptRelease, log=print) -> bytes:
     is discarded rather than pushed to a board. This is what lets the GUI stream
     a script to a device that has no network of its own.
     """
+    # Host-tool helpers consistently accept log=None to mean silent operation.
+    # Keep that contract here too: the provisioning path used None while baking
+    # littlefs, and the cold-cache branch otherwise tried to call it. A warm
+    # cache returned before this first log call, making the failure machine-state
+    # dependent and invisible to the old tests.
+    if log is None:
+        log = lambda _message: None
+
     cached = SCRIPTS_CACHE_DIR / f"{script.sha256}.lua"
     if cached.is_file():
         blob = cached.read_bytes()

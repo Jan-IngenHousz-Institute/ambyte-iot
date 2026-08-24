@@ -140,6 +140,20 @@ def test_script_bytes_reuses_a_good_cache_without_network(monkeypatch, tmp_path)
     assert release_fetch.script_bytes(_script(), log=lambda _m: None) == BLOB
 
 
+def test_script_bytes_can_download_silently_on_a_cold_cache(monkeypatch, tmp_path):
+    """The provisioning caller historically passes log=None.
+
+    A warm cache returned before logging and hid the bug; the first board on a
+    clean PC instead tried to call None immediately before building littlefs.
+    """
+    monkeypatch.setattr(release_fetch, "SCRIPTS_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(
+        release_fetch, "_download",
+        lambda url, dest, expect_size: dest.write_bytes(BLOB))
+
+    assert release_fetch.script_bytes(_script(), log=None) == BLOB
+
+
 def test_script_bytes_rejects_a_download_that_does_not_match_the_manifest(
         monkeypatch, tmp_path):
     monkeypatch.setattr(release_fetch, "SCRIPTS_CACHE_DIR", tmp_path)
