@@ -84,9 +84,38 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The PR artifact is the artifact promoted by the main workflow, so its
+      # identity must be predicted here rather than injected by rebuilding at
+      # release time. The release job verifies this prediction before publish
+      # and fails closed if another GUI release won the tag in between.
+      - name: Determine expected GUI release tag
+        id: expected-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST=$(git ls-remote --tags origin 'refs/tags/flash-gui-v*' \
+            | sed 's|.*refs/tags/||; s|\^{}$||' \
+            | sort -u | sort -V | tail -1)
+          if [[ -z "${LATEST}" ]]; then
+            NEXT="flash-gui-v0.1.0"
+          else
+            IFS=. read -r MAJOR MINOR PATCH <<< "${LATEST#flash-gui-v}"
+            NEXT="flash-gui-v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          echo "tag=${NEXT}" >> "${GITHUB_OUTPUT}"
+
       - name: Install dependencies
         run: |
           python -m pip install -r flash_gui/requirements.txt pyinstaller
+
+      - name: Generate packaged release identity
+        shell: bash
+        run: |
+          python -m flash_gui.build_release_info \
+            --tag "${{ steps.expected-version.outputs.tag }}" \
+            --source-sha "${SOURCE_SHA}" \
+            --output release_info.json
+          cat release_info.json
 
       - name: Build executable
         shell: bash
@@ -114,6 +143,7 @@ jobs:
             --name ambyte-flash-gui \
             --paths . \
             --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
+            --add-data "release_info.json${SEP}flash_gui" \
             --collect-all esptool \
             --collect-all littlefs \
             "${VERSION_FILE[@]}" \
@@ -156,6 +186,12 @@ jobs:
   release:
     name: Release from main
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Serialize GUI releases so two quick merges cannot both select and upload
+    # the same next tag. The later job then sees the new tag and fails its
+    # embedded-identity check until its PR artifact is deliberately rebuilt.
+    concurrency:
+      group: flash-gui-release
+      cancel-in-progress: false
     # Windows-only: azure/artifact-signing-action shells out to signtool, so the
     # signing step cannot run on ubuntu. Signing here rather than in `build`
     # keeps the certificate off every PR run (and off fork PRs, which get no
@@ -169,6 +205,10 @@ jobs:
     steps:
       - name: Checkout main
         uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Locate PR executable artifacts
         id: artifact
@@ -333,6 +373,56 @@ jobs:
           echo "Previous: ${LATEST:-none}. Releasing: ${NEXT}."
           echo "tag=${NEXT}" >> "${GITHUB_OUTPUT}"
           echo "Releasing GUI ${NEXT} from ${GITHUB_SHA}." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Verify packaged GUI release identity
+        env:
+          EXPECTED_TAG: ${{ steps.version.outputs.tag }}
+          EXPECTED_SOURCE_SHA: ${{ steps.artifact.outputs.head-sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          expected_archives = {
+              "ambyte-flash-gui-linux.zip",
+              "ambyte-flash-gui-macos.zip",
+              "ambyte-flash-gui-windows.zip",
+          }
+          archives = {path.name: path for path in Path("out").glob("ambyte-flash-gui-*.zip")}
+          if archives.keys() != expected_archives:
+              raise SystemExit(
+                  f"GUI archives differ from expected set: {sorted(archives)}"
+              )
+
+          for name, archive in sorted(archives.items()):
+              with zipfile.ZipFile(archive) as bundle:
+                  matches = [
+                      member for member in bundle.namelist()
+                      if member.replace("\\", "/").endswith(
+                          "/flash_gui/release_info.json"
+                      )
+                  ]
+                  if len(matches) != 1:
+                      raise SystemExit(
+                          f"{name}: expected exactly one embedded release_info.json, "
+                          f"found {matches}"
+                      )
+                  metadata = json.loads(bundle.read(matches[0]))
+              expected = {
+                  "schema_version": 1,
+                  "tag": os.environ["EXPECTED_TAG"],
+                  "source_sha": os.environ["EXPECTED_SOURCE_SHA"],
+              }
+              if metadata != expected:
+                  raise SystemExit(
+                      f"{name}: embedded identity {metadata!r} != {expected!r}"
+                  )
+              print(f"{name}: verified {metadata['tag']} from {metadata['source_sha']}")
+          PY
 
       - name: Create GitHub release with executables
         uses: softprops/action-gh-release@v2
