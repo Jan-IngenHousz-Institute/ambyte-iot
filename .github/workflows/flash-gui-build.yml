@@ -65,16 +65,19 @@ jobs:
           - os: windows-latest
             label: windows
             bundle: dist/ambyte-flash-gui
+            executable: dist/ambyte-flash-gui/ambyte-flash-gui.exe
             asset: ambyte-flash-gui-windows.zip
           - os: ubuntu-latest
             label: linux
             bundle: dist/ambyte-flash-gui
+            executable: dist/ambyte-flash-gui/ambyte-flash-gui
             asset: ambyte-flash-gui-linux.zip
           - os: macos-latest
             label: macos
             # --windowed builds a .app alongside the plain onedir folder; ship
             # the bundle, since Tk needs it to take keyboard focus properly.
             bundle: dist/ambyte-flash-gui.app
+            executable: dist/ambyte-flash-gui.app/Contents/MacOS/ambyte-flash-gui
             asset: ambyte-flash-gui-macos.zip
     runs-on: ${{ matrix.os }}
     steps:
@@ -148,6 +151,20 @@ jobs:
             --collect-all littlefs \
             "${VERSION_FILE[@]}" \
             flash_gui/launcher.py
+
+      # A unit import is not enough: 0.2.9 failed only on a cold script cache,
+      # where a silent logger was called before littlefs even started. Exercise
+      # the exact cold-fetch + digest + image/read-back sequence inside every
+      # packaged platform before uploading it.
+      - name: Smoke-test packaged littlefs image
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! "${{ matrix.executable }}" --smoke-littlefs; then
+            cat packaged-littlefs-smoke.txt 2>/dev/null || true
+            exit 1
+          fi
+          cat packaged-littlefs-smoke.txt
 
       # onedir means the asset is a directory, and GitHub release assets must be
       # files, so each platform zips with the tool that preserves its own

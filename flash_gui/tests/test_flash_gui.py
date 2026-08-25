@@ -261,6 +261,14 @@ def test_littlefs_image_rejects_empty(tmp_path):
         build_main_lua_image(b"", tmp_path / "littlefs.bin")
 
 
+def test_packaged_littlefs_smoke_seam(tmp_path):
+    from flash_gui.packaged_smoke import run_littlefs_smoke
+
+    report = tmp_path / "result.txt"
+    run_littlefs_smoke(report)
+    assert report.read_text().startswith("PASS:")
+
+
 def test_nvs_image_generation(tmp_path):
     out = build_nvs_image(make_plan(ca_cert_pem=AMAZON_ROOT_CA1),
                           tmp_path / "nvs.bin", flash_time=1786000000)

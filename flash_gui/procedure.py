@@ -270,7 +270,10 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
     log(f"Baking {ctx.lua_script.asset_name} into the littlefs image...")
     lua_out = CACHE_DIR / "littlefs" / f"littlefs-{run.preflight.mac.replace(':', '')}.bin"
     try:
-        blob = release_fetch.script_bytes(ctx.lua_script, log=None)
+        # Surface a cold-cache download in the same operator log as the rest of
+        # provisioning. script_bytes still supports log=None for silent callers,
+        # but there is no reason to hide useful progress in the GUI.
+        blob = release_fetch.script_bytes(ctx.lua_script, log=log)
         run.lua_image_path = build_main_lua_image(blob, lua_out)
     except Exception as exc:
         raise ProcedureError("nvs", f"littlefs image: {exc}") from exc

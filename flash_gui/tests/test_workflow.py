@@ -100,6 +100,18 @@ def test_build_is_onedir_not_onefile():
     assert not [line for line in executable if "--onefile" in line]
 
 
+def test_every_packaged_platform_executes_littlefs_image_builder():
+    assert "name: Smoke-test packaged littlefs image" in WORKFLOW
+    assert '"${{ matrix.executable }}" --smoke-littlefs' in WORKFLOW
+    assert "cat packaged-littlefs-smoke.txt" in WORKFLOW
+    for executable in (
+        "dist/ambyte-flash-gui/ambyte-flash-gui.exe",
+        "dist/ambyte-flash-gui/ambyte-flash-gui",
+        "dist/ambyte-flash-gui.app/Contents/MacOS/ambyte-flash-gui",
+    ):
+        assert f"executable: {executable}" in WORKFLOW
+
+
 def test_windows_build_embeds_publisher_metadata():
     assert "python -m flash_gui.build_version_info version_info.txt" in WORKFLOW
     assert '"${VERSION_FILE[@]}"' in WORKFLOW
