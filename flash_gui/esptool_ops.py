@@ -132,6 +132,32 @@ def read_mac(port: str, log=None) -> str:
     return ":".join(f"{b:02X}" for b in mac)
 
 
+def rom_bootloader_answers(port: str) -> bool:
+    """Is the chip sitting in the ROM downloader right now? If so, reset it.
+
+    Connects WITHOUT toggling the control lines (`no-reset`): a running app
+    ignores the sync bytes (the console sees one garbage line), while a chip
+    parked in download mode answers immediately. Used by the post-flash console
+    wait to tell "board is silently stuck in the bootloader" — which some
+    Windows usbser stacks cause simply by opening the USB-JTAG port — from
+    "board is slow/boot-looping". When the ROM does answer, the chip is
+    hard-reset into run mode before returning so the caller can just keep
+    waiting for the console.
+    """
+    tee = _Tee(None)
+    try:
+        with redirect_stdout(tee):
+            esp = detect_chip(port=port, baud=115200,
+                              connect_mode="no-reset", connect_attempts=2)
+            try:
+                reset_chip(esp, "hard-reset")
+            finally:
+                _close_port(esp)
+    except Exception:
+        return False
+    return True
+
+
 def flash_images(port: str, images: list[tuple[int, Path]],
                  flash_settings: dict[str, str], log=None) -> None:
     """Write all images (offset asc). Writes only these regions — no chip

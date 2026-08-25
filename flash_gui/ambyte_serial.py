@@ -29,9 +29,20 @@ from dataclasses import dataclass, field
 import serial
 from serial.tools import list_ports
 
+from . import esptool_ops
 from .config import USB_JTAG_VID
 
 PROMPT = "ambyte> "
+# The ROM prints "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)" on the
+# USB-Serial-JTAG console at every reset (CONFIG_ESP_ROM_CONSOLE_OUTPUT_SECONDARY),
+# so counting these while waiting for the CLI turns "no prompt" into "the board
+# reset N times" — a boot loop — with the last reset reason attached.
+_RESET_BANNER_RE = re.compile(r"rst:0x[0-9a-fA-F]+\s*\(([A-Z_0-9]+)\)")
+_PANIC_RE = re.compile(
+    r"(Guru Meditation Error[^\r\n]*|Brownout detector was triggered|"
+    r"abort\(\) was called[^\r\n]*|assert failed[^\r\n]*)")
+# Keep this much of the most recent console output for the failure report.
+RX_TAIL_BYTES = 8192
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _STATUS_MAC_RE = re.compile(r"-\s*MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -123,6 +134,11 @@ class AmbyteConsole:
         ser.open()
         self._ser = ser
         self._timeout = timeout
+        # Everything the board printed while we held the port, bounded. The
+        # firmware and the ROM share this console, so an empty tail after a
+        # long wait means "nothing is running", not "the CLI is slow".
+        self.rx_total = 0
+        self._rx_tail = ""
 
     def close(self) -> None:
         try:
@@ -142,7 +158,48 @@ class AmbyteConsole:
             chunk = self._ser.read(4096)
         except (OSError, serial.SerialException) as exc:
             raise ConsoleError(f"port {self.port} went away: {exc}") from exc
-        return chunk.decode("utf-8", "replace") if chunk else ""
+        if not chunk:
+            return ""
+        text = chunk.decode("utf-8", "replace")
+        self.rx_total = getattr(self, "rx_total", 0) + len(chunk)
+        self._rx_tail = (getattr(self, "_rx_tail", "") + text)[-RX_TAIL_BYTES:]
+        return text
+
+    def rx_tail(self, lines: int = 6) -> str:
+        """The last few non-empty, ANSI-stripped lines the board printed."""
+        clean = _ANSI_RE.sub("", getattr(self, "_rx_tail", ""))
+        kept = [ln.strip() for ln in clean.replace("\r", "\n").split("\n")
+                if ln.strip()]
+        return "\n".join(kept[-lines:])
+
+    def reset_count(self) -> int:
+        return len(_RESET_BANNER_RE.findall(getattr(self, "_rx_tail", "")))
+
+    def last_reset_reason(self) -> str | None:
+        hits = _RESET_BANNER_RE.findall(getattr(self, "_rx_tail", ""))
+        return hits[-1] if hits else None
+
+    def last_panic(self) -> str | None:
+        hits = _PANIC_RE.findall(_ANSI_RE.sub("", getattr(self, "_rx_tail", "")))
+        return hits[-1].strip() if hits else None
+
+    def pulse_reset(self) -> None:
+        """Hard-reset into RUN mode over the USB-Serial-JTAG control lines.
+
+        The S3's USB-JTAG peripheral decodes RTS=1/DTR=0 as "pull EN low" and
+        DTR=1/RTS=0 as "boot into the ROM downloader". Some Windows usbser
+        stacks pulse DTR when a port is opened, which can leave a board parked
+        in download mode: enumerated, silent, and never reaching the CLI. This
+        is esptool's own hard-reset sequence and gets it out of that state.
+        The port will drop and re-enumerate; the caller must reopen.
+        """
+        try:
+            self._ser.dtr = False
+            self._ser.rts = True
+            time.sleep(0.2)
+            self._ser.rts = False
+        except (OSError, serial.SerialException) as exc:
+            raise ConsoleError(f"reset over {self.port} failed: {exc}") from exc
 
     def wait_prompt(self, timeout: float | None = None) -> bool:
         """Nudge with empty lines until the `ambyte> ` prompt shows up.
@@ -384,30 +441,102 @@ def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResu
     return result
 
 
+# Wait-loop tunables (module-level so tests can shrink them).
+# esptool has just hard-reset the chip. Opening the USB-JTAG port pulses the
+# control lines on some Windows usbser stacks; doing that while the ROM is
+# still deciding between run and download mode is the most likely moment to
+# park the board in the bootloader, and the CLI cannot appear this early anyway.
+CONSOLE_SETTLE_S = 8.0
+# One "still waiting" line per this interval, so a 3-minute silence in the GUI
+# log is never mistaken for a hung tool.
+CONSOLE_PROGRESS_S = 30.0
+# Both the ROM and the firmware print on this console at boot, so a board that
+# has produced zero bytes for this long after the settle window is not slow: it
+# is parked in the ROM downloader, unpowered, or the port belongs to someone
+# else. Check for the first case once and reset out of it.
+CONSOLE_SILENCE_RESET_S = 45.0
+# Reset banners seen before the CLI appears. One is the normal boot; a
+# firmware may legitimately reboot once more (first-boot NVS/partition fixups).
+# This many means a boot loop, and waiting the full deadline is pointless.
+BOOT_LOOP_RESETS = 4
+
+
 def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
-                       log=None) -> AmbyteConsole:
+                       log=None, settle_s: float | None = None) -> AmbyteConsole:
     """Console session on a freshly rebooted board.
 
     The ESP32-S3 native USB-Serial-JTAG re-enumerates to a NEW port name on
     every reset (and leaves ghost ports behind), and the CLI task only starts
     ~20-35 s into boot, so rescan every live JTAG port until one answers with
     the prompt, retrying across re-enumerations until the deadline.
+
+    Everything the board prints meanwhile is captured, so the wait is
+    self-diagnosing: total silence, a boot loop (repeated ROM reset banners,
+    with the last reset reason / panic), and a busy port each get their own
+    verdict instead of one generic timeout. A board that stays silent is
+    checked for the "parked in the ROM downloader" state and hard-reset out of
+    it once (see AmbyteConsole.pulse_reset for why that state happens at all).
     """
-    deadline = time.time() + deadline_s
+    if settle_s is None:
+        settle_s = CONSOLE_SETTLE_S
+    start = time.time()
+    deadline = start + deadline_s
     said_wait = False
     con: AmbyteConsole | None = None
     active_port: str | None = None
+    ports_seen: set[str] = set()
+    open_failures: dict[str, str] = {}    # port -> last error text, logged once
+    silence_checked = False
+    next_progress = start + CONSOLE_PROGRESS_S
+    # Console output folded in from handles that were closed along the way.
+    rx_total = 0
+    rx_tail = ""
+    resets = 0
+    last_reason: str | None = None
+    panic: str | None = None
+
+    def fold(c: AmbyteConsole) -> None:
+        nonlocal rx_total, rx_tail, resets, last_reason, panic
+        rx_total += c.rx_total
+        if c.rx_total:
+            rx_tail = c.rx_tail(8)
+        resets += c.reset_count()
+        last_reason = c.last_reset_reason() or last_reason
+        panic = c.last_panic() or panic
+
+    def drop() -> None:
+        nonlocal con, active_port
+        if con is not None:
+            fold(con)
+            con.close()
+        con = None
+        active_port = None
+
+    if settle_s > 0:
+        if log:
+            log(f"Letting the board leave the bootloader for {settle_s:.0f}s "
+                "before opening its port...")
+        time.sleep(min(settle_s, deadline_s))
+
     while time.time() < deadline:
         if con is None:
             cands = ([preferred_port] if preferred_port else []) + \
                 [p for p in esp_jtag_ports() if p != preferred_port]
+            ports_seen.update(cands)
             for cand in cands:
                 try:
                     con = AmbyteConsole(cand)
                     active_port = cand
                     break
-                except (OSError, serial.SerialException):
-                    continue           # ghost / not ready / busy
+                except (OSError, serial.SerialException) as exc:
+                    # ghost / not ready / busy — but say so once per port,
+                    # because "busy" is a different problem from "slow board".
+                    msg = (str(exc).splitlines() or ["?"])[0][:120]
+                    if log and open_failures.get(cand) != msg:
+                        log(f"Cannot open {cand} ({msg}); if this persists, "
+                            "another program is holding the port.")
+                    open_failures[cand] = msg
+                    continue
 
         if con is not None:
             try:
@@ -421,27 +550,104 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                         log(f"Console up on {active_port}.")
                     return con
             except ConsoleError:
-                con.close()
-                con = None
-                active_port = None
+                drop()
                 continue
 
             # A real USB disconnect makes the open descriptor unusable and is
             # normally raised above. This explicit presence check also handles
             # platforms that leave a quiet ghost descriptor behind.
             if active_port not in esp_jtag_ports():
-                con.close()
-                con = None
-                active_port = None
+                drop()
 
         if log and not said_wait:
             log("Waiting for the board's console (it starts ~20-35 s after "
                 "boot; the USB port may re-enumerate)...")
             said_wait = True
+
+        now = time.time()
+        total_rx = rx_total + (con.rx_total if con else 0)
+        total_resets = resets + (con.reset_count() if con else 0)
+
+        if total_resets >= BOOT_LOOP_RESETS:
+            drop()
+            detail = f"last reset reason: {last_reason or 'unknown'}"
+            if panic:
+                detail += f"; last panic: {panic}"
+            raise ConsoleError(
+                f"the board reset {resets} times while waiting for its console "
+                f"— it is boot-looping, not slow ({detail}). Check power/battery "
+                "and the SD card, then use Retry provisioning (no re-flash).\n"
+                f"Last console output:\n{rx_tail}")
+
+        if (not silence_checked and total_rx == 0
+                and now - start >= settle_s + CONSOLE_SILENCE_RESET_S):
+            silence_checked = True
+            probe_port = active_port or preferred_port
+            drop()
+            if log:
+                log(f"Nothing printed for {CONSOLE_SILENCE_RESET_S:.0f}s. Checking "
+                    "whether the board is parked in the ROM bootloader "
+                    "(download mode)...")
+            if probe_port and esptool_ops.rom_bootloader_answers(probe_port):
+                if log:
+                    log("It was: the ROM downloader answered on "
+                        f"{probe_port}. Hard-reset into run mode; waiting for "
+                        "the console again.")
+            else:
+                if log:
+                    log("The ROM does not answer either; pulsing the reset line "
+                        "once and waiting again.")
+                if probe_port:
+                    try:
+                        c = AmbyteConsole(probe_port)
+                        try:
+                            c.pulse_reset()
+                        finally:
+                            c.close()
+                    except (OSError, serial.SerialException, ConsoleError) as exc:
+                        if log:
+                            log(f"Could not pulse reset on {probe_port}: {exc}")
+            # Whatever the board printed before our reset is stale now.
+            resets = 0
+            continue
+
+        if log and now >= next_progress:
+            next_progress = now + CONSOLE_PROGRESS_S
+            live = ", ".join(esp_jtag_ports()) or "none"
+            holding = f"holding {active_port}" if con else "no port open"
+            if total_rx == 0:
+                state = "no output at all"
+            else:
+                state = (f"{total_rx} bytes of boot output, {total_resets} reset "
+                         "banner(s), CLI not up yet")
+            log(f"Still waiting ({now - start:.0f}s): Espressif ports: {live}; "
+                f"{holding}; {state}.")
+
         if con is None:
             time.sleep(1.5)
-    if con is not None:
-        con.close()
-    raise ConsoleError(
-        f"no ambyte console answered within {deadline_s:.0f}s; the board may "
-        "still be booting, or the USB port re-enumerated to a different name.")
+
+    drop()
+    if rx_total == 0:
+        why = ("the board printed NOTHING on its console, so it is not merely "
+               "slow: it is parked in the ROM bootloader, not booting, or the "
+               "port is held by another program. Unplug and replug the USB "
+               "cable, close any serial monitor, click Refresh, then use "
+               "Retry provisioning (no re-flash).")
+    else:
+        seen = f"{rx_total} bytes of boot output, {resets} reset banner(s)"
+        if last_reason:
+            seen += f", last reset reason {last_reason}"
+        if panic:
+            seen += f", last panic: {panic}"
+        why = (f"the board printed {seen}, but its CLI never came up. It may "
+               "still be recovering the SD card: wait a minute and use Retry "
+               "provisioning (no re-flash), or remove the SD card and retry.")
+    ports = ", ".join(sorted(ports_seen)) or "none"
+    msg = (f"no ambyte console answered within {deadline_s:.0f}s; {why}\n"
+           f"Espressif ports seen: {ports}.")
+    if open_failures:
+        msg += "\nPorts that would not open: " + "; ".join(
+            f"{p} ({e})" for p, e in sorted(open_failures.items()))
+    if rx_tail:
+        msg += f"\nLast console output:\n{rx_tail}"
+    raise ConsoleError(msg)

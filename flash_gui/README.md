@@ -201,6 +201,14 @@ RTC, selected Lua script).
    20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
    keeping one serial handle open so polling cannot repeatedly reset the board,
    then sets the exact current UTC epoch with `rtc set` (applies immediately).
+   The wait is self-diagnosing: the port is left alone for the first 8 s after
+   esptool's reset, a "still waiting" line every 30 s reports the Espressif
+   ports seen and the bytes received, and a board that prints *nothing* for
+   45 s is checked for the "parked in the ROM downloader" state (some Windows
+   usbser stacks trip it just by opening the USB-JTAG port) and hard-reset out
+   of it once. Repeated ROM reset banners end the wait early as a **boot loop**
+   with the last reset reason/panic, and the failure text names any port that
+   would not open (another program holding it) plus the last console lines.
 6. **Lua script** — with a firmware that runs main.lua from internal flash
    (littlefs), the baked image + NVS provenance already verify, so this step
    usually confirms and moves on. Otherwise it pushes the selected immutable
