@@ -201,6 +201,21 @@ RTC, selected Lua script).
    20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
    keeping one serial handle open so polling cannot repeatedly reset the board,
    then sets the exact current UTC epoch with `rtc set` (applies immediately).
+   Hardware-verified on Windows (2026-08-25): esptool's RTS "hard reset" boots
+   the S3 into the ROM downloader (`boot:0x0 DOWNLOAD`) even with GPIO0 high —
+   the USB-JTAG block emulates the DTR/RTS auto-reset circuit and this usbser
+   stack leaves DTR effectively asserted — so the board sat enumerated, silent,
+   no CLI ever. The flasher therefore reboots via esptool's **watchdog reset**
+   (register-driven, no control lines) after flashing and after the MAC read;
+   the USB device re-enumerates and the app boots. As a backstop, a freshly
+   opened console handle first asks the ROM (`no-reset` sync) and, if it
+   answers, reboots the board the same way. The wait is also self-diagnosing:
+   a "still waiting" line every 30 s reports the Espressif ports seen and the
+   bytes received, and a board that still prints *nothing* for 45 s gets the
+   downloader check again.
+   Repeated ROM reset banners end the wait early as a **boot loop**
+   with the last reset reason/panic, and the failure text names any port that
+   would not open (another program holding it) plus the last console lines.
 6. **Lua script** — with a firmware that runs main.lua from internal flash
    (littlefs), the baked image + NVS provenance already verify, so this step
    usually confirms and moves on. Otherwise it pushes the selected immutable

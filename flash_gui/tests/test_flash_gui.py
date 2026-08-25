@@ -460,6 +460,8 @@ def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
     created = []
 
     class SlowConsole:
+        rx_total = 0
+
         def __init__(self, port):
             self.port = port
             self.polls = 0
@@ -473,17 +475,27 @@ def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
         def close(self):
             self.closed = True
 
+        def reset_count(self):
+            return 0
+
+        def rescue_download_mode(self):
+            self.checked = True
+            return False
+
     monkeypatch.setattr(procedure.ambyte_serial, "AmbyteConsole", SlowConsole)
     monkeypatch.setattr(
         procedure.ambyte_serial, "esp_jtag_ports", lambda: ["/dev/ttyACM0"])
 
     console = procedure.ambyte_serial.connect_after_boot(
-        "/dev/ttyACM0", deadline_s=30.0)
+        "/dev/ttyACM0", deadline_s=30.0, settle_s=0.0)
 
     assert console is created[0]
     assert len(created) == 1
     assert console.polls == 3
     assert not console.closed
+    # The download-mode check goes through the handle we keep, so the port is
+    # never reopened (reopening is what parks the S3 in download mode).
+    assert console.checked
 
 
 def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch):

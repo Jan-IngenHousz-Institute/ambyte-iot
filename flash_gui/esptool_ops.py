@@ -109,6 +109,30 @@ def _session(port: str, baud: int):
     return esp
 
 
+def reboot_into_app(esp) -> None:
+    """Leave the bootloader and boot the application — via the RTC watchdog.
+
+    Hardware-verified 2026-08-25 (ESP32-S3 USB-Serial-JTAG, Windows 11): with
+    GPIO0 physically HIGH and FORCE_DOWNLOAD_BOOT clear, esptool's RTS
+    "hard-reset" STILL booted `boot:0x0 (DOWNLOAD(USB/UART0))` every time.
+    The S3's USB-JTAG block emulates the DTR/RTS auto-reset circuit, and this
+    usbser stack leaves DTR effectively asserted while the port is open, so the
+    emulated boot strap reads "download" whenever RTS pulses EN. Result: after
+    every flash the board sat silently in the ROM downloader until a power
+    cycle — the "no console within 180 s" failures on two PCs.
+
+    A watchdog reset is register-driven (write_reg to RTC_CNTL), touches no
+    control line, and booted the app + CLI on the first try. It also drops and
+    re-enumerates the USB device, so any handle open on the port dies — callers
+    must expect to reopen. RTS reset stays only as a fallback for chips where
+    the watchdog path is unavailable.
+    """
+    try:
+        reset_chip(esp, "watchdog-reset")
+    except Exception:
+        reset_chip(esp, "hard-reset")
+
+
 def read_mac(port: str, log=None) -> str:
     """The base (Wi-Fi STA) MAC as AA:BB:CC:DD:EE:FF — the board's serial
     number in the openJII registry and in the AMBYTE_<MAC> naming scheme."""
@@ -121,7 +145,7 @@ def read_mac(port: str, log=None) -> str:
                 mac = esp.read_mac("BASE_MAC")
             finally:
                 try:
-                    reset_chip(esp, "hard-reset")
+                    reboot_into_app(esp)
                 finally:
                     _close_port(esp)
     except EsptoolError:
@@ -130,6 +154,45 @@ def read_mac(port: str, log=None) -> str:
         raise EsptoolError(f"reading MAC on {port} failed: {exc}\n"
                            f"{tee.tail()}") from exc
     return ":".join(f"{b:02X}" for b in mac)
+
+
+def rescue_from_download_mode(ser) -> bool:
+    """If the chip behind this OPEN pyserial handle is in the ROM downloader,
+    boot it into the app (watchdog reset, see reboot_into_app).
+
+    Backstop for the post-flash console wait: should a board still be sitting
+    in the downloader (an older GUI's RTS reset, an operator's serial tool, a
+    reset we did not perform), this notices and reboots it instead of waiting
+    180 s for a prompt that can never come. `no-reset` connect: a running app
+    just sees one line of sync garbage on its console (harmless) and we return
+    False within ~2 s; a parked ROM answers at once. The watchdog reboot drops
+    the USB device, so after True the caller's handle is dead and must be
+    reopened. Baud/timeouts of the handle are restored on the way out.
+    """
+    saved = (ser.baudrate, ser.timeout, ser.write_timeout)
+    tee = _Tee(None)
+    try:
+        with redirect_stdout(tee):
+            esp = detect_chip(port=ser, baud=115200,
+                              connect_mode="no-reset", connect_attempts=2)
+            reboot_into_app(esp)
+    except Exception:
+        return False
+    finally:
+        # ESPLoader.connect() CLOSES the port it was handed when the sync
+        # fails (loader.py, "Failed to connect"), i.e. on every healthy board.
+        # Field 2026-08-25: the caller's next reset_input_buffer() then raised
+        # PortNotOpenError as an "UNEXPECTED ERROR". Give the handle back open.
+        try:
+            if not ser.is_open:
+                ser.open()
+        except Exception:
+            pass          # a truly gone port surfaces on the caller's next read
+        try:
+            ser.baudrate, ser.timeout, ser.write_timeout = saved
+        except Exception:
+            pass
+    return True
 
 
 def flash_images(port: str, images: list[tuple[int, Path]],
@@ -174,7 +237,7 @@ def _write(port: str, images: list[tuple[int, Path]],
                             pass
             finally:
                 try:
-                    reset_chip(esp, "hard-reset")
+                    reboot_into_app(esp)
                 finally:
                     _close_port(esp)
     except EsptoolError:

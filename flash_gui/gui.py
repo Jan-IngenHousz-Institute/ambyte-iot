@@ -20,7 +20,8 @@ import webbrowser
 from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-from . import app_update, esptool_ops, procedure, release_fetch, timezones
+from . import (app_update, esptool_ops, host_deps, procedure, release_fetch,
+               timezones)
 from .config import ENVIRONMENTS, Settings, default_topic_root
 from .config import TOPIC_IDENTITY_TOKEN
 from .openjii_client import OpenJIIClient, OpenJIIError
@@ -773,6 +774,18 @@ def main() -> None:
         ttk.Style().theme_use("clam")
     except tk.TclError:
         pass
+    # Before the first window: a Python without the runtime packages used to
+    # get all the way to step 3 (certificate already rotated) before failing
+    # with "No module named 'littlefs'". Say which interpreter and what to
+    # install, then leave — nothing useful can happen in this GUI otherwise.
+    missing = host_deps.missing_host_dependencies()
+    if missing:
+        root.withdraw()
+        text = host_deps.describe_missing(missing)
+        print(text, file=sys.stderr)
+        messagebox.showerror("ambyte on-boarding: missing Python packages", text)
+        root.destroy()
+        sys.exit(2)
     App(root)
     root.mainloop()
 
