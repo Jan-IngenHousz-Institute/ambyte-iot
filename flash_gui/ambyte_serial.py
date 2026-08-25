@@ -129,6 +129,12 @@ class AmbyteConsole:
         ser.port = port
         ser.baudrate = 115200        # irrelevant on USB CDC, pyserial needs one
         ser.timeout = 0.2
+        # Observed 2026-08-25: a board whose app is up but not servicing the
+        # USB-JTAG console (crashed / not yet at console init) stays enumerated
+        # and never drains USB OUT, so a write with no timeout blocks FOREVER
+        # and the whole GUI hangs on the first prompt nudge. Bounded, so it
+        # surfaces as a ConsoleError the wait loop can act on instead.
+        ser.write_timeout = 2.0
         ser.dtr = False
         ser.rts = False
         ser.open()
@@ -183,23 +189,20 @@ class AmbyteConsole:
         hits = _PANIC_RE.findall(_ANSI_RE.sub("", getattr(self, "_rx_tail", "")))
         return hits[-1].strip() if hits else None
 
-    def pulse_reset(self) -> None:
-        """Hard-reset into RUN mode over the USB-Serial-JTAG control lines.
+    # NB: there is deliberately no "pulse RTS to reset" helper here. Verified
+    # on hardware 2026-08-25: on this Windows usbser stack an RTS reset boots
+    # the S3 into the ROM downloader (emulated boot strap reads DTR as
+    # asserted). Reboot via esptool's watchdog reset instead — see
+    # esptool_ops.reboot_into_app and rescue_download_mode().
 
-        The S3's USB-JTAG peripheral decodes RTS=1/DTR=0 as "pull EN low" and
-        DTR=1/RTS=0 as "boot into the ROM downloader". Some Windows usbser
-        stacks pulse DTR when a port is opened, which can leave a board parked
-        in download mode: enumerated, silent, and never reaching the CLI. This
-        is esptool's own hard-reset sequence and gets it out of that state.
-        The port will drop and re-enumerate; the caller must reopen.
+    def rescue_download_mode(self) -> bool:
+        """Boot a ROM-downloader-parked chip into the app, asking over THIS
+        handle. True when the ROM was listening and has been rebooted — the
+        USB device re-enumerates, so this handle is dead afterwards and the
+        caller must reopen; False when nothing answered (app presumably
+        running). See esptool_ops.rescue_from_download_mode.
         """
-        try:
-            self._ser.dtr = False
-            self._ser.rts = True
-            time.sleep(0.2)
-            self._ser.rts = False
-        except (OSError, serial.SerialException) as exc:
-            raise ConsoleError(f"reset over {self.port} failed: {exc}") from exc
+        return esptool_ops.rescue_from_download_mode(self._ser)
 
     def wait_prompt(self, timeout: float | None = None) -> bool:
         """Nudge with empty lines until the `ambyte> ` prompt shows up.
@@ -209,7 +212,13 @@ class AmbyteConsole:
         """
         deadline = time.time() + (timeout or self._timeout)
         buf = ""
-        self._ser.reset_input_buffer()
+        try:
+            self._ser.reset_input_buffer()
+        except (OSError, serial.SerialException) as exc:
+            # PortNotOpenError included: a handle closed under us (USB drop,
+            # or a helper that closed it) must become a ConsoleError the wait
+            # loop can recover from, never an "UNEXPECTED ERROR" dialog.
+            raise ConsoleError(f"port {self.port} went away: {exc}") from exc
         self._write_line("")
         last_nudge = time.time()
         while time.time() < deadline:
@@ -442,11 +451,11 @@ def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResu
 
 
 # Wait-loop tunables (module-level so tests can shrink them).
-# esptool has just hard-reset the chip. Opening the USB-JTAG port pulses the
-# control lines on some Windows usbser stacks; doing that while the ROM is
-# still deciding between run and download mode is the most likely moment to
-# park the board in the bootloader, and the CLI cannot appear this early anyway.
-CONSOLE_SETTLE_S = 8.0
+# esptool has just closed the port after its watchdog reboot, which drops and
+# re-enumerates the USB device; give Windows a moment before we start
+# scanning. The loop copes with a port that is not back yet, so this only
+# spares a few noisy "cannot open" lines.
+CONSOLE_SETTLE_S = 1.0
 # One "still waiting" line per this interval, so a 3-minute silence in the GUI
 # log is never mistaken for a hung tool.
 CONSOLE_PROGRESS_S = 30.0
@@ -473,9 +482,18 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
     Everything the board prints meanwhile is captured, so the wait is
     self-diagnosing: total silence, a boot loop (repeated ROM reset banners,
     with the last reset reason / panic), and a busy port each get their own
-    verdict instead of one generic timeout. A board that stays silent is
-    checked for the "parked in the ROM downloader" state and hard-reset out of
-    it once (see AmbyteConsole.pulse_reset for why that state happens at all).
+    verdict instead of one generic timeout.
+
+    Hardware-verified 2026-08-25 (fw 1.10.1, Windows 11, two PCs): esptool's
+    RTS "hard-reset" boots this board into the ROM downloader every time
+    (emulated boot strap, see esptool_ops.reboot_into_app), which is why the
+    GUI used to wait 180 s on a silent port after every flash. The flasher now
+    reboots via the RTC watchdog instead, so normally the app is simply
+    booting when we get here. As a backstop, the FIRST thing done on a newly
+    opened handle is to ask the ROM through it (`no-reset` sync); if it
+    answers, the board is rebooted the same way — the handle then dies with
+    the USB re-enumeration and the loop reopens. The silence check below
+    repeats that once more.
     """
     if settle_s is None:
         settle_s = CONSOLE_SETTLE_S
@@ -512,10 +530,12 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
         con = None
         active_port = None
 
+    # Check/rescue download mode on the first handle we get (and again if the
+    # board then stays silent), never on every reopen: a flapping port would
+    # otherwise turn into a reset storm.
+    rescue_pending = True
+
     if settle_s > 0:
-        if log:
-            log(f"Letting the board leave the bootloader for {settle_s:.0f}s "
-                "before opening its port...")
         time.sleep(min(settle_s, deadline_s))
 
     while time.time() < deadline:
@@ -527,6 +547,16 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                 try:
                     con = AmbyteConsole(cand)
                     active_port = cand
+                    if rescue_pending:
+                        rescue_pending = False
+                        if con.rescue_download_mode():
+                            if log:
+                                log(f"Board on {cand} was sitting in the ROM "
+                                    "downloader; rebooted it via watchdog. The "
+                                    "port re-enumerates; CLI in ~20-35 s...")
+                        elif log:
+                            log(f"Board on {cand} is not in the ROM downloader; "
+                                "waiting for its console.")
                     break
                 except (OSError, serial.SerialException) as exc:
                     # ghost / not ready / busy — but say so once per port,
@@ -582,33 +612,23 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
         if (not silence_checked and total_rx == 0
                 and now - start >= settle_s + CONSOLE_SILENCE_RESET_S):
             silence_checked = True
-            probe_port = active_port or preferred_port
-            drop()
             if log:
                 log(f"Nothing printed for {CONSOLE_SILENCE_RESET_S:.0f}s. Checking "
-                    "whether the board is parked in the ROM bootloader "
+                    "again whether the board is parked in the ROM bootloader "
                     "(download mode)...")
-            if probe_port and esptool_ops.rom_bootloader_answers(probe_port):
-                if log:
-                    log("It was: the ROM downloader answered on "
-                        f"{probe_port}. Hard-reset into run mode; waiting for "
-                        "the console again.")
+            if con is not None:
+                # Same handle, never a reopen (reopening is what parks it).
+                if con.rescue_download_mode():
+                    if log:
+                        log("It was: rebooted it via watchdog through "
+                            f"{active_port}; the port re-enumerates, reopening.")
+                    resets = 0
+                elif log:
+                    log("The ROM does not answer either; the board is not "
+                        "in download mode.")
             else:
-                if log:
-                    log("The ROM does not answer either; pulsing the reset line "
-                        "once and waiting again.")
-                if probe_port:
-                    try:
-                        c = AmbyteConsole(probe_port)
-                        try:
-                            c.pulse_reset()
-                        finally:
-                            c.close()
-                    except (OSError, serial.SerialException, ConsoleError) as exc:
-                        if log:
-                            log(f"Could not pulse reset on {probe_port}: {exc}")
-            # Whatever the board printed before our reset is stale now.
-            resets = 0
+                # No handle to talk through: let the next open run the check.
+                rescue_pending = True
             continue
 
         if log and now >= next_progress:

@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ambyte_serial, esptool_ops, timezones
+from . import ambyte_serial, esptool_ops, host_deps, timezones
 from .ambyte_serial import (ConsoleError, UnsupportedConsoleCommand,
                             expand_mac_token)
 from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
@@ -220,6 +220,16 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
             f"the MQTT broker endpoint for '{ctx.env.key}' is not configured "
             "(see the TODO in flash_gui/config.py), refusing to provision a "
             "board that could never connect.")
+
+    # Last host-side gate before the first irreversible action. The littlefs
+    # bake in this same step needs `littlefs-python`; discovering it missing
+    # AFTER provision_device() has rotated the board's certificate is exactly
+    # what happened three times on 2026-08-25 (GUI launched from a Python
+    # other than the one the requirements were installed into).
+    try:
+        host_deps.require_host_dependencies()
+    except host_deps.HostDependencyError as exc:
+        raise ProcedureError("credentials", str(exc)) from exc
 
     log("Requesting device identity + certificate from openJII...")
     try:
