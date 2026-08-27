@@ -159,8 +159,9 @@ Once per session:
    page; create a key there (shown once, `jii_...`) and paste it into the
    dialog. The key is validated and remembered per environment.
 3. Pick the **experiment** from the dropdown (active experiments you are a
-   member of). The **MQTT topic root** is pre-filled from it and stays
-   editable; `{thingName}` is replaced per board.
+   member of). During each board run, openJII binds the device to this
+   experiment and returns its authoritative broker endpoint and ingest topic
+   prefix; the GUI does not construct or edit either value.
 4. Pick the **Lua script**. The GUI always loads the newest stable `lua-v*`
    catalog and lists the released `.lua` files it contains; `main.lua` is the
    default when available.
@@ -177,20 +178,24 @@ RTC, selected Lua script).
    firmware and its stored name; falls back to reading the MAC with esptool
    (works on unflashed chips). The name prompt is pre-filled with the stored
    name, else `AMBYTE_<MAC>`.
-2. **openJII registration + certificate** — registers the MAC as an `ambyte`
-   device (or re-uses the existing registration), issues — or rotates, when a
-   live cert exists — its X.509 credentials. The show-once private key is
-   written to disk *before* anything else can fail
+2. **openJII registration + certificate + onboarding** — registers the MAC as
+   an `ambyte` device (or re-uses the existing registration), issues — or
+   rotates, when a live cert exists — its X.509 credentials, then calls
+   `POST /api/v1/devices/{deviceId}/onboard` with the selected experiment. The
+   call binds the device and returns the server-owned Thing name, broker
+   endpoint, device family, and ingest topic prefix. The show-once private key
+   is written to disk *before* the onboarding call
    (`<config>/device_certs/<thing>/`). This happens **before** flashing, so an
    API failure leaves the board untouched.
 3. **NVS + littlefs bake** — a per-board provisioning image: device name, IANA
    timezone (from this PC's clock), `flash_time` RTC seed, the board's own
-   cert + key + Amazon Root CA 1, Wi-Fi credentials, MQTT broker (per
-   environment), client id = openJII Thing name (required by the AWS IoT
-   policy), topic root, command/status topics, and the selected Lua release's
-   provenance (sha256/version/campaign). Alongside it, a littlefs image of the
-   internal script partition carrying that release's `main.lua`, built
-   host-side (no mklittlefs needed).
+   cert + key + Amazon Root CA 1, Wi-Fi credentials, MQTT broker from openJII,
+   client id = openJII Thing name (required by the AWS IoT policy),
+   server-provided topic prefix plus the API-required sensor version/id suffix,
+   command/status topics, and the selected Lua release's provenance
+   (sha256/version/campaign). Alongside it, a littlefs image of the internal
+   script partition carrying that release's `main.lua`, built host-side (no
+   mklittlefs needed).
 4. **Flash** — the latest GitHub release (`ambyte-iot-v*.zip`, cached locally,
    version shown in the GUI) + the NVS image + the littlefs image, offsets
    from the release's own `flasher_args.json` plus the fixed NVS/littlefs
@@ -223,11 +228,15 @@ RTC, selected Lua script).
 ```mermaid
 sequenceDiagram
     participant GUI
+    participant openJII
     participant GitHub
     participant Device
     GUI->>GitHub: Fetch releases
     GitHub-->>GUI: Latest firmware + latest lua-v catalog
     GUI->>GitHub: Fetch manifests for released .lua assets
+    GUI->>openJII: Register + issue/rotate credentials
+    GUI->>openJII: POST device onboarding + selected experiment
+    openJII-->>GUI: Thing, MQTT endpoint, ingest topic prefix
     GUI->>Device: Flash firmware + per-device NVS
     GUI->>Device: Set RTC and verify configuration
     GUI->>Device: lua install <immutable URL + SHA + release metadata>
@@ -258,11 +267,11 @@ sequenceDiagram
   `x-api-key`. Device-registry endpoints are additionally gated by the
   `iot-devices` feature flag per user — a 403 means the flag is off for your
   account.
-- The AWS IoT broker endpoints in `config.py` are account-specific and not
-  discoverable via any openJII API; they were resolved with
-  `aws iot describe-endpoint --endpoint-type iot:Data-ATS` against each
-  account. If an environment's endpoint ever changes, update it there — the
-  GUI refuses to start a procedure for an environment whose endpoint is unset.
+- The AWS IoT broker endpoint and ingest topic prefix are authoritative values
+  from openJII's device-onboarding response. The GUI only appends the
+  contract-required `/{sensorVersion}/{sensorId}` suffix because that portion
+  is device-owned; the firmware appends its final protocol segment at publish
+  time.
 - Firmware and Lua are independent release streams. The GUI scans the release
   feed separately for the newest stable firmware `vX.Y.Z` flash bundle and the
   highest stable `lua-vX.Y.Z` catalog, so a Lua or GUI release can never be
