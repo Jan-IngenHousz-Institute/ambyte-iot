@@ -40,12 +40,17 @@ THING = "ambyte_E8:F6:0A:B1:1F:34"
 
 def test_gui_doubles_display_and_replaces_unscalable_bitmap_fonts(monkeypatch):
     calls = []
+    monkeypatch.setattr(gui.sys, "platform", "linux")
 
     class FakeFont:
         def __init__(self, size, linespace):
             self.size = size
             self.linespace = linespace
             self.family = "fixed"
+
+        def actual(self, key):
+            assert key == "family"
+            return self.family
 
         def cget(self, key):
             assert key == "size"
@@ -82,6 +87,50 @@ def test_gui_doubles_display_and_replaces_unscalable_bitmap_fonts(monkeypatch):
             fonts["TkDefaultFont"].size) == ("liberation sans", -26)
     assert (fonts["TkFixedFont"].family,
             fonts["TkFixedFont"].size) == ("liberation mono", -30)
+
+
+@pytest.mark.parametrize(("platform", "family"), [
+    ("win32", "Segoe UI"),
+    ("darwin", "Helvetica"),
+    ("linux", "Noto Sans"),
+])
+def test_gui_preserves_native_scalable_platform_dpi_and_fonts(
+        monkeypatch, platform, family):
+    calls = []
+
+    class FakeFont:
+        configured = False
+
+        def actual(self, key):
+            assert key == "family"
+            return family
+
+        def metrics(self, key):
+            assert key == "linespace"
+            return 13
+
+        def configure(self, **_options):
+            self.configured = True
+
+    class FakeTk:
+        def call(self, *args):
+            calls.append(args)
+            return 1.5
+
+    font = FakeFont()
+    root = SimpleNamespace(tk=FakeTk())
+    monkeypatch.setattr(gui.sys, "platform", platform)
+    monkeypatch.setattr(gui.tkfont, "names",
+                        lambda *, root: ("TkDefaultFont",))
+    monkeypatch.setattr(gui.tkfont, "nametofont",
+                        lambda name, *, root: font)
+    monkeypatch.setattr(gui.tkfont, "families",
+                        lambda *, root: ("segoe ui",))
+
+    gui.apply_ui_scale(root)
+
+    assert calls == []
+    assert font.configured is False
 
 
 # ── frozen-app TLS trust ────────────────────────────────────────────────────

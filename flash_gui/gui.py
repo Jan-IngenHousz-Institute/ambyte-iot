@@ -59,7 +59,13 @@ def _available_font(root: tk.Tk, candidates: tuple[str, ...]) -> str:
 
 def apply_ui_scale(root: tk.Tk,
                    multiplier: float = UI_SCALE_MULTIPLIER) -> None:
-    """Double widget geometry and rendered text, including bitmap defaults."""
+    """Repair unreadable legacy X11 fonts without overriding native DPI."""
+    default_font = tkfont.nametofont("TkDefaultFont", root=root)
+    if str(default_font.actual("family")).casefold() != "fixed":
+        # Windows, macOS, and modern Linux desktops already expose scalable
+        # fonts and DPI-aware Tk metrics. Scaling those again breaks layout.
+        return
+
     current = float(root.tk.call("tk", "scaling"))
     root.tk.call("tk", "scaling", current * multiplier)
     ui_family = _available_font(root, UI_FONT_CANDIDATES)
