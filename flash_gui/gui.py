@@ -19,17 +19,17 @@ import tkinter as tk
 import webbrowser
 from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
+from tkinter import font as tkfont
 
 from . import app_update, esptool_ops, procedure, release_fetch, timezones
-from .config import ENVIRONMENTS, Settings, default_topic_root
-from .config import TOPIC_IDENTITY_TOKEN
+from .config import ENVIRONMENTS, Settings
 from .openjii_client import OpenJIIClient, OpenJIIError
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
                         clean_device_name)
 
 STEPS = [
     ("check", "Pre-flash check"),
-    ("credentials", "openJII credentials"),
+    ("credentials", "openJII onboarding"),
     ("nvs", "NVS image"),
     ("flash", "Flash"),
     ("provision", "RTC + reboot"),
@@ -37,6 +37,42 @@ STEPS = [
     ("verify", "Verify"),
 ]
 STEP_ICONS = {"pending": "·", "running": "▶", "ok": "✓", "fail": "✗"}
+UI_SCALE_MULTIPLIER = 2.0
+UI_FONT_CANDIDATES = (
+    "liberation sans", "dejavu sans", "noto sans", "cantarell",
+    "segoe ui", "sf pro text", "arial", "helvetica",
+)
+FIXED_FONT_CANDIDATES = (
+    "liberation mono", "dejavu sans mono", "noto sans mono",
+    "courier new", "courier 10 pitch",
+)
+
+
+def _available_font(root: tk.Tk, candidates: tuple[str, ...]) -> str:
+    available = {family.casefold(): family
+                 for family in tkfont.families(root=root)}
+    for candidate in candidates:
+        if candidate in available:
+            return available[candidate]
+    return candidates[-1]
+
+
+def apply_ui_scale(root: tk.Tk,
+                   multiplier: float = UI_SCALE_MULTIPLIER) -> None:
+    """Double widget geometry and rendered text, including bitmap defaults."""
+    current = float(root.tk.call("tk", "scaling"))
+    root.tk.call("tk", "scaling", current * multiplier)
+    ui_family = _available_font(root, UI_FONT_CANDIDATES)
+    fixed_family = _available_font(root, FIXED_FONT_CANDIDATES)
+    for name in tkfont.names(root=root):
+        named_font = tkfont.nametofont(name, root=root)
+        target_pixels = max(1, round(
+            int(named_font.metrics("linespace")) * multiplier))
+        family = fixed_family if name == "TkFixedFont" else ui_family
+        # Negative Tk font sizes are pixels, so this remains readable even
+        # when a desktop maps Helvetica/Courier to the unscalable X11
+        # ``fixed`` bitmap font.
+        named_font.configure(family=family, size=-target_pixels)
 
 
 class App(ttk.Frame):
@@ -94,7 +130,7 @@ class App(ttk.Frame):
         ttk.Label(
             frame,
             textvariable=self.app_version_var,
-            font=("TkDefaultFont", 11, "bold"),
+            font="TkHeadingFont",
         ).grid(row=0, column=0, sticky="w")
 
         self.app_update_var = tk.StringVar(value="Checking for updates…")
@@ -168,26 +204,16 @@ class App(ttk.Frame):
         self.lua_refresh_btn.grid(row=2, column=3, sticky="e", padx=(8, 0),
                                   pady=(6, 0))
 
-        ttk.Label(frame, text="MQTT topic root:").grid(row=3, column=0,
-                                                       sticky="w", pady=(6, 0))
-        self.topic_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.topic_var).grid(
-            row=3, column=1, columnspan=3, sticky="we", pady=(6, 0))
-        ttk.Label(frame, text=f"({TOPIC_IDENTITY_TOKEN} is replaced by each "
-                              "board's openJII Thing name)",
-                  foreground="gray").grid(row=4, column=1, columnspan=3,
-                                          sticky="w")
-
-        ttk.Label(frame, text="Wi-Fi SSID:").grid(row=5, column=0, sticky="w",
+        ttk.Label(frame, text="Wi-Fi SSID:").grid(row=3, column=0, sticky="w",
                                                   pady=(6, 0))
         self.ssid_var = tk.StringVar(value=self.settings.wifi_ssid)
         ttk.Entry(frame, textvariable=self.ssid_var, width=24).grid(
-            row=5, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(frame, text="Password:").grid(row=5, column=2, sticky="e",
+            row=3, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(frame, text="Password:").grid(row=3, column=2, sticky="e",
                                                 pady=(6, 0))
         self.wifi_pass_var = tk.StringVar(value=self.settings.wifi_password)
         ttk.Entry(frame, textvariable=self.wifi_pass_var, show="•",
-                  width=20).grid(row=5, column=3, sticky="we", pady=(6, 0))
+                  width=20).grid(row=3, column=3, sticky="we", pady=(6, 0))
 
     def _build_info_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Detected (read-only)", padding=8)
@@ -245,12 +271,11 @@ class App(ttk.Frame):
         self.retry_prov_btn.pack(side="left", padx=(8, 0))
         self.result_var = tk.StringVar()
         ttk.Label(btn_row, textvariable=self.result_var,
-                  font=("TkDefaultFont", 10, "bold")).pack(side="left",
-                                                           padx=(16, 0))
+                  font="TkHeadingFont").pack(side="left", padx=(16, 0))
 
         self.log_text = scrolledtext.ScrolledText(frame, height=14,
                                                   state="disabled",
-                                                  font=("Consolas", 9))
+                                                  font="TkFixedFont")
         self.log_text.grid(row=3, column=0, columnspan=4, sticky="nsew",
                            pady=(8, 0))
         frame.rowconfigure(3, weight=1)
@@ -565,7 +590,6 @@ class App(ttk.Frame):
         self.settings.experiment_id = exp.id
         self.settings.experiment_name = exp.name
         self.settings.save()
-        self.topic_var.set(default_topic_root(exp.id, TOPIC_IDENTITY_TOKEN))
 
     # ── the procedure ────────────────────────────────────────────────────
     def _session_ready(self) -> str | None:
@@ -580,13 +604,8 @@ class App(ttk.Frame):
             return "the Lua release or script selection is not available yet."
         if not self._current_experiment():
             return "select an experiment first."
-        if not self.topic_var.get().strip():
-            return "the MQTT topic root is empty."
         if not self.ssid_var.get().strip():
             return "enter the Wi-Fi SSID the boards should join."
-        if self._env().mqtt_uri is None:
-            return (f"the '{self._env().key}' MQTT broker endpoint is not "
-                    "configured (TODO in flash_gui/config.py).")
         if not self._selected_port():
             return "select a serial port."
         if not timezones.firmware_supports(self.local_tz):
@@ -605,12 +624,14 @@ class App(ttk.Frame):
         self.settings.save()
         lua_script = self._selected_lua_script()
         assert lua_script is not None, "_session_ready must validate the Lua selection"
+        experiment = self._current_experiment()
+        assert experiment is not None, "_session_ready must validate the experiment selection"
         return SessionContext(
             env=self._env(),
             client=self.client,
             release=self.release,
             lua_script=lua_script,
-            topic_root_template=self.topic_var.get().strip(),
+            experiment_id=experiment.id,
             timezone=self.local_tz,
             wifi_ssid=self.settings.wifi_ssid,
             wifi_password=self.settings.wifi_password,
@@ -773,6 +794,7 @@ def main() -> None:
         ttk.Style().theme_use("clam")
     except tk.TclError:
         pass
+    apply_ui_scale(root)
     App(root)
     root.mainloop()
 

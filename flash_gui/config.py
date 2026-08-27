@@ -58,11 +58,6 @@ class Environment:
     key: str
     api_url: str
     web_url: str
-    # AWS IoT Core ATS data endpoint for this environment. The account-specific
-    # prefix is not committed to the open-jii repo and no REST endpoint returns
-    # it; ops resolve it with `aws iot describe-endpoint --endpoint-type
-    # iot:Data-ATS`. Only the dev endpoint is publicly known.
-    mqtt_uri: str | None
 
     @property
     def api_keys_url(self) -> str:
@@ -77,13 +72,11 @@ ENVIRONMENTS: dict[str, Environment] = {
         key="dev",
         api_url="https://api.dev.openjii.org",
         web_url="https://dev.openjii.org",
-        mqtt_uri="mqtts://a2s5vvyojsnl53-ats.iot.eu-central-1.amazonaws.com:8883",
     ),
     "prod": Environment(
         key="prod",
         api_url="https://api.openjii.org",
         web_url="https://openjii.org",
-        mqtt_uri="mqtts://a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com:8883",
     ),
 }
 
@@ -95,29 +88,12 @@ ENVIRONMENTS: dict[str, Environment] = {
 OPENJII_DEVICE_TYPE = "ambyte"
 
 
-# ── MQTT topic conventions ───────────────────────────────────────────────────
-# Canonical ingest grammar (open-jii asyncapi.yaml):
-#   experiment/data_ingest/v1/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}/{protocolId}
-# The firmware stores the first 7 segments as mqtt_topic_root and appends
-# protocol_id when publishing, so the rule's 8-level filter matches.
-#
-# sensorType/sensorVersion below follow what the deployed ambyte fleet already
-# publishes (from the maintained provisioning .env) rather than the schema's
-# suggestion, because Databricks' clean_data pipeline currently reads segment 5
-# as protocol_id; changing these silently re-labels rows downstream.
-TOPIC_SENSOR_TYPE = "multispeq"
+# ── MQTT device suffix ───────────────────────────────────────────────────────
+# openJII's onboarding response owns the broker endpoint and the topic prefix
+# through sensorType. Its contract requires the device to append
+# /{sensorVersion}/{sensorId}; the firmware then appends its final protocol
+# segment at publish time.
 TOPIC_SENSOR_VERSION = "v1.0"
-
-
-def default_topic_root(experiment_id: str, thing_name: str) -> str:
-    """The pre-filled (still user-editable) topic root for an experiment."""
-    return (f"experiment/data_ingest/v1/{experiment_id}"
-            f"/{TOPIC_SENSOR_TYPE}/{TOPIC_SENSOR_VERSION}/{thing_name}")
-
-
-# Identity placeholder the GUI shows in the editable topic before a concrete
-# board is known; replaced with the board's Thing name per procedure.
-TOPIC_IDENTITY_TOKEN = "{thingName}"
 
 # Cloud→device script channel: device/scripts/v1/{sensorType}/{sensorVersion}/
 # {thingName}. Values mirror the deployed fleet's provisioning .env; the

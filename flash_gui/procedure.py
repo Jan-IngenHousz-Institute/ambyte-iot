@@ -9,8 +9,8 @@ clearly-reported state:
   1. check        pre-flash serial probe (2 s, one retry) → stored name;
                   fallback: MAC via esptool (works on unflashed chips)
      [GUI prompts for the device name here]
-  2. credentials  openJII register + issue/rotate, BEFORE flashing, so an
-                  API failure means nothing was written to the board at all
+  2. credentials  openJII register + issue/rotate + onboard, BEFORE flashing,
+                  so an API failure means nothing was written to the board
   3. nvs          bake the per-board NVS image (identity, certs, Wi-Fi,
                   timezone, MQTT, flash_time, Lua release provenance) and the
                   littlefs image carrying the selected main.lua
@@ -34,6 +34,7 @@ Retry paths (no full restart needed):
 from __future__ import annotations
 
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,7 +43,8 @@ from .ambyte_serial import (ConsoleError, UnsupportedConsoleCommand,
                             expand_mac_token)
 from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
                      LITTLEFS_OFFSET, MAX_NAME_LEN, NVS_OFFSET, PROTOCOL_ID,
-                     Environment, default_command_topic, default_status_topic)
+                     OPENJII_DEVICE_TYPE, TOPIC_SENSOR_VERSION, Environment,
+                     default_command_topic, default_status_topic)
 from .littlefs_image import build_main_lua_image
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient
@@ -87,6 +89,26 @@ class ProcedureError(RuntimeError):
     def __init__(self, step: str, message: str):
         super().__init__(message)
         self.step = step
+
+
+def mqtt_uri_from_endpoint(endpoint: str) -> str:
+    """Turn openJII's ATS broker host into the URI ESP-MQTT requires."""
+    value = (endpoint or "").strip().rstrip("/")
+    if "://" not in value:
+        value = f"mqtts://{value}"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port or 8883
+    except ValueError as exc:
+        raise ValueError(f"invalid MQTT endpoint '{endpoint}'") from exc
+    if (parsed.scheme != "mqtts" or not parsed.hostname or
+            parsed.username is not None or parsed.password is not None or
+            parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError(f"unsupported MQTT endpoint '{endpoint}'")
+    host = parsed.hostname
+    if ":" in host:  # Preserve a valid URI when an IPv6 endpoint is ever used.
+        host = f"[{host}]"
+    return f"mqtts://{host}:{port}"
 
 
 def clean_device_name(name: str) -> str | None:
@@ -137,7 +159,7 @@ class SessionContext:
     client: OpenJIIClient
     release: ReleaseImages
     lua_script: LuaScriptRelease
-    topic_root_template: str       # may contain {thingName}
+    experiment_id: str
     timezone: str
     wifi_ssid: str
     wifi_password: str
@@ -214,27 +236,46 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
             "IANA zone, or regenerate the table with tools/gen_tz_table.py and "
             "release firmware built from it.")
 
-    if ctx.env.mqtt_uri is None:
-        raise ProcedureError(
-            "credentials",
-            f"the MQTT broker endpoint for '{ctx.env.key}' is not configured "
-            "(see the TODO in flash_gui/config.py), refusing to provision a "
-            "board that could never connect.")
-
-    log("Requesting device identity + certificate from openJII...")
+    log("Requesting device identity, certificate, and onboarding config from openJII...")
     try:
         identity = ctx.client.provision_device(run.preflight.mac, name, log=log)
+        onboarding = ctx.client.onboard_device(identity.device_id,
+                                               ctx.experiment_id)
     except Exception as exc:
         raise ProcedureError("credentials", str(exc)) from exc
     run.identity = identity
     log(f"Thing name: {identity.thing_name} (this becomes the MQTT client id).")
 
-    topic_root = ctx.topic_root_template.replace(
-        "{thingName}", identity.thing_name).strip().strip("/")
+    if onboarding.thing_name != identity.thing_name:
+        raise ProcedureError(
+            "credentials",
+            "openJII onboarding returned a different Thing name "
+            f"('{onboarding.thing_name}') than credential issuance "
+            f"('{identity.thing_name}').")
+    if onboarding.device_type != OPENJII_DEVICE_TYPE:
+        raise ProcedureError(
+            "credentials",
+            "openJII onboarding returned device type "
+            f"'{onboarding.device_type}', expected '{OPENJII_DEVICE_TYPE}'.")
+
+    try:
+        endpoint = mqtt_uri_from_endpoint(onboarding.endpoint)
+    except ValueError as exc:
+        raise ProcedureError(
+            "credentials",
+            str(exc)) from exc
+
+    # openJII owns the prefix through sensorType. Its onboarding contract says
+    # the device appends /{sensorVersion}/{sensorId}; the firmware appends the
+    # final protocol segment when publishing.
+    topic_root = (f"{onboarding.topic_prefix}/{TOPIC_SENSOR_VERSION}/"
+                  f"{onboarding.thing_name}")
+    log(f"openJII MQTT endpoint: {endpoint}")
+    log(f"openJII ingest topic root: {topic_root}")
     plan = ProvisioningPlan(
         device_name=name,
         timezone=ctx.timezone,
-        mqtt_uri=ctx.env.mqtt_uri,
+        mqtt_uri=endpoint,
         client_id=identity.thing_name,
         topic_root=topic_root,
         command_topic=default_command_topic(identity.thing_name),

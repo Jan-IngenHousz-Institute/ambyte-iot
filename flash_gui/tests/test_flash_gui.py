@@ -16,14 +16,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from flash_gui import config, procedure                        # noqa: E402
+from flash_gui import config, gui, procedure                   # noqa: E402
 from flash_gui import openjii_client, release_fetch, tls       # noqa: E402
 from flash_gui.ambyte_serial import (AmbyteConsole, ConsoleError,  # noqa: E402
                                     LuaReleaseStatus, expand_mac_token)
 from flash_gui.nvs_builder import (AMAZON_ROOT_CA1,            # noqa: E402
                                    NvsBuildError, ProvisioningPlan,
                                    build_nvs_csv, build_nvs_image)
-from flash_gui.procedure import PreflightInfo, clean_device_name  # noqa: E402
+from flash_gui.openjii_client import (DeviceIdentity, DeviceOnboarding,  # noqa: E402
+                                     OpenJIIError)
+from flash_gui.procedure import (DeviceRun, PreflightInfo, SessionContext,  # noqa: E402
+                                 clean_device_name, mqtt_uri_from_endpoint)
 from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
                                      LuaScriptRelease,
                                      fetch_latest_lua_catalog,
@@ -33,6 +36,52 @@ from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
 
 MAC = "E8:F6:0A:B1:1F:34"
 THING = "ambyte_E8:F6:0A:B1:1F:34"
+
+
+def test_gui_doubles_display_and_replaces_unscalable_bitmap_fonts(monkeypatch):
+    calls = []
+
+    class FakeFont:
+        def __init__(self, size, linespace):
+            self.size = size
+            self.linespace = linespace
+            self.family = "fixed"
+
+        def cget(self, key):
+            assert key == "size"
+            return self.size
+
+        def metrics(self, key):
+            assert key == "linespace"
+            return self.linespace
+
+        def configure(self, *, family, size):
+            self.family = family
+            self.size = size
+
+    class FakeTk:
+        def call(self, *args):
+            calls.append(args)
+            return 1.6 if len(args) == 2 else None
+
+    fonts = {
+        "TkDefaultFont": FakeFont(10, 13),
+        "TkFixedFont": FakeFont(-12, 15),
+    }
+    root = SimpleNamespace(tk=FakeTk())
+    monkeypatch.setattr(gui.tkfont, "names", lambda *, root: fonts)
+    monkeypatch.setattr(gui.tkfont, "nametofont",
+                        lambda name, *, root: fonts[name])
+    monkeypatch.setattr(gui.tkfont, "families",
+                        lambda *, root: ("liberation sans", "liberation mono"))
+
+    gui.apply_ui_scale(root)
+
+    assert calls == [("tk", "scaling"), ("tk", "scaling", 3.2)]
+    assert (fonts["TkDefaultFont"].family,
+            fonts["TkDefaultFont"].size) == ("liberation sans", -26)
+    assert (fonts["TkFixedFont"].family,
+            fonts["TkFixedFont"].size) == ("liberation mono", -30)
 
 
 # ── frozen-app TLS trust ────────────────────────────────────────────────────
@@ -147,13 +196,139 @@ def test_mac_token_expansion():
     assert expand_mac_token("Roof-3", MAC) == "Roof-3"
 
 
-# ── topic derivation ─────────────────────────────────────────────────────────
-def test_default_topic_root():
-    root = config.default_topic_root("011a2000-3b00-44bd-a3c0-bed319f44f26",
-                                     THING)
-    assert root == ("experiment/data_ingest/v1/"
-                    "011a2000-3b00-44bd-a3c0-bed319f44f26/"
-                    f"multispeq/v1.0/{THING}")
+# ── openJII onboarding contract ─────────────────────────────────────────────
+def test_onboard_device_posts_binding_and_uses_selected_server_config(monkeypatch):
+    client = openjii_client.OpenJIIClient(config.ENVIRONMENTS["dev"], "jii_test")
+    calls = []
+    payload = {
+        "thingName": THING,
+        "deviceType": "ambyte",
+        "endpoint": "example-ats.iot.eu-central-1.amazonaws.com",
+        "experiments": [
+            {"experimentId": "other", "topicPrefix": "wrong/prefix"},
+            {"experimentId": "selected", "topicPrefix": "/server/topic/prefix/"},
+        ],
+    }
+
+    def request(method, path, body=None, timeout=60):
+        calls.append((method, path, body, timeout))
+        return 200, payload
+
+    monkeypatch.setattr(client, "_request", request)
+
+    result = client.onboard_device("device-id", "selected")
+
+    assert result == DeviceOnboarding(
+        thing_name=THING,
+        device_type="ambyte",
+        endpoint="example-ats.iot.eu-central-1.amazonaws.com",
+        topic_prefix="server/topic/prefix",
+    )
+    assert calls == [(
+        "POST",
+        "/api/v1/devices/device-id/onboard",
+        {"experimentIds": ["selected"], "includeWorkbook": False},
+        60,
+    )]
+
+
+def test_onboard_device_rejects_config_without_selected_topic(monkeypatch):
+    client = openjii_client.OpenJIIClient(config.ENVIRONMENTS["dev"], "jii_test")
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: (200, {
+        "thingName": THING,
+        "deviceType": "ambyte",
+        "endpoint": "example.test",
+        "experiments": [],
+    }))
+
+    with pytest.raises(OpenJIIError, match="topicPrefix for experiment selected"):
+        client.onboard_device("device-id", "selected")
+
+
+@pytest.mark.parametrize("endpoint,expected", [
+    ("example-ats.iot.eu-central-1.amazonaws.com",
+     "mqtts://example-ats.iot.eu-central-1.amazonaws.com:8883"),
+    ("mqtts://example.test", "mqtts://example.test:8883"),
+    ("mqtts://example.test:443/", "mqtts://example.test:443"),
+])
+def test_mqtt_uri_comes_from_onboarding_endpoint(endpoint, expected):
+    assert mqtt_uri_from_endpoint(endpoint) == expected
+
+
+@pytest.mark.parametrize("endpoint", ["", "https://example.test", "mqtts://user@example.test"])
+def test_mqtt_uri_rejects_unsupported_endpoint(endpoint):
+    with pytest.raises(ValueError):
+        mqtt_uri_from_endpoint(endpoint)
+
+
+def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatch,
+                                                                    tmp_path):
+    identity = DeviceIdentity(
+        device_id="device-id",
+        thing_name=THING,
+        certificate_pem="certificate",
+        private_key_pem="private-key",
+        bundle_dir=tmp_path,
+        rotated=False,
+    )
+    onboarding = DeviceOnboarding(
+        thing_name=THING,
+        device_type="ambyte",
+        endpoint="server-owned.iot.example",
+        topic_prefix="experiment/data_ingest/v1/experiment-id/ambyte",
+    )
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def provision_device(self, serial, name, log=print):
+            self.calls.append(("provision", serial, name))
+            return identity
+
+        def onboard_device(self, device_id, experiment_id):
+            self.calls.append(("onboard", device_id, experiment_id))
+            return onboarding
+
+    client = Client()
+    context = SessionContext(
+        env=config.ENVIRONMENTS["dev"],
+        client=client,
+        release=SimpleNamespace(version="1.6.0"),
+        lua_script=SimpleNamespace(
+            asset_name="main.lua",
+            sha256="abc123",
+            script_version="2.0.0",
+            built_against_fw="1.6.0",
+            campaign_id="lua-v2.0.0",
+        ),
+        experiment_id="experiment-id",
+        timezone="Europe/Amsterdam",
+        wifi_ssid="Fionas Garden",
+        wifi_password="secret",
+    )
+    run = DeviceRun(
+        port="COM7",
+        preflight=PreflightInfo("COM7", MAC, False, None),
+        name="Roof-3",
+    )
+    monkeypatch.setattr(procedure, "build_nvs_image",
+                        lambda plan, path: path)
+    monkeypatch.setattr(procedure.release_fetch, "script_bytes",
+                        lambda script, log=None: b"print('ready')\n")
+    monkeypatch.setattr(procedure, "build_main_lua_image",
+                        lambda blob, path: path)
+
+    procedure.prepare_provisioning(context, run, log=lambda _message: None)
+
+    assert client.calls == [
+        ("provision", MAC, "Roof-3"),
+        ("onboard", "device-id", "experiment-id"),
+    ]
+    assert run.plan.mqtt_uri == "mqtts://server-owned.iot.example:8883"
+    assert run.plan.topic_root == (
+        "experiment/data_ingest/v1/experiment-id/ambyte/v1.0/" + THING)
+    assert run.plan.client_id == THING
 
 
 def test_status_topic_is_root_plus_status():
