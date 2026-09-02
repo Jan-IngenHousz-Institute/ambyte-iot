@@ -431,6 +431,7 @@ static int cli_cmd_i2cscan(int argc, char **argv)
 
 /* ── selftest — factory PCBA acceptance test ────────────────────────────────
  *
+ *
  * One command the assembly-station host tool (flash_gui/factory_test.py)
  * drives over USB to accept a freshly assembled board. Contract with that
  * parser — hold these three lines stable across releases:
