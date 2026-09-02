@@ -9,13 +9,19 @@
 
 #include "CLI.h"
 #include "driver/i2c.h"
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
 #include "esp_console.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "ambit_ota.h"
 #include "ambit_flash.h"
@@ -31,6 +37,7 @@
 #include "time_sync.h"
 #include "timezone.h"
 #include "i2c_bus.h"
+#include "mp2731.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
@@ -420,6 +427,351 @@ static int cli_cmd_i2cscan(int argc, char **argv)
         CLI_BME280_ADDR_PRIMARY,
         found_bme_primary ? "yes" : "no");
     return 0;
+}
+
+/* ── selftest — factory PCBA acceptance test ────────────────────────────────
+ *
+ * One command the assembly-station host tool (flash_gui/factory_test.py)
+ * drives over USB to accept a freshly assembled board. Contract with that
+ * parser — hold these three lines stable across releases:
+ *   SELFTEST BEGIN fw=<ver> mac=<mac>
+ *   TEST <name> <PASS|FAIL> key=value ... t=<ms>ms     (one line per test)
+ *   SELFTEST <PASS|FAIL> passed=<n> failed=<n> fw=<ver> mac=<mac>
+ *
+ * Every test prints exactly one TEST line and the suite NEVER aborts early:
+ * the station needs the complete picture in one run (a board with two faults
+ * must not take two test cycles to learn that). Raw measured values ride on
+ * each line on purpose — the host archives them per MAC, so production-batch
+ * drift (sagging Vsys, a hot BME, an RTC that barely ticks) stays findable
+ * long after the boards shipped.
+ *
+ * Deliberately read-only towards device state: no NVS writes (same rule as
+ * `wd test` — a factory command must never touch production latches), no
+ * event-log records, no RTC set. A factory-fresh PCF2131 legitimately reports
+ * OSF=1 until provisioning first sets the time, so OSF is reported, never
+ * failed on — the tick test below is the real oscillator check. The only side
+ * effect is the status LED left ON at the end, so the operator can confirm it
+ * and the host tool switches it back off (`red 0`). */
+
+/* Enough to span several littlefs cache lines without noticeably slowing the
+ * station cycle; the pattern (not the size) is what catches corruption. */
+#define SELFTEST_FS_PROBE_BYTES   1024U
+/* Big enough that a PSRAM data/address-line fault can't hide inside one CPU
+ * cache line, small enough to always fit even on a fragmented boot heap. */
+#define SELFTEST_PSRAM_PROBE_BYTES (256U * 1024U)
+/* N16R2 carries 2 MiB; heap_caps total comes in just under after reserved
+ * regions, so gate on 1 MiB — low enough for overhead, high enough that a
+ * wrongly assembled no-PSRAM module (plain N16) can never pass. */
+#define SELFTEST_PSRAM_MIN_BYTES  (1024U * 1024U)
+
+static int64_t selftest_now_ms(void)
+{
+    return (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static bool selftest_identity(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const char *mac = device_commands_get_mac();
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    uint32_t flash_bytes = 0;
+    const esp_err_t ferr = esp_flash_get_size(NULL, &flash_bytes);
+
+    /* MAC is the log's primary key at the station; a board that cannot state
+     * it is untestable. Flash size is read from the live chip (not sdkconfig)
+     * so a wrong flash part shows up here as flash_mb != 16. */
+    const bool pass = (mac != NULL && mac[0] != '\0') && (ferr == ESP_OK);
+    printf("TEST identity %s mac=%s chip_rev=%u cores=%u flash_mb=%u t=%lldms\r\n",
+           pass ? "PASS" : "FAIL",
+           (mac && mac[0]) ? mac : "unavail",
+           (unsigned)chip.revision, (unsigned)chip.cores,
+           (unsigned)(flash_bytes / (1024U * 1024U)),
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_psram(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const size_t total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    bool rw_ok = false;
+
+    if (total > 0) {
+        uint8_t *buf = heap_caps_malloc(SELFTEST_PSRAM_PROBE_BYTES, MALLOC_CAP_SPIRAM);
+        if (buf != NULL) {
+            /* Index-derived pattern (not a constant fill) so stuck or crossed
+             * data/address lines can't echo the expected value back. */
+            for (size_t i = 0; i < SELFTEST_PSRAM_PROBE_BYTES; ++i) {
+                buf[i] = (uint8_t)((i * 31U) ^ (i >> 8));
+            }
+            rw_ok = true;
+            for (size_t i = 0; i < SELFTEST_PSRAM_PROBE_BYTES; ++i) {
+                if (buf[i] != (uint8_t)((i * 31U) ^ (i >> 8))) {
+                    rw_ok = false;
+                    break;
+                }
+            }
+            heap_caps_free(buf);
+        }
+    }
+
+    const bool pass = (total >= SELFTEST_PSRAM_MIN_BYTES) && rw_ok;
+    printf("TEST psram %s size=%u rw=%s t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", (unsigned)total, rw_ok ? "ok" : "fail",
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+/* Write/readback/delete one probe file at the root of `mount`. Proves the
+ * whole VFS→littlefs→flash chain, not just that the mount registered. */
+static bool selftest_fs_rw(const char *mount)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "%s/selftest.tmp", mount);
+
+    uint8_t *buf = malloc(SELFTEST_FS_PROBE_BYTES);
+    if (buf == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < SELFTEST_FS_PROBE_BYTES; ++i) {
+        buf[i] = (uint8_t)(i * 131U + 7U);
+    }
+
+    bool ok = false;
+    FILE *f = fopen(path, "wb");
+    if (f != NULL) {
+        ok = fwrite(buf, 1, SELFTEST_FS_PROBE_BYTES, f) == SELFTEST_FS_PROBE_BYTES;
+        ok = (fclose(f) == 0) && ok;
+    }
+    if (ok) {
+        ok = false;
+        f = fopen(path, "rb");
+        if (f != NULL) {
+            uint8_t rd[64];
+            size_t verified = 0;
+            ok = true;
+            while (verified < SELFTEST_FS_PROBE_BYTES && ok) {
+                const size_t n = fread(rd, 1, sizeof(rd), f);
+                if (n == 0) {
+                    ok = false;
+                    break;
+                }
+                if (memcmp(rd, buf + verified, n) != 0) {
+                    ok = false;
+                }
+                verified += n;
+            }
+            ok = ok && (verified == SELFTEST_FS_PROBE_BYTES);
+            fclose(f);
+        }
+    }
+    remove(path);   /* best-effort either way; a stale probe file is harmless */
+    free(buf);
+    return ok;
+}
+
+static bool selftest_littlefs_mount(const char *test_name, const char *mount,
+                                    const char *label)
+{
+    const int64_t t0 = selftest_now_ms();
+    size_t total = 0, used = 0;
+    const bool info_ok = esp_littlefs_info(label, &total, &used) == ESP_OK;
+    /* info_ok already implies the partition exists under its load-bearing
+     * label AND mounted — a mis-flashed partition table dies right here. */
+    const bool rw_ok = info_ok && selftest_fs_rw(mount);
+
+    printf("TEST %s %s mounted=%d total=%u used=%u rw=%s t=%lldms\r\n",
+           test_name, (info_ok && rw_ok) ? "PASS" : "FAIL",
+           info_ok ? 1 : 0, (unsigned)total, (unsigned)used,
+           rw_ok ? "ok" : "fail",
+           (long long)(selftest_now_ms() - t0));
+    return info_ok && rw_ok;
+}
+
+/* No-arg wrappers so both mounts fit the suite's function-pointer table. */
+static bool selftest_littlefs_evstore(void)
+{
+    return selftest_littlefs_mount("evstore", EVSTORE_MOUNT, EVSTORE_PARTITION);
+}
+
+static bool selftest_littlefs_script(void)
+{
+    return selftest_littlefs_mount("littlefs", "/littlefs", "littlefs");
+}
+
+static bool selftest_nvs(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    nvs_stats_t st = {0};
+    /* Read-only: stats prove the default NVS partition initialized without
+     * writing a byte (identity/provisioning data must survive this test). */
+    const bool pass = nvs_get_stats(NULL, &st) == ESP_OK;
+    printf("TEST nvs %s used=%u free=%u t=%lldms\r\n",
+           pass ? "PASS" : "FAIL",
+           (unsigned)st.used_entries, (unsigned)st.free_entries,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_i2c(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    bool found_chg = false, found_rtc = false, found_bme = false;
+    int extra = 0;
+    bool bus_ok = false;
+
+    i2c_port_t port = I2C_NUM_MAX;
+    if (i2c_bus_get_port(&port) == ESP_OK &&
+        i2c_bus_lock(CLI_I2C_SCAN_LOCK_TIMEOUT_TICKS) == ESP_OK) {
+        bus_ok = true;
+        for (uint8_t addr = CLI_I2C_SCAN_FIRST_ADDR; addr <= CLI_I2C_SCAN_LAST_ADDR; ++addr) {
+            if (cli_i2c_probe_locked(port, addr) != ESP_OK) {
+                continue;
+            }
+            if (addr == MP2731_I2C_ADDR) {
+                found_chg = true;
+            } else if (addr == CLI_RTC_I2C_ADDR) {
+                found_rtc = true;
+            } else if (addr == CLI_BME280_ADDR_PRIMARY ||
+                       addr == CLI_BME280_ADDR_SECONDARY) {
+                /* SDO strapping decides which of the two — either is fine. */
+                found_bme = true;
+            } else {
+                /* An unknown ACK is reported, not failed: solder bridges can
+                 * ghost-ACK, but so can a future board rev's new part — the
+                 * station log keeps the count either way. */
+                ++extra;
+            }
+        }
+        (void)i2c_bus_unlock();
+    }
+
+    const bool pass = bus_ok && found_chg && found_rtc && found_bme;
+    printf("TEST i2c %s bus=%s mp2731=%d rtc=%d bme280=%d extra=%d t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", bus_ok ? "ok" : "fail",
+           found_chg ? 1 : 0, found_rtc ? 1 : 0, found_bme ? 1 : 0, extra,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_rtc(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const bool ready = pcf2131tfy_rtc_is_ready();
+    bool osf = false;
+    (void)pcf2131tfy_rtc_get_oscillator_stopped(&osf);
+
+    /* The oscillator check that matters: two reads > 1 s apart must differ.
+     * A dead 32 kHz crystal passes a plain register read but never ticks. */
+    time_t t1 = 0, t2 = 0;
+    const bool r1 = cmd_read_rtc(&t1).status == ESP_OK;
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    const bool r2 = cmd_read_rtc(&t2).status == ESP_OK;
+    const bool tick_ok = r1 && r2 && (t2 > t1);
+
+    const bool pass = ready && tick_ok;
+    printf("TEST rtc %s ready=%d osf=%d tick=%s epoch=%lld t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", ready ? 1 : 0, osf ? 1 : 0,
+           tick_ok ? "ok" : "fail", (long long)t2,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_power(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    power_reading_t pw = {0};
+    const bool read_ok = cmd_read_power(&pw).status == ESP_OK;
+
+    /* Vsys powers the chip that is running this test, so a sane range is a
+     * hard requirement; Vbat/Vin are reported only — the station may test
+     * with no battery fitted, and USB alone is a legitimate power source. */
+    const bool vsys_ok = read_ok && pw.system_mv >= 2500 && pw.system_mv <= 5800;
+
+    const bool pass = read_ok && vsys_ok;
+    printf("TEST power %s read=%s vbat_mv=%u vin_mv=%u vsys_mv=%u vbus=%d t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", read_ok ? "ok" : "fail",
+           (unsigned)pw.battery_mv, (unsigned)pw.input_mv, (unsigned)pw.system_mv,
+           pw.input_present ? 1 : 0,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_bme280(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    float temp = 0, hum = 0, pres = 0;
+    const bool read_ok = cmd_read_env(&temp, &hum, &pres).status == ESP_OK;
+
+    /* Bounds catch a soldered-but-damaged part answering garbage: indoor
+     * assembly floor conditions, generous on temperature for a board still
+     * warm from reflow/handling. Pressure in Pa (cmd_read_env contract). */
+    const bool sane = read_ok &&
+                      temp > 5.0f && temp < 45.0f &&
+                      hum >= 0.0f && hum <= 100.0f &&
+                      pres > 85000.0f && pres < 110000.0f;
+
+    const bool pass = read_ok && sane;
+    printf("TEST bme280 %s read=%s temp_c=%.2f hum_pct=%.1f pres_pa=%.0f t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", read_ok ? "ok" : "fail",
+           (double)temp, (double)hum, (double)pres,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_led_on(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    /* Same drive level as `red 1`. PASS here means only that the firmware
+     * could command the LED; whether it actually lit is the operator's call,
+     * recorded by the host tool (which also sends `red 0` afterwards). */
+    const bool pass = cmd_set_rgb(5, 0, 0).status == ESP_OK;
+    printf("TEST led %s state=on t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static int cli_cmd_selftest(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: selftest\r\n");
+        return 1;
+    }
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    const char *mac = device_commands_get_mac();
+    printf("SELFTEST BEGIN fw=%s mac=%s\r\n",
+           app->version, (mac && mac[0]) ? mac : "unavail");
+
+    int passed = 0, failed = 0;
+    /* Function-pointer table keeps the never-abort rule structural: adding a
+     * test cannot accidentally early-return past the ones after it. */
+    static bool (*const tests[])(void) = {
+        selftest_identity,
+        selftest_psram,
+        selftest_littlefs_evstore,
+        selftest_littlefs_script,
+        selftest_nvs,
+        selftest_i2c,
+        selftest_rtc,
+        selftest_power,
+        selftest_bme280,
+        selftest_led_on,   /* keep last: leaves the LED on for the operator */
+    };
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
+        if (tests[i]()) {
+            ++passed;
+        } else {
+            ++failed;
+        }
+    }
+
+    printf("SELFTEST %s passed=%d failed=%d fw=%s mac=%s\r\n",
+           failed == 0 ? "PASS" : "FAIL", passed, failed,
+           app->version, (mac && mac[0]) ? mac : "unavail");
+    return failed == 0 ? 0 : 1;
 }
 
 static int cli_cmd_ping_uart(int argc, char **argv)
@@ -1592,6 +1944,11 @@ static esp_err_t cli_register_commands(void)
         .help = "scan the shared I2C bus for responding 7-bit addresses",
         .func = cli_cmd_i2cscan,
     };
+    static const esp_console_cmd_t selftest_cmd = {
+        .command = "selftest",
+        .help = "factory PCBA test: TEST lines + SELFTEST verdict; leaves LED on (red 0 to clear)",
+        .func = cli_cmd_selftest,
+    };
     static const esp_console_cmd_t ping_uart_cmd = {
         .command = "ping_uart",
         .help    = "ping_uart <0-3>  check if AMBIT sensor on channel is connected",
@@ -1760,6 +2117,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&i2cscan_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&selftest_cmd);
     if (err != ESP_OK) {
         return err;
     }

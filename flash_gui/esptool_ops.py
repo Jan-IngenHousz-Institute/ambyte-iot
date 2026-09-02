@@ -8,9 +8,9 @@ Three entry points:
   flash_images(port, images, ...)       full flash: release images + nvs.bin
   write_nvs(port, nvs_path)             provision-only rewrite at 0x9000
 
-Each opens its own esptool session (detect → stub → attach → op → hard reset),
-because the ESP32-S3 native USB-Serial-JTAG re-enumerates on reset — holding a
-connection across steps is what breaks, not reconnecting.
+Each opens its own esptool session (detect → stub → attach → op → watchdog
+reset), because the ESP32-S3 native USB-Serial-JTAG re-enumerates on reset —
+holding a connection across steps is what breaks, not reconnecting.
 
 A failed/interrupted write_flash leaves the chip in the ROM/stub bootloader,
 which is exactly the re-flashable state the retry path needs — no cleanup is
@@ -51,6 +51,19 @@ def _close_port(esp) -> None:
             close()
         except Exception:
             pass
+
+
+def _reset_to_app(esp) -> None:
+    """Boot the app after a session — via the software watchdog, NEVER the RTS
+    line. On Windows usbser the RTS pulse of a classic hard reset re-arms the
+    S3's emulated download strap, so the chip wakes in the ROM downloader and
+    sits silent instead of booting (HW-verified 2026-08-25; the '180 s console
+    timeout' failure). Falls back to RTS only if the watchdog path itself
+    errors (e.g. secure download mode, where esptool does the same)."""
+    try:
+        reset_chip(esp, "watchdog-reset")
+    except Exception:
+        reset_chip(esp, "hard-reset")
 
 
 class EsptoolError(RuntimeError):
@@ -94,7 +107,7 @@ def _session(port: str, baud: int):
                       connect_attempts=CONNECT_ATTEMPTS)
     if esp.CHIP_NAME.lower().replace("-", "") != "esp32s3":
         try:
-            reset_chip(esp, "hard-reset")
+            _reset_to_app(esp)
         finally:
             _close_port(esp)
         raise EsptoolError(
@@ -121,7 +134,7 @@ def read_mac(port: str, log=None) -> str:
                 mac = esp.read_mac("BASE_MAC")
             finally:
                 try:
-                    reset_chip(esp, "hard-reset")
+                    _reset_to_app(esp)
                 finally:
                     _close_port(esp)
     except EsptoolError:
@@ -174,7 +187,7 @@ def _write(port: str, images: list[tuple[int, Path]],
                             pass
             finally:
                 try:
-                    reset_chip(esp, "hard-reset")
+                    _reset_to_app(esp)
                 finally:
                     _close_port(esp)
     except EsptoolError:
