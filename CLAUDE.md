@@ -18,7 +18,8 @@ Databricks `open_jii_dev.centrum.clean_data`.
   tzdata (never hand-edit them; `tests/test_timezone_config.py` asserts freshness)
 - Serial console: 115200 on `/dev/ttyACM0` (USB-JTAG; opening the port can reset the device).
   Useful CLI: `status`, `netwd [test]`, `inflight`, `evlog`, `cfg`, `wifi_join <ssid> <pass>`,
-  `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`
+  `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`,
+  `selftest` (factory PCBA test; host runner: `python -m flash_gui.factory_test`)
 
 ## Architecture (delivery pipeline invariants — do not break)
 

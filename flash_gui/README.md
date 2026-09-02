@@ -172,6 +172,40 @@ device** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
 RTC, selected Lua script).
 
+## Factory PCBA flash + test (`factory_test`)
+
+Separate from onboarding: one CLI invocation per freshly assembled board. It
+flashes the firmware, then drives the firmware's `selftest` console command
+(identity, PSRAM, both internal littlefs mounts, NVS, I2C population, RTC
+tick, MP2731 power rails, BME280, LED) and archives the result. The test
+intelligence is firmware-side; this runner flashes, connects, parses, asks
+the operator whether the LED lit, and logs.
+
+```
+python -m flash_gui.factory_test [--fw latest|BUILD_DIR] [--no-flash]
+                                 [--port COM7] [--logdir factory_logs]
+                                 [--operator NAME] [--station ID] [--no-led]
+```
+
+With one board plugged in, no arguments are needed: the newest published
+firmware release is downloaded (then cached), the single Espressif USB-JTAG
+port is auto-detected (the tool also waits if the board is plugged in after
+starting), the release images are written, and the console is awaited through
+the S3's boot-time re-enumeration. Flashing writes only bootloader, partition
+table, otadata and app — **never NVS**, so identity/provisioning survives a
+retest and a fresh PCBA simply boots unprovisioned (the selftest needs no
+network). `--fw .pio/build/esp32-s3-devkitm-1` flashes a local build instead
+(any directory with a `flasher_args.json`); `--no-flash` skips straight to
+testing whatever is on the board.
+
+Each run writes one JSON file (parsed tests, raw measured values, flashed
+release tag, the verbatim serial transcript) plus one appended row in
+`results.csv`; nothing is ever overwritten — a retest is a new row. The LED
+is left ON by the firmware, confirmed by the operator (recorded as attested,
+skippable with `--no-led` for unattended runs), then switched off. Exit code:
+0 = board PASS, 1 = board FAIL, 2 = the run could not complete (flash or
+connection failure).
+
 ## What one procedure does
 
 1. **Pre-flash check** — 2 s console probe (one retry) for a running ambyte
