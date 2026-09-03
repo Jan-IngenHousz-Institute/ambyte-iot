@@ -47,9 +47,10 @@ class AmbitAnnouncementTest(unittest.TestCase):
         self.assertNotIn("nvs_flash", cmake)
         self.assertIn("ambit_announcement_store_port_t announcement_store", header)
         self.assertIn("ambit_announcement_init", source)
-        self.assertIn("ambit_announcement_commit", source)
+        self.assertIn("ambit_announcement_stage", source)
+        self.assertIn("ambit_announcement_ack", source)
         self.assertLess(source.index("s_cfg.store_event(&d)"),
-                        source.index("ambit_announce_persist(announce_slot, e)"))
+                        source.index("ambit_announce_stage(announce_slot, e, mid)"))
         self.assertIn("ambit_announcement_nvs_port()", app)
 
     def test_domain_component_remains_header_only(self) -> None:
