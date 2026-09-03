@@ -1,6 +1,6 @@
 # Ambyte IoT
 
-ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on the SD card, and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. The measurement schedule is a **Lua script on the SD card** (`/sdcard/main.lua`) — no reflash to change what/when the device measures. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
+ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. The measurement schedule is a **Lua script** (`/littlefs/main.lua`, delivered by flashing or MQTT `script_update`; an SD card carrying `main.lua` is the manual offline-recovery source) — no reflash to change what/when the device measures. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
 
 Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on the host from `.env` + a `device_certs/<bundle>/` PEM set and flashed into the NVS partition next to the firmware — **no BLE companion app, no runtime provisioning round-trip** (BLE provisioning is deprecated/compiled out).
 
@@ -16,11 +16,11 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **External sensor** | AMBIT (multispeq-style), ESP8685 / ESP32-C3, up to 4 channels over a shared UART/FFC link |
 | **Onboard sensors** | BME280 (T/H/P), PCF2131 RTC, MP2731 battery charger / power-path (all I2C) |
 | **Transport** | MQTT v5 over mutual TLS → AWS IoT Core (device cert + private key from NVS) |
-| **Storage** | Append-only `event_log` on FAT/SD (`/sdcard/events/`); read cursor + `next_id` high-water mark in NVS. **SQLite has been removed.** |
-| **Scripting** | Lua 5.4 VM running `/sdcard/main.lua`; hot-updatable over MQTT |
+| **Storage** | Append-only `event_log` on internal littlefs (`/evstore/events/`, the 9.4 MiB `storage` partition); read cursor + `next_id` HWM in NVS; SD = bulk archive (`/sdcard/archive/`) + logs + AMBIT firmware. **SQLite has been removed.** |
+| **Scripting** | Lua 5.4 VM running `/littlefs/main.lua`; hot-updatable over MQTT |
 | **Power** | Radio publishing gated on external power (MP2731); DFS clock scaling 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
-| **License** | CERN Open Hardware Licence Version 2 — Strongly Reciprocal (see [LICENSE](LICENSE)) |
+| **License** | Firmware and hardware: CERN-OHL-S v2 ([LICENSE](LICENSE)). Host-side software: GPL-3.0 ([LICENSE.GPL-3.0](LICENSE.GPL-3.0)) |
 
 ---
 
@@ -40,11 +40,13 @@ cp .env.example .env && $EDITOR .env          # Wi-Fi creds, MQTT URI, topic roo
 pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 
-# 4. Put a measurement schedule on the SD card
+# 4. Seed a measurement schedule (first flash only): put main.lua on an SD card —
+#    the device imports it into its internal home (/littlefs/main.lua) at boot and
+#    no longer needs the card. Subsequent updates go over MQTT (script_update).
 cp lua/main.lua  /path/to/AMBYTE_SD/main.lua
 ```
 
-The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/sdcard/main.lua`, stores measurements to the SD `event_log`, and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock.
+The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/littlefs/main.lua`, stores measurements to the internal `event_log` (`/evstore`), and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock. Synced records are bulk-archived to the SD card (when present) once per 1000 stores.
 
 ---
 
@@ -88,6 +90,8 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 - **sync_runner** — the only MQTT publisher; also emits the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
 - **lua_runner** — runs `/sdcard/main.lua` once, self-deletes on return/stop, restarts on SD reinsert. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement isn't preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
+- **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
+- **sd_keeper** — the only event-pipeline SD writer: migrates a legacy `/sdcard/events` backlog into the internal store (post-OTA, oldest-first, duplicate-safe) and bulk-archives fully-synced files to `/sdcard/archive/arc-<first_id>.log` once per 1000 stores.
 - **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap).
 - **mqtt_client / wifi** run on the esp-mqtt / esp-netif event loops.
 
@@ -180,10 +184,30 @@ Missing required fields cause a loud non-zero exit listing them — never a sile
 
 ### Timezone contract and legacy migration
 
-`AMBYTE_TIMEZONE` must be one of the IANA zones supported by
-[`components/timezone/timezone.c`](components/timezone/timezone.c); the default
-is `Europe/Amsterdam`. Provisioning fails closed on an unsupported value. The
-runtime `cfg set timezone <value>` command applies the same validation.
+`AMBYTE_TIMEZONE` must be an IANA zone name present in the firmware's compiled
+zone table, [`components/timezone/tz_zone_table.inc`](components/timezone/tz_zone_table.inc);
+the default is `Europe/Amsterdam`. Provisioning fails closed on an unsupported
+value, and the runtime `cfg set timezone <value>` command applies the same
+validation (`ESP_ERR_INVALID_ARG` on an unknown name).
+
+Since firmware 1.10.1 that table holds the **entire IANA database** — every
+canonical name plus its historical aliases (`Asia/Calcutta`, `US/Pacific`) —
+generated from tzdata by [`tools/gen_tz_table.py`](tools/gen_tz_table.py) and
+checked in (~17 KB of rodata). Before that it was a hand-written Europe-only
+list, so on-boarding a board from a PC set to, say, `America/La_Paz` failed
+verification with no repair path. Regenerate after a tzdata release that changes
+a deployment's rules:
+
+```bash
+python tools/gen_tz_table.py     # rewrites the .inc + flash_gui/tz_zone_table.py
+python -m pytest tests/test_timezone_config.py -q
+```
+
+Names are stored exactly as given: deprecated aliases are accepted but never
+rewritten to their canonical target, so provisioning read-back comparisons hold.
+A zone whose POSIX rule libc refuses is detected at apply time and scheduled on
+the zone's prevailing fixed offset instead (logged as an error), rather than
+silently reverting to the CEST default.
 
 Firmware v1.6.1 and later migrates the historical JII shorthand `AMT` to
 `Europe/Amsterdam` in NVS at boot. It also maps `Z` to `UTC` and trims surrounding
@@ -229,7 +253,8 @@ uv run python tools/build_nvs_image.py --out ./nvs.bin
 Stress-testing 4 AMBIT channels every few seconds corrupted the SQLite events DB on consumer microSD cards (SQLite's in-place page/header rewrites are hostile to FATFS), and recovery leaked into an OOM spiral that killed MQTT. The workload is a store-and-forward FIFO, not relational queries. So SQLite was replaced — behind the same `persistence_port.h` interface — by [components/event_log](components/event_log) (a prior TXT-file logger had run for months on the same cards without corruption).
 
 - **On-disk format v2:** rotating tab-delimited files `/sdcard/events/ev-NNNNNN.log` (rolled past 256 KiB), one newline-terminated record per event, 9 fields: `measure_id · channel · device · tag · cmd_raw · start_ms · end_ms · metadata · payload`.
-- **Durability:** writes are appends only; read cursor + `next_id` high-water mark live in NVS. Periodic flush (every 1500 ms / 8 records), not per-event fsync. A torn final record is skipped on read (no boot-time repair); a short write is rolled back with `ftruncate`. Drained rotated files are deleted.
+- **Durability:** the store is littlefs on the internal 9.4 MiB `storage` partition (`/evstore`) — copy-on-write, power-loss-safe: a brownout can lose at most the ≤8 records since the last batched flush (every 8 records / 1500 ms), never tear framing or the filesystem. Read cursor + `next_id` HWM live in NVS. Fully-synced rotated files are **retained** for the bulk SD archive and **evicted oldest-first when space runs low** — unsynced records always win; writes are refused only when nothing synced remains to evict.
+- **SD card role:** bulk archive (`/sdcard/archive/`, one burst per 1000 stores), WARN/ERROR logs, AMBIT firmware images, and offline `main.lua` recovery. A dead, absent, or corrupted card no longer affects measurement or publishing.
 - **IDs:** `measure_id` is monotonic int64, HWM persisted to NVS every 64 ids and **re-seeded above the SD log's max on boot** (NVS is wiped on every reflash, but the SD log survives, and openJII dedupes on `(device_id, measure_id)`).
 
 ### Inspecting / decoding telemetry
@@ -299,7 +324,7 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 [components/script_update](components/script_update), dispatched by `command_router`:
 
-- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. The immutable Lua release manifest contains this ready-to-publish object.
+- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable Lua release catalog has a manifest containing this ready-to-publish object.
 - Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
 - `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
 - Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
@@ -316,13 +341,13 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ## SD card
 
-- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). The canonical released source is [lua/main.lua](lua/main.lua). For a manual iteration, copy it to the card and reset; for a traceable rollout, use the independently versioned Lua release manifest.
+- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). Released sources live in the [Lua catalog](lua): `main.lua` is the default and `legacy_1Hz_spec.lua` is the opt-in cmd 31 experiment. For a manual iteration, copy the chosen source to the card as `main.lua` and reset; for a traceable rollout, select it in the independently versioned Lua deploy workflow.
 - Behaviour when the script is missing: no SD mounted → Lua task skipped, CLI+MQTT continue; SD mounted but no `main.lua` → task starts, fails the load, exits cleanly.
 - **Hot pull/reinsert recovery** ([components/sd_card](components/sd_card)): no card-detect pin, so a monitor polls `sdmmc_get_status` (CMD13, 2000 ms) plus a **lock-free error-driven loss latch** (writers call `sdcard_report_io_error/ok` and gate on `sdcard_io_lost()`) — needed because CMD13 alone loses the race to a task stuck in a multi-second failing transfer (priority inversion, the historic sdmmc `0x107` flood). On loss the Lua runner stops and `event_log_on_sd_lost` fires; on reinsert `event_log_on_sd_restored` runs and Lua restarts. `sd_logger` buffers WARN/ERROR in a RAM ring while the card is absent and flushes on remount.
 
 Lua binding tables exposed to scripts (see the `luaL_Reg` arrays in `lua_runner.c`): `device.*` (rtc/status/power/sd_ready/sleep_ms/log/PWM/…), `uart.*` (raw transport), `db.*` (`store_event`/`next_id`, for custom/derived events), `ambit.*` (ping/spec/leaf_temp/run/trigger/poll/fetch/run_mpf/set_gains/set_currents/blink/calibrate/actinic/set_metadata), and `sync.*` (interval/clock/weekly/sunrise-sunset scheduling from lat/lon + tz). The old `mqtt` Lua table was removed — scripts no longer publish.
 
-The production field schedule is [lua/main.lua](lua/main.lua). The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
+The production field schedule is [lua/main.lua](lua/main.lua), with [lua/legacy_1Hz_spec.lua](lua/legacy_1Hz_spec.lua) available for the selected legacy-sensor cohort. The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
 
 ---
 
@@ -386,7 +411,8 @@ ambyteiot_ambit_demo.ipynb / ambit-demo-workbook.jii  # telemetry decode/analysi
 .env / .env.example  # provisioning defaults
 platformio.ini       # PlatformIO env + pre: hook
 partitions.csv       # dual-OTA 16 MB layout
-LICENSE              # CERN-OHL-S v2
+LICENSE              # CERN-OHL-S v2 (hardware design + firmware)
+LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 ```
 
 > **Legacy / unused:** `littlefs` is mounted but no measurement data is written there (the event store is on FAT/SD); `spike_log` is a dev-only SD soak gated behind the `SPIKE_LOG` build flag. There is **no** `sqlite3` or `persistence` component in the built firmware — neither is present in the tree.
@@ -468,4 +494,23 @@ records), `evlog`/`inflight`/`netwd` CLI, dropped the derived `fluo` payload key
 
 ## License
 
-This project is released under the **CERN Open Hardware Licence Version 2 — Strongly Reciprocal (CERN-OHL-S v2)**. See [LICENSE](LICENSE) for the full text.
+This repository is dual-licensed, split by what the code is rather than where it sits:
+
+| Scope | Licence | Text |
+| --- | --- | --- |
+| Hardware design and firmware: `components/`, `main/`, `lua/`, `test/`, `CMakeLists.txt`, `partitions.csv`, `platformio.ini`, `sdkconfig*` | CERN Open Hardware Licence Version 2, Strongly Reciprocal (CERN-OHL-S v2) | [LICENSE](LICENSE) |
+| Host-side software: `flash_gui/`, `tools/`, `tests/`, `release.config.js` | GNU General Public License v3.0 | [LICENSE.GPL-3.0](LICENSE.GPL-3.0) |
+
+CERN-OHL-S is a hardware licence, so it does not cleanly govern the host-side
+Python and JavaScript. GPL-3.0 matches [openJII](https://github.com/Jan-IngenHousz-Institute/open-jii)
+and keeps the same strong reciprocity as CERN-OHL-S v2, which CERN designed as
+the hardware analogue of the GPL.
+
+Every GPL-3.0 source file carries an `SPDX-License-Identifier` header, so the
+split survives files being moved or copied out of the repo. The one exception is
+`flash_gui/vendor/nvs_partition_gen.py`, which is Espressif's and stays
+Apache-2.0 under its own SPDX header.
+
+The distributed `flash_gui` executables bundle [esptool](https://github.com/espressif/esptool)
+(GPL-2.0-or-later) and `certifi` (MPL-2.0), so the shipped binaries are covered
+by GPL-3.0 as a combined work.

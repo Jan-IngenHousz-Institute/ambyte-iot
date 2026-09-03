@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Read an ambyte board's Wi-Fi STA MAC over the USB-C console.
 
 The firmware exposes an esp_console REPL (prompt `ambyte> `) on the ESP32-S3's

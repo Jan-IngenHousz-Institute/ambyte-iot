@@ -4,3 +4,4 @@ esptool>=5.0
 pyserial>=3.5
 tzlocal>=5.0
 certifi>=2024.7.4
+littlefs-python>=0.19

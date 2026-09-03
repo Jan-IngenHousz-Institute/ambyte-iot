@@ -1,20 +1,29 @@
+#include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include "mbedtls/base64.h"
 
 #include "CLI.h"
 #include "driver/i2c.h"
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
 #include "esp_console.h"
+#include "esp_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "ambit_ota.h"
 #include "ambit_flash.h"
@@ -25,18 +34,28 @@
 #include "uart_sensors.h"
 #include "uart_stream_cli_support.h"
 #include "lua_runner.h"
+#include "script_update.h"
 #include "sync_runner.h"
 #include "event_log.h"
 #include "time_sync.h"
 #include "timezone.h"
 #include "i2c_bus.h"
+#include "mp2731.h"
 #include "pcf2131tfy_rtc_api.h"
+#include "sd_card.h"
 #include "sd_logger.h"
 #include "wifi_manager.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
 #include "esp_heap_trace.h"
 #endif
+
+/* `lua put` framing. max_cmdline_length is 512 (see cli_start), so one chunk
+ * decodes to at most 384 bytes; the buffer is sized for the whole line. */
+#define LUA_PUT_CHUNK_MAX 512
+/* A runaway push must not fill the internal partition. The largest released
+ * script today is legacy_1Hz_spec.lua at ~15 KB. */
+#define LUA_PUT_TOTAL_MAX (64U * 1024U)
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
@@ -149,6 +168,13 @@ static int cli_cmd_status(int argc, char **argv)
     } else {
         printf(" - DB: %s\r\n", dres.message);
     }
+
+    /* SD card: archive/log/recovery roles only since the event store and
+     * main.lua moved to internal flash — an absent card is informational,
+     * not a failure. */
+    printf(" - SD card: %s\r\n",
+           sdcard_is_mounted() ? "mounted (archive/logs/AMBIT OTA only)"
+                               : "absent (OK — Lua and the event store are internal)");
 
     /* Battery / input power (MP2731 charger). */
     power_reading_t pw;
@@ -415,6 +441,352 @@ static int cli_cmd_i2cscan(int argc, char **argv)
         CLI_BME280_ADDR_PRIMARY,
         found_bme_primary ? "yes" : "no");
     return 0;
+}
+
+/* ── selftest — factory PCBA acceptance test ────────────────────────────────
+ *
+ *
+ * One command the assembly-station host tool (flash_gui/factory_test.py)
+ * drives over USB to accept a freshly assembled board. Contract with that
+ * parser — hold these three lines stable across releases:
+ *   SELFTEST BEGIN fw=<ver> mac=<mac>
+ *   TEST <name> <PASS|FAIL> key=value ... t=<ms>ms     (one line per test)
+ *   SELFTEST <PASS|FAIL> passed=<n> failed=<n> fw=<ver> mac=<mac>
+ *
+ * Every test prints exactly one TEST line and the suite NEVER aborts early:
+ * the station needs the complete picture in one run (a board with two faults
+ * must not take two test cycles to learn that). Raw measured values ride on
+ * each line on purpose — the host archives them per MAC, so production-batch
+ * drift (sagging Vsys, a hot BME, an RTC that barely ticks) stays findable
+ * long after the boards shipped.
+ *
+ * Deliberately read-only towards device state: no NVS writes (same rule as
+ * `wd test` — a factory command must never touch production latches), no
+ * event-log records, no RTC set. A factory-fresh PCF2131 legitimately reports
+ * OSF=1 until provisioning first sets the time, so OSF is reported, never
+ * failed on — the tick test below is the real oscillator check. The only side
+ * effect is the status LED left ON at the end, so the operator can confirm it
+ * and the host tool switches it back off (`red 0`). */
+
+/* Enough to span several littlefs cache lines without noticeably slowing the
+ * station cycle; the pattern (not the size) is what catches corruption. */
+#define SELFTEST_FS_PROBE_BYTES   1024U
+/* Big enough that a PSRAM data/address-line fault can't hide inside one CPU
+ * cache line, small enough to always fit even on a fragmented boot heap. */
+#define SELFTEST_PSRAM_PROBE_BYTES (256U * 1024U)
+/* N16R2 carries 2 MiB; heap_caps total comes in just under after reserved
+ * regions, so gate on 1 MiB — low enough for overhead, high enough that a
+ * wrongly assembled no-PSRAM module (plain N16) can never pass. */
+#define SELFTEST_PSRAM_MIN_BYTES  (1024U * 1024U)
+
+static int64_t selftest_now_ms(void)
+{
+    return (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+static bool selftest_identity(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const char *mac = device_commands_get_mac();
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    uint32_t flash_bytes = 0;
+    const esp_err_t ferr = esp_flash_get_size(NULL, &flash_bytes);
+
+    /* MAC is the log's primary key at the station; a board that cannot state
+     * it is untestable. Flash size is read from the live chip (not sdkconfig)
+     * so a wrong flash part shows up here as flash_mb != 16. */
+    const bool pass = (mac != NULL && mac[0] != '\0') && (ferr == ESP_OK);
+    printf("TEST identity %s mac=%s chip_rev=%u cores=%u flash_mb=%u t=%lldms\r\n",
+           pass ? "PASS" : "FAIL",
+           (mac && mac[0]) ? mac : "unavail",
+           (unsigned)chip.revision, (unsigned)chip.cores,
+           (unsigned)(flash_bytes / (1024U * 1024U)),
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_psram(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const size_t total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    bool rw_ok = false;
+
+    if (total > 0) {
+        uint8_t *buf = heap_caps_malloc(SELFTEST_PSRAM_PROBE_BYTES, MALLOC_CAP_SPIRAM);
+        if (buf != NULL) {
+            /* Index-derived pattern (not a constant fill) so stuck or crossed
+             * data/address lines can't echo the expected value back. */
+            for (size_t i = 0; i < SELFTEST_PSRAM_PROBE_BYTES; ++i) {
+                buf[i] = (uint8_t)((i * 31U) ^ (i >> 8));
+            }
+            rw_ok = true;
+            for (size_t i = 0; i < SELFTEST_PSRAM_PROBE_BYTES; ++i) {
+                if (buf[i] != (uint8_t)((i * 31U) ^ (i >> 8))) {
+                    rw_ok = false;
+                    break;
+                }
+            }
+            heap_caps_free(buf);
+        }
+    }
+
+    const bool pass = (total >= SELFTEST_PSRAM_MIN_BYTES) && rw_ok;
+    printf("TEST psram %s size=%u rw=%s t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", (unsigned)total, rw_ok ? "ok" : "fail",
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+/* Write/readback/delete one probe file at the root of `mount`. Proves the
+ * whole VFS→littlefs→flash chain, not just that the mount registered. */
+static bool selftest_fs_rw(const char *mount)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "%s/selftest.tmp", mount);
+
+    uint8_t *buf = malloc(SELFTEST_FS_PROBE_BYTES);
+    if (buf == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < SELFTEST_FS_PROBE_BYTES; ++i) {
+        buf[i] = (uint8_t)(i * 131U + 7U);
+    }
+
+    bool ok = false;
+    FILE *f = fopen(path, "wb");
+    if (f != NULL) {
+        ok = fwrite(buf, 1, SELFTEST_FS_PROBE_BYTES, f) == SELFTEST_FS_PROBE_BYTES;
+        ok = (fclose(f) == 0) && ok;
+    }
+    if (ok) {
+        ok = false;
+        f = fopen(path, "rb");
+        if (f != NULL) {
+            uint8_t rd[64];
+            size_t verified = 0;
+            ok = true;
+            while (verified < SELFTEST_FS_PROBE_BYTES && ok) {
+                const size_t n = fread(rd, 1, sizeof(rd), f);
+                if (n == 0) {
+                    ok = false;
+                    break;
+                }
+                if (memcmp(rd, buf + verified, n) != 0) {
+                    ok = false;
+                }
+                verified += n;
+            }
+            ok = ok && (verified == SELFTEST_FS_PROBE_BYTES);
+            fclose(f);
+        }
+    }
+    remove(path);   /* best-effort either way; a stale probe file is harmless */
+    free(buf);
+    return ok;
+}
+
+static bool selftest_littlefs_mount(const char *test_name, const char *mount,
+                                    const char *label)
+{
+    const int64_t t0 = selftest_now_ms();
+    size_t total = 0, used = 0;
+    const bool info_ok = esp_littlefs_info(label, &total, &used) == ESP_OK;
+    /* info_ok already implies the partition exists under its load-bearing
+     * label AND mounted — a mis-flashed partition table dies right here. */
+    const bool rw_ok = info_ok && selftest_fs_rw(mount);
+
+    printf("TEST %s %s mounted=%d total=%u used=%u rw=%s t=%lldms\r\n",
+           test_name, (info_ok && rw_ok) ? "PASS" : "FAIL",
+           info_ok ? 1 : 0, (unsigned)total, (unsigned)used,
+           rw_ok ? "ok" : "fail",
+           (long long)(selftest_now_ms() - t0));
+    return info_ok && rw_ok;
+}
+
+/* No-arg wrappers so both mounts fit the suite's function-pointer table. */
+static bool selftest_littlefs_evstore(void)
+{
+    return selftest_littlefs_mount("evstore", EVSTORE_MOUNT, EVSTORE_PARTITION);
+}
+
+static bool selftest_littlefs_script(void)
+{
+    return selftest_littlefs_mount("littlefs", "/littlefs", "littlefs");
+}
+
+static bool selftest_nvs(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    nvs_stats_t st = {0};
+    /* Read-only: stats prove the default NVS partition initialized without
+     * writing a byte (identity/provisioning data must survive this test). */
+    const bool pass = nvs_get_stats(NULL, &st) == ESP_OK;
+    printf("TEST nvs %s used=%u free=%u t=%lldms\r\n",
+           pass ? "PASS" : "FAIL",
+           (unsigned)st.used_entries, (unsigned)st.free_entries,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_i2c(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    bool found_chg = false, found_rtc = false, found_bme = false;
+    int extra = 0;
+    bool bus_ok = false;
+
+    i2c_port_t port = I2C_NUM_MAX;
+    if (i2c_bus_get_port(&port) == ESP_OK &&
+        i2c_bus_lock(CLI_I2C_SCAN_LOCK_TIMEOUT_TICKS) == ESP_OK) {
+        bus_ok = true;
+        for (uint8_t addr = CLI_I2C_SCAN_FIRST_ADDR; addr <= CLI_I2C_SCAN_LAST_ADDR; ++addr) {
+            if (cli_i2c_probe_locked(port, addr) != ESP_OK) {
+                continue;
+            }
+            if (addr == MP2731_I2C_ADDR) {
+                found_chg = true;
+            } else if (addr == CLI_RTC_I2C_ADDR) {
+                found_rtc = true;
+            } else if (addr == CLI_BME280_ADDR_PRIMARY ||
+                       addr == CLI_BME280_ADDR_SECONDARY) {
+                /* SDO strapping decides which of the two — either is fine. */
+                found_bme = true;
+            } else {
+                /* An unknown ACK is reported, not failed: solder bridges can
+                 * ghost-ACK, but so can a future board rev's new part — the
+                 * station log keeps the count either way. */
+                ++extra;
+            }
+        }
+        (void)i2c_bus_unlock();
+    }
+
+    const bool pass = bus_ok && found_chg && found_rtc && found_bme;
+    printf("TEST i2c %s bus=%s mp2731=%d rtc=%d bme280=%d extra=%d t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", bus_ok ? "ok" : "fail",
+           found_chg ? 1 : 0, found_rtc ? 1 : 0, found_bme ? 1 : 0, extra,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_rtc(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    const bool ready = pcf2131tfy_rtc_is_ready();
+    bool osf = false;
+    (void)pcf2131tfy_rtc_get_oscillator_stopped(&osf);
+
+    /* The oscillator check that matters: two reads > 1 s apart must differ.
+     * A dead 32 kHz crystal passes a plain register read but never ticks. */
+    time_t t1 = 0, t2 = 0;
+    const bool r1 = cmd_read_rtc(&t1).status == ESP_OK;
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    const bool r2 = cmd_read_rtc(&t2).status == ESP_OK;
+    const bool tick_ok = r1 && r2 && (t2 > t1);
+
+    const bool pass = ready && tick_ok;
+    printf("TEST rtc %s ready=%d osf=%d tick=%s epoch=%lld t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", ready ? 1 : 0, osf ? 1 : 0,
+           tick_ok ? "ok" : "fail", (long long)t2,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_power(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    power_reading_t pw = {0};
+    const bool read_ok = cmd_read_power(&pw).status == ESP_OK;
+
+    /* Vsys powers the chip that is running this test, so a sane range is a
+     * hard requirement; Vbat/Vin are reported only — the station may test
+     * with no battery fitted, and USB alone is a legitimate power source. */
+    const bool vsys_ok = read_ok && pw.system_mv >= 2500 && pw.system_mv <= 5800;
+
+    const bool pass = read_ok && vsys_ok;
+    printf("TEST power %s read=%s vbat_mv=%u vin_mv=%u vsys_mv=%u vbus=%d t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", read_ok ? "ok" : "fail",
+           (unsigned)pw.battery_mv, (unsigned)pw.input_mv, (unsigned)pw.system_mv,
+           pw.input_present ? 1 : 0,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_bme280(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    float temp = 0, hum = 0, pres = 0;
+    const bool read_ok = cmd_read_env(&temp, &hum, &pres).status == ESP_OK;
+
+    /* Bounds catch a soldered-but-damaged part answering garbage: indoor
+     * assembly floor conditions, generous on temperature for a board still
+     * warm from reflow/handling. Pressure in Pa (cmd_read_env contract). */
+    const bool sane = read_ok &&
+                      temp > 5.0f && temp < 45.0f &&
+                      hum >= 0.0f && hum <= 100.0f &&
+                      pres > 85000.0f && pres < 110000.0f;
+
+    const bool pass = read_ok && sane;
+    printf("TEST bme280 %s read=%s temp_c=%.2f hum_pct=%.1f pres_pa=%.0f t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", read_ok ? "ok" : "fail",
+           (double)temp, (double)hum, (double)pres,
+           (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static bool selftest_led_on(void)
+{
+    const int64_t t0 = selftest_now_ms();
+    /* Same drive level as `red 1`. PASS here means only that the firmware
+     * could command the LED; whether it actually lit is the operator's call,
+     * recorded by the host tool (which also sends `red 0` afterwards). */
+    const bool pass = cmd_set_rgb(5, 0, 0).status == ESP_OK;
+    printf("TEST led %s state=on t=%lldms\r\n",
+           pass ? "PASS" : "FAIL", (long long)(selftest_now_ms() - t0));
+    return pass;
+}
+
+static int cli_cmd_selftest(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: selftest\r\n");
+        return 1;
+    }
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    const char *mac = device_commands_get_mac();
+    printf("SELFTEST BEGIN fw=%s mac=%s\r\n",
+           app->version, (mac && mac[0]) ? mac : "unavail");
+
+    int passed = 0, failed = 0;
+    /* Function-pointer table keeps the never-abort rule structural: adding a
+     * test cannot accidentally early-return past the ones after it. */
+    static bool (*const tests[])(void) = {
+        selftest_identity,
+        selftest_psram,
+        selftest_littlefs_evstore,
+        selftest_littlefs_script,
+        selftest_nvs,
+        selftest_i2c,
+        selftest_rtc,
+        selftest_power,
+        selftest_bme280,
+        selftest_led_on,   /* keep last: leaves the LED on for the operator */
+    };
+    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
+        if (tests[i]()) {
+            ++passed;
+        } else {
+            ++failed;
+        }
+    }
+
+    printf("SELFTEST %s passed=%d failed=%d fw=%s mac=%s\r\n",
+           failed == 0 ? "PASS" : "FAIL", passed, failed,
+           app->version, (mac && mac[0]) ? mac : "unavail");
+    return failed == 0 ? 0 : 1;
 }
 
 static int cli_cmd_ping_uart(int argc, char **argv)
@@ -1345,14 +1717,15 @@ static int cli_cmd_ambit_check(int argc, char **argv)
 static int cli_cmd_lua(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: lua <start|stop|status|exec <code...>>\r\n");
+        printf("Usage: lua <start|stop|status|release|install|begin|put|commit"
+               "|abort|exec>\r\n");
         return 1;
     }
     if (strcmp(argv[1], "start") == 0) {
         esp_err_t err = lua_runner_start();
         if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
         else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
-        else                              printf("started (loads /sdcard/main.lua)\r\n");
+        else                              printf("started (loads /littlefs/main.lua)\r\n");
         return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
@@ -1367,6 +1740,144 @@ static int cli_cmd_lua(int argc, char **argv)
     }
     if (strcmp(argv[1], "status") == 0) {
         printf("lua script: %s\r\n", lua_runner_is_running() ? "RUNNING" : "stopped");
+        return 0;
+    }
+    if (strcmp(argv[1], "release") == 0) {
+        script_identity_t identity;
+        esp_err_t err = script_update_get_identity(&identity);
+        if (err != ESP_OK) {
+            printf("lua release unavailable: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua release: sha256=%s version=%s built_against_fw=%s "
+               "installed_on_fw=%s verified=%s running=%s\r\n",
+               identity.sha256,
+               identity.version[0] ? identity.version : "-",
+               identity.built_against_fw[0] ? identity.built_against_fw : "-",
+               identity.installed_on_fw[0] ? identity.installed_on_fw : "-",
+               identity.release_metadata_verified ? "true" : "false",
+               lua_runner_is_running() ? "true" : "false");
+        return 0;
+    }
+    if (strcmp(argv[1], "install") == 0) {
+        if (argc != 7) {
+            printf("Usage: lua install <https-url> <sha256> <id> "
+                   "<script-version> <built-against-fw>\r\n");
+            return 1;
+        }
+        if (strncmp(argv[2], "https://", 8) != 0 || strlen(argv[3]) != 64) {
+            printf("lua install requires an HTTPS URL and 64-digit SHA-256\r\n");
+            return 1;
+        }
+        for (size_t i = 0; i < 64; i++) {
+            if (!isxdigit((unsigned char)argv[3][i])) {
+                printf("lua install SHA-256 must be hexadecimal\r\n");
+                return 1;
+            }
+        }
+        /* The GUI remains attached to this console and verifies the active
+         * identity, so use the in-place path: the existing script-update worker
+         * still stops Lua/MQTT, downloads + hashes + parses, atomically swaps,
+         * preserves .bak, then restarts Lua without another USB re-enumeration. */
+        esp_err_t err = script_update_url_request_immediate(
+            argv[2], argv[3], argv[4], false, argv[5], argv[6]);
+        if (err != ESP_OK) {
+            printf("lua install queue failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua install queued: id=%s\r\n", argv[4]);
+        return 0;
+    }
+    /* ── serial push: `lua begin` / `lua put` / `lua commit` / `lua abort` ──
+     * Lets the operator's PC stream a script down this console instead of the
+     * board fetching it over HTTPS, so onboarding needs no device network at all.
+     * Deliberately stateless between commands: each `put` opens, appends, closes
+     * and re-stats, so an abandoned push leaks no handle, and the reported total
+     * is the file itself rather than a counter that could disagree with it.
+     * Staging is on internal littlefs (SCRIPT_UPDATE_STAGING_PATH), so no SD
+     * gate: a missing archive card must not fail a serial push. */
+    if (strcmp(argv[1], "begin") == 0) {
+        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "wb");   /* truncates */
+        bool ok = (f != NULL);
+        if (ok) fclose(f);
+        if (!ok) {
+            printf("lua begin: cannot open %s\r\n", SCRIPT_UPDATE_STAGING_PATH);
+            return 1;
+        }
+        printf("lua begin: ready\r\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "put") == 0) {
+        if (argc != 3) {
+            printf("Usage: lua put <base64-chunk>\r\n");
+            return 1;
+        }
+        /* A 512-byte console line decodes to at most 384 bytes. */
+        unsigned char raw[LUA_PUT_CHUNK_MAX];
+        size_t olen = 0;
+        if (mbedtls_base64_decode(raw, sizeof raw, &olen,
+                                  (const unsigned char *)argv[2],
+                                  strlen(argv[2])) != 0) {
+            printf("lua put: invalid base64\r\n");
+            return 1;
+        }
+        long before = 0;
+        struct stat st;
+        if (stat(SCRIPT_UPDATE_STAGING_PATH, &st) != 0) {
+            printf("lua put: no staged file, run `lua begin` first\r\n");
+            return 1;
+        }
+        before = (long)st.st_size;
+        if ((size_t)before + olen > LUA_PUT_TOTAL_MAX) {
+            printf("lua put: refusing to exceed %u bytes\r\n", (unsigned)LUA_PUT_TOTAL_MAX);
+            return 1;
+        }
+        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "ab");
+        bool ok = (f != NULL) && fwrite(raw, 1, olen, f) == olen;
+        if (f != NULL) {
+            if (fflush(f) != 0) ok = false;
+            fclose(f);
+        }
+        long after = ok && stat(SCRIPT_UPDATE_STAGING_PATH, &st) == 0
+                     ? (long)st.st_size : -1;
+        if (!ok || after != before + (long)olen) {
+            printf("lua put: write failed\r\n");
+            return 1;
+        }
+        printf("lua put: %ld bytes\r\n", after);
+        return 0;
+    }
+    if (strcmp(argv[1], "commit") == 0) {
+        if (argc != 6) {
+            printf("Usage: lua commit <sha256> <id> <script-version> "
+                   "<built-against-fw>\r\n");
+            return 1;
+        }
+        if (strlen(argv[2]) != 64) {
+            printf("lua commit requires a 64-digit SHA-256\r\n");
+            return 1;
+        }
+        for (size_t i = 0; i < 64; i++) {
+            if (!isxdigit((unsigned char)argv[2][i])) {
+                printf("lua commit SHA-256 must be hexadecimal\r\n");
+                return 1;
+            }
+        }
+        /* reboot=false for the same reason as `lua install`: the GUI stays on
+         * this console to verify the identity, so an in-place runner restart
+         * avoids another USB re-enumeration. */
+        esp_err_t err = script_update_local_request(argv[2], argv[3], false,
+                                                   argv[4], argv[5]);
+        if (err != ESP_OK) {
+            printf("lua commit queue failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("lua commit queued: id=%s\r\n", argv[3]);
+        return 0;
+    }
+    if (strcmp(argv[1], "abort") == 0) {
+        (void)remove(SCRIPT_UPDATE_STAGING_PATH);
+        printf("lua abort: discarded\r\n");
         return 0;
     }
     if (strcmp(argv[1], "exec") == 0) {
@@ -1390,7 +1901,8 @@ static int cli_cmd_lua(int argc, char **argv)
         printf("error (%s): %s\r\n", esp_err_to_name(err), result);
         return 1;
     }
-    printf("unknown subcommand '%s' (start|stop|status|exec)\r\n", argv[1]);
+    printf("unknown subcommand '%s' "
+           "(start|stop|status|release|install|exec)\r\n", argv[1]);
     return 1;
 }
 
@@ -1565,6 +2077,11 @@ static esp_err_t cli_register_commands(void)
         .help = "scan the shared I2C bus for responding 7-bit addresses",
         .func = cli_cmd_i2cscan,
     };
+    static const esp_console_cmd_t selftest_cmd = {
+        .command = "selftest",
+        .help = "factory PCBA test: TEST lines + SELFTEST verdict; leaves LED on (red 0 to clear)",
+        .func = cli_cmd_selftest,
+    };
     static const esp_console_cmd_t ping_uart_cmd = {
         .command = "ping_uart",
         .help    = "ping_uart <0-3>  check if AMBIT sensor on channel is connected",
@@ -1637,7 +2154,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
-        .help    = "lua start|stop|status|exec <code...>  control / poke the Lua script",
+        .help    = "lua start|stop|status|release|install|begin|put|commit|abort|exec  control / update the Lua script",
         .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
@@ -1738,6 +2255,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&i2cscan_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&selftest_cmd);
     if (err != ESP_OK) {
         return err;
     }

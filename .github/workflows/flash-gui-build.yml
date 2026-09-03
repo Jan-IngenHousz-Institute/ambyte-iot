@@ -7,18 +7,20 @@
 # here, not in the semantic-release pipeline:
 #
 #   * PRs build each executable once, keyed by the PR head SHA;
-#   * the matching main push promotes those exact PR artifacts without
-#     rebuilding them;
-#   * pushing a tag `flash-gui-v*` attaches the promoted main artifact to a
-#     GitHub release without rebuilding it again (the firmware pipeline's
-#     tagFormat is plain `v${version}`, so these tags never collide with it).
+#   * the matching main push publishes those exact PR artifacts as a GitHub
+#     release, without rebuilding them.
+#
+# Releases are cut automatically, patch-incremented from the highest existing
+# `flash-gui-v*` tag (the firmware pipeline's tagFormat is plain `v${version}`,
+# so these tags never collide with it). There is deliberately no hand-cut tag
+# step: it was a manual gate that got forgotten, and it required a version
+# constant in the source to be bumped in lockstep, which silently drifted.
 name: Build flash GUI executables
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    tags: ["flash-gui-v*"]
     paths:
       - "flash_gui/**"
       - ".github/workflows/flash-gui-build.yml"
@@ -62,18 +64,21 @@ jobs:
         include:
           - os: windows-latest
             label: windows
-            binary: dist/ambyte-flash-gui.exe
-            asset: ambyte-flash-gui-windows.exe
+            bundle: dist/ambyte-flash-gui
+            executable: dist/ambyte-flash-gui/ambyte-flash-gui.exe
+            asset: ambyte-flash-gui-windows.zip
           - os: ubuntu-latest
             label: linux
-            binary: dist/ambyte-flash-gui
-            asset: ambyte-flash-gui-linux
+            bundle: dist/ambyte-flash-gui
+            executable: dist/ambyte-flash-gui/ambyte-flash-gui
+            asset: ambyte-flash-gui-linux.zip
           - os: macos-latest
             label: macos
-            # Release assets must be files, so ship the standalone Mach-O
-            # executable rather than wrapping the .app directory in a zip.
-            binary: dist/ambyte-flash-gui
-            asset: ambyte-flash-gui-macos
+            # --windowed builds a .app alongside the plain onedir folder; ship
+            # the bundle, since Tk needs it to take keyboard focus properly.
+            bundle: dist/ambyte-flash-gui.app
+            executable: dist/ambyte-flash-gui.app/Contents/MacOS/ambyte-flash-gui
+            asset: ambyte-flash-gui-macos.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -82,9 +87,38 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The PR artifact is the artifact promoted by the main workflow, so its
+      # identity must be predicted here rather than injected by rebuilding at
+      # release time. The release job verifies this prediction before publish
+      # and fails closed if another GUI release won the tag in between.
+      - name: Determine expected GUI release tag
+        id: expected-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST=$(git ls-remote --tags origin 'refs/tags/flash-gui-v*' \
+            | sed 's|.*refs/tags/||; s|\^{}$||' \
+            | sort -u | sort -V | tail -1)
+          if [[ -z "${LATEST}" ]]; then
+            NEXT="flash-gui-v0.1.0"
+          else
+            IFS=. read -r MAJOR MINOR PATCH <<< "${LATEST#flash-gui-v}"
+            NEXT="flash-gui-v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          echo "tag=${NEXT}" >> "${GITHUB_OUTPUT}"
+
       - name: Install dependencies
         run: |
           python -m pip install -r flash_gui/requirements.txt pyinstaller
+
+      - name: Generate packaged release identity
+        shell: bash
+        run: |
+          python -m flash_gui.build_release_info \
+            --tag "${{ steps.expected-version.outputs.tag }}" \
+            --source-sha "${SOURCE_SHA}" \
+            --output release_info.json
+          cat release_info.json
 
       - name: Build executable
         shell: bash
@@ -96,21 +130,68 @@ jobs:
           # runtime (never imported statically), so PyInstaller's analysis
           # cannot discover it — bundle it explicitly. esptool ships flasher
           # stub JSONs as package data; --collect-all pulls those in.
-          pyinstaller --noconfirm --clean --onefile --windowed \
+          # A blank PE (no CompanyName/ProductName/FileDescription) scores worse
+          # with Defender's ML models than the same binary carrying publisher
+          # metadata. Windows-only: it is a Win32 version resource.
+          VERSION_FILE=()
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python -m flash_gui.build_version_info version_info.txt
+            cat version_info.txt
+            VERSION_FILE=(--version-file version_info.txt)
+          fi
+          # --onedir, not --onefile: the onefile bootloader unpacks a PE payload
+          # to %TEMP% and executes it, which is the single biggest reason
+          # Defender's ML models score these binaries as droppers.
+          pyinstaller --noconfirm --clean --onedir --windowed \
             --name ambyte-flash-gui \
             --paths . \
             --add-data "flash_gui/vendor/nvs_partition_gen.py${SEP}flash_gui/vendor" \
+            --add-data "release_info.json${SEP}flash_gui" \
             --collect-all esptool \
+            --collect-all littlefs \
+            "${VERSION_FILE[@]}" \
             flash_gui/launcher.py
 
-      - name: Package
+      # A unit import is not enough: 0.2.9 failed only on a cold script cache,
+      # where a silent logger was called before littlefs even started. Exercise
+      # the exact cold-fetch + digest + image/read-back sequence inside every
+      # packaged platform before uploading it.
+      - name: Smoke-test packaged littlefs image
         shell: bash
         run: |
-          mkdir -p out
-          cp "${{ matrix.binary }}" "out/${{ matrix.asset }}"
-          if [[ "${{ matrix.label }}" != "windows" ]]; then
-            chmod +x "out/${{ matrix.asset }}"
+          set -euo pipefail
+          if ! "${{ matrix.executable }}" --smoke-littlefs; then
+            cat packaged-littlefs-smoke.txt 2>/dev/null || true
+            exit 1
           fi
+          cat packaged-littlefs-smoke.txt
+
+      # onedir means the asset is a directory, and GitHub release assets must be
+      # files, so each platform zips with the tool that preserves its own
+      # metadata: executable bits on Linux, bundle symlinks on macOS.
+      - name: Package (Linux)
+        if: matrix.label == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cd dist
+          zip -r -y "../out/${{ matrix.asset }}" ambyte-flash-gui
+
+      - name: Package (macOS)
+        if: matrix.label == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ditto -c -k --keepParent "${{ matrix.bundle }}" "out/${{ matrix.asset }}"
+
+      - name: Package (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Compress-Archive -Path "${{ matrix.bundle }}" -DestinationPath "out/${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v6
         with:
@@ -119,17 +200,32 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  promote:
-    name: Promote PR executables
+  release:
+    name: Release from main
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # Serialize GUI releases so two quick merges cannot both select and upload
+    # the same next tag. The later job then sees the new tag and fails its
+    # embedded-identity check until its PR artifact is deliberately rebuilt.
+    concurrency:
+      group: flash-gui-release
+      cancel-in-progress: false
+    # Windows-only: azure/artifact-signing-action shells out to signtool, so the
+    # signing step cannot run on ubuntu. Signing here rather than in `build`
+    # keeps the certificate off every PR run (and off fork PRs, which get no
+    # secrets): exactly one signing operation per published release.
+    runs-on: windows-latest
     permissions:
       actions: read
-      contents: read
+      contents: write
       pull-requests: read
+      id-token: write # OIDC federated credential for azure/login
     steps:
       - name: Checkout main
         uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Locate PR executable artifacts
         id: artifact
@@ -146,14 +242,46 @@ jobs:
             exit 1
           fi
           HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
-          ARTIFACT_NAME="ambyte-flash-gui-linux-${HEAD_SHA}"
-          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
-            | jq -r --arg head "${HEAD_SHA}" \
-              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $head)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+
+          # A squash merge can start this main workflow while the PR workflow
+          # is still building or uploading another platform. Locate that exact
+          # PR run, then wait for it instead of racing artifact visibility.
+          RUN_ID=""
+          for attempt in $(seq 1 12); do
+            RUN_ID=$(gh api --method GET \
+              "repos/${REPO}/actions/workflows/flash-gui-build.yml/runs" \
+              -f event=pull_request \
+              -f head_sha="${HEAD_SHA}" \
+              -f per_page=100 \
+              | jq -r --arg head "${HEAD_SHA}" \
+                '[.workflow_runs[] | select(.head_sha == $head)] | sort_by(.created_at) | last | .id // empty')
+            if [[ -n "${RUN_ID}" ]]; then
+              break
+            fi
+            echo "Attempt ${attempt}/12: waiting for the PR GUI workflow run to appear..."
+            sleep 5
+          done
           if [[ -z "${RUN_ID}" ]]; then
-            echo "::error::No live PR GUI artifacts for head ${HEAD_SHA}"
+            echo "::error::No PR GUI workflow run found for head ${HEAD_SHA}"
             exit 1
           fi
+
+          echo "Waiting for PR GUI workflow run ${RUN_ID} to finish..."
+          gh run watch "${RUN_ID}" --repo "${REPO}" --exit-status
+
+          MISSING=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            | jq -r --arg head "${HEAD_SHA}" '
+              [
+                ("ambyte-flash-gui-linux-" + $head),
+                ("ambyte-flash-gui-macos-" + $head),
+                ("ambyte-flash-gui-windows-" + $head)
+              ] - [.artifacts[] | select(.expired == false) | .name]
+              | join(", ")')
+          if [[ -n "${MISSING}" ]]; then
+            echo "::error::PR GUI workflow ${RUN_ID} is missing artifacts: ${MISSING}"
+            exit 1
+          fi
+
           echo "head-sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
           echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "Promoting GUI executables from PR #${PR_NUMBER} (${HEAD_SHA})." >> "${GITHUB_STEP_SUMMARY}"
@@ -168,78 +296,178 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ steps.artifact.outputs.run-id }}
 
-      - name: Verify promoted executables
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s out/ambyte-flash-gui-macos
-          test -s out/ambyte-flash-gui-linux
-          test -s out/ambyte-flash-gui-windows.exe
-
-      - name: Upload promoted executables
-        uses: actions/upload-artifact@v6
-        with:
-          name: ambyte-flash-gui-${{ github.sha }}
-          path: out/*
-          if-no-files-found: error
-          retention-days: 30
-
-  release:
-    name: Attach to release
-    # Only for flash-gui-v* tags: makes the executables publicly downloadable
-    # without a GitHub login (workflow artifacts require one).
-    if: startsWith(github.ref, 'refs/tags/flash-gui-v')
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - name: Locate promoted main artifact
-        id: artifact
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARTIFACT_NAME="ambyte-flash-gui-${COMMIT_SHA}"
-          RUN_ID=$(gh api "repos/${REPO}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
-            | jq -r --arg head "${COMMIT_SHA}" \
-              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $head)] | sort_by(.created_at) | last | .workflow_run.id // empty')
-          if [[ -z "${RUN_ID}" ]]; then
-            echo "::error::No promoted GUI artifact for main commit ${COMMIT_SHA}"
-            exit 1
-          fi
-          echo "name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
-          echo "run-id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download promoted executables
-        uses: actions/download-artifact@v6
-        with:
-          name: ${{ steps.artifact.outputs.name }}
-          path: out
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.artifact.outputs.run-id }}
-
       - name: Verify release executables
         shell: bash
         run: |
           set -euo pipefail
-          test -s out/ambyte-flash-gui-macos
-          test -s out/ambyte-flash-gui-linux
-          test -s out/ambyte-flash-gui-windows.exe
+          test -s out/ambyte-flash-gui-macos.zip
+          test -s out/ambyte-flash-gui-linux.zip
+          test -s out/ambyte-flash-gui-windows.zip
+
+      # Unsigned PyInstaller output is reliably misclassified by Defender's ML
+      # models (Trojan:Win32/Sabsik.TE.A!ml, 2026-08-17). Reporting each false
+      # positive to Microsoft is keyed to one file hash, so it dies on the next
+      # build; an Authenticode signature is the only fix that survives a rebuild.
+      - name: Azure login
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Unpack Windows bundle for signing
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        shell: pwsh
+        run: Expand-Archive -Path out\ambyte-flash-gui-windows.zip -DestinationPath signing
+
+      - name: Sign Windows bundle
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          # Sign the whole bundle, not just the launcher: Defender scores the
+          # extracted .dll/.pyd files too, and a half-signed directory reads
+          # worse than an unsigned one.
+          files-folder: ${{ github.workspace }}\signing
+          files-folder-filter: exe,dll,pyd
+          files-folder-recurse: true
+          file-digest: SHA256
+          # Without a countersignature the bundle stops verifying the day the
+          # signing certificate expires; with one it stays valid indefinitely.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Repack signed Windows bundle
+        if: vars.AZURE_SIGNING_ENDPOINT != ''
+        shell: pwsh
+        run: |
+          $exe = 'signing\ambyte-flash-gui\ambyte-flash-gui.exe'
+          $sig = Get-AuthenticodeSignature $exe
+          $sig | Format-List
+          if ($sig.Status -ne 'Valid') {
+            throw "Authenticode signature is $($sig.Status), refusing to publish"
+          }
+          Remove-Item out\ambyte-flash-gui-windows.zip
+          Compress-Archive -Path signing\ambyte-flash-gui -DestinationPath out\ambyte-flash-gui-windows.zip
+
+      - name: Warn that the release is unsigned
+        if: vars.AZURE_SIGNING_ENDPOINT == ''
+        shell: bash
+        run: |
+          echo "::warning title=Unsigned release::AZURE_SIGNING_ENDPOINT is not set, so ambyte-flash-gui-windows.zip ships unsigned and will likely be flagged by Microsoft Defender. See flash_gui/README.md."
+
+      # Generated last so the published sums match the bytes users actually
+      # download: signing rewrites the PE and repacking rewrites the zip.
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum ambyte-flash-gui-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      # Patch-incremented from the highest existing tag rather than read from a
+      # constant in the source: a constant has to be bumped by hand before every
+      # release, and when that is forgotten the release ships the wrong number
+      # silently. ls-remote avoids needing the tag history in this checkout.
+      - name: Determine release tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST=$(git ls-remote --tags origin 'refs/tags/flash-gui-v*' \
+            | sed 's|.*refs/tags/||; s|\^{}$||' \
+            | sort -u | sort -V | tail -1)
+          if [[ -z "${LATEST}" ]]; then
+            NEXT="flash-gui-v0.1.0"
+          else
+            IFS=. read -r MAJOR MINOR PATCH <<< "${LATEST#flash-gui-v}"
+            NEXT="flash-gui-v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          echo "Previous: ${LATEST:-none}. Releasing: ${NEXT}."
+          echo "tag=${NEXT}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing GUI ${NEXT} from ${GITHUB_SHA}." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Verify packaged GUI release identity
+        env:
+          EXPECTED_TAG: ${{ steps.version.outputs.tag }}
+          EXPECTED_SOURCE_SHA: ${{ steps.artifact.outputs.head-sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          expected_archives = {
+              "ambyte-flash-gui-linux.zip",
+              "ambyte-flash-gui-macos.zip",
+              "ambyte-flash-gui-windows.zip",
+          }
+          archives = {path.name: path for path in Path("out").glob("ambyte-flash-gui-*.zip")}
+          if archives.keys() != expected_archives:
+              raise SystemExit(
+                  f"GUI archives differ from expected set: {sorted(archives)}"
+              )
+
+          for name, archive in sorted(archives.items()):
+              with zipfile.ZipFile(archive) as bundle:
+                  matches = [
+                      member for member in bundle.namelist()
+                      if member.replace("\\", "/").endswith(
+                          "/flash_gui/release_info.json"
+                      )
+                  ]
+                  if len(matches) != 1:
+                      raise SystemExit(
+                          f"{name}: expected exactly one embedded release_info.json, "
+                          f"found {matches}"
+                      )
+                  metadata = json.loads(bundle.read(matches[0]))
+              expected = {
+                  "schema_version": 1,
+                  "tag": os.environ["EXPECTED_TAG"],
+                  "source_sha": os.environ["EXPECTED_SOURCE_SHA"],
+              }
+              if metadata != expected:
+                  raise SystemExit(
+                      f"{name}: embedded identity {metadata!r} != {expected!r}"
+                  )
+              print(f"{name}: verified {metadata['tag']} from {metadata['source_sha']}")
+          PY
 
       - name: Create GitHub release with executables
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: out/*
           fail_on_unmatched_files: true
+          # This repository uses immutable releases. Upload every executable
+          # while the release is still mutable, then publish it below.
+          draft: true
           # Never let a GUI release become the repo's "Latest": consumers of
           # /releases/latest (and the repo landing page) must keep seeing the
           # newest FIRMWARE release. flash_gui's own fetcher additionally
           # filters by tag+asset (pick_firmware_release), belt and braces.
           prerelease: true
           make_latest: false
+
+      # Publishing the draft is what actually creates the git tag.
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --prerelease

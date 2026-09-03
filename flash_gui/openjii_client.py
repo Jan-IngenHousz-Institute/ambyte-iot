@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """openJII API client for device provisioning (stdlib urllib only).
 
 Authentication
@@ -19,6 +22,7 @@ Endpoints (packages/api/src/domains/... upstream)
   POST /api/v1/devices                          register → Thing, status=pending
   POST /api/v1/devices/{id}/credentials         issue → SHOW-ONCE cert bundle
   POST /api/v1/devices/{id}/credentials/rotate  re-issue for a live device
+  POST /api/v1/devices/{id}/onboard             bind + authoritative MQTT config
 
 Issuance is refused while a certificate is live (status active/rotating) —
 those go down the /rotate path. The returned private key is show-once: the
@@ -68,6 +72,16 @@ class DeviceIdentity:
     private_key_pem: str
     bundle_dir: Path       # where the show-once PEMs were persisted
     rotated: bool
+
+
+@dataclass(frozen=True)
+class DeviceOnboarding:
+    """Authoritative connection contract returned by openJII."""
+
+    thing_name: str
+    device_type: str
+    endpoint: str
+    topic_prefix: str
 
 
 class OpenJIIClient:
@@ -195,6 +209,57 @@ class OpenJIIClient:
             return payload
         raise OpenJIIError(f"issuing credentials failed ({status}): "
                            f"{self._error_text(payload)}")
+
+    def onboard_device(self, device_id: str,
+                       experiment_id: str) -> DeviceOnboarding:
+        """Bind a device to one experiment and return its server-owned config.
+
+        The flasher does not consume workbook procedures, so it explicitly asks
+        for the connection/topic contract only. The response can include all
+        existing bindings; this single-topic firmware uses the selected one.
+        """
+        if not device_id:
+            raise OpenJIIError("cannot onboard a device without an id.")
+        if not experiment_id:
+            raise OpenJIIError("cannot onboard a device without an experiment id.")
+
+        path = f"/api/v1/devices/{device_id}/onboard"
+        body = {"experimentIds": [experiment_id], "includeWorkbook": False}
+        status, payload = self._request("POST", path, body)
+        if status != 200 or not isinstance(payload, dict):
+            raise OpenJIIError(f"onboarding device failed ({status}): "
+                               f"{self._error_text(payload)}")
+
+        experiments = payload.get("experiments")
+        selected = next(
+            (item for item in experiments
+             if isinstance(item, dict) and item.get("experimentId") == experiment_id),
+            None,
+        ) if isinstance(experiments, list) else None
+
+        thing_name = payload.get("thingName")
+        device_type = payload.get("deviceType")
+        endpoint = payload.get("endpoint")
+        topic_prefix = selected.get("topicPrefix") if selected else None
+        missing = [
+            label for label, value in (
+                ("thingName", thing_name),
+                ("deviceType", device_type),
+                ("endpoint", endpoint),
+                (f"topicPrefix for experiment {experiment_id}", topic_prefix),
+            ) if not isinstance(value, str) or not value.strip()
+        ]
+        if missing:
+            raise OpenJIIError(
+                "openJII returned an incomplete onboarding config: "
+                + ", ".join(missing))
+
+        return DeviceOnboarding(
+            thing_name=thing_name.strip(),
+            device_type=device_type.strip(),
+            endpoint=endpoint.strip(),
+            topic_prefix=topic_prefix.strip().strip("/"),
+        )
 
     # ── the full provisioning round ──────────────────────────────────────
     def provision_device(self, serial: str, name: str | None,

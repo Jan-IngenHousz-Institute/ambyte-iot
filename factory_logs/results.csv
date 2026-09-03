@@ -1,0 +1,2 @@
+timestamp_utc,mac,fw,overall,firmware_verdict,led_operator,failed_tests,operator,station,json_file
+2026-09-02T11:40:54.781490+00:00,E8:F6:0A:B1:1F:34,1.0.6-rc1,PASS,PASS,skipped,,claude-e2e,bench-1,20260902T114054Z_E8F60AB11F34.json

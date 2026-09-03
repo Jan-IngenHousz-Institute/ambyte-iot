@@ -272,9 +272,11 @@ require the ROM-flasher recovery path.
 Use **Actions -> Fleet deploy (Lua) -> Run workflow**. Its targeting form
 matches Fleet deploy (OTA): environment, release tag or `latest`, firmware
 predicate, deterministic percentage, optional exact devices, and discovery
-window. It also controls whether the device reboots after the swap. Dry-run is
-the default; it publishes correlated ping commands to discover firmware
-versions but publishes no `script_update` command.
+window. Select `main` for the default schedule or `legacy_1Hz_spec` for the
+one-channel cmd 31 experiment; either payload is installed on-device as
+`main.lua`. The form also controls whether the device reboots after the swap.
+Dry-run is the default; it publishes correlated ping commands to discover
+firmware versions but publishes no `script_update` command.
 
 `latest` considers only published `lua-v*` releases. Before connecting to IoT,
 the deploy tool verifies the manifest schema, tag and version identity,
@@ -291,6 +293,7 @@ For a local exact-device preview:
 ```sh
 python tools/fleet_deploy/lua_deploy.py \
     --profile <sso-profile> --tag lua-v1.0.0 \
+    --script-name legacy_1Hz_spec \
     --devices "E8:F6:0A:B1:1D:D4" --dry-run
 ```
 

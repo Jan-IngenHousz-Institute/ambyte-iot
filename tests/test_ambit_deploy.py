@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 from __future__ import annotations
 
 import hashlib
@@ -432,6 +435,22 @@ class ColdWakePreflightTest(unittest.TestCase):
 
 
 class StatusTrackerTest(unittest.TestCase):
+    def test_correlates_status_case_insensitively_but_keeps_requested_route(self) -> None:
+        lower = DEVICE_A.replace("AMBYTE_", "ambyte_")
+        tracker = ambit_deploy.AmbitStatusTracker([lower], "run-1")
+        event = tracker.record(
+            STATUS_A,
+            json.dumps(
+                {
+                    "type": "ambit_ota_status",
+                    "id": "run-1",
+                    "channel": 255,
+                    "state": "accepted",
+                }
+            ),
+        )
+        self.assertEqual(event, (lower, "accepted"))
+
     def test_correlates_campaign_gateway_channels_and_overall(self) -> None:
         tracker = ambit_deploy.AmbitStatusTracker([DEVICE_A], "run-1")
         ignored = [

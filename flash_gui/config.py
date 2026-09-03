@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Deployment constants + persisted session settings for the flash GUI.
 
 Everything environment-shaped lives here so the rest of the tool never
 hardcodes an endpoint or topic segment. Values that could not be determined
-from the repos are marked TODO and must be filled before that path is used —
+from the repos are marked TODO and must be filled before that path is used;
 the GUI surfaces them as configuration errors rather than guessing.
 """
 
@@ -17,19 +20,29 @@ from pathlib import Path
 APP_NAME = "ambyte-flash-gui"
 
 # ── firmware source ──────────────────────────────────────────────────────────
-# The firmware repo was renamed ambyte-iot → protoMUSIC upstream; GitHub
-# redirects the old name, but we point at the canonical one. Release assets:
-# ambyte-iot-v<X.Y.Z>.zip holding bootloader/, partition_table/, otadata, app
-# and flasher_args.json (offsets come from that manifest, never hardcoded).
-# nvs.bin is deliberately NOT in the asset (CI builds with AMBYTE_NVS_SKIP=1 so
-# no secrets land in a public artifact) — this tool bakes it per board.
+# Canonical name is ambyte-iot: api.github.com/repos/<org>/protoMUSIC answers
+# 301 to repository id 1192990170, whose full_name is ambyte-iot. The old name
+# only resolves through GitHub's rename redirect, which dies the moment anyone
+# creates a new repo called protoMUSIC, and pointing at it made an unrelated
+# outage report name a repo that no longer exists.
+# Release assets: ambyte-iot-v<X.Y.Z>.zip holding bootloader/, partition_table/,
+# otadata, app and flasher_args.json (offsets come from that manifest, never
+# hardcoded). nvs.bin is deliberately NOT in the asset (CI builds with
+# AMBYTE_NVS_SKIP=1 so no secrets land in a public artifact); this tool bakes it
+# per board.
 FIRMWARE_REPO = os.environ.get("AMBYTE_FIRMWARE_REPO",
-                               "Jan-IngenHousz-Institute/protoMUSIC")
+                               "Jan-IngenHousz-Institute/ambyte-iot")
 
-# nvs @ 0x9000 size 0x6000 — must match partitions.csv; the release's
+# nvs @ 0x9000 size 0x6000, must match partitions.csv; the release's
 # partition table is flashed alongside, so a drift would be a release bug.
 NVS_OFFSET = 0x9000
 NVS_PARTITION_SIZE = 0x6000
+
+# littlefs @ 0x620000 size 0x80000 (partitions.csv): the firmware's internal
+# script home. Provisioning bakes main.lua into an image flashed here so a
+# fresh board runs the selected release without an SD seed step.
+LITTLEFS_OFFSET = 0x620000
+LITTLEFS_PARTITION_SIZE = 0x80000
 
 # Espressif USB-Serial-JTAG (the native USB-C console/flash port).
 USB_JTAG_VID = 0x303A
@@ -45,11 +58,6 @@ class Environment:
     key: str
     api_url: str
     web_url: str
-    # AWS IoT Core ATS data endpoint for this environment. The account-specific
-    # prefix is not committed to the open-jii repo and no REST endpoint returns
-    # it; ops resolve it with `aws iot describe-endpoint --endpoint-type
-    # iot:Data-ATS`. Only the dev endpoint is publicly known.
-    mqtt_uri: str | None
 
     @property
     def api_keys_url(self) -> str:
@@ -64,47 +72,28 @@ ENVIRONMENTS: dict[str, Environment] = {
         key="dev",
         api_url="https://api.dev.openjii.org",
         web_url="https://dev.openjii.org",
-        mqtt_uri="mqtts://a2s5vvyojsnl53-ats.iot.eu-central-1.amazonaws.com:8883",
     ),
     "prod": Environment(
         key="prod",
         api_url="https://api.openjii.org",
         web_url="https://openjii.org",
-        mqtt_uri="mqtts://a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com:8883",
     ),
 }
 
 # The device family in the openJII registry. Upstream derives the Thing name
 # as `<deviceType>_<serialNumber>` (sanitised; MAC colons survive), e.g.
-# ambyte_E8:F6:0A:B1:1F:34 — and the MQTT clientId MUST equal that Thing name
+# ambyte_E8:F6:0A:B1:1F:34, and the MQTT clientId MUST equal that Thing name
 # (the IoT policy's identity-bound resources render as
 # ${iot:Connection.Thing.ThingName}, which AWS only resolves when they match).
 OPENJII_DEVICE_TYPE = "ambyte"
 
 
-# ── MQTT topic conventions ───────────────────────────────────────────────────
-# Canonical ingest grammar (open-jii asyncapi.yaml):
-#   experiment/data_ingest/v1/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}/{protocolId}
-# The firmware stores the first 7 segments as mqtt_topic_root and appends
-# protocol_id when publishing, so the rule's 8-level filter matches.
-#
-# sensorType/sensorVersion below follow what the deployed ambyte fleet already
-# publishes (from the maintained provisioning .env) rather than the schema's
-# suggestion, because Databricks' clean_data pipeline currently reads segment 5
-# as protocol_id — changing these silently re-labels rows downstream.
-TOPIC_SENSOR_TYPE = "multispeq"
+# ── MQTT device suffix ───────────────────────────────────────────────────────
+# openJII's onboarding response owns the broker endpoint and the topic prefix
+# through sensorType. Its contract requires the device to append
+# /{sensorVersion}/{sensorId}; the firmware then appends its final protocol
+# segment at publish time.
 TOPIC_SENSOR_VERSION = "v1.0"
-
-
-def default_topic_root(experiment_id: str, thing_name: str) -> str:
-    """The pre-filled (still user-editable) topic root for an experiment."""
-    return (f"experiment/data_ingest/v1/{experiment_id}"
-            f"/{TOPIC_SENSOR_TYPE}/{TOPIC_SENSOR_VERSION}/{thing_name}")
-
-
-# Identity placeholder the GUI shows in the editable topic before a concrete
-# board is known; replaced with the board's Thing name per procedure.
-TOPIC_IDENTITY_TOKEN = "{thingName}"
 
 # Cloud→device script channel: device/scripts/v1/{sensorType}/{sensorVersion}/
 # {thingName}. Values mirror the deployed fleet's provisioning .env; the
@@ -144,7 +133,7 @@ CONFIG_DIR = _config_dir()
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # Release zips + unpacked images; safe to delete any time.
 CACHE_DIR = CONFIG_DIR / "cache"
-# Show-once credential bundles land here BEFORE any step that can fail —
+# Show-once credential bundles land here BEFORE any step that can fail:
 # losing a private key means the board must be rotated again.
 CERTS_DIR = CONFIG_DIR / "device_certs"
 
@@ -163,6 +152,7 @@ class Settings:
     experiment_name: str = ""
     wifi_ssid: str = ""
     wifi_password: str = ""
+    lua_script_name: str = "main"
     api_keys: dict = field(default_factory=dict)   # env key -> "jii_..." key
 
     @classmethod

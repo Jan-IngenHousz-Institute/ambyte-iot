@@ -16,6 +16,11 @@ on:
         description: "Lua release tag (e.g. lua-v1.0.0), or 'latest'"
         type: string
         default: "latest"
+      script:
+        description: "Released Lua script to install as main.lua"
+        type: choice
+        options: [main, legacy_1Hz_spec]
+        default: main
       version_op:
         description: "Firmware-version filter reported by each device"
         type: choice
@@ -58,7 +63,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    name: Deploy ${{ inputs.script }} from ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
     runs-on: ubuntu-latest
     environment: fleet-deploy-${{ inputs.environment }}
     timeout-minutes: 60
@@ -74,6 +79,7 @@ jobs:
           kind: lua
           repository: ${{ github.repository }}
           release-tag: ${{ inputs.release_tag }}
+          script-name: ${{ inputs.script }}
           version-op: ${{ inputs.version_op }}
           version: ${{ inputs.version }}
           percentage: ${{ inputs.percentage }}

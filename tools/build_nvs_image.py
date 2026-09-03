@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """
 Build an NVS partition binary that pre-provisions a device.
 
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -98,30 +102,28 @@ OPTIONAL_FIELDS = [
 # offset. Mirrors flash/flash.py's DEFAULT_TIMEZONE; override via AMBYTE_TIMEZONE.
 DEFAULT_TIMEZONE = "Europe/Amsterdam"
 
-SUPPORTED_TIMEZONES = {
-    "Europe/Amsterdam",
-    "Europe/Brussels",
-    "Europe/Paris",
-    "Europe/Berlin",
-    "Europe/Madrid",
-    "Europe/Rome",
-    "Europe/Vienna",
-    "Europe/Zurich",
-    "Europe/Copenhagen",
-    "Europe/Stockholm",
-    "Europe/Oslo",
-    "Europe/Prague",
-    "Europe/Warsaw",
-    "Europe/Budapest",
-    "Europe/London",
-    "Europe/Dublin",
-    "Europe/Lisbon",
-    "Europe/Helsinki",
-    "Europe/Athens",
-    "Europe/Bucharest",
-    "UTC",
-    "Etc/UTC",
-}
+# The authoritative zone list is the firmware's own generated table — parsed
+# here rather than mirrored, so a regenerated table (tools/gen_tz_table.py) can
+# never leave the provisioner accepting a name the device rejects, or vice
+# versa. Keys are the `{ "Zone/Name", rule, offset }` rows of k_tz_zones.
+TZ_TABLE_INC = REPO_ROOT / "components/timezone/tz_zone_table.inc"
+
+
+def _load_supported_timezones() -> frozenset[str]:
+    try:
+        text = TZ_TABLE_INC.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"cannot read the firmware timezone table at {TZ_TABLE_INC}: {exc}"
+        ) from exc
+    zones = frozenset(re.findall(r'\{\s*"([^"]+)"\s*,\s*\d+\s*,', text))
+    if not zones:
+        raise SystemExit(f"no zones parsed from {TZ_TABLE_INC} — regenerate it "
+                         "with tools/gen_tz_table.py")
+    return zones
+
+
+SUPPORTED_TIMEZONES = _load_supported_timezones()
 
 
 def canonical_timezone(value: str) -> str:
@@ -129,9 +131,12 @@ def canonical_timezone(value: str) -> str:
     candidate = value.strip()
     candidate = {"AMT": DEFAULT_TIMEZONE, "Z": "UTC"}.get(candidate, candidate)
     if candidate not in SUPPORTED_TIMEZONES:
-        supported = ", ".join(sorted(SUPPORTED_TIMEZONES))
         raise ValueError(
-            f"AMBYTE_TIMEZONE={value!r} is unsupported; use one of: {supported}"
+            f"AMBYTE_TIMEZONE={value!r} is unsupported: not one of the "
+            f"{len(SUPPORTED_TIMEZONES)} IANA names in "
+            f"components/timezone/tz_zone_table.inc. Use the exact IANA name "
+            f"(e.g. 'America/La_Paz'), or regenerate the table with "
+            f"tools/gen_tz_table.py against newer tzdata."
         )
     return candidate
 

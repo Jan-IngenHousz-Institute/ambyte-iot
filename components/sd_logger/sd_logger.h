@@ -27,6 +27,16 @@ extern "C" {
  * mounts; on a mid-run pull the file is closed and reopened on reinsertion. */
 esp_err_t sd_logger_init(void);
 
+/* Low-battery park handshake (used by app_main's persistence guard around a
+ * deliberate unmount). pause() signals the writer task to drain the RAM ring to
+ * the file, fsync + CLEANLY close it, then hold — buffering to RAM only — until
+ * resume(); blocks up to ~1 s for the close so the caller may unmount right after.
+ * Unlike prepare_shutdown() the writer task survives and resumes normal service
+ * (reopening the file) after resume(), so a park can recur nightly without
+ * leaking handles. Both are no-ops before sd_logger_init(). */
+void sd_logger_pause(void);
+void sd_logger_resume(void);
+
 /* Pre-reboot power-safety flush (register once via esp_register_shutdown_handler,
  * before sdcard_unmount()). Signals the writer task to drain the RAM ring to the
  * current file, fsync + close it, and park; blocks up to ~1 s for that to finish.

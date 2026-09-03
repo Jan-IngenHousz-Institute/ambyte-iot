@@ -1,7 +1,7 @@
 # CLAUDE.md — ambyte-iot firmware
 
 ESP32-S3 firmware for Ambyte field devices (plant-measurement loggers carrying up to 4 AMBIT
-sensor boards over UART). Data flows: `main.lua` schedule → SD event log (append-only FIFO) →
+sensor boards over UART). Data flows: `main.lua` schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = bulk archive only) →
 QoS1 MQTT → AWS IoT Core (dev: account 084375565727, eu-central-1) → Kinesis/S3 →
 Databricks `open_jii_dev.centrum.clean_data`.
 
@@ -13,9 +13,13 @@ Databricks `open_jii_dev.centrum.clean_data`.
   `bench-pm-none` single-toggle bisect envs) — see `docs/bench/RUNBOOK.md`
 - If littlefs is missing at CMake: `git submodule update --init --recursive components/littlefs`
 - Builds regenerate `sched_lua_embed.h`; keep it out of unrelated diffs
+- Timezone table: `python tools/gen_tz_table.py` regenerates the checked-in
+  `components/timezone/tz_zone_table.inc` + `flash_gui/tz_zone_table.py` from IANA
+  tzdata (never hand-edit them; `tests/test_timezone_config.py` asserts freshness)
 - Serial console: 115200 on `/dev/ttyACM0` (USB-JTAG; opening the port can reset the device).
   Useful CLI: `status`, `netwd [test]`, `inflight`, `evlog`, `cfg`, `wifi_join <ssid> <pass>`,
-  `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`
+  `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`,
+  `selftest` (factory PCBA test; host runner: `python -m flash_gui.factory_test`)
 
 ## Architecture (delivery pipeline invariants — do not break)
 
@@ -33,6 +37,20 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **Cap chain (compile-verified)**: `AMBIT_RUN_PAYLOAD_CAP` (64,000) < `EVLOG_RECORD_CAP_NORMAL`
   (65,552) < `AMBYTE_PUBLISH_MAX_BYTES` (record+4 KiB). PSRAM-absent boots fall back to the
   12 KB record cap at runtime.
+- **Storage layout (since the internal-store PR)**: events live on INTERNAL littlefs
+  (`/evstore` = the 9.4 MiB `storage` partition — label is load-bearing, partition tables
+  can't be OTA'd); `main.lua` lives on `/littlefs` (delivered by flash/script_update OTA;
+  `/sdcard/main.lua` is only the offline-recovery import source). The SD card is archive +
+  sd_logger + AMBIT firmware only — measurement/publishing must NEVER depend on it.
+- **Retention/eviction invariant**: fully-synced rotated files are retained for the bulk SD
+  archive (one burst per 1000 stores, keeper task) and are the ONLY eviction pool when the
+  store runs low — unsynced records always outrank synced archive copies. Never evict or
+  archive the cursor file or anything at/after it.
+- **SD is treated as corruption-prone**: FATFS has no journal, so the SDMMC bus runs at
+  20 MHz (40 MHz was marginal on this wiring) and the low-battery power guard in app_main
+  parks the SD (sd_logger flush/close → unmount) below 3300 mV on battery. Lua and the event
+  store KEEP RUNNING through a park — internal littlefs is power-loss-safe. New SD writers
+  must use sdcard_io_begin/end AND survive the park/unpark cycle (see sd_logger_pause).
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

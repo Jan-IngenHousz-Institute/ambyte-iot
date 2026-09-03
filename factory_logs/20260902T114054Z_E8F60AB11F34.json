@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "timestamp_utc": "2026-09-02T11:40:54.781490+00:00",
+  "mac": "E8:F6:0A:B1:1F:34",
+  "fw": "1.0.6-rc1",
+  "port": "COM16",
+  "operator": "claude-e2e",
+  "station": "bench-1",
+  "flashed": "local",
+  "duration_s": 58.9,
+  "firmware_verdict": "PASS",
+  "passed": 10,
+  "failed": 0,
+  "failed_tests": [],
+  "led_operator_pass": null,
+  "overall": "PASS",
+  "tests": [
+    {
+      "name": "identity",
+      "verdict": "PASS",
+      "values": {
+        "mac": "E8:F6:0A:B1:1F:34",
+        "chip_rev": "2",
+        "cores": "2",
+        "flash_mb": "16",
+        "t": "0ms"
+      },
+      "raw": "TEST identity PASS mac=E8:F6:0A:B1:1F:34 chip_rev=2 cores=2 flash_mb=16 t=0ms"
+    },
+    {
+      "name": "psram",
+      "verdict": "PASS",
+      "values": {
+        "size": "2097152",
+        "rw": "ok",
+        "t": "70ms"
+      },
+      "raw": "TEST psram PASS size=2097152 rw=ok t=70ms"
+    },
+    {
+      "name": "evstore",
+      "verdict": "PASS",
+      "values": {
+        "mounted": "1",
+        "total": "9830400",
+        "used": "425984",
+        "rw": "ok",
+        "t": "30ms"
+      },
+      "raw": "TEST evstore PASS mounted=1 total=9830400 used=425984 rw=ok t=30ms"
+    },
+    {
+      "name": "littlefs",
+      "verdict": "PASS",
+      "values": {
+        "mounted": "1",
+        "total": "524288",
+        "used": "24576",
+        "rw": "ok",
+        "t": "40ms"
+      },
+      "raw": "TEST littlefs PASS mounted=1 total=524288 used=24576 rw=ok t=40ms"
+    },
+    {
+      "name": "nvs",
+      "verdict": "PASS",
+      "values": {
+        "used": "321",
+        "free": "435",
+        "t": "0ms"
+      },
+      "raw": "TEST nvs PASS used=321 free=435 t=0ms"
+    },
+    {
+      "name": "i2c",
+      "verdict": "PASS",
+      "values": {
+        "bus": "ok",
+        "mp2731": "1",
+        "rtc": "1",
+        "bme280": "1",
+        "extra": "0",
+        "t": "20ms"
+      },
+      "raw": "TEST i2c PASS bus=ok mp2731=1 rtc=1 bme280=1 extra=0 t=20ms"
+    },
+    {
+      "name": "rtc",
+      "verdict": "PASS",
+      "values": {
+        "ready": "1",
+        "osf": "0",
+        "tick": "ok",
+        "epoch": "1787836363",
+        "t": "1100ms"
+      },
+      "raw": "TEST rtc PASS ready=1 osf=0 tick=ok epoch=1787836363 t=1100ms"
+    },
+    {
+      "name": "power",
+      "verdict": "PASS",
+      "values": {
+        "read": "ok",
+        "vbat_mv": "4220",
+        "vin_mv": "5100",
+        "vsys_mv": "4260",
+        "vbus": "1",
+        "t": "80ms"
+      },
+      "raw": "TEST power PASS read=ok vbat_mv=4220 vin_mv=5100 vsys_mv=4260 vbus=1 t=80ms"
+    },
+    {
+      "name": "bme280",
+      "verdict": "PASS",
+      "values": {
+        "read": "ok",
+        "temp_c": "23.87",
+        "hum_pct": "51.3",
+        "pres_pa": "102006",
+        "t": "100ms"
+      },
+      "raw": "TEST bme280 PASS read=ok temp_c=23.87 hum_pct=51.3 pres_pa=102006 t=100ms"
+    },
+    {
+      "name": "led",
+      "verdict": "PASS",
+      "values": {
+        "state": "on",
+        "t": "0ms"
+      },
+      "raw": "TEST led PASS state=on t=0ms"
+    }
+  ],
+  "transcript": "selftest\r\nSELFTEST BEGIN fw=1.0.6-rc1 mac=E8:F6:0A:B1:1F:34\r\r\nTEST identity PASS mac=E8:F6:0A:B1:1F:34 chip_rev=2 cores=2 flash_mb=16 t=0ms\r\r\nW (13712) wifi_manager: Wi-Fi disconnected (reason=201), reconnect attempt 3 in 1000 ms\r\nTEST psram PASS size=2097152 rw=ok t=70ms\r\r\nTEST evstore PASS mounted=1 total=9830400 used=425984 rw=ok t=30ms\r\r\nTEST littlefs PASS mounted=1 total=524288 used=24576 rw=ok t=40ms\r\r\nTEST nvs PASS used=321 free=435 t=0ms\r\r\nTEST i2c PASS bus=ok mp2731=1 rtc=1 bme280=1 extra=0 t=20ms\r\r\nTEST rtc PASS ready=1 osf=0 tick=ok epoch=1787836363 t=1100ms\r\r\nTEST power PASS read=ok vbat_mv=4220 vin_mv=5100 vsys_mv=4260 vbus=1 t=80ms\r\r\nTEST bme280 PASS read=ok temp_c=23.87 hum_pct=51.3 pres_pa=102006 t=100ms\r\r\nTEST led PASS state=on t=0ms\r\r\nSELFTEST PASS passed=10 failed=0 fw=1.0.6-rc1 mac=E8:F6:0A:B1:1F:34\r\r\nambyte>  \r\nambyte>  "
+}

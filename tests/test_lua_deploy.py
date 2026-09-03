@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 from __future__ import annotations
 
 import hashlib
@@ -23,13 +26,15 @@ MANIFEST_URL = (
 )
 
 
-def release_fixture(body: bytes = b"return 42\n") -> dict:
+def release_fixture(body: bytes = b"return 42\n", script_name: str = "main") -> dict:
     digest = hashlib.sha256(body).hexdigest()
     asset_url = (
-        f"https://github.com/{REPOSITORY}/releases/download/{TAG}/main.lua"
+        f"https://github.com/{REPOSITORY}/releases/download/{TAG}/{script_name}.lua"
     )
+    campaign_id = TAG if script_name == "main" else f"{TAG}:{script_name}"
     return {
         "schema_version": 1,
+        "script_name": script_name,
         "script_version": "1.2.3",
         "tag": TAG,
         "sha256": digest,
@@ -38,7 +43,7 @@ def release_fixture(body: bytes = b"return 42\n") -> dict:
         "asset_url": asset_url,
         "script_update": {
             "type": "script_update",
-            "id": TAG,
+            "id": campaign_id,
             "url": asset_url,
             "checksum": digest,
             "script_version": "1.2.3",
@@ -65,6 +70,37 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(verified, manifest)
         self.assertEqual(asset, body)
 
+    def test_keeps_pre_catalog_main_manifests_deployable(self) -> None:
+        manifest = release_fixture()
+        del manifest["script_name"]
+        self.assertEqual(
+            lua_deploy.validate_manifest(manifest, REPOSITORY, TAG), manifest
+        )
+
+    def test_validates_and_fetches_selected_script(self) -> None:
+        script_name = "legacy_1Hz_spec"
+        body = b"return 31\n"
+        manifest = release_fixture(body, script_name)
+        manifest_url = (
+            f"https://github.com/{REPOSITORY}/releases/download/{TAG}/"
+            f"{script_name}.lua.manifest.json"
+        )
+        responses = {
+            manifest_url: json.dumps(manifest).encode(),
+            manifest["asset_url"]: body,
+        }
+
+        verified, asset = lua_deploy.fetch_release(
+            REPOSITORY,
+            TAG,
+            script_name,
+            downloader=lambda url, **kwargs: responses[url],
+        )
+
+        self.assertEqual(verified["script_name"], script_name)
+        self.assertEqual(verified["script_update"]["id"], f"{TAG}:{script_name}")
+        self.assertEqual(asset, body)
+
     def test_rejects_schema_tag_version_url_and_command_drift(self) -> None:
         mutations = [
             ("schema", lambda m: m.__setitem__("schema_version", 2)),
@@ -82,6 +118,15 @@ class ManifestTest(unittest.TestCase):
                 mutate(manifest)
                 with self.assertRaises(lua_deploy.ManifestError):
                     lua_deploy.validate_manifest(manifest, REPOSITORY, TAG)
+
+    def test_rejects_selected_script_manifest_drift_and_unsafe_name(self) -> None:
+        manifest = release_fixture(script_name="legacy_1Hz_spec")
+        with self.assertRaises(lua_deploy.ManifestError):
+            lua_deploy.validate_manifest(
+                manifest, REPOSITORY, TAG, "different_script"
+            )
+        with self.assertRaises(lua_deploy.ManifestError):
+            lua_deploy.fetch_release(REPOSITORY, TAG, "../main")
 
     def test_rejects_asset_size_and_digest_mismatches(self) -> None:
         for name, body in (("size", b"short"), ("digest", b"xxxxxxxxxx")):
@@ -104,7 +149,7 @@ class TargetingTest(unittest.TestCase):
         devices = lua_deploy.parse_devices(
             "00:11:22:33:44:55, ambyte_aa:bb:cc:dd:ee:ff 00:11:22:33:44:55"
         )
-        self.assertEqual(devices, [DEVICE_A, DEVICE_B])
+        self.assertEqual(devices, [DEVICE_A, "ambyte_aa:bb:cc:dd:ee:ff"])
         with self.assertRaises(ValueError):
             lua_deploy.parse_devices("not-a-device")
 
@@ -202,6 +247,20 @@ class TargetingTest(unittest.TestCase):
 
 
 class StatusTest(unittest.TestCase):
+    def test_correlates_status_case_insensitively_but_keeps_requested_route(self) -> None:
+        lower = DEVICE_A.replace("AMBYTE_", "ambyte_")
+        tracker = lua_deploy.ScriptStatusTracker([lower], TAG)
+        terminal = {
+            "type": "script_status",
+            "id": TAG,
+            "state": "applied",
+            "script_sha256": "a" * 64,
+        }
+        self.assertEqual(
+            tracker.record(STATUS_A, json.dumps(terminal)), (lower, "applied")
+        )
+        self.assertEqual(tracker.results()[lower]["state"], "applied")
+
     def test_correlates_topic_and_campaign_and_ignores_duplicate_out_of_order(self) -> None:
         tracker = lua_deploy.ScriptStatusTracker([DEVICE_A], TAG)
         ignored = [

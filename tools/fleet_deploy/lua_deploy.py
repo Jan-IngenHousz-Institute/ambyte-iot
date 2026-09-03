@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Targeted deployment of an immutable Lua release to the Ambyte fleet.
 
-The release manifest and ``main.lua`` asset are downloaded and verified before
+The selected release manifest and Lua asset are downloaded and verified before
 the tool opens an MQTT connection. Device discovery, normalization, firmware
 ping/version handling, deterministic cohort ordering, and AWS IoT WebSocket
 setup deliberately reuse :mod:`fleet_deploy`.
@@ -30,10 +33,9 @@ except ImportError:  # pragma: no cover - exercised by CLI invocation
     from release_selection import LUA_TAG_RE
 
 
-MANIFEST_NAME = "main.lua.manifest.json"
-ASSET_NAME = "main.lua"
 MANIFEST_SCHEMA_VERSION = 1
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SCRIPT_TERMINAL_STATES = {"applied", "failed", "busy"}
 STATUS_FIELDS = (
@@ -63,11 +65,13 @@ def _require_string(obj: dict[str, Any], field: str) -> str:
 
 
 def validate_manifest(
-    manifest: Any, repository: str, tag: str
+    manifest: Any, repository: str, tag: str, script_name: str = "main"
 ) -> dict[str, Any]:
     """Validate schema, release identity, immutable URL, and command equality."""
     if not REPOSITORY_RE.fullmatch(repository):
         raise ManifestError(f"invalid GitHub repository: {repository!r}")
+    if SCRIPT_NAME_RE.fullmatch(script_name) is None:
+        raise ManifestError(f"invalid Lua script name: {script_name!r}")
     tag_match = LUA_TAG_RE.fullmatch(tag)
     if tag_match is None:
         raise ManifestError(f"Lua release tag must match lua-vX.Y.Z: {tag!r}")
@@ -85,6 +89,11 @@ def validate_manifest(
         )
     if _require_string(manifest, "tag") != tag:
         raise ManifestError("manifest tag does not match the requested release tag")
+    manifest_script_name = manifest.get("script_name")
+    if manifest_script_name is None and script_name == "main":
+        pass  # Schema-1 manifests from before the script catalog.
+    elif manifest_script_name != script_name:
+        raise ManifestError("manifest script_name does not match the requested script")
 
     digest = _require_string(manifest, "sha256")
     if SHA256_RE.fullmatch(digest) is None:
@@ -94,18 +103,20 @@ def validate_manifest(
         raise ManifestError("manifest size_bytes must be a non-negative integer")
     built_against = _require_string(manifest, "built_against_fw")
 
-    expected_asset_url = _release_url(repository, tag, ASSET_NAME)
+    asset_name = f"{script_name}.lua"
+    expected_asset_url = _release_url(repository, tag, asset_name)
     if _require_string(manifest, "asset_url") != expected_asset_url:
         raise ManifestError(
-            "manifest asset_url is not the immutable main.lua URL for the requested release"
+            f"manifest asset_url is not the immutable {asset_name} URL for the requested release"
         )
 
     command = manifest.get("script_update")
     if not isinstance(command, dict):
         raise ManifestError("manifest script_update must be a JSON object")
+    campaign_id = tag if script_name == "main" else f"{tag}:{script_name}"
     expected_command = {
         "type": "script_update",
-        "id": tag,
+        "id": campaign_id,
         "url": expected_asset_url,
         "checksum": digest,
         "script_version": version,
@@ -136,6 +147,7 @@ def _download_bytes(url: str, *, max_bytes: int) -> bytes:
 def fetch_release(
     repository: str,
     tag: str,
+    script_name: str = "main",
     *,
     downloader: Callable[..., bytes] = _download_bytes,
 ) -> tuple[dict[str, Any], bytes]:
@@ -145,25 +157,28 @@ def fetch_release(
         raise ManifestError(f"invalid GitHub repository: {repository!r}")
     if LUA_TAG_RE.fullmatch(tag) is None:
         raise ManifestError(f"Lua release tag must match lua-vX.Y.Z: {tag!r}")
+    if SCRIPT_NAME_RE.fullmatch(script_name) is None:
+        raise ManifestError(f"invalid Lua script name: {script_name!r}")
 
-    manifest_url = _release_url(repository, tag, MANIFEST_NAME)
+    asset_name = f"{script_name}.lua"
+    manifest_url = _release_url(repository, tag, f"{asset_name}.manifest.json")
     raw_manifest = downloader(manifest_url, max_bytes=64 * 1024)
     try:
         decoded = json.loads(raw_manifest.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestError("release manifest is not valid UTF-8 JSON") from exc
-    manifest = validate_manifest(decoded, repository, tag)
+    manifest = validate_manifest(decoded, repository, tag, script_name)
 
     asset = downloader(manifest["asset_url"], max_bytes=1024 * 1024)
     expected_size = manifest["size_bytes"]
     if len(asset) != expected_size:
         raise ManifestError(
-            f"main.lua byte count mismatch: got {len(asset)}, expected {expected_size}"
+            f"{asset_name} byte count mismatch: got {len(asset)}, expected {expected_size}"
         )
     digest = hashlib.sha256(asset).hexdigest()
     if digest != manifest["sha256"]:
         raise ManifestError(
-            f"main.lua SHA-256 mismatch: got {digest}, expected {manifest['sha256']}"
+            f"{asset_name} SHA-256 mismatch: got {digest}, expected {manifest['sha256']}"
         )
     return manifest, asset
 
@@ -182,7 +197,7 @@ def parse_devices(value: str) -> list[str]:
             devices.append(normalized)
     if invalid:
         raise ValueError(f"unrecognized device tokens: {invalid}")
-    return sorted(set(devices))
+    return fleet.unique_devices(devices)
 
 
 def select_cohort(
@@ -226,7 +241,8 @@ class ScriptStatusTracker:
     """Correlate status-topic device, campaign ID, and first terminal report."""
 
     def __init__(self, devices: list[str], campaign_id: str):
-        self._devices = set(devices)
+        self._devices = list(devices)
+        self._devices_by_identity = fleet.device_index(devices)
         self._campaign_id = campaign_id
         self._accepted = {device: False for device in devices}
         self._terminal: dict[str, dict[str, Any] | None] = {
@@ -244,8 +260,10 @@ class ScriptStatusTracker:
             return None
         if data.get("id") != self._campaign_id:
             return None
-        device = fleet.device_from_status_topic(topic)
-        if device not in self._devices:
+        device = fleet.requested_device_from_status_topic(
+            topic, self._devices_by_identity
+        )
+        if device is None:
             return None
         state = data.get("state")
         if state == "accepted":
@@ -434,6 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tag", required=True, help="published lua-vX.Y.Z tag")
     parser.add_argument(
+        "--script-name",
+        default="main",
+        help="released Lua asset name without the .lua suffix",
+    )
+    parser.add_argument(
         "--version-op",
         choices=["any", *sorted(fleet.VERSION_OPS)],
         default="any",
@@ -473,13 +496,14 @@ def main(argv: list[str] | None = None) -> int:
     # This must finish before fleet_ping or the deployment connection can publish.
     print(f"Resolving and verifying {args.tag} ...")
     try:
-        manifest, _asset = fetch_release(args.repo, args.tag)
+        manifest, _asset = fetch_release(args.repo, args.tag, args.script_name)
     except (ManifestError, OSError, RuntimeError) as exc:
         error = _redact_text(str(exc))
         write_results(
             args.results_json,
             {
                 "tag": args.tag,
+                "script_name": args.script_name,
                 "dry_run": args.dry_run,
                 "results": {},
                 "error": error,
@@ -492,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Release validation failed: {error}", file=sys.stderr)
         return 2
     print(
-        f"  Lua {manifest['script_version']}: {manifest['size_bytes']} bytes, "
+        f"  Lua {args.script_name} {manifest['script_version']}: "
+        f"{manifest['size_bytes']} bytes, "
         f"sha256={manifest['sha256']} (built against fw "
         f"{manifest['built_against_fw']})"
     )
@@ -515,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             args.results_json,
             {
                 "tag": args.tag,
+                "script_name": args.script_name,
                 "campaign_id": manifest["script_update"]["id"],
                 "sha256": manifest["sha256"],
                 "script_version": manifest["script_version"],
@@ -560,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan: dict[str, Any] = {
         "tag": args.tag,
+        "script_name": args.script_name,
         "campaign_id": command["id"],
         "asset_url": manifest["asset_url"],
         "sha256": manifest["sha256"],
@@ -607,7 +634,8 @@ def main(argv: list[str] | None = None) -> int:
         f"## Fleet deploy (Lua): {args.tag} "
         f"({'dry run' if args.dry_run else 'live'})",
         "",
-        f"- Lua: `{manifest['script_version']}` (`{manifest['sha256']}`)",
+        f"- Lua script: `{args.script_name}`",
+        f"- Lua version: `{manifest['script_version']}` (`{manifest['sha256']}`)",
         f"- Built against firmware: `{manifest['built_against_fw']}` (provenance only)",
         f"- Targeting: `{args.version_op}"
         + (f" {args.version}" if args.version_op != "any" else "")

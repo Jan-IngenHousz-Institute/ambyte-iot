@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
+#include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -37,8 +38,54 @@
 
 #define TAG "event_log"
 
-#define EVLOG_DIR            "/sdcard/events"
+/* ── internal-store seams ──────────────────────────────────────────────────
+ * The store used to live on the hot-unpluggable SD card, where every FATFS touch
+ * needed an unmount-safety refcount (sdcard_io_begin/end) and an error-driven
+ * card-loss latch. The internal partition can never be unplugged and its volume
+ * is never freed at runtime, so those seams collapse to no-ops — kept as named
+ * functions (not deleted call sites) so the store's I/O discipline stays visible
+ * and could target removable media again without re-auditing every path. */
+static inline bool evstore_io_begin(void) { return true; }
+static inline void evstore_io_end(void) {}
+
+/* I/O errors on internal flash are not a removal signal (nothing to unmount) but
+ * they are still worth counting: a rising streak means the partition or driver is
+ * sick, which should be visible on the bench log rather than silently retried. */
+static volatile uint32_t s_evstore_io_errors = 0;
+static void evstore_report_io_error(void)
+{
+    uint32_t n = ++s_evstore_io_errors;
+    if (n <= 3 || (n % 100) == 0) {
+        ESP_LOGE(TAG, "internal-store I/O error (#%u)", (unsigned)n);
+    }
+}
+static inline void evstore_report_io_ok(void) {}
+
+/* Free bytes on the internal store partition (littlefs bookkeeping, no media
+ * walk — cheap enough for per-store admission checks). */
+static esp_err_t evstore_free_bytes(uint64_t *out_free)
+{
+    if (out_free == NULL) return ESP_ERR_INVALID_ARG;
+    size_t total = 0, used = 0;
+    esp_err_t err = esp_littlefs_info(EVSTORE_PARTITION, &total, &used);
+    if (err != ESP_OK) return err;
+    *out_free = (total > used) ? (uint64_t)(total - used) : 0;
+    return ESP_OK;
+}
+
+/* The store lives on INTERNAL flash (littlefs on the previously-unused 9.4 MiB
+ * "storage" partition, mounted at EVSTORE_MOUNT by app_main). littlefs is
+ * copy-on-write and power-loss-safe: a reset/brownout mid-append rolls the file
+ * back to the last fsync — record framing can never tear, and the filesystem
+ * structure can never be lost the way FAT metadata could on the SD card. The SD
+ * card is demoted to two explicitly-bracketed interchange roles at the bottom of
+ * this file: bulk ARCHIVE of already-synced records (one burst per
+ * EVLOG_ARCHIVE_EVERY_N stores, not a continuous trickle) and one-shot IMPORT of
+ * a legacy /sdcard/events backlog after the OTA that moves the store internal. */
+#define EVLOG_DIR            EVSTORE_MOUNT "/events"
 #define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
+#define EVLOG_LEGACY_SD_DIR  "/sdcard/events"              /* pre-internal-store firmware backlog */
+#define EVLOG_ARCHIVE_DIR    "/sdcard/archive"             /* bulk archive of synced records */
 /* lua_runner's binding case is the permanent new-firmware v2 fallback:
  * 62,999 payload + 1,535 metadata + 543 arrun command + 113 fixed header +
  * 2 framing = 65,192 B, strictly below EVLOG_RECORD_CAP_NORMAL (65,552) with
@@ -46,13 +93,26 @@
  * producer names every term and proves the positive margin with static asserts. */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
-#define EVLOG_FLUSH_EVERY_N  1                /* fsync each record: at ~0.4 writes/s the write-amp is trivial and
-                                               * the brownout-loss window shrinks to one record (audit G3/B2) */
+#define EVLOG_FLUSH_EVERY_N  8                /* fsync every N records. Was 1 (per-record) to shrink the
+                                               * brownout-loss window to one record (audit G3/B2) — but each
+                                               * fsync rewrites the FAT sector + dir entry IN PLACE, so at the
+                                               * field cadence that was thousands of in-place metadata writes
+                                               * per day, each one a corruption window if power dies mid-write
+                                               * (FATFS has no journal; consumer-card FTLs can tear a whole
+                                               * erase block on power loss). Batching trades ≤8 records /
+                                               * ≤1.5 s of loss — which at-least-once delivery already
+                                               * tolerates — for ~8× less FAT exposure; a corrupted FAT loses
+                                               * the ENTIRE backlog + main.lua. The low-battery persistence
+                                               * park (app_main) closes the predictable-brownout case. Claims
+                                               * of tail records still flush first, so publishing never sees a
+                                               * stale tail. */
 #define EVLOG_CURSOR_BATCH   16               /* persist read cursor every N acks */
 #define EVLOG_ID_BLOCK       64               /* reserve next_id in blocks → 1 NVS write / 64 ids */
 #define EVLOG_SCAN_MAX_LINES 20000            /* bound the boot pending-count (stat only) */
 #define EVLOG_SCAN_MAX_MS    3000             /* …and its wall-clock, so a huge/slow backlog can't churn on */
 #define EVLOG_MIN_FREE_BYTES (256 * 1024)     /* storage-full watermark: refuse writes below this (audit C1/C2) */
+#define EVLOG_EVICT_TARGET   (512 * 1024)     /* eviction hysteresis: clean synced files until this much is free */
+#define EVLOG_ARCHIVE_EVERY_N 1000            /* bulk-archive synced files to SD once per N stores */
 #define EVLOG_OOM_STUCK_MAX  30               /* NO_MEM retries on one head record → quarantine it (audit D2) */
 
 _Static_assert(PUBLISH_WINDOW_SLOTS > 0 && PUBLISH_WINDOW_SLOTS <= 16,
@@ -63,7 +123,9 @@ _Static_assert(PUBLISH_WINDOW_BYTES > 0, "publish window byte budget must be non
 #define NVS_KEY_RD_SEQ       "rd_seq"
 #define NVS_KEY_RD_OFF       "rd_off"
 #define NVS_KEY_NID          "nid"
-#define NVS_KEY_CARDID       "card_id"   /* SDMMC serial bound to the persisted cursor (audit I2/I3) */
+/* (The former "card_id" CID-binding key is gone: the store and its NVS cursor now
+ * live on the same soldered-down device, so a cursor can never meet a foreign log —
+ * the audit I2/I3 card-swap failure class is structurally impossible internally.) */
 
 static SemaphoreHandle_t s_mtx = NULL;
 static StaticSemaphore_t s_mtx_storage;
@@ -127,6 +189,7 @@ static TaskHandle_t s_count_task = NULL;   /* one-shot boot backlog counter */
 static uint32_t   s_writes_since_flush = 0;
 static TickType_t s_last_flush_tick    = 0;
 static uint32_t   s_acks_since_persist = 0;
+static uint32_t   s_stores_since_archive = 0;   /* bulk-SD-archive trigger counter */
 
 /* Health / loss accounting (surfaced via event_log_health for the STATUS heartbeat,
  * so silent-skip and drop sites become observable in the field). */
@@ -353,11 +416,17 @@ static void evlog_persist_cursor_locked(void)
     nvs_close(h);
 }
 
-/* Delete/step over a rotated file only when the durable cursor itself has
- * reached its EOF.  The claim tail may already be in a later file, but it is
- * deliberately irrelevant here: a reboot must still find every un-ACKed byte
- * at or after the cursor.  File-boundary persistence matches the old frequency
- * (once per drained file) and is safe even between 16-ACK cursor batches. */
+/* Step over a rotated file only when the durable cursor itself has reached its
+ * EOF.  The claim tail may already be in a later file, but it is deliberately
+ * irrelevant here: a reboot must still find every un-ACKed byte at or after the
+ * cursor.  File-boundary persistence matches the old frequency (once per drained
+ * file) and is safe even between 16-ACK cursor batches.
+ *
+ * RETENTION CHANGE (internal store): a fully-drained file is NO LONGER deleted
+ * here. Files with seq < s_rd_seq are 100% synced and linger for the bulk SD
+ * archive (event_log_archive_to_sd) — and they are the eviction pool when the
+ * store runs short of space (evlog_evict_synced_locked): unsynced data always
+ * outranks synced archive copies. */
 static void evlog_normalize_cursor_locked(void)
 {
     while (s_rd_seq < s_tail_seq) {
@@ -370,11 +439,64 @@ static void evlog_normalize_cursor_locked(void)
          * EOF here could silently skip a whole rotated file. */
         if (stat(path, &st) != 0 || s_rd_off < (long)st.st_size) break;
 
-        remove(path);
         s_rd_seq++;
         s_rd_off = 0;
         evlog_persist_cursor_locked();
     }
+}
+
+/* ── synced-first eviction (audit C1 successor) ────────────────────────────
+ * When the internal store runs short (dead SD → nothing archives, and/or a slow
+ * uplink → the cursor crawls), free space by deleting the OLDEST fully-synced
+ * retained files (seq < s_rd_seq strictly — the cursor file may hold unsynced
+ * bytes and is never touched, nor is anything after it). What is lost is only
+ * the not-yet-archived SD copy of data the platform has already ACKed; unsynced
+ * records are sacred and are what this space is being freed FOR. Returns true
+ * if at least one file was evicted. Caller holds s_mtx. */
+static int64_t s_evicted_files = 0;   /* lifetime counter (boot-relative), logged */
+static bool evlog_evict_synced_locked(void)
+{
+    bool evicted = false;
+    uint64_t freeb = 0;
+    while (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_EVICT_TARGET) {
+        uint32_t min_seq = 0, max_seq = 0;
+        if (!evlog_scan_range_locked(&min_seq, &max_seq)) break;
+        if (min_seq >= s_rd_seq) break;              /* nothing fully-synced left */
+        char path[64];
+        evlog_file_path(path, sizeof path, min_seq);
+        if (remove(path) != 0) break;                /* stuck file: don't spin */
+        evicted = true;
+        s_evicted_files++;
+        ESP_LOGW(TAG, "evicted synced %s (unarchived) to protect unsynced capacity "
+                      "(%llu B free, %lld evicted so far)",
+                 path, (unsigned long long)freeb, (long long)s_evicted_files);
+    }
+    return evicted;
+}
+
+/* Full-store recovery, shared by EVERY ENOSPC-class failure path (short write,
+ * flush/fsync failure, rotate-open failure, tail-reopen failure): evict the
+ * oldest fully-synced retained files before anything is dropped or reported as
+ * a media fault. Returns true when the store has headroom again (or never lost
+ * it). On false, s_write_full is latched so later stores fail fast at the
+ * admission check instead of paying a full littlefs free-block scan per attempt.
+ * Caller holds s_mtx. */
+static bool evlog_full_recovery_locked(void)
+{
+    uint64_t freeb = 0;
+    if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+        (void)evlog_evict_synced_locked();
+    }
+    if (evstore_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
+        return true;
+    }
+    if (!s_write_full) {
+        ESP_LOGW(TAG, "store full (%llu B free, nothing synced left to evict) — "
+                      "writes paused until the drain frees space",
+                 (unsigned long long)freeb);
+    }
+    s_write_full = true;
+    return false;
 }
 
 /* Advance only the contiguous ACKed prefix.  Out-of-order ACKs merely flip a
@@ -452,51 +574,6 @@ static int64_t evlog_tail_max_id_locked(void)
     return 0;
 }
 
-/* Full-directory scan for the highest measure_id across ALL ev files. Used only on
- * a detected card swap, where the tail-only scan could miss a higher id in a lower-seq
- * file and hand out a colliding measure_id on the foreign card (audit I3). Caller
- * holds s_mtx; uses s_line. */
-static int64_t evlog_scan_max_id_locked(void)
-{
-    int64_t max_id = 0;
-    uint32_t mn = 0, mx = 0;
-    if (!evlog_scan_range_locked(&mn, &mx)) return 0;
-    for (uint32_t seq = mn; seq <= mx; seq++) {
-        char path[64];
-        evlog_file_path(path, sizeof path, seq);
-        FILE *f = fopen(path, "rb");
-        if (f == NULL) continue;
-        while (fgets(s_line, s_line_cap, f) != NULL) {
-            size_t len = strlen(s_line);
-            if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
-            int64_t id = (int64_t)strtoll(s_line, NULL, 10);
-            if (id > max_id) max_id = id;
-        }
-        fclose(f);
-    }
-    return max_id;
-}
-
-static uint32_t evlog_nvs_get_cardid(void)
-{
-    uint32_t v = 0;
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u32(h, NVS_KEY_CARDID, &v);
-        nvs_close(h);
-    }
-    return v;
-}
-
-static void evlog_nvs_set_cardid(uint32_t v)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u32(h, NVS_KEY_CARDID, v);
-    nvs_commit(h);
-    nvs_close(h);
-}
-
 /* One-shot task: count the pending backlog (cursor → tail) OFF the boot path, so a
  * large offline accumulation (Wi-Fi down → nothing drains) can't stall app_main
  * before the console starts. BOUNDED by line count and wall-clock — beyond that the
@@ -551,7 +628,7 @@ static void evlog_count_task(void *arg)
 
     if (capped) {
         ESP_LOGW(TAG, "pending backlog >= %lld (count capped) — drain via Wi-Fi/MQTT "
-                      "or clear /sdcard/events", (long long)pending);
+                      "or clear " EVLOG_DIR, (long long)pending);
     } else {
         ESP_LOGI(TAG, "pending backlog counted: %lld", (long long)pending);
     }
@@ -621,21 +698,6 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_seq = max_seq;
 
-    /* Card-identity guard: the read cursor + next_id HWM live in NVS (internal flash),
-     * but the log lives on the SD. If the card was swapped/restored while NVS persisted,
-     * applying the stale cursor to a DIFFERENT card's log would strand its lower-seq
-     * files (the ~35k-record gap failure) or hand out colliding measure_ids. Detect the
-     * swap by CID serial and, on mismatch, re-publish this card's log from the oldest
-     * file and reseed next_id from a FULL scan (audit I2/I3). */
-    uint32_t card_serial = sdcard_card_serial();
-    uint32_t prev_serial = evlog_nvs_get_cardid();
-    bool card_swapped = (prev_serial != 0 && card_serial != 0 && prev_serial != card_serial);
-    if (card_swapped) {
-        ESP_LOGW(TAG, "SD card changed (serial 0x%08x -> 0x%08x) — re-publishing this card's "
-                      "log from oldest, reseeding id from full scan",
-                 (unsigned)prev_serial, (unsigned)card_serial);
-    }
-
     /* Read cursor; default to the oldest file. */
     uint32_t cseq = min_seq, coff32 = 0;
     nvs_handle_t h;
@@ -644,15 +706,15 @@ static esp_err_t evlog_open_locked(void)
         nvs_get_u32(h, NVS_KEY_RD_OFF, &coff32);
         nvs_close(h);
     }
-    /* Clamp to what's actually on the card (drained files were deleted; a torn
-     * offset past EOF is pulled back). Over-clamping only re-sends a few events,
-     * which at-least-once already tolerates. */
+    /* Clamp to what's actually in the store (a torn offset past EOF is pulled
+     * back). NOTE: with synced files now RETAINED for archive/eviction, min_seq
+     * being far below the cursor is the normal shape, not a stale-cursor sign.
+     * Over-clamping only re-sends a few events, which at-least-once tolerates. */
     if (cseq < min_seq) { cseq = min_seq; coff32 = 0; }
     if (cseq > max_seq) { cseq = max_seq; coff32 = 0; }
     long fsz  = evlog_file_size(cseq);
     long coff = (long)coff32;
     if (coff > fsz) coff = fsz;
-    if (card_swapped) { cseq = min_seq; coff = 0; }   /* foreign cursor → start at oldest */
     s_rd_seq = cseq;
     s_rd_off = coff;
 
@@ -695,17 +757,10 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_size = evlog_file_size(s_tail_seq);
 
-    /* Seed next_id from the card synchronously — cheap: only the tail file (records are
-     * appended in ascending id order, so the tail holds the max). On a card SWAP the
-     * tail-only shortcut is unsafe (a lower-seq file could hold a higher id from the
-     * foreign device), so scan the whole directory once. */
-    int64_t max_id = card_swapped ? evlog_scan_max_id_locked() : evlog_tail_max_id_locked();
+    /* Seed next_id from the store synchronously — cheap: only the tail file (records
+     * are appended in ascending id order, so the tail holds the max). */
+    int64_t max_id = evlog_tail_max_id_locked();
     s_pending = 0;   /* provisional; evlog_count_task fills it in shortly */
-
-    /* Bind this card's serial to the cursor for next-boot swap detection. */
-    if (card_serial != 0 && card_serial != prev_serial) {
-        evlog_nvs_set_cardid(card_serial);
-    }
 
     /* Never hand out an id that collides with a record still on the card. NVS
      * (where next_id's HWM lives) is wiped on every reflash and could be lost to
@@ -762,54 +817,18 @@ esp_err_t event_log_init(void)
     s_next_id  = (int64_t)hwm;
     s_id_limit = (int64_t)hwm;
 
-    if (sdcard_is_mounted()) {
-        s_available = (evlog_open_locked() == ESP_OK);
-        if (!s_available) ESP_LOGW(TAG, "event log unavailable");
-    } else {
-        ESP_LOGW(TAG, "SD not mounted — persistence offline");
-    }
+    /* The internal partition is mounted by app_main before this runs and cannot
+     * disappear afterwards — open unconditionally. (The old SD-store variant had
+     * to gate on sdcard_is_mounted and react to hot-plug callbacks; both of those
+     * seams are gone with the store internal.) */
+    s_available = (evlog_open_locked() == ESP_OK);
+    if (!s_available) ESP_LOGW(TAG, "event log unavailable");
     return ESP_OK;
 }
 
 void event_log_set_reset_notifier(void (*fn)(void))
 {
     s_reset_notifier = fn;
-}
-
-esp_err_t event_log_on_sd_lost(void)
-{
-    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-
-    /* Stop new stores FIRST, without waiting for the lock. A writer stuck in a
-     * failing multi-second fwrite still holds s_mtx, but the next store to acquire
-     * it will see s_available=false (and sdcard_io_lost()) and bail. This is what
-     * makes the close starvation-proof: even if we can't grab the lock to close
-     * the file, the writers are already shut off. */
-    s_available = false;
-
-    /* Generous timeout: must outlast one in-flight store's worst-case failing
-     * write burst on a gone card (writes time out at ~5 s each in the driver), so
-     * the close actually happens instead of leaking the open tail. If it still
-     * times out, the FILE* is closed defensively on the next evlog_open_locked. */
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(8000)) != pdTRUE) {
-        ESP_LOGW(TAG, "SD lost — stores halted, but tail close deferred (lock busy)");
-        return ESP_ERR_TIMEOUT;
-    }
-    if (s_wf != NULL) {
-        /* If the card is already latched lost, the FATFS volume may be freed by the
-         * monitor's teardown at any moment — flushing/closing the handle would race
-         * that free (UAF, audit R-8). Just abandon the handle; the next
-         * evlog_open_locked closes it defensively (a bounded, one-per-loss leak). */
-        if (!sdcard_io_lost()) {
-            evlog_flush_writer_locked();    /* best-effort; card believed present */
-            fclose(s_wf);
-        }
-        s_wf = NULL;
-    }
-    evlog_persist_cursor_locked();      /* save progress before the card goes */
-    xSemaphoreGive(s_mtx);
-    ESP_LOGW(TAG, "SD lost — event log closed");
-    return ESP_OK;
 }
 
 esp_err_t event_log_prepare_shutdown(void)
@@ -838,38 +857,6 @@ esp_err_t event_log_prepare_shutdown(void)
     return ESP_OK;
 }
 
-esp_err_t event_log_on_sd_restored(void)
-{
-    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t err = ESP_OK;
-    bool reopened = false;
-    if (!s_available) {
-        err = evlog_open_locked();
-        reopened = (err == ESP_OK);
-    }
-    bool available = s_available;
-    xSemaphoreGive(s_mtx);
-    /* Keep admission closed across the whole two-component reset. A claimant that
-     * runs after reopen but before peer reconciliation observes NOT_SUPPORTED,
-     * never a fresh event window paired with stale MQTT latches/completions.
-     * The notifier must run outside s_mtx; publish availability only after it has
-     * returned, using a brief re-take so every normal claimant sees one atomic
-     * false -> reconciled -> true transition. */
-    if (reopened) {
-        if (s_reset_notifier != NULL) s_reset_notifier();
-        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            ESP_LOGE(TAG, "SD reopened but availability publish timed out — holding event log offline");
-            return ESP_ERR_TIMEOUT;
-        }
-        s_available = true;
-        available = true;
-        xSemaphoreGive(s_mtx);
-    }
-    if (available) ESP_LOGI(TAG, "SD restored — event log reopened");
-    return err;
-}
-
 esp_err_t event_log_next_id(int64_t *out_id)
 {
     if (out_id == NULL) return ESP_ERR_INVALID_ARG;
@@ -891,30 +878,45 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-    /* Lock-free early-out: if the card has been latched lost, don't even take the
-     * lock or touch the (gone) media — bail before re-arming a failing write. */
-    if (sdcard_io_lost()) return ESP_ERR_NOT_SUPPORTED;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (!s_available || sdcard_io_lost()) {
+    if (!s_available) {
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_SUPPORTED;
     }
     /* Self-heal: a prior rotate/open failure may have closed the tail without
      * latching the log offline (see rotate path). Reopen it here rather than
-     * staying dark for the rest of the session (audit D1). */
-    if (s_wf == NULL && evlog_reopen_tail_locked() != ESP_OK) {
-        sdcard_report_io_error();
-        xSemaphoreGive(s_mtx);
-        return ESP_ERR_NOT_SUPPORTED;
+     * staying dark for the rest of the session (audit D1). On a FULL partition
+     * the reopen itself ENOSPCs (the file handle needs a metadata block), so
+     * evict synced files and retry once before declaring the store unwritable. */
+    if (s_wf == NULL) {
+        esp_err_t ro = evlog_reopen_tail_locked();
+        if (ro != ESP_OK && evlog_full_recovery_locked()) {
+            ro = evlog_reopen_tail_locked();
+        }
+        if (ro != ESP_OK) {
+            xSemaphoreGive(s_mtx);
+            if (s_write_full) {
+                s_dropped++;
+                return ESP_ERR_NO_MEM;   /* full is not a media fault */
+            }
+            evstore_report_io_error();
+            return ESP_ERR_NOT_SUPPORTED;
+        }
     }
     /* Storage-full admission control: a full card is healthy, so refuse cleanly
      * (no I/O-error report → no unmount/Lua-restart thrash) and let the drain free
      * space. Re-enable once the drain has recovered headroom (audit C1/C2). */
     if (s_write_full) {
         uint64_t freeb = 0;
-        if (sdcard_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
+        /* Recovery order: the drain freeing space is passive; ACTIVE recovery is
+         * evicting the oldest fully-synced retained files — unsynced capacity
+         * always outranks unarchived synced copies (see evlog_evict_synced_locked). */
+        if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+            (void)evlog_evict_synced_locked();
+        }
+        if (evstore_free_bytes(&freeb) == ESP_OK && freeb >= EVLOG_MIN_FREE_BYTES) {
             s_write_full = false;
-            ESP_LOGI(TAG, "SD storage recovered (%llu B free) — writes resumed",
+            ESP_LOGI(TAG, "store space recovered (%llu B free) — writes resumed",
                      (unsigned long long)freeb);
         } else {
             s_dropped++;
@@ -972,26 +974,41 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     /* Roll to a fresh file before the tail would exceed the rotate threshold, so
      * a fully-published file can later be deleted to reclaim space. */
     if (s_tail_size > 0 && s_tail_size + (long)total > EVLOG_ROTATE_BYTES) {
-        if (evlog_flush_writer_locked() != ESP_OK) sdcard_report_io_error();
+        if (evlog_flush_writer_locked() != ESP_OK) evstore_report_io_error();
         fclose(s_wf);
         s_wf = NULL;
         s_tail_seq++;
         char path[64];
         evlog_file_path(path, sizeof path, s_tail_seq);
         s_wf = fopen(path, "a");
-        if (s_wf == NULL) {
-            /* Do NOT latch the log offline: a transient open failure (heap/DMA OOM)
-             * must not disable persistence for the rest of the session. Drop this one
-             * record; the next store's self-heal reopens the (now-incremented) tail
-             * (audit D1). */
-            ESP_LOGE(TAG, "rotate: open %s failed — retrying next store", path);
-            s_dropped++;
-            free(cmd);
-            xSemaphoreGive(s_mtx);
-            sdcard_report_io_error();
-            return ESP_FAIL;
+        if (s_wf == NULL && evlog_full_recovery_locked()) {
+            s_wf = fopen(path, "a");   /* eviction freed space — retry once */
         }
-        s_tail_size = 0;
+        if (s_wf == NULL) {
+            /* Still no room (nothing synced left to evict). Roll the sequence
+             * back and keep appending to the previous tail: writer and reader
+             * must never point at a file that does not exist (a phantom tail
+             * reads as "queue drained" to the claim path and deadlocks the
+             * publisher until reboot). The old tail grows past the rotate
+             * threshold until the drain frees space — harmless. */
+            s_tail_seq--;
+            evlog_file_path(path, sizeof path, s_tail_seq);
+            s_wf = fopen(path, "a");
+            if (s_wf == NULL) {
+                /* Do NOT latch the log offline: a transient open failure
+                 * (heap/DMA OOM) must not disable persistence for the rest of
+                 * the session (audit D1). */
+                ESP_LOGE(TAG, "rotate: reopen of previous tail %s failed — dropping record", path);
+                s_dropped++;
+                free(cmd);
+                xSemaphoreGive(s_mtx);
+                evstore_report_io_error();
+                return ESP_FAIL;
+            }
+            ESP_LOGW(TAG, "rotate deferred (store full) — still appending to %s", path);
+        } else {
+            s_tail_size = 0;
+        }
     }
 
     size_t w = 0;
@@ -1017,38 +1034,51 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
             ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
         }
         s_dropped++;
-        /* Distinguish a FULL card (healthy — pause writes, keep draining) from a
-         * pulled/dead one (report I/O error → latch → unmount). A false unmount of a
-         * full-but-healthy card causes the remount/Lua-restart thrash (audit C1). */
+        /* Distinguish a FULL store (healthy — pause writes, keep draining) from a
+         * media fault (report I/O error → latch). A false fault report on a
+         * full-but-healthy store causes the remount/Lua-restart thrash (audit C1).
+         * Recovery (evict synced files first) is shared with every other
+         * ENOSPC-class path via evlog_full_recovery_locked(). */
         uint64_t freeb = 0;
         bool full = (errno == ENOSPC) ||
-                    (sdcard_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
+                    (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
         if (full) {
-            if (!s_write_full) {
-                ESP_LOGW(TAG, "SD storage full (%llu B free) — writes paused, draining to reclaim",
-                         (unsigned long long)freeb);
-            }
-            s_write_full = true;
+            /* This record was already rolled back and stays dropped; the next
+             * store proceeds when eviction restored headroom. */
+            (void)evlog_full_recovery_locked();
             xSemaphoreGive(s_mtx);
-            return ESP_ERR_NO_MEM;      /* full is not card-loss: no report_io_error */
+            return ESP_ERR_NO_MEM;      /* full is not a media fault: no report_io_error */
         }
         xSemaphoreGive(s_mtx);
-        sdcard_report_io_error();       /* a pulled/dead card latches loss after a few of these */
+        evstore_report_io_error();
         return ESP_FAIL;
     }
-    sdcard_report_io_ok();          /* good write → reset the consecutive-failure streak */
+    evstore_report_io_ok();
     s_tail_size += (long)total;
     s_pending++;
+    s_stores_since_archive++;        /* bulk-SD-archive trigger (event_log_archive_pending) */
 
     s_writes_since_flush++;
     TickType_t now = xTaskGetTickCount();
     if (s_writes_since_flush >= EVLOG_FLUSH_EVERY_N ||
         (now - s_last_flush_tick) >= pdMS_TO_TICKS(EVLOG_FLUSH_PERIOD_MS)) {
         if (evlog_flush_writer_locked() != ESP_OK) {
-            /* The record's bytes reached stdio but fsync failed — treat as an I/O
-             * error so a dying card is caught rather than counting torn data durable. */
+            /* The record's bytes reached stdio but the flush failed. On a FULL
+             * littlefs this is backpressure (the COW commit has no free block
+             * pair), not a dying medium — and this is the path a full store
+             * actually takes, since stdio absorbs the fwrites and the failure
+             * only surfaces here. Evict synced files first; only with space
+             * available is a flush failure a real I/O fault. The record stays
+             * dropped/not-durable either way. */
+            uint64_t freeb = 0;
+            if (evstore_free_bytes(&freeb) == ESP_OK &&
+                freeb < EVLOG_MIN_FREE_BYTES) {
+                (void)evlog_full_recovery_locked();
+                xSemaphoreGive(s_mtx);
+                return ESP_ERR_NO_MEM;
+            }
             xSemaphoreGive(s_mtx);
-            sdcard_report_io_error();
+            evstore_report_io_error();
             return ESP_FAIL;
         }
         s_writes_since_flush = 0;
@@ -1081,7 +1111,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
 
         bool is_tail = slot->seq >= s_tail_seq;
         if (is_tail && evlog_flush_writer_locked() != ESP_OK) {  /* push appends to media first */
-            sdcard_report_io_error();
+            evstore_report_io_error();
             xSemaphoreGive(s_mtx);
             return ESP_FAIL;
         }
@@ -1142,7 +1172,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         bool at_cursor = s_window_count == 0 && scan_seq == s_rd_seq && scan_off == s_rd_off;
         bool is_tail = (scan_seq >= s_tail_seq);
         if (is_tail && evlog_flush_writer_locked() != ESP_OK) {
-            sdcard_report_io_error();
+            evstore_report_io_error();
             result = ESP_FAIL;
             break;
         }
@@ -1152,6 +1182,28 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         errno = 0;
         FILE *rf = fopen(path, "rb");
         if (rf == NULL) {
+            if (is_tail && errno == ENOENT && s_wf == NULL) {
+                /* Writer-down state: a rotate onto a full store advanced
+                 * s_tail_seq past a file that was never created, and the
+                 * store-side reopen keeps failing. A phantom tail must not read
+                 * as "queue drained" (that idles the publisher until reboot):
+                 * evict to make room, roll the tail back to the newest real
+                 * file, reopen it, and retry the claim once. */
+                (void)evlog_full_recovery_locked();
+                uint32_t min_seq = 0, max_seq = 0;
+                if (evlog_scan_range_locked(&min_seq, &max_seq) &&
+                    max_seq < s_tail_seq) {
+                    ESP_LOGW(TAG, "tail ev-%06u.log missing with writer down — "
+                                  "rolling back to ev-%06u.log",
+                             (unsigned)s_tail_seq, (unsigned)max_seq);
+                    s_tail_seq = max_seq;
+                }
+                if (evlog_reopen_tail_locked() == ESP_OK) {
+                    continue;            /* tail healed — retry the read */
+                }
+                result = ESP_ERR_NOT_FOUND;
+                break;
+            }
             if (!is_tail && errno == ENOENT) {
                 if (at_cursor) {
                     ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)scan_seq);
@@ -1168,7 +1220,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
                 result = ESP_ERR_INVALID_STATE;
                 break;
             }
-            if (!is_tail) sdcard_report_io_error();
+            if (!is_tail) evstore_report_io_error();
             result = is_tail ? ESP_ERR_NOT_FOUND : ESP_FAIL;
             break;
         }
@@ -1182,7 +1234,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         if (got == NULL) {
             if (ferror(rf)) {
                 clearerr(rf); fclose(rf);
-                sdcard_report_io_error();
+                evstore_report_io_error();
                 result = ESP_FAIL;
                 break;
             }
@@ -1214,7 +1266,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
                 }
                 if (ferror(rf)) {                    /* over-long scan hit a read error → don't skip */
                     clearerr(rf); fclose(rf);
-                    sdcard_report_io_error();
+                    evstore_report_io_error();
                     result = ESP_FAIL;
                     break;
                 }
@@ -1237,7 +1289,7 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             }
             if (ferror(rf)) {                        /* partial line due to a read error, not a torn record */
                 clearerr(rf); fclose(rf);
-                sdcard_report_io_error();
+                evstore_report_io_error();
                 result = ESP_FAIL;
                 break;
             }
@@ -1549,7 +1601,7 @@ esp_err_t event_log_health(evlog_health_t *out)
 }
 
 /* ── public entry points: SD RW-gate wrappers ─────────────────────────────
- * Every op that touches the FATFS volume runs between sdcard_io_begin()/io_end() so
+ * Every op that touches the FATFS volume runs between evstore_io_begin()/io_end() so
  * an unmount cannot free the volume mid-op (audit F1/R-5). The begin/end are 1:1 by
  * construction — exactly one begin, exactly one end, NO branch between — so no return
  * path inside the *_impl (which keep all their own s_mtx handling) can leak a ref.
@@ -1558,34 +1610,34 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
         desc->tag == NULL || desc->tag[0] == '\0') return ESP_ERR_INVALID_ARG;
-    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    if (!evstore_io_begin()) return ESP_ERR_NOT_SUPPORTED;
     esp_err_t rc = event_log_store_impl(desc);
-    sdcard_io_end();
+    evstore_io_end();
     return rc;
 }
 
 esp_err_t event_log_claim_next_event(measurement_event_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
-    if (!sdcard_io_begin()) { memset(out, 0, sizeof *out); return ESP_ERR_NOT_SUPPORTED; }
+    if (!evstore_io_begin()) { memset(out, 0, sizeof *out); return ESP_ERR_NOT_SUPPORTED; }
     esp_err_t rc = event_log_claim_impl(out);
-    sdcard_io_end();
+    evstore_io_end();
     return rc;
 }
 
 esp_err_t event_log_quarantine_event(int64_t measure_id)
 {
-    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    if (!evstore_io_begin()) return ESP_ERR_NOT_SUPPORTED;
     esp_err_t rc = event_log_quarantine_impl(measure_id);
-    sdcard_io_end();
+    evstore_io_end();
     return rc;
 }
 
 esp_err_t event_log_rewind(uint32_t seq, uint32_t *out_seq, int64_t *out_pending)
 {
-    if (!sdcard_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    if (!evstore_io_begin()) return ESP_ERR_NOT_SUPPORTED;
     esp_err_t rc = event_log_rewind_impl(seq, out_seq, out_pending);
-    sdcard_io_end();
+    evstore_io_end();
     return rc;
 }
 
@@ -1598,3 +1650,228 @@ measurement_mark_event_synced_fn  event_log_get_mark_event_synced_fn(void)  { re
 measurement_mark_event_pending_fn event_log_get_mark_event_pending_fn(void) { return event_log_mark_event_pending; }
 measurement_quarantine_fn         event_log_get_quarantine_fn(void)         { return event_log_quarantine_event; }
 measurement_db_stats_fn           event_log_get_db_stats_fn(void)           { return event_log_db_stats; }
+
+/* ═══ SD interchange: bulk archive + legacy-backlog import ═══════════════════
+ * The ONLY two places this component touches the SD card, both driven by the
+ * app-level keeper task (never the store/claim hot path) and both bracketed by
+ * sdcard_io_begin/end because the SD — unlike the internal store — can vanish
+ * mid-op. SD failures here report into the card-loss latch (a genuinely dead
+ * card should unmount) but NEVER affect store availability: with no SD the
+ * archive simply skips and eviction bounds the retained-synced pool. */
+
+esp_err_t event_log_free_bytes(uint64_t *out_free)
+{
+    return evstore_free_bytes(out_free);
+}
+
+bool event_log_archive_pending(void)
+{
+    /* Racy reads are fine: the keeper polls; a stale answer costs one period. */
+    return s_available && s_stores_since_archive >= EVLOG_ARCHIVE_EVERY_N &&
+           sdcard_is_mounted();
+}
+
+/* Copy every fully-synced retained file (seq < durable cursor) to
+ * EVLOG_ARCHIVE_DIR, then delete the internal copy. One burst per trigger — the
+ * SD sees a few large sequential writes per EVLOG_ARCHIVE_EVERY_N stores instead
+ * of a continuous metadata trickle (the corruption pattern PR #27 documented).
+ * Archive names are arc-<first_measure_id>.log: measure_ids are monotonic for
+ * the device's lifetime (NVS HWM + reseed-above-max), so names never collide
+ * across internal seq resets. s_mtx is taken PER FILE so store/claim latency is
+ * bounded by one file copy, not the whole burst. */
+esp_err_t event_log_archive_to_sd(size_t *out_archived)
+{
+    if (out_archived) *out_archived = 0;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    size_t archived = 0;
+
+    for (;;) {
+        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) break;
+
+        uint32_t min_seq = 0, max_seq = 0;
+        bool any = s_available && evlog_scan_range_locked(&min_seq, &max_seq) &&
+                   min_seq < s_rd_seq;               /* strictly-synced files only */
+        if (!any) {
+            /* Reset the trigger only when the pool is clean, so leftovers from a
+             * failed burst re-arm the next keeper pass immediately. */
+            if (archived > 0 || min_seq >= s_rd_seq) s_stores_since_archive = 0;
+            xSemaphoreGive(s_mtx);
+            break;
+        }
+
+        char src[64];
+        evlog_file_path(src, sizeof src, min_seq);
+        FILE *rf = fopen(src, "rb");
+        if (rf == NULL) { xSemaphoreGive(s_mtx); break; }
+
+        /* First line's id names the archive file. */
+        int64_t first_id = 0;
+        if (fgets(s_line, s_line_cap, rf) != NULL) {
+            first_id = (int64_t)strtoll(s_line, NULL, 10);
+        }
+        if (first_id <= 0) {
+            /* Unreadable/empty synced file: nothing to archive, drop it. */
+            fclose(rf);
+            remove(src);
+            xSemaphoreGive(s_mtx);
+            continue;
+        }
+        rewind(rf);
+
+        bool ok = false;
+        if (sdcard_io_begin()) {
+            mkdir(EVLOG_ARCHIVE_DIR, 0777);          /* ignore EEXIST */
+            char dst[64];
+            snprintf(dst, sizeof dst, "%s/arc-%lld.log", EVLOG_ARCHIVE_DIR,
+                     (long long)first_id);
+            FILE *wf = fopen(dst, "wb");
+            if (wf != NULL) {
+                ok = true;
+                size_t n;
+                while ((n = fread(s_line, 1, s_line_cap, rf)) > 0) {
+                    if (fwrite(s_line, 1, n, wf) != n) { ok = false; break; }
+                }
+                if (ok && (fflush(wf) != 0 || fsync(fileno(wf)) != 0)) ok = false;
+                fclose(wf);
+                if (!ok) remove(dst);                /* no partial archives */
+            }
+            if (ok) sdcard_report_io_ok(); else sdcard_report_io_error();
+            sdcard_io_end();
+        }
+        fclose(rf);
+
+        if (ok) {
+            remove(src);                             /* internal copy freed */
+            archived++;
+        }
+        xSemaphoreGive(s_mtx);
+        if (!ok) break;                              /* SD unhappy: retry next trigger */
+        vTaskDelay(1);                               /* yield between files */
+    }
+
+    if (archived > 0) {
+        ESP_LOGI(TAG, "archived %u synced file(s) to " EVLOG_ARCHIVE_DIR, (unsigned)archived);
+    }
+    if (out_archived) *out_archived = archived;
+    return ESP_OK;
+}
+
+/* One-shot fleet migration: re-append the pre-internal-store /sdcard/events
+ * backlog through the normal internal writer, preserving each record verbatim
+ * (measure_id included — openJII dedups on it, so a power cut between "appended
+ * internally" and "deleted from SD" costs only duplicates, never a skip). Files
+ * import oldest-first so the publish order stays FIFO; each SD file is deleted
+ * only after its records are appended AND fsync'd internally. Imports at most
+ * max_files per call so the keeper loop stays responsive; returns the number of
+ * files imported (0 = nothing left or SD absent). Storage-full stops the import
+ * cleanly — the remainder stays on the SD for the next pass. */
+size_t event_log_import_sd_backlog(size_t max_files)
+{
+    if (s_mtx == NULL || !sdcard_is_mounted()) return 0;
+    size_t files_done = 0;
+    int64_t max_seen_id = 0;
+
+    while (files_done < max_files) {
+        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) break;
+        if (!s_available || s_wf == NULL) { xSemaphoreGive(s_mtx); break; }
+
+        /* Oldest legacy file (min seq) this pass. */
+        uint32_t min_seq = 0;
+        bool found = false;
+        if (sdcard_io_begin()) {
+            DIR *d = opendir(EVLOG_LEGACY_SD_DIR);
+            if (d != NULL) {
+                struct dirent *ent;
+                while ((ent = readdir(d)) != NULL) {
+                    uint32_t seq;
+                    if (parse_ev_name(ent->d_name, &seq)) {
+                        if (!found || seq < min_seq) { min_seq = seq; found = true; }
+                    }
+                }
+                closedir(d);
+            }
+            sdcard_io_end();
+        }
+        if (!found) { xSemaphoreGive(s_mtx); break; }
+
+        char src[64];
+        snprintf(src, sizeof src, "%s/ev-%06u.log", EVLOG_LEGACY_SD_DIR, (unsigned)min_seq);
+
+        bool file_ok = true, store_full = false;
+        size_t imported = 0, skipped = 0;
+        if (sdcard_io_begin()) {
+            FILE *rf = fopen(src, "rb");
+            if (rf == NULL) {
+                file_ok = false;
+            } else {
+                while (fgets(s_line, s_line_cap, rf) != NULL) {
+                    size_t len = strlen(s_line);
+                    /* Verbatim-append gate: framed, sized, and 9-field shaped.
+                     * Anything else (torn tail, over-long, v1 relics) is skipped —
+                     * the old firmware's reader would have skipped it too. */
+                    if (len == 0 || s_line[len - 1] != '\n' || len > s_max_record) { skipped++; continue; }
+                    int tabs = 0;
+                    for (size_t i = 0; i < len; i++) tabs += (s_line[i] == '\t');
+                    int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+                    if (tabs < 8 || id <= 0) { skipped++; continue; }
+
+                    uint64_t freeb = 0;
+                    if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+                        (void)evlog_evict_synced_locked();
+                        if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+                            store_full = true;
+                            break;                   /* remainder stays on SD */
+                        }
+                    }
+                    if (s_tail_size > 0 && s_tail_size + (long)len > EVLOG_ROTATE_BYTES) {
+                        if (evlog_flush_writer_locked() != ESP_OK) { file_ok = false; break; }
+                        fclose(s_wf);
+                        s_wf = NULL;
+                        s_tail_seq++;
+                        if (evlog_reopen_tail_locked() != ESP_OK) { file_ok = false; break; }
+                    }
+                    if (fwrite(s_line, 1, len, s_wf) != len) {
+                        fflush(s_wf);
+                        (void)ftruncate(fileno(s_wf), s_tail_size);
+                        file_ok = false;
+                        break;
+                    }
+                    s_tail_size += (long)len;
+                    s_pending++;
+                    imported++;
+                    if (id > max_seen_id) max_seen_id = id;
+                }
+                fclose(rf);
+            }
+            /* Delete the SD source only when its every record is durably internal. */
+            if (file_ok && !store_full && evlog_flush_writer_locked() == ESP_OK) {
+                remove(src);
+                files_done++;
+            } else {
+                file_ok = false;
+            }
+            sdcard_io_end();
+        } else {
+            file_ok = false;
+        }
+
+        if (imported > 0 || skipped > 0) {
+            ESP_LOGI(TAG, "migrated %s: %u record(s) imported, %u skipped%s",
+                     src, (unsigned)imported, (unsigned)skipped,
+                     store_full ? " (store full — resuming later)" : "");
+        }
+        /* Ids inside the imported backlog can exceed the NVS HWM if NVS was ever
+         * wiped; keep next_id above everything now inside the store. */
+        if (max_seen_id + 1 > s_next_id) {
+            s_next_id = max_seen_id + 1;
+            if (s_next_id >= s_id_limit) {
+                s_id_limit = s_next_id + EVLOG_ID_BLOCK;
+                evlog_persist_nid_locked();
+            }
+        }
+        xSemaphoreGive(s_mtx);
+        if (!file_ok || store_full) break;
+        vTaskDelay(1);
+    }
+    return files_done;
+}

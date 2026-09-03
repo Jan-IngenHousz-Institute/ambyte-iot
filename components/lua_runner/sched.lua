@@ -1,5 +1,5 @@
 -- sched.lua — declarative RTC job scheduler. Bundled into the firmware and
--- loaded before /sdcard/main.lua, so the `sched` global is always available.
+-- loaded before /littlefs/main.lua, so the `sched` global is always available.
 -- Built entirely on the `sync` global (components/time_sync).
 --
 -- Register jobs, then call sched.run() (which never returns):

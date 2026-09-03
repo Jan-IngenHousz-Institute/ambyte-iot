@@ -481,10 +481,20 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 
     s_wifi.connect_requested = false;
     s_wifi.reconfigure_in_progress = true;
-    err = esp_wifi_disconnect();
-    if ((err != ESP_OK) && (err != ESP_ERR_WIFI_NOT_CONNECT)) {
-        s_wifi.reconfigure_in_progress = false;
-        return err;
+    /* The reconnect timer task may be inside esp_wifi_connect() right now (an
+     * unreachable AP keeps the driver busy almost continuously), and the driver
+     * rejects any overlapping disconnect/connect with ESP_ERR_WIFI_STATE. Retry
+     * past the transient instead of failing the join outright. */
+    for (int attempt = 0; ; attempt++) {
+        err = esp_wifi_disconnect();
+        if ((err == ESP_OK) || (err == ESP_ERR_WIFI_NOT_CONNECT)) {
+            break;
+        }
+        if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
+            s_wifi.reconfigure_in_progress = false;
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
     if (err == ESP_ERR_WIFI_NOT_CONNECT) {
         s_wifi.reconfigure_in_progress = false;
@@ -492,10 +502,16 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 
     s_wifi.connect_requested = true;
 
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        s_wifi.connect_requested = false;
-        return err;
+    for (int attempt = 0; ; attempt++) {
+        err = esp_wifi_connect();
+        if (err == ESP_OK) {
+            break;
+        }
+        if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
+            s_wifi.connect_requested = false;
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     const EventBits_t bits = xEventGroupWaitBits(

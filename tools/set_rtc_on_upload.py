@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 """PlatformIO post-upload hook — set the device RTC to the host's current UTC
 time over the serial console, right after flashing.
 

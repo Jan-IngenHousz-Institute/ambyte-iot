@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
+# SPDX-License-Identifier: GPL-3.0-only
+
 from pathlib import Path
 import re
 import unittest
@@ -33,6 +36,7 @@ class LuaWorkflowTest(unittest.TestCase):
         inputs = {
             "environment": "fleet-deploy-${{ inputs.environment }}",
             "release_tag": "release-tag: ${{ inputs.release_tag }}",
+            "script": "script-name: ${{ inputs.script }}",
             "version_op": "version-op: ${{ inputs.version_op }}",
             "version": "version: ${{ inputs.version }}",
             "percentage": "percentage: ${{ inputs.percentage }}",
@@ -58,7 +62,8 @@ class LuaWorkflowTest(unittest.TestCase):
         self.assertIn("release_selection.py --kind \"${KIND}\"", DEPLOY_ACTION)
         self.assertIn("REQUIRED_ASSETS=(firmware.bin)", DEPLOY_ACTION)
         self.assertIn(
-            "REQUIRED_ASSETS=(main.lua main.lua.manifest.json)", DEPLOY_ACTION
+            'REQUIRED_ASSETS=("${SCRIPT_NAME}.lua" "${SCRIPT_NAME}.lua.manifest.json")',
+            DEPLOY_ACTION,
         )
         self.assertIn(
             "jq -e '.draft == false and .published_at != null'", DEPLOY_ACTION
@@ -74,6 +79,7 @@ class LuaWorkflowTest(unittest.TestCase):
         self.assertIn("uses: ./.github/actions/fleet-deploy", LUA_WORKFLOW)
         self.assertIn("kind: lua", LUA_WORKFLOW)
         self.assertIn("reboot: ${{ inputs.reboot }}", LUA_WORKFLOW)
+        self.assertIn('ARGS+=(--script-name "${SCRIPT_NAME}")', DEPLOY_ACTION)
         self.assertIn("python tools/fleet_deploy/fleet_deploy.py", DEPLOY_ACTION)
         self.assertIn("python tools/fleet_deploy/lua_deploy.py", DEPLOY_ACTION)
 

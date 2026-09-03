@@ -190,7 +190,7 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
-        /* Replace /sdcard/main.lua. Two delivery modes:
+        /* Replace /littlefs/main.lua. Two delivery modes:
          *   - `url`   : download the script over HTTPS (reliable on a fragmented
          *               heap — tiny command, chunked download). Preferred for big
          *               scripts. `checksum` = sha256 hex of the fetched file.
