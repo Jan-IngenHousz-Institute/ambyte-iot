@@ -11,8 +11,17 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "ambit_announcement.h"
 #include "clock_trust.h"
+#include "payload_gzip.h"
+#include "payload_v3.h"
 #include "timezone.h"
+
+/* ESP32-S3 ROM miniz: the tdefl DEFLATE compressor lives in mask ROM (see
+ * esp32s3.rom.ld), so transport gzip costs no flash. ROM miniz is built with
+ * MINIZ_NO_MALLOC — the *_mem_to_heap conveniences are unusable — so the
+ * publish path drives tdefl_init/tdefl_compress with its own heap buffers. */
+#include "miniz.h"
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -59,6 +68,24 @@
         "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
         "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
 
+#define DC_V3_EVENT_ENVELOPE_FMT \
+        "{\"sample\":[%s],\"timestamp\":\"%s\",%s%s" \
+        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+
+/* Gzip transport variant of the v3 envelope, emitted only while the runtime
+ * publish_gzip switch is on AND the compressed form is strictly smaller.
+ * `sample` becomes base64(gzip("[<canonical v3 object>]")) — the exact JSON
+ * text the plain envelope would splice — and `_sample_encoding` is the marker
+ * the OpenJII Silver layer already reverses for the mobile uploader
+ * (decompress_sample_value). The outer envelope stays plain JSON so broker
+ * routing and raw storage are unaffected. */
+#define DC_V3_GZ_EVENT_ENVELOPE_FMT \
+        "{\"sample\":\"%s\",\"_sample_encoding\":\"gzip+base64\"," \
+        "\"timestamp\":\"%s\",%s%s" \
+        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+
 /* Large-publish heap gate (Track 1) — see the gate in cmd_mqtt_publish_next_event.
  * An arrun envelope can now approach 64 KiB and needs an outbox copy plus a
  * transient mbedTLS write buffer. The large mallocs route to PSRAM, while the
@@ -91,6 +118,7 @@ _Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
 #endif
 
 static device_commands_config_t s_cfg;
+static ambit_announcement_tracker_t s_ambit_announcements;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
@@ -237,53 +265,6 @@ static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
     vsnprintf(r.message, sizeof(r.message), fmt, ap);
     va_end(ap);
     return r;
-}
-
-/* Append one optional STATUS block transactionally. The sizing pass avoids a
- * scratch buffer: if the entire block plus the final '}' will not fit, leave
- * the payload untouched, log exactly one warning for that block, and let the
- * heartbeat continue with the remaining optional blocks. */
-static bool status_append_optional(char *payload, size_t cap, size_t *len,
-                                   const char *block, const char *fmt, ...)
-{
-    va_list ap, sizing;
-    va_start(ap, fmt);
-    va_copy(sizing, ap);
-    int needed = vsnprintf(NULL, 0, fmt, sizing);
-    va_end(sizing);
-
-    size_t available = (*len + 2 <= cap) ? cap - *len - 2 : 0;
-    if (needed < 0 || (size_t)needed > available) {
-        ESP_LOGW(TAG, "STATUS optional block '%s' omitted (needs=%d, available=%u)",
-                 block, needed, (unsigned)available);
-        va_end(ap);
-        return false;
-    }
-
-    int wrote = vsnprintf(payload + *len, cap - *len, fmt, ap);
-    va_end(ap);
-    if (wrote != needed) {
-        payload[*len] = '\0';
-        ESP_LOGW(TAG, "STATUS optional block '%s' omitted (format failed)", block);
-        return false;
-    }
-    *len += (size_t)wrote;
-    return true;
-}
-
-/* STATUS string sources are controlled and short, but PROJECT_VER can still
- * contain punctuation supplied by the build. Keep the value JSON-safe without
- * allocating or introducing an escaping-size worst case. */
-static void status_copy_json_safe(char *dst, size_t cap, const char *src)
-{
-    if (cap == 0) return;
-    size_t n = 0;
-    while (src != NULL && src[n] != '\0' && n + 1 < cap) {
-        unsigned char c = (unsigned char)src[n];
-        dst[n] = (c >= 0x20 && c != '"' && c != '\\') ? (char)c : '_';
-        n++;
-    }
-    dst[n] = '\0';
 }
 
 /* ── Sync-runner wake hook ───────────────────────────────────────────────
@@ -434,6 +415,7 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
     s_cfg = *cfg;
+    ambit_announcement_init(&s_ambit_announcements, s_cfg.announcement_store);
     if (s_ack_queue == NULL) {
         s_ack_queue = xQueueCreateStatic(DC_ACK_QUEUE_DEPTH,
                                          sizeof(dc_ack_completion_t),
@@ -883,15 +865,29 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading)
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
 
-    /* One event: T/H/P together in the payload. channel "" = onboard sensor. */
-    char payload[160];
-    snprintf(payload, sizeof(payload),
-             "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f}",
-             m.temperature_c, m.humidity_percent, m.pressure_pa);
+    /* An explicit stored BME280 read is an intentional extra observation using
+     * the same canonical telemetry family as the heartbeat. Its health groups
+     * remain present-but-empty because this command sampled only the BME280. */
+    char payload[768];
+    char build_error[96];
+    payload_v3_telemetry_input_t input = {
+        .measure_id = mid,
+        .device = s_mac_str,
+        .observed_utc_ms = start_ms,
+        .observations_valid = true,
+        .air_temperature = m.temperature_c,
+        .relative_humidity = m.humidity_percent,
+        .air_pressure = m.pressure_pa,
+    };
+    if (!payload_v3_build_telemetry(payload, sizeof payload, &input,
+                                    build_error, sizeof build_error)) {
+        return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
+    }
 
     measurement_event_desc_t d = {
         .measure_id   = mid,
-        .tag          = MEASUREMENT_TAG_MEASUREMENT,
+        .device       = s_mac_str,
+        .tag          = MEASUREMENT_TAG_TELEMETRY,
         .cmd_raw      = "device.bme280",
         .start_ms     = start_ms,
         .end_ms       = end_ms,
@@ -1054,6 +1050,65 @@ static unsigned note_publish_stuck(int64_t mid)
     return slot->failures;
 }
 
+/* Raw-DEFLATE provider for payload_gzip using the ROM tdefl compressor. 128
+ * probes ≈ zlib level 6 (the exact benchmarked setting: 690 B for the 60-point
+ * compact v3 fixture vs 733 B at level 1). The compressor state is a large
+ * single-shot heap block (~160 KiB with the ROM's TDEFL_LESS_MEMORY build), so
+ * SPIRAM_MALLOC_ALWAYSINTERNAL routes it to PSRAM and it never competes with
+ * the internal/DMA pools the publish heap gate protects. */
+static bool dc_rom_deflate(void *ctx, const uint8_t *src, size_t src_len,
+                           uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    (void)ctx;
+    tdefl_compressor *comp = malloc(sizeof(tdefl_compressor));
+    if (comp == NULL) return false;
+    bool ok = tdefl_init(comp, NULL, NULL, 128) == TDEFL_STATUS_OKAY;
+    size_t in_len = src_len;
+    size_t produced = out_cap;
+    if (ok) {
+        ok = tdefl_compress(comp, src, &in_len, out, &produced, TDEFL_FINISH)
+                 == TDEFL_STATUS_DONE
+             && in_len == src_len;
+    }
+    free(comp);
+    if (!ok) return false;
+    *out_len = produced;
+    return true;
+}
+
+/* base64(gzip("[<payload_json>]")) for the gzip transport envelope, or NULL on
+ * any allocation/compression failure — the caller then publishes the plain v3
+ * envelope, so a failed gzip can never lose or delay a measurement. All
+ * buffers are transient and freed here; only the returned base64 string (heap,
+ * caller frees) outlives the call. */
+static char *dc_gzip_sample_b64(const char *payload_json)
+{
+    size_t payload_len = strlen(payload_json);
+    size_t src_len = payload_len + 2U; /* wrapping "[" + "]" */
+    char *src = malloc(src_len);
+    if (src == NULL) return NULL;
+    src[0] = '[';
+    memcpy(src + 1, payload_json, payload_len);
+    src[src_len - 1U] = ']';
+
+    size_t scratch_cap = payload_gzip_stream_cap(payload_gzip_deflate_bound(src_len));
+    uint8_t *scratch = malloc(scratch_cap);
+    size_t b64_cap = payload_gzip_base64_cap(scratch_cap);
+    char *b64 = malloc(b64_cap);
+    bool ok = scratch != NULL && b64 != NULL &&
+              payload_gzip_encode_base64((const uint8_t *)src, src_len,
+                                         dc_rom_deflate, NULL,
+                                         scratch, scratch_cap,
+                                         b64, b64_cap, NULL);
+    free(scratch);
+    free(src);
+    if (!ok) {
+        free(b64);
+        return NULL;
+    }
+    return b64;
+}
+
 cmd_result_t cmd_mqtt_publish_next_event(void)
 {
     if (!s_initialized || s_cfg.publish == NULL ||
@@ -1091,7 +1146,14 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(err, "claim_next_event failed: %s", esp_err_to_name(err));
     }
 
-    /* Build the MQTT envelope (schema v2) as a string, splicing the already-valid
+    /* Build the MQTT envelope as a string, splicing already-valid JSON verbatim.
+     * New firmware-owned v3 objects are complete canonical sample objects in the
+     * payload column, so the publisher only adds the unchanged outer envelope.
+     * Every old SD backlog record and generic Lua event still follows the frozen
+     * v2 builder below. This schema-keyed split is the dual-read migration rule
+     * and lets upgrades drain historical v2 without creating mixed objects.
+     *
+     * The legacy path builds schema v2 by splicing the already-valid
      * payload (and metadata) JSON in verbatim — no cJSON_Parse round-trip. The old
      * parse→tree→print path needed ~4× the payload in heap (a node per number),
      * which OOMs on this tight heap for multi-array runs, and scaled with point
@@ -1138,8 +1200,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     else                      strcpy(devbuf, "null");
     /* cmd_raw is variable-length (a full "arrun …" can be ~520 B) → heap-quoted;
      * NULL falls back to the JSON null literal in the splice below. */
+    const bool canonical_v3 = payload_v3_is_canonical_object(e.payload_json);
     char *cmdbuf = NULL;
-    if (e.cmd_raw != NULL && e.cmd_raw[0] != '\0') {
+    if (!canonical_v3 && e.cmd_raw != NULL && e.cmd_raw[0] != '\0') {
         size_t cn = strlen(e.cmd_raw);
         cmdbuf = malloc(cn + 3);
         if (cmdbuf == NULL) {
@@ -1170,17 +1233,52 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
 
+    /* Transport gzip attempt (canonical v3 only — the frozen v2 backlog path
+     * never changes shape). Runs before sizing so the publish cap, heap gate
+     * and MQTT window all see the real envelope length. Failure or a
+     * not-smaller result falls back to the plain envelope. */
+    char *gz_b64 = NULL;
+    if (canonical_v3 && s_cfg.publish_gzip_enabled != NULL &&
+        s_cfg.publish_gzip_enabled()) {
+        gz_b64 = dc_gzip_sample_b64(e.payload_json);
+        if (gz_b64 == NULL) {
+            ESP_LOGW(TAG, "event id=%lld gzip transport failed — publishing plain v3",
+                     (long long)e.measure_id);
+        }
+    }
+
     /* Size the exact serialized envelope before any large allocation. This lets
      * a lowered publish cap identify a valid 64-KiB stored record and archive it
      * without first tripping the ordinary internal/DMA heap gate. */
-    int n = snprintf(NULL, 0, DC_EVENT_ENVELOPE_FMT,
-        (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
-        meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
-        meta ? meta : "null", e.payload_json,
-        meas_ts, battpart, tzpart,
-        s_mac_str, dn, dv, fw);
+    int n;
+    if (canonical_v3) {
+        n = snprintf(NULL, 0, DC_V3_EVENT_ENVELOPE_FMT,
+                     e.payload_json, meas_ts, battpart, tzpart,
+                     s_mac_str, dn, dv, fw);
+        if (gz_b64 != NULL) {
+            int n_gz = snprintf(NULL, 0, DC_V3_GZ_EVENT_ENVELOPE_FMT,
+                                gz_b64, meas_ts, battpart, tzpart,
+                                s_mac_str, dn, dv, fw);
+            /* Keep gzip only when strictly smaller: base64 costs 4/3× and tiny
+             * telemetry objects can lose to their own gzip header. */
+            if (n_gz >= 0 && (n < 0 || n_gz < n)) {
+                n = n_gz;
+            } else {
+                free(gz_b64);
+                gz_b64 = NULL;
+            }
+        }
+    } else {
+        n = snprintf(NULL, 0, DC_EVENT_ENVELOPE_FMT,
+            (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
+            meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
+            meta ? meta : "null", e.payload_json,
+            meas_ts, battpart, tzpart,
+            s_mac_str, dn, dv, fw);
+    }
     if (n < 0) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(ESP_FAIL, "envelope sizing failed");
@@ -1194,6 +1292,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (payload_len > AMBYTE_PUBLISH_MAX_BYTES) {
         int64_t mid = e.measure_id;
         free(cmdbuf);
+        free(gz_b64);
         esp_err_t pending_err = s_cfg.mark_event_pending(mid);
         if (s_oversize_warned_id != mid) {
             ESP_LOGW(TAG, "event id=%lld envelope %u B exceeds AMBYTE_PUBLISH_MAX_BYTES=%u — preserving in quarantine sidecar",
@@ -1247,6 +1346,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     }
     if (heap_tight) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         int64_t mid = e.measure_id;
         measurement_event_free(&e);
@@ -1263,18 +1363,30 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     char *payload = malloc(cap);
     if (payload == NULL) {
         free(cmdbuf);
+        free(gz_b64);
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
         return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
     }
 
-    n = snprintf(payload, cap, DC_EVENT_ENVELOPE_FMT,
-        (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
-        meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
-        meta ? meta : "null", e.payload_json,
-        meas_ts, battpart, tzpart,
-        s_mac_str, dn, dv, fw);
+    if (canonical_v3 && gz_b64 != NULL) {
+        n = snprintf(payload, cap, DC_V3_GZ_EVENT_ENVELOPE_FMT,
+                     gz_b64, meas_ts, battpart, tzpart,
+                     s_mac_str, dn, dv, fw);
+    } else if (canonical_v3) {
+        n = snprintf(payload, cap, DC_V3_EVENT_ENVELOPE_FMT,
+                     e.payload_json, meas_ts, battpart, tzpart,
+                     s_mac_str, dn, dv, fw);
+    } else {
+        n = snprintf(payload, cap, DC_EVENT_ENVELOPE_FMT,
+            (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
+            meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
+            meta ? meta : "null", e.payload_json,
+            meas_ts, battpart, tzpart,
+            s_mac_str, dn, dv, fw);
+    }
     free(cmdbuf);
+    free(gz_b64);
 
     if (n < 0 || (size_t)n >= cap) {
         free(payload);
@@ -1321,8 +1433,15 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         ESP_LOGW(TAG, "event payload %u bytes exceeds %u; may be rejected",
                  (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
     }
+    /* Lean ingest topic: publish to the provisioned 7-segment topic_root
+     * (…/{experimentId}/{sensorType}/{sensorVersion}/{sensorId}) with NO
+     * trailing protocolId segment. openJII e38cdd45b made that shape canonical
+     * ("new publishers must use the shape without protocolId"); the old
+     * hardcoded "/1234" suffix put every publish on the transitional legacy
+     * channel with a fabricated protocol id. Protocol attribution now travels
+     * in the payload (`protocol.id`, optional), never in the topic. */
     char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/1234", s_cfg.topic_root ? s_cfg.topic_root : "");
+    snprintf(topic, sizeof(topic), "%s", s_cfg.topic_root ? s_cfg.topic_root : "");
 
     ESP_LOGI(TAG, "publish event -> %s (id=%lld, tag=%s, ch=%s, %u bytes)",
              topic, (long long)e.measure_id, e.tag,
@@ -1500,14 +1619,11 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     return make_result(ESP_OK, "status report");
 }
 
-/* Build + store one STATUS heartbeat event from the live status snapshot
- * (tag STATUS, onboard provenance — channel/cmd_raw null). Owned by the
- * sync_runner heartbeat (payload-v2 Phase 4): status reporting must survive a
- * missing/crashed main.lua, so it does NOT live in the script. Payload keys
- * match the old Lua status_report table for analysis continuity; power fields
- * are omitted when the charger read fails, and BME280 T/H/P fields are appended
- * when the env read succeeds. Does NOT notify the sync runner — the caller IS
- * the sync runner. */
+/* Build + store one ambyte.telemetry/1 heartbeat from one live snapshot.
+ * Status reporting stays firmware-owned so a missing/crashed main.lua cannot
+ * silence it. cmd_status_report performs the BME280 read exactly once; this
+ * function groups that observation beside health in ONE stored row. It never
+ * stores the old companion environment event and never wakes a UART channel. */
 cmd_result_t cmd_store_status_event(void)
 {
     if (!s_initialized || s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
@@ -1520,6 +1636,13 @@ cmd_result_t cmd_store_status_event(void)
         return r;
     }
 
+    int64_t mid = 0;
+    esp_err_t err = s_cfg.next_id(&mid);
+    if (err != ESP_OK) {
+        return make_result(err, "next_id failed: %s", esp_err_to_name(err));
+    }
+
+    const int64_t now = now_ms();
     uint32_t mqtt_connects = 0;
     int64_t conn_age_s = -1;
     char last_disc_reason[24] = {0};
@@ -1529,185 +1652,122 @@ cmd_result_t cmd_store_status_event(void)
     }
 
     const esp_app_desc_t *app = esp_app_get_description();
-    char app_version[32];
-    status_copy_json_safe(app_version, sizeof app_version,
-                          app != NULL ? app->version : "");
     bool wd_armed = s_cfg.watchdog_armed != NULL && s_cfg.watchdog_armed();
     char wd_reason[16] = {0};
-    if (s_cfg.last_wd_reboot_reason != NULL) {
+    if (s_cfg.last_wd_reboot_reason != NULL)
         (void)s_cfg.last_wd_reboot_reason(wd_reason, sizeof wd_reason);
-    }
     const char *clock_source = "rtc";
     bool clock_suspect = false;
     clock_trust_get_status(&clock_source, &clock_suspect);
     script_identity_t script_identity = {0};
-    bool script_identity_valid = s_cfg.read_script_identity != NULL &&
-                                 s_cfg.read_script_identity(&script_identity) == ESP_OK;
-    if (script_identity_valid) {
-        status_copy_json_safe(script_identity.sha256, sizeof script_identity.sha256,
-                              script_identity.sha256);
-        status_copy_json_safe(script_identity.version, sizeof script_identity.version,
-                              script_identity.version);
-        status_copy_json_safe(script_identity.built_against_fw,
-                              sizeof script_identity.built_against_fw,
-                              script_identity.built_against_fw);
-        status_copy_json_safe(script_identity.installed_on_fw,
-                              sizeof script_identity.installed_on_fw,
-                              script_identity.installed_on_fw);
-    }
+    const bool script_valid = s_cfg.read_script_identity != NULL &&
+                              s_cfg.read_script_identity(&script_identity) == ESP_OK;
 
-    /* Schema split (2026-07-28, Dominik): the sample's `data` object carries only
-     * MEASUREMENTS (the BME280 environment readings); all device-health/info
-     * fields live in the sample's `metadata` object, and `device` carries the
-     * MAC. Platform charts device health from metadata, science from data.
-     * The bounded base always fits. Optional script, SD, power, and per-channel
-     * AMBIT blocks are appended transactionally below. */
-    /* Worst-case budget at declared format maxima (%.3f of a pathological
-     * negative mV reading renders 10 chars ×3; the u32 currents render 10
-     * digits; every string block at its cap):
-     *   base + SD + power + '}' + NUL         891 B
-     *   script identity (digest+3 versions)   286 B
-     *   AMBIT identity, 4 × 138 B             552 B   (host-measured)
-     *                                       ------
-     *                                        1729 B
-     * The 2,048-B buffer leaves 319 B spare. On the bench (2 AMBITs, real
-     * values) the ambit blocks total 232 B. DO NOT add fields against
-     * typical-value headroom: budget against these maxima, or grow the buffer.
-     * An overflow doesn't corrupt (status_append_optional drops the offending
-     * block with a WARN) but silently costs that block on outlier readings.
-     * This buffer lives on the wd-task frame — SYNC_WD_TASK_STACK covers its
-     * growth from the original 896 B. Identity hashing uses a short-lived 1-KiB
-     * heap buffer so the heartbeat task does not carry it on the stack. */
-    char payload[2048];
-    int n = snprintf(payload, sizeof(payload),
-        "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
-        "\"uptime_s\":%lld,\"psram_free_kb\":%u,\"psram_largest_kb\":%u,"
-        "\"psram_size_kb\":%u,\"heap_dma_largest_kb\":%u,\"mqtt_reconnects\":%u,"
-        "\"last_disc_reason\":\"%.23s\",\"conn_age_s\":%lld,\"pending\":%lld,"
-        "\"last_wd_reboot_reason\":\"%.15s\",\"wd_armed\":%s,\"app_version\":\"%.31s\","
-        "\"clock_src\":\"%.4s\",\"clock_suspect\":%s,"
-        "\"heap_int_free_kb\":%u,\"heap_int_largest_kb\":%u",
-        s.wifi_connected ? "true" : "false",
-        s.provisioned ? "true" : "false",
-        s.db_online ? "true" : "false",
-        s.publish_gate_open ? "true" : "false",
-        (long long)(esp_timer_get_time() / 1000000LL),
-        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
-        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
-        (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
-        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
-        (unsigned)mqtt_connects, last_disc_reason,
-        (long long)conn_age_s, (long long)s.pending,
-        wd_reason, wd_armed ? "true" : "false", app_version,
-        clock_source, clock_suspect ? "true" : "false",
-        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-        (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
-    if (n < 0 || (size_t)n + 2 > sizeof(payload)) {
-        return make_result(ESP_FAIL, "status base payload build failed");
-    }
-    size_t payload_len = (size_t)n;
+    payload_v3_telemetry_input_t input = {
+        .measure_id = mid,
+        .device = s_mac_str,
+        .observed_utc_ms = now,
+        .observations_valid = s.env_valid,
+        .air_temperature = s.temperature_c,
+        .relative_humidity = s.humidity_percent,
+        .air_pressure = s.pressure_pa,
+        .connectivity_valid = true,
+        .wifi = s.wifi_connected,
+        .provisioned = s.provisioned,
+        .publish_gate = s.publish_gate_open,
+        .mqtt_reconnects = mqtt_connects,
+        .last_disc_reason = last_disc_reason,
+        .conn_age_s = conn_age_s,
+        .pending = s.pending,
+        .power_valid = s.power_valid,
+        .battery_v = (double)s.power.battery_mv / 1000.0,
+        .input_v = (double)s.power.input_mv / 1000.0,
+        .system_v = (double)s.power.system_mv / 1000.0,
+        .input_ma = s.power.input_ma,
+        .charge_ma = s.power.charge_ma,
+        .input_present = s.power.input_present,
+        .charge_status = s.power.charge_status,
+        .runtime_valid = true,
+        .uptime_s = esp_timer_get_time() / 1000000LL,
+        .psram_free_kb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U,
+        .psram_largest_kb = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U,
+        .psram_size_kb = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U,
+        .heap_dma_largest_kb = heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024U,
+        .heap_int_free_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024U,
+        .heap_int_largest_kb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024U,
+        .wd_armed = wd_armed,
+        .last_wd_reboot_reason = wd_reason,
+        .clock_valid = true,
+        .clock_source = clock_source,
+        .clock_suspect = clock_suspect,
+        .software_valid = true,
+        .firmware = app != NULL ? app->version : "",
+        .script_valid = script_valid,
+        .script_sha256 = script_identity.sha256,
+        .script_version = script_identity.version,
+        .script_built_against_fw = script_identity.built_against_fw,
+        .script_installed_on_fw = script_identity.installed_on_fw,
+        .script_metadata_verified = script_identity.release_metadata_verified,
+        /* Database availability is independent of the optional SD health
+         * callback; an SD probe failure must not erase a known db_online leaf. */
+        .storage_db_valid = true,
+        .db_online = s.db_online,
+    };
 
-    if (script_identity_valid) {
-        (void)status_append_optional(payload, sizeof payload, &payload_len, "script",
-            ",\"script_sha256\":\"%.64s\",\"script_version\":\"%.31s\","
-            "\"script_built_against_fw\":\"%.31s\",\"script_installed_on_fw\":\"%.31s\","
-            "\"script_metadata_verified\":%s",
-            script_identity.sha256, script_identity.version,
-            script_identity.built_against_fw, script_identity.installed_on_fw,
-            script_identity.release_metadata_verified ? "true" : "false");
-    }
-
-    /* SD/persistence health — surfaces the audit's silent-loss counters so a
-     * degrading card is visible before the cliff (free space, skipped/dropped
-     * records, delivery high-water, io-lost). */
     if (s_cfg.sd_health != NULL) {
-        bool sd_io_lost = false;
-        uint64_t sd_free = 0;
-        int64_t sd_skipped = 0, sd_dropped = 0, last_acked = 0;
-        if (s_cfg.sd_health(&sd_io_lost, &sd_free, &sd_skipped, &sd_dropped, &last_acked) == ESP_OK) {
-            (void)status_append_optional(payload, sizeof payload, &payload_len, "sd",
-                ",\"sd_free_kb\":%llu,\"sd_skipped\":%lld,\"sd_dropped\":%lld,"
-                "\"last_acked_id\":%lld,\"sd_io_lost\":%s",
-                (unsigned long long)(sd_free / 1024),
-                (long long)sd_skipped, (long long)sd_dropped, (long long)last_acked,
-                sd_io_lost ? "true" : "false");
+        bool io_lost = false;
+        uint64_t free_bytes = 0;
+        if (s_cfg.sd_health(&io_lost, &free_bytes, &input.sd_skipped,
+                            &input.sd_dropped, &input.last_acked_id) == ESP_OK) {
+            input.storage_sd_valid = true;
+            input.sd_free_kb = free_bytes / 1024U;
+            input.sd_io_lost = io_lost;
         }
     }
-    if (s.power_valid) {
-        (void)status_append_optional(payload, sizeof payload, &payload_len, "power",
-            ",\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"
-            "\"input_ma\":%u,\"charge_ma\":%u,\"input_present\":%s,\"charge_status\":%u",
-            (double)s.power.battery_mv / 1000.0,
-            (double)s.power.input_mv / 1000.0,
-            (double)s.power.system_mv / 1000.0,
-            (unsigned)s.power.input_ma,
-            (unsigned)s.power.charge_ma,
-            s.power.input_present ? "true" : "false",
-            (unsigned)s.power.charge_status);
-    }
 
-    /* Per-channel AMBIT identity (fleet inventory: which sensor + which fw is
-     * on which channel). CACHE-ONLY — never triggers a UART fetch from the
-     * heartbeat (a fetch is 2×5 s blocking + channel-mutex contention with
-     * Lua); boot sync populates the cache. Absent/unread channels are simply
-     * omitted. One transactional block per channel so a single outlier only
-     * drops itself. ambit_name comes from the AMBIT's NVS = untrusted bytes;
-     * event_log does NOT sanitize metadata_json, so it goes through
-     * status_copy_json_safe (fw/id/cal are ambyte-formatted and safe). */
-    for (uint8_t ch = 0; ch < 4; ch++) {
+    char channels[PAYLOAD_V3_MAX_ATTACHED][12];
+    for (uint8_t ch = 0; ch < PAYLOAD_V3_MAX_ATTACHED; ++ch) {
         ambit_device_info_t ai;
-        if (!cmd_ambit_device_info_cached(ch, &ai)) {
-            continue;
-        }
-        char safe_name[20];
-        status_copy_json_safe(safe_name, sizeof safe_name, ai.ambit_name);
-        char block[16];
-        snprintf(block, sizeof block, "ambit%u", ch);
-        (void)status_append_optional(payload, sizeof payload, &payload_len, block,
-            ",\"ambit%u_fw\":\"%.15s\",\"ambit%u_hw\":%u,\"ambit%u_name\":\"%s\","
-            "\"ambit%u_id\":\"%.17s\",\"ambit%u_cal\":\"%08lx\"",
-            ch, ai.fw_version, ch, (unsigned)ai.hw_rev, ch, safe_name,
-            ch, ai.device_id, ch, (unsigned long)ai.cal_version);
-    }
-    payload[payload_len++] = '}';
-    payload[payload_len] = '\0';
-
-    /* `data` = measurements only: the BME280 environment readings. Empty object
-     * when the sensor read failed this cycle — data consumers never see device
-     * health here. */
-    char env_data[128];
-    if (s.env_valid) {
-        int en = snprintf(env_data, sizeof env_data,
-            "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f}",
-            s.temperature_c, s.humidity_percent, s.pressure_pa);
-        if (en < 0 || (size_t)en >= sizeof env_data) {
-            strcpy(env_data, "{}");
-        }
-    } else {
-        strcpy(env_data, "{}");
+        if (!cmd_ambit_device_info_cached(ch, &ai)) continue;
+        const size_t slot = input.attached_count++;
+        snprintf(channels[slot], sizeof channels[slot], "uart_%u", (unsigned)ch);
+        input.attached[slot] = (payload_v3_attached_sensor_t) {
+            .present = true,
+            .channel = channels[slot],
+            .sensor_id = ai.device_id,
+            .firmware = ai.fw_version,
+            .hardware_revision = ai.hw_rev,
+            .name = ai.ambit_name,
+            /* Calibration is optional in telemetry cache references. A failed
+             * calibration fetch must not masquerade as CRC 00000000. */
+            .cal_version_present = ai.tick_factor > 0.0f,
+            .cal_version = ai.cal_version,
+        };
     }
 
-    int64_t mid = 0;
-    esp_err_t err = s_cfg.next_id(&mid);
-    if (err != ESP_OK) {
-        return make_result(err, "next_id failed: %s", esp_err_to_name(err));
+    char *payload = malloc(4096U);
+    if (payload == NULL) return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
+    char build_error[96];
+    if (!payload_v3_build_telemetry(payload, 4096U, &input,
+                                    build_error, sizeof build_error)) {
+        free(payload);
+        return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
     }
 
-    int64_t now = now_ms();
     measurement_event_desc_t d = {
         .measure_id    = mid,
-        .device        = s_mac_str,          /* device = MAC (2026-07-28 ask) */
-        .tag           = MEASUREMENT_TAG_STATUS,
+        .device        = s_mac_str,
+        .tag           = MEASUREMENT_TAG_TELEMETRY,
         .start_ms      = now,
         .end_ms        = now,
-        .metadata_json = payload,            /* device health/info */
-        .payload_json  = env_data,           /* measurements only */
+        .payload_json  = payload,
     };
     err = s_cfg.store_event(&d);
+    free(payload);
     if (err != ESP_OK) {
-        return make_result(err, "status store failed: %s", esp_err_to_name(err));
+        return make_result(err, "telemetry store failed: %s", esp_err_to_name(err));
     }
-    return make_result(ESP_OK, "STATUS id=%lld gate=%s Vbat=%umV",
+    return make_result(ESP_OK, "TELEMETRY id=%lld gate=%s Vbat=%umV",
                        (long long)mid, s.publish_gate_open ? "OPEN" : "CLOSED",
                        (unsigned)(s.power_valid ? s.power.battery_mv : 0));
 }
@@ -1721,17 +1781,25 @@ uint32_t device_commands_last_battery_mv(void)
 
 cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
                                    const char *sentinel, uint32_t timeout_ms,
-                                   char *out, size_t out_cap, size_t *out_len)
+                                   uart_sensor_stream_write_fn write,
+                                   void *write_ctx, size_t *out_len)
 {
     if (!s_initialized || s_cfg.uart_stream_query == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART stream query not available");
     }
-    if (cmd == NULL || out == NULL || out_len == NULL || out_cap < 2) {
+    if (channel >= UART_SENSOR_NUM_CHANNELS || cmd == NULL || cmd[0] == '\0' ||
+            sentinel == NULL || sentinel[0] == '\0' ||
+            write == NULL || out_len == NULL || timeout_ms == 0) {
         return make_result(ESP_ERR_INVALID_ARG, "stream_query: bad args");
     }
+    /* Start the one wall-clock budget before the outer transaction bracket.
+     * The UART adapter passes this same absolute deadline through both mutexes,
+     * wake, sensor read, and sink delivery instead of restarting timeout_ms at
+     * each layer. */
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     sensor_transaction_begin();
     esp_err_t err = s_cfg.uart_stream_query(channel, cmd, "\n", sentinel,
-                                            out, out_cap, out_len, timeout_ms);
+                                            write, write_ctx, out_len, deadline_us);
     sensor_transaction_end();
     if (err == ESP_ERR_TIMEOUT) {
         return make_result(ESP_ERR_TIMEOUT, "stream timeout (no '%s')", sentinel ? sentinel : "");
@@ -2197,6 +2265,44 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
 #define AMBIT_INFO_NUM_CH 4
 static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
 
+/* Inventory announcements are keyed by stable sensor identity, not channel.
+ * Persist four last-seen tuples so a transient UART reconnect, reboot, or
+ * channel move does not republish unchanged calibration. A sensor-id match with
+ * changed firmware/cal CRC replaces its own slot; a fifth distinct sensor
+ * evicts round-robin. Store the event before committing the tuple: after a
+ * brownout this can duplicate inventory, but can never suppress the only copy. */
+#define AMBIT_ANNOUNCE_SLOTS AMBIT_ANNOUNCEMENT_SLOTS
+_Static_assert(AMBIT_INFO_NUM_CH == AMBIT_ANNOUNCEMENT_SLOTS,
+               "announcement tuple capacity must match physical channels");
+
+static int ambit_announce_slot(const ambit_device_info_t *info, bool *unchanged)
+{
+    ambit_announcement_tuple_t candidate = {
+        .valid = true,
+        .cal_version = info->cal_version,
+    };
+    snprintf(candidate.sensor_id, sizeof candidate.sensor_id, "%s", info->device_id);
+    snprintf(candidate.firmware, sizeof candidate.firmware, "%s", info->fw_version);
+    const char *attached[AMBIT_ANNOUNCE_SLOTS] = {0};
+    for (size_t i = 0; i < AMBIT_ANNOUNCE_SLOTS; ++i) {
+        if (s_ambit_info[i].valid) attached[i] = s_ambit_info[i].device_id;
+    }
+    return (int)ambit_announcement_select(
+        &s_ambit_announcements, &candidate, attached, unchanged);
+}
+
+static esp_err_t ambit_announce_persist(int slot, const ambit_device_info_t *info)
+{
+    if (slot < 0 || slot >= (int)AMBIT_ANNOUNCE_SLOTS) return ESP_ERR_INVALID_ARG;
+    ambit_announcement_tuple_t tuple = {
+        .valid = true,
+        .cal_version = info->cal_version,
+    };
+    snprintf(tuple.sensor_id, sizeof tuple.sensor_id, "%s", info->device_id);
+    snprintf(tuple.firmware, sizeof tuple.firmware, "%s", info->fw_version);
+    return ambit_announcement_commit(&s_ambit_announcements, (size_t)slot, &tuple);
+}
+
 /* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
  * name lives in the calibration blob, and the identity fetch used to treat a
  * failed calibration read as final — caching valid=true with an empty name, so
@@ -2401,59 +2507,81 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
  * The cache + setters live above (near cmd_ambit_set_gains); below is the
  * one-time fetch that fills identity/calibration and announces it. */
 
-/* Emit one DEVICE_INFO event (tag DEVICE_INFO, channel uart_<ch>, device =
- * ambit_name, cmd_raw "get_info") carrying the full calibration. Called once
- * per connection from ambit_info_fetch. Best-effort: a store failure must not
- * fail the identity fetch. */
+/* Emit one ambit.device/1 event (tag DEVICE_INFO, channel uart_<ch>) carrying
+ * complete identity and calibration only when the persisted stable tuple
+ * changes. Best-effort: a store failure must not fail the identity fetch. */
+#define AMBIT_DEVICE_PAYLOAD_CAP 1536U
 static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
                                    const ambit_calibration_t *cal, bool have_cal)
 {
-    if (s_cfg.store_event == NULL || s_cfg.next_id == NULL) return;
-
-    char payload[768];
-    int o = snprintf(payload, sizeof payload,
-        "{\"device_id\":\"%s\",\"fw\":\"%s\",\"cal_version\":\"%08lx\"",
-        e->device_id, e->fw_version, (unsigned long)e->cal_version);
-    if (have_cal && o > 0 && o < (int)sizeof payload) {
-        o += snprintf(payload + o, sizeof payload - o, ",\"mlx_coef\":[");
-        for (int i = 0; i < 14 && o > 0 && o < (int)sizeof payload; i++)
-            o += snprintf(payload + o, sizeof payload - o, "%s%ld",
-                          i ? "," : "", (long)cal->mlx_coef[i]);
-        o += snprintf(payload + o, sizeof payload - o, "],\"adpd\":[");
-        for (int i = 0; i < 6 && o > 0 && o < (int)sizeof payload; i++)
-            o += snprintf(payload + o, sizeof payload - o, "%s%lu",
-                          i ? "," : "", (unsigned long)cal->adpd[i]);
-        o += snprintf(payload + o, sizeof payload - o,
-            "],\"temp_offset\":%.4f,\"temp_slope\":%.4f,\"actinic_coef\":%.6f,"
-            "\"spec_coef\":%.6f,\"act\":[%u,%u,%u,%u,%u],"
-            "\"mlx_emissivity\":%.4f,\"sun_coef\":%.6f,\"tick_factor\":%.6f",
-            (double)cal->temp_offset, (double)cal->temp_slope, (double)cal->actinic_coef,
-            (double)cal->spec_coef, (unsigned)cal->act_50, (unsigned)cal->act_100,
-            (unsigned)cal->act_150, (unsigned)cal->act_200, (unsigned)cal->act_250,
-            (double)cal->mlx_emissivity, (double)cal->sun_coef, (double)cal->tick_factor);
-    }
-    if (o < 0 || o >= (int)sizeof payload) {
-        ESP_LOGW(TAG, "AMBIT%u device_info payload truncated", ch + 1);
-        return;
-    }
+    if (s_cfg.store_event == NULL || s_cfg.next_id == NULL || !have_cal || cal == NULL)
+        return; /* ambit.device/1 never permits a partial calibration object. */
+    bool unchanged = false;
+    const int announce_slot = ambit_announce_slot(e, &unchanged);
+    if (unchanged) return;
 
     int64_t mid = 0;
     if (s_cfg.next_id(&mid) != ESP_OK) return;
     char chan[12];
     snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+    const int64_t observed = now_ms();
+    payload_v3_device_input_t input = {
+        .measure_id = mid,
+        .channel = chan,
+        .device = e->ambit_name[0] ? e->ambit_name : "ambit",
+        .observed_utc_ms = observed,
+        .sensor_id = e->device_id,
+        .name = e->ambit_name[0] ? e->ambit_name : "ambit",
+        .firmware = e->fw_version,
+        .hardware_revision = e->hw_rev,
+        .cal_version = e->cal_version,
+        .temp_offset = cal->temp_offset,
+        .temp_slope = cal->temp_slope,
+        .actinic_coef = cal->actinic_coef,
+        .spec_coef = cal->spec_coef,
+        .act = {cal->act_50, cal->act_100, cal->act_150, cal->act_200, cal->act_250},
+        .mlx_emissivity = cal->mlx_emissivity,
+        .sun_coef = cal->sun_coef,
+        .tick_factor = cal->tick_factor,
+    };
+    memcpy(input.mlx_coef, cal->mlx_coef, sizeof input.mlx_coef);
+    memcpy(input.adpd, cal->adpd, sizeof input.adpd);
+    /* This path may run inside the deep Lua measurement→late-calibration
+     * recovery chain. Keep the bounded device object off that 8-KiB task
+     * stack; ownership remains local and event storage consumes it
+     * synchronously before free, so no persistent cross-caller scratch races. */
+    char *payload = malloc(AMBIT_DEVICE_PAYLOAD_CAP);
+    if (payload == NULL) {
+        ESP_LOGW(TAG, "AMBIT%u device object allocation failed", ch + 1);
+        return;
+    }
+    char build_error[96];
+    if (!payload_v3_build_device(payload, AMBIT_DEVICE_PAYLOAD_CAP, &input,
+                                 build_error, sizeof build_error)) {
+        ESP_LOGW(TAG, "AMBIT%u device object build failed: %s", ch + 1, build_error);
+        free(payload);
+        return;
+    }
     measurement_event_desc_t d = {
         .measure_id   = mid,
         .channel      = chan,
         .device       = (e->ambit_name[0] != '\0') ? e->ambit_name : "ambit",
         .tag          = MEASUREMENT_TAG_DEVICE_INFO,
         .cmd_raw      = "get_info",
-        .start_ms     = now_ms(),
-        .end_ms       = now_ms(),
+        .start_ms     = observed,
+        .end_ms       = observed,
         .payload_json = payload,
     };
-    if (s_cfg.store_event(&d) == ESP_OK) {
+    const bool stored = s_cfg.store_event(&d) == ESP_OK;
+    free(payload);
+    if (stored) {
+        esp_err_t persist_err = ambit_announce_persist(announce_slot, e);
+        if (persist_err != ESP_OK) {
+            ESP_LOGW(TAG, "AMBIT%u announcement tuple persistence failed: %s",
+                     ch + 1, esp_err_to_name(persist_err));
+        }
         notify_sync();
-        ESP_LOGI(TAG, "AMBIT%u DEVICE_INFO stored (%s cal=%08lx)",
+        ESP_LOGI(TAG, "AMBIT%u ambit.device/1 stored (%s cal=%08lx)",
                  ch + 1, e->ambit_name, (unsigned long)e->cal_version);
     }
 }
@@ -2469,6 +2597,7 @@ static bool ambit_cal_read(uint8_t ch, ambit_device_info_t *e, ambit_calibration
     if (cr.status != ESP_OK || cgot < sizeof *cal) return false;
     e->cal_version  = esp_rom_crc32_le(0, (const uint8_t *)cal, sizeof *cal);
     e->actinic_coef = cal->actinic_coef;
+    e->tick_factor  = cal->tick_factor;
     memset(e->ambit_name, 0, sizeof e->ambit_name);
     memcpy(e->ambit_name, cal->ambit_name, sizeof e->ambit_name - 1);
     return true;
@@ -2521,7 +2650,7 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
     e.valid = true;
     s_ambit_info[ch] = e;
 
-    /* Announce the freshly-connected sensor's identity + calibration once. */
+    /* Stable-tuple persistence suppresses unchanged reconnect announcements. */
     ambit_emit_device_info(ch, &e, &cal, have_cal);
     return ESP_OK;
 }

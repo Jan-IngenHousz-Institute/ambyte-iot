@@ -14,6 +14,8 @@
  */
 
 #include "uart_sensors.h"
+#include "uart_sensor_ping_cache_policy.h"
+#include "uart_stream_support.h"
 
 #include <string.h>
 
@@ -55,12 +57,18 @@
 #define TEXT_QUERY_PRIME_MS 50
 #define WAKE_RETRIES        25
 #define WAKE_RETRY_MS       50
+#define WAKE_READ_MS        20
 #define PING_TIMEOUT_MS     2000
 #define PING_CACHE_TTL_US   (10LL * 1000 * 1000)  /* 10 s — present-sensor re-confirm */
 /* A FAILED ping is cached far longer than a successful one: an absent/empty
  * channel would otherwise be re-woken (a ~1.25 s wake-retry burst) on every SS
  * round. A present sensor still re-confirms at the short TTL above. */
 #define PING_FAIL_CACHE_TTL_US (5LL * 60 * 1000 * 1000)  /* 5 min — empty channel */
+/* uart_sensors_init() deliberately resets the shared AMBIT bank. The C3 image
+ * needs roughly four seconds before its binary router is ready (the OTA path
+ * already waits five). During that window a failed probe means "still booting",
+ * not "empty slot", and must not enter the five-minute negative cache. */
+#define AMBIT_APP_BOOT_GRACE_US (5LL * 1000 * 1000)
 
 /* ── AMBIT ROM-flash reset/boot control ─────────────────────────────────
  * Host-driven C3 firmware update: force an AMBIT (ESP8685/ESP32-C3) into its
@@ -91,10 +99,24 @@ static channel_t s_ch[UART_SENSOR_NUM_CHANNELS];
 static SemaphoreHandle_t s_uart0_mtx;       /* guards UART0 remap */
 static SemaphoreHandle_t s_ch_mtx[UART_SENSOR_NUM_CHANNELS];
 static bool s_inited;
+static int64_t s_ping_fail_cache_not_before_us;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
 static inline int64_t now_us(void) { return esp_timer_get_time(); }
+
+/* CHIP_EN is shared, so every reset invalidates every channel. Keeping the
+ * volatile state transition next to the physical reset prevents a stale
+ * connected/absent decision from surviving a ROM probe, OTA exit, or host boot. */
+static void ambit_note_shared_app_reset(void)
+{
+    s_ping_fail_cache_not_before_us = now_us() + AMBIT_APP_BOOT_GRACE_US;
+    for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++) {
+        s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+        s_ch[channel].ping_ok = false;
+        s_ch[channel].ping_ts = 0;
+    }
+}
 
 static inline bool deadline_reached(int64_t deadline)
 {
@@ -185,6 +207,49 @@ static void channel_release(uint8_t ch)
     xSemaphoreGive(s_ch_mtx[ch]);
 }
 
+static int64_t stream_lock_now_us(void *ctx)
+{
+    (void)ctx;
+    return now_us();
+}
+
+static bool stream_lock_take(void *lock, uint32_t wait_ticks, void *ctx)
+{
+    (void)ctx;
+    return xSemaphoreTake((SemaphoreHandle_t)lock, (TickType_t)wait_ticks) == pdTRUE;
+}
+
+static void stream_lock_give(void *lock, void *ctx)
+{
+    (void)ctx;
+    xSemaphoreGive((SemaphoreHandle_t)lock);
+}
+
+/* Streaming diagnostics advertise one wall-clock timeout. Unlike the legacy
+ * channel_acquire(wait) contract used by short sensor commands, this path must
+ * not spend that timeout once on the channel mutex and again on shared UART0.
+ * The production helper recomputes remaining ticks before each take and rolls
+ * the channel mutex back if the shared-bus take cannot finish in time. */
+static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
+{
+    void *shared_lock = s_ch[ch].shared ? (void *)s_uart0_mtx : NULL;
+    if (!uart_stream_acquire_until((void *)s_ch_mtx[ch], shared_lock,
+                                   deadline_us, portTICK_PERIOD_MS,
+                                   stream_lock_now_us, stream_lock_take,
+                                   stream_lock_give, NULL)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_ch[ch].shared) {
+        uart_flush_input(UART_NUM_0);
+        uart_set_pin(UART_NUM_0, s_ch[ch].tx_pin, s_ch[ch].rx_pin,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+        ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
+                 ch, s_ch[ch].tx_pin, s_ch[ch].rx_pin);
+    }
+    s_ch[ch].state = UART_SENSOR_BUSY;
+    return ESP_OK;
+}
+
 /* ── AMBIT ROM-flash: reset/boot sequencer ──────────────────────────────
  * See the AMBIT_RESET_GPIO block above. Forces one AMBIT into the ESP32-C3
  * ROM serial download mode over the shared FFC/UART so the ambyte can flash it
@@ -228,6 +293,7 @@ static esp_err_t ambit_boot_gpio_init(void)
     gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge the 2.2uF cap */
     gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp back up */
+    ambit_note_shared_app_reset();
     return ESP_OK;
 }
 
@@ -271,6 +337,7 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));
     gpio_set_level(AMBIT_RESET_GPIO, 1);
+    ambit_note_shared_app_reset();
     ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
     return ESP_OK;
 }
@@ -291,9 +358,17 @@ static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
             retry_deadline = deadline;
         }
         /* Scan for ack (128) or boot-idle (133, means ambit just woke) */
-        while (!deadline_reached(retry_deadline)) {
+        while (true) {
+            /* The operation deadline includes wake. Ceiling rounding preserves
+             * one scheduler tick for a positive sub-tick remainder, while the
+             * 20 ms cap preserves the established polling cadence whenever
+             * enough budget remains. An expired deadline starts no UART read. */
+            uint32_t read_ticks = uart_stream_capped_deadline_ticks(
+                now_us(), retry_deadline, WAKE_READ_MS, portTICK_PERIOD_MS);
+            if (read_ticks == 0) break;
+
             uint8_t b;
-            int n = uart_read_bytes(port, &b, 1, pdMS_TO_TICKS(20));
+            int n = uart_read_bytes(port, &b, 1, (TickType_t)read_ticks);
             if (n == 1) {
                 if (b == AMBIT_ACK) {
                     return ESP_OK;
@@ -643,8 +718,15 @@ static esp_err_t do_ping(uint8_t channel, bool *connected)
     err = ambit_wake(port, deadline);
     bool ok = (err == ESP_OK);
 
+    const int64_t observed_at_us = now_us();
     s_ch[channel].ping_ok = ok;
-    s_ch[channel].ping_ts = now_us();
+    /* Empty-channel probes are intentionally fail-cached for five minutes, but
+     * never turn a predictable app-start race into five minutes of false absence.
+     * A zero timestamp makes the next caller reach the wire again. */
+    s_ch[channel].ping_ts = uart_sensor_ping_result_cacheable(
+        ok, observed_at_us, s_ping_fail_cache_not_before_us)
+        ? observed_at_us
+        : 0;
     s_ch[channel].state   = ok ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
 
     *connected = ok;
@@ -825,20 +907,35 @@ static esp_err_t do_text_query(uint8_t channel,
 
 /* ── Streaming ASCII query (multi-line until a sentinel) ──────────────── *
  *
- * For sensors that answer a command with many lines and a final sentinel line
- * (e.g. the AMBIT PLOTTING run: many "T:..,F:.." lines then a "Done" line).
- * Pre-wakes the port (the AMBIT light-sleeps and drops the first bytes on UART
- * wake; a lone newline is parsed as an empty command and wakes it), sends
- * cmd+terminator, then accumulates everything into `out` until a line
- * containing `sentinel` arrives or `timeout_ms` elapses. */
+ * For sensors that answer a command with a response too large for the normal
+ * 256-byte line query. Pre-wake, ownership, and deadline handling remain the
+ * same as the other UART adapters, but response bytes are relayed through a
+ * bounded chunk so a diagnostic openJII trace never needs a response-sized
+ * allocation on the Ambyte. */
+typedef struct {
+    uart_sensor_stream_write_fn write;
+    void *write_ctx;
+    esp_err_t error;
+} stream_sink_adapter_t;
+
+static int stream_sink_write(const uint8_t *data, size_t len, void *opaque)
+{
+    stream_sink_adapter_t *sink = (stream_sink_adapter_t *)opaque;
+    sink->error = sink->write(data, len, sink->write_ctx);
+    return (sink->error == ESP_OK) ? 0 : -1;
+}
+
 static esp_err_t do_stream_query(uint8_t channel,
                                  const char *cmd, const char *terminator,
                                  const char *sentinel,
-                                 char *out, size_t cap, size_t *out_len,
-                                 uint32_t timeout_ms)
+                                 uart_sensor_stream_write_fn write,
+                                 void *write_ctx, size_t *out_len,
+                                 int64_t deadline_us)
 {
     if (channel >= UART_SENSOR_NUM_CHANNELS || cmd == NULL ||
-            out == NULL || cap < 2 || out_len == NULL) {
+            terminator == NULL || terminator[0] == '\0' ||
+            sentinel == NULL || sentinel[0] == '\0' ||
+            write == NULL || out_len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_inited) {
@@ -846,10 +943,12 @@ static esp_err_t do_stream_query(uint8_t channel,
     }
 
     *out_len = 0;
-    out[0] = '\0';
-    int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+    uart_stream_relay_t relay;
+    if (!uart_stream_relay_init(&relay, sentinel)) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    esp_err_t err = channel_acquire(channel, pdMS_TO_TICKS(timeout_ms));
+    esp_err_t err = channel_acquire_until(channel, deadline_us);
     if (err != ESP_OK) {
         return err;
     }
@@ -862,7 +961,7 @@ static esp_err_t do_stream_query(uint8_t channel,
      * misroutes to binary mode and rejects the whole command ("Unknown cmd N").
      * Confirming the ack first guarantees the AMBIT is awake and the command's
      * first byte arrives clean. */
-    esp_err_t wake_err = ambit_wake(port, deadline);
+    esp_err_t wake_err = ambit_wake(port, deadline_us);
     if (wake_err != ESP_OK) {
         s_ch[channel].state = UART_SENSOR_DISCONNECTED;
         channel_release(channel);
@@ -878,10 +977,15 @@ static esp_err_t do_stream_query(uint8_t channel,
         uart_write_bytes(port, terminator, strlen(terminator));
     }
 
-    size_t line_start = 0;
-    size_t sent_len   = (sentinel != NULL) ? strlen(sentinel) : 0;
-    while (*out_len + 1 < cap) {
-        int64_t remain_us = deadline - now_us();
+    stream_sink_adapter_t sink = {
+        .write = write,
+        .write_ctx = write_ctx,
+        .error = ESP_OK,
+    };
+    esp_err_t result = ESP_ERR_TIMEOUT;
+
+    while (true) {
+        int64_t remain_us = deadline_us - now_us();
         if (remain_us <= 0) break;
         TickType_t ticks = pdMS_TO_TICKS((uint32_t)(remain_us / 1000));
         if (ticks == 0) ticks = 1;
@@ -891,20 +995,30 @@ static esp_err_t do_stream_query(uint8_t channel,
         if (n <= 0) {
             continue;
         }
-        out[(*out_len)++] = (char)b;
-        if (b == '\n') {
-            out[*out_len] = '\0';
-            if (sent_len > 0 && strstr(out + line_start, sentinel) != NULL) {
-                break; /* sentinel line received — done */
-            }
-            line_start = *out_len;
+
+        uart_stream_relay_result_t relay_result =
+            uart_stream_relay_push(&relay, b, stream_sink_write, &sink);
+        if (relay_result == UART_STREAM_RELAY_COMPLETE) {
+            result = ESP_OK;
+            break;
+        }
+        if (relay_result == UART_STREAM_RELAY_SINK_ERROR) {
+            result = (sink.error == ESP_OK) ? ESP_FAIL : sink.error;
+            break;
         }
     }
 
-    out[*out_len] = '\0';
+    /* A timeout/error may follow a useful partial response. Relay every byte
+     * already received before the caller prints its out-of-band error marker. */
+    if (result == ESP_ERR_TIMEOUT &&
+            !uart_stream_relay_flush(&relay, stream_sink_write, &sink)) {
+        result = (sink.error == ESP_OK) ? ESP_FAIL : sink.error;
+    }
+
+    *out_len = relay.accepted_bytes;
     s_ch[channel].state = (*out_len > 0) ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
     channel_release(channel);
-    return (*out_len > 0) ? ESP_OK : ESP_ERR_TIMEOUT;
+    return result;
 }
 
 /* ── Port-adapter getters ──────────────────────────────────────────── */

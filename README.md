@@ -87,7 +87,7 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 
 ### Tasks (each created inside its own component)
 
-- **sync_runner** — the only MQTT publisher; also emits the STATUS heartbeat and runs a connectivity watchdog.
+- **sync_runner** — the only MQTT publisher; also emits the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
 - **lua_runner** — runs `/sdcard/main.lua` once, self-deletes on return/stop, restarts on SD reinsert. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement isn't preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
 - **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
@@ -277,13 +277,15 @@ Lua **never** touches MQTT. [components/sync_runner](components/sync_runner) is 
 
 **Reliability hardening** (current branch): one in-flight slot is cleared on both Wi-Fi and MQTT-level disconnects (`device_commands_on_mqtt_disconnect`), and a slot held past 60 s without a PUBACK is reaped back to PENDING (`device_commands_reap_stale_inflight`) so a lost/expired QoS1 PUBACK on a marginal link can't silently wedge the drain forever. A separate connectivity **watchdog** reboots the unit if it *should* be publishing (external power, clock valid, events pending) but lands no PUBACK for 1 h — the SD backlog and NVS cursor survive.
 
-### STATUS heartbeat
+### TELEMETRY heartbeat
 
-A firmware-owned STATUS heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. It stores a `tag=STATUS` event with Wi-Fi/provisioned/DB/publish-gate flags, MP2731 power keys, onboard BME280 T/H/P, compiled `app_version`, and the active script identity (`script_sha256`, independently released `script_version`, `script_built_against_fw`, and `script_installed_on_fw`). Release metadata is included only when its persisted digest still matches the actual SD file.
+A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Release metadata is included only when its persisted digest still matches the actual SD file.
 
-### Payload schema v2
+### Payload schema
 
-Each stored event becomes exactly one MQTT message under the v2 envelope. `tag` is a firmware-controlled origin enum (`MEASUREMENT` / `STATUS` / `DEVICE_INFO`); `channel` (`uart_<n>` / null) replaces the old `sensor` field; `device` is best-effort sensor self-identification (AMBIT `ambit_name`); `cmd_raw` is the command in the target device's own vocabulary (replayable). The envelope `timestamp` is the **measurement** time, so battery-queued events carry their capture time, not publish time. Full spec: [docs/mqtt-payload.md](docs/mqtt-payload.md) (v2) and [docs/payload-v2-plan.md](docs/payload-v2-plan.md).
+Each stored event becomes exactly one MQTT message. New AMBIT runs, gateway heartbeats, and sensor inventory changes store complete canonical `ambit.trace/3`, `ambyte.telemetry/1`, and `ambit.device/1` objects in the existing event-log payload column; the publisher places that object directly in the unchanged outer `sample` envelope. Old v2 SD backlog and generic Lua events retain the legacy v2 builder, so queued data is not rewritten. `channel` (`uart_<n>` / null) identifies the port and `device` is the human sensor name or gateway identity. The normative fields, units, time models, formatting, and dual-read rule are in [docs/mqtt-payload.md](docs/mqtt-payload.md).
+
+Transport gzip is opt-in and **off by default**: `cfg set publish_gzip 1` makes canonical v3 publishes carry `sample` as `base64(gzip(...))` with the pipeline's existing `_sample_encoding: "gzip+base64"` marker (deflate from the ESP32-S3 ROM tdefl, kept only when strictly smaller, fail-open to plain JSON). Details in docs/mqtt-payload.md §14a.
 
 ---
 
@@ -294,7 +296,7 @@ The **AMBIT** is an external multispeq-style measurement device (leaf photosynth
 - **UART topology:** CH0=UART1, CH1=UART2, CH2/CH3 share UART0 (per-query GPIO remap). A bus mutex serializes measurement / OTA / ROM-flash / Lua so nothing collides (busy bus → `ESP_ERR_TIMEOUT`).
 - **Binary protocol** ([ambit_protocol.h](components/device_commands/include/ambit_protocol.h)): `RUN`(21)/`RUN_MPF`(20) synchronous measurements; `GET_SPEC`(31), `GET_TEMP`(32); config `SET_GAINS`(1)/`SET_CURRENTS`(2); actions `BLINK`(5)/`CALIBRATE_BASELINE`(6)/`ACTINIC`(4); `GET_INFO`(33) sub-types CALIBRATION/FW/METADATA; `SET_METADATA`(37). Typed C wrappers are `cmd_ambit_*` in `device_commands`.
 - **Parallel trigger → poll → fetch** (cmds 22/23/24): so long multi-second runs don't block the shared UART — `trigger` starts a retained run, `poll` reads one async state byte (BUSY inferred from poll timeout), `fetch` streams the buffered arrays. HW-working with real `arrun` events published via `run_trace`.
-- **Identity/calibration caching:** fetched once per channel after (re)connect (`GET_INFO` 33): `device_id`, `fw_version` (major.minor.batch), `cal_version` (CRC32), `ambit_name`, `actinic_coef`. The first fetch emits one `DEVICE_INFO` event.
+- **Identity/calibration caching:** fetched once per channel after (re)connect (`GET_INFO` 33): `device_id`, `fw_version` (major.minor.batch), `cal_version` (CRC32), `ambit_name`, and the full calibration object. `ambit.device/1` inventory is emitted only when the stable `(sensor_id, firmware, cal_version)` tuple changes; the tuple is persisted in NVS so reconnects, reboots, and channel movement do not duplicate unchanged inventory.
 
 ### AMBIT firmware update — two independent paths
 

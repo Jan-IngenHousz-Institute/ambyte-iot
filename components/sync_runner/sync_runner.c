@@ -101,12 +101,10 @@
  * NVS cursor survive, so nothing is lost). Runs as a SEPARATE task from the drain
  * so it also catches a wedged/dead drain task. */
 #define SYNC_WD_TASK_NAME     "sync_wdog"
-/* 6144 + 1536: the STATUS metadata buffer (cmd_store_status_event) grew from
- * 896 B to 2048 B (script identity + per-channel AMBIT identity blocks), and
- * script_identity_t also sits on this frame. A stack overflow here would take
- * out the task that performs the self-healing reboots, so the growth is
- * over-covered rather than trimmed to the calculated minimum; confirm the
- * high-water mark on hardware before trimming. */
+/* The canonical TELEMETRY builder and script/device health snapshots sit on
+ * this path. A stack overflow here would take out the task that performs the
+ * self-healing reboots, so the allocation is deliberately conservative;
+ * confirm the high-water mark on hardware before trimming. */
 #define SYNC_WD_TASK_STACK    7680
 #define SYNC_WD_TASK_PRIO     2                      /* mostly sleeps */
 
@@ -413,13 +411,13 @@ static bool self_reboot(const char *reason, const char *detail,
         }
     }
 
-    /* Persist a final STATUS snapshot for post-boot delivery. It is best-effort:
+    /* Persist a final TELEMETRY snapshot for post-boot delivery. It is best-effort:
      * production reason/day/guard latches above are the hard anti-loop
      * requirement. Test mode intentionally writes none. The app's registered
      * shutdown handler flushes event_log + SD during esp_restart(). */
     cmd_result_t sr = cmd_store_status_event();
     if (sr.status != ESP_OK && sr.status != ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "pre-reboot STATUS failed: %s", sr.message);
+        ESP_LOGW(TAG, "pre-reboot TELEMETRY failed: %s", sr.message);
     }
     ESP_LOGE(TAG, "SELF-REBOOT reason=%s: %s", reason, detail);
     vTaskDelay(pdMS_TO_TICKS(200));

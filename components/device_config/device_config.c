@@ -1,5 +1,7 @@
 #include "device_config.h"
 
+#include <string.h>
+
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -23,9 +25,16 @@
 #define KEY_TIMEZONE        "timezone"
 #define KEY_FLASH_TIME      "flash_time"
 #define KEY_HEARTBEAT_S     "heartbeat_s"
+#define KEY_PUBLISH_GZIP    "publish_gzip"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
+
+/* RAM cache of KEY_PUBLISH_GZIP so the per-publish check in the MQTT drain
+ * path never touches NVS. Loaded once in device_config_init, updated by the
+ * setter. Absent/invalid values read as disabled — plain JSON is the safe
+ * default until the OpenJII ingest confirms gzip support for this producer. */
+static bool         s_publish_gzip = false;
 
 esp_err_t device_config_init(void)
 {
@@ -35,6 +44,13 @@ esp_err_t device_config_init(void)
         return err;
     }
     s_initialized = true;
+
+    {
+        char gz[8];
+        size_t gz_len = sizeof(gz);
+        s_publish_gzip = nvs_get_str(s_handle, KEY_PUBLISH_GZIP, gz, &gz_len) == ESP_OK
+                         && strcmp(gz, "1") == 0;
+    }
 
     /* One-time OTA-safe migration for early provisioning images that used AMT
      * as shorthand for Amsterdam. Do not rewrite unknown values: retain them in
@@ -220,4 +236,35 @@ esp_err_t device_config_get_firmware_version(char *buf, size_t len)
 esp_err_t device_config_set_firmware_version(const char *val)
 {
     return cfg_set(KEY_FIRMWARE_VER, val);
+}
+
+bool device_config_publish_gzip_enabled(void)
+{
+    return s_initialized && s_publish_gzip;
+}
+
+esp_err_t device_config_get_publish_gzip(char *buf, size_t len)
+{
+    if (buf == NULL || len < 2) return ESP_ERR_INVALID_ARG;
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    buf[0] = s_publish_gzip ? '1' : '0';
+    buf[1] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t device_config_set_publish_gzip(const char *val)
+{
+    bool enable;
+    if (val != NULL && (strcmp(val, "1") == 0 || strcmp(val, "on") == 0 ||
+                        strcmp(val, "true") == 0)) {
+        enable = true;
+    } else if (val != NULL && (strcmp(val, "0") == 0 || strcmp(val, "off") == 0 ||
+                               strcmp(val, "false") == 0)) {
+        enable = false;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = cfg_set(KEY_PUBLISH_GZIP, enable ? "1" : "0");
+    if (err == ESP_OK) s_publish_gzip = enable;
+    return err;
 }

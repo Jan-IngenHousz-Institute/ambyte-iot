@@ -29,6 +29,7 @@ if (HAVE_LOCAL_LUA)
             "include"
         REQUIRES
             device_commands
+            payload_codec
             event_log
             time_sync
             timezone
@@ -57,6 +58,7 @@ else()
             "include"
         REQUIRES
             device_commands
+            payload_codec
             event_log
             time_sync
             timezone

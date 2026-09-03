@@ -1,5 +1,7 @@
-#include <stdbool.h>
 #include <ctype.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +32,8 @@
 #include "device_commands.h"
 #include "device_config.h"
 #include "uart_sensors.h"
+#include "uart_stream_cli_support.h"
+#include "uart_stream_support.h"
 #include "lua_runner.h"
 #include "script_update.h"
 #include "sync_runner.h"
@@ -61,6 +65,17 @@ static const uint8_t CLI_BME280_ADDR_PRIMARY = 0x77;
 static const uint8_t CLI_BME280_ADDR_SECONDARY = 0x76;
 static const TickType_t CLI_I2C_SCAN_TIMEOUT_TICKS = pdMS_TO_TICKS(50);
 static const TickType_t CLI_I2C_SCAN_LOCK_TIMEOUT_TICKS = pdMS_TO_TICKS(1000);
+
+/* The diagnostic stream command stays within the REPL's 512-byte input line
+ * and cannot hold a sensor channel indefinitely. A 30 s default covers normal
+ * openJII traces; the explicit 120 s ceiling permits slow protocols without
+ * turning a malformed request into an unbounded UART lock. */
+#define CLI_UART_STREAM_REQUEST_MAX       448U
+#define CLI_UART_STREAM_TIMEOUT_DEFAULT_MS 30000U
+#define CLI_UART_STREAM_TIMEOUT_MIN_MS      100U
+#define CLI_UART_STREAM_TIMEOUT_MAX_MS   120000U
+#define CLI_UART_STREAM_SENTINEL       "7A1E3AA1"
+
 static esp_console_repl_t *s_cli_repl = NULL;
 static bool s_cli_commands_registered = false;
 
@@ -848,6 +863,123 @@ static int cli_cmd_uart_query(int argc, char **argv)
     }
     printf("ch%d (%u bytes): %s\r\n", ch, (unsigned)resp_len, resp);
     return 0;
+}
+
+typedef struct {
+    size_t offset;
+} cli_uart_stream_ctx_t;
+
+/* Emit only ASCII hex inside prefix-labelled, stdout-atomic records. The USB
+ * console is configured to translate LF to CRLF, so forwarding raw stdout
+ * would mutate the sensor's final newline. Hex records let a host concatenate
+ * `hex=` fields and recover every original byte (including 0x0a) exactly, while
+ * unrelated task logs may still appear safely between whole records. */
+static esp_err_t cli_uart_stream_write(const uint8_t *data, size_t len, void *opaque)
+{
+    if ((data == NULL && len != 0) || len > UART_STREAM_CHUNK_MAX ||
+            opaque == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cli_uart_stream_ctx_t *ctx = (cli_uart_stream_ctx_t *)opaque;
+    char encoded[UART_STREAM_CHUNK_MAX * 2U + 1U];
+    if (!uart_stream_hex_encode(data, len, encoded, sizeof(encoded))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool failed = false;
+    flockfile(stdout);
+    if (printf("UART_STREAM_DATA offset=%u hex=", (unsigned)ctx->offset) < 0 ||
+            fwrite(encoded, 1, len * 2U, stdout) != len * 2U ||
+            printf("\r\n") < 0 || fflush(stdout) != 0) {
+        failed = true;
+    }
+    funlockfile(stdout);
+    if (failed) {
+        return ESP_FAIL;
+    }
+
+    ctx->offset += len;
+    return ESP_OK;
+}
+
+static bool cli_parse_u32_range(const char *text, uint32_t min, uint32_t max,
+                                uint32_t *out)
+{
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < min || value > max) {
+        return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+/* uart_stream_query <ch> <compact_json> [timeout_ms=30000]
+ *
+ * A non-storing diagnostic bridge for responses larger than uart_query's
+ * compatibility-frozen 256-byte buffer. The payload is streamed as ordered
+ * hex records between BEGIN and END/ERROR records; concatenate each `hex=`
+ * value by offset to recover the sensor bytes exactly. */
+static int cli_cmd_uart_stream_query(int argc, char **argv)
+{
+    if (argc < 3 || argc > 4) {
+        printf("Usage: uart_stream_query <ch> <compact_json> [timeout_ms=30000]\r\n");
+        return 1;
+    }
+
+    uint32_t channel = 0;
+    if (!cli_parse_u32_range(argv[1], 0, UART_SENSOR_NUM_CHANNELS - 1U, &channel)) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    if (!uart_stream_json_request_valid(argv[2], CLI_UART_STREAM_REQUEST_MAX)) {
+        printf("Request must be one bracketed JSON argument (max %u bytes, no CR/LF)\r\n",
+               (unsigned)CLI_UART_STREAM_REQUEST_MAX);
+        return 1;
+    }
+
+    uint32_t timeout_ms = CLI_UART_STREAM_TIMEOUT_DEFAULT_MS;
+    if (argc == 4 && !cli_parse_u32_range(argv[3],
+                                          CLI_UART_STREAM_TIMEOUT_MIN_MS,
+                                          CLI_UART_STREAM_TIMEOUT_MAX_MS,
+                                          &timeout_ms)) {
+        printf("Timeout must be %u-%u ms\r\n",
+               (unsigned)CLI_UART_STREAM_TIMEOUT_MIN_MS,
+               (unsigned)CLI_UART_STREAM_TIMEOUT_MAX_MS);
+        return 1;
+    }
+
+    cli_uart_stream_ctx_t ctx = {0};
+    size_t response_bytes = 0;
+    flockfile(stdout);
+    printf("UART_STREAM_BEGIN ch=%u timeout_ms=%u encoding=hex sentinel=%s\r\n",
+           (unsigned)channel, (unsigned)timeout_ms, CLI_UART_STREAM_SENTINEL);
+    fflush(stdout);
+    funlockfile(stdout);
+
+    cmd_result_t result = cmd_uart_stream_query((uint8_t)channel, argv[2],
+                                                 CLI_UART_STREAM_SENTINEL,
+                                                 timeout_ms,
+                                                 cli_uart_stream_write, &ctx,
+                                                 &response_bytes);
+
+    flockfile(stdout);
+    if (result.status == ESP_OK) {
+        printf("UART_STREAM_END ch=%u bytes=%u\r\n",
+               (unsigned)channel, (unsigned)response_bytes);
+    } else {
+        printf("UART_STREAM_ERROR ch=%u bytes=%u status=%s detail=%s\r\n",
+               (unsigned)channel, (unsigned)response_bytes,
+               esp_err_to_name(result.status), result.message);
+    }
+    fflush(stdout);
+    funlockfile(stdout);
+    return (result.status == ESP_OK) ? 0 : 1;
 }
 
 static int cli_cmd_ambit_temp(int argc, char **argv)
@@ -1829,6 +1961,7 @@ static const cfg_entry_t s_cfg_table[] = {
     { "device_firmware",  device_config_get_device_firmware,  device_config_set_device_firmware },
     { "firmware_version", device_config_get_firmware_version, device_config_set_firmware_version },
     { "timezone",         device_config_get_timezone,         device_config_set_timezone },
+    { "publish_gzip",     device_config_get_publish_gzip,     device_config_set_publish_gzip },
 };
 
 static const cfg_entry_t *cfg_find(const char *key)
@@ -1964,6 +2097,11 @@ static esp_err_t cli_register_commands(void)
         .command = "uart_query",
         .help    = "uart_query <ch> <message> [timeout_ms=1000]  ASCII line query (LF-terminated, never stores)",
         .func    = cli_cmd_uart_query,
+    };
+    static const esp_console_cmd_t uart_stream_query_cmd = {
+        .command = "uart_stream_query",
+        .help    = "uart_stream_query <ch> <compact_json> [timeout_ms=30000]  stream exact response as offset hex records (never stores)",
+        .func    = cli_cmd_uart_stream_query,
     };
     static const esp_console_cmd_t ambit_temp_cmd = {
         .command = "ambit_temp",
@@ -2138,6 +2276,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&uart_query_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&uart_stream_query_cmd);
     if (err != ESP_OK) {
         return err;
     }
