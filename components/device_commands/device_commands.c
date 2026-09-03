@@ -1781,7 +1781,7 @@ cmd_result_t cmd_store_status_event(void)
          * only firmware-owned health event. Retry without the optional attached
          * sensor references; the DEVICE_INFO path will still report its own
          * validation failure and a later healthy heartbeat restores the list. */
-        ESP_LOGW(TAG, "telemetry attached-sensor block dropped: %s", build_error);
+        ESP_LOGW(TAG, "telemetry build retry without attached sensors: %s", build_error);
         input.attached_count = 0;
         built = payload_v3_build_telemetry(payload, 4096U, &input,
                                            build_error, sizeof build_error);

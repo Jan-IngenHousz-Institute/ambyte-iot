@@ -96,9 +96,10 @@ esp_err_t ambit_announcement_stage(
 esp_err_t ambit_announcement_ack(
     ambit_announcement_tracker_t *tracker, int64_t measure_id)
 {
-    if (tracker == NULL || measure_id <= 0 || tracker->store.save == NULL) {
+    if (tracker == NULL || measure_id <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (tracker->store.save == NULL) return ESP_ERR_NOT_FOUND;
     for (size_t slot = 0; slot < AMBIT_ANNOUNCEMENT_SLOTS; ++slot) {
         if (!tracker->pending[slot].valid ||
             tracker->pending[slot].measure_id != measure_id) continue;

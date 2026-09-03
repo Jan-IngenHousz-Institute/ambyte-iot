@@ -110,6 +110,11 @@ int main(void)
     assert(slot == 0U);
     assert(!unchanged);
 
+    ambit_announcement_store_port_t no_store = {0};
+    ambit_announcement_init(&tracker, no_store);
+    assert(ambit_announcement_stage(&tracker, 0U, &candidate, 45) == ESP_OK);
+    assert(ambit_announcement_ack(&tracker, 45) == ESP_ERR_NOT_FOUND);
+
     puts("ambit announcement tracker tests: ok");
     return 0;
 }
