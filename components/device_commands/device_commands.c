@@ -35,6 +35,7 @@
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #define TAG "dev_cmd"
@@ -119,6 +120,8 @@ _Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
 
 static device_commands_config_t s_cfg;
 static ambit_announcement_tracker_t s_ambit_announcements;
+static SemaphoreHandle_t s_ambit_announcement_mutex;
+static StaticSemaphore_t s_ambit_announcement_mutex_control;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
@@ -415,6 +418,11 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
     s_cfg = *cfg;
+    if (s_ambit_announcement_mutex == NULL) {
+        s_ambit_announcement_mutex = xSemaphoreCreateMutexStatic(
+            &s_ambit_announcement_mutex_control);
+        if (s_ambit_announcement_mutex == NULL) return ESP_ERR_NO_MEM;
+    }
     ambit_announcement_init(&s_ambit_announcements, s_cfg.announcement_store);
     if (s_ack_queue == NULL) {
         s_ack_queue = xQueueCreateStatic(DC_ACK_QUEUE_DEPTH,
@@ -546,6 +554,24 @@ esp_err_t cmd_process_pending_acks(void)
             return ESP_OK;
         }
         if (!terminal) {
+            if (completion.status == ESP_OK) {
+                esp_err_t persist_err = ESP_ERR_TIMEOUT;
+                if (s_ambit_announcement_mutex != NULL &&
+                    xSemaphoreTake(s_ambit_announcement_mutex,
+                                   pdMS_TO_TICKS(5000)) == pdTRUE) {
+                    persist_err = ambit_announcement_ack(
+                        &s_ambit_announcements, completion.measure_id);
+                    xSemaphoreGive(s_ambit_announcement_mutex);
+                }
+                if (persist_err != ESP_OK && persist_err != ESP_ERR_NOT_FOUND) {
+                    /* Delivery already succeeded. Keep the event-log ACK moving;
+                     * leaving NVS unchanged deliberately causes a safe duplicate
+                     * announcement after reboot instead of a permanent loss. */
+                    ESP_LOGW(TAG, "announcement ACK persistence failed for id=%lld: %s",
+                             (long long)completion.measure_id,
+                             esp_err_to_name(persist_err));
+                }
+            }
             ESP_LOGD(TAG, "processed deferred %s msg_id=%d id=%lld",
                      completion.kind == DC_ACK_PUBACK ? "PUBACK" :
                      (completion.kind == DC_ACK_DISCONNECT ? "disconnect" : "publish error"),
@@ -1748,8 +1774,19 @@ cmd_result_t cmd_store_status_event(void)
     char *payload = malloc(4096U);
     if (payload == NULL) return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
     char build_error[96];
-    if (!payload_v3_build_telemetry(payload, 4096U, &input,
-                                    build_error, sizeof build_error)) {
+    bool built = payload_v3_build_telemetry(payload, 4096U, &input,
+                                            build_error, sizeof build_error);
+    if (!built && input.attached_count > 0) {
+        /* A malformed/stale peripheral cache must not silence the gateway's
+         * only firmware-owned health event. Retry without the optional attached
+         * sensor references; the DEVICE_INFO path will still report its own
+         * validation failure and a later healthy heartbeat restores the list. */
+        ESP_LOGW(TAG, "telemetry attached-sensor block dropped: %s", build_error);
+        input.attached_count = 0;
+        built = payload_v3_build_telemetry(payload, 4096U, &input,
+                                           build_error, sizeof build_error);
+    }
+    if (!built) {
         free(payload);
         return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
     }
@@ -2266,11 +2303,15 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
 static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
 
 /* Inventory announcements are keyed by stable sensor identity, not channel.
- * Persist four last-seen tuples so a transient UART reconnect, reboot, or
- * channel move does not republish unchanged calibration. A sensor-id match with
- * changed firmware/cal CRC replaces its own slot; a fifth distinct sensor
- * evicts round-robin. Store the event before committing the tuple: after a
- * brownout this can duplicate inventory, but can never suppress the only copy. */
+ * Persist four last-delivered tuples so a transient UART reconnect, reboot, or
+ * channel move does not republish acknowledged calibration. A sensor-id match
+ * with changed firmware/cal CRC replaces its own slot; a fifth distinct sensor
+ * evicts round-robin. Merely entering the event log is not delivery: stage the
+ * tuple after store, then persist it only when that exact measure_id receives a
+ * PUBACK and advances persistence. A brownout or dropped row may duplicate the
+ * inventory event later, but can never suppress its only cloud copy. The Lua
+ * measurement task stages while sync_runner acknowledges, so both operations
+ * share the dedicated mutex created during device_commands_init(). */
 #define AMBIT_ANNOUNCE_SLOTS AMBIT_ANNOUNCEMENT_SLOTS
 _Static_assert(AMBIT_INFO_NUM_CH == AMBIT_ANNOUNCEMENT_SLOTS,
                "announcement tuple capacity must match physical channels");
@@ -2287,11 +2328,17 @@ static int ambit_announce_slot(const ambit_device_info_t *info, bool *unchanged)
     for (size_t i = 0; i < AMBIT_ANNOUNCE_SLOTS; ++i) {
         if (s_ambit_info[i].valid) attached[i] = s_ambit_info[i].device_id;
     }
-    return (int)ambit_announcement_select(
+    if (s_ambit_announcement_mutex == NULL ||
+        xSemaphoreTake(s_ambit_announcement_mutex,
+                       pdMS_TO_TICKS(5000)) != pdTRUE) return -1;
+    const int slot = (int)ambit_announcement_select(
         &s_ambit_announcements, &candidate, attached, unchanged);
+    xSemaphoreGive(s_ambit_announcement_mutex);
+    return slot;
 }
 
-static esp_err_t ambit_announce_persist(int slot, const ambit_device_info_t *info)
+static esp_err_t ambit_announce_stage(int slot, const ambit_device_info_t *info,
+                                     int64_t measure_id)
 {
     if (slot < 0 || slot >= (int)AMBIT_ANNOUNCE_SLOTS) return ESP_ERR_INVALID_ARG;
     ambit_announcement_tuple_t tuple = {
@@ -2300,7 +2347,13 @@ static esp_err_t ambit_announce_persist(int slot, const ambit_device_info_t *inf
     };
     snprintf(tuple.sensor_id, sizeof tuple.sensor_id, "%s", info->device_id);
     snprintf(tuple.firmware, sizeof tuple.firmware, "%s", info->fw_version);
-    return ambit_announcement_commit(&s_ambit_announcements, (size_t)slot, &tuple);
+    if (s_ambit_announcement_mutex == NULL ||
+        xSemaphoreTake(s_ambit_announcement_mutex,
+                       pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t err = ambit_announcement_stage(
+        &s_ambit_announcements, (size_t)slot, &tuple, measure_id);
+    xSemaphoreGive(s_ambit_announcement_mutex);
+    return err;
 }
 
 /* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
@@ -2575,10 +2628,10 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     const bool stored = s_cfg.store_event(&d) == ESP_OK;
     free(payload);
     if (stored) {
-        esp_err_t persist_err = ambit_announce_persist(announce_slot, e);
-        if (persist_err != ESP_OK) {
-            ESP_LOGW(TAG, "AMBIT%u announcement tuple persistence failed: %s",
-                     ch + 1, esp_err_to_name(persist_err));
+        esp_err_t stage_err = ambit_announce_stage(announce_slot, e, mid);
+        if (stage_err != ESP_OK) {
+            ESP_LOGW(TAG, "AMBIT%u announcement tuple staging failed: %s",
+                     ch + 1, esp_err_to_name(stage_err));
         }
         notify_sync();
         ESP_LOGI(TAG, "AMBIT%u ambit.device/1 stored (%s cal=%08lx)",

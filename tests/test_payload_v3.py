@@ -248,7 +248,7 @@ class PayloadV3Test(unittest.TestCase):
             '"mlx_emissivity":0.9800,"sun_coef":1.000000,"tick_factor":0.854000}}',
         )
 
-    def test_production_wiring_preserves_backlogs_and_persists_dedupe(self) -> None:
+    def test_production_wiring_preserves_backlogs_and_acks_dedupe(self) -> None:
         source = (ROOT / "components/device_commands/device_commands.c").read_text()
         publisher = source.split("cmd_result_t cmd_mqtt_publish_next_event", 1)[1].split(
             "/* ── Status report", 1
@@ -263,7 +263,15 @@ class PayloadV3Test(unittest.TestCase):
         self.assertIn("ambit_announcement_select", announcement)
         self.assertLess(
             announcement.index("s_cfg.store_event(&d)"),
-            announcement.index("ambit_announce_persist(announce_slot, e)"),
+            announcement.index("ambit_announce_stage(announce_slot, e, mid)"),
+        )
+        ack_processing = source.split("esp_err_t cmd_process_pending_acks", 1)[1].split(
+            "const char *device_commands_get_mac", 1
+        )[0]
+        self.assertIn("ambit_announcement_ack", ack_processing)
+        self.assertLess(
+            ack_processing.index("s_cfg.mark_event_synced(completion.measure_id)"),
+            ack_processing.index("ambit_announcement_ack"),
         )
 
         heartbeat = source.split("cmd_result_t cmd_store_status_event", 1)[1].split(
@@ -271,6 +279,8 @@ class PayloadV3Test(unittest.TestCase):
         )[0]
         self.assertIn("cmd_ambit_device_info_cached", heartbeat)
         self.assertNotIn("ambit_info_fetch", heartbeat)
+        self.assertIn("input.attached_count = 0", heartbeat)
+        self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 2)
 
         lua_source = (ROOT / "components/lua_runner/lua_runner.c").read_text()
         self.assertNotIn("AMBIT_RUN_METADATA_CAP", lua_source)
@@ -332,7 +342,7 @@ class PayloadV3Test(unittest.TestCase):
         self.assertNotIn("char payload[1536]", announcement)
         self.assertIn("malloc(AMBIT_DEVICE_PAYLOAD_CAP)", announcement)
         self.assertLess(announcement.index("free(payload)"),
-                        announcement.index("ambit_announce_persist(announce_slot, e)"))
+                        announcement.index("ambit_announce_stage(announce_slot, e, mid)"))
 
 
 if __name__ == "__main__":

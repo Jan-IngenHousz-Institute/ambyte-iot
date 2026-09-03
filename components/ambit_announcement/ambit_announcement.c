@@ -74,20 +74,38 @@ size_t ambit_announcement_select(
     return tracker->evict_start % AMBIT_ANNOUNCEMENT_SLOTS;
 }
 
-esp_err_t ambit_announcement_commit(
+esp_err_t ambit_announcement_stage(
     ambit_announcement_tracker_t *tracker, size_t slot,
-    const ambit_announcement_tuple_t *candidate)
+    const ambit_announcement_tuple_t *candidate, int64_t measure_id)
 {
     if (tracker == NULL || candidate == NULL || !candidate->valid ||
-        slot >= AMBIT_ANNOUNCEMENT_SLOTS || tracker->store.save == NULL) {
+        slot >= AMBIT_ANNOUNCEMENT_SLOTS || measure_id <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t err = tracker->store.save(tracker->store.ctx, slot, candidate);
-    if (err != ESP_OK) return err;
     if (tracker->slots[slot].valid &&
         strcmp(tracker->slots[slot].sensor_id, candidate->sensor_id) != 0) {
         tracker->evict_start = (slot + 1U) % AMBIT_ANNOUNCEMENT_SLOTS;
     }
     tracker->slots[slot] = *candidate;
+    tracker->pending[slot].valid = true;
+    tracker->pending[slot].measure_id = measure_id;
+    tracker->pending[slot].tuple = *candidate;
     return ESP_OK;
+}
+
+esp_err_t ambit_announcement_ack(
+    ambit_announcement_tracker_t *tracker, int64_t measure_id)
+{
+    if (tracker == NULL || measure_id <= 0 || tracker->store.save == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t slot = 0; slot < AMBIT_ANNOUNCEMENT_SLOTS; ++slot) {
+        if (!tracker->pending[slot].valid ||
+            tracker->pending[slot].measure_id != measure_id) continue;
+        esp_err_t err = tracker->store.save(
+            tracker->store.ctx, slot, &tracker->pending[slot].tuple);
+        if (err == ESP_OK) tracker->pending[slot].valid = false;
+        return err;
+    }
+    return ESP_ERR_NOT_FOUND;
 }
