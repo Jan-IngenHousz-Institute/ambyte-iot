@@ -1,0 +1,20 @@
+schema: jii.ambyte-schedule/v1-draft
+id: urn:jii:schedule:legacy-1hz-spec
+version: 0.1.0-draft
+name: legacy-1hz-spec
+description: The legacy 1 Hz field script as two windowed jobs plus hourly status.
+
+jobs:
+  fast:
+    on: { every: 1s }
+    when: { window: { from: sunrise-1h, to: sunset+1h, unresolved: skip } }
+    overlap: skip
+    missed: skip                           # a late slot is counted, never replayed as a burst
+    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]
+  slow:
+    on: { every: 10m }
+    when: { window: { from: sunset+1h, to: sunrise-1h, unresolved: run } }  # no sun fix → keep the slow cadence
+    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]
+  hourly_status:
+    on: { cron: "0 * * * *" }
+    steps: [ { uses: device/status-report, with: { tags: { script: legacy_1Hz_spec } } } ]

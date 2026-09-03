@@ -1,0 +1,6 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j:
+    on: { every: 5m }
+    steps: [ { uses: ambit/spectrum, with: { channels: [4] } } ]

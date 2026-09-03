@@ -1,0 +1,8 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+description: |
+  multi line
+jobs:
+  j:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]

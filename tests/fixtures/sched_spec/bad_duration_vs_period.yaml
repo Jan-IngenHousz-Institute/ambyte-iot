@@ -1,0 +1,9 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+protocols:
+  SS59:
+    - { pulses: 59, freq: 1, actinic: 0 }
+jobs:
+  j:
+    on: { every: 1m }
+    steps: [ { uses: ambit/trace, with: { protocol: SS59, channels: [0] } } ]

@@ -1,0 +1,56 @@
+schema: jii.ambyte-schedule/v1-draft
+id: urn:jii:schedule:default-multichannel
+version: 0.1.0-draft
+name: default-multichannel
+description: SS every minute, spectra + MPF by day, dark-edge traces around sun events.
+
+# This file is site-independent. Per-device facts (lat/lon, timezone, deployment
+# tag, MAC) live in NVS device_config and are never written here.
+
+protocols:                       # named AMBIT segment tables, referenced by ambit/trace
+  SS:
+    - { pulses: 45, freq: 1,   actinic: 0 }      # 45 since #47; 59 s left no slack on a 1 m grid
+  MPF:
+    - { pulses: 40, freq: 10,  actinic: 0 }      # dark baseline
+    - { pulses: 70, freq: 100, actinic: -250 }   # saturating phases (raw DAC)
+    - { pulses: 10, freq: 100, actinic: -200 }
+    - { pulses: 10, freq: 100, actinic: -160 }
+    - { pulses: 10, freq: 100, actinic: -250 }
+    - { pulses: 40, freq: 10,  actinic: 0 }      # relaxation
+
+jobs:
+  steady_state:
+    on: { every: 1m }                       # clock-aligned (:00, :01 …)
+    steps:
+      - uses: ambit/trace
+        with: { protocol: SS, channels: [0, 1, 2, 3], hold_window: false }
+
+  spectra:
+    on: { every: 5m }
+    when: { window: day }                   # sunrise..sunset
+    steps:
+      - uses: ambit/spectrum
+        with: { channels: [0, 1, 2, 3] }
+
+  saturating_flash:
+    on: { every: 10m }
+    when: { window: day }
+    steps:
+      - uses: ambit/trace
+        with: { protocol: MPF, channels: [0, 1, 2, 3], hold_window: true }
+
+  dark_edge:
+    on:
+      - { sun: sunset,  offset: +30m }
+      - { sun: sunrise, offset: -30m }
+    steps:
+      - uses: ambit/trace
+        with: { protocol: MPF, channels: [0, 1, 2, 3], hold_window: true, tag: edge }
+
+  health:
+    on:
+      - boot
+      - { sun: sunrise, offset: -15m }
+      - { sun: sunset,  offset: +15m }
+    steps:
+      - uses: device/status-report          # "get internal stats and send them"
