@@ -14,6 +14,7 @@
  */
 
 #include "uart_sensors.h"
+#include "uart_sensor_ping_cache_policy.h"
 #include "uart_stream_support.h"
 
 #include <string.h>
@@ -63,6 +64,11 @@
  * channel would otherwise be re-woken (a ~1.25 s wake-retry burst) on every SS
  * round. A present sensor still re-confirms at the short TTL above. */
 #define PING_FAIL_CACHE_TTL_US (5LL * 60 * 1000 * 1000)  /* 5 min — empty channel */
+/* uart_sensors_init() deliberately resets the shared AMBIT bank. The C3 image
+ * needs roughly four seconds before its binary router is ready (the OTA path
+ * already waits five). During that window a failed probe means "still booting",
+ * not "empty slot", and must not enter the five-minute negative cache. */
+#define AMBIT_APP_BOOT_GRACE_US (5LL * 1000 * 1000)
 
 /* ── AMBIT ROM-flash reset/boot control ─────────────────────────────────
  * Host-driven C3 firmware update: force an AMBIT (ESP8685/ESP32-C3) into its
@@ -93,10 +99,24 @@ static channel_t s_ch[UART_SENSOR_NUM_CHANNELS];
 static SemaphoreHandle_t s_uart0_mtx;       /* guards UART0 remap */
 static SemaphoreHandle_t s_ch_mtx[UART_SENSOR_NUM_CHANNELS];
 static bool s_inited;
+static int64_t s_ping_fail_cache_not_before_us;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
 static inline int64_t now_us(void) { return esp_timer_get_time(); }
+
+/* CHIP_EN is shared, so every reset invalidates every channel. Keeping the
+ * volatile state transition next to the physical reset prevents a stale
+ * connected/absent decision from surviving a ROM probe, OTA exit, or host boot. */
+static void ambit_note_shared_app_reset(void)
+{
+    s_ping_fail_cache_not_before_us = now_us() + AMBIT_APP_BOOT_GRACE_US;
+    for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++) {
+        s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+        s_ch[channel].ping_ok = false;
+        s_ch[channel].ping_ts = 0;
+    }
+}
 
 static inline bool deadline_reached(int64_t deadline)
 {
@@ -273,6 +293,7 @@ static esp_err_t ambit_boot_gpio_init(void)
     gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge the 2.2uF cap */
     gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp back up */
+    ambit_note_shared_app_reset();
     return ESP_OK;
 }
 
@@ -316,6 +337,7 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));
     gpio_set_level(AMBIT_RESET_GPIO, 1);
+    ambit_note_shared_app_reset();
     ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
     return ESP_OK;
 }
@@ -696,8 +718,15 @@ static esp_err_t do_ping(uint8_t channel, bool *connected)
     err = ambit_wake(port, deadline);
     bool ok = (err == ESP_OK);
 
+    const int64_t observed_at_us = now_us();
     s_ch[channel].ping_ok = ok;
-    s_ch[channel].ping_ts = now_us();
+    /* Empty-channel probes are intentionally fail-cached for five minutes, but
+     * never turn a predictable app-start race into five minutes of false absence.
+     * A zero timestamp makes the next caller reach the wire again. */
+    s_ch[channel].ping_ts = uart_sensor_ping_result_cacheable(
+        ok, observed_at_us, s_ping_fail_cache_not_before_us)
+        ? observed_at_us
+        : 0;
     s_ch[channel].state   = ok ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
 
     *connected = ok;
