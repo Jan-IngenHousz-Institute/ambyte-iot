@@ -183,18 +183,18 @@ static void test_lossless_trace_routes(void)
     assert(strstr(out, "\"arr9\":{\"u\":\"count\"") != NULL);
     arrays[1].index = 1;
 
-    input.array_count = 2; /* idx7/idx8 absent: duration omitted, cadence retained */
+    input.array_count = 2; /* missing calibration timing is a permanent v2 fallback */
     assert(payload_v3_build_trace_lossless(out, sizeof out, metadata, sizeof metadata,
                                             &input, error, sizeof error) ==
-           PAYLOAD_TRACE_ROUTE_V3);
-    assert(strstr(out, "duration_ms") == NULL);
-    assert(strstr(out, "\"t\":[0,4]") != NULL);
+           PAYLOAD_TRACE_ROUTE_V2);
+    assert(strstr(out, "\"s_630\":[10,11,12,13]") != NULL);
+    assert(strstr(metadata, "\"sensor_id\":\"10:91:A8:4F:4F:C0\"") != NULL);
     arrays[2].length = 1;
     input.array_count = 3;
     assert(payload_v3_build_trace_lossless(out, sizeof out, metadata, sizeof metadata,
                                             &input, error, sizeof error) ==
-           PAYLOAD_TRACE_ROUTE_V3);
-    assert(strstr(out, "duration_ms") == NULL);
+           PAYLOAD_TRACE_ROUTE_V2);
+    assert(strstr(metadata, "\"sensor_id\":\"10:91:A8:4F:4F:C0\"") != NULL);
     arrays[2].length = 2;
     input.array_count = 4;
 
@@ -222,6 +222,23 @@ static void test_lossless_trace_routes(void)
            PAYLOAD_TRACE_ROUTE_V2);
     assert(metadata[0] != '\0');
     assert(strstr(metadata, "\"sensor_id\":\"10:91:A8:4F:4F:C0\"") != NULL);
+
+    /* If the complete legacy metadata cannot fit, the lossless route must at
+     * least retain the stable identity join key. It must not claim success with
+     * empty metadata, and a buffer too small even for that key is an error. */
+    char identity_only[64];
+    assert(payload_v3_build_trace_lossless(out, sizeof out,
+                                            identity_only, sizeof identity_only,
+                                            &input, error, sizeof error) ==
+           PAYLOAD_TRACE_ROUTE_V2);
+    assert(strcmp(identity_only,
+                  "{\"sensor_id\":\"10:91:A8:4F:4F:C0\"}") == 0);
+    char identity_too_small[8];
+    assert(payload_v3_build_trace_lossless(out, sizeof out,
+                                            identity_too_small,
+                                            sizeof identity_too_small,
+                                            &input, error, sizeof error) ==
+           PAYLOAD_TRACE_ROUTE_ERROR);
 
     assert(!payload_v3_can_fetch_retained(false, 1));
     assert(!payload_v3_can_fetch_retained(true, 0));

@@ -365,8 +365,8 @@ bool payload_v3_build_trace(char *out, size_t cap,
         return false;
     }
     const payload_v3_array_t *timing = find_array(input, 7U);
-    if (timing != NULL && timing->length > 2U) {
-        set_error(error, error_cap, "timing trailer has unexpected values");
+    if (timing == NULL || timing->values == NULL || timing->length != 2U) {
+        set_error(error, error_cap, "calibration timing trailer missing or invalid");
         return false;
     }
 
@@ -539,6 +539,17 @@ static bool build_legacy_metadata(char *out, size_t cap,
     return w.ok;
 }
 
+static bool build_legacy_identity(char *out, size_t cap, const char *sensor_id)
+{
+    json_writer_t w;
+    jw_init(&w, out, cap);
+    if (sensor_id == NULL || sensor_id[0] == '\0') return false;
+    jw_append(&w, "{\"sensor_id\":");
+    jw_string(&w, sensor_id);
+    jw_append(&w, "}");
+    return w.ok;
+}
+
 payload_trace_route_t payload_v3_build_trace_lossless(
     char *out, size_t cap, char *metadata, size_t metadata_cap,
     const payload_v3_trace_input_t *input, char *error, size_t error_cap)
@@ -554,12 +565,21 @@ payload_trace_route_t payload_v3_build_trace_lossless(
         set_error(error, error_cap, "v3 and v2 payload exceed buffer or arrays invalid");
         return PAYLOAD_TRACE_ROUTE_ERROR;
     }
-    /* Metadata is not the only copy of a measurement. If its bounded legacy
-     * rendering cannot fit, retain the unchanged raw v2 data with null
-     * metadata instead of discarding a completed sensor run. */
-    if (metadata != NULL && metadata_cap != 0U &&
-        !build_legacy_metadata(metadata, metadata_cap, input)) {
-        metadata[0] = '\0';
+    /* Keep the completed raw arrays even if verbose legacy metadata exceeds
+     * its bounded region, but never report a lossless route after discarding a
+     * known stable identity. The compact form preserves the platform's join
+     * key; if even that cannot fit, fail explicitly instead of storing a v2 row
+     * that cannot be associated with its sensor. */
+    if (metadata != NULL && metadata_cap != 0U) {
+        if (!build_legacy_metadata(metadata, metadata_cap, input) &&
+            input != NULL && input->sensor_id != NULL && input->sensor_id[0] != '\0' &&
+            !build_legacy_identity(metadata, metadata_cap, input->sensor_id)) {
+            set_error(error, error_cap, "v2 fallback metadata cannot retain sensor identity");
+            return PAYLOAD_TRACE_ROUTE_ERROR;
+        }
+    } else if (input != NULL && input->sensor_id != NULL && input->sensor_id[0] != '\0') {
+        set_error(error, error_cap, "v2 fallback requires metadata for sensor identity");
+        return PAYLOAD_TRACE_ROUTE_ERROR;
     }
     if (error != NULL && error_cap != 0U)
         snprintf(error, error_cap, "v2 fallback: %s", v3_error[0] ? v3_error : "not representable");
