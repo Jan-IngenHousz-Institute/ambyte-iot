@@ -14,6 +14,7 @@
  */
 
 #include "uart_sensors.h"
+#include "uart_stream_support.h"
 
 #include <string.h>
 

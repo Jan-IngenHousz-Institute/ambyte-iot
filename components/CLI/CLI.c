@@ -33,6 +33,7 @@
 #include "device_config.h"
 #include "uart_sensors.h"
 #include "uart_stream_cli_support.h"
+#include "uart_stream_support.h"
 #include "lua_runner.h"
 #include "script_update.h"
 #include "sync_runner.h"

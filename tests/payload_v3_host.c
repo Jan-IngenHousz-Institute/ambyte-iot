@@ -362,25 +362,6 @@ static void print_device_fixture(void)
     assert(payload_v3_build_device(output, sizeof output, &input, error, sizeof error));
     printf("DEVICE=%s\n", output);
 
-    assert(payload_v3_same_device_tuple("A", "1.0.0", 1, "A", "1.0.0", 1));
-    assert(!payload_v3_same_device_tuple("A", "1.0.0", 1, "B", "1.0.0", 1));
-    assert(!payload_v3_same_device_tuple("A", "1.0.0", 1, "A", "1.0.1", 1));
-    assert(!payload_v3_same_device_tuple("A", "1.0.0", 1, "A", "1.0.0", 2));
-
-    payload_v3_device_tuple_t tuple;
-    assert(payload_v3_parse_device_tuple("AA:BB:CC:DD:EE:FF||1234abcd", &tuple));
-    assert(tuple.firmware[0] == '\0' && tuple.cal_version == 0x1234abcdU);
-    assert(!payload_v3_parse_device_tuple("AA:BB|1.0|xyz", &tuple));
-    payload_v3_device_tuple_t tuples[PAYLOAD_V3_MAX_ATTACHED] = {
-        {true, "A", "1", 1}, {true, "B", "1", 1},
-        {true, "C", "1", 1}, {true, "D", "1", 1},
-    };
-    payload_v3_device_tuple_t candidate = {true, "E", "1", 1};
-    const char *attached[PAYLOAD_V3_MAX_ATTACHED] = {"A", "B", "D", "E"};
-    bool unchanged = true;
-    assert(payload_v3_select_device_tuple_slot(tuples, &candidate, attached, 0,
-                                                &unchanged) == 2U);
-    assert(!unchanged);
     assert(payload_v3_is_canonical_object(output));
     assert(!payload_v3_is_canonical_object("{\"v\":2}"));
 

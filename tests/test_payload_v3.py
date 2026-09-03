@@ -74,9 +74,9 @@ class PayloadV3Test(unittest.TestCase):
             "-Werror",
             "-fsanitize=address,undefined",
             "-fno-omit-frame-pointer",
-            f"-I{ROOT / 'components/domain/include'}",
+            f"-I{ROOT / 'components/payload_codec/include'}",
             str(ROOT / "tests/payload_v3_host.c"),
-            str(ROOT / "components/domain/payload_v3.c"),
+            str(ROOT / "components/payload_codec/payload_v3.c"),
             "-lm",
             "-o",
             str(binary),
@@ -257,11 +257,10 @@ class PayloadV3Test(unittest.TestCase):
         self.assertIn("DC_EVENT_ENVELOPE_FMT", publisher)  # old rows remain v2
         self.assertIn("DC_V3_EVENT_ENVELOPE_FMT", publisher)
 
-        announcement = source.split("static void ambit_announce_load", 1)[1].split(
+        announcement = source.split("static int ambit_announce_slot", 1)[1].split(
             "static esp_err_t ambit_info_fetch", 1
         )[0]
-        self.assertIn("nvs_get_str", announcement)
-        self.assertIn("payload_v3_select_device_tuple_slot", announcement)
+        self.assertIn("ambit_announcement_select", announcement)
         self.assertLess(
             announcement.index("s_cfg.store_event(&d)"),
             announcement.index("ambit_announce_persist(announce_slot, e)"),

@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
+#include "ambit_announcement.h"
 #include "clock_trust.h"
 #include "payload_gzip.h"
 #include "payload_v3.h"
@@ -30,7 +31,6 @@
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_wifi.h"
-#include "nvs.h"
 #include "wifi_manager.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
@@ -118,6 +118,7 @@ _Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
 #endif
 
 static device_commands_config_t s_cfg;
+static ambit_announcement_tracker_t s_ambit_announcements;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
@@ -414,6 +415,7 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
     s_cfg = *cfg;
+    ambit_announcement_init(&s_ambit_announcements, s_cfg.announcement_store);
     if (s_ack_queue == NULL) {
         s_ack_queue = xQueueCreateStatic(DC_ACK_QUEUE_DEPTH,
                                          sizeof(dc_ack_completion_t),
@@ -2269,34 +2271,13 @@ static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
  * changed firmware/cal CRC replaces its own slot; a fifth distinct sensor
  * evicts round-robin. Store the event before committing the tuple: after a
  * brownout this can duplicate inventory, but can never suppress the only copy. */
-#define AMBIT_ANNOUNCE_NVS_NS "ambit_ann"
-#define AMBIT_ANNOUNCE_SLOTS PAYLOAD_V3_MAX_ATTACHED
-_Static_assert(AMBIT_INFO_NUM_CH == PAYLOAD_V3_MAX_ATTACHED,
+#define AMBIT_ANNOUNCE_SLOTS AMBIT_ANNOUNCEMENT_SLOTS
+_Static_assert(AMBIT_INFO_NUM_CH == AMBIT_ANNOUNCEMENT_SLOTS,
                "announcement tuple capacity must match physical channels");
-static payload_v3_device_tuple_t s_ambit_announced[AMBIT_ANNOUNCE_SLOTS];
-static bool s_ambit_announced_loaded;
-static uint8_t s_ambit_announce_evict;
-
-static void ambit_announce_load(void)
-{
-    if (s_ambit_announced_loaded) return;
-    s_ambit_announced_loaded = true;
-    nvs_handle_t h;
-    if (nvs_open(AMBIT_ANNOUNCE_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
-    for (size_t i = 0; i < AMBIT_ANNOUNCE_SLOTS; ++i) {
-        char key[4], value[64];
-        snprintf(key, sizeof key, "a%u", (unsigned)i);
-        size_t len = sizeof value;
-        if (nvs_get_str(h, key, value, &len) != ESP_OK) continue;
-        payload_v3_parse_device_tuple(value, &s_ambit_announced[i]);
-    }
-    nvs_close(h);
-}
 
 static int ambit_announce_slot(const ambit_device_info_t *info, bool *unchanged)
 {
-    ambit_announce_load();
-    payload_v3_device_tuple_t candidate = {
+    ambit_announcement_tuple_t candidate = {
         .valid = true,
         .cal_version = info->cal_version,
     };
@@ -2306,34 +2287,20 @@ static int ambit_announce_slot(const ambit_device_info_t *info, bool *unchanged)
     for (size_t i = 0; i < AMBIT_ANNOUNCE_SLOTS; ++i) {
         if (s_ambit_info[i].valid) attached[i] = s_ambit_info[i].device_id;
     }
-    const size_t slot = payload_v3_select_device_tuple_slot(
-        s_ambit_announced, &candidate, attached, s_ambit_announce_evict, unchanged);
-    if (s_ambit_announced[slot].valid &&
-        strcmp(s_ambit_announced[slot].sensor_id, info->device_id) != 0)
-        s_ambit_announce_evict = (uint8_t)((slot + 1U) % AMBIT_ANNOUNCE_SLOTS);
-    return (int)slot;
+    return (int)ambit_announcement_select(
+        &s_ambit_announcements, &candidate, attached, unchanged);
 }
 
-static void ambit_announce_persist(int slot, const ambit_device_info_t *info)
+static esp_err_t ambit_announce_persist(int slot, const ambit_device_info_t *info)
 {
-    if (slot < 0 || slot >= (int)AMBIT_ANNOUNCE_SLOTS) return;
-    payload_v3_device_tuple_t *tuple = &s_ambit_announced[slot];
-    tuple->valid = true;
-    snprintf(tuple->sensor_id, sizeof tuple->sensor_id, "%s", info->device_id);
-    snprintf(tuple->firmware, sizeof tuple->firmware, "%s", info->fw_version);
-    tuple->cal_version = info->cal_version;
-
-    nvs_handle_t h;
-    if (nvs_open(AMBIT_ANNOUNCE_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    char key[4], value[64];
-    snprintf(key, sizeof key, "a%u", (unsigned)slot);
-    snprintf(value, sizeof value, "%s|%s|%08x", info->device_id,
-             info->fw_version, (unsigned)info->cal_version);
-    esp_err_t err = nvs_set_str(h, key, value);
-    if (err == ESP_OK) err = nvs_commit(h);
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "AMBIT announcement tuple persistence failed: %s", esp_err_to_name(err));
-    nvs_close(h);
+    if (slot < 0 || slot >= (int)AMBIT_ANNOUNCE_SLOTS) return ESP_ERR_INVALID_ARG;
+    ambit_announcement_tuple_t tuple = {
+        .valid = true,
+        .cal_version = info->cal_version,
+    };
+    snprintf(tuple.sensor_id, sizeof tuple.sensor_id, "%s", info->device_id);
+    snprintf(tuple.firmware, sizeof tuple.firmware, "%s", info->fw_version);
+    return ambit_announcement_commit(&s_ambit_announcements, (size_t)slot, &tuple);
 }
 
 /* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
@@ -2608,7 +2575,11 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     const bool stored = s_cfg.store_event(&d) == ESP_OK;
     free(payload);
     if (stored) {
-        ambit_announce_persist(announce_slot, e);
+        esp_err_t persist_err = ambit_announce_persist(announce_slot, e);
+        if (persist_err != ESP_OK) {
+            ESP_LOGW(TAG, "AMBIT%u announcement tuple persistence failed: %s",
+                     ch + 1, esp_err_to_name(persist_err));
+        }
         notify_sync();
         ESP_LOGI(TAG, "AMBIT%u ambit.device/1 stored (%s cal=%08lx)",
                  ch + 1, e->ambit_name, (unsigned long)e->cal_version);

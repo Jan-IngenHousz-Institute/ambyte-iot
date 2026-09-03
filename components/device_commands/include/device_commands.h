@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 #include "device_status_port.h"
+#include "ambit_announcement_port.h"
 #include "messaging_port.h"
 #include "persistence_port.h"
 #include "sensing_port.h"
@@ -48,6 +49,7 @@ typedef struct {
      * rounds when the card is out). NULL = SD layer absent. */
     bool                       (*sd_ready)(void);
     script_identity_read_fn      read_script_identity; /* active main.lua + verified release provenance */
+    ambit_announcement_store_port_t announcement_store; /* persisted DEVICE_INFO dedupe */
 
     /* Messaging ports (Phase 6A) */
     message_publish_fn                  publish;

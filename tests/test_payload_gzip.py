@@ -52,9 +52,9 @@ class PayloadGzipTest(unittest.TestCase):
             "-Werror",
             "-fsanitize=address,undefined",
             "-fno-omit-frame-pointer",
-            f"-I{ROOT / 'components/domain/include'}",
+            f"-I{ROOT / 'components/payload_codec/include'}",
             str(ROOT / "tests/payload_gzip_host.c"),
-            str(ROOT / "components/domain/payload_gzip.c"),
+            str(ROOT / "components/payload_codec/payload_gzip.c"),
             "-o",
             str(binary),
         ]

@@ -22,6 +22,7 @@
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
+#include "ambit_announcement_nvs.h"
 #include "script_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
@@ -1442,6 +1443,7 @@ void app_main(void)
          * probes wired for the whole session. They fail closed while unmounted. */
         .sd_ready               = sdcard_is_mounted,
         .read_script_identity   = script_update_get_identity,
+        .announcement_store    = ambit_announcement_nvs_port(),
         .next_id            = persistence_available ? event_log_get_next_id_fn()            : NULL,
         .store_event        = persistence_available ? event_log_get_store_event_fn()        : NULL,
         .claim_next_event   = persistence_available ? event_log_get_claim_next_event_fn()   : NULL,

@@ -7,13 +7,12 @@
 #include <stdlib.h>
 
 #include "esp_err.h"
-#include "uart_stream_support.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define UART_SENSOR_NUM_CHANNELS  4
+#define UART_SENSOR_STREAM_CHUNK_MAX 128U
 /* v2 run streams up to 8 arrays (ENV, Fluo, Fluoref, Sun, Leaf, 730, 730ref,
  * TIMING); keep headroom so the receive loop still reads CMD_END after the last. */
 #define UART_SENSOR_MAX_ARRAYS    12
@@ -131,7 +130,7 @@ typedef esp_err_t (*uart_sensor_stream_write_fn)(const uint8_t *data,
  * token) arrives or `timeout_ms` elapses. Pre-wakes the port. Bytes, including
  * the terminating newline, are passed to `write` in order rather than collected
  * in one response-sized allocation; *out_len is the number accepted by the
- * sink. No callback exceeds UART_STREAM_CHUNK_MAX bytes. `deadline_us` is an
+ * sink. No callback exceeds UART_SENSOR_STREAM_CHUNK_MAX bytes. `deadline_us` is an
  * already-started absolute wall-clock deadline shared with outer arbitration. */
 typedef esp_err_t (*uart_sensor_stream_query_fn)(uint8_t channel,
                                                  const char *cmd,

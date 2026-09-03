@@ -13,8 +13,6 @@ extern "C" {
 #define PAYLOAD_V3_MAX_ARRAYS   12U
 #define PAYLOAD_V3_MAX_ATTACHED  4U
 #define PAYLOAD_V3_TICK_FACTOR_MAX 100.0
-#define PAYLOAD_V3_SENSOR_ID_CAP 18U
-#define PAYLOAD_V3_FIRMWARE_CAP  32U
 
 typedef struct {
     uint8_t type;
@@ -157,13 +155,6 @@ typedef enum {
     PAYLOAD_TRACE_ROUTE_V2,
 } payload_trace_route_t;
 
-typedef struct {
-    bool valid;
-    char sensor_id[PAYLOAD_V3_SENSOR_ID_CAP];
-    char firmware[PAYLOAD_V3_FIRMWARE_CAP];
-    uint32_t cal_version;
-} payload_v3_device_tuple_t;
-
 /* Production JSON builders. They never allocate, always NUL-terminate when cap
  * is nonzero, and fail rather than emitting a partial or mixed-schema object.
  * error receives a stable diagnostic when supplied. */
@@ -187,18 +178,6 @@ bool payload_v3_build_device(char *out, size_t cap,
  * families bypass the legacy v2 sample builder. */
 bool payload_v3_is_canonical_object(const char *json);
 
-/* Stable inventory change tuple used by both production NVS persistence and
- * host regressions. */
-bool payload_v3_same_device_tuple(const char *sensor_a, const char *firmware_a,
-                                  uint32_t cal_a, const char *sensor_b,
-                                  const char *firmware_b, uint32_t cal_b);
-bool payload_v3_parse_device_tuple(const char *encoded,
-                                   payload_v3_device_tuple_t *tuple);
-size_t payload_v3_select_device_tuple_slot(
-    const payload_v3_device_tuple_t tuples[PAYLOAD_V3_MAX_ATTACHED],
-    const payload_v3_device_tuple_t *candidate,
-    const char *const attached_sensor_ids[PAYLOAD_V3_MAX_ATTACHED],
-    size_t evict_start, bool *unchanged);
 bool payload_v3_can_fetch_retained(bool trigger_valid, size_t segment_count);
 
 #ifdef __cplusplus
