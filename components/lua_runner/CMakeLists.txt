@@ -28,6 +28,7 @@ if (HAVE_LOCAL_LUA)
         INCLUDE_DIRS
             "include"
         REQUIRES
+            ambit_trace
             device_commands
             payload_codec
             event_log
@@ -57,6 +58,7 @@ else()
         INCLUDE_DIRS
             "include"
         REQUIRES
+            ambit_trace
             device_commands
             payload_codec
             event_log

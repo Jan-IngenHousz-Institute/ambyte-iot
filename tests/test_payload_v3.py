@@ -282,62 +282,84 @@ class PayloadV3Test(unittest.TestCase):
         self.assertIn("input.attached_count = 0", heartbeat)
         self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 2)
 
+        trace_source = (ROOT / "components/ambit_trace/ambit_trace.c").read_text()
+        trace_header = (ROOT / "components/ambit_trace/include/ambit_trace.h").read_text()
         lua_source = (ROOT / "components/lua_runner/lua_runner.c").read_text()
-        self.assertNotIn("AMBIT_RUN_METADATA_CAP", lua_source)
-        self.assertIn("payload_v3_build_trace_lossless", lua_source)
-        self.assertNotIn("char fallback_metadata[", lua_source)
-        self.assertIn("payload + AMBIT_RUN_PAYLOAD_CAP", lua_source)
-        self.assertIn("char *candidate = malloc(AMBIT_RUN_BUFFER_CAP)", lua_source)
+        self.assertNotIn('#include "lua.h"', trace_header)
+        self.assertIn("AMBIT_RUN_METADATA_CAP", trace_header)
+        self.assertRegex(
+            trace_header,
+            r"(?s)typedef struct \{.*uint8_t type;.*bool far_red;.*"
+            r"uint16_t pulses;.*uint16_t freq;.*int16_t actinic;.*"
+            r"uint8_t subsampling;.*\} ambit_trace_segment_t;",
+        )
+        self.assertIn("payload_v3_build_trace_lossless", trace_source)
+        self.assertNotIn("char fallback_metadata[", trace_source)
+        self.assertIn("payload + AMBIT_RUN_PAYLOAD_CAP", trace_source)
+        self.assertIn("char *candidate = malloc(AMBIT_RUN_BUFFER_CAP)", trace_source)
         self.assertIn("opts.metadata ignored %u unsupported key(s)", lua_source)
         sync_run = lua_source.split("static int l_ambit_run", 1)[1].split(
-            "/* Parallel-run phase 1", 1
+            "/* ambit.trigger", 1
         )[0]
         self.assertLess(
             sync_run.index("ambit_capture_protocol_ref(L, 3"),
             sync_run.index("cmd_ambit_run(ch"),
         )
-        route_store = lua_source.split("static int ambit_decode_store_push", 1)[1].split(
-            "static int l_ambit_run", 1
+        self.assertIn("ambit_trace_build_run_arr", sync_run)
+        self.assertIn("ambit_trace_decode_store", sync_run)
+        lua_segment_adapter = lua_source.split(
+            "static void ambit_read_segments", 1
+        )[1].split("static int ambit_push_result", 1)[0]
+        self.assertIn(".type = 2", lua_segment_adapter)
+        self.assertIn(".far_red = false", lua_segment_adapter)
+        self.assertIn(".subsampling = 1", lua_segment_adapter)
+
+        run_array_builder = trace_source.split(
+            "uint8_t *ambit_trace_build_run_arr", 1
+        )[1].split("int64_t ambit_trace_estimate_ms", 1)[0]
+        self.assertIn("line[0] = segments[i].type", run_array_builder)
+        self.assertIn("line[1] = segments[i].far_red ? 1U : 0U", run_array_builder)
+        self.assertIn("line[2] = (uint8_t)(segments[i].pulses >> 8)", run_array_builder)
+        self.assertIn("line[3] = (uint8_t)segments[i].pulses", run_array_builder)
+        self.assertIn("line[4] = (uint8_t)(segments[i].freq >> 8)", run_array_builder)
+        self.assertIn("line[5] = (uint8_t)segments[i].freq", run_array_builder)
+        self.assertIn("line[6] = ambit_actinic_to_dac", run_array_builder)
+        self.assertIn("line[7] = segments[i].subsampling", run_array_builder)
+        self.assertNotIn("payload_v3_build_trace_lossless", lua_source)
+
+        route_store = trace_source.split("esp_err_t ambit_trace_decode_store", 1)[1].split(
+            "cmd_result_t ambit_trace_trigger", 1
         )[0]
-        self.assertEqual(route_store.count("cmd_store_event(&d)"), 1)
+        self.assertEqual(route_store.count("cmd_store_event(&desc)"), 1)
         self.assertIn("payload_v3_build_trace_lossless", route_store)
         self.assertNotIn("cJSON_Parse", route_store)
-        self.assertIn("char *payload = ambit_payload_reserve_locked()", route_store)
+        self.assertIn("char *payload = payload_reserve_locked()", route_store)
         self.assertIn("char *fallback_metadata = payload + AMBIT_RUN_PAYLOAD_CAP", route_store)
-        self.assertIn(".payload_json  = payload", route_store)
-        self.assertNotIn("s_ambit_payload +", route_store)
-        self.assertNotIn("s_ambit_payload",
-                         route_store.replace("s_ambit_payload_mtx", ""))
-        self.assertLess(route_store.index("xSemaphoreTake(s_ambit_payload_mtx"),
-                        route_store.index("ambit_payload_reserve_locked()"))
+        self.assertIn(".payload_json = payload", route_store)
+        self.assertNotIn("s_payload +", route_store)
+        self.assertLess(route_store.index("xSemaphoreTake(s_payload_mtx"),
+                        route_store.index("payload_reserve_locked()"))
 
-        reservation = lua_source.split(
-            "static char *ambit_payload_reserve_locked", 1
-        )[1].split("/* ambit.run(channel", 1)[0]
-        self.assertIn("if (s_ambit_payload == NULL)", reservation)
-        self.assertIn("s_ambit_payload = candidate", reservation)
-        self.assertEqual(lua_source.count("s_ambit_payload = candidate"), 1)
-        self.assertEqual(lua_source.count("malloc(AMBIT_RUN_BUFFER_CAP)"), 1)
-        self.assertEqual(lua_source.count("ambit_payload_reserve_locked()"), 2)
+        reservation = trace_source.split(
+            "static char *payload_reserve_locked", 1
+        )[1].split("esp_err_t ambit_trace_reserve", 1)[0]
+        self.assertIn("if (s_payload == NULL)", reservation)
+        self.assertIn("s_payload = candidate", reservation)
+        self.assertEqual(trace_source.count("s_payload = candidate"), 1)
+        self.assertEqual(trace_source.count("malloc(AMBIT_RUN_BUFFER_CAP)"), 1)
+        self.assertEqual(trace_source.count("payload_reserve_locked()"), 2)
 
         registration = lua_source.split("static void lua_register_ambit_module", 1)[1].split(
-            "static void lua_register_device_module", 1
+            "/* ── sync.* bindings", 1
         )[0]
-        self.assertLess(registration.index("ambit_payload_mtx_ensure()"),
-                        registration.index("ambit_payload_reserve_locked()"))
-        self.assertLess(registration.index("xSemaphoreTake(s_ambit_payload_mtx"),
-                        registration.index("ambit_payload_reserve_locked()"))
-        self.assertLess(registration.index("ambit_payload_reserve_locked()"),
-                        registration.index("xSemaphoreGive(s_ambit_payload_mtx)"))
-        self.assertNotIn("s_ambit_payload =", registration)
+        self.assertIn("ambit_trace_reserve()", registration)
+        self.assertNotIn("payload_reserve_locked", registration)
 
         fetch = lua_source.split("static int l_ambit_fetch", 1)[1].split(
             "/* ── ambit.* bindings", 1
         )[0]
-        self.assertLess(
-            fetch.index("payload_v3_can_fetch_retained"),
-            fetch.index("cmd_ambit_fetch(ch"),
-        )
+        self.assertIn("ambit_trace_fetch", fetch)
+        self.assertNotIn("cmd_ambit_fetch", fetch)
 
         self.assertNotIn("char payload[1536]", announcement)
         self.assertIn("malloc(AMBIT_DEVICE_PAYLOAD_CAP)", announcement)

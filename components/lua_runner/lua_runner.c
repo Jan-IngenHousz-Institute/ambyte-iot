@@ -1,6 +1,5 @@
 #include <stdbool.h>
 #include <limits.h>
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,12 +11,12 @@
 
 #include "cJSON.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "ambit_trace.h"
 #include "device_commands.h"
 #include "event_log.h"
 #include "payload_v3.h"
@@ -535,63 +534,6 @@ static int l_device_ambit_config_detector(lua_State *L)
     return 1;
 }
 
-/* Resolve the cached AMBIT name for the event's `device` field (Phase 3),
- * lazily fetching identity (which also emits the once-per-connection DEVICE_INFO
- * event). Fills *info for v3 protocol/device fields; returns the name, or the generic
- * "ambit" until discovery succeeds. */
-static const char *ambit_device_name(uint8_t ch, ambit_device_info_t *info)
-{
-    cmd_ambit_device_info(ch, info);
-    return (info->valid && info->ambit_name[0] != '\0') ? info->ambit_name : "ambit";
-}
-
-/* Write the per-measurement config key/values from cached identity+config — no
- * surrounding braces, so it splices into any metadata object:
- *   "cal_version":"hex"|null[,"gains":[6]][,"currents":[3]]
- * cal_version is always present, so gains/currents prepend a comma cleanly. */
-static int ambit_config_kvs(const ambit_device_info_t *info, char *buf, size_t cap)
-{
-    int o = 0;
-    if (info->valid)
-        o += snprintf(buf, cap, "\"cal_version\":\"%08lx\"", (unsigned long)info->cal_version);
-    else
-        o += snprintf(buf, cap, "\"cal_version\":null");
-    if (info->gains_set && o > 0 && o < (int)cap)
-        o += snprintf(buf + o, cap - o, ",\"gains\":[%u,%u,%u,%u,%u,%u]",
-                      info->gains[0], info->gains[1], info->gains[2],
-                      info->gains[3], info->gains[4], info->gains[5]);
-    if (info->currents_set && o > 0 && o < (int)cap)
-        o += snprintf(buf + o, cap - o, ",\"currents\":[%u,%u,%u]",
-                      info->currents[0], info->currents[1], info->currents[2]);
-    return o;
-}
-
-/* Fused store for small typed AMBIT queries: one MEASUREMENT event, channel
- * "uart_<ch>", device + metadata supplied by the caller, cmd_raw in the AMBIT's
- * own ASCII vocabulary. Returns the measure_id, or -1 on store failure. */
-static int64_t ambit_store_small(uint8_t ch, const char *device, const char *cmd_ascii,
-                                 const char *metadata_json,
-                                 int64_t start_ms, int64_t end_ms,
-                                 const char *payload_json)
-{
-    char chan[12];
-    snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
-    int64_t mid = 0;
-    if (cmd_next_measure_id(&mid).status != ESP_OK) return -1;
-    measurement_event_desc_t d = {
-        .measure_id    = mid,
-        .channel       = chan,
-        .device        = device,
-        .tag           = MEASUREMENT_TAG_MEASUREMENT,
-        .cmd_raw       = cmd_ascii,
-        .start_ms      = start_ms,
-        .end_ms        = end_ms,
-        .metadata_json = metadata_json,
-        .payload_json  = payload_json,
-    };
-    return (cmd_store_event(&d).status == ESP_OK) ? mid : -1;
-}
-
 /* ambit.leaf_temp(ch [, opts]) — leaf + chip temperature (binary GET_TEMP,
  * AMBIT ASCII "get_temp"). Stores by default ({store=false} to probe);
  * payload {"leaf":..,"chip":..}.
@@ -1057,84 +999,6 @@ static void lua_register_db_module(lua_State *L)
     lua_setglobal(L, "db");
 }
 
-/* Reserved once (at module register, while the heap is still contiguous) and
- * reused for every run's JSON payload — the run's one big allocation, kept off
- * the fragmenting per-run path. Sized for current point counts; larger runs
- * truncate (logged). A uint16/compact-storage v2 will shrink this need.
- *
- * The buffer is SHARED between the main-script task and any lua_runner_exec
- * state (an exec snippet may call ambit.run/fetch while main.lua measures), so
- * its build+store window is serialized by s_ambit_payload_mtx — created lazily
- * under a spinlock because the first contender may be either task. */
-/* Max length of a reconstructed "arrun" ASCII command: "arrun " + nseg(≤2) + ","
- * + persist(≤3) + "," + 16 segments × 8 bytes × "255," (≤4) ≈ 525 B. */
-#define AMBIT_CMD_ASCII_CAP 544
-/* The raw v2 fallback carries metadata in the event-log column. Reserve enough
- * room for that complete record, rather than letting a completed run fit the
- * v3 buffer and then become unstorable only because it needs fallback. This
- * deliberately reduces the effective payload cap from 63999 to 62999 bytes. */
-#define AMBIT_RUN_PAYLOAD_CAP              63000U
-#define AMBIT_RUN_FALLBACK_METADATA_CAP     1536U
-#define AMBIT_RUN_BUFFER_CAP \
-    (AMBIT_RUN_PAYLOAD_CAP + AMBIT_RUN_FALLBACK_METADATA_CAP)
-#define AMBIT_PROTOCOL_FIELD_CAP              256U
-/* Maximum non-payload bytes in the v2 TSV line: 113-B fixed scalar/header
- * fields, 543-B NUL-excluded cmd, 1,535-B metadata, and two framing bytes.
- * Keep these named beside the producer so future cap changes fail at compile
- * time instead of drifting from event_log's admission rule. */
-#define AMBIT_EVENT_FIXED_HEADER_MAX 113U
-#define AMBIT_EVENT_FRAMING_MAX        2U
-#define AMBIT_RUN_PAYLOAD_MAX   (AMBIT_RUN_PAYLOAD_CAP - 1U)
-#define AMBIT_RUN_METADATA_MAX  (AMBIT_RUN_FALLBACK_METADATA_CAP - 1U)
-#define AMBIT_CMD_ASCII_MAX     (AMBIT_CMD_ASCII_CAP - 1U)
-#define AMBIT_RUN_RECORD_MAX \
-    (AMBIT_RUN_PAYLOAD_MAX + AMBIT_RUN_METADATA_MAX + AMBIT_CMD_ASCII_MAX + \
-     AMBIT_EVENT_FIXED_HEADER_MAX + AMBIT_EVENT_FRAMING_MAX)
-_Static_assert(AMBIT_RUN_RECORD_MAX < EVLOG_RECORD_CAP_NORMAL,
-               "AMBIT v2 fallback record must fit the normal event-log cap");
-_Static_assert(EVLOG_RECORD_CAP_NORMAL - AMBIT_RUN_RECORD_MAX > 0U,
-               "AMBIT v2 fallback record must retain positive admission margin");
-_Static_assert(PAYLOAD_V3_MAX_ARRAYS == UART_SENSOR_MAX_ARRAYS,
-               "payload array model must track the UART response model");
-_Static_assert(PAYLOAD_V3_MAX_SEGMENTS == 16U,
-               "Lua arrun protocol limit must track the payload model");
-/* One heap reservation owns two non-overlapping regions under
- * s_ambit_payload_mtx: [0,63000) trace data and [63000,64536) fallback
- * metadata. event_log_store_event consumes both synchronously before unlock,
- * so neither region aliases live bytes or escapes its ownership window. */
-static char *s_ambit_payload;
-static SemaphoreHandle_t s_ambit_payload_mtx;
-static portMUX_TYPE      s_payload_mtx_init_lock = portMUX_INITIALIZER_UNLOCKED;
-
-static void ambit_payload_mtx_ensure(void)
-{
-    if (s_ambit_payload_mtx != NULL) return;
-    SemaphoreHandle_t m = xSemaphoreCreateMutex();
-    if (m == NULL) return;   /* caller fails closed; shared bytes are never unlocked */
-    taskENTER_CRITICAL(&s_payload_mtx_init_lock);
-    if (s_ambit_payload_mtx == NULL) {
-        s_ambit_payload_mtx = m;
-        m = NULL;
-    }
-    taskEXIT_CRITICAL(&s_payload_mtx_init_lock);
-    if (m != NULL) vSemaphoreDelete(m);   /* lost the race — ours is surplus */
-}
-
-/* Caller must hold s_ambit_payload_mtx. Keeping the NULL check, allocation,
- * and publication in one locked helper prevents a registering exec-state from
- * replacing the reservation while another state builds/stores a record. The
- * returned pointer is the one stable owner for both buffer regions throughout
- * that caller's locked window. */
-static char *ambit_payload_reserve_locked(void)
-{
-    if (s_ambit_payload == NULL) {
-        char *candidate = malloc(AMBIT_RUN_BUFFER_CAP);
-        if (candidate == NULL) return NULL;
-        s_ambit_payload = candidate;
-    }
-    return s_ambit_payload;
-}
-
 /* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace over the
  * binary AMBYTE protocol (cmd 21): the ambit runs the whole trace, then streams
  * each result array back over the FSM handshake as raw uint32 LE (no ASCII, no
@@ -1149,37 +1013,8 @@ static char *ambit_payload_reserve_locked(void)
  * point arrays are persisted to the event log (the point of the run), not
  * materialised back into Lua, to keep memory bounded for large runs. store=true
  * persists one canonical ambit.trace/3 object; no derived fluo ratio is stored. */
-/* Actinic value → AMBIT LED-current byte, matching the original WRENCH ambyte
- * (protocol.cpp::generate_arr): a negative value (-255..-1) is an exact DAC level
- * (|value|); a positive value (1..9999) is PAR in µmol → byte = par_coef × PAR,
- * floored at 4 and capped at 255; anything else (0 / out of range) = 0 (off).
- * par_coef is the AMBIT's actinic calibration (fallback 0.05 byte/µmol). */
-static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
-{
-    if (actinic < 0 && actinic > -256) return (uint8_t)(-actinic);
-    if (actinic > 0 && actinic < 10000) {
-        float t = par_coef * (float)actinic;
-        if (t < 4.0f)   return 4;
-        if (t > 255.0f) return 255;
-        return (uint8_t)t;
-    }
-    return 0;
-}
-
-/* Per-channel state stashed by ambit.trigger for the eventual ambit.fetch store:
- * the run metadata (segments JSON) and the measurement start time. */
-typedef struct {
-    char protocol[AMBIT_PROTOCOL_FIELD_CAP];
-    char protocol_id[AMBIT_PROTOCOL_FIELD_CAP];
-} ambit_protocol_ref_t;
-
-static ambit_protocol_ref_t s_ambit_protocol[UART_SENSOR_NUM_CHANNELS];
-static char    s_ambit_cmd[UART_SENSOR_NUM_CHANNELS][AMBIT_CMD_ASCII_CAP];
-static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
-static payload_v3_segment_t
-               s_ambit_segments[UART_SENSOR_NUM_CHANNELS][PAYLOAD_V3_MAX_SEGMENTS];
-static uint8_t s_ambit_segment_count[UART_SENSOR_NUM_CHANNELS];
-static bool    s_ambit_trigger_valid[UART_SENSOR_NUM_CHANNELS];
+/* Caller-owned per-channel state retained between Lua's trigger and fetch. */
+static ambit_trace_pending_t s_ambit_pending[UART_SENSOR_NUM_CHANNELS];
 
 /* Only these two user metadata leaves survive the normative v3 contract.
  * Capture them directly while the Lua table exists; building, printing and
@@ -1248,242 +1083,72 @@ static void ambit_capture_protocol_ref(lua_State *L, int opts_idx,
     lua_pop(L, 1);
 }
 
-static void ambit_decode_segments(const uint8_t *run_arr, size_t nseg,
-                                  payload_v3_segment_t *segments)
+/* Convert the Lua protocol table into the typed, Lua-free trace model. The Lua
+ * adapter owns shape/range errors; wire encoding and calibration live in
+ * ambit_trace. */
+static void ambit_read_segments(lua_State *L, int seg_idx, int nseg,
+                                ambit_trace_segment_t *segments)
 {
-    for (size_t i = 0; i < nseg; ++i) {
-        const uint8_t *line = run_arr + i * 8U;
-        segments[i] = (payload_v3_segment_t) {
-            .type = line[0],
-            .pulses = (uint16_t)(((uint16_t)line[2] << 8) | line[3]),
-            .freq = (uint16_t)(((uint16_t)line[4] << 8) | line[5]),
-            .actinic = line[6],
-            .subsampling = line[7],
-        };
-    }
-}
-
-/* Reconstruct the AMBIT's full ASCII run command from the packed run array,
- * matching its console grammar (do_command.h: arrun <len>,<persist>,<bytes…>).
- * This literal command becomes the event's cmd_raw, so the trace's arguments
- * travel with it (not just the bare verb). */
-static void ambit_build_cmd_ascii(char *out, size_t cap, const uint8_t *run_arr,
-                                  int nseg, uint8_t persist)
-{
-    int off = snprintf(out, cap, "arrun %d,%u", nseg, (unsigned)persist);
-    for (int i = 0; i < nseg * 8 && off > 0 && off < (int)cap; i++) {
-        off += snprintf(out + off, (off < (int)cap) ? cap - off : 0,
-                        ",%u", (unsigned)run_arr[i]);
-    }
-}
-
-/* Build a malloc'd run_arr (caller frees) of nseg*8 bytes from the Lua segments
- * table at `seg_idx`, for channel `ch` (its actinic
- * calibration sets the PAR→DAC coefficient). Shared by ambit.run and ambit.trigger
- * so both encode the wire identically. luaL_errors (longjmp) on malformed input. */
-static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int nseg)
-{
-    uint8_t *run_arr = malloc((size_t)nseg * 8);
-    if (!run_arr) { luaL_error(L, "out of memory"); return NULL; }
-
-    /* This AMBIT's PAR→DAC actinic coefficient — lazily fetched once + cached
-     * (cmd 33). Fallback 0.05 byte/µmol if the calibration can't be read. */
-    ambit_device_info_t info;
-    cmd_ambit_device_info(ch, &info);
-    float par_coef = (info.valid && info.actinic_coef > 0.0f) ? info.actinic_coef : 0.05f;
-
-    for (int i = 1; i <= nseg; i++) {
+    for (int i = 1; i <= nseg; ++i) {
         lua_rawgeti(L, seg_idx, i);
-        if (!lua_istable(L, -1)) {
-            free(run_arr);
-            luaL_error(L, "segment %d must be a table", i);
-        }
+        if (!lua_istable(L, -1)) luaL_error(L, "segment %d must be a table", i);
 
         lua_getfield(L, -1, "pulses");
         if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 1); }
-        lua_Integer pulses = luaL_optinteger(L, -1, 0);
+        const lua_Integer pulses = luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
 
         lua_getfield(L, -1, "freq");
         if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 2); }
-        lua_Integer freq = luaL_optinteger(L, -1, 0);
+        const lua_Integer freq = luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
 
         lua_getfield(L, -1, "actinic");
         if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 3); }
-        lua_Integer actinic = luaL_optinteger(L, -1, 0);
+        const lua_Integer actinic = luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
-
         lua_pop(L, 1); /* segment table */
 
-        if (pulses < 1 || pulses > 65535) { free(run_arr); luaL_error(L, "segment %d: pulses must be 1-65535", i); }
-        if (freq   < 1 || freq   > 65535) { free(run_arr); luaL_error(L, "segment %d: freq must be 1-65535", i); }
-        /* actinic: WRENCH convention — -255..-1 = raw DAC, 1..9999 = PAR (µmol),
-         * 0 / out-of-range = off. Converted per the AMBIT's calibration below. */
-
-        uint8_t *line = run_arr + (i - 1) * 8;
-        line[0] = 2;                              /* type 2: no IR (notebook default) */
-        line[1] = 0;                              /* far-red off */
-        line[2] = (uint8_t)((pulses >> 8) & 0xFF);
-        line[3] = (uint8_t)(pulses & 0xFF);
-        line[4] = (uint8_t)((freq >> 8) & 0xFF);
-        line[5] = (uint8_t)(freq & 0xFF);
-        line[6] = ambit_actinic_to_dac(actinic, par_coef);
-        line[7] = 1;                              /* subsampling: every point */
+        if (pulses < 1 || pulses > UINT16_MAX)
+            luaL_error(L, "segment %d: pulses must be 1-65535", i);
+        if (freq < 1 || freq > UINT16_MAX)
+            luaL_error(L, "segment %d: freq must be 1-65535", i);
+        segments[i - 1] = (ambit_trace_segment_t) {
+            /* Byte-identical defaults from the former Lua-owned encoder. */
+            .type = 2,        /* no IR (notebook default) */
+            .far_red = false, /* far-red off */
+            .pulses = (uint16_t)pulses,
+            .freq = (uint16_t)freq,
+            /* The historical binding accepted any Lua integer and mapped values
+             * outside the trace model's int16 range to off, not a wrapped DAC. */
+            .actinic = actinic >= INT16_MIN && actinic <= INT16_MAX
+                ? (int16_t)actinic : 0,
+            .subsampling = 1, /* every point */
+        };
     }
-
-    return run_arr;
 }
 
-/* Decode an AMBIT FSM response into the reserved JSON payload, optionally store
- * it as one event, free `resp`, and push the Lua result table (or nil+reason).
- * Shared by ambit.run and ambit.fetch so both produce identical events;
- * `cmd_name` is recorded as the event's cmd_raw — the full reconstructed AMBIT
- * ASCII command incl. its segment args ("arrun <len>,<persist>,<bytes…>",
- * do_command.h). The binary run (cmd 21) and the async trigger/fetch pair
- * (cmds 22/24) are the same stimulus, so both store the same arrun command. */
-static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
-                                   uint8_t ch, bool store, int64_t start_ms,
-                                   int64_t end_ms,
-                                   const ambit_protocol_ref_t *protocol_ref,
-                                   const char *cmd_name,
-                                   const payload_v3_segment_t *segments,
-                                   size_t segment_count)
+static int ambit_push_result(lua_State *L, esp_err_t err,
+                             const ambit_trace_result_t *result)
 {
-    uint8_t narr = resp->array_count;
-    if (narr == 0) {
-        uart_sensor_response_free(resp);
+    if (err == ESP_ERR_INVALID_RESPONSE)
         return lua_push_nil_reason(L, "ambit run returned no arrays");
-    }
-
-    /* Serialize the shared payload buffer between the main script and an exec
-     * state. Held across build + store only; released before ANY call that can
-     * raise a Lua error (longjmp would leak the mutex). */
-    ambit_payload_mtx_ensure();
-    if (s_ambit_payload_mtx == NULL) {
-        uart_sensor_response_free(resp);
-        return lua_push_nil_reason(L, "ambit payload lock allocation failed");
-    }
-    xSemaphoreTake(s_ambit_payload_mtx, portMAX_DELAY);
-
-    /* Reserve the JSON payload buffer once (lazily here; normally already done at
-     * module register, while the heap was contiguous) and reuse it every run. */
-    char *payload = ambit_payload_reserve_locked();
-    if (payload == NULL) {
-        xSemaphoreGive(s_ambit_payload_mtx);
-        uart_sensor_response_free(resp);
-        return luaL_error(L, "out of memory reserving %dB payload (free=%d, largest=%d)",
-                          (int)AMBIT_RUN_BUFFER_CAP,
-                          (int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                          (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    }
-
-    size_t fluor_len = 0;
-    double leaf_temp_c = 0.0;
-
-    for (uint8_t a = 0; a < narr; ++a) {
-        const uart_data_array_t *arr = &resp->arrays[a];
-        if (arr->index == 1U) fluor_len = arr->length;
-        if (arr->index == 0U && arr->length > 0U) {
-            leaf_temp_c = (int16_t)(arr->data[0] & 0xFFFFU) / 100.0;
-        }
-    }
-    int stored = 0;
-    if (store) {
-        char chan[12];
-        snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
-        ambit_device_info_t info;
-        const char *dev = ambit_device_name(ch, &info);   /* cached name, or "ambit" */
-        int64_t mid = 0;
-        if (cmd_next_measure_id(&mid).status == ESP_OK) {
-            payload_v3_array_t arrays[PAYLOAD_V3_MAX_ARRAYS];
-            for (uint8_t a = 0; a < narr; ++a) {
-                arrays[a] = (payload_v3_array_t) {
-                    .index = resp->arrays[a].index,
-                    .length = resp->arrays[a].length,
-                    .values = resp->arrays[a].data,
-                };
-            }
-
-            payload_v3_trace_input_t input = {
-                .measure_id = mid,
-                .channel = chan,
-                .device = dev,
-                .sensor_id = info.valid ? info.device_id : NULL,
-                .start_utc_ms = start_ms,
-                .end_utc_ms = end_ms,
-                .protocol_name = protocol_ref != NULL && protocol_ref->protocol[0]
-                    ? protocol_ref->protocol : NULL,
-                .protocol_id = protocol_ref != NULL && protocol_ref->protocol_id[0]
-                    ? protocol_ref->protocol_id : NULL,
-                .protocol_cmd = cmd_name,
-                .segments = segments,
-                .segment_count = segment_count,
-                .calibration_present = info.valid && isfinite(info.tick_factor) &&
-                                       info.tick_factor > 0.0f,
-                .cal_version = info.cal_version,
-                .tick_factor = info.tick_factor,
-                .gains_present = info.gains_set,
-                .currents_present = info.currents_set,
-                .arrays = arrays,
-                .array_count = narr,
-            };
-            memcpy(input.gains, info.gains, sizeof input.gains);
-            memcpy(input.currents, info.currents, sizeof input.currents);
-            char *fallback_metadata = payload + AMBIT_RUN_PAYLOAD_CAP;
-            char build_error[96];
-            const payload_trace_route_t route = payload_v3_build_trace_lossless(
-                payload, AMBIT_RUN_PAYLOAD_CAP,
-                fallback_metadata, AMBIT_RUN_FALLBACK_METADATA_CAP,
-                &input, build_error, sizeof build_error);
-            if (route == PAYLOAD_TRACE_ROUTE_V2) {
-                ESP_LOGW(LUA_RUNNER_TAG, "%s", build_error);
-            } else if (route == PAYLOAD_TRACE_ROUTE_ERROR) {
-                ESP_LOGE(LUA_RUNNER_TAG, "AMBIT payload build failed: %s", build_error);
-            }
-
-            measurement_event_desc_t d = {
-                .measure_id    = mid,
-                .channel       = chan,
-                .device        = dev,
-                .tag           = MEASUREMENT_TAG_MEASUREMENT,
-                .cmd_raw       = cmd_name,
-                .start_ms      = start_ms,
-                .end_ms        = end_ms,
-                /* v3 is a canonical object in payload_json. Keep cmd_raw in its
-                 * dedicated on-disk column for replay/backlog diagnostics; the
-                 * publisher recognizes the schema and does not rebuild v2. */
-                .metadata_json = route == PAYLOAD_TRACE_ROUTE_V2 && fallback_metadata[0]
-                    ? fallback_metadata : NULL,
-                .payload_json  = payload,
-            };
-            /* Exactly one store attempt is made after routing. Canonical v3
-             * owns payload_json directly; every ordinary v3 precondition or
-             * representability failure keeps the completed raw arrays via v2. */
-            if (route != PAYLOAD_TRACE_ROUTE_ERROR &&
-                cmd_store_event(&d).status == ESP_OK) {
-                stored = 1;
-            }
-        }
-    }
-
-    /* Buffer no longer referenced — release before the Lua pushes below (they
-     * can raise on OOM, and a longjmp must not leak the mutex). */
-    if (s_ambit_payload_mtx != NULL) xSemaphoreGive(s_ambit_payload_mtx);
-
-    uart_sensor_response_free(resp);
+    if (err != ESP_OK)
+        return lua_push_nil_reason(L, esp_err_to_name(err));
 
     lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer)fluor_len);    lua_setfield(L, -2, "points");
-    lua_pushinteger(L, stored);                    lua_setfield(L, -2, "stored");
-    lua_pushnumber(L, leaf_temp_c);                lua_setfield(L, -2, "leaf_temp");
-    lua_pushinteger(L, (lua_Integer)narr);         lua_setfield(L, -2, "arrays");
+    lua_pushinteger(L, (lua_Integer)result->points); lua_setfield(L, -2, "points");
+    lua_pushinteger(L, result->measure_id >= 0 ? 1 : 0); lua_setfield(L, -2, "stored");
+    lua_pushnumber(L, result->leaf_temp); lua_setfield(L, -2, "leaf_temp");
+    lua_pushinteger(L, result->array_count); lua_setfield(L, -2, "arrays");
     return 1;
 }
 
 static int l_ambit_run(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    if (ch >= UART_SENSOR_NUM_CHANNELS)
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
     luaL_checktype(L, 2, LUA_TTABLE);
 
     int nseg = (int)luaL_len(L, 2);
@@ -1513,7 +1178,10 @@ static int l_ambit_run(lua_State *L)
 
     ambit_protocol_ref_t protocol_ref;
     ambit_capture_protocol_ref(L, 3, &protocol_ref);
-    uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg);
+    ambit_trace_segment_t trace[PAYLOAD_V3_MAX_SEGMENTS];
+    ambit_read_segments(L, 2, nseg, trace);
+    uint8_t *run_arr = ambit_trace_build_run_arr(trace, (size_t)nseg, ch);
+    if (run_arr == NULL) return luaL_error(L, "out of memory");
     payload_v3_segment_t segments[PAYLOAD_V3_MAX_SEGMENTS];
     ambit_decode_segments(run_arr, (size_t)nseg, segments);
 
@@ -1537,8 +1205,11 @@ static int l_ambit_run(lua_State *L)
         uart_sensor_response_free(&resp);
         return lua_push_nil_reason(L, res.message);
     }
-    return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms,
-                                   &protocol_ref, cmd_ascii, segments, (size_t)nseg);
+    ambit_trace_result_t result;
+    const esp_err_t err = ambit_trace_decode_store(
+        &resp, ch, store, start_ms, end_ms, &protocol_ref, cmd_ascii, segments,
+        (size_t)nseg, &result);
+    return ambit_push_result(L, err, &result);
 }
 
 /* ambit.trigger(ch, segments [, opts]) — start a retained (async) run on `ch`
@@ -1557,36 +1228,27 @@ static int l_ambit_trigger(lua_State *L)
     if (nseg <= 0 || nseg > 16)
         return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
 
-    uint8_t  persist        = 0;
-    bool     allow_interrupt = false;
-    uint32_t timeout_ms     = 3000;   /* covers wake + ack only */
+    ambit_trace_options_t opts = {
+        .timeout_ms = 3000, /* covers wake + ack only */
+    };
     if (lua_istable(L, 3)) {
         lua_getfield(L, 3, "persist");
-        if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
+        if (!lua_isnil(L, -1)) opts.persist = lua_toboolean(L, -1) ? 1 : 0;
         lua_pop(L, 1);
         lua_getfield(L, 3, "interrupt");
-        if (!lua_isnil(L, -1)) allow_interrupt = lua_toboolean(L, -1);
+        if (!lua_isnil(L, -1)) opts.allow_interrupt = lua_toboolean(L, -1);
         lua_pop(L, 1);
         lua_getfield(L, 3, "timeout_ms");
-        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        if (lua_isnumber(L, -1)) opts.timeout_ms = (uint32_t)lua_tointeger(L, -1);
         lua_pop(L, 1);
     }
 
-    s_ambit_trigger_valid[ch] = false;
-    ambit_capture_protocol_ref(L, 3, &s_ambit_protocol[ch]);
-    uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg);
-    ambit_decode_segments(run_arr, (size_t)nseg, s_ambit_segments[ch]);
-    s_ambit_segment_count[ch] = (uint8_t)nseg;
-    /* Stash the full ASCII command for the eventual ambit.fetch store. */
-    ambit_build_cmd_ascii(s_ambit_cmd[ch], sizeof s_ambit_cmd[ch], run_arr, nseg, persist);
-
-    s_ambit_start_ms[ch] = lua_now_ms();
-
-    cmd_result_t res = cmd_ambit_trigger(ch, run_arr, (uint8_t)nseg, persist,
-                                         allow_interrupt, timeout_ms);
-    free(run_arr);
+    ambit_capture_protocol_ref(L, 3, &opts.protocol_ref);
+    ambit_trace_segment_t trace[PAYLOAD_V3_MAX_SEGMENTS];
+    ambit_read_segments(L, 2, nseg, trace);
+    cmd_result_t res = ambit_trace_trigger(ch, trace, (size_t)nseg, &opts,
+                                           &s_ambit_pending[ch]);
     if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
-    s_ambit_trigger_valid[ch] = true;
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1634,27 +1296,11 @@ static int l_ambit_fetch(lua_State *L)
         lua_pop(L, 1);
     }
 
-    /* Do not issue cmd24 unless this process has a successfully retained
-     * trigger model. Fetching first would consume sensor state and only then
-     * discover that the completed arrays could not be attributed. */
-    if (!payload_v3_can_fetch_retained(s_ambit_trigger_valid[ch],
-                                       s_ambit_segment_count[ch]))
-        return lua_push_nil_reason(L, "no successful retained ambit.trigger for channel");
-
-    uart_sensor_response_t resp;
-    cmd_result_t res = cmd_ambit_fetch(ch, &resp, timeout_ms);
-    if (res.status != ESP_OK) {
-        uart_sensor_response_free(&resp);
-        return lua_push_nil_reason(L, res.message);
-    }
-
-    int64_t end_ms = lua_now_ms();
-    s_ambit_trigger_valid[ch] = false;
-
-    return ambit_decode_store_push(L, &resp, ch, store,
-                                   s_ambit_start_ms[ch], end_ms, &s_ambit_protocol[ch],
-                                   s_ambit_cmd[ch], s_ambit_segments[ch],
-                                   s_ambit_segment_count[ch]);
+    ambit_trace_result_t result;
+    const cmd_result_t res = ambit_trace_fetch(
+        ch, &s_ambit_pending[ch], store, timeout_ms, &result);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    return ambit_push_result(L, ESP_OK, &result);
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────
@@ -1664,23 +1310,11 @@ static int l_ambit_fetch(lua_State *L)
  * commands never store. */
 static void lua_register_ambit_module(lua_State *L)
 {
-    /* Reserve the run payload buffer up front, while the heap is still
-     * contiguous — avoids a fragmentation-time failure on the first run.
-     * Registration can run concurrently with main.lua, so even this eager
-     * reservation uses the same lazily-published mutex as build/store. */
-    ambit_payload_mtx_ensure();
-    if (s_ambit_payload_mtx == NULL) {
+    /* Reserve the shared run payload up front while the heap is contiguous. */
+    if (ambit_trace_reserve() != ESP_OK) {
         ESP_LOGW(LUA_RUNNER_TAG,
-                 "ambit.run payload lock reserve failed; will retry per-run");
-    } else {
-        xSemaphoreTake(s_ambit_payload_mtx, portMAX_DELAY);
-        char *payload = ambit_payload_reserve_locked();
-        xSemaphoreGive(s_ambit_payload_mtx);
-        if (payload == NULL) {
-            ESP_LOGW(LUA_RUNNER_TAG,
-                     "ambit.run payload reserve (%dB) failed; will retry per-run",
-                     (int)AMBIT_RUN_BUFFER_CAP);
-        }
+                 "ambit.run payload reserve (%uB) failed; will retry per-run",
+                 (unsigned)AMBIT_RUN_BUFFER_CAP);
     }
 
     static const luaL_Reg ambit_api[] = {

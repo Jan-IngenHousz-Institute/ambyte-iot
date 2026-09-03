@@ -86,11 +86,13 @@ static esp_err_t evstore_free_bytes(uint64_t *out_free)
 #define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
 #define EVLOG_LEGACY_SD_DIR  "/sdcard/events"              /* pre-internal-store firmware backlog */
 #define EVLOG_ARCHIVE_DIR    "/sdcard/archive"             /* bulk archive of synced records */
-/* lua_runner's binding case is the permanent new-firmware v2 fallback:
+/* ambit_trace's binding case is the permanent new-firmware v2 fallback:
  * 62,999 payload + 1,535 metadata + 543 arrun command + 113 fixed header +
  * 2 framing = 65,192 B, strictly below EVLOG_RECORD_CAP_NORMAL (65,552) with
  * 360 B spare. Canonical v3 rows leave metadata empty and are smaller. The
- * producer names every term and proves the positive margin with static asserts. */
+ * producer names every term and proves the positive margin with static asserts
+ * against this component's public cap (a reverse include here would create an
+ * event_log <-> ambit_trace component dependency cycle). */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
 #define EVLOG_FLUSH_EVERY_N  8                /* fsync every N records. Was 1 (per-record) to shrink the
