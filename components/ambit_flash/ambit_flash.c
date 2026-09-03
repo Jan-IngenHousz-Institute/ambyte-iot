@@ -352,6 +352,13 @@ static bool fw_matches(const ambit_fw_info_t *fw, const ambit_flash_target_t *tg
     return fw->major == tgt->major && fw->minor == tgt->minor && fw->batch == tgt->batch;
 }
 
+static bool fw_is_newer_than_target(const ambit_fw_info_t *fw,
+                                    const ambit_flash_target_t *tgt)
+{
+    return ver_gt(fw->major, fw->minor, fw->batch,
+                  tgt->major, tgt->minor, tgt->batch);
+}
+
 static bool dir_has_all_regions(const char *dir)
 {
     for (size_t i = 0; i < NUM_REGIONS; i++) {
@@ -677,7 +684,7 @@ int ambit_flash_boot_sync(void)
 
     /* Pass 1: app-level version read for every channel (harmless to running
      * units). Silent channels are remembered for the ROM-probe pass. */
-    enum { CH_OK, CH_STALE, CH_SILENT, CH_BARE, CH_ABSENT, CH_SKIPPED };
+    enum { CH_OK, CH_NEWER, CH_STALE, CH_SILENT, CH_BARE, CH_ABSENT, CH_SKIPPED };
     int state[UART_SENSOR_NUM_CHANNELS];
     int fails[UART_SENSOR_NUM_CHANNELS];   /* -1 = not read from NVS yet */
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
@@ -698,6 +705,13 @@ int ambit_flash_boot_sync(void)
         if (fw_matches(&fw, &tgt)) {
             state[ch] = CH_OK;
             ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date", ch, fw.major, fw.minor, fw.batch);
+        } else if (fw_is_newer_than_target(&fw, &tgt)) {
+            /* An SD recovery image is a minimum/repair target, not permission
+             * to roll a field-updated AMBIT backward. Manual `ambit_flash`
+             * remains the explicit escape hatch when a downgrade is intended. */
+            state[ch] = CH_NEWER;
+            ESP_LOGW(TAG, "  ch%u: v%u.%u.%u newer than SD target v%s — not downgrading",
+                     ch, fw.major, fw.minor, fw.batch, ver);
         } else {
             state[ch] = CH_STALE;
             ESP_LOGW(TAG, "  ch%u: v%u.%u.%u != target v%s — will auto-flash",
@@ -757,6 +771,10 @@ int ambit_flash_boot_sync(void)
                 state[ch] = CH_OK;
                 ESP_LOGI(TAG, "  ch%u: v%u.%u.%u — up to date (ping glitch, app alive)",
                          ch, fw.major, fw.minor, fw.batch);
+            } else if (fw_is_newer_than_target(&fw, &tgt)) {
+                state[ch] = CH_NEWER;
+                ESP_LOGW(TAG, "  ch%u: v%u.%u.%u newer than SD target v%s — not downgrading",
+                         ch, fw.major, fw.minor, fw.batch, ver);
             } else {
                 state[ch] = CH_STALE;
                 ESP_LOGW(TAG, "  ch%u: v%u.%u.%u != target v%s — will auto-flash",
@@ -770,8 +788,12 @@ int ambit_flash_boot_sync(void)
     }
 
     /* Fail-cap filter (pass-1 stale channels) + tally. */
-    int n_need = 0, n_skipped = 0;
+    int n_need = 0, n_newer = 0, n_skipped = 0;
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (state[ch] == CH_NEWER) {
+            n_newer++;
+            continue;
+        }
         if (state[ch] == CH_SKIPPED) {
             n_skipped++;
             continue;
@@ -797,6 +819,10 @@ int ambit_flash_boot_sync(void)
             ESP_LOGW(TAG, "boot sync: nothing to auto-flash, but %d channel(s) were "
                           "SKIPPED (fail cap / unreadable version — see lines above)",
                      n_skipped);
+        } else if (n_newer > 0) {
+            ESP_LOGW(TAG, "boot sync: present AMBITs match or exceed v%s; "
+                          "%d newer channel(s) preserved — nothing to flash",
+                     ver, n_newer);
         } else {
             ESP_LOGW(TAG, "boot sync: all present AMBITs match v%s — nothing to flash", ver);
         }

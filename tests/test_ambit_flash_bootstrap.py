@@ -11,6 +11,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AmbitFlashBootstrapTest(unittest.TestCase):
+    def test_boot_sync_never_downgrades_newer_ambit_firmware(self):
+        source = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
+        boot_sync = source.split("int ambit_flash_boot_sync(void)", 1)[1]
+
+        self.assertIn("CH_NEWER", boot_sync)
+        self.assertEqual(
+            boot_sync.count("fw_is_newer_than_target(&fw, &tgt)"),
+            2,
+        )
+        self.assertIn("newer than SD target", boot_sync)
+
+        flash_loop = boot_sync.split(
+            "/* Power gate", 1
+        )[1].split("return flashed;", 1)[0]
+        self.assertNotIn("state[ch] == CH_NEWER", flash_loop)
+
     def test_missing_recovery_directories_are_created_before_file_preflight(self):
         source = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
         function = source.split("esp_err_t ambit_flash_image(", 1)[1]
