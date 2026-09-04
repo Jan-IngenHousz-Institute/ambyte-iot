@@ -5,8 +5,8 @@ measurement object is implemented by **two producers**:
 
 - the **Ambyte** envelope builder (`cmd_mqtt_publish_next_event()` in
   [components/device_commands/device_commands.c](../components/device_commands/device_commands.c)
-  + the run-payload builder in
-  [components/lua_runner/lua_runner.c](../components/lua_runner/lua_runner.c)),
+  + the trace adapter in
+  [components/ambit_trace/ambit_trace.c](../components/ambit_trace/ambit_trace.c)),
   which decodes the AMBIT's binary FSM arrays and wraps them for MQTT, and
 - the **AMBIT firmware's own openJII JSON envelope** (`frontend_json.cpp` in the
   ambit repo), used when a host app drives the sensor directly over serial.
@@ -23,8 +23,8 @@ mapping and the dual-read rule). The v2 spec is recoverable with
 
 ## 1. Model: store, then publish (unchanged from v2)
 
-Lua scripts measure and store events (`db.store_event`, `ambit.run{store=true}`)
-into the append-log event store; the `sync_runner` background task is the sole
+The declarative schedule runner measures and stores events through its fixed
+action catalog into the append-log event store; the `sync_runner` background task is the sole
 publisher and drains the store when MQTT is connected, no UART measurement is
 in progress, the external-power gate is open, and the clock is valid
 (≥ 2024-01-01 UTC). One stored event (one `measure_id`) becomes exactly one
@@ -77,7 +77,7 @@ consumers use (`device_id`, `measure_id`) as the event identity (§1).
     "duration_ms": 50386                // sensor-measured run duration (wrap-safe
   },                                    //   diff of the AMBIT's µs tick pair)
   "protocol": {
-    "name": "SS",                       // free-form label (Lua/user metadata); OPTIONAL
+    "name": "SS",                       // free-form schedule metadata; OPTIONAL
     "id": "b1946ac9-…",                 // registered openJII protocol id; OPTIONAL —
                                         //   present only when the run was launched from
                                         //   a platform protocol. See the delivery note
@@ -122,7 +122,7 @@ Notes:
   an Ambyte**: the cloud→device script channel (`DeviceScriptMessage`) has no
   backend sender and carries no protocol id, and the NVS `protocol_id` key is
   static and unused. Until script delivery lands (and gains a `protocolId`
-  field the Ambyte stores per job and surfaces via the Lua job metadata key
+  field the Ambyte stores per job and surfaces via schedule metadata
   `opts.metadata.protocol_id`), Ambyte-path measurements omit `protocol.id`
   and land with NULL protocol attribution on the lean topic — deliberately
   visible here rather than silently "optional". Direct/app-path producers
@@ -135,7 +135,7 @@ The measurement object is produced twice; fields split by who can know them:
 | class | fields | Ambyte path | direct/app path |
 |---|---|---|---|
 | sensor-known (identical from both producers when available, given §5's encoding rules) | `schema`, `device`, `sensor_id`, `series`, `protocol.segments`, `protocol.cal_version`, `protocol.tick_factor`, `time.duration_ms` | `sensor_id` is REQUIRED from the cached cmd-33 identity; series decoded from the binary FSM arrays; `segments` from the sent run bytes; `cal_version`/`tick_factor` from the cal-struct read | emits `sensor_id` when the sensor/host exposes it; omission is allowed only for a legacy/direct host that genuinely cannot obtain it |
-| transport-filled (the sensor has no wall clock or ID counter) | `time.start_utc`, `time.end_utc`, `measure_id`, `channel`, `tag`, `protocol.name`, `protocol.id`, `protocol.cmd`, `protocol.gains`, `protocol.currents` | Ambyte clock, event log, Lua job metadata | host app (phone/browser) clock and protocol context |
+| transport-filled (the sensor has no wall clock or ID counter) | `time.start_utc`, `time.end_utc`, `measure_id`, `channel`, `tag`, `protocol.name`, `protocol.id`, `protocol.cmd`, `protocol.gains`, `protocol.currents` | Ambyte clock, event log, schedule metadata | host app (phone/browser) clock and protocol context |
 
 `measure_id` and `channel` are therefore **optional**: a host without an event
 log omits `measure_id` (the pipeline's row hash covers identity) and a host
@@ -305,7 +305,7 @@ require idx-8 firmware.
   every raw array, uses `cal_version:null` when unavailable, and includes
   `metadata.sensor_id` whenever identity is known. It has no `schema` key and
   never mixes v2/v3 fields.
-- `ambit.spec`, `ambit.temp`, and generic Lua `db.store_event` measurement
+- spectrum, leaf-temperature, and generic `db/store-event` schedule actions
   families remain permanently v2 unless separately migrated. T5 dual-read and
   the v2 compat view are therefore permanent, not a backlog-drain window.
 
@@ -457,11 +457,11 @@ non-negative integers.
 | `clock` | `source` | string enum | `clock_src`; `rtc`, `hwm` (persisted high-water mark), or `sntp`. Unknown future values are preserved. |
 | | `suspect` | boolean | `clock_suspect`; wall clock may be wrong. |
 | `software` | `firmware` | string | `app_version`; running Ambyte firmware version. |
-| | `script_sha256` | 64-char lowercase hex string | Digest of the active Lua file. |
-| | `script_version` | string | Independently released Lua version. |
-| | `script_built_against_fw` | string | Firmware version targeted by that Lua release. |
-| | `script_installed_on_fw` | string | Firmware version running when the Lua release was installed. |
-| | `script_metadata_verified` | boolean | Release metadata digest matches the active Lua file. |
+| | `script_sha256` | 64-char lowercase hex string | Digest of the active schedule file. |
+| | `script_version` | string | Independently released schedule version. |
+| | `script_built_against_fw` | string | Firmware version targeted by that schedule release. |
+| | `script_installed_on_fw` | string | Firmware version running when the schedule release was installed. |
+| | `script_metadata_verified` | boolean | Release metadata digest matches the active schedule file. |
 
 ### 9.3 Numeric encoding (normative)
 
@@ -498,12 +498,11 @@ state learned outside the heartbeat, without heartbeat-initiated UART I/O.
 - The configured heartbeat period defaults to 300 s. Each due heartbeat stores
   exactly one `ambyte.telemetry/1` event, whether the BME280 read succeeds or
   fails. It never stores a companion environment event.
-- `device.bme280{store=false}` remains a read-only Lua call and stores nothing.
-  `device.bme280()` or `device.bme280{store=true}` stores one intentional extra
-  `ambyte.telemetry/1` event with all three BME280 scalars and the complete
-  required health shape (unsampled object groups are `{}` and
-  `attached_sensors` is `[]`). It does not use a MEASUREMENT-only shape or
-  create a parallel schema.
+- An explicit read-only BME280 operation stores nothing. The `record_env` CLI
+  stores one intentional extra `ambyte.telemetry/1` event with all three BME280
+  scalars and the complete required health shape (unsampled object groups are
+  `{}` and `attached_sensors` is `[]`). It does not use a MEASUREMENT-only
+  shape or create a parallel schema.
 - An explicit stored BME280 snapshot gets its own `measure_id` and
   `time.observed_utc`; it is not folded into the preceding/following heartbeat.
 - At every path, the gateway BME280 is gateway-level context only. Its values
@@ -661,7 +660,7 @@ the compat view MUST flag or exclude it rather than invent coefficients.
 ## 12. Persisted experiment events vs command status
 
 The three schemas in this document describe records stored in the append log
-and published on the experiment data-ingest topic. OTA updates, Lua/script
+and published on the experiment data-ingest topic. OTA and schedule
 updates, remote command acknowledgements, progress, failures, and terminal
 results use the separate command **status topic**. Those replies are not
 `ambyte.telemetry/1`, not `ambit.device/1`, do not enter the experiment event

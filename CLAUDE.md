@@ -1,7 +1,7 @@
 # CLAUDE.md — ambyte-iot firmware
 
 ESP32-S3 firmware for Ambyte field devices (plant-measurement loggers carrying up to 4 AMBIT
-sensor boards over UART). Data flows: `main.lua` schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = bulk archive only) →
+sensor boards over UART). Data flows: declarative schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = bulk archive only) →
 QoS1 MQTT → AWS IoT Core (dev: account 084375565727, eu-central-1) → Kinesis/S3 →
 Databricks `open_jii_dev.centrum.clean_data`.
 
@@ -12,13 +12,14 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - Bench diagnostics build: `pio run -e bench` (+ `bench-spiram-internal`, `bench-wifi-ps-none`,
   `bench-pm-none` single-toggle bisect envs) — see `docs/bench/RUNBOOK.md`
 - If littlefs is missing at CMake: `git submodule update --init --recursive components/littlefs`
-- Builds regenerate `sched_lua_embed.h`; keep it out of unrelated diffs
+- The schedule runner generates `default_yaml_embed.h` under each build directory
 - Timezone table: `python tools/gen_tz_table.py` regenerates the checked-in
   `components/timezone/tz_zone_table.inc` + `flash_gui/tz_zone_table.py` from IANA
   tzdata (never hand-edit them; `tests/test_timezone_config.py` asserts freshness)
 - Serial console: 115200 on `/dev/ttyACM0` (USB-JTAG; opening the port can reset the device).
   Useful CLI: `status`, `netwd [test]`, `inflight`, `evlog`, `cfg`, `wifi_join <ssid> <pass>`,
-  `lua <start|stop|status|exec>`, `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`,
+  `schedule <status|run|start|stop|reload|actions|validate|release|install>`,
+  `record_env`, `ambit_spec <ch>`, `ping_uart <ch>`, `reboot`,
   `selftest` (factory PCBA test; host runner: `python -m flash_gui.factory_test`)
 
 ## Architecture (delivery pipeline invariants — do not break)
@@ -39,8 +40,8 @@ Databricks `open_jii_dev.centrum.clean_data`.
   12 KB record cap at runtime.
 - **Storage layout (since the internal-store PR)**: events live on INTERNAL littlefs
   (`/evstore` = the 9.4 MiB `storage` partition — label is load-bearing, partition tables
-  can't be OTA'd); `main.lua` lives on `/littlefs` (delivered by flash/script_update OTA;
-  `/sdcard/main.lua` is only the offline-recovery import source). The SD card is archive +
+  can't be OTA'd); `/littlefs/schedule.yaml` is installed atomically after compile
+  validation and falls back to the embedded default. The SD card is archive +
   sd_logger + AMBIT firmware only — measurement/publishing must NEVER depend on it.
 - **Retention/eviction invariant**: fully-synced rotated files are retained for the bulk SD
   archive (one burst per 1000 stores, keeper task) and are the ONLY eviction pool when the
@@ -48,7 +49,7 @@ Databricks `open_jii_dev.centrum.clean_data`.
   archive the cursor file or anything at/after it.
 - **SD is treated as corruption-prone**: FATFS has no journal, so the SDMMC bus runs at
   20 MHz (40 MHz was marginal on this wiring) and the low-battery power guard in app_main
-  parks the SD (sd_logger flush/close → unmount) below 3300 mV on battery. Lua and the event
+  parks the SD (sd_logger flush/close → unmount) below 3300 mV on battery. Measurement and the event
   store KEEP RUNNING through a park — internal littlefs is power-loss-safe. New SD writers
   must use sdcard_io_begin/end AND survive the park/unpark cycle (see sd_logger_pause).
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
@@ -57,12 +58,12 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **version.txt is load-bearing**: STATUS telemetry reports the compiled `app_version` (the
   NVS `device_firmware`/`device_version` strings are junk — whole fleet says "1"). Bump it
   every release; IDF reads it at CMake *configure* time (touch CMakeLists.txt to force).
-- **Two release units**: firmware keeps `vX.Y.Z`; `lua/**` releases independently as
-  `lua-vX.Y.Z`. The path filter must be applied to commit analysis *and* release notes so a
-  Lua-only commit cannot bump firmware later. Lua assets carry SHA + built-against firmware.
+- **Two release units**: firmware keeps `vX.Y.Z`; `schedule/**` releases independently as
+  `schedule-vX.Y.Z`. The path filter must be applied to commit analysis *and* release notes so a
+  schedule-only commit cannot bump firmware later. Schedule assets carry SHA + built-against firmware.
 - STATUS schema (since 1.0.6): sample `data` = environment readings only; device health lives
   in sample `metadata`; `device` = MAC. Heartbeat every 5 min from the watchdog task. Script
-  release metadata is trusted only while its stored SHA matches `/sdcard/main.lua`.
+  release metadata is trusted only while its stored SHA matches `/littlefs/schedule.yaml`.
 
 ## Key dates / incident context (2026-07)
 
