@@ -22,7 +22,7 @@
 #define TAG "ota_update"
 
 #define OTA_TASK_STACK     8192
-#define OTA_TASK_PRIO      4          /* below sched_runner(5); OTA is not latency-critical */
+#define OTA_TASK_PRIO      4          /* below sched_runner(10); OTA is not latency-critical */
 #define OTA_URL_MAX        256
 #define OTA_ID_MAX         64
 #define OTA_CONFIRM_TIMEOUT_S 300     /* wait this long for MQTT before rolling back a new image */

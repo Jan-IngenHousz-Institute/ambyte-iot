@@ -80,8 +80,8 @@
  * (ESP32-S3 is dual-core; retained from the previous runner.) */
 #define SCHED_TASK_CORE 1
 
-/* The schedule lives on internal littlefs;
- * power-loss-safe, no SD anywhere in the path (design decision 7). */
+/* The schedule lives on power-loss-safe internal littlefs; no SD appears
+ * anywhere in this path (design decision 7). */
 #define SCHED_PATH "/littlefs/schedule.yaml"
 
 /* On-demand dispatches (CLI `schedule run`, MQTT schedule_run). Four is

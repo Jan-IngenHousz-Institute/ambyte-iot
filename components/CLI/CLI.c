@@ -2531,9 +2531,10 @@ esp_err_t cli_start(void)
      * staying below the schedule runner (10), whose measurement timing must
      * not be preempted by console echo. */
     repl_config.task_priority = 6;
-    /* Native schedule validation allocates its large compiled program on heap;
-     * 8 KiB leaves ample room for command parsing and driver call frames. */
-    repl_config.task_stack_size = 8192;
+    /* Keep the pre-removal 12 KiB stack until the inline recovery commands
+     * (ambit_flash, selftest, schedule validate/put) have measured high-water
+     * margins. Avoid trading a small unmeasured saving for a field panic. */
+    repl_config.task_stack_size = 12288;
 
     esp_err_t err = cli_create_repl(&repl_config);
     if (err != ESP_OK) {

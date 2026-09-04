@@ -26,16 +26,28 @@ broker. Do not use a production device identity against a shared broker.
    - `BENCH sample begin` once per minute
    - MQTT connects and PUBACK progress begins
 
-4. Start the finite flood from the console. This example produces the historical
-   ~1.2 KiB payload at 10/s for enough time to cross 150,000 messages:
+4. Stop the schedule so the flood is the only producer of measurement ids, then
+   start the finite flood. This example produces the historical ~1.2 KiB payload
+   at 10/s for enough time to cross 150,000 messages:
 
    ```text
+   schedule stop
    bench_flood 10 1200 16000
    ```
 
    The command is compiled only in the four `bench*` environments. Accepted
-   ranges are 1–100 Hz, 32–60000 payload bytes, and 1–604800 seconds. Run only
+   ranges are 1–100 Hz, 48–60000 payload bytes, and 1–604800 seconds. Run only
    one flood at a time.
+
+5. Wait for `BENCH flood complete:`, record its `stored=` count, then restore
+   normal measurement operation:
+
+   ```text
+   schedule start
+   ```
+
+   There is no in-process flood abort. Choose the duration before starting; to
+   abort, reboot the bench unit, which also starts its schedule during boot.
 
 Keep the serial monitor captured to a file. The firmware SD logger retains the
 WARN summary lines under `/sdcard/logs/`, but the full raw `stats_display()` and
@@ -63,12 +75,13 @@ serial log verbatim so the Wi-Fi lines remain available for comparison.
 ## Message count and expected failure
 
 `bench_flood` allocates one monotonic `measure_id` per event through
-`cmd_store_event` and logs progress every 100 successful stores. Use
-`last measure_id - first measure_id + 1`
-for the generated message count; also record the publisher's acknowledged-id
-progress (STATUS `last_acked_id`, downstream data, or the relevant publish/PUBACK
-logs). Count the messages that actually reached the broker when assigning the
-failure threshold; stored backlog alone is not proof of TX work.
+`cmd_store_event` and logs progress every 100 successful stores. Use `stored=`
+from the `BENCH flood complete:` line for the generated message count; first/last
+ids are diagnostic only because other firmware producers can consume ids. Also
+record the publisher's acknowledged-id progress (STATUS `last_acked_id`,
+downstream data, or the relevant publish/PUBACK logs). Count the messages that
+actually reached the broker when assigning the failure threshold; stored backlog
+alone is not proof of TX work.
 
 The known signature is:
 

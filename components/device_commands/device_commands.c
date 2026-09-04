@@ -1147,9 +1147,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
     /* Power gate lives solely in sync_runner_is_allowed() now — sync_runner is
-     * the only caller of this function, so
-     * one check there is sufficient and unbypassable.  Count admission is checked
-     * before touching FATFS; byte admission is exact once the envelope exists. */
+     * the only caller of this function, so one check there is sufficient and
+     * unbypassable. Count admission is checked before touching FATFS; byte
+     * admission is exact once the envelope exists. */
     size_t active_slots = 0, outstanding_bytes = 0;
     portENTER_CRITICAL(&s_inflight_mtx);
     inflight_usage_locked(&active_slots, &outstanding_bytes);
@@ -1173,9 +1173,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     /* Build the MQTT envelope as a string, splicing already-valid JSON verbatim.
      * New firmware-owned v3 objects are complete canonical sample objects in the
      * payload column, so the publisher only adds the unchanged outer envelope.
-     * Every old SD backlog record and generic legacy event still follows the frozen
-     * v2 builder below. This schema-keyed split is the dual-read migration rule
-     * and lets upgrades drain historical v2 without creating mixed objects.
+     * Every old SD backlog record and generic legacy event still follows the
+     * frozen v2 builder below. This schema-keyed split is the dual-read migration
+     * rule and lets upgrades drain historical v2 without creating mixed objects.
      *
      * The legacy path builds schema v2 by splicing the already-valid
      * payload (and metadata) JSON in verbatim — no cJSON_Parse round-trip. The old
@@ -1351,8 +1351,13 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     /* Window-aware heap gate. MALLOC_CAP_8BIT totals include PSRAM and therefore
      * cannot prove that lwIP/Wi-Fi/TLS allocations fit. Charge the already queued
      * envelopes plus this allocation and fixed TLS headroom against BOTH largest
-     * internal-DRAM and DMA-capable blocks. A failure reverts only this
-     * event-log slot; there is no scripting heap to collect or settle. */
+     * internal-DRAM and DMA-capable blocks. A failure reverts only this event-log
+     * slot. ESP_ERR_NO_MEM makes sync_runner return from the drain pass, so the
+     * next notification/fallback wake provides a much longer settle than the
+     * removed 300 ms scripting-GC retry. Poison attribution is unchanged or
+     * looser: a record is charged only when the pre-claim outstanding byte count
+     * was zero, while queued envelopes suppress attribution. Removal therefore
+     * cannot accelerate quarantine. */
     size_t heap_need = outstanding_bytes + cap + DC_PUBLISH_HEAP_HEADROOM;
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);

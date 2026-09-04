@@ -25,7 +25,7 @@
  * connect/MD5 machinery on this same stack. The task is spawned on demand and
  * exits when idle, so the extra 2 KiB is transient, not resident. */
 #define AMBIT_OTA_TASK_STACK   10240
-#define AMBIT_OTA_TASK_PRIO    4          /* below sched_runner(5); not latency-critical */
+#define AMBIT_OTA_TASK_PRIO    4          /* below sched_runner(10); not latency-critical */
 #define AMBIT_OTA_URL_MAX      256
 #define AMBIT_OTA_MAX_RETRY    4          /* per-chunk resend attempts on CRC/transport error */
 #define AMBIT_OTA_REBOOT_WAIT_MS 5000     /* let the C3 reboot into the new image before re-querying */

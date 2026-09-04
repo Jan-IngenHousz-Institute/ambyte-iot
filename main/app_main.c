@@ -1204,11 +1204,12 @@ void app_main(void)
     }
 
     /* Start the single shared maintenance worker now — the heap is still clean
-     * (the schedule runner has not started), so its stack allocation cannot fail like the old
-     * per-op lazy spawns did on a fragmented heap. Must run AFTER the three
-     * *_init() calls above so their configs (used by the worker's boot-confirm
-     * and job handlers) are stored. If it can't start, remote OTA / AMBIT flash /
-     * script update are unavailable, but the device still measures + publishes. */
+     * (the schedule runner has not started), so its stack allocation cannot fail
+     * like the old per-op lazy spawns did on a fragmented heap. Must run AFTER
+     * the three *_init() calls above so their configs (used by the worker's
+     * boot-confirm and job handlers) are stored. If it can't start, remote OTA /
+     * AMBIT flash / script update are unavailable, but the device still measures
+     * and publishes. */
     s_maint_q = xQueueCreate(MAINT_WORKER_QLEN, sizeof(maint_job_t));
     if (s_maint_q == NULL ||
         xTaskCreatePinnedToCore(app_maint_worker, "maint", MAINT_WORKER_STACK,
@@ -1485,7 +1486,11 @@ void app_main(void)
     app_open_boot_gate();
 
 #if CONFIG_AMBYTE_BENCH_DIAG
-    ESP_ERROR_CHECK(bench_diag_start());
+    const esp_err_t bench_diag_err = bench_diag_start();
+    if (bench_diag_err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "bench diagnostics unavailable: %s",
+                 esp_err_to_name(bench_diag_err));
+    }
 #endif
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",

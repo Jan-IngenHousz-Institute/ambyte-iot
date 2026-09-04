@@ -89,7 +89,7 @@
  * normally) into its one-time PSRAM-backed s_line buffer. Neither scales this
  * task's stack with record size. */
 #define SYNC_RUNNER_TASK_STACK   8192
-#define SYNC_RUNNER_TASK_PRIO    3   /* below sched_runner (5), above idle */
+#define SYNC_RUNNER_TASK_PRIO    3   /* below sched_runner (10), above idle */
 
 /* ── Connectivity / liveness watchdog ────────────────────────────────────
  * A device that SHOULD be publishing (external power, valid clock, events

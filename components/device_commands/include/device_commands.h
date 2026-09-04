@@ -172,8 +172,8 @@ cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
  * measured values. */
 cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading);
 
-/* Returns true when the SD card is mounted (and therefore the SQLite event DB
- * is writable). */
+/* Returns true when the archive/log SD card is mounted. The event store is on
+ * internal littlefs and does not depend on this state. */
 cmd_result_t cmd_sd_ready(bool *out_ready);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);

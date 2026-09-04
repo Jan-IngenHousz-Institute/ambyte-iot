@@ -257,8 +257,8 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
 
     /* Failure accounting: "no AMBIT responded" and "every triggered channel
      * failed" are job failures; a partial round (one of two channels stored)
-     * is a success with a warning trail. A stop abort is
-     * neither (run_job skips counting when should_stop is set). */
+     * is a success with a warning trail. A stop abort is neither (run_job skips
+     * counting when should_stop is set). */
     if (pending_count + fetched + chan_failed == 0) {
         return act_fail(ctx, "no AMBIT responded");
     }

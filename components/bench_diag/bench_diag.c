@@ -18,7 +18,6 @@
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "lwip/opt.h"
 #include "lwip/sockets.h"
@@ -32,7 +31,7 @@
 #define BENCH_FLOOD_STACK      4096U
 #define BENCH_FLOOD_PRIORITY   2U
 #define BENCH_FLOOD_HZ_MAX     100U
-#define BENCH_FLOOD_BYTES_MIN  32U
+#define BENCH_FLOOD_BYTES_MIN  48U
 #define BENCH_FLOOD_BYTES_MAX  60000U
 #define BENCH_FLOOD_SECONDS_MAX (7U * 24U * 60U * 60U)
 
@@ -48,6 +47,9 @@ typedef struct {
 
 static bench_flood_config_t s_flood_cfg;
 
+_Static_assert(configTICK_RATE_HZ >= BENCH_FLOOD_HZ_MAX,
+               "bench_flood rate must not exceed the FreeRTOS tick rate");
+
 static bool parse_u32(const char *text, uint32_t min, uint32_t max, uint32_t *out)
 {
     if (text == NULL || text[0] == '\0' || out == NULL) return false;
@@ -61,13 +63,20 @@ static bool parse_u32(const char *text, uint32_t min, uint32_t max, uint32_t *ou
     return true;
 }
 
-static bool build_flood_payload(char *payload, size_t bytes, int64_t sequence)
+static bool build_flood_payload(char *payload, size_t bytes, int64_t sequence,
+                                size_t *required_out)
 {
     const int prefix_len = snprintf(payload, bytes + 1U,
                                     "{\"sequence\":%lld,\"padding\":\"",
                                     (long long)sequence);
     static const char suffix[] = "\"}";
-    if (prefix_len < 0 || (size_t)prefix_len + sizeof(suffix) - 1U > bytes) {
+    if (prefix_len < 0) {
+        if (required_out != NULL) *required_out = 0;
+        return false;
+    }
+    const size_t required = (size_t)prefix_len + sizeof(suffix) - 1U;
+    if (required_out != NULL) *required_out = required;
+    if (required > bytes) {
         return false;
     }
     const size_t pad_len = bytes - (size_t)prefix_len - (sizeof(suffix) - 1U);
@@ -87,9 +96,9 @@ static void bench_flood_task(void *arg)
         return;
     }
 
-    const int64_t period_us = 1000000LL / (int64_t)cfg.hz;
     const uint64_t target = (uint64_t)cfg.hz * (uint64_t)cfg.seconds;
-    int64_t deadline_us = esp_timer_get_time();
+    TickType_t wake = xTaskGetTickCount();
+    uint32_t tick_remainder = 0;
     uint64_t attempted = 0;
     uint64_t stored = 0;
     uint64_t failed = 0;
@@ -101,8 +110,22 @@ static void bench_flood_task(void *arg)
     while (attempted < target) {
         int64_t measure_id = 0;
         cmd_result_t id_result = cmd_next_measure_id(&measure_id);
-        if (id_result.status == ESP_OK &&
-            build_flood_payload(payload, cfg.bytes, measure_id)) {
+        size_t payload_required = 0;
+        if (id_result.status != ESP_OK) {
+            failed++;
+            if (failed == 1U || failed % 100U == 0U) {
+                ESP_LOGE(TAG, "BENCH flood id fetch failed: count=%llu %s",
+                         (unsigned long long)failed, id_result.message);
+            }
+        } else if (!build_flood_payload(payload, cfg.bytes, measure_id,
+                                        &payload_required)) {
+            failed++;
+            if (failed == 1U || failed % 100U == 0U) {
+                ESP_LOGE(TAG, "BENCH flood payload too small: count=%llu id=%lld bytes=%u required=%u",
+                         (unsigned long long)failed, (long long)measure_id,
+                         (unsigned)cfg.bytes, (unsigned)payload_required);
+            }
+        } else {
             const int64_t now_ms = (int64_t)time(NULL) * 1000LL;
             const measurement_event_desc_t event = {
                 .measure_id = measure_id,
@@ -134,22 +157,16 @@ static void bench_flood_task(void *arg)
                              store_result.message);
                 }
             }
-        } else {
-            failed++;
-            if (failed == 1U || failed % 100U == 0U) {
-                ESP_LOGE(TAG, "BENCH flood id/payload failed: count=%llu %s",
-                         (unsigned long long)failed, id_result.message);
-            }
         }
         attempted++;
 
-        deadline_us += period_us;
-        int64_t delay_us = deadline_us - esp_timer_get_time();
-        if (delay_us > 0) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)((delay_us + 999LL) / 1000LL)));
-        } else if (delay_us < -period_us) {
-            deadline_us = esp_timer_get_time();
-        }
+        /* Fractional tick accumulation preserves the requested average rate
+         * when hz does not divide configTICK_RATE_HZ. The static assertion makes
+         * every interval at least one tick, so no sub-tick residual can spin. */
+        const uint32_t tick_numerator = configTICK_RATE_HZ + tick_remainder;
+        const TickType_t period_ticks = (TickType_t)(tick_numerator / cfg.hz);
+        tick_remainder = tick_numerator % cfg.hz;
+        vTaskDelayUntil(&wake, period_ticks);
     }
 
     ESP_LOGW(TAG, "BENCH flood complete: attempted=%llu stored=%llu failed=%llu first_id=%lld last_id=%lld",
