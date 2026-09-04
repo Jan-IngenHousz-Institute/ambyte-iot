@@ -219,12 +219,15 @@
               "type": "string"
             }
           },
-          "required": [],
+          "required": [
+            "kind"
+          ],
           "additionalProperties": false
         }
       },
       "required": [
-        "uses"
+        "uses",
+        "with"
       ]
     },
     {
