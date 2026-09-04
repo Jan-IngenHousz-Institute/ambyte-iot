@@ -466,7 +466,11 @@ static void jw_placeholder(sched_jw_t *w, const char *ph,
     if (sched_jw_job_placeholder(w, ph, ctx)) {
         return;
     } else if (strcmp(ph, "$deployment") == 0) {
-        sched_jw_str(w, ctx->deployment);
+        /* Read at action time so a retained set_location command takes effect
+         * on the next event without stopping/reloading a running campaign. */
+        char deployment[64] = "";
+        (void)device_config_get_deployment(deployment, sizeof(deployment));
+        sched_jw_str(w, deployment);
     } else if (strcmp(ph, "$lat") == 0 || strcmp(ph, "$lon") == 0) {
         double lat, lon;
         time_sync_get_location(&lat, &lon, NULL);

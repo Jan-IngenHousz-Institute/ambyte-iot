@@ -109,6 +109,15 @@ class ReconnectWaitTest(unittest.TestCase):
         self.assertIn("#define SCRIPT_RECONNECT_WAIT_TICKS 150", SCRIPT_UPDATE)
 
 
+class UrlDownloadCapTest(unittest.TestCase):
+    def test_content_length_and_chunked_downloads_are_bounded(self):
+        body = SCRIPT_UPDATE.split("static esp_err_t download_to_file_sha256(", 1)[1]
+        body = body.split("\n}\n", 1)[0]
+        self.assertIn("clen > SCHED_YAML_MAX_FILE_BYTES", body)
+        self.assertIn("SCHED_YAML_MAX_FILE_BYTES - total", body)
+        self.assertIn("ESP_ERR_INVALID_SIZE", body)
+
+
 class StagingPathTest(unittest.TestCase):
     def test_defined_once_and_shared_with_the_console(self):
         self.assertIn('#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/schedule.yaml.new"',
@@ -176,6 +185,13 @@ class ConsoleCommandsTest(unittest.TestCase):
     def test_component_dependencies_are_declared(self):
         for dep in ("sd_card", "mbedtls"):
             self.assertIn(dep, CLI_CMAKE)
+
+    def test_legacy_lua_execution_cannot_compete_with_schedule_runner(self):
+        lua = CLI.split("static int cli_cmd_lua(", 1)[1]
+        lua = lua.split("\n}\n", 1)[0]
+        self.assertNotIn("lua_runner_start()", lua)
+        self.assertNotIn("lua_runner_exec(", lua)
+        self.assertEqual(lua.count("schedule runner owns the AMBIT UART"), 2)
 
 
 if __name__ == "__main__":

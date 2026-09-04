@@ -98,6 +98,15 @@ class SchedSpecTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.startswith("OK "), result.stdout)
 
+    def test_every_released_schedule_compiles(self) -> None:
+        catalog = sorted((ROOT / "schedule").glob("*.yaml"))
+        self.assertTrue(catalog, "schedule catalog is empty")
+        for schedule in catalog:
+            with self.subTest(schedule=schedule.name):
+                result = self.run_cli("--check", str(schedule))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("OK "), result.stdout)
+
     def test_bad_fixtures_rejected_with_line_col(self) -> None:
         bad = sorted(FIXTURES.glob("bad_*.yaml"))
         self.assertGreaterEqual(len(bad), 20)
@@ -111,6 +120,11 @@ class SchedSpecTest(unittest.TestCase):
         result = self.run_cli("--schema")
         self.assertEqual(result.returncode, 0, result.stderr)
         schema = json.loads(result.stdout)
+        checked_in = json.loads(
+            (ROOT / "schedule/actions.schema.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(checked_in, schema,
+                         "regenerate schedule/actions.schema.json with sched_host --schema")
         self.assertIsInstance(schema, dict)
         for action in ACTIONS:
             self.assertIn(action, result.stdout)

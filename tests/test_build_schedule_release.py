@@ -11,13 +11,20 @@ from pathlib import Path
 
 from tools.build_schedule_release import build
 
+VALID_SCHEDULE = """schema: jii.ambyte-schedule/v1-draft
+jobs:
+  manual:
+    on: dispatch
+    steps: [ { uses: device/status-report } ]
+"""
+
 
 class ScheduleReleaseManifestTest(unittest.TestCase):
     def test_manifest_and_command_match_asset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source.yaml"
-            source.write_text("return 42\n", encoding="utf-8")
+            source.write_text(VALID_SCHEDULE, encoding="utf-8")
 
             manifest = build(
                 source,
@@ -41,7 +48,8 @@ class ScheduleReleaseManifestTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "experiment.yaml"
-            source.write_text("return 31\n", encoding="utf-8")
+            source.write_text(VALID_SCHEDULE.replace("manual", "named"),
+                              encoding="utf-8")
 
             manifest = build(
                 source,
@@ -65,14 +73,14 @@ class ScheduleReleaseManifestTest(unittest.TestCase):
     def test_rejects_non_semver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.yaml"
-            source.write_text("return 42\n", encoding="utf-8")
+            source.write_text(VALID_SCHEDULE, encoding="utf-8")
             with self.assertRaises(ValueError):
                 build(source, Path(tmp) / "dist", "latest", "1.0.0", "example/repo")
 
     def test_rejects_unsafe_asset_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.yaml"
-            source.write_text("return 42\n", encoding="utf-8")
+            source.write_text(VALID_SCHEDULE, encoding="utf-8")
             with self.assertRaises(ValueError):
                 build(
                     source,

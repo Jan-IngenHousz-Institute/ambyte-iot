@@ -36,6 +36,17 @@ description: A readable note.     # optional
 Per-device latitude, longitude, timezone, deployment, and identity belong in
 NVS `device_config`; never fork a schedule per site for those values.
 
+Set site facts through one of three supported paths:
+
+- Provisioning: pass `--lat`, `--lon`, and optional `--deployment` to
+  `tools/build_nvs_image.py`, or enter the same values in the flash GUI.
+- Console: `sync loc 52.173 5.819` persists latitude and longitude. Its optional
+  numeric timezone offset is runtime-only; persist an IANA zone separately with
+  `cfg set timezone Europe/Amsterdam`.
+- MQTT: publish the retain-safe command
+  `{"type":"set_location","id":"site-a","lat":52.173,"lon":5.819,"deployment":"greenhouse-a"}`.
+  The `set_location_result` reply echoes the persisted deployment tag.
+
 ## YAML subset
 
 The device accepts block and flow mappings and sequences, comments, quoted or

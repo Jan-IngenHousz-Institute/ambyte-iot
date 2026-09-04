@@ -161,6 +161,13 @@ static void report_script(const char *state, const char *id, const char *detail)
     const esp_app_desc_t *app = esp_app_get_description();
     sched_source_t source = {0};
     sched_runner_source(&source);
+    /* A rebooting install reports after the runner has stopped but after the
+     * validated file has been swapped. Its stale in-memory source describes
+     * the previous program, so report the installed source that will load on
+     * reboot. Other states keep the runner's current source for diagnosis. */
+    if (strcmp(state, "applied") == 0 && !sched_runner_is_running()) {
+        source.kind = SCHED_SOURCE_INSTALLED;
+    }
     static const char *const source_names[] = {
         "none", "installed", "embedded_default", "embedded_fallback",
     };
@@ -417,6 +424,13 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
         esp_http_client_cleanup(c);
         return ESP_FAIL;
     }
+    if (clen > SCHED_YAML_MAX_FILE_BYTES) {
+        ESP_LOGE(TAG, "download is %lld bytes; schedule limit is %u",
+                 (long long)clen, (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     FILE *f = fopen(path, "wb");
     if (f == NULL) {
@@ -443,6 +457,12 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
         int r = esp_http_client_read(c, (char *)buf, SCRIPT_DL_BUF);
         if (r < 0) { err = ESP_FAIL; break; }
         if (r == 0) break;   /* EOF */
+        if ((size_t)r > SCHED_YAML_MAX_FILE_BYTES - total) {
+            ESP_LOGE(TAG, "chunked download exceeds %u-byte schedule limit",
+                     (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
         mbedtls_sha256_update(&sha, buf, (size_t)r);
         if (fwrite(buf, 1, (size_t)r, f) != (size_t)r) { err = ESP_ERR_NO_MEM; wr_ok = false; break; }
         total += (size_t)r;

@@ -308,6 +308,8 @@ def _collect_values(*, lat: float | None = None, lon: float | None = None,
                     ) -> dict[tuple[str, str], tuple[str, str]]:
     """Return {(namespace, key): (kind, value)} after resolving every field.
     Raises SystemExit on missing required values."""
+    if deployment is not None and len(deployment.encode("utf-8")) > 63:
+        raise ValueError("deployment must fit the firmware's 63-byte buffer")
     out: dict[tuple[str, str], tuple[str, str]] = {}
     missing: list[str] = []
     for env_var, ns, key, kind in FIELDS:

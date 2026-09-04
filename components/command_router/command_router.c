@@ -284,11 +284,9 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             jlat->valuedouble >= -90.0 && jlat->valuedouble <= 90.0 &&
             jlon->valuedouble >= -180.0 && jlon->valuedouble <= 180.0 &&
             (jdeployment == NULL || cJSON_IsString(jdeployment))) {
-            err = device_config_set_lat(jlat->valuedouble);
-            if (err == ESP_OK) err = device_config_set_lon(jlon->valuedouble);
-            if (err == ESP_OK && deployment != NULL) {
-                err = device_config_set_deployment(deployment);
-            }
+            err = device_config_set_location(jlat->valuedouble,
+                                             jlon->valuedouble,
+                                             deployment);
             if (err == ESP_OK) {
                 int tz = 0;
                 time_sync_get_location(NULL, NULL, &tz);
@@ -296,15 +294,29 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             }
         }
         ESP_LOGW(TAG, "set_location id=%s -> %s", id ? id : "", esp_err_to_name(err));
-        char reply[384];
-        snprintf(reply, sizeof(reply),
-                 "{\"type\":\"set_location_result\",\"id\":\"%.64s\",\"ok\":%s,"
-                 "\"lat\":%.8g,\"lon\":%.8g,\"detail\":\"%s\"}",
-                 id ? id : "", err == ESP_OK ? "true" : "false",
-                 cJSON_IsNumber(jlat) ? jlat->valuedouble : 0.0,
-                 cJSON_IsNumber(jlon) ? jlon->valuedouble : 0.0,
-                 esp_err_to_name(err));
-        publish_reply(reply);
+        char applied_deployment[64] = "";
+        (void)device_config_get_deployment(applied_deployment,
+                                           sizeof(applied_deployment));
+        cJSON *reply = cJSON_CreateObject();
+        if (reply != NULL) {
+            cJSON_AddStringToObject(reply, "type", "set_location_result");
+            cJSON_AddStringToObject(reply, "id", id ? id : "");
+            cJSON_AddBoolToObject(reply, "ok", err == ESP_OK);
+            cJSON_AddNumberToObject(reply, "lat",
+                cJSON_IsNumber(jlat) && isfinite(jlat->valuedouble)
+                    ? jlat->valuedouble : 0.0);
+            cJSON_AddNumberToObject(reply, "lon",
+                cJSON_IsNumber(jlon) && isfinite(jlon->valuedouble)
+                    ? jlon->valuedouble : 0.0);
+            cJSON_AddStringToObject(reply, "deployment", applied_deployment);
+            cJSON_AddStringToObject(reply, "detail", esp_err_to_name(err));
+            char *encoded = cJSON_PrintUnformatted(reply);
+            if (encoded != NULL) {
+                publish_reply(encoded);
+                cJSON_free(encoded);
+            }
+            cJSON_Delete(reply);
+        }
     } else if (strcmp(type, "set_time") == 0) {
         /* Set the device RTC from a UTC epoch: {"epoch": <UTC seconds>}. The RTC is
          * UTC by design — send UTC, never local. Do NOT publish set_time as a

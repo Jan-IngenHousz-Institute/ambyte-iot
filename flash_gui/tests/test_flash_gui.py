@@ -419,6 +419,11 @@ def test_nvs_csv_optional_site_metadata():
     assert 'deployment,data,string,"greenhouse-a"' in csv
 
 
+def test_nvs_csv_rejects_oversized_deployment():
+    with pytest.raises(NvsBuildError, match="63-byte"):
+        build_nvs_csv(make_plan(deployment="x" * 64))
+
+
 @pytest.mark.parametrize(("field", "value"), [
     ("lat", float("nan")),
     ("lat", 90.01),

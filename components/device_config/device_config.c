@@ -219,8 +219,77 @@ esp_err_t device_config_set_lon(double val)
 
 esp_err_t device_config_set_deployment(const char *val)
 {
-    if (val == NULL) return ESP_ERR_INVALID_ARG;
+    /* sched_runner's placeholder buffer is char[64]; reject rather than store
+     * a tag that later reads as ESP_ERR_NVS_INVALID_LENGTH and appears empty. */
+    if (val == NULL || strlen(val) >= 64) return ESP_ERR_INVALID_ARG;
     return cfg_set(KEY_DEPLOYMENT, val);
+}
+
+static esp_err_t cfg_restore_double(const char *key, bool existed, double value)
+{
+    esp_err_t err = existed ? nvs_set_blob(s_handle, key, &value, sizeof(value))
+                            : nvs_erase_key(s_handle, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND && !existed) return ESP_OK;
+    if (err != ESP_OK) return err;
+    return nvs_commit(s_handle);
+}
+
+static esp_err_t cfg_restore_string(const char *key, bool existed, const char *value)
+{
+    esp_err_t err = existed ? nvs_set_str(s_handle, key, value)
+                            : nvs_erase_key(s_handle, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND && !existed) return ESP_OK;
+    if (err != ESP_OK) return err;
+    return nvs_commit(s_handle);
+}
+
+esp_err_t device_config_set_location(double lat, double lon,
+                                     const char *deployment)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (!isfinite(lat) || lat < -90.0 || lat > 90.0 ||
+        !isfinite(lon) || lon < -180.0 || lon > 180.0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    double old_lat = 0.0, old_lon = 0.0;
+    char old_deployment[64] = "";
+    esp_err_t lat_read = device_config_get_lat(&old_lat);
+    esp_err_t lon_read = device_config_get_lon(&old_lon);
+    esp_err_t deployment_read = device_config_get_deployment(
+        old_deployment, sizeof(old_deployment));
+    if (lat_read != ESP_OK && lat_read != ESP_ERR_NVS_NOT_FOUND) return lat_read;
+    if (lon_read != ESP_OK && lon_read != ESP_ERR_NVS_NOT_FOUND) return lon_read;
+    if (deployment != NULL && deployment_read != ESP_OK &&
+        deployment_read != ESP_ERR_NVS_NOT_FOUND) {
+        return deployment_read;
+    }
+
+    esp_err_t err = device_config_set_lat(lat);
+    if (err == ESP_OK) err = device_config_set_lon(lon);
+    if (err == ESP_OK && deployment != NULL) {
+        err = device_config_set_deployment(deployment);
+    }
+    if (err == ESP_OK) return ESP_OK;
+
+    /* A setter can fail either before or during nvs_commit, so restore every
+     * member that may have reached flash. Keep attempting after one rollback
+     * error; restoring two of three values is still better than stopping at
+     * the first failure, and the ERROR names both the command and rollback. */
+    esp_err_t rollback = cfg_restore_double(KEY_LAT, lat_read == ESP_OK, old_lat);
+    esp_err_t r = cfg_restore_double(KEY_LON, lon_read == ESP_OK, old_lon);
+    if (rollback == ESP_OK) rollback = r;
+    if (deployment != NULL) {
+        r = cfg_restore_string(KEY_DEPLOYMENT, deployment_read == ESP_OK,
+                               old_deployment);
+        if (rollback == ESP_OK) rollback = r;
+    }
+    if (rollback != ESP_OK) {
+        ESP_LOGE(TAG, "location write failed (%s), rollback also failed (%s)",
+                 esp_err_to_name(err), esp_err_to_name(rollback));
+        return rollback;
+    }
+    return err;
 }
 
 esp_err_t device_config_set_timezone(const char *val)

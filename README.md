@@ -327,7 +327,7 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 - Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable Lua release catalog has a manifest containing this ready-to-publish object.
 - Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
 - `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
-- Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
+- Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Schedule releases and authoring](docs/schedule-releases.md).
 
 ---
 

@@ -133,6 +133,10 @@ class TimezoneProvisioningTest(unittest.TestCase):
             os.environ.clear()
             os.environ.update(original)
 
+    def test_collect_values_rejects_oversized_deployment(self):
+        with self.assertRaisesRegex(ValueError, "63-byte"):
+            BUILD_NVS._collect_values(deployment="x" * 64)
+
 
 class GeneratedTableContractTest(unittest.TestCase):
     """The three consumers of the generated table must agree."""

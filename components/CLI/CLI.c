@@ -1333,14 +1333,17 @@ static int cli_cmd_sync(int argc, char **argv)
                 printf("Usage: sync loc <lat -90..90> <lon -180..180> [tz]\r\n");
                 return 1;
             }
-            esp_err_t err = device_config_set_lat(lat);
-            if (err == ESP_OK) err = device_config_set_lon(lon);
+            esp_err_t err = device_config_set_location(lat, lon, NULL);
             if (err != ESP_OK) {
                 printf("location persist failed: %s\r\n", esp_err_to_name(err));
                 return 1;
             }
             int tz; time_sync_get_location(NULL, NULL, &tz);
-            if (argc >= 5) tz = atoi(argv[4]);
+            if (argc >= 5) {
+                tz = atoi(argv[4]);
+                printf("timezone offset is runtime-only; use `cfg set timezone <IANA-name>` "
+                       "to persist it\r\n");
+            }
             time_sync_set_location(lat, lon, tz);
         }
         double lat, lon; int tz;
@@ -1988,9 +1991,10 @@ static int cli_cmd_schedule(int argc, char **argv)
     return 1;
 }
 
-/* Operator control of the Lua measurement script. `exec` runs a snippet in an
- * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
- * db/sync) — the console-side twin of the MQTT lua_exec command. */
+/* Keep the legacy command surface until T5 removes the Lua component, but do
+ * not let it create a second scheduler against the AMBIT UART/event store.
+ * app_main never starts lua_runner on this firmware, so stop/status remain
+ * useful diagnostics while start/exec fail closed. */
 static int cli_cmd_lua(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1998,11 +2002,8 @@ static int cli_cmd_lua(int argc, char **argv)
         return 1;
     }
     if (strcmp(argv[1], "start") == 0) {
-        esp_err_t err = lua_runner_start();
-        if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
-        else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
-        else                              printf("started (loads /littlefs/main.lua)\r\n");
-        return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
+        printf("disabled: the schedule runner owns the AMBIT UART and event store\r\n");
+        return 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
         esp_err_t err = lua_runner_stop(5000);
@@ -2019,24 +2020,7 @@ static int cli_cmd_lua(int argc, char **argv)
         return 0;
     }
     if (strcmp(argv[1], "exec") == 0) {
-        if (argc < 3) {
-            printf("Usage: lua exec <code...>   e.g. lua exec return device.uptime_ms()\r\n");
-            return 1;
-        }
-        /* Rejoin argv[2..] — the console splits on spaces. */
-        char code[512] = "";
-        size_t off = 0;
-        for (int i = 2; i < argc && off < sizeof(code) - 1; i++) {
-            off += (size_t)snprintf(code + off, sizeof(code) - off, "%s%s",
-                                    i > 2 ? " " : "", argv[i]);
-        }
-        char result[256] = "";
-        esp_err_t err = lua_runner_exec(code, 120000, result, sizeof result);
-        if (err == ESP_OK) {
-            printf("ok: %s\r\n", result[0] ? result : "(no return value)");
-            return 0;
-        }
-        printf("error (%s): %s\r\n", esp_err_to_name(err), result);
+        printf("disabled: the schedule runner owns the AMBIT UART and event store\r\n");
         return 1;
     }
     printf("unknown subcommand '%s' "
@@ -2292,7 +2276,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t lua_cmd = {
         .command = "lua",
-        .help    = "lua start|stop|status|exec  legacy Lua diagnostics (removed in the next cleanup)",
+        .help    = "lua stop|status  legacy Lua diagnostics; start/exec disabled (removed next cleanup)",
         .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t schedule_cmd = {

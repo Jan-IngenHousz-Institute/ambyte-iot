@@ -139,6 +139,9 @@ class ProvisioningPlan:
         if self.lon is not None and (not math.isfinite(self.lon)
                                      or not -180.0 <= self.lon <= 180.0):
             raise NvsBuildError("lon must be between -180 and 180")
+        if self.deployment is not None and len(
+                self.deployment.encode("utf-8")) > 63:
+            raise NvsBuildError("deployment must fit the firmware's 63-byte buffer")
         for label, pem in (("CA cert", self.ca_cert_pem),
                            ("device cert", self.device_cert_pem),
                            ("device key", self.device_key_pem)):

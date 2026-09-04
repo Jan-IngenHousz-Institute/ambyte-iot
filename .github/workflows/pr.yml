@@ -218,15 +218,15 @@ jobs:
           cc -std=c11 -O2 -Icomponents/sched_spec/include \
             -Icomponents/time_sync/include -Itests/host_stubs \
             tools/sched_host.c components/sched_spec/*.c \
-            components/time_sync/time_sync.c -lm -o dist/sched_host
-          dist/sched_host --schema > dist/actions.schema.json
+            components/time_sync/time_sync.c -lm -o "${RUNNER_TEMP}/sched_host"
+          "${RUNNER_TEMP}/sched_host" --schema > dist/actions.schema.json
           SCHEDULES=(default legacy_1hz_spec)
           for SCRIPT in "${SCHEDULES[@]}"; do
-            dist/sched_host --check "schedule/${SCRIPT}.yaml"
+            "${RUNNER_TEMP}/sched_host" --check "schedule/${SCRIPT}.yaml"
             {
               echo "### Simulated schedule/${SCRIPT}.yaml"
               echo '```text'
-              dist/sched_host --simulate "schedule/${SCRIPT}.yaml" \
+              "${RUNNER_TEMP}/sched_host" --simulate "schedule/${SCRIPT}.yaml" \
                 --date 2026-06-21 --tz-offset-s 7200 --lat 52.173 --lon 5.819
               echo '```'
             } >> "${GITHUB_STEP_SUMMARY}"

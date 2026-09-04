@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from flash_gui import release_fetch
+from tools.build_schedule_release import build
 from tools.fleet_deploy import fleet_deploy
 from tools.fleet_deploy import schedule_deploy
 
@@ -24,9 +26,16 @@ STATUS_A = f"experiment/data_ingest/v1/site/multispeq/v1.0/{DEVICE_A}/status"
 MANIFEST_URL = (
     f"https://github.com/{REPOSITORY}/releases/download/{TAG}/default.yaml.manifest.json"
 )
+VALID_SCHEDULE = (
+    b"schema: jii.ambyte-schedule/v1-draft\n"
+    b"jobs:\n"
+    b"  manual:\n"
+    b"    on: dispatch\n"
+    b"    steps: [ { uses: device/status-report } ]\n"
+)
 
 
-def release_fixture(body: bytes = b"return 42\n", script_name: str = "default") -> dict:
+def release_fixture(body: bytes = VALID_SCHEDULE, script_name: str = "default") -> dict:
     digest = hashlib.sha256(body).hexdigest()
     asset_url = (
         f"https://github.com/{REPOSITORY}/releases/download/{TAG}/{script_name}.yaml"
@@ -54,7 +63,7 @@ def release_fixture(body: bytes = b"return 42\n", script_name: str = "default") 
 
 class ManifestTest(unittest.TestCase):
     def test_validates_real_schema_and_downloaded_asset(self) -> None:
-        body = b"return 42\n"
+        body = VALID_SCHEDULE
         manifest = release_fixture(body)
         responses = {
             MANIFEST_URL: json.dumps(manifest).encode(),
@@ -79,7 +88,7 @@ class ManifestTest(unittest.TestCase):
 
     def test_validates_and_fetches_selected_script(self) -> None:
         script_name = "legacy_1Hz_spec"
-        body = b"return 31\n"
+        body = VALID_SCHEDULE.replace(b"manual", b"named")
         manifest = release_fixture(body, script_name)
         manifest_url = (
             f"https://github.com/{REPOSITORY}/releases/download/{TAG}/"
@@ -151,13 +160,45 @@ class ManifestTest(unittest.TestCase):
             requested_limits[url] = max_bytes
             if url == MANIFEST_URL:
                 return json.dumps(manifest).encode()
-            return b"return 42\n"
+            return VALID_SCHEDULE
 
         schedule_deploy.fetch_release(REPOSITORY, TAG, downloader=downloader)
         self.assertEqual(
             requested_limits[manifest["asset_url"]],
             schedule_deploy.SCHEDULE_MAX_BYTES,
         )
+
+    def test_builder_deployer_and_flash_gui_share_one_manifest_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            manifest = build(
+                Path("schedule/default.yaml"),
+                output,
+                "1.2.3",
+                "4.5.6",
+                REPOSITORY,
+            )
+            deployed = schedule_deploy.validate_manifest(
+                manifest, REPOSITORY, TAG, "default"
+            )
+            gui_script = release_fetch._validated_schedule_script(
+                TAG,
+                {
+                    "name": "default.yaml",
+                    "size": manifest["size_bytes"],
+                    "browser_download_url": manifest["asset_url"],
+                },
+                manifest,
+            )
+
+            self.assertEqual(deployed, manifest)
+            self.assertEqual(gui_script.sha256, manifest["sha256"])
+            self.assertEqual(gui_script.campaign_id,
+                             manifest["script_update"]["id"])
+            self.assertEqual(
+                (output / "default.yaml").read_bytes(),
+                Path("schedule/default.yaml").read_bytes(),
+            )
 
 
 class TargetingTest(unittest.TestCase):
@@ -190,7 +231,7 @@ class TargetingTest(unittest.TestCase):
         manifest = release_fixture()
         with (
             mock.patch.object(
-                schedule_deploy, "fetch_release", return_value=(manifest, b"return 42\n")
+                schedule_deploy, "fetch_release", return_value=(manifest, VALID_SCHEDULE)
             ),
             mock.patch.object(schedule_deploy.fleet, "boto_session", return_value=object()),
             mock.patch.object(
@@ -240,7 +281,7 @@ class TargetingTest(unittest.TestCase):
             with (
                 self.subTest(name=name),
                 mock.patch.object(
-                    schedule_deploy, "fetch_release", return_value=(manifest, b"return 42\n")
+                    schedule_deploy, "fetch_release", return_value=(manifest, VALID_SCHEDULE)
                 ),
                 mock.patch.object(
                     schedule_deploy.fleet, "boto_session", return_value=object()

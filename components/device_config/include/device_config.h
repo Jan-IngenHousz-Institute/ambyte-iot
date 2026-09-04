@@ -52,6 +52,11 @@ esp_err_t device_config_get_deployment(char *buf, size_t len);
 esp_err_t device_config_set_lat(double val);
 esp_err_t device_config_set_lon(double val);
 esp_err_t device_config_set_deployment(const char *val);
+/* Persist a coherent site update. `deployment == NULL` leaves the tag
+ * unchanged. If any write fails, the previous lat/lon/tag values are restored
+ * before returning so a rejected command cannot leave a mixed coordinate. */
+esp_err_t device_config_set_location(double lat, double lon,
+                                     const char *deployment);
 /* STATUS heartbeat period in seconds (sync_runner). Optional; caller defaults
  * (300 s) when unset. 0 disables the heartbeat. */
 esp_err_t device_config_get_heartbeat_s(uint32_t *out);
