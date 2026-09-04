@@ -1,4 +1,4 @@
-name: Release firmware and Lua
+name: Release firmware and schedule
 
 on:
   push:
@@ -49,18 +49,18 @@ jobs:
             node "${GITHUB_WORKSPACE}/tools/release/next-version.js" "${log}"
           }
           FIRMWARE_VERSION=$(preview_unit firmware .)
-          LUA_VERSION=$(preview_unit lua lua)
+          SCHEDULE_VERSION=$(preview_unit schedule schedule)
           [[ -n "${FIRMWARE_VERSION}" ]] && FIRMWARE_WILL_RELEASE=true || FIRMWARE_WILL_RELEASE=false
-          [[ -n "${LUA_VERSION}" ]] && LUA_WILL_RELEASE=true || LUA_WILL_RELEASE=false
-          [[ "${FIRMWARE_WILL_RELEASE}" == true || "${LUA_WILL_RELEASE}" == true ]] \
+          [[ -n "${SCHEDULE_VERSION}" ]] && SCHEDULE_WILL_RELEASE=true || SCHEDULE_WILL_RELEASE=false
+          [[ "${FIRMWARE_WILL_RELEASE}" == true || "${SCHEDULE_WILL_RELEASE}" == true ]] \
             && ANY_WILL_RELEASE=true || ANY_WILL_RELEASE=false
           echo "firmware-version=${FIRMWARE_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "firmware-will-release=${FIRMWARE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
-          echo "lua-version=${LUA_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "lua-will-release=${LUA_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "schedule-version=${SCHEDULE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "schedule-will-release=${SCHEDULE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
           echo "any-will-release=${ANY_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
           if [[ "${ANY_WILL_RELEASE}" == false ]]; then
-            echo "No firmware or Lua release is required." >> "${GITHUB_STEP_SUMMARY}"
+            echo "No firmware or schedule release is required." >> "${GITHUB_STEP_SUMMARY}"
           fi
 
       - name: Locate PR release artifact
@@ -104,8 +104,8 @@ jobs:
         env:
           FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-version }}
           FIRMWARE_WILL_RELEASE: ${{ steps.preview.outputs.firmware-will-release }}
-          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
-          LUA_WILL_RELEASE: ${{ steps.preview.outputs.lua-will-release }}
+          SCHEDULE_VERSION: ${{ steps.preview.outputs.schedule-version }}
+          SCHEDULE_WILL_RELEASE: ${{ steps.preview.outputs.schedule-will-release }}
         shell: bash
         run: |
           set -euo pipefail
@@ -113,15 +113,16 @@ jobs:
             test -f release-assets/firmware.bin
             test -f "release-assets/ambyte-iot-v${FIRMWARE_VERSION}.zip"
           fi
-          if [[ "${LUA_WILL_RELEASE}" == true ]]; then
-            LUA_SCRIPTS=(main legacy_1Hz_spec)
-            for SCRIPT in "${LUA_SCRIPTS[@]}"; do
-              test -f "release-assets/${SCRIPT}.lua"
-              MANIFEST="release-assets/${SCRIPT}.lua.manifest.json"
+          if [[ "${SCHEDULE_WILL_RELEASE}" == true ]]; then
+            SCHEDULES=(default legacy_1hz_spec)
+            test -f release-assets/actions.schema.json
+            for SCRIPT in "${SCHEDULES[@]}"; do
+              test -f "release-assets/${SCRIPT}.yaml"
+              MANIFEST="release-assets/${SCRIPT}.yaml.manifest.json"
               test -f "${MANIFEST}"
               test "$(jq -r .script_name "${MANIFEST}")" = "${SCRIPT}"
-              test "$(jq -r .script_version "${MANIFEST}")" = "${LUA_VERSION}"
-              test "$(sha256sum "release-assets/${SCRIPT}.lua" | awk '{print $1}')" = \
+              test "$(jq -r .script_version "${MANIFEST}")" = "${SCHEDULE_VERSION}"
+              test "$(sha256sum "release-assets/${SCRIPT}.yaml" | awk '{print $1}')" = \
                 "$(jq -r .sha256 "${MANIFEST}")"
             done
           fi
@@ -132,21 +133,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx semantic-release
 
-      - name: Publish Lua release
-        if: steps.preview.outputs.lua-will-release == 'true'
+      - name: Publish schedule release
+        if: steps.preview.outputs.schedule-will-release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cd lua && ../node_modules/.bin/semantic-release
+        run: cd schedule && ../node_modules/.bin/semantic-release
 
       - name: Release summary
         if: steps.preview.outputs.any-will-release == 'true'
         env:
           FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-version }}
-          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
+          SCHEDULE_VERSION: ${{ steps.preview.outputs.schedule-version }}
         run: |
           if [[ -n "${FIRMWARE_VERSION}" ]]; then
             echo "Published firmware v${FIRMWARE_VERSION} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
           fi
-          if [[ -n "${LUA_VERSION}" ]]; then
-            echo "Published Lua lua-v${LUA_VERSION} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
+          if [[ -n "${SCHEDULE_VERSION}" ]]; then
+            echo "Published schedule schedule-v${SCHEDULE_VERSION} from the PR-built artifact." >> "${GITHUB_STEP_SUMMARY}"
           fi

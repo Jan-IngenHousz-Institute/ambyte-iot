@@ -1,9 +1,9 @@
 name: Fleet deploy utility
-description: Resolve, authenticate, target, run, and report an OTA, Lua, or AMBIT fleet deployment
+description: Resolve, authenticate, target, run, and report an OTA, schedule, or AMBIT fleet deployment
 
 inputs:
   kind:
-    description: Deployment kind (`ota`, `lua`, or `ambit`)
+    description: Deployment kind (`ota`, `schedule`, or `ambit`)
     required: true
   repository:
     description: GitHub owner/repository containing release assets
@@ -12,9 +12,9 @@ inputs:
     description: Exact release tag, or `latest` within the selected kind
     required: true
   script-name:
-    description: Lua only; released asset name without the .lua suffix
+    description: Schedule only; released asset name without the .yaml suffix
     required: false
-    default: main
+    default: default
   version-op:
     description: Firmware-version predicate
     required: true
@@ -52,7 +52,7 @@ inputs:
     required: false
     default: "3600"
   reboot:
-    description: Lua only; reboot after a successful swap
+    description: Schedule only; reboot after a successful swap
     required: false
     default: "true"
   github-token:
@@ -105,10 +105,10 @@ runs:
           ota)
             REQUIRED_ASSETS=(firmware.bin)
             ;;
-          lua)
+          schedule)
             [[ "${SCRIPT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
-              || { echo "::error::invalid Lua script name: ${SCRIPT_NAME}"; exit 2; }
-            REQUIRED_ASSETS=("${SCRIPT_NAME}.lua" "${SCRIPT_NAME}.lua.manifest.json")
+              || { echo "::error::invalid schedule name: ${SCRIPT_NAME}"; exit 2; }
+            REQUIRED_ASSETS=("${SCRIPT_NAME}.yaml" "${SCRIPT_NAME}.yaml.manifest.json")
             ;;
           ambit)
             REQUIRED_ASSETS=(manifest.json)
@@ -211,10 +211,10 @@ runs:
             [[ "${ALLOW_DOWNGRADE}" == "true" ]] && ARGS+=(--allow-downgrade)
             python tools/fleet_deploy/fleet_deploy.py "${ARGS[@]}"
             ;;
-          lua)
+          schedule)
             [[ "${REBOOT}" == "true" ]] && ARGS+=(--reboot) || ARGS+=(--no-reboot)
             ARGS+=(--script-name "${SCRIPT_NAME}")
-            python tools/fleet_deploy/lua_deploy.py "${ARGS[@]}"
+            python tools/fleet_deploy/schedule_deploy.py "${ARGS[@]}"
             ;;
           ambit)
             [[ "${ALLOW_DOWNGRADE}" == "true" ]] && ARGS+=(--allow-downgrade)

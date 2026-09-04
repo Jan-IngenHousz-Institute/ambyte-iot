@@ -1,0 +1,282 @@
+{
+  "$schema": "http://json-schema.org/draft-07#",
+  "title": "ambyte-schedule-actions",
+  "description": "generated from the firmware action table (components/sched_spec/sched_actions_table.c); do not hand-edit",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "ambit/trace"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "protocol": {
+              "type": "string"
+            },
+            "channels": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "uniqueItems": true,
+              "minItems": 1
+            },
+            "hold_window": {
+              "type": "boolean",
+              "default": false
+            },
+            "tag": {
+              "type": "string"
+            },
+            "deadline_margin": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$",
+              "x-minMs": 0,
+              "x-maxMs": 300000,
+              "defaultMs": 15000
+            }
+          },
+          "required": [
+            "protocol"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses",
+        "with"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "ambit/spectrum"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "channels": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "uniqueItems": true,
+              "minItems": 1
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "ambit/leaf-temp"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "channels": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "uniqueItems": true,
+              "minItems": 1
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "ambit/actinic"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "channels": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "uniqueItems": true,
+              "minItems": 1
+            },
+            "level": {
+              "type": "integer",
+              "minimum": -32768,
+              "maximum": 32767
+            },
+            "duration": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$",
+              "x-minMs": 1,
+              "x-maxMs": 600000
+            }
+          },
+          "required": [
+            "level",
+            "duration"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses",
+        "with"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "device/status-report"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "tags": {
+              "type": "object",
+              "maxProperties": 16,
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "db/store-event"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "channel": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "data": {
+              "type": "object",
+              "maxProperties": 16,
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            },
+            "metadata": {
+              "type": "object",
+              "maxProperties": 16,
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            },
+            "kind": {
+              "type": "string"
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "device/log"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses",
+        "with"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "uses": {
+          "const": "device/sleep"
+        },
+        "with": {
+          "type": "object",
+          "properties": {
+            "duration": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h)$",
+              "x-minMs": 1,
+              "x-maxMs": 60000
+            }
+          },
+          "required": [
+            "duration"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "uses",
+        "with"
+      ]
+    }
+  ]
+}

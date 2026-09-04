@@ -1,6 +1,6 @@
-name: Fleet deploy (Lua)
+name: Fleet deploy (Schedule)
 
-# Manually deploys one immutable, published Lua release to a targeted cohort.
+# Manually deploys one immutable, published Schedule release to a targeted cohort.
 # Release publication stays separate; this workflow only selects devices and
 # publishes the manifest's verified script_update command.
 
@@ -13,14 +13,14 @@ on:
         options: [dev, prod]
         default: dev
       release_tag:
-        description: "Lua release tag (e.g. lua-v1.0.0), or 'latest'"
+        description: "Schedule release tag (e.g. schedule-v1.0.0), or 'latest'"
         type: string
         default: "latest"
       script:
-        description: "Released Lua script to install as main.lua"
+        description: "Released Schedule script to install as schedule.yaml"
         type: choice
-        options: [main, legacy_1Hz_spec]
-        default: main
+        options: [default, legacy_1hz_spec]
+        default: default
       version_op:
         description: "Firmware-version filter reported by each device"
         type: choice
@@ -55,7 +55,7 @@ permissions:
   contents: read
   id-token: write
 
-# OTA and Lua swaps share the device maintenance admission gate. Serialize all
+# OTA and Schedule swaps share the device maintenance admission gate. Serialize all
 # fleet mutation workflows so overlapping campaigns cannot race one another.
 concurrency:
   group: fleet-deploy
@@ -73,10 +73,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Deploy Lua release
+      - name: Deploy Schedule release
         uses: ./.github/actions/fleet-deploy
         with:
-          kind: lua
+          kind: schedule
           repository: ${{ github.repository }}
           release-tag: ${{ inputs.release_tag }}
           script-name: ${{ inputs.script }}

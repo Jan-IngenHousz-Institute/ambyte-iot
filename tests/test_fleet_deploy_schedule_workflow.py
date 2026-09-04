@@ -7,7 +7,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LUA_WORKFLOW = (ROOT / ".github/workflows/fleet-deploy-lua.yml").read_text(
+SCHEDULE_WORKFLOW = (ROOT / ".github/workflows/fleet-deploy-schedule.yml").read_text(
     encoding="utf-8"
 )
 OTA_WORKFLOW = (ROOT / ".github/workflows/fleet-deploy.yml").read_text(
@@ -31,7 +31,7 @@ def workflow_input_default(workflow: str, input_name: str) -> bool:
     return default.group(1) == "true"
 
 
-class LuaWorkflowTest(unittest.TestCase):
+class ScheduleWorkflowTest(unittest.TestCase):
     def test_form_exposes_and_forwards_every_targeting_input(self) -> None:
         inputs = {
             "environment": "fleet-deploy-${{ inputs.environment }}",
@@ -49,20 +49,20 @@ class LuaWorkflowTest(unittest.TestCase):
         }
         for input_name, forwarding in inputs.items():
             with self.subTest(input_name=input_name):
-                self.assertIn(f"      {input_name}:\n", LUA_WORKFLOW)
-                self.assertIn(forwarding, LUA_WORKFLOW)
+                self.assertIn(f"      {input_name}:\n", SCHEDULE_WORKFLOW)
+                self.assertIn(forwarding, SCHEDULE_WORKFLOW)
 
-        self.assertTrue(workflow_input_default(LUA_WORKFLOW, "dry_run"))
-        self.assertIn("environment: fleet-deploy-${{ inputs.environment }}", LUA_WORKFLOW)
-        self.assertIn("uses: ./.github/actions/fleet-deploy", LUA_WORKFLOW)
-        self.assertIn("kind: lua", LUA_WORKFLOW)
+        self.assertTrue(workflow_input_default(SCHEDULE_WORKFLOW, "dry_run"))
+        self.assertIn("environment: fleet-deploy-${{ inputs.environment }}", SCHEDULE_WORKFLOW)
+        self.assertIn("uses: ./.github/actions/fleet-deploy", SCHEDULE_WORKFLOW)
+        self.assertIn("kind: schedule", SCHEDULE_WORKFLOW)
 
     def test_shared_action_scopes_latest_and_requires_kind_assets(self) -> None:
         self.assertIn("gh release list", DEPLOY_ACTION)
         self.assertIn("release_selection.py --kind \"${KIND}\"", DEPLOY_ACTION)
         self.assertIn("REQUIRED_ASSETS=(firmware.bin)", DEPLOY_ACTION)
         self.assertIn(
-            'REQUIRED_ASSETS=("${SCRIPT_NAME}.lua" "${SCRIPT_NAME}.lua.manifest.json")',
+            'REQUIRED_ASSETS=("${SCRIPT_NAME}.yaml" "${SCRIPT_NAME}.yaml.manifest.json")',
             DEPLOY_ACTION,
         )
         self.assertIn(
@@ -76,12 +76,12 @@ class LuaWorkflowTest(unittest.TestCase):
         self.assertIn("uses: ./.github/actions/fleet-deploy", OTA_WORKFLOW)
         self.assertIn("kind: ota", OTA_WORKFLOW)
         self.assertIn("allow-downgrade: ${{ inputs.allow_downgrade }}", OTA_WORKFLOW)
-        self.assertIn("uses: ./.github/actions/fleet-deploy", LUA_WORKFLOW)
-        self.assertIn("kind: lua", LUA_WORKFLOW)
-        self.assertIn("reboot: ${{ inputs.reboot }}", LUA_WORKFLOW)
+        self.assertIn("uses: ./.github/actions/fleet-deploy", SCHEDULE_WORKFLOW)
+        self.assertIn("kind: schedule", SCHEDULE_WORKFLOW)
+        self.assertIn("reboot: ${{ inputs.reboot }}", SCHEDULE_WORKFLOW)
         self.assertIn('ARGS+=(--script-name "${SCRIPT_NAME}")', DEPLOY_ACTION)
         self.assertIn("python tools/fleet_deploy/fleet_deploy.py", DEPLOY_ACTION)
-        self.assertIn("python tools/fleet_deploy/lua_deploy.py", DEPLOY_ACTION)
+        self.assertIn("python tools/fleet_deploy/schedule_deploy.py", DEPLOY_ACTION)
 
     def test_pr_firmware_steps_are_path_gated(self) -> None:
         self.assertIn("node tools/release/pr-build-scope.js", PR_WORKFLOW)
