@@ -3,7 +3,7 @@ name = "ambyte-iot-ludo"
 version = "0.1.0"
 description = "Ambyte IoT firmware (ESP32-S3) + BLE provisioning helper"
 # Covers the host-side Python only; the firmware and hardware design under
-# components/, main/ and lua/ stay CERN-OHL-S-2.0. See README.md.
+# components/ and main/ stay CERN-OHL-S-2.0. See README.md.
 license = "GPL-3.0-only"
 authors = [
     { name = "dominikvrbic", email = "dominik.vrbic@jii.org" }

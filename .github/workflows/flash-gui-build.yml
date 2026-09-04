@@ -3,7 +3,7 @@
 #
 # The flash GUI is host-side tooling and deliberately belongs to NO release
 # unit (tools/release/path-scoped.js excludes flash_gui/** from firmware
-# commit analysis, mirroring the lua/** rule) — so its distribution lives
+# commit analysis, mirroring the schedule/** rule) — so its distribution lives
 # here, not in the semantic-release pipeline:
 #
 #   * PRs build each executable once, keyed by the PR head SHA;
