@@ -1,6 +1,0 @@
-schema: jii.ambyte-schedule/v1-draft
-name: whole-second-every-90s
-jobs:
-  j:
-    on: { every: 90s, phase: 30s }
-    steps: [ { uses: device/log, with: { message: hi } } ]

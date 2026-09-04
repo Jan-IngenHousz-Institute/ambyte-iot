@@ -95,18 +95,18 @@ static void test_parser_acceptance(void)
     CHECK(parse_only_ok("a: -17\nb: 3.25\nc: -0.5\n"));
     CHECK(parse_only_ok("a: 500ms\nb: 2s\nc: 30m\nd: 1h\n"));
     CHECK(parse_only_ok("a: 08:30\nb: \"23:59\"\n"));
-    CHECK(parse_only_ok("a: { k: [0, 1], n: { deep: true } }\n"));
     CHECK(parse_only_ok("a: \"quoted # not a comment\"\nb: 'single'\n"));
     CHECK(parse_only_ok("a: \"esc \\\" quote\"\n"));
     CHECK(parse_only_ok("# just a comment\n\na: 1 # trailing\n"));
-    /* block sequence under a key, scalars and inline mappings */
+    /* Block sequences and the `- key: value` mapping-item shorthand. */
     CHECK(parse_only_ok("channels:\n  - 0\n  - 1\n  - 2\n"));
-    CHECK(parse_only_ok("steps:\n  - uses: device/log\n    with: { message: hi }\n"
-                        "  - uses: device/sleep\n    with: { duration: 5s }\n"));
-    /* scalar seq items incl. plain strings */
-    CHECK(parse_only_ok("days: [mon, wed, fri]\n"));
+    CHECK(parse_only_ok("steps:\n  - uses: device/log\n    with:\n"
+                        "      message: hi\n  - uses: device/sleep\n"
+                        "    with:\n      duration: 5s\n"));
+    /* Scalar sequence items, including plain strings. */
+    CHECK(parse_only_ok("days:\n  - mon\n  - wed\n  - fri\n"));
     /* CRLF tolerated */
-    CHECK(parse_only_ok("a: 1\r\nb: [x, y]\r\n"));
+    CHECK(parse_only_ok("a: 1\r\nb:\r\n  - x\r\n  - y\r\n"));
 
     /* scalar resolution spot-checks */
     sched_yaml_doc_t *doc = NULL;
@@ -141,7 +141,8 @@ static void test_parser_rejections(void)
     PARSE_ERR("---\na: 1\n", "multi-document");
     PARSE_ERR("a: yes\n", "true/false");
     PARSE_ERR("a: OFF\n", "true/false");
-    PARSE_ERR("a: { k: 1,\n  j: 2 }\n", "multi-line flow");
+    PARSE_ERR("a: { k: 1 }\n", "flow collections");
+    PARSE_ERR("a: [1, 2]\n", "flow collections");
     PARSE_ERR("a: 1\na: 2\n", "duplicate key");
     PARSE_ERR("a: 25:10\n", "invalid time");
     PARSE_ERR("a: 1\n  b: 2\n", "unexpected indentation");
@@ -193,14 +194,9 @@ static void test_parser_rejections(void)
     /* depth > 6 */
     PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f:\n            g: 1\n",
               "nesting deeper");
-    /* mixed block/flow (review T2-4): the flow collection on a key's own
-     * line shares the key's depth; further flow nesting counts +1 each */
-    CHECK(parse_only_ok("a:\n  b:\n    c:\n      d:\n        e:\n          f: [0]\n"));
-    PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f: [[0]]\n",
-              "nesting deeper");
-    /* the review's depth-11 document */
-    PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f: [[[[[0]]]]]\n",
-              "nesting deeper");
+    CHECK(parse_only_ok("a:\n  b:\n    c:\n      d:\n        e:\n          f: 0\n"));
+    PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f:\n"
+              "            g: 0\n", "nesting deeper");
 
     /* int64 / duration magnitude is checked BEFORE any multiply (review
      * T2-1: "999999999999999999h" was signed-overflow UB) */
@@ -293,30 +289,31 @@ static void test_parser_rejections(void)
 
 static void test_compiler_rules(void)
 {
-    /* valid trigger shapes */
+    /* Five-field cron, seconds-first cron, solar, and lifecycle triggers. */
     sched_program_t *p = COMPILE_OK(
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
         "  j:\n"
-        "    on:\n"
-        "      - { every: 5m, phase: 30s }\n"
-        "      - { at: \"08:00\" }\n"
-        "      - { weekly: { days: [mon, wed], at: 9:30 } }\n"
-        "      - { cron: \"0 3 * * sun\" }\n"
-        "      - { sun: sunset }\n"
+        "    schedule:\n"
+        "      - cron: \"*/5 * * * *\"\n"
+        "      - cron: \"0 8 * * *\"\n"
+        "      - cron: \"0 30 9 * * mon,wed\"\n"
+        "      - cron: 0 3 * * sun\n"
+        "      - solar: sunset\n"
         "      - boot\n"
         "      - dispatch\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n");
     CHECK(p != NULL);
     if (p != NULL) {
         CHECK(p->job_count == 1);
         const sched_job_t *j = &p->jobs[0];
         CHECK(j->trigger_count == 7);
-        CHECK(j->triggers[0].u.every.period_ms == 300000);
-        CHECK(j->triggers[0].u.every.phase_ms == 30000);
-        CHECK(j->triggers[2].u.weekly.days_mask == ((1u << 1) | (1u << 3)));
-        CHECK(j->triggers[2].u.weekly.hh == 9 && j->triggers[2].u.weekly.mm == 30);
-        CHECK(j->triggers[4].u.sun.event == TIME_SYNC_SUNSET);
+        CHECK(j->triggers[0].kind == SCHED_TRIG_CRON);
+        CHECK(j->triggers[2].kind == SCHED_TRIG_CRON);
+        CHECK(j->triggers[4].u.solar.event == TIME_SYNC_SUNSET);
         CHECK(j->on_enter == 0); /* ungated: no gate to enter */
         CHECK(j->overlap == SCHED_OVERLAP_SKIP && j->missed == SCHED_MISSED_SKIP);
         free(p);
@@ -327,11 +324,16 @@ static void test_compiler_rules(void)
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
         "  j:\n"
-        "    on: { every: 5m }\n"
-        "    when: { window: night }\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    when:\n"
+        "      window: night\n"
         "    overlap: queue-one\n"
         "    missed: run-once\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const sched_job_t *j = &p->jobs[0];
@@ -349,13 +351,21 @@ static void test_compiler_rules(void)
         "protocols:\n"
         "  P:\n"
         "    segments:\n"
-        "      - { pulses: 10, freq: 5, actinic: -100 }\n"
+        "      - pulses: 10\n"
+        "        freq: 5\n"
+        "        actinic: -100\n"
         "    persist: true\n"
         "    allow_interrupt: true\n"
         "jobs:\n"
         "  j:\n"
-        "    on: { every: 5m }\n"
-        "    steps: [ { uses: ambit/trace, with: { protocol: P, channels: [0] } } ]\n");
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: ambit/trace\n"
+        "        with:\n"
+        "          protocol: P\n"
+        "          channels:\n"
+        "            - 0\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const sched_protocol_t *proto = &p->protocols[0];
@@ -388,10 +398,20 @@ static void test_compiler_rules(void)
     p = COMPILE_OK(
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
-        "  a:\n    on: { every: 5m }\n"
-        "    steps: [ { uses: ambit/spectrum } ]\n"
-        "  b:\n    on: { every: 5m }\n"
-        "    steps: [ { uses: ambit/spectrum, with: { channels: [0, 2] } } ]\n");
+        "  a:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: ambit/spectrum\n"
+        "  b:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: ambit/spectrum\n"
+        "        with:\n"
+        "          channels:\n"
+        "            - 0\n"
+        "            - 2\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const sched_step_t *a = &p->jobs[0].steps[0];
@@ -411,9 +431,19 @@ static void test_compiler_rules(void)
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
         "  j:\n"
-        "    on: { cron: \"0 * * * *\" }\n"
-        "    steps: [ { uses: db/store-event, with: { kind: hourly, "
-        "data: { runs: $job.runs, saturated: $job.skipped_saturated, note: hello, n: 5, x: 1.5, ok: true } } } ]\n");
+        "    schedule:\n"
+        "      cron: 0 * * * *\n"
+        "    steps:\n"
+        "      - uses: db/store-event\n"
+        "        with:\n"
+        "          kind: hourly\n"
+        "          data:\n"
+        "            runs: $job.runs\n"
+        "            saturated: $job.skipped_saturated\n"
+        "            note: hello\n"
+        "            n: 5\n"
+        "            x: 1.5\n"
+        "            ok: true\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const sched_step_t *st = &p->jobs[0].steps[0];
@@ -421,98 +451,211 @@ static void test_compiler_rules(void)
         free(p);
     }
 
-    /* every rule of the plan's list that is cheap to trigger inline */
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { every: 1m, cron: \"0 * * * *\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-                "exactly one");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { sun: sunrise, offset: 30m, phase: 1s }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    /* Duplicate trigger keys and unknown modifiers fail closed. */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 * * * * *\"\n"
+    "      cron: 0 * * * *\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
+                "duplicate key 'cron'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      solar: sunrise\n"
+    "      offset: 30m\n"
+    "      phase: 1s\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "phase");
     /* Signed sun/window modifiers use a separate compiler parser from YAML's
      * duration lexer. It must require at least one digit and guard magnitude
      * before every decimal/unit multiplication as well. */
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { sun: sunrise, offset: \"+h\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      solar: sunrise\n"
+    "      offset: +h\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "expected a duration");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { sun: sunrise, offset: \"+9223372036854775808ms\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      solar: sunrise\n"
+    "      offset: +9223372036854775808ms\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "duration too large");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { sun: sunrise, offset: \"+999999999999999999999999999999999999h\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      solar: sunrise\n"
+    "      offset: +999999999999999999999999999999999999h\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "duration too large");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: [ boot ]\n"
-                "    frobnicate: 1\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      - boot\n"
+    "    frobnicate: 1\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "unknown job key");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    steps: [ { uses: device/log, with: { message: hi }, bogus: 1 } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n"
+    "        bogus: 1\n",
                 "unknown step key");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    when: { window: { from: sunrise } }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    when:\n"
+    "      window:\n"
+    "        from: sunrise\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "from: and to:");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    when: { window: { from: noon, to: sunset } }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    when:\n"
+    "      window:\n"
+    "        from: noon\n"
+    "        to: sunset\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "window edge");
     /* duration vs period passes exactly at the boundary (the shipped SS shape) */
     p = COMPILE_OK(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "protocols:\n  SS:\n    - { pulses: 45, freq: 1, actinic: 0 }\n"
-        "jobs:\n  j:\n    on: { every: 1m }\n"
-        "    steps: [ { uses: ambit/trace, with: { protocol: SS, channels: [0] } } ]\n");
+        "protocols:\n"
+        "  SS:\n"
+        "    - pulses: 45\n"
+        "      freq: 1\n"
+        "      actinic: 0\n"
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: ambit/trace\n"
+        "        with:\n"
+        "          protocol: SS\n"
+        "          channels:\n"
+        "            - 0\n");
     CHECK(p != NULL);
     free(p);
 
-    /* review T2-3: protocol references resolve for EVERY trigger kind,
-     * not only inside the every-trigger duration check */
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: [ boot ]\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+    /* Protocol references resolve for every remaining trigger kind. */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      - boot\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: NOPE\n",
                 "unknown protocol");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { cron: \"0 9 * * *\" }\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: 0 9 * * *\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: NOPE\n",
                 "unknown protocol");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { sun: sunset }\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      solar: sunset\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: NOPE\n",
                 "unknown protocol");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { at: \"08:00\" }\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
-                "unknown protocol");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { weekly: { days: [mon], at: \"08:00\" } }\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
-                "unknown protocol");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: dispatch\n"
-                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule: dispatch\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: NOPE\n",
                 "unknown protocol");
 
     /* header provenance keys are string scalars only (review): 123 / true /
      * 30m keep .str set for every scalar kind, so node_text proves nothing */
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nid: 123\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "id: 123\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "'id' must be a string");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nversion: true\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "version: true\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "'version' must be a string");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nworkbookVersionId: 30m\njobs:\n  j:\n"
-                "    on: { every: 5m }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "workbookVersionId: 30m\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 */5 * * * *\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "'workbookVersionId' must be a string");
     /* and string provenance is carried through */
     p = COMPILE_OK(
@@ -520,8 +663,14 @@ static void test_compiler_rules(void)
         "id: urn:jii:schedule:default-multichannel\n"
         "version: 0.1.0-draft\n"
         "workbookVersionId: 7b281a2e-d86a-4cc6-8268-81b67315f1ad\n"
-        "jobs:\n  j:\n    on: { every: 5m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const char *id = sched_pool_str(p, p->id_off);
@@ -533,28 +682,65 @@ static void test_compiler_rules(void)
         free(p);
     }
 
-    /* strict quoted HH:MM (review): partial matches and extra fields reject */
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { at: \"1:2x\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-                "expected HH:MM");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { at: \"1:2\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-                "expected HH:MM");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: { at: \"10:00:00\" }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-                "expected HH:MM");
-    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                "    on: [ boot ]\n"
-                "    when: { window: { from: \"9:5x\", to: sunset } }\n"
-                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+    /* Removed trigger aliases stay rejected: authored schedules use cron. */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      at: 1:2x\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
+                "unknown schedule key 'at'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      weekly: 1:2\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
+                "unknown schedule key 'weekly'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      interval: 10m\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
+                "unknown schedule key 'interval'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      - boot\n"
+    "    when:\n"
+    "      window:\n"
+    "        from: 9:5x\n"
+    "        to: sunset\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n",
                 "window edge");
-    /* sane quoted clocks still compile */
-    p = COMPILE_OK("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
-                   "    on: [ { at: \"08:00\" }, { at: \"8:05\" } ]\n"
-                   "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+    /* Quoted clocks remain valid for explicit windows. */
+    p = COMPILE_OK("schema: jii.ambyte-schedule/v1-draft\n"
+    "jobs:\n"
+    "  j:\n"
+    "    schedule:\n"
+    "      cron: \"0 8 * * *\"\n"
+    "    when:\n"
+    "      window:\n"
+    "        from: \"08:00\"\n"
+    "        to: \"8:05\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n");
     CHECK(p != NULL);
     free(p);
 }
@@ -573,18 +759,30 @@ static void test_cron_basics(void)
     CHECK(c.dow == 0x3E); /* mon..fri */
     CHECK(c.dom_restricted && c.dow_restricted);
 
+    /* Common seconds-first extension, as used by esp_cron/ccronexpr. */
+    CHECK(sched_cron_parse("*/5 * * * * *", &c, err, sizeof(err)) == ESP_OK);
+    CHECK(c.has_seconds == 1);
+    CHECK(c.sec == ((1ULL << 0) | (1ULL << 5) | (1ULL << 10) |
+                    (1ULL << 15) | (1ULL << 20) | (1ULL << 25) |
+                    (1ULL << 30) | (1ULL << 35) | (1ULL << 40) |
+                    (1ULL << 45) | (1ULL << 50) | (1ULL << 55)));
+    sched_tm_like_t at_five_seconds = { 2026, 9, 4, 9, 0, 5, 5 };
+    CHECK(sched_cron_matches(&c, &at_five_seconds));
+    at_five_seconds.sec = 6;
+    CHECK(!sched_cron_matches(&c, &at_five_seconds));
+
     CHECK(sched_cron_parse("0 9 * * *", &c, err, sizeof(err)) == ESP_OK);
     CHECK(!c.dom_restricted && !c.dow_restricted);
-    sched_tm_like_t t = { 2026, 9, 4, 9, 0, 5 }; /* Friday */
+    sched_tm_like_t t = { 2026, 9, 4, 9, 0, 5, 0 }; /* Friday */
     CHECK(sched_cron_matches(&c, &t));
     t.min = 1;
     CHECK(!sched_cron_matches(&c, &t));
 
     /* vixie OR rule: "0 0 13 * fri" fires on the 13th AND every Friday */
     CHECK(sched_cron_parse("0 0 13 * fri", &c, err, sizeof(err)) == ESP_OK);
-    sched_tm_like_t fri = { 2026, 9, 4, 0, 0, 5 };   /* Friday, not 13th */
-    sched_tm_like_t thirteenth = { 2026, 10, 13, 0, 0, 2 }; /* Tuesday 13th */
-    sched_tm_like_t other = { 2026, 10, 14, 0, 0, 3 };
+    sched_tm_like_t fri = { 2026, 9, 4, 0, 0, 5, 0 };   /* Friday, not 13th */
+    sched_tm_like_t thirteenth = { 2026, 10, 13, 0, 0, 2, 0 }; /* Tuesday 13th */
+    sched_tm_like_t other = { 2026, 10, 14, 0, 0, 3, 0 };
     CHECK(sched_cron_matches(&c, &fri));
     CHECK(sched_cron_matches(&c, &thirteenth));
     CHECK(!sched_cron_matches(&c, &other));
@@ -607,6 +805,8 @@ static void test_cron_basics(void)
     CHECK(sched_cron_parse("@daily", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0 0 * *", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0 0 * * * extra", &c, err, sizeof(err)) == ESP_FAIL);
+    CHECK(sched_cron_parse("0 0 0 * * * extra", &c, err, sizeof(err)) == ESP_FAIL);
+    CHECK(sched_cron_parse("60 * * * * *", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0 25 * * *", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0/0 * * * *", &c, err, sizeof(err)) == ESP_FAIL);
     /* A numeric cron token is bounded input too; reject it without overflowing
@@ -639,6 +839,10 @@ static void test_cron_basics(void)
     CHECK(sched_cron_parse("*/7 * * * *", &c, err, sizeof(err)) == ESP_OK);
     CHECK(sched_cron_next(&c, time_sync_make(2026, 6, 1, 0, 0, 0), &out) == ESP_OK);
     CHECK(out == time_sync_make(2026, 6, 1, 0, 7, 0));
+    /* six-field next-fire searches at second resolution */
+    CHECK(sched_cron_parse("*/5 * * * * *", &c, err, sizeof(err)) == ESP_OK);
+    CHECK(sched_cron_next(&c, time_sync_make(2026, 6, 1, 0, 0, 0), &out) == ESP_OK);
+    CHECK(out == time_sync_make(2026, 6, 1, 0, 0, 5));
     /* month name + bounded search: "0 0 29 2 *" from 2027 → 2028 (leap) */
     CHECK(sched_cron_parse("0 0 29 feb *", &c, err, sizeof(err)) == ESP_OK);
     CHECK(sched_cron_next(&c, time_sync_make(2027, 3, 1, 0, 0, 0), &out) == ESP_OK);
@@ -659,7 +863,7 @@ static int count_wall_matches(const sched_cron_t *c, time_t from_utc, time_t to_
         int y, mo, d, h, mi, wd;
         time_sync_localtime(frame, &y, &mo, &d, &h, &mi, NULL, &wd);
         if (y != want_y || mo != want_m || d != want_d) continue;
-        sched_tm_like_t t = { y, mo, d, h, mi, wd };
+        sched_tm_like_t t = { y, mo, d, h, mi, wd, 0 };
         if (sched_cron_matches(c, &t)) n++;
     }
     return n;
@@ -797,8 +1001,14 @@ static void test_due_model(void)
     /* late grace: within period → fires late; past period → skipped */
     sched_due_t *d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
@@ -814,8 +1024,14 @@ static void test_due_model(void)
     /* skip counting across a big clock step: 10 m grid, 2 h jump → 11 slots */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     if (d != NULL) {
         /* one poll at t0+2h: the 11 slots in (t0, t0+6600] are counted
@@ -831,8 +1047,14 @@ static void test_due_model(void)
      * elapsed slots; 5039 are stale and the current slot fires. */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 35 * 86400) == 1);
@@ -841,24 +1063,46 @@ static void test_due_model(void)
         free(d);
     }
 
-    /* The due model has one-second resolution. Reject the 1500 ms grid that
-     * used to be quantised +2,+3,+5,+6,+8,+9,+11 and then miscounted by the
-     * arithmetic stale-slot shortcut. */
+    /* Seconds-first cron lowers regular sub-minute grids onto the monotonic
+     * cadence path; the public grammar cannot express fractional seconds. */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"*/5 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n");
+    CHECK(p != NULL);
+    if (p != NULL) {
+        CHECK(p->jobs[0].triggers[0].kind == SCHED_TRIG_INTERVAL);
+        CHECK(p->jobs[0].triggers[0].u.interval.period_ms == 5000);
+        free(p);
+    }
     COMPILE_ERR(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1500ms }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-        "whole number of seconds");
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"* * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
+        "expected 5 fields");
     COMPILE_ERR(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 2500ms }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-        "whole number of seconds");
-    COMPILE_ERR(
-        "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 90s, phase: 1500ms }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
-        "whole number of seconds");
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"60 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
+        "0..59 in second");
 
     /* review T2-2, the exact case: 10 m grid behind a daily 10:00–11:00
      * window, init 10:00, poll ~26 h later. The gate flips twice inside the
@@ -866,9 +1110,18 @@ static void test_due_model(void)
      * day 2 = 11), never the whole 155-slot interval arithmetically. */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
@@ -882,9 +1135,19 @@ static void test_due_model(void)
      * one's), then the debt is consumed */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n    missed: run-once\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    missed: run-once\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 1);
@@ -899,9 +1162,18 @@ static void test_due_model(void)
      * the first slot's gate state */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
@@ -916,9 +1188,18 @@ static void test_due_model(void)
     time_sync_set_utc_offset_seconds(7200);
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 10m }\n"
-        "    when: { window: { from: sunrise, to: sunset } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: sunrise\n"
+        "        to: sunset\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
@@ -936,12 +1217,29 @@ static void test_due_model(void)
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
-        "  a:\n    on: { every: 1s }\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: a } } ]\n"
-        "  b:\n    on: { every: 1s }\n    missed: run-once\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: b } } ]\n",
+        "  a:\n"
+        "    schedule:\n"
+        "      cron: \"* * * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: a\n"
+        "  b:\n"
+        "    schedule:\n"
+        "      cron: \"* * * * * *\"\n"
+        "    missed: run-once\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: b\n",
         time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 2);
@@ -957,14 +1255,37 @@ static void test_due_model(void)
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
-        "  fast:\n    on: { every: 1s }\n"
-        "    when: { window: { from: sunrise-1h, to: sunset+1h, unresolved: skip } }\n"
-        "    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]\n"
-        "  slow:\n    on: { every: 10m }\n"
-        "    when: { window: { from: sunset+1h, to: sunrise-1h, unresolved: run } }\n"
-        "    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]\n"
-        "  hourly_status:\n    on: { cron: \"0 * * * *\" }\n"
-        "    steps: [ { uses: device/status-report } ]\n",
+        "  fast:\n"
+        "    schedule:\n"
+        "      cron: \"* * * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: sunrise-1h\n"
+        "        to: sunset+1h\n"
+        "        unresolved: skip\n"
+        "    steps:\n"
+        "      - uses: ambit/spectrum\n"
+        "        with:\n"
+        "          channels:\n"
+        "            - 0\n"
+        "  slow:\n"
+        "    schedule:\n"
+        "      cron: \"0 */10 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: sunset+1h\n"
+        "        to: sunrise-1h\n"
+        "        unresolved: run\n"
+        "    steps:\n"
+        "      - uses: ambit/spectrum\n"
+        "        with:\n"
+        "          channels:\n"
+        "            - 0\n"
+        "  hourly_status:\n"
+        "    schedule:\n"
+        "      cron: 0 * * * *\n"
+        "    steps:\n"
+        "      - uses: device/status-report\n",
         time_sync_make(2026, 6, 21, 11, 15, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 21, 13, 15, 0)) == 0x1);
@@ -979,8 +1300,14 @@ static void test_due_model(void)
      * UINT32_MAX occurrences. */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1s }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"* * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + (int64_t)UINT32_MAX + 10000000) == 1);
@@ -996,8 +1323,14 @@ static void test_due_model(void)
     time_sync_set_utc_offset_seconds(7200);
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { sun: sunrise }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      solar: sunrise\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(d->jobs[0].wall_due_local[0] == -1);
@@ -1018,9 +1351,18 @@ static void test_due_model(void)
      * lower bound, and skipped_saturated reports it. */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1s }\n"
-        "    when: { window: { from: sunrise, to: sunset } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"* * * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: sunrise\n"
+        "        to: sunset\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 1, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
         struct timespec ta, tb;
@@ -1040,8 +1382,15 @@ static void test_due_model(void)
     /* missed: run-once — one make-up fire instead of a skip count */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { cron: \"0 9 * * *\" }\n    missed: run-once\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: 0 9 * * *\n"
+        "    missed: run-once\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 0, 0, 0), identity_localize, &p);
     if (d != NULL) {
         /* clock jumps to noon: the 09:00 slot is 3 h past grace */
@@ -1056,9 +1405,18 @@ static void test_due_model(void)
     /* window entry: on_enter fires once when the gate opens */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 5m }\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 9, 55, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 21, 9, 58, 0)) == 0);
@@ -1073,8 +1431,14 @@ static void test_due_model(void)
     /* backward clock step: dues only move forward, no refire */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 60) == 1);
@@ -1088,9 +1452,18 @@ static void test_due_model(void)
     /* boot fires once, after the gate opens if gated */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: [ boot ]\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      - boot\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 9, 0, 0), identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, time_sync_make(2026, 6, 21, 9, 0, 1)) == 0); /* gated */
@@ -1103,8 +1476,13 @@ static void test_due_model(void)
     /* dispatch never fires by itself */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: dispatch\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule: dispatch\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 3600) == 0);
@@ -1118,8 +1496,15 @@ static void test_due_model(void)
     time_sync_set_utc_offset_seconds(7200);
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: [ { sun: sunset, offset: +30m } ]\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      - solar: sunset\n"
+        "        offset: +30m\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
         int64_t set, expect = 0;
@@ -1139,15 +1524,21 @@ static void test_due_reanchor(void)
 {
     sched_program_t *p;
     int64_t t0 = time_sync_make(2026, 6, 21, 0, 0, 0); /* grid-aligned */
-    const char *every_1m =
+    const char *fixed_1m =
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n";
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n";
 
     /* backward 1 h correction: without re-anchor the stale due (t0+120)
      * would silence the 1 m job for ~1 h; re-anchor resumes it within one
      * period on the new timebase */
-    sched_due_t *d = mk_due(every_1m, t0, identity_localize, &p);
+    sched_due_t *d = mk_due(fixed_1m, t0, identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 60) == 1);            /* fired; next due t0+120 */
@@ -1165,8 +1556,8 @@ static void test_due_reanchor(void)
 
     /* forward ~2 h correction: dues at/past the new now are LEFT for poll's
      * late-grace/missed accounting — counted skipped slots, then the in-grace
-     * slot fires (grace for every 1m is the period, 60 s) */
-    d = mk_due(every_1m, t0, identity_localize, &p);
+     * slot fires (fixed 1 m cron uses its 60 s period as grace) */
+    d = mk_due(fixed_1m, t0, identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 60) == 1);
@@ -1183,8 +1574,15 @@ static void test_due_reanchor(void)
      * boot firing was consumed) */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: [ boot, { every: 1m } ]\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      - boot\n"
+        "      - cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
@@ -1197,20 +1595,26 @@ static void test_due_reanchor(void)
         free(d);
     }
 
-    /* fired-minute latch preserved: a sub-minute backward step re-anchors the
-     * cron due into the minute that already fired, and the latch is what
+    /* Fired-second latch preserved: a sub-minute backward step re-anchors the
+     * cron due onto the instant that already fired, and the latch is what
      * prevents the double-fire */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { cron: \"* * * * *\" }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: '* * * * *'\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         t0, identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
         CHECK(sched_due_poll(d, t0 + 60) == 1);
-        int64_t latch = d->jobs[0].fired_minute;
+        int64_t latch = d->jobs[0].fired_second;
         sched_due_reanchor(d, t0 + 30);                    /* 30 s backward */
-        CHECK(d->jobs[0].fired_minute == latch);           /* latch preserved */
+        CHECK(d->jobs[0].fired_second == latch);           /* latch preserved */
         CHECK(d->jobs[0].wall_due_local[0] == t0 + 60);    /* re-anchored into */
         CHECK(sched_due_poll(d, t0 + 60) == 0);            /* ...but no refire */
         CHECK(sched_due_poll(d, t0 + 120) == 1);           /* next minute normal */
@@ -1223,9 +1627,18 @@ static void test_due_reanchor(void)
      * grid: windowed job mid-window keeps gate_open, no spurious entry edge */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 5m }\n"
-        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    when:\n"
+        "      window:\n"
+        "        from: 10:00\n"
+        "        to: 11:00\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
         time_sync_make(2026, 6, 21, 9, 59, 0), identity_localize, &p);
     CHECK(d != NULL);
     if (d != NULL) {
@@ -1249,8 +1662,14 @@ static void test_due_monotonic_clock(void)
 {
     const char *every_1m =
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { every: 1m }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n";
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 * * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n";
     const int64_t us = 1000000;
     const int64_t mono0 = 5000000;
     const int64_t t0 = time_sync_make(2026, 6, 21, 0, 0, 0);
@@ -1311,8 +1730,14 @@ static void test_due_dst(void)
     tzset();
     const char *yaml =
         "schema: jii.ambyte-schedule/v1-draft\n"
-        "jobs:\n  j:\n    on: { cron: \"30 2 * * *\" }\n"
-        "    steps: [ { uses: device/log, with: { message: hi } } ]\n";
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: 30 2 * * *\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n";
 
     struct tm day = { 0 };
     day.tm_year = 126; day.tm_mon = 9; day.tm_mday = 24; /* 2026-10-24 UTC */

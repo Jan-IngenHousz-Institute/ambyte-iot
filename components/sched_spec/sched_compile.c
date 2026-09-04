@@ -15,11 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* every/period bounds: 1 s floor (the ping cache and UART transaction cost
- * make anything faster meaningless in the field) … 24 h. */
-#define EVERY_MIN_MS 1000
-#define EVERY_MAX_MS (24 * 3600 * 1000)
-#define SUN_OFFSET_MAX_S (12 * 3600) /* plan: sun.offset within ±12 h */
+#define SOLAR_OFFSET_MAX_S (12 * 3600)
 #define TRACE_MARGIN_DEFAULT_MS 15000 /* matches the action table default */
 
 typedef struct {
@@ -371,8 +367,8 @@ static bool parse_signed_duration(ctx_t *c, const sched_node_t *n, int64_t *out_
 }
 
 /* Exact clock grammar for quoted strings: 1–2 hour digits, ':', exactly 2
- * minute digits, full consumption. Shared by at/weekly triggers and window
- * edges — sscanf's %2d:%2d would accept partial matches like "1:2x".
+ * minute digits, full consumption. Used by window edges; sscanf's %2d:%2d
+ * would accept partial matches like "1:2x".
  * Mirrors the plain-scalar HHMM lexer in sched_yaml.c. */
 static bool parse_clock_str(const char *s, int *hh, int *mm)
 {
@@ -393,20 +389,42 @@ static bool parse_clock_str(const char *s, int *hh, int *mm)
     return true;
 }
 
-/* HH:MM from an HHMM scalar or a quoted/plain string. */
-static bool parse_hhmm(ctx_t *c, const sched_node_t *n, int *hh, int *mm)
+/* Identify a cron whose within-hour occurrences form a regular cadence and
+ * whose larger calendar fields are wildcards. Seconds-first expressions can
+ * then use the monotonic interval machinery; five-field expressions retain
+ * wall/DST semantics but still expose their period to the protocol fit check.
+ * Irregular and calendar-constrained expressions remain wall cron. */
+static bool cron_fixed_cadence(const sched_cron_t *cron,
+                               int64_t *period_ms, int64_t *phase_ms)
 {
-    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_HHMM) {
-        *hh = n->u.s.hh;
-        *mm = n->u.s.mm;
-        return true;
+    if (cron->hour != ((UINT32_C(1) << 24) - 1) ||
+        cron->dom != UINT32_C(0xFFFFFFFE) || cron->month != UINT16_C(0x1FFE) ||
+        cron->dow != UINT8_C(0x7F)) {
+        return false;
     }
-    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_STR &&
-        parse_clock_str(n->u.s.str, hh, mm)) {
-        return true;
+
+    int first = -1, previous = -1, period = -1;
+    for (int minute = 0; minute < 60; minute++) {
+        if ((cron->min & (UINT64_C(1) << minute)) == 0) continue;
+        for (int second = 0; second < 60; second++) {
+            if ((cron->sec & (UINT64_C(1) << second)) == 0) continue;
+            int instant = minute * 60 + second;
+            if (first < 0) first = instant;
+            if (previous >= 0) {
+                int gap = instant - previous;
+                if (period < 0) period = gap;
+                else if (gap != period) return false;
+            }
+            previous = instant;
+        }
     }
-    cerr(c, n, "expected HH:MM");
-    return false;
+    if (first < 0) return false;
+    int wrap_gap = 3600 + first - previous;
+    if (period < 0) period = wrap_gap;
+    if (wrap_gap != period) return false;
+    *period_ms = (int64_t)period * 1000;
+    *phase_ms = (int64_t)(first % period) * 1000;
+    return true;
 }
 
 static bool compile_trigger(ctx_t *c, const sched_node_t *node, sched_trigger_t *t)
@@ -422,179 +440,84 @@ static bool compile_trigger(ctx_t *c, const sched_node_t *node, sched_trigger_t 
             t->kind = SCHED_TRIG_DISPATCH;
             return true;
         }
-        cerr(c, node, "trigger must be 'boot', 'dispatch', or a mapping "
-             "({every|cron|at|weekly|sun: …})");
+        cerr(c, node, "schedule entry must be 'boot', 'dispatch', or a mapping "
+             "with cron or solar");
         return false;
     }
     if (node->kind != SCHED_NODE_MAP) {
-        cerr(c, node, "trigger must be a mapping ({every|cron|at|weekly|sun: …})");
+        cerr(c, node, "schedule entry must be a mapping with cron or solar");
         return false;
     }
-    /* exactly one trigger key, plus its modifiers */
-    const sched_node_t *every = map_get(node, "every");
-    const sched_node_t *cron  = map_get(node, "cron");
-    const sched_node_t *at    = map_get(node, "at");
-    const sched_node_t *weekly = map_get(node, "weekly");
-    const sched_node_t *sun   = map_get(node, "sun");
-    const sched_node_t *phase  = map_get(node, "phase");
+    /* Cron is the normal schedule. Solar is the one explicit extension for
+     * location-dependent events that no cron expression can know. */
+    const sched_node_t *cron     = map_get(node, "cron");
+    const sched_node_t *solar    = map_get(node, "solar");
     const sched_node_t *offset = map_get(node, "offset");
-    int count = (every != NULL) + (cron != NULL) + (at != NULL) +
-                (weekly != NULL) + (sun != NULL);
+    for (int i = 0; i < node->u.m.count; i++) {
+        const char *key = node->u.m.pairs[i].key;
+        bool known = strcmp(key, "cron") == 0 || strcmp(key, "solar") == 0 ||
+                     strcmp(key, "offset") == 0;
+        if (!known) {
+            cerr(c, node->u.m.pairs[i].value, "unknown schedule key '%s'", key);
+            return false;
+        }
+    }
+    int count = (cron != NULL) + (solar != NULL);
     if (count == 0) {
-        cerr(c, node, "trigger mapping needs one of every/cron/at/weekly/sun");
+        cerr(c, node, "schedule mapping needs one of cron/solar");
         return false;
     }
     if (count > 1) {
-        cerr(c, node, "trigger mapping has %d trigger keys; exactly one of "
-             "every/cron/at/weekly/sun", count);
-        return false;
-    }
-    for (int i = 0; i < node->u.m.count; i++) {
-        const char *key = node->u.m.pairs[i].key;
-        bool known = strcmp(key, "every") == 0 || strcmp(key, "cron") == 0 ||
-                     strcmp(key, "at") == 0 || strcmp(key, "weekly") == 0 ||
-                     strcmp(key, "sun") == 0 || strcmp(key, "phase") == 0 ||
-                     strcmp(key, "offset") == 0;
-        if (!known) {
-            cerr(c, node->u.m.pairs[i].value, "unknown trigger key '%s'", key);
-            return false;
-        }
-    }
-
-    if (every != NULL) {
-        t->kind = SCHED_TRIG_EVERY;
-        if (every->kind != SCHED_NODE_SCALAR || every->scal_kind != SCHED_SCAL_DURATION_MS) {
-            cerr(c, every, "'every' must be a duration (1s … 24h)");
-            return false;
-        }
-        int64_t period = every->u.s.ms;
-        if (period < EVERY_MIN_MS || period > EVERY_MAX_MS) {
-            cerr(c, every, "'every' must be between 1s and 24h (the ping cache and "
-                 "UART transaction cost make anything faster meaningless)");
-            return false;
-        }
-        if (period % 1000 != 0) {
-            cerr(c, every, "'every' must be a whole number of seconds "
-                           "(the due-time model has one-second resolution)");
-            return false;
-        }
-        int64_t ph = 0;
-        if (phase != NULL) {
-            if (phase->kind != SCHED_NODE_SCALAR || phase->scal_kind != SCHED_SCAL_DURATION_MS) {
-                cerr(c, phase, "'phase' must be a duration");
-                return false;
-            }
-            ph = phase->u.s.ms;
-            if (ph % 1000 != 0) {
-                cerr(c, phase, "'phase' must be a whole number of seconds "
-                               "(the due-time model has one-second resolution)");
-                return false;
-            }
-            if (ph >= period) {
-                cerr(c, phase, "'phase' must be smaller than the period");
-                return false;
-            }
-        }
-        if (offset != NULL) {
-            cerr(c, offset, "'offset' only applies to sun triggers");
-            return false;
-        }
-        t->u.every.period_ms = period;
-        t->u.every.phase_ms = ph;
-        return true;
-    }
-    if (phase != NULL) {
-        cerr(c, phase, "'phase' only applies to 'every' triggers");
+        cerr(c, node, "schedule mapping has %d schedule keys; exactly one of "
+             "cron/solar is allowed", count);
         return false;
     }
     if (cron != NULL) {
-        t->kind = SCHED_TRIG_CRON;
         const char *expr = node_text(cron);
         if (expr == NULL) {
-            cerr(c, cron, "'cron' must be a string like \"0 * * * *\"");
+            cerr(c, cron, "'cron' must be a string with 5 fields, or 6 with seconds");
             return false;
         }
         char cerr_buf[128];
-        if (sched_cron_parse(expr, &t->u.cron, cerr_buf, sizeof(cerr_buf)) != ESP_OK) {
+        sched_cron_t parsed;
+        if (sched_cron_parse(expr, &parsed, cerr_buf, sizeof(cerr_buf)) != ESP_OK) {
             cerr(c, cron, "%s", cerr_buf);
             return false;
         }
-        if (offset != NULL) { cerr(c, offset, "'offset' only applies to sun triggers"); return false; }
+        if (offset != NULL) {
+            cerr(c, offset, "'offset' only applies to solar schedules");
+            return false;
+        }
+        int64_t period_ms, phase_ms;
+        if (parsed.has_seconds &&
+            cron_fixed_cadence(&parsed, &period_ms, &phase_ms)) {
+            t->kind = SCHED_TRIG_INTERVAL;
+            t->u.interval.period_ms = period_ms;
+            t->u.interval.phase_ms = phase_ms;
+        } else {
+            t->kind = SCHED_TRIG_CRON;
+            t->u.cron = parsed;
+        }
         return true;
     }
-    if (at != NULL) {
-        t->kind = SCHED_TRIG_AT;
-        int hh, mm;
-        if (!parse_hhmm(c, at, &hh, &mm)) return false;
-        t->u.at.hh = (uint8_t)hh;
-        t->u.at.mm = (uint8_t)mm;
-        if (offset != NULL) { cerr(c, offset, "'offset' only applies to sun triggers"); return false; }
-        return true;
-    }
-    if (weekly != NULL) {
-        t->kind = SCHED_TRIG_WEEKLY;
-        if (weekly->kind != SCHED_NODE_MAP) {
-            cerr(c, weekly, "'weekly' must be a mapping {days: [...], at: HH:MM}");
-            return false;
-        }
-        const sched_node_t *days = map_get(weekly, "days");
-        const sched_node_t *wat  = map_get(weekly, "at");
-        for (int i = 0; i < weekly->u.m.count; i++) {
-            const char *key = weekly->u.m.pairs[i].key;
-            if (strcmp(key, "days") != 0 && strcmp(key, "at") != 0) {
-                cerr(c, weekly->u.m.pairs[i].value, "unknown weekly key '%s'", key);
-                return false;
-            }
-        }
-        if (days == NULL || wat == NULL) {
-            cerr(c, weekly, "'weekly' needs both days: and at:");
-            return false;
-        }
-        if (days->kind != SCHED_NODE_SEQ || days->u.q.count < 1) {
-            cerr(c, days, "'weekly.days' must be a non-empty list (mon … sun)");
-            return false;
-        }
-        uint8_t mask = 0;
-        for (int i = 0; i < days->u.q.count; i++) {
-            const sched_node_t *d = days->u.q.items[i];
-            const char *name = node_text(d);
-            int bit = name != NULL ? time_sync_day_bit(name) : -1;
-            if (bit < 0) {
-                cerr(c, d, "'weekly.days' entries are weekday names (mon … sun)");
-                return false;
-            }
-            mask |= (uint8_t)(1u << bit);
-        }
-        if (mask == 0) { /* unreachable given count ≥ 1, keep the rule explicit */
-            cerr(c, days, "'weekly' needs at least one day");
-            return false;
-        }
-        t->u.weekly.days_mask = mask;
-        int hh, mm;
-        if (!parse_hhmm(c, wat, &hh, &mm)) return false;
-        t->u.weekly.hh = (uint8_t)hh;
-        t->u.weekly.mm = (uint8_t)mm;
-        if (offset != NULL) { cerr(c, offset, "'offset' only applies to sun triggers"); return false; }
-        return true;
-    }
-    /* sun */
-    t->kind = SCHED_TRIG_SUN;
-    const char *ev = node_text(sun);
+    /* solar */
+    t->kind = SCHED_TRIG_SOLAR;
+    const char *ev = node_text(solar);
     if (ev == NULL ||
         (strcmp(ev, "sunrise") != 0 && strcmp(ev, "sunset") != 0)) {
-        cerr(c, sun, "'sun' must be sunrise or sunset");
+        cerr(c, solar, "'solar' must be sunrise or sunset");
         return false;
     }
-    t->u.sun.event = strcmp(ev, "sunrise") == 0 ? TIME_SYNC_SUNRISE : TIME_SYNC_SUNSET;
-    t->u.sun.offset_s = 0;
+    t->u.solar.event = strcmp(ev, "sunrise") == 0 ? TIME_SYNC_SUNRISE : TIME_SYNC_SUNSET;
+    t->u.solar.offset_s = 0;
     if (offset != NULL) {
         int64_t ms;
         if (!parse_signed_duration(c, offset, &ms)) return false;
-        if (ms % 1000 != 0 || ms / 1000 > SUN_OFFSET_MAX_S || ms / 1000 < -SUN_OFFSET_MAX_S) {
-            cerr(c, offset, "sun 'offset' must be a whole-second duration within ±12h");
+        if (ms % 1000 != 0 || ms / 1000 > SOLAR_OFFSET_MAX_S || ms / 1000 < -SOLAR_OFFSET_MAX_S) {
+            cerr(c, offset, "solar 'offset' must be a whole-second duration within ±12h");
             return false;
         }
-        t->u.sun.offset_s = (int32_t)(ms / 1000);
+        t->u.solar.offset_s = (int32_t)(ms / 1000);
     }
     return true;
 }
@@ -646,7 +569,7 @@ static bool parse_edge(ctx_t *c, const sched_node_t *n, sched_edge_t *e)
     int64_t ms;
     fake.u.s.str = s + base;
     if (!parse_signed_duration(c, &fake, &ms)) return false;
-    if (ms % 1000 != 0 || ms / 1000 > SUN_OFFSET_MAX_S || ms / 1000 < -SUN_OFFSET_MAX_S) {
+    if (ms % 1000 != 0 || ms / 1000 > SOLAR_OFFSET_MAX_S || ms / 1000 < -SOLAR_OFFSET_MAX_S) {
         cerr(c, n, "sun edge offset must be a whole-second duration within ±12h");
         return false;
     }
@@ -665,7 +588,7 @@ static bool edges_equal(const sched_edge_t *a, const sched_edge_t *b)
 static bool compile_when(ctx_t *c, const sched_node_t *when, sched_job_t *job)
 {
     if (when->kind != SCHED_NODE_MAP) {
-        cerr(c, when, "'when' must be a mapping ({window: …})");
+        cerr(c, when, "'when' must be a block mapping containing 'window'");
         return false;
     }
     const sched_node_t *win = map_get(when, "window");
@@ -698,7 +621,7 @@ static bool compile_when(ctx_t *c, const sched_node_t *when, sched_job_t *job)
         return true;
     }
     if (win->kind != SCHED_NODE_MAP) {
-        cerr(c, win, "'window' must be day, night, or {from: …, to: …}");
+        cerr(c, win, "'window' must be day, night, or a from/to block mapping");
         return false;
     }
     w->hint = SCHED_WIN_EXPLICIT;
@@ -825,7 +748,7 @@ static bool fill_entry(ctx_t *c, const sched_node_t *v,
         return true;
     case SCHED_IN_CHANNELS: {
         if (v->kind != SCHED_NODE_SEQ || v->u.q.count < 1) {
-            cerr(c, v, "input '%s' must be a non-empty channel list, e.g. [0, 1]",
+            cerr(c, v, "input '%s' must be a non-empty block list of channels",
                  decl->name);
             return false;
         }
@@ -1008,11 +931,11 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
     job->has_window = 0;
     bool on_enter_set = false;
 
-    const sched_node_t *on    = map_get(node, "on");
+    const sched_node_t *schedule = map_get(node, "schedule");
     const sched_node_t *when  = map_get(node, "when");
     const sched_node_t *steps = map_get(node, "steps");
     static const char *const k_job_keys[] = {
-        "on", "when", "overlap", "missed", "on_enter", "steps",
+        "schedule", "when", "overlap", "missed", "on_enter", "steps",
     };
     for (int i = 0; i < node->u.m.count; i++) {
         const char *key = node->u.m.pairs[i].key;
@@ -1025,8 +948,8 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
             return false;
         }
     }
-    if (on == NULL) {
-        cerr(c, node, "job '%s' has no 'on' (use 'on: dispatch' for a manual-only job)", name);
+    if (schedule == NULL) {
+        cerr(c, node, "job '%s' has no 'schedule' (use a boot/dispatch entry when needed)", name);
         return false;
     }
     if (steps == NULL) {
@@ -1064,20 +987,21 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
     if (!on_enter_set) job->on_enter = job->has_window;
 
     /* triggers */
-    if (on->kind == SCHED_NODE_SEQ) {
-        if (on->u.q.count < 1 || on->u.q.count > SCHED_SPEC_MAX_TRIGGERS) {
-            cerr(c, on, "job '%s' has %d triggers; the cap is %d",
-                 name, on->u.q.count, SCHED_SPEC_MAX_TRIGGERS);
+    if (schedule->kind == SCHED_NODE_SEQ) {
+        if (schedule->u.q.count < 1 || schedule->u.q.count > SCHED_SPEC_MAX_TRIGGERS) {
+            cerr(c, schedule, "job '%s' has %d schedule entries; the cap is %d",
+                 name, schedule->u.q.count, SCHED_SPEC_MAX_TRIGGERS);
             return false;
         }
-        for (int i = 0; i < on->u.q.count; i++) {
-            if (!compile_trigger(c, on->u.q.items[i], &job->triggers[job->trigger_count])) {
+        for (int i = 0; i < schedule->u.q.count; i++) {
+            if (!compile_trigger(c, schedule->u.q.items[i],
+                                 &job->triggers[job->trigger_count])) {
                 return false;
             }
             job->trigger_count++;
         }
     } else {
-        if (!compile_trigger(c, on, &job->triggers[0])) return false;
+        if (!compile_trigger(c, schedule, &job->triggers[0])) return false;
         job->trigger_count = 1;
     }
 
@@ -1105,7 +1029,7 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
     for (int i = 0; i < steps->u.q.count; i++) {
         const sched_node_t *sn = steps->u.q.items[i];
         if (sn->kind != SCHED_NODE_MAP) {
-            cerr(c, sn, "step must be a mapping ({uses: …, with: {…}})");
+            cerr(c, sn, "step must be a block mapping containing 'uses'");
             return false;
         }
         const sched_node_t *uses = map_get(sn, "uses");
@@ -1147,10 +1071,10 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
         job->step_count++;
     }
 
-    /* Protocol references: resolve every ambit/trace step's protocol here,
-     * once, regardless of trigger kind — a boot/cron/sun trace referencing a
-     * missing protocol must not reach runtime. The duration-vs-period check
-     * below then runs only for every triggers. */
+    /* Resolve every ambit/trace protocol here regardless of trigger kind; a
+     * boot, cron, or solar trace with a missing protocol must not reach
+     * runtime. The duration-vs-period check below applies when regular cron
+     * lowered to a fixed cadence. */
     for (int si = 0; si < job->step_count; si++) {
         const sched_step_t *step = &job->steps[si];
         if (strcmp(step->action->name, "ambit/trace") != 0) continue;
@@ -1166,8 +1090,16 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
      * SS on a 1 m grid would have been caught by this) */
     for (int ti = 0; ti < job->trigger_count; ti++) {
         const sched_trigger_t *t = &job->triggers[ti];
-        if (t->kind != SCHED_TRIG_EVERY) continue;
-        int64_t period = t->u.every.period_ms;
+        int64_t period, unused_phase;
+        if (t->kind == SCHED_TRIG_INTERVAL) {
+            period = t->u.interval.period_ms;
+        } else if (t->kind == SCHED_TRIG_CRON &&
+                   cron_fixed_cadence(&t->u.cron, &period, &unused_phase)) {
+            /* A five-field fixed grid keeps calendar/DST semantics, but its
+             * period is still known well enough for the fit check. */
+        } else {
+            continue;
+        }
         for (int si = 0; si < job->step_count; si++) {
             const sched_step_t *step = &job->steps[si];
             if (strcmp(step->action->name, "ambit/trace") != 0) continue;

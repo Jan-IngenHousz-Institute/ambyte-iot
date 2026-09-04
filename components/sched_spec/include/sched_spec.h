@@ -122,7 +122,7 @@ typedef enum {
     SCHED_IN_BOOL,
     SCHED_IN_STRING,
     SCHED_IN_DURATION_MS, /* duration scalar; range in ms via min/max */
-    SCHED_IN_CHANNELS,    /* flow seq of ints 0..3, unique */
+    SCHED_IN_CHANNELS,    /* block sequence of ints 0..3, unique */
     SCHED_IN_MAP,         /* flat string→scalar map, ≤ SCHED_SPEC_MAX_EVENT_KEYS */
 } sched_input_type_t;
 
@@ -214,8 +214,10 @@ typedef struct {
     sched_segment_t segments[SCHED_SPEC_MAX_SEGMENTS];
 } sched_protocol_t;
 
-/* 5-field cron as bitmasks (plan "Cron matcher"). */
+/* Cron bitmasks. Five fields mean minute/hour/dom/month/dow; a sixth field is
+ * accepted before them for second-level schedules. */
 typedef struct {
+    uint64_t sec;   /* bits 0..59; five-field expressions set only bit 0 */
     uint64_t min;   /* bits 0..59 */
     uint32_t hour;  /* bits 0..23 */
     uint32_t dom;   /* bits 1..31 */
@@ -223,15 +225,15 @@ typedef struct {
     uint8_t  dow;   /* bits 0..6, 0=Sunday (7 folded in at parse) */
     uint8_t  dom_restricted; /* field did not start with '*' (vixie OR rule) */
     uint8_t  dow_restricted;
-    uint8_t  _pad;
+    uint8_t  has_seconds;
 } sched_cron_t;
 
 typedef enum {
-    SCHED_TRIG_EVERY,
+    /* Internal fixed-cadence lowering for regular cron expressions. This is
+     * not an authored YAML trigger. */
+    SCHED_TRIG_INTERVAL,
     SCHED_TRIG_CRON,
-    SCHED_TRIG_AT,
-    SCHED_TRIG_WEEKLY,
-    SCHED_TRIG_SUN,
+    SCHED_TRIG_SOLAR,
     SCHED_TRIG_BOOT,
     SCHED_TRIG_DISPATCH,
 } sched_trigger_kind_t;
@@ -240,11 +242,9 @@ typedef struct {
     uint8_t kind; /* sched_trigger_kind_t */
     uint8_t _pad[7];
     union {
-        struct { int64_t period_ms; int64_t phase_ms; } every;
+        struct { int64_t period_ms; int64_t phase_ms; } interval;
         sched_cron_t cron;
-        struct { uint8_t hh, mm; } at;
-        struct { uint8_t days_mask, hh, mm; } weekly; /* bit i = weekday i, 0=Sun */
-        struct { uint8_t event; int32_t offset_s; } sun; /* ±12 h, compile-checked */
+        struct { uint8_t event; int32_t offset_s; } solar; /* ±12 h, compile-checked */
     } u;
 } sched_trigger_t;
 
@@ -354,7 +354,7 @@ int64_t sched_estimate_ms(const sched_protocol_t *proto);
 /* ── cron ────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    int year, month, day, hour, min, wday; /* wday 0=Sun; year/month/day for masks */
+    int year, month, day, hour, min, wday, sec; /* wday 0=Sun */
 } sched_tm_like_t;
 
 esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
@@ -364,8 +364,8 @@ bool sched_cron_matches(const sched_cron_t *c, const sched_tm_like_t *t);
  * ESP_ERR_NOT_FOUND beyond that. Operates on the linear local frame:
  * spring-forward times that never materialise on the wall are still frame
  * instants — the runner's poll skips them because its localised now jumps
- * past, and the fall-back double wall minute is de-duplicated by the due
- * model's forward-only dues + fired-minute latch. */
+ * past, and a repeated fall-back wall instant is de-duplicated by the due
+ * model's forward-only dues + fired-second latch. */
 esp_err_t sched_cron_next(const sched_cron_t *c, int64_t after_local, int64_t *out_local);
 
 /* ── window math ─────────────────────────────────────────────────────── */
@@ -390,7 +390,7 @@ typedef struct {
     int64_t due_us[SCHED_SPEC_MAX_TRIGGERS]; /* armed monotonic µs; INT64_MIN=none */
     int64_t wall_due_local[SCHED_SPEC_MAX_TRIGGERS]; /* paired wall anchor used
                                              * only to resolve wall successors */
-    int64_t fired_minute;  /* last local minute a cron trigger fired in (DST latch) */
+    int64_t fired_second;  /* last local second a cron trigger fired in (DST latch) */
     uint32_t skipped;      /* runnable slots missed past grace; a lower bound
                             * while skipped_saturated is 1 */
     uint32_t runs;         /* firings handed to the runner */
@@ -414,7 +414,7 @@ typedef struct {
  * all armed dues, polling and waits use monotonic microseconds. The wall
  * projection advances from the anchor by monotonic elapsed time, so corrections
  * inside the runner's >2 s re-anchor threshold cannot stretch/compress an
- * `every` cadence. */
+ * fixed cron cadence. */
 void sched_due_init_mono(sched_due_t *d, const sched_program_t *prog,
                          sched_localize_fn localize, void *ctx,
                          int64_t now_utc, int64_t now_mono_us);
@@ -436,7 +436,7 @@ void sched_due_init(sched_due_t *d, const sched_program_t *prog,
                     sched_localize_fn localize, void *ctx, int64_t now_utc);
 
 /* Advance the model to now_utc; returns the bitmask of jobs to fire now.
- * Late slots (older than grace: period for `every`, 600 s otherwise) are
+ * Late slots (older than one period for fixed-cadence cron, 600 s otherwise) are
  * counted in `skipped` and dropped (missed: skip) or fired once late
  * (missed: run-once). Slots that passed while the gate was closed advance
  * silently. A poll's stale-slot walk is budget-bounded; a jumped backlog
@@ -453,11 +453,11 @@ int64_t sched_due_next(const sched_due_t *d, int64_t now_utc);
  * runner detects the step by comparing wall vs monotonic elapsed), BEFORE the
  * next poll. Dues still ahead of the new now were anchored to the old,
  * larger timebase (backward correction) and are recomputed from the new local
- * now, so an every-job resumes within one period instead of waiting out a
- * stale due. Dues already at/past the new now are left alone so the next
+ * now, so a fixed-cadence job resumes within one period instead of waiting
+ * out a stale due. Dues already at/past the new now are left alone so the next
  * poll applies the late-grace/missed accounting (a forward correction
  * surfaces as counted skipped slots or one make-up run, per `missed:`).
- * boot_pending, skipped/runs counters, the fired-minute latch and the gate
+ * boot_pending, skipped/runs counters, the fired-second latch and the gate
  * state are preserved: re-anchoring must not re-arm a consumed boot trigger,
  * erase statistics, or manufacture an on_enter edge. */
 void sched_due_reanchor(sched_due_t *d, int64_t now_utc);

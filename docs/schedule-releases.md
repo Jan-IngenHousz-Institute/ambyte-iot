@@ -54,13 +54,15 @@ for already-provisioned devices; the next explicit site write migrates them.
 
 ## YAML subset
 
-The device accepts block and flow mappings and sequences, comments, quoted or
+The device accepts indented block mappings and sequences, comments, quoted or
 plain strings, integers, floats, `true`/`false`, durations, and `HH:MM` values.
-The limits are 16 KiB, 256 characters per line, nesting depth 6, 512 nodes, and
-an 8 KiB scalar-string arena.
+Flow collections (`{...}` and `[...]`) are deliberately rejected so released
+schedules remain readable diffs rather than JSON embedded in YAML. The limits
+are 16 KiB, 256 characters per line, nesting depth 6, 512 nodes, and an 8 KiB
+scalar-string arena.
 
 Anchors, aliases, merge keys, tags, block scalars, multiple documents, tabs,
-multiline flow collections, escapes other than quote/backslash, and YAML's
+escapes other than quote/backslash, and YAML's
 `yes`/`no` booleans are rejected. Unknown keys are errors. Run the host compiler
 before release:
 
@@ -73,14 +75,28 @@ sched_host --simulate schedule/default.yaml \
 ## Jobs, triggers, and gates
 
 Jobs run in file order; steps within a job run sequentially. Every job has
-`on:` and `steps:`. Available triggers are:
+`schedule:` and `steps:`. Available triggers are:
 
-- `{ every: 1s..24h, phase: <duration> }` on a clock-aligned local-time grid.
-- `{ cron: "m h dom mon dow" }` with lists, ranges, and steps.
-- `{ at: "HH:MM" }` and `{ weekly: { days: [...], at: "HH:MM" } }`.
-- `{ sun: sunrise|sunset, offset: +/-duration }`.
+- `cron: "m h dom mon dow"` using conventional five-field cron.
+- `cron: "s m h dom mon dow"` using the common seconds-first extension for
+  one-second and other sub-minute cadences.
+- `solar: sunrise|sunset` with an optional signed `offset`; this is the sole
+  schedule extension because a cron expression cannot know site-dependent
+  solar times.
 - `boot`, once after the clock is trusted.
 - `dispatch`, only by `schedule run <job>` or MQTT `schedule_run`.
+
+Cron supports stars, comma-separated lists, ranges, steps, month names, and
+weekday names. Day-of-month and day-of-week follow Vixie cron's OR rule when
+both are restricted. `L`, `W`, `#`, and `@` extensions are not supported.
+Regular seconds-first cron grids are armed on monotonic deadlines, so small RTC
+corrections do not stretch acquisition cadence. Five-field cron retains normal
+calendar and DST semantics.
+
+Cron is an orchestration clock, not a real-time sample loop. Rates above 1 Hz
+belong inside the invoked action or protocol—for example a protocol segment's
+`freq: 10000`—where the implementation can use the appropriate hardware timer
+or DMA peripheral without dispatching thousands of YAML jobs per second.
 
 Every job may be dispatched manually regardless of its declared triggers.
 Optional `when.window` accepts `day`, `night`, or explicit `from`/`to` edges.
@@ -123,8 +139,10 @@ schema: jii.ambyte-schedule/v1-draft
 id: urn:jii:schedule:day-spectrum
 jobs:
   spectrum:
-    on: { every: 5m }
-    when: { window: day }
+    schedule:
+      cron: "*/5 * * * *"
+    when:
+      window: day
     steps:
       - uses: ambit/spectrum
 ```
@@ -136,14 +154,32 @@ schema: jii.ambyte-schedule/v1-draft
 id: urn:jii:schedule:windowed-spectrum
 jobs:
   fast:
-    on: { every: 1s }
-    when: { window: { from: sunrise-1h, to: sunset+1h, unresolved: skip } }
+    schedule:
+      cron: "* * * * * *"
+    when:
+      window:
+        from: sunrise-1h
+        to: sunset+1h
+        unresolved: skip
     missed: skip
-    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]
+    steps:
+      - uses: ambit/spectrum
+        with:
+          channels:
+            - 0
   slow:
-    on: { every: 10m }
-    when: { window: { from: sunset+1h, to: sunrise-1h, unresolved: run } }
-    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]
+    schedule:
+      cron: "*/10 * * * *"
+    when:
+      window:
+        from: sunset+1h
+        to: sunrise-1h
+        unresolved: run
+    steps:
+      - uses: ambit/spectrum
+        with:
+          channels:
+            - 0
 ```
 
 For the complete shipped examples, comments, and precise defaults, read

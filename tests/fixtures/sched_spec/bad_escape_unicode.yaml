@@ -1,7 +1,0 @@
-schema: jii.ambyte-schedule/v1-draft
-name: neg
-description: "bad \u1234 escape"
-jobs:
-  j:
-    on: { every: 5m }
-    steps: [ { uses: device/log, with: { message: hi } } ]

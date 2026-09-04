@@ -1,7 +1,7 @@
 /*
- * sched_cron.c — 5-field cron → bitmasks, matching, next-fire search.
+ * sched_cron.c — 5/6-field cron → bitmasks, matching, next-fire search.
  *
- * Fields: min hour dom month dow. Syntax: star, a,b lists, a-b ranges, and
+ * Fields: [second] min hour dom month dow. Syntax: star, a,b lists, a-b ranges, and
  * steps (star/n or a-b/n); three-letter names for month and dow; dow 0 or 7 =
  * Sunday. No L/W/#/@ — field scripts never used them and each is a research
  * project to explain. dom and dow combine with OR when both are restricted,
@@ -10,6 +10,7 @@
 
 #include "sched_spec.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -190,33 +191,34 @@ esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
     }
     memset(out, 0, sizeof(*out));
 
-    /* exactly five whitespace-separated fields: "*****" is not cron */
-    const char *f[5];
-    size_t flen[5];
+    /* Conventional five-field cron plus the common seconds-first extension. */
+    const char *f[6];
+    size_t flen[6];
     int nf = 0;
     size_t i = 0, len = strlen(expr);
     while (i < len) {
         while (i < len && (expr[i] == ' ' || expr[i] == '\t')) i++;
         if (i >= len) break;
-        if (nf == 5) { nf++; break; } /* a 6th field: mark overflow */
+        if (nf == 6) { nf++; break; } /* a 7th field: mark overflow */
         f[nf] = expr + i;
         size_t st = i;
         while (i < len && expr[i] != ' ' && expr[i] != '\t') i++;
         flen[nf] = i - st;
         nf++;
     }
-    if (nf != 5) {
-        cerr(err, err_cap, "cron: expected exactly 5 whitespace-separated "
-             "fields (min hour dom month dow)");
+    if (nf != 5 && nf != 6) {
+        cerr(err, err_cap, "cron: expected 5 fields (min hour dom month dow) "
+             "or 6 fields (sec min hour dom month dow)");
         return ESP_FAIL;
     }
+    out->has_seconds = nf == 6 ? 1 : 0;
 
     /* Reject the vixie extensions where they appear as field syntax, without
      * misfiring on case-insensitive names (JUL, WED): a list piece that is
      * all letters (a range like mon-fri keeps its hyphen) and long enough to
      * be a name is left for the field parser; anything else carrying an
      * L/W/#/@ is the extension syntax, which we do not support. */
-    for (int k = 0; k < 5; k++) {
+    for (int k = 0; k < nf; k++) {
         size_t p0 = 0;
         for (size_t j = 0; j <= flen[k]; j++) {
             if (j < flen[k] && f[k][j] != ',') continue;
@@ -246,15 +248,19 @@ esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
         const char *const *names;
         int n_names;
         const char *field;
-    } k_fields[5] = {
+    } k_fields[6] = {
+        { 0, 59, 0, NULL, 0, "second" },
         { 0, 59, 0, NULL, 0, "minute" },
         { 0, 23, 0, NULL, 0, "hour" },
         { 1, 31, 0, NULL, 0, "day-of-month" },
         { 1, 12, 1, k_months_full, 12, "month" },
         { 0, 7, 0, k_dow, 7, "day-of-week" },
     };
-    for (int k = 0; k < 5; k++) {
-        pcur_t c = { f[k], flen[k], 0 };
+    int field_offset = nf == 6 ? 0 : 1;
+    out->sec = nf == 6 ? 0 : 1ULL;
+    for (int k = field_offset; k < 6; k++) {
+        int source = k - field_offset;
+        pcur_t c = { f[source], flen[source], 0 };
         uint64_t bits;
         bool restricted;
         if (!parse_field(&c, k_fields[k].vmin, k_fields[k].vmax,
@@ -269,10 +275,11 @@ esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
             return ESP_FAIL;
         }
         switch (k) {
-        case 0: out->min = bits; break;
-        case 1: out->hour = (uint32_t)bits; break;
-        case 2: out->dom = (uint32_t)bits; out->dom_restricted = restricted ? 1 : 0; break;
-        case 3: out->month = (uint16_t)bits; break;
+        case 0: out->sec = bits; break;
+        case 1: out->min = bits; break;
+        case 2: out->hour = (uint32_t)bits; break;
+        case 3: out->dom = (uint32_t)bits; out->dom_restricted = restricted ? 1 : 0; break;
+        case 4: out->month = (uint16_t)bits; break;
         default: out->dow = (uint8_t)bits; out->dow_restricted = restricted ? 1 : 0; break;
         }
     }
@@ -281,6 +288,7 @@ esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
 
 bool sched_cron_matches(const sched_cron_t *c, const sched_tm_like_t *t)
 {
+    if ((c->sec & (1ULL << t->sec)) == 0) return false;
     if ((c->min & (1ULL << t->min)) == 0) return false;
     if ((c->hour & (1U << t->hour)) == 0) return false;
     if ((c->month & (1U << t->month)) == 0) return false;
@@ -291,23 +299,15 @@ bool sched_cron_matches(const sched_cron_t *c, const sched_tm_like_t *t)
     return dom_ok && dow_ok;
 }
 
-/* First set bit in mask at or after `from` (wrapping at nbits), or -1. */
-static int next_bit_u64(uint64_t mask, int from, int nbits)
-{
-    for (int v = from; v < nbits; v++) {
-        if (mask & (1ULL << v)) return v;
-    }
-    return -1;
-}
-
 esp_err_t sched_cron_next(const sched_cron_t *c, int64_t after_local, int64_t *out_local)
 {
     if (c == NULL || out_local == NULL) return ESP_ERR_INVALID_ARG;
-    /* start at the next minute boundary, strictly after `after_local` */
-    int64_t t = (after_local / 60) * 60 + 60;
-    int y, mo, d, h, mi, wd;
-    time_sync_localtime(t, &y, &mo, &d, &h, &mi, NULL, &wd);
-    int64_t day0 = t - (int64_t)h * 3600 - (int64_t)mi * 60;
+    if (after_local == INT64_MAX) return ESP_ERR_NOT_FOUND;
+    /* Start at the next second, strictly after `after_local`. */
+    int64_t t = after_local + 1;
+    int y, mo, d, h, mi, s, wd;
+    time_sync_localtime(t, &y, &mo, &d, &h, &mi, &s, &wd);
+    int64_t day0 = t - (int64_t)h * 3600 - (int64_t)mi * 60 - s;
 
     for (int day = 0; day <= 366; day++) { /* bounded search, per plan */
         int64_t base = day0 + (int64_t)day * 86400;
@@ -319,25 +319,21 @@ esp_err_t sched_cron_next(const sched_cron_t *c, int64_t after_local, int64_t *o
                           ? (dom_ok || dow_ok)
                           : (dom_ok && dow_ok);
         if (!day_ok) continue;
-        int h0 = (day == 0) ? h : 0;
-        int hh = next_bit_u64(c->hour, h0, 24);
-        if (hh < 0) continue;
-        int m0 = (day == 0 && hh == h) ? mi : 0;
-        int mm = next_bit_u64(c->min, m0, 60);
-        while (hh >= 0) {
-            if (mm >= 0) {
-                int64_t cand = base + (int64_t)hh * 3600 + (int64_t)mm * 60;
-                if (cand > after_local) {
-                    *out_local = cand;
-                    return ESP_OK;
+        for (int hh = 0; hh < 24; hh++) {
+            if ((c->hour & (1U << hh)) == 0 || (day == 0 && hh < h)) continue;
+            for (int mm = 0; mm < 60; mm++) {
+                if ((c->min & (1ULL << mm)) == 0 ||
+                    (day == 0 && hh == h && mm < mi)) continue;
+                for (int ss = 0; ss < 60; ss++) {
+                    if ((c->sec & (1ULL << ss)) == 0 ||
+                        (day == 0 && hh == h && mm == mi && ss < s)) continue;
+                    int64_t cand = base + (int64_t)hh * 3600 +
+                                   (int64_t)mm * 60 + ss;
+                    if (cand > after_local) {
+                        *out_local = cand;
+                        return ESP_OK;
+                    }
                 }
-            }
-            /* next minute in this hour, else next hour */
-            mm = next_bit_u64(c->min, (mm >= 0 ? mm + 1 : m0 + 1), 60);
-            if (mm < 0) {
-                hh = next_bit_u64(c->hour, hh + 1, 24);
-                m0 = 0;
-                mm = (hh >= 0) ? next_bit_u64(c->min, 0, 60) : -1;
             }
         }
     }

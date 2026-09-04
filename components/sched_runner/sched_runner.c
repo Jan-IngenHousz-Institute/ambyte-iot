@@ -8,8 +8,9 @@
  * wall UTC is sampled only at init/re-anchor and projected from monotonic
  * elapsed between them. Clock-step detection compares real wall with that
  * projection; a divergence over 2 s reprojects wall triggers before polling.
- * Thus small corrections/slews cannot stretch an `every` cadence, while
- * cron/sun/at/weekly and DST keep their wall semantics. The 60 s wait ceiling
+ * Thus small corrections/slews cannot stretch a fixed seconds-first cron
+ * cadence, while calendar cron, solar events, and DST keep wall semantics. The
+ * 60 s wait ceiling
  * bounds how long a step can go unnoticed.
  *
  * Lifecycle: an explicit state machine (STOPPED/STARTING/RUNNING/STOPPING)

@@ -2,54 +2,94 @@ schema: jii.ambyte-schedule/v1-draft
 id: urn:jii:schedule:default-multichannel
 version: 0.1.0-draft
 name: default-multichannel
-description: SS every minute, spectra + MPF by day, dark-edge traces around sun events.
+description: SS every minute, spectra and MPF by day, with traces around sunrise and sunset.
 
-# This file is site-independent. Per-device facts (lat/lon, timezone, deployment
-# tag, MAC) live in NVS device_config and are never written here.
+# Site facts such as location, timezone, deployment, and MAC live in NVS.
+# This schedule is identical across sites.
 
-protocols:                       # named AMBIT segment tables, referenced by ambit/trace
+protocols:
   SS:
-    - { pulses: 45, freq: 1,   actinic: 0 }      # 45 since #47; 59 s left no slack on a 1 m grid
+    # 45 pulses since #47; 59 seconds left no slack on a one-minute grid.
+    - pulses: 45
+      freq: 1
+      actinic: 0
+
   MPF:
-    - { pulses: 40, freq: 10,  actinic: 0 }      # dark baseline
-    - { pulses: 70, freq: 100, actinic: -250 }   # saturating phases (raw DAC)
-    - { pulses: 10, freq: 100, actinic: -200 }
-    - { pulses: 10, freq: 100, actinic: -160 }
-    - { pulses: 10, freq: 100, actinic: -250 }
-    - { pulses: 40, freq: 10,  actinic: 0 }      # relaxation
+    # Dark baseline.
+    - pulses: 40
+      freq: 10
+      actinic: 0
+
+    # Saturating phases. Actinic values are raw DAC values.
+    - pulses: 70
+      freq: 100
+      actinic: -250
+    - pulses: 10
+      freq: 100
+      actinic: -200
+    - pulses: 10
+      freq: 100
+      actinic: -160
+    - pulses: 10
+      freq: 100
+      actinic: -250
+
+    # Relaxation.
+    - pulses: 40
+      freq: 10
+      actinic: 0
 
 jobs:
   steady_state:
-    on: { every: 1m }                       # clock-aligned (:00, :01 …)
+    # Conventional five-field cron is the normal scheduling syntax.
+    schedule:
+      cron: "* * * * *"
     steps:
       - uses: ambit/trace
-        with: { protocol: SS, hold_window: false }   # channels absent = all that answer a ping
+        with:
+          protocol: SS
+          hold_window: false
 
   spectra:
-    on: { every: 5m }
-    when: { window: day }                   # sunrise..sunset
+    schedule:
+      cron: "*/5 * * * *"
+    when:
+      window: day
     steps:
-      - uses: ambit/spectrum                # channels absent = all present
+      # With no channels list, every AMBIT that answers a ping is measured.
+      - uses: ambit/spectrum
 
   saturating_flash:
-    on: { every: 10m }
-    when: { window: day }
+    schedule:
+      cron: "*/10 * * * *"
+    when:
+      window: day
     steps:
       - uses: ambit/trace
-        with: { protocol: MPF, hold_window: true }
+        with:
+          protocol: MPF
+          hold_window: true
 
   dark_edge:
-    on:
-      - { sun: sunset,  offset: +30m }
-      - { sun: sunrise, offset: -30m }
+    # Solar entries are the explicit extension for times cron cannot know.
+    schedule:
+      - solar: sunset
+        offset: +30m
+      - solar: sunrise
+        offset: -30m
     steps:
       - uses: ambit/trace
-        with: { protocol: MPF, hold_window: true, tag: edge }
+        with:
+          protocol: MPF
+          hold_window: true
+          tag: edge
 
   health:
-    on:
+    schedule:
       - boot
-      - { sun: sunrise, offset: -15m }
-      - { sun: sunset,  offset: +15m }
+      - solar: sunrise
+        offset: -15m
+      - solar: sunset
+        offset: +15m
     steps:
-      - uses: device/status-report          # "get internal stats and send them"
+      - uses: device/status-report

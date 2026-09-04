@@ -1,6 +1,0 @@
-schema: jii.ambyte-schedule/v1-draft
-name: fractional-every-1500ms
-jobs:
-  j:
-    on: { every: 1500ms }
-    steps: [ { uses: device/log, with: { message: hi } } ]

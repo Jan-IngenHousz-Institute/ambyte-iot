@@ -30,8 +30,9 @@ VALID_SCHEDULE = (
     b"schema: jii.ambyte-schedule/v1-draft\n"
     b"jobs:\n"
     b"  manual:\n"
-    b"    on: dispatch\n"
-    b"    steps: [ { uses: device/status-report } ]\n"
+    b"    schedule: dispatch\n"
+    b"    steps:\n"
+    b"      - uses: device/status-report\n"
 )
 
 

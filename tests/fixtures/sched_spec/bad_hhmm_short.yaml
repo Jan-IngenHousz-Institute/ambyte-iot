@@ -1,6 +1,0 @@
-schema: jii.ambyte-schedule/v1-draft
-name: neg
-jobs:
-  j:
-    on: { at: "1:2" }
-    steps: [ { uses: device/log, with: { message: hi } } ]

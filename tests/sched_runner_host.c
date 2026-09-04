@@ -248,13 +248,20 @@ static const char *k_full_yaml =
     "name: t\n"
     "jobs:\n"
     "  j:\n"
-    "    on: { every: 5m }\n"
+    "    schedule:\n"
+    "      cron: \"*/5 * * * *\"\n"
     "    steps:\n"
     "      - uses: db/store-event\n"
     "        with:\n"
     "          kind: boot\n"
-    "          data: { n: 42, f: 2.5, ok: true, s: \"hi \\\"x\\\"\", ph: $deployment }\n"
-    "          metadata: { fw: \"1.3.0\" }\n";
+    "          data:\n"
+    "            n: 42\n"
+    "            f: 2.5\n"
+    "            ok: true\n"
+    "            s: \"hi \\\"x\\\"\"\n"
+    "            ph: $deployment\n"
+    "          metadata:\n"
+    "            fw: \"1.3.0\"\n";
 
 static void test_build_map_json(void)
 {
@@ -294,8 +301,12 @@ static void test_build_map_json(void)
         "schema: jii.ambyte-schedule/v1-draft\n"
         "jobs:\n"
         "  j:\n"
-        "    on: { every: 5m }\n"
-        "    steps: [ { uses: db/store-event, with: { kind: k } } ]\n");
+        "    schedule:\n"
+        "      cron: \"*/5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: db/store-event\n"
+        "        with:\n"
+        "          kind: k\n");
     if (q != NULL) {
         const sched_step_t *st2 = find_step(q, "db/store-event");
         CHECK(st2 != NULL);

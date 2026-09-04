@@ -1,9 +1,0 @@
-schema: jii.ambyte-schedule/v1-draft
-name: neg
-protocols:
-  P:
-    - { type: 2, far_red: true, pulses: 10, freq: 1, actinic: 0 }
-jobs:
-  j:
-    on: { every: 5m }
-    steps: [ { uses: device/log, with: { message: hi } } ]

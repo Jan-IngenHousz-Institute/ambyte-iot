@@ -385,7 +385,7 @@ static sched_node_t *resolve_plain(parser_t *p, const char *s, size_t len,
     return store_str(p, n, s, len, line, col) ? n : NULL;
 }
 
-/* ── flow collections and inline values ──────────────────────────────── *
+/* ── inline scalar values ────────────────────────────────────────────── *
  * cursor_t: col0 is the 1-based column of s[0]; the column of s[pos] is
  * col0 + pos. */
 
@@ -394,13 +394,6 @@ typedef struct {
     size_t      len, pos;
     int         line, col0;
 } cursor_t;
-
-static void skip_ws(cursor_t *c)
-{
-    while (c->pos < c->len && c->s[c->pos] == ' ') c->pos++;
-}
-
-static sched_node_t *parse_flow_value(parser_t *p, cursor_t *c, int depth);
 
 static sched_node_t *parse_quoted(parser_t *p, cursor_t *c)
 {
@@ -481,151 +474,26 @@ static bool grow_items(parser_t *p, sched_node_t *n, int line, int col)
     return true;
 }
 
-static sched_node_t *parse_flow_map(parser_t *p, cursor_t *c, int depth)
-{
-    /* collections self-check their depth before allocating; children recurse
-     * with depth + 1 and are checked the same way on entry */
-    if (depth > SCHED_YAML_MAX_DEPTH) {
-        set_err(p, c->line, c->col0 + (int)c->pos,
-                "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
-        return NULL;
-    }
-    sched_node_t *n = node_new(p, SCHED_NODE_MAP, c->line, c->col0 + (int)c->pos);
-    if (n == NULL) return NULL;
-    c->pos++; /* '{' */
-    skip_ws(c);
-    if (c->pos < c->len && c->s[c->pos] == '}') { c->pos++; return n; }
-    while (c->pos < c->len) {
-        skip_ws(c);
-        size_t kstart = c->pos;
-        while (c->pos < c->len && is_key_char(c->s[c->pos], c->pos == kstart)) c->pos++;
-        size_t klen = c->pos - kstart;
-        if (klen == 0) {
-            set_err(p, c->line, c->col0 + (int)c->pos, "expected key in flow mapping");
-            return NULL;
-        }
-        skip_ws(c);
-        if (c->pos >= c->len || c->s[c->pos] != ':') {
-            set_err(p, c->line, c->col0 + (int)c->pos, "expected ':' in flow mapping");
-            return NULL;
-        }
-        c->pos++;
-        if (c->pos < c->len && c->s[c->pos] != ' ' &&
-            c->s[c->pos] != '}' && c->s[c->pos] != ',') {
-            set_err(p, c->line, c->col0 + (int)c->pos, "expected space after ':'");
-            return NULL;
-        }
-        sched_node_t *val = parse_flow_value(p, c, depth + 1);
-        if (val == NULL) return NULL;
-        for (int i = 0; i < n->u.m.count; i++) {
-            if (strlen(n->u.m.pairs[i].key) == klen &&
-                memcmp(n->u.m.pairs[i].key, c->s + kstart, klen) == 0) {
-                set_err(p, c->line, c->col0 + (int)kstart, "duplicate key '%.*s'",
-                        (int)klen, c->s + kstart);
-                return NULL;
-            }
-        }
-        char *key = arena_str(p, c->s + kstart, klen, c->line, c->col0 + (int)kstart);
-        if (key == NULL) return NULL;
-        if (!grow_pairs(p, n, c->line, c->col0)) return NULL;
-        n->u.m.pairs[n->u.m.count].key = key;
-        n->u.m.pairs[n->u.m.count].value = val;
-        n->u.m.count++;
-        skip_ws(c);
-        if (c->pos < c->len && c->s[c->pos] == ',') { c->pos++; continue; }
-        if (c->pos < c->len && c->s[c->pos] == '}') { c->pos++; return n; }
-        set_err(p, c->line, c->col0 + (int)c->pos, "expected ',' or '}' in flow mapping");
-        return NULL;
-    }
-    set_err(p, c->line, c->col0 + (int)c->pos,
-            "unterminated flow mapping (multi-line flow is not supported)");
-    return NULL;
-}
-
-static sched_node_t *parse_flow_seq(parser_t *p, cursor_t *c, int depth)
-{
-    if (depth > SCHED_YAML_MAX_DEPTH) {
-        set_err(p, c->line, c->col0 + (int)c->pos,
-                "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
-        return NULL;
-    }
-    sched_node_t *n = node_new(p, SCHED_NODE_SEQ, c->line, c->col0 + (int)c->pos);
-    if (n == NULL) return NULL;
-    c->pos++; /* '[' */
-    skip_ws(c);
-    if (c->pos < c->len && c->s[c->pos] == ']') { c->pos++; return n; }
-    while (c->pos < c->len) {
-        sched_node_t *item = parse_flow_value(p, c, depth + 1);
-        if (item == NULL) return NULL;
-        if (!grow_items(p, n, c->line, c->col0)) return NULL;
-        n->u.q.items[n->u.q.count++] = item;
-        skip_ws(c);
-        if (c->pos < c->len && c->s[c->pos] == ',') { c->pos++; continue; }
-        if (c->pos < c->len && c->s[c->pos] == ']') { c->pos++; return n; }
-        set_err(p, c->line, c->col0 + (int)c->pos, "expected ',' or ']' in flow sequence");
-        return NULL;
-    }
-    set_err(p, c->line, c->col0 + (int)c->pos,
-            "unterminated flow sequence (multi-line flow is not supported)");
-    return NULL;
-}
-
-static sched_node_t *parse_flow_value(parser_t *p, cursor_t *c, int depth)
-{
-    skip_ws(c);
-    if (c->pos >= c->len) {
-        set_err(p, c->line, c->col0 + (int)c->pos, "missing value");
-        return NULL;
-    }
-    char ch = c->s[c->pos];
-    if (ch == '{') return parse_flow_map(p, c, depth);
-    if (ch == '[') return parse_flow_seq(p, c, depth);
-    if (ch == '"' || ch == '\'') return parse_quoted(p, c);
-    /* plain scalar inside flow: up to , } ] */
-    size_t start = c->pos;
-    while (c->pos < c->len) {
-        char k = c->s[c->pos];
-        if (k == ',' || k == '}' || k == ']') break;
-        c->pos++;
-    }
-    size_t end = c->pos;
-    while (end > start && c->s[end - 1] == ' ') end--;
-    if (end == start) {
-        set_err(p, c->line, c->col0 + (int)start, "missing value");
-        return NULL;
-    }
-    return resolve_plain(p, c->s + start, end - start, c->line, c->col0 + (int)start);
-}
-
-/* Whole-line inline value (after `key:` or `- `): flow collection, quoted
- * string, or plain scalar to end of line. col = 1-based column of s[0].
- * depth = the containing block collection's depth: a flow collection on the
- * key's (or dash's) own line adds no indentation level, so it occupies that
- * same depth and self-checks it on entry; each further nested flow collection
- * costs +1 via parse_flow_value. Scalars are leaves and uncounted. One depth
- * counter thus runs across block and flow nesting. */
+/* Whole-line value after `key:` or `- `. Collections must use indentation;
+ * rejecting {} and [] keeps authored schedules readable and the parser small. */
 static sched_node_t *parse_inline(parser_t *p, const char *s, size_t len,
                                   int line, int col, int depth)
 {
+    (void)depth;
     cursor_t c = { s, len, 0, line, col };
-    skip_ws(&c);
-    if (c.pos >= c.len) {
-        set_err(p, line, col, "missing value");
-        return NULL;
-    }
     char ch = c.s[c.pos];
     sched_node_t *n;
-    if (ch == '{') {
-        n = parse_flow_map(p, &c, depth);
-    } else if (ch == '[') {
-        n = parse_flow_seq(p, &c, depth);
-    } else if (ch == '"' || ch == '\'') {
+    if (ch == '{' || ch == '[') {
+        set_err(p, line, col,
+                "flow collections are not supported; use indented block YAML");
+        return NULL;
+    }
+    if (ch == '"' || ch == '\'') {
         n = parse_quoted(p, &c);
     } else {
-        return resolve_plain(p, c.s + c.pos, c.len - c.pos, line, col + (int)c.pos);
+        return resolve_plain(p, c.s, c.len, line, col);
     }
     if (n == NULL) return NULL;
-    skip_ws(&c);
     if (c.pos < c.len) {
         set_err(p, line, c.col0 + (int)c.pos,
                 "unexpected content after value");
@@ -763,11 +631,6 @@ static sched_node_t *parse_sequence(parser_t *p, int ind, int depth)
                 return NULL;
             }
             if (item == NULL) return NULL;
-        } else if (rest[0] == '{' || rest[0] == '[') {
-            item = parse_inline(p, rest, (size_t)rest_len, ln->lineno, rest_col,
-                                depth);
-            if (item == NULL) return NULL;
-            p->pos++;
         } else if (is_key_char(rest[0], true)) {
             /* `- uses: x` — inline mapping start (GitHub Actions step shape);
              * sibling keys follow at the key's column. Consume the dash line

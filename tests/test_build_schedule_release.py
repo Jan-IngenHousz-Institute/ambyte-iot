@@ -14,8 +14,9 @@ from tools.build_schedule_release import build
 VALID_SCHEDULE = """schema: jii.ambyte-schedule/v1-draft
 jobs:
   manual:
-    on: dispatch
-    steps: [ { uses: device/status-report } ]
+    schedule: dispatch
+    steps:
+      - uses: device/status-report
 """
 
 

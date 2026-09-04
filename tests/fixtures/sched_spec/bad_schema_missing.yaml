@@ -1,5 +1,0 @@
-name: no-schema
-jobs:
-  j:
-    on: { every: 5m }
-    steps: [ { uses: device/log, with: { message: hi } } ]

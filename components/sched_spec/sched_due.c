@@ -3,16 +3,17 @@
  *
  * Armed instants live in monotonic microseconds. Wall UTC is sampled only at
  * init/re-anchor; between anchors it is projected from monotonic elapsed time.
- * This is load-bearing for `every`: a small RTC correction or NTP slew cannot
- * stretch/compress the grid. Cron/at/weekly/sun retain their paired local-wall
- * anchor so their successor can be resolved after a fire and so clock-step,
+ * This is load-bearing for fixed-cadence cron: a small RTC correction or NTP
+ * slew cannot stretch/compress the grid. Calendar cron and solar retain a
+ * paired local-wall anchor so their successor can be resolved after a fire and
+ * so clock-step,
  * DST, gate and missed-slot behavior stays explicit.
  *
  * The runner compares real wall UTC with sched_due_project_wall_utc() at least
  * every 60 s. A difference over 2 s calls sched_due_reanchor_mono(). The model
  * also notices a timezone-offset transition on its projected UTC timeline and
  * reprojects wall triggers; that preserves spring-gap/fall-repeat semantics
- * without making `every` depend on local wall time.
+ * without making fixed cadences depend on local wall time.
  */
 
 #include "sched_spec.h"
@@ -23,7 +24,7 @@
 #define US_PER_S 1000000LL
 #define LATE_GRACE_DEFAULT_S 600
 
-/* One hour of a gated 1 Hz grid. Ungated every grids use arithmetic and closed
+/* One hour of a gated 1 Hz grid. Ungated fixed grids use arithmetic and closed
  * window stretches jump to their next opening; once this budget is exhausted,
  * skipped is deliberately a lower bound and skipped_saturated says so. */
 #define SCHED_MISSED_WALK_CAP 3600
@@ -31,9 +32,9 @@
 static int64_t next_trigger_due(const sched_trigger_t *t, int64_t from_local)
 {
     switch (t->kind) {
-    case SCHED_TRIG_EVERY: {
-        int64_t period = t->u.every.period_ms;
-        int64_t phase  = t->u.every.phase_ms;
+    case SCHED_TRIG_INTERVAL: {
+        int64_t period = t->u.interval.period_ms;
+        int64_t phase  = t->u.interval.phase_ms;
         int64_t n = (from_local * 1000 - phase) / period + 1;
         int64_t g = n * period + phase;
         return (g + 999) / 1000;
@@ -43,18 +44,9 @@ static int64_t next_trigger_due(const sched_trigger_t *t, int64_t from_local)
         if (sched_cron_next(&t->u.cron, from_local, &out) != ESP_OK) return -1;
         return out;
     }
-    case SCHED_TRIG_AT: {
-        int64_t w = time_sync_until_clock(from_local, t->u.at.hh, t->u.at.mm, 0);
-        return w < 0 ? -1 : from_local + w;
-    }
-    case SCHED_TRIG_WEEKLY: {
-        int64_t w = time_sync_until_weekly(from_local, t->u.weekly.days_mask,
-                                           t->u.weekly.hh, t->u.weekly.mm);
-        return w < 0 ? -1 : from_local + w;
-    }
-    case SCHED_TRIG_SUN: {
-        int64_t w = time_sync_until_sun(from_local, t->u.sun.event,
-                                        t->u.sun.offset_s);
+    case SCHED_TRIG_SOLAR: {
+        int64_t w = time_sync_until_sun(from_local, t->u.solar.event,
+                                        t->u.solar.offset_s);
         return w < 0 ? -1 : from_local + w;
     }
     case SCHED_TRIG_BOOT:
@@ -116,8 +108,8 @@ static void set_wall_due(const sched_due_t *d, sched_due_job_t *job, int idx,
     job->due_us[idx] = project_local(d, local, ref_mono_us);
 }
 
-static void sync_every_wall_due(const sched_due_t *d, sched_due_job_t *job,
-                                int idx, int64_t ref_mono_us)
+static void sync_interval_wall_due(const sched_due_t *d, sched_due_job_t *job,
+                                   int idx, int64_t ref_mono_us)
 {
     if (job->due_us[idx] == SCHED_DUE_NONE_US) {
         job->wall_due_local[idx] = -1;
@@ -189,8 +181,8 @@ static int64_t walk_wall_missed(const sched_trigger_t *t,
     return cur;
 }
 
-static int64_t first_every_after(int64_t due_us, int64_t limit_us,
-                                 int64_t period_us)
+static int64_t first_interval_after(int64_t due_us, int64_t limit_us,
+                                    int64_t period_us)
 {
     if (due_us > limit_us) return due_us;
     /* Unsigned subtraction represents the non-negative distance without UB
@@ -205,18 +197,18 @@ static int64_t first_every_after(int64_t due_us, int64_t limit_us,
     return due_us + advance;
 }
 
-/* Gated `every` stale walk in the monotonic domain. Gate checks translate each
- * scheduled instant through the anchored wall projection. Closed intervals
+/* Gated fixed-cadence stale walk. Gate checks translate each scheduled instant
+ * through the anchored wall projection. Closed intervals
  * retain T2's jump-to-next-opening optimization; the per-job budget remains a
  * hard ceiling even when an offset transition makes that projection awkward. */
-static int64_t walk_every_missed(const sched_due_t *d,
-                                 const sched_trigger_t *trigger,
-                                 const sched_job_t *job,
-                                 int64_t due_us, int64_t limit_us,
-                                 uint32_t *budget, uint32_t *count,
-                                 bool *any_open, bool *saturated)
+static int64_t walk_interval_missed(const sched_due_t *d,
+                                    const sched_trigger_t *trigger,
+                                    const sched_job_t *job,
+                                    int64_t due_us, int64_t limit_us,
+                                    uint32_t *budget, uint32_t *count,
+                                    bool *any_open, bool *saturated)
 {
-    const int64_t period_us = trigger->u.every.period_ms * 1000;
+    const int64_t period_us = trigger->u.interval.period_ms * 1000;
     int64_t cur = due_us;
     while (cur != SCHED_DUE_NONE_US && cur <= limit_us) {
         int64_t local = local_at_mono(d, cur);
@@ -233,7 +225,7 @@ static int64_t walk_every_missed(const sched_due_t *d,
                     }
                 }
             }
-            return first_every_after(cur, limit_us, period_us);
+            return first_interval_after(cur, limit_us, period_us);
         }
         (*budget)--;
         if (gate_open_at(job, local)) {
@@ -283,7 +275,7 @@ void sched_due_init_mono(sched_due_t *d, const sched_program_t *prog,
                 set_wall_due(d, dj, t, next_trigger_due(tr, L), now_mono_us);
             }
         }
-        dj->fired_minute = -1;
+        dj->fired_second = -1;
         dj->gate_open = gate_open_at(job, L) ? 1 : 0;
     }
 }
@@ -328,7 +320,7 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
 {
     /* A timezone offset edge is not an RTC step, but wall triggers on the far
      * side need reprojection. Use projected UTC, never a fresh wall sample;
-     * `every` remains owned by monotonic time. */
+     * fixed cadences remain owned by monotonic time. */
     int32_t off = offset_at_mono(d, now_mono_us);
     if (off != d->anchor_offset_s) {
         sched_due_reanchor_mono(d,
@@ -366,8 +358,8 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
             }
 
             const int64_t grace_us =
-                (tr->kind == SCHED_TRIG_EVERY
-                     ? tr->u.every.period_ms / 1000
+                (tr->kind == SCHED_TRIG_INTERVAL
+                     ? tr->u.interval.period_ms / 1000
                      : LATE_GRACE_DEFAULT_S) * US_PER_S;
 
             while (D_us != SCHED_DUE_NONE_US && D_us <= now_mono_us) {
@@ -377,8 +369,8 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
                     uint32_t n = 0;
                     bool any_open = false, saturated = false;
 
-                    if (tr->kind == SCHED_TRIG_EVERY) {
-                        const int64_t period_us = tr->u.every.period_ms * 1000;
+                    if (tr->kind == SCHED_TRIG_INTERVAL) {
+                        const int64_t period_us = tr->u.interval.period_ms * 1000;
                         const int64_t limit_us = now_mono_us - grace_us;
                         if (!job->has_window) {
                             uint64_t distance =
@@ -390,17 +382,17 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
                             } else {
                                 accumulate_skipped(dj, slots);
                             }
-                            D_us = first_every_after(D_us, limit_us, period_us);
+                            D_us = first_interval_after(D_us, limit_us, period_us);
                         } else {
-                            D_us = walk_every_missed(d, tr, job, D_us, limit_us,
-                                                     &walk_budget, &n, &any_open,
-                                                     &saturated);
+                            D_us = walk_interval_missed(d, tr, job, D_us, limit_us,
+                                                        &walk_budget, &n, &any_open,
+                                                        &saturated);
                             if (job->missed != SCHED_MISSED_RUN_ONCE) {
                                 accumulate_skipped(dj, n);
                             }
                         }
                         dj->due_us[i] = D_us;
-                        sync_every_wall_due(d, dj, i, now_mono_us);
+                        sync_interval_wall_due(d, dj, i, now_mono_us);
                         D_local = dj->wall_due_local[i];
                     } else {
                         int64_t limit_local =
@@ -435,11 +427,11 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
                 }
 
                 if (!gate) {
-                    if (tr->kind == SCHED_TRIG_EVERY) {
-                        int64_t period_us = tr->u.every.period_ms * 1000;
-                        D_us = first_every_after(D_us, now_mono_us, period_us);
+                    if (tr->kind == SCHED_TRIG_INTERVAL) {
+                        int64_t period_us = tr->u.interval.period_ms * 1000;
+                        D_us = first_interval_after(D_us, now_mono_us, period_us);
                         dj->due_us[i] = D_us;
-                        sync_every_wall_due(d, dj, i, now_mono_us);
+                        sync_interval_wall_due(d, dj, i, now_mono_us);
                     } else {
                         D_local = next_trigger_due(tr, L);
                         set_wall_due(d, dj, i, D_local, now_mono_us);
@@ -448,21 +440,21 @@ uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
                 }
 
                 if (tr->kind == SCHED_TRIG_CRON) {
-                    if (dj->fired_minute == L / 60) {
+                    if (dj->fired_second == L) {
                         D_local = next_trigger_due(tr, L);
                         set_wall_due(d, dj, i, D_local, now_mono_us);
                         break;
                     }
-                    dj->fired_minute = L / 60;
+                    dj->fired_second = L;
                 }
 
                 fired = true;
-                if (tr->kind == SCHED_TRIG_EVERY) {
-                    int64_t period_us = tr->u.every.period_ms * 1000;
+                if (tr->kind == SCHED_TRIG_INTERVAL) {
+                    int64_t period_us = tr->u.interval.period_ms * 1000;
                     dj->due_us[i] =
                         (D_us >= 0 && INT64_MAX - D_us < period_us)
                             ? INT64_MAX : D_us + period_us;
-                    sync_every_wall_due(d, dj, i, now_mono_us);
+                    sync_interval_wall_due(d, dj, i, now_mono_us);
                 } else {
                     D_local = next_trigger_due(tr, L > D_local ? L : D_local);
                     set_wall_due(d, dj, i, D_local, now_mono_us);
