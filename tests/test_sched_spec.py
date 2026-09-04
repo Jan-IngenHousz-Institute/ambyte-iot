@@ -90,6 +90,7 @@ class SchedSpecTest(unittest.TestCase):
             "schedule_default.yaml",
             "schedule_legacy_1hz_spec.yaml",
             "schedule_channels_forms.yaml",
+            "schedule_every_90s.yaml",
         )
         for name in valid:
             with self.subTest(fixture=name):

@@ -474,6 +474,11 @@ static bool compile_trigger(ctx_t *c, const sched_node_t *node, sched_trigger_t 
                  "UART transaction cost make anything faster meaningless)");
             return false;
         }
+        if (period % 1000 != 0) {
+            cerr(c, every, "'every' must be a whole number of seconds "
+                           "(the due-time model has one-second resolution)");
+            return false;
+        }
         int64_t ph = 0;
         if (phase != NULL) {
             if (phase->kind != SCHED_NODE_SCALAR || phase->scal_kind != SCHED_SCAL_DURATION_MS) {
@@ -481,6 +486,11 @@ static bool compile_trigger(ctx_t *c, const sched_node_t *node, sched_trigger_t 
                 return false;
             }
             ph = phase->u.s.ms;
+            if (ph % 1000 != 0) {
+                cerr(c, phase, "'phase' must be a whole number of seconds "
+                               "(the due-time model has one-second resolution)");
+                return false;
+            }
             if (ph >= period) {
                 cerr(c, phase, "'phase' must be smaller than the period");
                 return false;

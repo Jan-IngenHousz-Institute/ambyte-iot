@@ -841,6 +841,25 @@ static void test_due_model(void)
         free(d);
     }
 
+    /* The due model has one-second resolution. Reject the 1500 ms grid that
+     * used to be quantised +2,+3,+5,+6,+8,+9,+11 and then miscounted by the
+     * arithmetic stale-slot shortcut. */
+    COMPILE_ERR(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 1500ms }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "whole number of seconds");
+    COMPILE_ERR(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 2500ms }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "whole number of seconds");
+    COMPILE_ERR(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 90s, phase: 1500ms }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        "whole number of seconds");
+
     /* review T2-2, the exact case: 10 m grid behind a daily 10:00–11:00
      * window, init 10:00, poll ~26 h later. The gate flips twice inside the
      * stale interval; only the runnable slots count (5 left on day 1 + 6 on
@@ -907,6 +926,89 @@ static void test_due_model(void)
         free(p);
         free(d);
     }
+
+    time_sync_set_location(52.173, 5.819, 0);
+    time_sync_set_utc_offset_seconds(7200);
+
+    /* The shared work budget must not make run-once semantics depend on job
+     * order.  Job a consumes the 3600 evaluations; job b still had runnable
+     * stale slots in the same daily window and therefore owes one make-up. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  a:\n    on: { every: 1s }\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: a } } ]\n"
+        "  b:\n    on: { every: 1s }\n    missed: run-once\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: b } } ]\n",
+        time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 2);
+        CHECK(d->jobs[0].skipped_saturated == 1);
+        CHECK(d->jobs[1].skipped_saturated == 1);
+        free(p);
+        free(d);
+    }
+
+    /* The shipped legacy shape has a saturated 1 Hz daytime job ahead of an
+     * hourly cron job. Each job owns its 3600-step budget, so a 2 h poll
+     * gap counts both stale hourly slots without inheriting saturation. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  fast:\n    on: { every: 1s }\n"
+        "    when: { window: { from: sunrise-1h, to: sunset+1h, unresolved: skip } }\n"
+        "    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]\n"
+        "  slow:\n    on: { every: 10m }\n"
+        "    when: { window: { from: sunset+1h, to: sunrise-1h, unresolved: run } }\n"
+        "    steps: [ { uses: ambit/spectrum, with: { channels: [0] } } ]\n"
+        "  hourly_status:\n    on: { cron: \"0 * * * *\" }\n"
+        "    steps: [ { uses: device/status-report } ]\n",
+        time_sync_make(2026, 6, 21, 11, 15, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 21, 13, 15, 0)) == 0x1);
+        CHECK(d->jobs[0].skipped_saturated == 1);
+        CHECK(d->jobs[2].skipped == 2);
+        CHECK(d->jobs[2].skipped_saturated == 0);
+        free(p);
+        free(d);
+    }
+
+    /* skipped is saturating telemetry even when an absurd RTC jump crosses
+     * UINT32_MAX occurrences. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 1s }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        t0, identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0 + (int64_t)UINT32_MAX + 10000000) == 1);
+        CHECK(d->jobs[0].skipped == UINT32_MAX);
+        CHECK(d->jobs[0].skipped_saturated == 1);
+        free(p);
+        free(d);
+    }
+
+    /* A polar sunrise initially resolves to -1. Polling after the event
+     * returns must re-resolve it, and the job then fires at that due. */
+    time_sync_set_location(78.2, 15.6, 0);
+    time_sync_set_utc_offset_seconds(7200);
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { sun: sunrise }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(d->jobs[0].due[0] == -1);
+        int64_t august = time_sync_make(2026, 8, 25, 0, 0, 0);
+        CHECK(sched_due_poll(d, august) == 0);
+        CHECK(d->jobs[0].due[0] > august);
+        CHECK(sched_due_poll(d, d->jobs[0].due[0]) == 1);
+        free(p);
+        free(d);
+    }
+
     time_sync_set_location(52.173, 5.819, 0);
     time_sync_set_utc_offset_seconds(7200);
 
@@ -927,6 +1029,7 @@ static void test_due_model(void)
         clock_gettime(CLOCK_MONOTONIC, &tb);
         double ms = (double)(tb.tv_sec - ta.tv_sec) * 1e3 +
                     (double)(tb.tv_nsec - ta.tv_nsec) / 1e6;
+        printf("MISSED_WALK_3W_MS %.3f\n", ms);
         CHECK(ms < 10.0); /* unbudgeted this was ~650 ms on this host */
         CHECK(d->jobs[0].skipped_saturated == 1);
         CHECK(d->jobs[0].skipped > 0 && d->jobs[0].skipped <= 3600);

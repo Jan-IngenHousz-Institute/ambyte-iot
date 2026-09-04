@@ -16,11 +16,11 @@
  *   clock or sun window can open and close many times inside one stale
  *   interval. Slots whose due time fell while the gate was closed advance
  *   silently — they were never runnable, so they are not "missed".
- *   One poll spends at most SCHED_MISSED_WALK_CAP gate evaluations on stale
- *   backlogs (ungated grids count arithmetically; closed window stretches
- *   are jumped via sched_window_next_open). Beyond the budget the backlog
- *   is jumped to the grace horizon and skipped_saturated marks skipped a
- *   lower bound — after weeks the only truth is "a lot".
+ *   Each job gets at most SCHED_MISSED_WALK_CAP gate evaluations per poll on
+ *   stale backlogs (ungated grids count arithmetically; closed window
+ *   stretches are jumped via sched_window_next_open). Beyond a job's budget
+ *   its backlog is jumped to the grace horizon and its skipped_saturated
+ *   marks skipped a lower bound — after weeks the only truth is "a lot".
  * - overlap (skip / queue-one / reject) governs execution while a job is
  *   still running; execution belongs to the runner (T3). The model hands out
  *   at most one firing per job per poll.
@@ -43,8 +43,8 @@
 
 /* plan: late grace is the period for `every`, 600 s default otherwise */
 #define LATE_GRACE_DEFAULT_S 600
-/* Total gate evaluations one poll may spend walking stale slots across all
- * jobs and triggers. Beyond it the backlog is jumped to the grace horizon,
+/* Total gate evaluations one job may spend walking stale slots across its
+ * triggers in one poll. Beyond it the backlog is jumped to the grace horizon,
  * not counted, and the job's skipped_saturated flag marks the count a lower
  * bound: exact skipped counts have operational value only for short gaps —
  * after weeks the only truth is "a lot" (re-review 2-2: the shipped 1 Hz
@@ -111,15 +111,16 @@ static bool gate_open_at(const sched_job_t *job, int64_t local)
  *
  * Work is bounded three ways: an ungated every-grid counts arithmetically
  * (no gate to evaluate); a closed window stretch jumps to the window's next
- * opening instead of stepping slot by slot; and *budget (per poll, shared
- * by all jobs) caps the remaining gate evaluations — at zero the walk jumps
+ * opening instead of stepping slot by slot; and *budget (shared by a job's
+ * triggers) caps the remaining gate evaluations — at zero the walk jumps
  * straight to the horizon and sets *saturated, leaving *count a lower
  * bound. */
 static int64_t walk_missed(const sched_trigger_t *t, const sched_job_t *job,
                            int64_t D, int64_t limit, uint32_t *budget,
                            uint32_t *count, bool *any_open, bool *saturated)
 {
-    if (t->kind == SCHED_TRIG_EVERY && !job->has_window) {
+    if (t->kind == SCHED_TRIG_EVERY && !job->has_window &&
+        t->u.every.period_ms % 1000 == 0) {
         /* every slot is runnable: (limit - D)/P + 1 slots, no per-slot work */
         int64_t period = t->u.every.period_ms / 1000;
         int64_t n = (limit - D) / period + 1;
@@ -135,6 +136,20 @@ static int64_t walk_missed(const sched_trigger_t *t, const sched_job_t *job,
     while (cur >= 0 && cur <= limit) {
         if (*budget == 0) {
             *saturated = true;
+            if (job->missed == SCHED_MISSED_RUN_ONCE && !*any_open) {
+                /* Saturation must not silently downgrade run-once. Preserve
+                 * a make-up when the unwalked span is ungated, open now, or
+                 * has a known opening before the grace horizon. */
+                if (!job->has_window || gate_open_at(job, cur)) {
+                    *any_open = true;
+                } else {
+                    int64_t open_t;
+                    if (sched_window_next_open(&job->window, cur, &open_t) &&
+                        open_t <= limit) {
+                        *any_open = true;
+                    }
+                }
+            }
             return next_trigger_due(t, limit); /* jump to the grace horizon */
         }
         (*budget)--;
@@ -158,6 +173,22 @@ static int64_t walk_missed(const sched_trigger_t *t, const sched_job_t *job,
         cur = next;
     }
     return cur;
+}
+
+static void accumulate_skipped(sched_due_job_t *job, uint32_t count)
+{
+    if (UINT32_MAX - job->skipped < count) {
+        job->skipped = UINT32_MAX;
+        job->skipped_saturated = 1;
+    } else {
+        job->skipped += count;
+    }
+}
+
+static bool trigger_can_resolve(const sched_trigger_t *trigger)
+{
+    return trigger->kind != SCHED_TRIG_BOOT &&
+           trigger->kind != SCHED_TRIG_DISPATCH;
 }
 
 void sched_due_init(sched_due_t *d, const sched_program_t *prog,
@@ -191,10 +222,10 @@ uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc)
     const sched_program_t *prog = d->prog;
     int64_t L = d->localize(d->localize_ctx, now_utc);
     uint32_t mask = 0;
-    uint32_t walk_budget = SCHED_MISSED_WALK_CAP; /* one budget per poll */
     for (int j = 0; j < prog->job_count; j++) {
         const sched_job_t *job = &prog->jobs[j];
         sched_due_job_t *dj = &d->jobs[j];
+        uint32_t walk_budget = SCHED_MISSED_WALK_CAP; /* independent per job */
         bool gate = gate_open_at(job, L);
         bool fired = false;
 
@@ -210,6 +241,12 @@ uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc)
         for (int i = 0; i < job->trigger_count; i++) {
             const sched_trigger_t *tr = &job->triggers[i];
             int64_t D = dj->due[i];
+            if (D < 0 && trigger_can_resolve(tr)) {
+                /* A sun event can be absent inside time_sync's two-day polar
+                 * horizon and become resolvable months later. Retry disabled
+                 * dues on every poll so the trigger revives without reload. */
+                D = next_trigger_due(tr, L);
+            }
             int64_t grace = (tr->kind == SCHED_TRIG_EVERY)
                                 ? tr->u.every.period_ms / 1000
                                 : LATE_GRACE_DEFAULT_S;
@@ -232,7 +269,7 @@ uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc)
                     if (job->missed == SCHED_MISSED_RUN_ONCE) {
                         if (any_open) fired = true;
                     } else {
-                        dj->skipped += n;
+                        accumulate_skipped(dj, n);
                     }
                     continue;
                 }

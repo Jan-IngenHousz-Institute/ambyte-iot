@@ -391,8 +391,8 @@ typedef struct {
     uint32_t runs;         /* firings handed to the runner */
     uint8_t  boot_pending; /* boot trigger not yet consumed */
     uint8_t  gate_open;    /* last evaluated gate state (on_enter edge detect) */
-    uint8_t  skipped_saturated; /* a stale backlog exceeded the per-poll walk
-                            * budget; the rest was jumped, not counted */
+    uint8_t  skipped_saturated; /* this job's stale backlog exceeded its
+                            * per-poll walk budget; the rest was jumped */
 } sched_due_job_t;
 
 typedef struct {
