@@ -383,8 +383,14 @@ bool sched_window_next_open(const sched_window_t *win, int64_t now_local, int64_
  * offset here; host tests pass a fixed-offset stub. */
 typedef int64_t (*sched_localize_fn)(void *ctx, int64_t utc_unix);
 
+/* A forward wall correction can legitimately project an overdue armed instant
+ * before monotonic zero, so -1 is not a safe sentinel in the monotonic domain. */
+#define SCHED_DUE_NONE_US INT64_MIN
+
 typedef struct {
-    int64_t due[SCHED_SPEC_MAX_TRIGGERS]; /* local unix, -1 = no future fire */
+    int64_t due_us[SCHED_SPEC_MAX_TRIGGERS]; /* armed monotonic µs; INT64_MIN=none */
+    int64_t wall_due_local[SCHED_SPEC_MAX_TRIGGERS]; /* paired wall anchor used
+                                             * only to resolve wall successors */
     int64_t fired_minute;  /* last local minute a cron trigger fired in (DST latch) */
     uint32_t skipped;      /* runnable slots missed past grace; a lower bound
                             * while skipped_saturated is 1 */
@@ -399,10 +405,32 @@ typedef struct {
     const sched_program_t *prog;
     sched_localize_fn      localize;
     void                  *localize_ctx;
+    int64_t                anchor_wall_utc;
+    int64_t                anchor_mono_us;
+    int32_t                anchor_offset_s;
     sched_due_job_t        jobs[SCHED_SPEC_MAX_JOBS];
 } sched_due_t;
 
-/* Computes initial dues from now; boot triggers go pending (the runner calls
+/* Dual-clock runner API. Wall UTC is sampled only when anchoring/re-anchoring;
+ * all armed dues, polling and waits use monotonic microseconds. The wall
+ * projection advances from the anchor by monotonic elapsed time, so corrections
+ * inside the runner's >2 s re-anchor threshold cannot stretch/compress an
+ * `every` cadence. */
+void sched_due_init_mono(sched_due_t *d, const sched_program_t *prog,
+                         sched_localize_fn localize, void *ctx,
+                         int64_t now_utc, int64_t now_mono_us);
+uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us);
+int64_t sched_due_next_mono(const sched_due_t *d, int64_t now_mono_us);
+void sched_due_reanchor_mono(sched_due_t *d, int64_t now_utc,
+                             int64_t now_mono_us);
+/* Wall UTC projected from the last anchor and monotonic elapsed time. The
+ * runner compares this with gettimeofday() for cumulative step/slew detection
+ * and uses it to render a monotonic due in status output. */
+int64_t sched_due_project_wall_utc(const sched_due_t *d, int64_t mono_us);
+
+/* Compatibility seconds API for pure callers/tests: it maps UTC seconds onto
+ * the same numeric monotonic timeline. Firmware uses the dual-clock API above.
+ * Computes initial dues from now; boot triggers go pending (the runner calls
  * this after clock trust, so boot means first trusted time). No job fires as
  * a side effect of init, and the initial gate state is not an "entry". */
 void sched_due_init(sched_due_t *d, const sched_program_t *prog,

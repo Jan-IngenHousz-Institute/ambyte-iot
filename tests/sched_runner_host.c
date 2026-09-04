@@ -6,14 +6,17 @@
  *   - the failure-streak log throttle (sched_runner_priv.h, inline): first
  *     failure, every 300th, recovery — the flood protection the design owes
  *     legacy_1Hz_spec.lua's 536 K-line incident;
+ *   - the pure lifecycle transition model used under the firmware portMUX,
+ *     including stop-success → immediate start and stale-generation rejection;
  *   - the db/store-event JSON writer (sched_runner_json.c), including the
  *     exact path that reboot-looped hardware: a store-event whose kind is
  *     absent must omit the member, never dereference NULL (T3 review
  *     blocker 5; the compiler now also REQUIRES kind, tested in
  *     tests/sched_spec_host.c + test_sched_spec.py).
  *
- * The runner task/lifecycle itself is firmware-only (FreeRTOS) and is covered
- * by the hardware gate, not here.
+ * Semaphore timing remains firmware-only and is covered by the hardware gate;
+ * the state/generation rules themselves are the same inline functions tested
+ * here and called under the firmware lock.
  *
  * Prints "SCHED_RUNNER_HOST_OK <checks>" and exits 0 when all checks pass.
  */
@@ -58,6 +61,47 @@ static void test_fail_throttle(void)
     CHECK(logs == 4);
 }
 
+/* ── lifecycle generation/order model ───────────────────────────────── */
+
+static void test_lifecycle_immediate_restart(void)
+{
+    sched_lifecycle_t life = SCHED_LIFECYCLE_INITIALIZER;
+    uint32_t first = 0, second = 0;
+    bool stop_at_publish = false;
+
+    CHECK(sched_lifecycle_begin_start(&life, &first));
+    CHECK(first != 0 && life.state == SCHED_LIFE_STARTING);
+    CHECK(sched_lifecycle_publish_start(&life, first, &stop_at_publish));
+    CHECK(!stop_at_publish && life.state == SCHED_LIFE_RUNNING);
+
+    CHECK(sched_lifecycle_request_stop(&life) == first);
+    CHECK(life.state == SCHED_LIFE_STOPPING);
+
+    /* Successful completion publishes STOPPED and the completed generation
+     * together. A caller released at this exact boundary can start again
+     * immediately; no transient STOPPING state remains observable. */
+    CHECK(sched_lifecycle_complete(&life, first));
+    CHECK(sched_lifecycle_generation_complete(&life, first));
+    CHECK(life.state == SCHED_LIFE_STOPPED);
+    CHECK(sched_lifecycle_begin_start(&life, &second));
+    CHECK(second != first && life.state == SCHED_LIFE_STARTING);
+
+    /* A late wake/completion from the first run cannot complete or stop the
+     * newly claimed generation. */
+    CHECK(!sched_lifecycle_complete(&life, first));
+    CHECK(!sched_lifecycle_generation_complete(&life, second));
+    CHECK(life.state == SCHED_LIFE_STARTING);
+
+    sched_lifecycle_t during_start = SCHED_LIFECYCLE_INITIALIZER;
+    uint32_t third = 0;
+    CHECK(sched_lifecycle_begin_start(&during_start, &third));
+    CHECK(sched_lifecycle_request_stop(&during_start) == third);
+    CHECK(during_start.state == SCHED_LIFE_STARTING);
+    CHECK(sched_lifecycle_publish_start(&during_start, third, &stop_at_publish));
+    CHECK(stop_at_publish && during_start.state == SCHED_LIFE_STOPPING);
+    CHECK(sched_lifecycle_complete(&during_start, third));
+}
+
 /* ── JSON writer primitives ──────────────────────────────────────────── */
 
 static void test_jw_str(void)
@@ -84,6 +128,32 @@ static void test_jw_str(void)
     sched_jw_t t = { tiny, sizeof tiny, 0, false };
     sched_jw_str(&t, "abcdef");
     CHECK(t.overflow && t.len >= sizeof tiny && tiny[sizeof tiny - 1] == '\0');
+}
+
+static void test_job_stat_placeholders(void)
+{
+    char buf[32];
+    sched_runner_act_ctx_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.skipped = 1234;
+    ctx.skipped_saturated = true;
+
+    sched_jw_t w = { buf, sizeof buf, 0, false };
+    CHECK(sched_jw_job_placeholder(&w, "$job.skipped", &ctx));
+    CHECK(!w.overflow && strcmp(buf, "1234") == 0);
+
+    w.len = 0;
+    CHECK(sched_jw_job_placeholder(&w, "$job.skipped_saturated", &ctx));
+    CHECK(!w.overflow && strcmp(buf, "true") == 0);
+
+    ctx.skipped_saturated = false;
+    w.len = 0;
+    CHECK(sched_jw_job_placeholder(&w, "$job.skipped_saturated", &ctx));
+    CHECK(!w.overflow && strcmp(buf, "false") == 0);
+
+    w.len = 0;
+    CHECK(!sched_jw_job_placeholder(&w, "$deployment", &ctx));
+    CHECK(w.len == 0);
 }
 
 /* ── sched_build_map_json on a compiled store-event step ─────────────── */
@@ -207,7 +277,9 @@ static void test_build_map_json(void)
 int main(void)
 {
     test_fail_throttle();
+    test_lifecycle_immediate_restart();
     test_jw_str();
+    test_job_stat_placeholders();
     test_build_map_json();
 
     if (s_fails == 0) {

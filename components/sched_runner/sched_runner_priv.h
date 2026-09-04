@@ -39,6 +39,83 @@ static inline sched_fail_log_t sched_fail_log_decision(bool failed,
                : SCHED_FAIL_LOG_NONE;
 }
 
+/* Lifecycle transition model. The firmware keeps one instance under its
+ * portMUX; keeping the transition rules pure makes the stop-success → immediate
+ * start contract host-testable without pretending to emulate FreeRTOS.
+ *
+ * A completion semaphore is only a wake hint. `completed_generation` is the
+ * truth: an old task's late give can wake a waiter for a newer run, but it can
+ * never complete that run. `sched_lifecycle_complete()` publishes STOPPED and
+ * the completed generation in one lock-held transition before the task gives
+ * the semaphore. */
+typedef enum {
+    SCHED_LIFE_STOPPED = 0,
+    SCHED_LIFE_STARTING,
+    SCHED_LIFE_RUNNING,
+    SCHED_LIFE_STOPPING,
+} sched_lifecycle_state_t;
+
+typedef struct {
+    sched_lifecycle_state_t state;
+    uint32_t generation;
+    uint32_t completed_generation;
+    bool stop_requested;
+} sched_lifecycle_t;
+
+#define SCHED_LIFECYCLE_INITIALIZER \
+    { SCHED_LIFE_STOPPED, 0, 0, false }
+
+static inline bool sched_lifecycle_begin_start(sched_lifecycle_t *life,
+                                                uint32_t *generation)
+{
+    if (life == NULL || life->state != SCHED_LIFE_STOPPED) return false;
+    life->generation++;
+    if (life->generation == 0) life->generation++; /* reserve zero as "none" */
+    life->state = SCHED_LIFE_STARTING;
+    life->stop_requested = false;
+    if (generation != NULL) *generation = life->generation;
+    return true;
+}
+
+static inline bool sched_lifecycle_publish_start(sched_lifecycle_t *life,
+                                                  uint32_t generation,
+                                                  bool *stop_requested)
+{
+    if (life == NULL || life->state != SCHED_LIFE_STARTING ||
+        life->generation != generation) return false;
+    if (stop_requested != NULL) *stop_requested = life->stop_requested;
+    life->state = life->stop_requested ? SCHED_LIFE_STOPPING : SCHED_LIFE_RUNNING;
+    return true;
+}
+
+/* Returns the generation whose completion a stopper must observe, or zero
+ * when already stopped. */
+static inline uint32_t sched_lifecycle_request_stop(sched_lifecycle_t *life)
+{
+    if (life == NULL || life->state == SCHED_LIFE_STOPPED) return 0;
+    if (life->state == SCHED_LIFE_STARTING) life->stop_requested = true;
+    if (life->state == SCHED_LIFE_RUNNING) life->state = SCHED_LIFE_STOPPING;
+    return life->generation;
+}
+
+static inline bool sched_lifecycle_complete(sched_lifecycle_t *life,
+                                             uint32_t generation)
+{
+    if (life == NULL || generation == 0 || life->generation != generation ||
+        life->state == SCHED_LIFE_STOPPED) return false;
+    life->completed_generation = generation;
+    life->state = SCHED_LIFE_STOPPED;
+    life->stop_requested = false;
+    return true;
+}
+
+static inline bool sched_lifecycle_generation_complete(const sched_lifecycle_t *life,
+                                                        uint32_t generation)
+{
+    return life != NULL && generation != 0 &&
+           life->completed_generation == generation;
+}
+
 /* Snapshot of the job currently executing, refreshed before each run. The
  * actions read it for log lines and the db/store-event $job.* placeholders.
  * Single runner task → no locking. fail_detail is the action-written failure
@@ -51,6 +128,7 @@ typedef struct {
     uint32_t runs;
     uint32_t failures;
     uint32_t skipped;
+    bool     skipped_saturated;
     uint32_t fail_streak;
     char     fail_detail[128];
 } sched_runner_act_ctx_t;
@@ -75,6 +153,12 @@ void sched_jw_raw(sched_jw_t *w, const char *fmt, ...);
 /* Writes s as a JSON string with quote/backslash escaping; NULL → "" (a
  * compiled schedule must never be able to crash the runner). */
 void sched_jw_str(sched_jw_t *w, const char *s);
+
+/* Resolve the runner-owned $job.* subset. Returns false for a non-job
+ * placeholder so the firmware callback can handle device facts. Pure and
+ * host-tested, including the exact-vs-lower-bound saturation companion. */
+bool sched_jw_job_placeholder(sched_jw_t *w, const char *ph,
+                              const sched_runner_act_ctx_t *ctx);
 
 /* Serialize one flat map input ("data"/"metadata") as a JSON object.
  * extra_key/extra_val prepend a member (store-event stamps data.kind);

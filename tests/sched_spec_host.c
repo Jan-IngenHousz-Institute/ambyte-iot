@@ -413,11 +413,11 @@ static void test_compiler_rules(void)
         "  j:\n"
         "    on: { cron: \"0 * * * *\" }\n"
         "    steps: [ { uses: db/store-event, with: { kind: hourly, "
-        "data: { runs: $job.runs, note: hello, n: 5, x: 1.5, ok: true } } } ]\n");
+        "data: { runs: $job.runs, saturated: $job.skipped_saturated, note: hello, n: 5, x: 1.5, ok: true } } } ]\n");
     CHECK(p != NULL);
     if (p != NULL) {
         const sched_step_t *st = &p->jobs[0].steps[0];
-        CHECK(st->entry_count == 6); /* kind + 5 data entries */
+        CHECK(st->entry_count == 7); /* kind + 6 data entries */
         free(p);
     }
 
@@ -1000,11 +1000,11 @@ static void test_due_model(void)
         "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
         time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
     if (d != NULL) {
-        CHECK(d->jobs[0].due[0] == -1);
+        CHECK(d->jobs[0].wall_due_local[0] == -1);
         int64_t august = time_sync_make(2026, 8, 25, 0, 0, 0);
         CHECK(sched_due_poll(d, august) == 0);
-        CHECK(d->jobs[0].due[0] > august);
-        CHECK(sched_due_poll(d, d->jobs[0].due[0]) == 1);
+        CHECK(d->jobs[0].wall_due_local[0] > august);
+        CHECK(sched_due_poll(d, d->jobs[0].wall_due_local[0]) == 1);
         free(p);
         free(d);
     }
@@ -1154,7 +1154,7 @@ static void test_due_reanchor(void)
         int64_t now = t0 + 60 - 3600;                      /* RTC corrected back 1 h */
         CHECK(sched_due_poll(d, now) == 0);                /* stale due: silent */
         sched_due_reanchor(d, now);
-        CHECK(d->jobs[0].due[0] == now + 60);              /* re-anchored grid */
+        CHECK(d->jobs[0].wall_due_local[0] == now + 60);   /* re-anchored grid */
         CHECK(sched_due_poll(d, now + 30) == 0);
         CHECK(sched_due_poll(d, now + 60) == 1);           /* resumes within a period */
         CHECK(d->jobs[0].skipped == 0);                    /* no fake missed slots */
@@ -1172,7 +1172,7 @@ static void test_due_reanchor(void)
         CHECK(sched_due_poll(d, t0 + 60) == 1);
         int64_t now = t0 + 7260;                           /* RTC corrected forward */
         sched_due_reanchor(d, now);
-        CHECK(d->jobs[0].due[0] == t0 + 120);              /* past due untouched */
+        CHECK(d->jobs[0].wall_due_local[0] == t0 + 120);   /* past due untouched */
         CHECK(sched_due_poll(d, now) == 1);                /* t0+7260 slot fires */
         CHECK(d->jobs[0].skipped == 119);                  /* t0+120..t0+7200 counted */
         free(p);
@@ -1211,7 +1211,7 @@ static void test_due_reanchor(void)
         int64_t latch = d->jobs[0].fired_minute;
         sched_due_reanchor(d, t0 + 30);                    /* 30 s backward */
         CHECK(d->jobs[0].fired_minute == latch);           /* latch preserved */
-        CHECK(d->jobs[0].due[0] == t0 + 60);               /* re-anchored into */
+        CHECK(d->jobs[0].wall_due_local[0] == t0 + 60);    /* re-anchored into */
         CHECK(sched_due_poll(d, t0 + 60) == 0);            /* ...but no refire */
         CHECK(sched_due_poll(d, t0 + 120) == 1);           /* next minute normal */
         CHECK(d->jobs[0].runs == 2);
@@ -1232,15 +1232,74 @@ static void test_due_reanchor(void)
         int64_t ten = time_sync_make(2026, 6, 21, 10, 0, 0);
         CHECK(sched_due_poll(d, ten) == 1);                /* on_enter */
         CHECK(d->jobs[0].gate_open == 1);
-        int64_t due_before = d->jobs[0].due[0];
+        int64_t due_before = d->jobs[0].wall_due_local[0];
         sched_due_reanchor(d, ten + 120);                  /* no clock step */
-        CHECK(d->jobs[0].due[0] == due_before);            /* grid unchanged */
+        CHECK(d->jobs[0].wall_due_local[0] == due_before); /* grid unchanged */
         CHECK(d->jobs[0].gate_open == 1);                  /* gate preserved */
         CHECK(sched_due_poll(d, ten + 300) == 1);          /* grid, no 2nd entry */
         CHECK(d->jobs[0].runs == 2);
         free(p);
         free(d);
     }
+}
+
+/* The runner's injected dual-clock seam: wall establishes/re-establishes the
+ * anchor, while armed dues and cadence are monotonic microsecond instants. */
+static void test_due_monotonic_clock(void)
+{
+    const char *every_1m =
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 1m }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n";
+    const int64_t us = 1000000;
+    const int64_t mono0 = 5000000;
+    const int64_t t0 = time_sync_make(2026, 6, 21, 0, 0, 0);
+    sched_program_t *p = NULL;
+    sched_due_t *d = calloc(1, sizeof(*d));
+    char err[256];
+    CHECK(d != NULL);
+    p = calloc(1, sizeof(*p));
+    CHECK(p != NULL);
+    if (d == NULL || p == NULL) { free(d); free(p); return; }
+    CHECK(sched_compile_text(every_1m, strlen(every_1m), p, err, sizeof(err)) == ESP_OK);
+
+    sched_due_init_mono(d, p, identity_localize, NULL, t0, mono0);
+    CHECK(d->jobs[0].due_us[0] == mono0 + 60 * us);
+
+    /* A -2 s wall correction is inside the re-anchor threshold. At +60 s
+     * monotonic the slot still fires exactly on cadence even though wall has
+     * advanced only 58 s; the next armed due is another monotonic minute. */
+    const int64_t mono1 = mono0 + 60 * us;
+    CHECK(sched_due_project_wall_utc(d, mono1) == t0 + 60);
+    CHECK((t0 + 58) - sched_due_project_wall_utc(d, mono1) == -2);
+    CHECK(sched_due_poll_mono(d, mono1) == 1);
+    CHECK(sched_due_next_mono(d, mono1) == mono0 + 120 * us);
+
+    /* A real forward step (>2 s) reprojects the old armed slot onto the new
+     * anchor so T2's exact missed-slot accounting remains intact. */
+    const int64_t mono2 = mono1 + us;
+    sched_due_reanchor_mono(d, t0 + 7260, mono2);
+    CHECK(sched_due_poll_mono(d, mono2) == 1);
+    CHECK(d->jobs[0].skipped == 119);
+    free(d);
+    free(p);
+
+    /* Backward step: the obsolete future wall grid is re-resolved from the
+     * corrected wall anchor and becomes an armed monotonic due within 60 s. */
+    d = calloc(1, sizeof(*d));
+    p = calloc(1, sizeof(*p));
+    CHECK(d != NULL && p != NULL);
+    if (d == NULL || p == NULL) { free(d); free(p); return; }
+    CHECK(sched_compile_text(every_1m, strlen(every_1m), p, err, sizeof(err)) == ESP_OK);
+    sched_due_init_mono(d, p, identity_localize, NULL, t0, mono0);
+    CHECK(sched_due_poll_mono(d, mono1) == 1);
+    sched_due_reanchor_mono(d, t0 + 60 - 3600, mono2);
+    CHECK(sched_due_next_mono(d, mono2) == mono2 + 60 * us);
+    CHECK(sched_due_poll_mono(d, mono2 + 59 * us) == 0);
+    CHECK(sched_due_poll_mono(d, mono2 + 60 * us) == 1);
+    CHECK(d->jobs[0].skipped == 0);
+    free(d);
+    free(p);
 }
 
 /* DST through the due model with the libc offset: fall-back fires the
@@ -1333,6 +1392,7 @@ int main(void)
     test_windows();
     test_due_model();
     test_due_reanchor();
+    test_due_monotonic_clock();
     test_due_dst();
     test_actions_dump();
 

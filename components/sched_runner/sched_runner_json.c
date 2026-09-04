@@ -42,6 +42,26 @@ void sched_jw_str(sched_jw_t *w, const char *s)
     sched_jw_raw(w, "\"");
 }
 
+bool sched_jw_job_placeholder(sched_jw_t *w, const char *ph,
+                              const sched_runner_act_ctx_t *ctx)
+{
+    if (strcmp(ph, "$job.runs") == 0) {
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->runs);
+    } else if (strcmp(ph, "$job.failures") == 0) {
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->failures);
+    } else if (strcmp(ph, "$job.skipped") == 0) {
+        /* Backward-compatible numeric lower bound. */
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->skipped);
+    } else if (strcmp(ph, "$job.skipped_saturated") == 0) {
+        sched_jw_raw(w, "%s", ctx->skipped_saturated ? "true" : "false");
+    } else if (strcmp(ph, "$job.fail_streak") == 0) {
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->fail_streak);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void jw_value(sched_jw_t *w, const sched_entry_t *en,
                      const sched_program_t *prog,
                      const sched_runner_act_ctx_t *ctx,

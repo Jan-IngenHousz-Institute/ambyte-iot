@@ -4,16 +4,13 @@
  * design: components/sched_spec compiles /littlefs/schedule.yaml or the
  * embedded default into a bounded sched_program_t; this task executes it).
  *
- * Timebase (plan §Timebase): monotonic esp_timer_get_time() owns every wait
- * and deadline; wall clock (RTC-backed gettimeofday + timezone_localize) is
- * only an ANCHOR — sched_due_poll/sched_due_next translate wall anchors into
- * local due instants, and the loop sleeps on the FreeRTOS tick clock, never
- * on a wall difference. Clock-step detection compares wall vs monotonic
- * elapsed each iteration; a step over 2 s calls sched_due_reanchor() BEFORE
- * the next poll, so a backward RTC correction re-anchors stranded dues to the
- * new now (an every-job resumes within one period) and a forward correction
- * keeps the due model's missed-slot accounting. The 60 s wait ceiling bounds
- * how long a step can go unnoticed.
+ * Timebase (plan §Timebase): sched_due arms monotonic microsecond instants;
+ * wall UTC is sampled only at init/re-anchor and projected from monotonic
+ * elapsed between them. Clock-step detection compares real wall with that
+ * projection; a divergence over 2 s reprojects wall triggers before polling.
+ * Thus small corrections/slews cannot stretch an `every` cadence, while
+ * cron/sun/at/weekly and DST keep their wall semantics. The 60 s wait ceiling
+ * bounds how long a step can go unnoticed.
  *
  * Lifecycle: an explicit state machine (STOPPED/STARTING/RUNNING/STOPPING)
  * guarded by the s_state_mux spinlock, separate from the task handle. start()
@@ -103,13 +100,6 @@
 
 /* ── lifecycle state (guarded by s_state_mux) ──────────────────────────── */
 
-typedef enum {
-    SCHED_ST_STOPPED = 0, /* no task; the program stays loaded for status */
-    SCHED_ST_STARTING,    /* start() owns the compile; task not yet published */
-    SCHED_ST_RUNNING,
-    SCHED_ST_STOPPING,    /* stop requested; task unwinding (≤ one UART call) */
-} sched_st_t;
-
 /* Spinlock critical sections are never held across a blocking call — only
  * state/flag reads+writes and short struct copies. The one exception is each
  * first xSemaphoreCreateBinaryStatic: it only initializes caller-owned
@@ -117,8 +107,7 @@ typedef enum {
  * starts cannot initialize the same StaticSemaphore_t twice. Lock order when
  * nested: s_state_mux → s_dispatch_mux → s_stats_mux. */
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
-static sched_st_t   s_state = SCHED_ST_STOPPED;
-static bool         s_stop_requested = false; /* stop arrived during STARTING */
+static sched_lifecycle_t s_lifecycle = SCHED_LIFECYCLE_INITIALIZER;
 
 /* Stop flag polled by the loop and by every action between UART transactions.
  * Written only under s_state_mux; polled lock-free (a byte write is atomic on
@@ -159,9 +148,10 @@ static job_rt_t s_rt[SCHED_SPEC_MAX_JOBS];
  * and every poll; the CLI reads s_due only through this copy (a live read
  * could tear against poll's 64-bit due updates). */
 typedef struct {
-    int64_t  next_due_local; /* local unix, -1 = none */
+    int64_t  next_due_utc; /* wall projection of armed monotonic due */
     uint32_t skipped;
     uint8_t  boot_pending;
+    uint8_t  skipped_saturated;
 } job_snap_t;
 static job_snap_t s_snap[SCHED_SPEC_MAX_JOBS]; /* under s_state_mux */
 
@@ -270,14 +260,19 @@ static void publish_status_snapshot(void)
 {
     job_snap_t tmp[SCHED_SPEC_MAX_JOBS];
     for (int j = 0; j < s_prog.job_count; j++) {
-        int64_t best = -1;
+        int64_t best = SCHED_DUE_NONE_US;
         for (int t = 0; t < s_prog.jobs[j].trigger_count; t++) {
-            int64_t dd = s_due.jobs[j].due[t];
-            if (dd >= 0 && (best < 0 || dd < best)) best = dd;
+            int64_t dd = s_due.jobs[j].due_us[t];
+            if (dd != SCHED_DUE_NONE_US &&
+                (best == SCHED_DUE_NONE_US || dd < best)) best = dd;
         }
-        tmp[j].next_due_local = best;
-        tmp[j].skipped        = s_due.jobs[j].skipped;
-        tmp[j].boot_pending   = s_due.jobs[j].boot_pending;
+        tmp[j].next_due_utc =
+            best == SCHED_DUE_NONE_US
+                ? -1
+                : sched_due_project_wall_utc(&s_due, best);
+        tmp[j].skipped = s_due.jobs[j].skipped;
+        tmp[j].boot_pending = s_due.jobs[j].boot_pending;
+        tmp[j].skipped_saturated = s_due.jobs[j].skipped_saturated;
     }
     taskENTER_CRITICAL(&s_state_mux);
     memcpy(s_snap, tmp, sizeof(tmp));
@@ -318,6 +313,7 @@ static void run_job(int j)
     s_act_ctx.runs        = s_rt[j].runs;
     s_act_ctx.failures    = s_rt[j].failures;
     s_act_ctx.skipped     = s_due.jobs[j].skipped;
+    s_act_ctx.skipped_saturated = s_due.jobs[j].skipped_saturated != 0;
     s_act_ctx.fail_streak = s_rt[j].fail_streak;
     s_act_ctx.fail_detail[0] = '\0';
 
@@ -391,7 +387,7 @@ esp_err_t sched_runner_dispatch(const char *job_name)
      * with INVALID_STATE, never queued-then-silently-discarded. s_prog is
      * stable while RUNNING (compiles happen only under the STARTING claim). */
     taskENTER_CRITICAL(&s_state_mux);
-    if (s_state != SCHED_ST_RUNNING) {
+    if (s_lifecycle.state != SCHED_LIFE_RUNNING) {
         taskEXIT_CRITICAL(&s_state_mux);
         return ESP_ERR_INVALID_STATE;
     }
@@ -471,7 +467,7 @@ static void drain_dispatch(void)
 
 static void sched_runner_task(void *arg)
 {
-    (void)arg;
+    const uint32_t generation = (uint32_t)(uintptr_t)arg;
 
     /* xTaskCreatePinnedToCore may immediately schedule this higher-priority
      * task on the other core. Wait until start() has published the lifecycle
@@ -482,7 +478,9 @@ static void sched_runner_task(void *arg)
     /* Due-model init happens on the task, after start(): boot triggers go
      * pending here, and start happens after clock trust (same call-site
      * contract as lua_runner), so boot means first trusted time. */
-    sched_due_init(&s_due, &s_prog, runner_localize, NULL, wall_now_utc());
+    const int64_t init_mono_us = esp_timer_get_time();
+    sched_due_init_mono(&s_due, &s_prog, runner_localize, NULL,
+                        wall_now_utc(), init_mono_us);
     publish_status_snapshot();
 
     const char *name = sched_pool_str(&s_prog, s_prog.name_off);
@@ -508,32 +506,24 @@ static void sched_runner_task(void *arg)
         ESP_LOGI(TAG, "schedule started; sunrise=%s sunset=%s", sr, ss);
     }
 
-    int64_t last_mono_us = esp_timer_get_time();
-    int64_t last_wall_s  = wall_now_utc();
-
     for (;;) {
         if (s_should_stop) break;
 
-        /* Clock-step detection, monotonic-referenced: wall elapsed vs
-         * esp_timer elapsed since the last iteration. A step over 2 s
-         * re-anchors the due model BEFORE the poll: dues stranded in the
-         * future by a backward correction are recomputed from the new now
-         * (a 1 m job resumes within a minute, never waits out the stale
-         * due); past dues keep poll's missed-slot accounting. */
+        /* Compare real wall UTC with the wall projected from the last
+         * monotonic anchor. Unlike per-iteration deltas, this catches a slow
+         * correction once cumulative divergence exceeds the 2 s threshold. */
         const int64_t now  = wall_now_utc();
         const int64_t mono = esp_timer_get_time();
-        const int64_t wall_d = now - last_wall_s;
-        const int64_t mono_d = (mono - last_mono_us) / 1000000;
-        if (wall_d - mono_d > CLOCK_STEP_TOLERANCE_S ||
-            mono_d - wall_d > CLOCK_STEP_TOLERANCE_S) {
+        const int64_t wall_error =
+            now - sched_due_project_wall_utc(&s_due, mono);
+        if (wall_error > CLOCK_STEP_TOLERANCE_S ||
+            wall_error < -CLOCK_STEP_TOLERANCE_S) {
             ESP_LOGW(TAG, "clock stepped %lld s — re-anchoring wall triggers",
-                     (long long)(wall_d - mono_d));
-            sched_due_reanchor(&s_due, now);
+                     (long long)wall_error);
+            sched_due_reanchor_mono(&s_due, now, mono);
         }
-        last_wall_s  = now;
-        last_mono_us = mono;
 
-        uint32_t mask = sched_due_poll(&s_due, now);
+        uint32_t mask = sched_due_poll_mono(&s_due, mono);
         publish_status_snapshot();
         for (int j = 0; j < s_prog.job_count; j++) {
             if (mask & (1u << j)) run_job(j);
@@ -541,18 +531,13 @@ static void sched_runner_task(void *arg)
         drain_dispatch();
         if (s_should_stop) break;
 
-        /* Wait: wall clock only at the anchor (next due is a local wall
-         * instant), the WAIT itself is monotonic — the duration is converted
-         * to an esp_timer deadline and the semaphore take sleeps on the
-         * FreeRTOS tick clock, never on a wall difference. A step during the
-         * sleep is caught at wake (bounded by LOOP_MAX_WAIT_MS) and
-         * re-anchored above. */
-        const int64_t now2 = wall_now_utc();
-        const int64_t L = timezone_localize(now2);
+        /* Armed dues and this wait are both monotonic. The 60 s ceiling exists
+         * only so clock corrections are detected even when nothing is due. */
+        const int64_t now2_us = esp_timer_get_time();
         int64_t wait_ms = LOOP_MAX_WAIT_MS;
-        const int64_t next_local = sched_due_next(&s_due, now2);
-        if (next_local >= 0) {
-            int64_t d = (next_local - L) * 1000;
+        const int64_t next_us = sched_due_next_mono(&s_due, now2_us);
+        if (next_us >= 0) {
+            int64_t d = (next_us - now2_us) / 1000;
             if (d < 10) d = 10; /* overdue → spin once, don't busy-wait on 0 */
             if (d < wait_ms) wait_ms = d;
         }
@@ -569,14 +554,14 @@ static void sched_runner_task(void *arg)
     ESP_LOGI(TAG, "stopped; stack high-water mark %u bytes of %u",
              (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
              (unsigned)SCHED_TASK_STACK);
-    /* Signal first, then publish STOPPED. A new start cannot claim until the
-     * state transition, and therefore drains this run's done token AFTER it
-     * exists; publishing STOPPED first would let a new start drain an empty
-     * semaphore and inherit a stale exit token moments later. */
-    if (s_done_sem != NULL) xSemaphoreGive(s_done_sem);
+    /* Publish STOPPED and this run's completion generation in one lock-held
+     * transition, then wake waiters. A new start may claim before the give, but
+     * its stopper compares generations and discards that old wake; successful
+     * stop for this generation can never observe STOPPING afterwards. */
     taskENTER_CRITICAL(&s_state_mux);
-    s_state = SCHED_ST_STOPPED;
+    (void)sched_lifecycle_complete(&s_lifecycle, generation);
     taskEXIT_CRITICAL(&s_state_mux);
+    if (s_done_sem != NULL) xSemaphoreGive(s_done_sem);
     vTaskDelete(NULL);
 }
 
@@ -589,7 +574,8 @@ esp_err_t sched_runner_start(void)
      * caller can compile into s_prog, and a stop that observes STARTING is
      * guaranteed to have a valid done semaphore to wait on. */
     taskENTER_CRITICAL(&s_state_mux);
-    if (s_state != SCHED_ST_STOPPED) {
+    uint32_t generation = 0;
+    if (s_lifecycle.state != SCHED_LIFE_STOPPED) {
         taskEXIT_CRITICAL(&s_state_mux);
         return ESP_ERR_INVALID_STATE;
     }
@@ -607,8 +593,7 @@ esp_err_t sched_runner_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    s_state          = SCHED_ST_STARTING;
-    s_stop_requested = false;
+    (void)sched_lifecycle_begin_start(&s_lifecycle, &generation);
     s_should_stop    = false; /* clear the previous run before task creation */
     s_prog_valid     = false; /* status reads see "no program" during compile */
     taskEXIT_CRITICAL(&s_state_mux);
@@ -702,29 +687,28 @@ esp_err_t sched_runner_start(void)
      * the snapshot/source they now observe is fully initialised. The task
      * overwrites the snapshot with real dues right after its init. */
     taskENTER_CRITICAL(&s_state_mux);
-    for (int j = 0; j < SCHED_SPEC_MAX_JOBS; j++) s_snap[j].next_due_local = -1;
+    for (int j = 0; j < SCHED_SPEC_MAX_JOBS; j++) s_snap[j].next_due_utc = -1;
     s_source     = src;
     s_prog_valid = true;
     taskEXIT_CRITICAL(&s_state_mux);
 
     TaskHandle_t h = NULL;
     BaseType_t created = xTaskCreatePinnedToCore(
-        sched_runner_task, SCHED_TASK_NAME, SCHED_TASK_STACK, NULL,
+        sched_runner_task, SCHED_TASK_NAME, SCHED_TASK_STACK,
+        (void *)(uintptr_t)generation,
         SCHED_TASK_PRIORITY, &h, SCHED_TASK_CORE);
 
     taskENTER_CRITICAL(&s_state_mux);
     if (created != pdPASS) {
+        (void)sched_lifecycle_complete(&s_lifecycle, generation);
         taskEXIT_CRITICAL(&s_state_mux);
-        /* As at normal task exit, signal before publishing STOPPED so a new
-         * start cannot inherit a late token from this failed attempt. */
         xSemaphoreGive(s_done_sem);
-        taskENTER_CRITICAL(&s_state_mux);
-        s_state = SCHED_ST_STOPPED;
-        taskEXIT_CRITICAL(&s_state_mux);
         return ESP_ERR_NO_MEM;
     }
-    s_should_stop = s_stop_requested; /* a stop that landed during STARTING */
-    s_state       = s_stop_requested ? SCHED_ST_STOPPING : SCHED_ST_RUNNING;
+    bool stop_requested = false;
+    (void)sched_lifecycle_publish_start(&s_lifecycle, generation,
+                                        &stop_requested);
+    s_should_stop = stop_requested; /* a stop that landed during STARTING */
     taskEXIT_CRITICAL(&s_state_mux);
     /* Release the task's startup gate only after state + stop are published. */
     xSemaphoreGive(s_wake_sem);
@@ -737,41 +721,65 @@ esp_err_t sched_runner_start(void)
 esp_err_t sched_runner_stop(uint32_t wait_ms)
 {
     taskENTER_CRITICAL(&s_state_mux);
-    const sched_st_t st = s_state;
-    if (st == SCHED_ST_RUNNING) {
-        s_state       = SCHED_ST_STOPPING;
+    const sched_lifecycle_state_t st = s_lifecycle.state;
+    const uint32_t generation = sched_lifecycle_request_stop(&s_lifecycle);
+    if (st == SCHED_LIFE_RUNNING) {
         s_should_stop = true;
-    } else if (st == SCHED_ST_STARTING) {
+    } else if (st == SCHED_LIFE_STARTING) {
         /* The task does not exist yet; start() publishes should_stop and
          * wakes the task at the end of its spawn, and the task exits at its
          * first loop check. */
-        s_stop_requested = true;
         s_should_stop    = true;
     }
     taskEXIT_CRITICAL(&s_state_mux);
 
-    if (st == SCHED_ST_STOPPED) return ESP_OK; /* nothing running */
-    if (st == SCHED_ST_RUNNING) xSemaphoreGive(s_wake_sem); /* outside the lock */
+    if (generation == 0) return ESP_OK; /* nothing running */
+    if (st == SCHED_LIFE_RUNNING) xSemaphoreGive(s_wake_sem); /* outside lock */
 
     /* Actions poll s_should_stop between UART transactions and inside poll
      * loops, so a stop normally lands within one poll interval (500 ms) plus
      * one transaction. A stop during a 30 s fetch returns TIMEOUT, as with
      * lua_runner, and the task exits on its own when the fetch returns. */
-    if (xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
-        ESP_LOGW(TAG, "stop: task still busy after %u ms — will exit later",
-                 (unsigned)wait_ms);
-        return ESP_ERR_TIMEOUT;
+    const TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+    const TickType_t started = xTaskGetTickCount();
+    for (;;) {
+        taskENTER_CRITICAL(&s_state_mux);
+        const bool complete =
+            sched_lifecycle_generation_complete(&s_lifecycle, generation);
+        taskEXIT_CRITICAL(&s_state_mux);
+        if (complete) {
+            /* Keep the hint latched for concurrent stoppers. start() drains it;
+             * a late token is harmless because every waiter checks generation. */
+            xSemaphoreGive(s_done_sem);
+            return ESP_OK;
+        }
+
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= wait_ticks ||
+            xSemaphoreTake(s_done_sem, wait_ticks - elapsed) != pdTRUE) {
+            /* Close the boundary race: completion may have published between
+             * the last check and the timeout return. */
+            taskENTER_CRITICAL(&s_state_mux);
+            const bool completed_at_timeout =
+                sched_lifecycle_generation_complete(&s_lifecycle, generation);
+            taskEXIT_CRITICAL(&s_state_mux);
+            if (completed_at_timeout) {
+                xSemaphoreGive(s_done_sem);
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "stop: task still busy after %u ms — will exit later",
+                     (unsigned)wait_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        /* A stale completion token from an older generation is discarded and
+         * the remaining timeout is spent waiting for our generation. */
     }
-    /* Latch the exit signal: a concurrent stopper (or a later stop before the
-     * next start) also passes. start() drains it. */
-    xSemaphoreGive(s_done_sem);
-    return ESP_OK;
 }
 
 bool sched_runner_is_running(void)
 {
     taskENTER_CRITICAL(&s_state_mux);
-    bool running = (s_state != SCHED_ST_STOPPED);
+    bool running = (s_lifecycle.state != SCHED_LIFE_STOPPED);
     taskEXIT_CRITICAL(&s_state_mux);
     return running;
 }
@@ -813,6 +821,7 @@ esp_err_t sched_runner_stats(const char *job_name, sched_job_stats_t *out)
     out->last_duration_ms = s_rt[j].last_duration_ms;
     taskEXIT_CRITICAL(&s_stats_mux);
     out->skipped = s_snap[j].skipped;
+    out->skipped_saturated = s_snap[j].skipped_saturated != 0;
     taskEXIT_CRITICAL(&s_state_mux);
     return ESP_OK;
 }
@@ -849,7 +858,6 @@ int sched_runner_job_count(void)
 esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_STATE;
-    int64_t next_due_local;
     taskENTER_CRITICAL(&s_state_mux);
     if (!s_prog_valid || idx < 0 || idx >= s_prog.job_count) {
         taskEXIT_CRITICAL(&s_state_mux);
@@ -866,18 +874,10 @@ esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out)
     out->stats.last_duration_ms = s_rt[idx].last_duration_ms;
     taskEXIT_CRITICAL(&s_stats_mux);
     out->stats.skipped = s_snap[idx].skipped;
+    out->stats.skipped_saturated = s_snap[idx].skipped_saturated != 0;
     out->boot_pending  = s_snap[idx].boot_pending != 0;
-    next_due_local     = s_snap[idx].next_due_local;
+    out->next_due_utc  = s_snap[idx].next_due_utc;
     taskEXIT_CRITICAL(&s_state_mux);
-
-    /* dues are local unix seconds; convert with the offset valid NOW (good
-     * enough for a status table — DST transitions move a display, not a
-     * firing). Outside the lock: wall read + offset lookup. */
-    if (next_due_local >= 0) {
-        out->next_due_utc = next_due_local - timezone_utc_offset_seconds(wall_now_utc());
-    } else {
-        out->next_due_utc = -1;
-    }
     return ESP_OK;
 }
 

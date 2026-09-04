@@ -1760,10 +1760,14 @@ static int cli_cmd_schedule(int argc, char **argv)
                 gmtime_r(&t, &tm_utc);
                 strftime(due, sizeof due, "%Y-%m-%d %H:%M:%S", &tm_utc);
             }
-            printf("  %-16s %-20s %6lu %5lu %5lu %6lu %8lu\r\n",
+            char skipped[16];
+            snprintf(skipped, sizeof skipped,
+                     js.stats.skipped_saturated ? ">=%lu" : "%lu",
+                     (unsigned long)js.stats.skipped);
+            printf("  %-16s %-20s %6lu %5lu %5s %6lu %8lu\r\n",
                    js.name, due,
                    (unsigned long)js.stats.runs, (unsigned long)js.stats.failures,
-                   (unsigned long)js.stats.skipped, (unsigned long)js.stats.fail_streak,
+                   skipped, (unsigned long)js.stats.fail_streak,
                    (unsigned long)js.stats.last_duration_ms);
         }
         return 0;

@@ -18,9 +18,12 @@
  * maintenance resume) cannot spawn two runner tasks or share the static
  * program mid-compile. stop()/dispatch() wake a static, never-deleted
  * semaphore outside the state lock, so there is no task-handle lifetime to
- * race; the semaphore also gates a new task until start() has published its
- * state. dispatch() outside RUNNING is rejected with ESP_ERR_INVALID_STATE,
- * never silently discarded. Status queries snapshot under the same lock.
+ * race; a generation counter makes a late completion wake harmless. STOPPED
+ * and the completed generation are published together before waiters wake, so
+ * stop-success guarantees an immediate start/reload is accepted. The wake
+ * semaphore also gates a new task until start() has published its state.
+ * dispatch() outside RUNNING is rejected with ESP_ERR_INVALID_STATE, never
+ * silently discarded. Status queries snapshot under the same lock.
  *
  * The schedule source is /littlefs/schedule.yaml; when it is absent the
  * embedded default (components/sched_runner/default.yaml) runs instead, and
@@ -61,6 +64,7 @@ typedef struct {
     uint32_t runs;
     uint32_t failures;
     uint32_t skipped;
+    bool     skipped_saturated; /* skipped is a lower bound when true */
     uint32_t fail_streak;
     int64_t  last_run_epoch;   /* UTC seconds; -1 = never ran */
     uint32_t last_duration_ms;

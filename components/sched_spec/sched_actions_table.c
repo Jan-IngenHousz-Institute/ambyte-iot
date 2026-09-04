@@ -122,7 +122,8 @@ esp_err_t sched_action_bind(const char *name, void *run_ctx,
 
 static const char *const k_placeholders[] = {
     "$deployment", "$lat", "$lon", "$tz", "$boot_epoch", "$uptime_ms",
-    "$sd_ready", "$job.runs", "$job.failures", "$job.skipped", "$job.fail_streak",
+    "$sd_ready", "$job.runs", "$job.failures", "$job.skipped",
+    "$job.skipped_saturated", "$job.fail_streak",
 };
 
 bool sched_is_placeholder(const char *s)

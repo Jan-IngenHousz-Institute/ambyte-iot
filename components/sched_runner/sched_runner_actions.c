@@ -463,7 +463,9 @@ static esp_err_t act_status_report(void *vctx, const sched_step_t *step,
 static void jw_placeholder(sched_jw_t *w, const char *ph,
                            const sched_runner_act_ctx_t *ctx)
 {
-    if (strcmp(ph, "$deployment") == 0) {
+    if (sched_jw_job_placeholder(w, ph, ctx)) {
+        return;
+    } else if (strcmp(ph, "$deployment") == 0) {
         sched_jw_str(w, ctx->deployment);
     } else if (strcmp(ph, "$lat") == 0 || strcmp(ph, "$lon") == 0) {
         double lat, lon;
@@ -481,14 +483,6 @@ static void jw_placeholder(sched_jw_t *w, const char *ph,
         bool ready = false;
         (void)cmd_sd_ready(&ready);
         sched_jw_raw(w, "%s", ready ? "true" : "false");
-    } else if (strcmp(ph, "$job.runs") == 0) {
-        sched_jw_raw(w, "%lu", (unsigned long)ctx->runs);
-    } else if (strcmp(ph, "$job.failures") == 0) {
-        sched_jw_raw(w, "%lu", (unsigned long)ctx->failures);
-    } else if (strcmp(ph, "$job.skipped") == 0) {
-        sched_jw_raw(w, "%lu", (unsigned long)ctx->skipped);
-    } else if (strcmp(ph, "$job.fail_streak") == 0) {
-        sched_jw_raw(w, "%lu", (unsigned long)ctx->fail_streak);
     } else {
         sched_jw_str(w, ph); /* compiler validated the set; unreachable */
     }
