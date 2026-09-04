@@ -1,0 +1,13 @@
+# Boundary of the duration-vs-period check: SS 46 pulses on a 1 m grid needs
+# 46.0 s + 15 s margin = 61.0 s > 60.0 s → reject. (45 pulses fits exactly and
+# is the shipped default; the check is pulse time + deadline margin, per the
+# ruling recorded in sched_compile.c.)
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+protocols:
+  SS46:
+    - { pulses: 46, freq: 1, actinic: 0 }
+jobs:
+  j:
+    on: { every: 1m }
+    steps: [ { uses: ambit/trace, with: { protocol: SS46, channels: [0] } } ]

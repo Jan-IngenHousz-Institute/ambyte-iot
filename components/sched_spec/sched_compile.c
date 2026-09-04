@@ -1128,14 +1128,18 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
                 return false;
             }
             /* Pulse-train time + deadline margin vs the grid period. The
-             * estimator's 300 ms/segment transport overhead (see
-             * sched_estimate_ms) is NOT added here: the deadline margin
-             * already absorbs small fixed transport slack — its job is to
-             * bound the broken-channel case, which dominates 300 ms. Adding
-             * both would reject the shipped default (SS 45 pulses: 45.0 s +
-             * 15 s = 60.0 s exactly fits the 1 m grid; with the overhead it
-             * would fail by 0.3 s) while catching nothing the pulse-time
-             * check misses (the incident case, 59 pulses, fails at 74 s). */
+             * check exists to catch a protocol whose worst case cannot fit
+             * its grid, and the worst case is bounded by the deadline
+             * margin, which exists precisely to absorb transport slack — of
+             * which the estimator's 300 ms/segment (sched_estimate_ms) is a
+             * small part. So the 300 ms is NOT added here; tuning the
+             * science (fewer pulses in the shipped schedule) or the safety
+             * margin to satisfy the check would be backwards. Net effect:
+             * the shipped default fits exactly (SS 45 pulses: 45.0 s +
+             * 15 s = 60.0 s on a 1 m grid) while the incident case, 59
+             * pulses, still fails at 74 s. sched_estimate_ms keeps the
+             * firmware-exact +300 ms/segment for the runner's poll
+             * scheduling. (Orchestrator ruling on plan ambiguity, T2.) */
             int64_t pulse_ms = 0;
             for (int s = 0; s < proto->segment_count; s++) {
                 pulse_ms += (int64_t)proto->segments[s].pulses * 1000 /
