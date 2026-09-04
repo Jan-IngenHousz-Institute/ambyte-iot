@@ -112,8 +112,16 @@ static inline bool sched_lifecycle_complete(sched_lifecycle_t *life,
 static inline bool sched_lifecycle_generation_complete(const sched_lifecycle_t *life,
                                                         uint32_t generation)
 {
-    return life != NULL && generation != 0 &&
-           life->completed_generation == generation;
+    if (life == NULL || generation == 0 || life->completed_generation == 0) {
+        return false;
+    }
+    /* RFC-1982-style serial comparison: the latest completion proves every
+     * generation at most half the uint32_t space behind it, including across
+     * UINT32_MAX -> 1 (zero is reserved). A completion behind `generation`
+     * has a large unsigned delta and therefore remains stale for that waiter.
+     * The runner can have only one live generation, so a 2^31-run ambiguity
+     * between a stop request and its completion is impossible in practice. */
+    return life->completed_generation - generation < UINT32_C(0x80000000);
 }
 
 /* Snapshot of the job currently executing, refreshed before each run. The

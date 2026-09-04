@@ -102,6 +102,50 @@ static void test_lifecycle_immediate_restart(void)
     CHECK(sched_lifecycle_complete(&during_start, third));
 }
 
+static void test_lifecycle_retains_completion_proof(void)
+{
+    sched_lifecycle_t life = SCHED_LIFECYCLE_INITIALIZER;
+    uint32_t first = 0, second = 0;
+
+    CHECK(sched_lifecycle_begin_start(&life, &first));
+    CHECK(sched_lifecycle_publish_start(&life, first, NULL));
+    CHECK(sched_lifecycle_complete(&life, first));
+
+    CHECK(sched_lifecycle_begin_start(&life, &second));
+    CHECK(sched_lifecycle_publish_start(&life, second, NULL));
+    CHECK(sched_lifecycle_complete(&life, second));
+
+    /* A delayed waiter for N must retain proof after N+1 completes. */
+    CHECK(sched_lifecycle_generation_complete(&life, first));
+    CHECK(sched_lifecycle_generation_complete(&life, second));
+    CHECK(!sched_lifecycle_generation_complete(&life, second + 1));
+}
+
+static void test_lifecycle_completion_wrap(void)
+{
+    /* Zero is reserved, so the generation after UINT32_MAX is 1. */
+    sched_lifecycle_t life = {
+        SCHED_LIFE_STOPPED, UINT32_MAX - 1, UINT32_MAX - 1, false
+    };
+    uint32_t before_wrap = 0, after_wrap = 0;
+
+    CHECK(sched_lifecycle_begin_start(&life, &before_wrap));
+    CHECK(before_wrap == UINT32_MAX);
+    CHECK(sched_lifecycle_publish_start(&life, before_wrap, NULL));
+    CHECK(sched_lifecycle_complete(&life, before_wrap));
+
+    CHECK(sched_lifecycle_begin_start(&life, &after_wrap));
+    CHECK(after_wrap == 1);
+    CHECK(sched_lifecycle_publish_start(&life, after_wrap, NULL));
+    /* UINT32_MAX completion is stale for the newer generation 1. */
+    CHECK(!sched_lifecycle_generation_complete(&life, after_wrap));
+    CHECK(sched_lifecycle_complete(&life, after_wrap));
+    /* Completing generation 1 retains proof for UINT32_MAX across wrap. */
+    CHECK(sched_lifecycle_generation_complete(&life, before_wrap));
+    CHECK(sched_lifecycle_generation_complete(&life, after_wrap));
+    CHECK(!sched_lifecycle_generation_complete(&life, 2));
+}
+
 /* ── JSON writer primitives ──────────────────────────────────────────── */
 
 static void test_jw_str(void)
@@ -278,6 +322,8 @@ int main(void)
 {
     test_fail_throttle();
     test_lifecycle_immediate_restart();
+    test_lifecycle_retains_completion_proof();
+    test_lifecycle_completion_wrap();
     test_jw_str();
     test_job_stat_placeholders();
     test_build_map_json();
