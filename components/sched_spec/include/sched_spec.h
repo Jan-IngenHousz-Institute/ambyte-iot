@@ -194,8 +194,7 @@ typedef struct {
 } sched_entry_t;
 
 /* AMBIT segment: all six fields the run array takes (T1 owns the matching
- * firmware struct). Lua hardcoded three of them; that limitation is removed
- * here, not inherited. */
+ * firmware struct). */
 typedef struct {
     uint16_t pulses;      /* 1..65535, required */
     uint16_t freq;        /* Hz, 1..65535, required */
@@ -262,7 +261,7 @@ typedef struct {
 typedef enum { SCHED_UNRESOLVED_SKIP = 0, SCHED_UNRESOLVED_RUN = 1 } sched_unresolved_t;
 
 /* hint remembers whether the window was lowered from `day`/`night` so the
- * polar fallback keeps continuity with main.lua's is_daytime (design §Gates). */
+ * polar fallback follows design §Gates. */
 typedef enum { SCHED_WIN_EXPLICIT = 0, SCHED_WIN_DAY = 1, SCHED_WIN_NIGHT = 2 } sched_window_hint_t;
 
 typedef struct {
@@ -346,8 +345,8 @@ esp_err_t sched_compile_text(const char *text, size_t len, sched_program_t *out,
 
 /* Duration estimate exposed for the runner's poll scheduling (90 % poll
  * start, broken-channel deadline): Σ(pulses/freq·1000 + 300) ms — 300 ms
- * per-segment config/light-sleep slack, the same formula main.lua used and
- * T1 carries into firmware. NOTE: the compiler's duration-vs-period rule
+ * per-segment configuration/light-sleep slack, the established field formula.
+ * NOTE: the compiler's duration-vs-period rule
  * deliberately uses pulse time + deadline_margin without this overhead (see
  * sched_compile.c for why). */
 int64_t sched_estimate_ms(const sched_protocol_t *proto);

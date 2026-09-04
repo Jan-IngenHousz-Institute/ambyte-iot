@@ -90,7 +90,7 @@ FIELDS = [
 OPTIONAL_FIELDS = [
     ("AMBYTE_COMMAND_TOPIC",    "device_cfg", "cmd_topic",       "string"),
     ("AMBYTE_STATUS_TOPIC",     "device_cfg", "status_topic",    "string"),
-    # IANA timezone name. Drives DST-aware on-device scheduling (sched.lua
+    # IANA timezone name. Drives DST-aware on-device scheduling (sched_spec
     # sun/day-night/clock jobs, via components/timezone) AND is echoed in the
     # MQTT envelope so the cloud derives local-time columns. Defaults to
     # DEFAULT_TIMEZONE below when unset.

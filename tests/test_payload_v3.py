@@ -284,8 +284,8 @@ class PayloadV3Test(unittest.TestCase):
 
         trace_source = (ROOT / "components/ambit_trace/ambit_trace.c").read_text()
         trace_header = (ROOT / "components/ambit_trace/include/ambit_trace.h").read_text()
-        lua_source = (ROOT / "components/lua_runner/lua_runner.c").read_text()
-        self.assertNotIn('#include "lua.h"', trace_header)
+        runner_source = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
+        runner_core = (ROOT / "components/sched_runner/sched_runner.c").read_text()
         self.assertIn("AMBIT_RUN_METADATA_CAP", trace_header)
         self.assertRegex(
             trace_header,
@@ -297,22 +297,21 @@ class PayloadV3Test(unittest.TestCase):
         self.assertNotIn("char fallback_metadata[", trace_source)
         self.assertIn("payload + AMBIT_RUN_PAYLOAD_CAP", trace_source)
         self.assertIn("char *candidate = malloc(AMBIT_RUN_BUFFER_CAP)", trace_source)
-        self.assertIn("opts.metadata ignored %u unsupported key(s)", lua_source)
-        sync_run = lua_source.split("static int l_ambit_run", 1)[1].split(
-            "/* ambit.trigger", 1
+        sync_run = runner_source.split("static esp_err_t act_ambit_trace", 1)[1].split(
+            "/* ── ambit/spectrum", 1
         )[0]
         self.assertLess(
-            sync_run.index("ambit_capture_protocol_ref(L, 3"),
-            sync_run.index("cmd_ambit_run(ch"),
+            sync_run.index("snprintf(opts.protocol_ref.protocol"),
+            sync_run.index("ambit_trace_trigger(ch"),
         )
-        self.assertIn("ambit_trace_build_run_arr", sync_run)
-        self.assertIn("ambit_trace_decode_store", sync_run)
-        lua_segment_adapter = lua_source.split(
-            "static void ambit_read_segments", 1
-        )[1].split("static int ambit_push_result", 1)[0]
-        self.assertIn(".type = 2", lua_segment_adapter)
-        self.assertIn(".far_red = false", lua_segment_adapter)
-        self.assertIn(".subsampling = 1", lua_segment_adapter)
+        self.assertIn("ambit_trace_trigger", sync_run)
+        self.assertIn("ambit_trace_fetch", sync_run)
+        self.assertIn(".type        = proto->segments[i].type", sync_run)
+        self.assertIn(".far_red     = proto->segments[i].far_red != 0", sync_run)
+        self.assertIn(".pulses      = proto->segments[i].pulses", sync_run)
+        self.assertIn(".freq        = proto->segments[i].freq", sync_run)
+        self.assertIn(".actinic     = proto->segments[i].actinic", sync_run)
+        self.assertIn(".subsampling = proto->segments[i].subsampling", sync_run)
 
         run_array_builder = trace_source.split(
             "uint8_t *ambit_trace_build_run_arr", 1
@@ -325,7 +324,7 @@ class PayloadV3Test(unittest.TestCase):
         self.assertIn("line[5] = (uint8_t)segments[i].freq", run_array_builder)
         self.assertIn("line[6] = ambit_actinic_to_dac", run_array_builder)
         self.assertIn("line[7] = segments[i].subsampling", run_array_builder)
-        self.assertNotIn("payload_v3_build_trace_lossless", lua_source)
+        self.assertNotIn("payload_v3_build_trace_lossless", runner_source)
 
         route_store = trace_source.split("esp_err_t ambit_trace_decode_store", 1)[1].split(
             "cmd_result_t ambit_trace_trigger", 1
@@ -349,17 +348,9 @@ class PayloadV3Test(unittest.TestCase):
         self.assertEqual(trace_source.count("malloc(AMBIT_RUN_BUFFER_CAP)"), 1)
         self.assertEqual(trace_source.count("payload_reserve_locked()"), 2)
 
-        registration = lua_source.split("static void lua_register_ambit_module", 1)[1].split(
-            "/* ── sync.* bindings", 1
-        )[0]
-        self.assertIn("ambit_trace_reserve()", registration)
-        self.assertNotIn("payload_reserve_locked", registration)
-
-        fetch = lua_source.split("static int l_ambit_fetch", 1)[1].split(
-            "/* ── ambit.* bindings", 1
-        )[0]
-        self.assertIn("ambit_trace_fetch", fetch)
-        self.assertNotIn("cmd_ambit_fetch", fetch)
+        self.assertIn("ambit_trace_reserve()", runner_core)
+        self.assertNotIn("payload_reserve_locked", runner_core)
+        self.assertNotIn("cmd_ambit_fetch", sync_run)
 
         self.assertNotIn("char payload[1536]", announcement)
         self.assertIn("malloc(AMBIT_DEVICE_PAYLOAD_CAP)", announcement)

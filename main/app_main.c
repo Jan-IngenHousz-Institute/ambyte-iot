@@ -201,8 +201,7 @@ static bool app_wifi_provisioned(void)
  * AMBIT OTA/probe/flash, script update). Stopping it quiesces the shared UART
  * and frees the task/TCB (~9 KB); the 64,536 B AMBIT payload reserve is taken
  * once at first start and stays RESIDENT across stop/start (deliberate — one
- * early contiguous block beats per-trace fragmentation, and the Lua era held
- * the same reserve). REFCOUNTED: the workers run on
+ * early contiguous block beats per-trace fragmentation). REFCOUNTED: the workers run on
  * independent tasks, so overlapping suspend windows must not let one worker's
  * resume restart the runner inside another's quiesced window. */
 static portMUX_TYPE s_workload_mux    = portMUX_INITIALIZER_UNLOCKED;
@@ -251,13 +250,13 @@ static void app_workload_resume(void)
 }
 
 /* Global maintenance lock (Item D). The three maintenance workers — self-OTA
- * (ota_update), AMBIT OTA/flash/probe/versions (ambit_ota), and script update/
- * exec (script_update) — run on INDEPENDENT tasks with no shared "maintenance in
+ * (ota_update), AMBIT OTA/flash/probe/versions (ambit_ota), and schedule update
+ * (script_update) — run on INDEPENDENT tasks with no shared "maintenance in
  * progress" gate. Two close-spaced commands of different types (or a QoS1
  * redelivery of one) could otherwise overlap: one worker resuming MQTT while
  * another still holds an HTTPS/TLS session → two TLS sessions on this no-PSRAM
  * board → OOM/crash — the exact thing the per-op quiesce exists to prevent; or one
- * worker's esp_restart firing while another is mid main.lua rename → no main.lua.
+ * worker's esp_restart firing while another is mid schedule rename.
  * A single flag, taken at each worker's op entry and released on completion, makes
  * the three mutually exclusive; a second concurrent op of any type is rejected as
  * "busy"/"dropped". */
@@ -319,15 +318,15 @@ static void app_comms_resume(void)
 }
 
 /* ── Shared maintenance worker (fix #3) ───────────────────────────────────
- * The three update workers (self-OTA, AMBIT OTA/flash/probe/versions, script
- * update/exec) used to each spawn their own task ON DEMAND with a ~10 KB stack.
+ * The three update workers (self-OTA, AMBIT OTA/flash/probe/versions, schedule
+ * update) used to each spawn their own task ON DEMAND with a ~10 KB stack.
  * On the field's fragmented, no-PSRAM heap (largest free block seen pegged at
  * ~3.3 KB) that lazy xTaskCreate returned ESP_ERR_NO_MEM, so the very commands
- * meant to RECOVER a degraded unit (push a new main.lua, reflash a mismatched
+ * meant to RECOVER a degraded unit (push a new schedule, reflash a mismatched
  * AMBIT) could not even launch — observed 2026-07-20 as "script_update(url) …
  * dispatch failed: ESP_ERR_NO_MEM". The maintenance lock already makes the three
  * mutually exclusive, so ONE resident worker suffices. Created here while the
- * heap is still clean (before Lua starts), its stack can never fail to allocate;
+ * heap is still clean (before the schedule runner starts), its stack can never fail to allocate;
  * dispatch is now just a small (~few-hundred-byte) job enqueue that fits even a
  * fragmented heap. Net resident cost is one stack (~10 KB) — replacing the old
  * resident 8 KB OTA task plus two on-demand 10 KB stacks. */
@@ -522,9 +521,9 @@ static esp_err_t app_init_i2c_and_sensors(void)
     }
 
     /* Install the DST rule for the configured IANA timezone so the RTC-based
-     * scheduler (sched.lua) fires jobs on LOCAL wall time. The RTC and every
+     * schedule runner fires jobs on LOCAL wall time. The RTC and every
      * stored timestamp stay UTC; this only affects on-device scheduling. Applied
-     * before Lua starts (app_init_littlefs, later in the boot sequence). */
+     * before the schedule runner starts (app_init_littlefs, later in boot). */
     char tz[48];
     if (device_config_get_timezone(tz, sizeof(tz)) != ESP_OK) {
         tz[0] = '\0';
@@ -573,9 +572,8 @@ static esp_err_t app_init_sdcard(void)
  * transition. With the event store and the schedule both on INTERNAL flash, SD
  * loss no longer stops anything — measurement, storage, and publishing continue;
  * only the archive/log/AMBIT-firmware roles pause (each self-gates on mount
- * state). An INSERT used to trigger the /sdcard/main.lua offline-recovery
- * import; that path was dropped with the switch from lua_runner to
- * sched_runner (T3) — the embedded default schedule covers a blank unit. */
+ * state). No import runs on insertion; the embedded default schedule covers a
+ * blank unit and installed schedules live on internal littlefs. */
 static void app_on_sd_state_change(bool mounted)
 {
     if (!mounted) {
@@ -586,8 +584,7 @@ static void app_on_sd_state_change(bool mounted)
 /* Pre-reboot power-safety hook (Item B). Every esp_restart() in the tree (OTA,
  * script_update, connectivity watchdog, CLI reboot, Wi-Fi clear) previously fired
  * with no fsync/unmount, and FATFS is not power-safe — a torn FAT/dir-entry write
- * could orphan clusters or, rarely, leave an unmountable card, which would stop
- * the measurement loop entirely (main.lua lives on the SD). Registering ONE
+ * could orphan clusters or, rarely, leave an unmountable card. Registering ONE
  * shutdown handler here (esp_register_shutdown_handler runs it before every
  * esp_restart) drains + closes the buffered SD writers and cleanly unmounts, so
  * ALL reboot paths benefit without touching each call site. Runs with the
@@ -609,8 +606,7 @@ static void app_prepare_reboot(void)
  * and on a solar unit that happens on a schedule (every deep-discharge night).
  * Until now the device kept writing the event log right up to the brownout —
  * so each battery death rolled the dice on a FAT-metadata write in flight, which
- * is the leading candidate for the fleet's recurring corrupt-card bricks (a
- * corrupt FAT takes the whole backlog AND main.lua with it).
+ * is the leading candidate for the fleet's recurring corrupt-card bricks.
  *
  * This guard watches the MP2731 while on battery and, once the voltage sits
  * below the park floor, parks the SD CARD ONLY — flush + close the sd_logger
@@ -824,7 +820,7 @@ static esp_err_t app_init_evstore(void)
  * notice. Priority 2 (with the other background housekeeping). */
 #define SD_KEEPER_PERIOD_MS       60000
 #define SD_KEEPER_MIGRATE_FILES   4       /* per pass: bounds mutex hold + task burst */
-#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no Lua/mount fan-out */
+#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no mount fan-out */
 
 static void app_sd_keeper_task(void *arg)
 {
@@ -1163,7 +1159,7 @@ void app_main(void)
     }
 
     /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered
-     * (`ambit_ota <ch> <url>`): downloads the C3 image to SD, suspends Lua + MQTT,
+     * (`ambit_ota <ch> <url>`): downloads the C3 image to SD, suspends measurement + MQTT,
      * streams it to the sensor over the binary UART link; the AMBIT verifies and
      * reboots into its spare slot. Same quiesce hooks as the self-OTA. */
     ambit_ota_config_t ambit_ota_cfg = {
@@ -1208,7 +1204,7 @@ void app_main(void)
     }
 
     /* Start the single shared maintenance worker now — the heap is still clean
-     * (Lua has not started), so its stack allocation cannot fail the way the old
+     * (the schedule runner has not started), so its stack allocation cannot fail like the old
      * per-op lazy spawns did on a fragmented heap. Must run AFTER the three
      * *_init() calls above so their configs (used by the worker's boot-confirm
      * and job handlers) are stored. If it can't start, remote OTA / AMBIT flash /
@@ -1418,11 +1414,6 @@ void app_main(void)
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
-        /* No scripting VM any more (sched_runner replaced lua_runner), so
-         * there is nothing to garbage-collect before a large publish; the
-         * heap gate in the publisher still defers when fragmented. T5 removes
-         * the hook from the config struct entirely. */
-        .request_gc             = NULL,
         .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
         .watchdog_armed         = sync_runner_watchdog_armed,
         .publish_gzip_enabled   = device_config_publish_gzip_enabled,
@@ -1459,8 +1450,7 @@ void app_main(void)
                           "nightly reboot, and connection/memory/PUBACK self-healing disabled");
     }
 
-    /* ── Field-status LED blinker (firmware-owned; Lua no longer drives the
-     * LED). Probes are cheap reads of already-cached state. ─────────────── */
+    /* ── Field-status LED blinker. Probes are cheap reads of cached state. ── */
     {
         static const ambyte_blinker_config_t blink_cfg = {
             .sd_mounted        = sdcard_is_mounted,

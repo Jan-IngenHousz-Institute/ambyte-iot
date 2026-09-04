@@ -30,8 +30,8 @@ extern "C" {
 #define AMBIT_PROTOCOL_FIELD_CAP 256U
 
 typedef struct {
-    /* All six fields are part of the AMBIT wire format. Defaults preserve the
-     * former Lua encoder: type=2, far_red=false, subsampling=1. */
+    /* All six fields are part of the AMBIT wire format. Encoder defaults are
+     * type=2, far_red=false, subsampling=1. */
     uint8_t type;        /* 0 skip, 1 incl. 730-nm reflectance, 2 no IR. */
     bool far_red;        /* Byte 1; meaningful only when type == 1. */
     uint16_t pulses;
@@ -72,7 +72,7 @@ typedef struct {
 } ambit_trace_result_t;
 
 /* Reserve the shared trace/fallback buffer while the heap is contiguous.
- * Safe to call more than once and from competing Lua/CLI execution contexts. */
+ * Safe to call more than once and from competing runner/CLI contexts. */
 esp_err_t ambit_trace_reserve(void);
 
 const char *ambit_device_name(uint8_t ch, ambit_device_info_t *info);
@@ -89,7 +89,7 @@ void ambit_build_cmd_ascii(char *out, size_t cap, const uint8_t *run_arr,
 uint8_t *ambit_trace_build_run_arr(const ambit_trace_segment_t *segments,
                                    size_t nseg, uint8_t ch);
 
-/* Approximate run time from main.lua: pulses/freq seconds plus 300 ms of
+/* Approximate run time: pulses/freq seconds plus 300 ms of
  * per-segment configuration/light-sleep slack. The scheduler uses the estimate
  * only to defer polling and bound a broken AMBIT, not as a measurement clock. */
 int64_t ambit_trace_estimate_ms(const ambit_trace_segment_t *segments, size_t nseg);

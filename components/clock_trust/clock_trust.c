@@ -107,7 +107,7 @@ esp_err_t clock_trust_boot_guard(bool rtc_suspect, bool *out_adopted,
  * (2026-07-29): a clock that ran fast for one hour poisoned the monotonic
  * floor; every subsequent boot re-adopted the poisoned (future) value via the
  * rollback guard and the following SNTP correction stepped the clock BACKWARDS,
- * re-wedging every wall-clock deadline (Lua scheduler, power-gate dwell) for
+ * re-wedging every wall-clock deadline (schedule anchor, power-gate dwell) for
  * up to the poison duration. Letting network time lower the floor makes the
  * poison last one sync instead of one wall-clock catch-up. */
 static esp_err_t clock_trust_write_hwm(time_t epoch_utc, bool authoritative)

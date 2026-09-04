@@ -3,13 +3,13 @@
 # the pure due/cron/window math lives in sched_spec and is host-tested there.
 
 # ── Bundle default.yaml as a C byte array ────────────────────────────────────
-# Same pattern as lua_runner's sched_lua_embed.h: EMBED_TXTFILES mis-resolves
+# Generate the schedule header only in a real component build: EMBED_TXTFILES mis-resolves
 # the generated .S path under PlatformIO, so the array is generated at
 # configure time into the BUILD dir (never the source tree). Reconfigures
 # automatically when default.yaml changes.
 # NOTE: ${CMAKE_CURRENT_SOURCE_DIR} and ${CMAKE_CURRENT_BINARY_DIR} both point
 # at the project root during ESP-IDF's early requirements scan, which is how
-# sched_lua_embed.h leaks into the source tree. Address the input from the
+# generated headers can otherwise leak into the source tree. Address the input from the
 # project root, but write the header under ${CMAKE_BINARY_DIR}: during the
 # scan that is the scan's own throwaway dir, during the real build it is the
 # real build dir — either way never the source tree.

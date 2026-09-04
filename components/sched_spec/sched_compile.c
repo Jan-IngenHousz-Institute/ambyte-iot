@@ -168,7 +168,7 @@ int64_t sched_estimate_ms(const sched_protocol_t *proto)
     int64_t ms = 0;
     for (int i = 0; i < proto->segment_count; i++) {
         ms += (int64_t)proto->segments[i].pulses * 1000 / proto->segments[i].freq
-              + 300; /* per-segment config/light-sleep slack (main.lua SEG_OVERHEAD_MS) */
+              + 300; /* per-segment configuration/light-sleep slack */
     }
     return ms;
 }
@@ -180,8 +180,7 @@ static bool compile_segment(ctx_t *c, const sched_node_t *node, sched_segment_t 
              "({pulses, freq, actinic, …})");
         return false;
     }
-    /* defaults (orchestrator format note: all six AMBIT fields, Lua's
-     * hardcoding of the other three is removed, not inherited) */
+    /* Defaults cover all six AMBIT fields; shorthand is not the contract. */
     seg->type = 2;
     seg->far_red = 0;
     seg->subsampling = 1;

@@ -15,7 +15,7 @@ esp_err_t ambyte_status_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 status_set_fn ambyte_status_get_set_fn(void);
 
 /* ── Field-status blinker ──────────────────────────────────────────────
- * Firmware-owned LED state indicator (the Lua script no longer drives the
+ * Firmware-owned LED state indicator (the schedule runner does not drive the
  * LED). One short flash per cycle; colour encodes state, cadence/brightness
  * follow the power source. State probes are sampled every cycle; any may be
  * NULL (defaults: sd=true, wifi=false, provisioned=false, script=false,
@@ -24,7 +24,7 @@ typedef struct {
     bool     (*sd_mounted)(void);
     bool     (*wifi_connected)(void);
     bool     (*provisioned)(void);
-    bool     (*script_running)(void);     /* main.lua task alive             */
+    bool     (*script_running)(void);     /* schedule task alive             */
     bool     (*on_external_power)(void);  /* debounced VIN present           */
     uint32_t (*battery_mv)(void);         /* last known mV; 0 = unknown      */
 } ambyte_blinker_config_t;

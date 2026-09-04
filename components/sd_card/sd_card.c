@@ -161,7 +161,7 @@ static esp_err_t sdcard_mount_locked(bool quiet)
     if (err != ESP_OK) {
         if (err == ESP_FAIL) {
             /* Card answered card-init but FATFS could not mount it — a corrupt/garbage
-             * filesystem, NOT an absent card. This silently bricks the node (main.lua +
+             * filesystem, NOT an absent card. This silently bricks the node (archives +
              * the event log both live on SD), so surface it distinctly even when the
              * monitor calls quiet, and count it in NVS for post-mortem (audit A1).
              * format_if_mount_failed stays false so field data is never auto-wiped. */
@@ -225,7 +225,7 @@ static void sdcard_note_corrupt_mount(void)
     if (logged_this_boot) return;
     logged_this_boot = true;
     ESP_LOGE(TAG, "SD present but FATFS unmountable (corrupt filesystem?) — persistence + "
-                  "main.lua offline (format_if_mount_failed=false, so field data is preserved)");
+                  "SD card offline (format_if_mount_failed=false, so field data is preserved)");
 }
 
 esp_err_t sdcard_init_default(void)
@@ -289,7 +289,7 @@ static uint32_t          s_monitor_period_ms = 2000;   /* removal-detection prob
 
 /* Monitor stack (12 KB). Heap-allocated, NOT static/BSS: on this no-PSRAM board the
  * heap is tight (largest free block ~31 KB) and a permanent 12 KB static reservation
- * tips the marginal Lua-script load into ENOMEM. The monitor is created once at boot
+ * tips the marginal workload into ENOMEM. The monitor is created once at boot
  * while the heap is still clean (~126 KB free), so xTaskCreate can't realistically
  * fail there — the static-stack "insurance" (audit D4) costs more than it protects
  * against on this hardware. */
@@ -575,7 +575,7 @@ esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb)
     esp_log_level_set("sdmmc_req",     ESP_LOG_NONE);
 
     /* 12 KB stack: the remount path goes through esp_vfs_fat_sdmmc_mount +
-     * FATFS, and the cb can fan out to a script import + lua_runner_start()
+     * FATFS, and the callback can notify persistence/archive users
      * (FATFS reopen is a heavy stack user). 4 KB overflowed; 8 KB was marginal.
      * Static (BSS) storage so a fragmented heap can never fail to start the only
      * task that can recover a lost card (audit D4). */

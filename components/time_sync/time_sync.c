@@ -1,6 +1,6 @@
 /*
  * time_sync.c — RTC-based measurement scheduling math (pure C, no hardware).
- * Port of docs/sync.lua: Hinnant civil-date algorithms + the NOAA sunrise
+ * Hinnant civil-date algorithms + the NOAA sunrise
  * equation. All times are LOCAL (RTC) Unix seconds; see time_sync.h.
  */
 

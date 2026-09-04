@@ -35,7 +35,6 @@
 #include "uart_sensors.h"
 #include "uart_stream_cli_support.h"
 #include "uart_stream_support.h"
-#include "lua_runner.h"
 #include "sched_runner.h"
 #include "sched_spec.h"
 #include "script_update.h"
@@ -173,12 +172,11 @@ static int cli_cmd_status(int argc, char **argv)
         printf(" - DB: %s\r\n", dres.message);
     }
 
-    /* SD card: archive/log/recovery roles only since the event store and
-     * main.lua moved to internal flash — an absent card is informational,
-     * not a failure. */
+    /* SD card: archive/log/AMBIT-update roles only; schedules and the event
+     * store live on internal flash, so an absent card is informational. */
     printf(" - SD card: %s\r\n",
            sdcard_is_mounted() ? "mounted (archive/logs/AMBIT OTA only)"
-                               : "absent (OK — Lua and the event store are internal)");
+                               : "absent (OK — schedule and event store are internal)");
 
     /* Battery / input power (MP2731 charger). */
     power_reading_t pw;
@@ -1294,7 +1292,7 @@ static int cli_cmd_sync(int argc, char **argv)
 {
     time_t now_t = 0;
     cmd_read_rtc(&now_t);                        /* UTC — RTC holds UTC by design */
-    /* Localize like the Lua scheduler does, so `sync` previews match what jobs
+    /* Localize like the schedule runner does, so `sync` previews match what jobs
      * actually fire on (DST-correct via the applied timezone). */
     const int64_t now = timezone_localize((int64_t)now_t);
 
@@ -1525,7 +1523,7 @@ static int cli_cmd_ota_mark_valid(int argc, char **argv)
 }
 
 /* Stream a new AMBIT (C3) firmware image over UART. Non-blocking: queues the
- * request and the ambit_ota worker downloads to SD, suspends Lua+MQTT, streams,
+ * request and the ambit_ota worker downloads to SD, suspends measurement+MQTT, streams,
  * and the sensor reboots into the new slot. Watch the log for progress. Use
  * `ambit_info <ch> 2` before/after to read the version. */
 static int cli_cmd_ambit_ota(int argc, char **argv)
@@ -1533,7 +1531,7 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
     if (argc != 3) {
         printf("Usage: ambit_ota <channel 0-3 | all> <firmware-url>\r\n");
         printf("  'all' = every present channel (sequential). URL must be a direct .bin\r\n");
-        printf("  (raw.githubusercontent.com/...), not a /blob//tree/ page. Suspends Lua+MQTT.\r\n");
+        printf("  (raw.githubusercontent.com/...), not a /blob//tree/ page. Suspends measurement+MQTT.\r\n");
         return 1;
     }
     uint8_t ch;
@@ -1563,7 +1561,7 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
  * (`run`) using the ambyte reset/boot lines. After `enter` the chip STAYS in
  * download mode — verify with esptool on the FFC tap:
  *   esptool --chip esp32c3 --port <COM> --before no_reset --after no_reset chip_id
- * Stop Lua first (`lua stop`) so the shared UART bus is free. */
+ * Stop the schedule first (`schedule stop`) so the shared UART bus is free. */
 static int cli_cmd_ambit_dl(int argc, char **argv)
 {
     if (argc != 3 ||
@@ -1578,7 +1576,7 @@ static int cli_cmd_ambit_dl(int argc, char **argv)
     }
     esp_err_t err = uart_sensors_flash_session_begin((uint8_t)ch, 2000);
     if (err != ESP_OK) {
-        printf("bus busy (%s) — try `lua stop` first\r\n", esp_err_to_name(err));
+        printf("bus busy (%s) — try `schedule stop` first\r\n", esp_err_to_name(err));
         return 1;
     }
     if (strcmp(argv[2], "enter") == 0) {
@@ -1611,12 +1609,12 @@ static bool cli_parse_channel(const char *s, int *ch)
 /* Host-driven ROM flasher probe: force the AMBIT on <ch> into ESP32-C3 ROM
  * download mode over the FFC, connect via esp-serial-flasher, read chip + MAC,
  * then reset it back to its app. No PC/tap needed — the ambyte is the flasher.
- * Stop Lua first (`lua stop`) so the shared UART bus is free. NOTE: the reset
+ * Stop the schedule first (`schedule stop`) so the shared UART bus is free. NOTE: the reset
  * strap is shared, so a probe hard-resets ALL FOUR AMBITs. */
 static int cli_cmd_ambit_probe(int argc, char **argv)
 {
     if (argc != 2) {
-        printf("Usage: ambit_probe <0-3|all>   (stop Lua first: `lua stop`)\r\n");
+        printf("Usage: ambit_probe <0-3|all>   (stop schedule first: `schedule stop`)\r\n");
         return 1;
     }
     int from, to;
@@ -1638,7 +1636,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
             printf("ch%d: AMBIT ROM OK — chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
                    ch, r.chip, r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5]);
         } else {
-            printf("ch%d: no ROM response (%s) — check wiring / that Lua is stopped\r\n",
+            printf("ch%d: no ROM response (%s) — check wiring / that schedule is stopped\r\n",
                    ch, esp_err_to_name(err));
             failures++;
         }
@@ -1648,7 +1646,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
 
 /* Full ROM flash of an AMBIT from an SD firmware folder (bootloader/partitions/
  * boot_app0/app.bin). Works on bare / bricked / any-firmware units. Preserves NVS
- * calibration (0x9000 untouched). Stop Lua first (`lua stop`); confirm afterward
+ * calibration (0x9000 untouched). Stop the schedule first (`schedule stop`); confirm afterward
  * with `ambit_versions`. */
 static int cli_cmd_ambit_flash(int argc, char **argv)
 {
@@ -1657,7 +1655,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
         printf("  version X  => /sdcard/ambit_fw/X/{bootloader,partitions,boot_app0,app}.bin\r\n");
         printf("  all        => queue a background sweep of every ROM-answering channel\r\n");
         printf("                (version form only; watch the log, confirm with ambit_versions)\r\n");
-        printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop Lua first.\r\n");
+        printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop schedule first.\r\n");
         return 1;
     }
     if (strcmp(argv[1], "all") == 0) {
@@ -1672,7 +1670,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
             return 1;
         }
         /* Run on the ambit_ota worker (same path as the MQTT trigger): quiesces
-         * Lua + MQTT itself and sweeps every channel whose ROM answers — a 4-
+         * measurement + MQTT itself and sweeps every channel whose ROM answers — a 4-
          * channel sweep can take minutes, too long to block the console. NULL id:
          * operator-initiated, never deduped. */
         esp_err_t err = ambit_ota_request_flash(AMBIT_OTA_CH_ALL, argv[2], NULL);
@@ -1683,7 +1681,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
             return 1;
         }
         printf("queued: flash all ROM-answering channels from /sdcard/ambit_fw/%s\r\n"
-               "  (~10-60 s per channel; Lua+MQTT pause during the sweep)\r\n"
+               "  (~10-60 s per channel; measurement+MQTT pause during the sweep)\r\n"
                "  watch the log; confirm afterward with `ambit_versions`.\r\n", argv[2]);
         return 0;
     }
@@ -1716,7 +1714,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
 
 /* Detect + report AMBIT firmware drift vs the SD target image (no flashing). Finds
  * the highest /sdcard/ambit_fw/<major.minor.batch>/ with the 4 region files and
- * compares each present AMBIT's running version to it. Read-only; safe with Lua up. */
+ * compares each present AMBIT's running version to it. Read-only; safe while measuring. */
 static int cli_cmd_ambit_check(int argc, char **argv)
 {
     (void)argv;
@@ -1994,43 +1992,6 @@ static int cli_cmd_schedule(int argc, char **argv)
     return 1;
 }
 
-/* Keep the legacy command surface until T5 removes the Lua component, but do
- * not let it create a second scheduler against the AMBIT UART/event store.
- * app_main never starts lua_runner on this firmware, so stop/status remain
- * useful diagnostics while start/exec fail closed. */
-static int cli_cmd_lua(int argc, char **argv)
-{
-    if (argc < 2) {
-        printf("Usage: lua <start|stop|status|exec>\r\n");
-        return 1;
-    }
-    if (strcmp(argv[1], "start") == 0) {
-        printf("disabled: the schedule runner owns the AMBIT UART and event store\r\n");
-        return 1;
-    }
-    if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = lua_runner_stop(5000);
-        if (err == ESP_ERR_TIMEOUT) {
-            printf("still busy in a C call (e.g. a long UART read) — it will exit "
-                   "when that returns\r\n");
-        } else {
-            printf("%s\r\n", lua_runner_is_running() ? "stop signaled" : "stopped");
-        }
-        return 0;
-    }
-    if (strcmp(argv[1], "status") == 0) {
-        printf("lua script: %s\r\n", lua_runner_is_running() ? "RUNNING" : "stopped");
-        return 0;
-    }
-    if (strcmp(argv[1], "exec") == 0) {
-        printf("disabled: the schedule runner owns the AMBIT UART and event store\r\n");
-        return 1;
-    }
-    printf("unknown subcommand '%s' "
-           "(start|stop|status|exec)\r\n", argv[1]);
-    return 1;
-}
-
 /* Print the firmware version of every present AMBIT (cmd 33/2) — the fleet
  * staleness view. Synchronous (console task); the MQTT `ambit_versions` command
  * does the same sweep on the worker and publishes a JSON report. */
@@ -2264,23 +2225,18 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t ambit_probe_cmd = {
         .command = "ambit_probe",
-        .help    = "ambit_probe <0-3|all>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop Lua first)",
+        .help    = "ambit_probe <0-3|all>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop schedule first)",
         .func    = cli_cmd_ambit_probe,
     };
     static const esp_console_cmd_t ambit_flash_cmd = {
         .command = "ambit_flash",
-        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
+        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop schedule first)",
         .func    = cli_cmd_ambit_flash,
     };
     static const esp_console_cmd_t ambit_check_cmd = {
         .command = "ambit_check",
         .help    = "ambit_check  report each AMBIT's version vs the SD target /sdcard/ambit_fw/<M.m.b> (no flashing)",
         .func    = cli_cmd_ambit_check,
-    };
-    static const esp_console_cmd_t lua_cmd = {
-        .command = "lua",
-        .help    = "lua stop|status  legacy Lua diagnostics; start/exec disabled (removed next cleanup)",
-        .func    = cli_cmd_lua,
     };
     static const esp_console_cmd_t schedule_cmd = {
         .command = "schedule",
@@ -2464,11 +2420,6 @@ static esp_err_t cli_register_commands(void)
         return err;
     }
 
-    err = esp_console_cmd_register(&lua_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
     err = esp_console_cmd_register(&schedule_cmd);
     if (err != ESP_OK) {
         return err;
@@ -2577,16 +2528,12 @@ esp_err_t cli_start(void)
     /* The IDF default (2) parks the console below every worker on the chip
      * (sync_runner 3, ambit_ota 4, esp-mqtt 5) — under boot/publish load the
      * prompt starved. 6 keeps typing responsive above all of those while
-     * staying below lua_runner (10), whose measurement timing must not be
-     * preempted by console echo. */
+     * staying below the schedule runner (10), whose measurement timing must
+     * not be preempted by console echo. */
     repl_config.task_priority = 6;
-    /* `lua exec` runs a full Lua state (luaL_openlibs + every ambyte module +
-     * lua_pcall) INLINE on this console task — the same workload the dedicated
-     * Lua tasks run on 8 KB stacks (LUA_RUNNER_TASK_STACK / SCRIPT_TASK_STACK).
-     * The ESP-IDF default REPL stack (4096) overflows under it (observed:
-     * "stack overflow in task console_repl" after `lua exec`). Size for that
-     * workload PLUS this task's own line-edit/dispatch frames on top. */
-    repl_config.task_stack_size = 12288;
+    /* Native schedule validation allocates its large compiled program on heap;
+     * 8 KiB leaves ample room for command parsing and driver call frames. */
+    repl_config.task_stack_size = 8192;
 
     esp_err_t err = cli_create_repl(&repl_config);
     if (err != ESP_OK) {

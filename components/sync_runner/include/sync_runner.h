@@ -48,7 +48,7 @@ void sync_runner_notify(void);
 /**
  * @brief Signal that app_main's startup sequence is complete. The first drain
  *        pass is held until this fires (plus the usual stagger) so boot-time
- *        backlog traffic can never compete with the console/Lua bring-up.
+ *        backlog traffic can never compete with console/schedule bring-up.
  *        Falls open on its own after a generous timeout if never called.
  */
 void sync_runner_boot_complete(void);

@@ -742,7 +742,7 @@ static void test_windows(void)
     time_sync_set_location(78.0, 15.6, 0);
     time_sync_set_utc_offset_seconds(7200);
     CHECK(sched_window_state(&sunw, noon) == SCHED_WINDOW_UNRESOLVED);
-    /* day keeps is_daytime's polar fallback of true (main.lua continuity) */
+    /* day keeps the specified polar fallback of true */
     CHECK(sched_window_state(&day_w, noon) == SCHED_WINDOW_OPEN);
     sched_window_t night_w = mk_window_day();
     night_w.hint = SCHED_WIN_NIGHT;

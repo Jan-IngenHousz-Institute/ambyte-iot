@@ -17,7 +17,7 @@
 /* Ranges and defaults, with their whys: */
 #define TRACE_MARGIN_MIN_MS 0
 #define TRACE_MARGIN_MAX_MS 300000 /* 5 min: a margin beyond any sane grid is a typo */
-#define TRACE_MARGIN_DEF_MS 15000  /* main.lua's "broken past est + 15 s" */
+#define TRACE_MARGIN_DEF_MS 15000  /* broken-run allowance beyond estimate */
 #define ACTINIC_LEVEL_MIN   (-32768) /* raw int16 on the wire */
 #define ACTINIC_LEVEL_MAX   32767
 #define ACTINIC_DUR_MAX_MS  600000 /* 10 min ≈ longest MPF relaxation; the light must always turn off */

@@ -42,8 +42,8 @@ _Static_assert(PAYLOAD_V3_MAX_SEGMENTS == 16U,
  * trace. One reservation owns two non-overlapping regions under the mutex:
  * [0,63000) trace data and [63000,64536) fallback metadata. event_log consumes
  * both synchronously before unlock, so neither aliases live bytes or escapes
- * its ownership window. The buffer is shared by the main Lua task, lua exec,
- * and the future schedule runner, hence the lazily published mutex. A
+ * its ownership window. The buffer is shared by the schedule runner and CLI,
+ * hence the lazily published mutex. A
  * uint16/compact-storage v2 will shrink this need. */
 static char *s_payload;
 static SemaphoreHandle_t s_payload_mtx;
@@ -198,7 +198,7 @@ void ambit_build_cmd_ascii(char *out, size_t cap, const uint8_t *run_arr,
 }
 
 /* Build a caller-freed nseg*8 wire array. Calibration lookup deliberately stays
- * here so Lua and schedule callers cannot encode the same protocol differently. */
+ * here so all native callers encode the protocol identically. */
 uint8_t *ambit_trace_build_run_arr(const ambit_trace_segment_t *segments,
                                    size_t nseg, uint8_t ch)
 {
@@ -276,8 +276,8 @@ esp_err_t ambit_trace_decode_store(uart_sensor_response_t *resp, uint8_t ch,
         }
     }
 
-    /* Preserve the historical reservation point even for store=false: the Lua
-     * binding has always proved the large trace buffer is available before it
+    /* Preserve the reservation point even for store=false: callers must prove
+     * the large trace buffer is available before they
      * reports a decoded run. Serialize build + synchronous store when used. */
     payload_mtx_ensure();
     if (s_payload_mtx == NULL) {

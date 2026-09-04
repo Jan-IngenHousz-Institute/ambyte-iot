@@ -2,16 +2,16 @@
  * sched_runner_actions.c — run functions for the action catalog, bound into
  * the sched_spec table by sched_runner_bind_actions(). Each is a fused,
  * task-level operation (the spec never sees trigger/poll/fetch loops), ported
- * from the Lua bindings/scripts it replaces:
+ * from the previous field measurement implementation:
  *
- *   ambit/trace        ← main.lua run_trace (ping gate, parallel trigger,
+ *   ambit/trace        ← run_trace behavior (ping gate, parallel trigger,
  *                        poll from 90 % of the estimate every 500 ms, fetch +
  *                        store on done, broken past est + deadline_margin)
- *   ambit/spectrum     ← l_ambit_spec + record_spectra (missing id = failure)
- *   ambit/leaf-temp    ← l_ambit_leaf_temp
+ *   ambit/spectrum     ← spectrum read + store (missing id = failure)
+ *   ambit/leaf-temp    ← leaf/chip temperature read + store
  *   ambit/actinic      ← cmd_ambit_actinic, mandatory duration, off on stop
  *   device/status-report ← cmd_store_status_event (firmware heartbeat schema)
- *   db/store-event     ← l_db_store_event, tag MEASUREMENT, $-placeholders
+ *   db/store-event     ← generic event store, tag MEASUREMENT, $-placeholders
  *   device/log, device/sleep
  *
  * Inputs arrive pre-validated and typed by the compiler; these functions
@@ -51,7 +51,7 @@
 
 #define TAG "sched_act"
 
-/* ── parallel-run tuning, from main.lua:37-40 ─────────────────────────── */
+/* ── parallel-run tuning retained from the field schedule ────────────── */
 #define POLL_INTERVAL_MS   500    /* gap between poll sweeps */
 #define POLL_START_PCT     90     /* don't poll until 90 % of the estimate elapsed */
 #define TRACE_TRIGGER_TIMEOUT_MS 3000   /* covers wake + ack only */
@@ -128,7 +128,7 @@ static int64_t now_wall_ms(void)
 /* Caller-owned per-channel trigger→fetch attribution. Static (not stack):
  * four pendings carry the 544 B cmd buffer + 512 B protocol ref each, which
  * would eat most of the runner's 8 KiB stack. Only the runner task touches
- * them; the Lua runner keeps its own copies while it still compiles. */
+ * them; this adapter keeps only the catalog-facing names. */
 static ambit_trace_pending_t s_pend[UART_SENSOR_NUM_CHANNELS];
 
 static const sched_protocol_t *find_protocol(const sched_program_t *prog,
@@ -257,7 +257,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
 
     /* Failure accounting: "no AMBIT responded" and "every triggered channel
      * failed" are job failures; a partial round (one of two channels stored)
-     * is a success with a warning trail, as under main.lua. A stop abort is
+     * is a success with a warning trail. A stop abort is
      * neither (run_job skips counting when should_stop is set). */
     if (pending_count + fetched + chan_failed == 0) {
         return act_fail(ctx, "no AMBIT responded");
@@ -271,7 +271,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
 
 /* ── ambit/spectrum, ambit/leaf-temp ───────────────────────────────────── */
 
-/* Shared store shape from l_ambit_spec / l_ambit_leaf_temp: provenance
+/* Shared store shape for spectrum and leaf-temperature actions: provenance
  * metadata from the cached device info, store through the fused helper. */
 static int64_t store_small(uint8_t ch, const char *cmd_raw, const char *payload,
                            int64_t start_ms, int64_t end_ms)
@@ -312,8 +312,8 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
                  spec[0], spec[1], spec[2], spec[3], spec[4],
                  spec[5], spec[6], spec[7], spec[8], spec[9], (double)par);
         int64_t mid = store_small(ch, "get_par", payload, start_ms, end_ms);
-        /* legacy_1Hz_spec.lua:185-192: a missing stored id is a failure, not
-         * a warning — a measurement that didn't persist didn't happen. */
+        /* A missing stored id is a failure, not a warning — a measurement
+         * that did not persist did not happen. */
         if (mid < 0) {
             (void)act_fail(ctx, "spectra ch%u: PAR=%.2f store failed", ch, (double)par);
             continue;

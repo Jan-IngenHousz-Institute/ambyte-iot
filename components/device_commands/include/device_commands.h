@@ -45,10 +45,10 @@ typedef struct {
     /* Status port */
     status_set_fn               set_status;
 
-    /* SD-card readiness probe (used by Lua main.lua to gate measurement
-     * rounds when the card is out). NULL = SD layer absent. */
+    /* SD-card readiness probe for diagnostics and archive-aware operations.
+     * NULL = SD layer absent. */
     bool                       (*sd_ready)(void);
-    script_identity_read_fn      read_script_identity; /* active main.lua + verified release provenance */
+    script_identity_read_fn      read_script_identity; /* active schedule + verified release provenance */
     ambit_announcement_store_port_t announcement_store; /* persisted DEVICE_INFO dedupe */
 
     /* Messaging ports (Phase 6A) */
@@ -76,12 +76,6 @@ typedef struct {
     uart_sensor_status_fn               uart_status;
     uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
     uart_sensor_stream_query_fn         uart_stream_query; /* multi-line until sentinel */
-
-    /* Optional heap hook: request a garbage collection in the scripting VM (wired
-     * to lua_runner_request_gc). Before a large MQTT publish the publisher asks for
-     * a GC to de-fragment the shared heap; NULL = no GC available (the publish
-     * still heap-gates and defers if the largest free block is too small). */
-    void                              (*request_gc)(void);
 
     /* Optional SD/persistence telemetry for the TELEMETRY heartbeat, so silent-loss
      * sites become visible in the field. Fills any non-NULL out-param; returns
@@ -117,7 +111,7 @@ const char *device_commands_get_mac(void);
 #define AMBYTE_PUBLISH_GATE_LEGACY 0
 #endif
 
-/* Measurement-activity signal. The Lua whole-cycle bracket and each raw sensor
+/* Measurement-activity signal. The schedule whole-cycle bracket and each raw sensor
  * transaction assert this reference count. It retains the PM no-light-sleep
  * lock and measurement-end sync notification semantics, but the default publish
  * gate no longer consults it. Safe to nest. */
@@ -175,19 +169,18 @@ cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
  * (payload {"temperature":..,"humidity":..,"pressure":..}, cmd_raw
  * "device.bme280"). The background sync task (sync_runner) publishes it as one
  * MQTT message. Either out-pointer may be NULL; out_reading receives the
- * measured values (this is the fused-store backing of Lua device.bme280). */
+ * measured values. */
 cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading);
 
 /* Returns true when the SD card is mounted (and therefore the SQLite event DB
- * is writable). main.lua should consult this before starting a measurement
- * round so it doesn't measure into a closed DB. */
+ * is writable). */
 cmd_result_t cmd_sd_ready(bool *out_ready);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 
 /* Point-in-time device status (Wi-Fi + provisioning, event DB, MP2731 power and
  * publish-gate state) — the same facts the `status` CLI prints. Gathered by
- * cmd_status_report() for the Lua heartbeat, which stores it as a sensor="status"
+ * cmd_status_report() for the firmware heartbeat, which stores it as a sensor="status"
  * event so the sole publisher (sync_runner) forwards it under the power gate. */
 typedef struct {
     bool            wifi_connected;
@@ -207,7 +200,7 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out);
 
 /* Store one ambyte.telemetry/1 heartbeat event (tag TELEMETRY, onboard provenance)
  * built from cmd_status_report. Called by sync_runner on its heartbeat period — status
- * reporting is firmware-owned so a broken/missing main.lua can't silence it.
+ * reporting is firmware-owned so a bad installed schedule cannot silence it.
  * Does not wake the sync runner (the caller is the sync runner). */
 cmd_result_t cmd_store_status_event(void);
 
@@ -358,7 +351,7 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
  * be NULL) receives the AMBIT's 1-byte reply — 0 = ok; non-zero = a per-command
  * error code (OTA_DATA: 1 CRC, 2 out-of-order, 3 write-fail, 4 bad-len, 5 short,
  * 6 no-begin). The CRC16 over each chunk is computed here. Orchestrated by
- * components/ambit_ota; not for use from main.lua. */
+ * components/ambit_ota; not for schedule actions. */
 cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status);
 cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
                                 const uint8_t *chunk, uint8_t len, uint8_t *status);

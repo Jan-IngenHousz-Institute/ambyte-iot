@@ -65,7 +65,7 @@ esp_err_t ambit_flash_probe(uint8_t channel, ambit_flash_probe_result_t *out)
     /* Take the shared bus + route UART0 to this channel for the whole session. */
     esp_err_t e = uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "ch%u: cannot take UART bus (%s) — is Lua still running?",
+        ESP_LOGE(TAG, "ch%u: cannot take UART bus (%s) — is measurement still running?",
                  channel, esp_err_to_name(e));
         return e;
     }
@@ -258,7 +258,7 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
 
     esp_err_t e = uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "ch%u: cannot take UART bus (%s) — is Lua still running?",
+        ESP_LOGE(TAG, "ch%u: cannot take UART bus (%s) — is measurement still running?",
                  channel, esp_err_to_name(e));
         return e;
     }
@@ -722,7 +722,7 @@ int ambit_flash_boot_sync(void)
     /* Pass 2: ROM-probe the silent channels — a bare/bricked unit has no app to
      * answer the ping but its ROM bootloader always answers SYNC. NOTE: each
      * probe hard-resets ALL FOUR AMBITs (shared enable line); that is why this
-     * whole function must run before Lua starts measuring — and why fail-capped
+     * whole function must run before the schedule starts measuring — and why fail-capped
      * channels are skipped BEFORE the probe (a capped channel would otherwise
      * cost seconds + a gratuitous reset of the whole bank on every boot). */
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
@@ -848,7 +848,7 @@ int ambit_flash_boot_sync(void)
     }
 
     /* Flash + verify each channel. ~30-60 s per channel; the console is already
-     * up and Lua has not started, so the UART bus is exclusively ours. */
+     * up and measurement has not started, so the UART bus is exclusively ours. */
     int flashed = 0;
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (state[ch] != CH_STALE && state[ch] != CH_BARE) {

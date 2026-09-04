@@ -5,7 +5,7 @@
  *
  *   - the failure-streak log throttle (sched_runner_priv.h, inline): first
  *     failure, every 300th, recovery — the flood protection the design owes
- *     legacy_1Hz_spec.lua's 536 K-line incident;
+ *     the historical 536 K-line incident;
  *   - the pure lifecycle transition model used under the firmware portMUX,
  *     including stop-success → immediate start and stale-generation rejection;
  *   - the db/store-event JSON writer (sched_runner_json.c), including the

@@ -7,7 +7,7 @@
  * edge that does not exist (polar day/night, ESP_ERR_NOT_FOUND) makes the
  * whole window UNRESOLVED — the gate maps that through `unresolved: run|skip`
  * — except windows lowered from `day`/`night`, which keep time_sync_is_daytime's
- * polar fallback for continuity with main.lua (design §Gates).
+ * polar fallback required by design §Gates.
  */
 
 #include "sched_spec.h"

@@ -22,7 +22,7 @@
 #define TAG "ota_update"
 
 #define OTA_TASK_STACK     8192
-#define OTA_TASK_PRIO      4          /* below lua_runner(10); OTA is not latency-critical */
+#define OTA_TASK_PRIO      4          /* below sched_runner(5); OTA is not latency-critical */
 #define OTA_URL_MAX        256
 #define OTA_ID_MAX         64
 #define OTA_CONFIRM_TIMEOUT_S 300     /* wait this long for MQTT before rolling back a new image */
@@ -231,7 +231,7 @@ static void ota_do_update(const ota_request_t *r)
     wait_for_fleet_slot();
 
     /* Quiesce the heap for the download (the board can't hold two TLS sessions):
-     * stop the Lua measurement task (its 8 KB AMBIT buffer + transient tables
+     * stop the schedule runner (its transient action allocations
      * would fragment the heap mid-download), then free MQTT's TLS. */
     if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();

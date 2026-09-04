@@ -91,9 +91,7 @@
  * An arrun envelope can now approach 64 KiB and needs an outbox copy plus a
  * transient mbedTLS write buffer. The large mallocs route to PSRAM, while the
  * internal/DMA pools still need contiguous TLS/lwIP headroom. */
-#define DC_LARGE_PUBLISH_BYTES     3072U   /* envelopes above this get the heap gate */
 #define DC_PUBLISH_HEAP_HEADROOM   2048U   /* floor slack atop the envelope copy (payload_json is freed pre-publish; TLS write ~2.4 KB) */
-#define DC_PUBLISH_SETTLE_MS       300U    /* let the requested GC + transient frees land before re-checking */
 /* Poison-event escape: after this many CONSECUTIVE heap-defers/publish-failures
  * of the SAME event, quarantine it (archive to SD + advance the cursor) so one
  * un-publishable record can't head-of-line-block the strict FIFO forever.
@@ -247,7 +245,7 @@ static void inflight_usage_locked(size_t *slots, size_t *bytes)
     if (bytes != NULL) *bytes = b;
 }
 
-/* Measurement activity spans both the Lua whole-cycle bracket and each raw
+/* Measurement activity spans both the schedule whole-cycle bracket and each raw
  * sensor transaction. It owns the PM no-light-sleep lock and telemetry signal.
  * The narrower publish hold below covers only raw transactions, allowing MQTT
  * publishing during the rest of a measurement routine. Both are counters (not
@@ -1149,7 +1147,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
     /* Power gate lives solely in sync_runner_is_allowed() now — sync_runner is
-     * the only caller of this function (Lua can no longer publish directly), so
+     * the only caller of this function, so
      * one check there is sufficient and unbypassable.  Count admission is checked
      * before touching FATFS; byte admission is exact once the envelope exists. */
     size_t active_slots = 0, outstanding_bytes = 0;
@@ -1175,7 +1173,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     /* Build the MQTT envelope as a string, splicing already-valid JSON verbatim.
      * New firmware-owned v3 objects are complete canonical sample objects in the
      * payload column, so the publisher only adds the unchanged outer envelope.
-     * Every old SD backlog record and generic Lua event still follows the frozen
+     * Every old SD backlog record and generic legacy event still follows the frozen
      * v2 builder below. This schema-keyed split is the dual-read migration rule
      * and lets upgrades drain historical v2 without creating mixed objects.
      *
@@ -1353,23 +1351,12 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     /* Window-aware heap gate. MALLOC_CAP_8BIT totals include PSRAM and therefore
      * cannot prove that lwIP/Wi-Fi/TLS allocations fit. Charge the already queued
      * envelopes plus this allocation and fixed TLS headroom against BOTH largest
-     * internal-DRAM and DMA-capable blocks. Large envelopes get one Lua-GC/settle
-     * retry; a failure reverts only this event-log slot. */
+     * internal-DRAM and DMA-capable blocks. A failure reverts only this
+     * event-log slot; there is no scripting heap to collect or settle. */
     size_t heap_need = outstanding_bytes + cap + DC_PUBLISH_HEAP_HEADROOM;
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
     bool heap_tight = largest_internal < heap_need || largest_dma < heap_need;
-    if (heap_tight && cap > DC_LARGE_PUBLISH_BYTES) {
-        if (s_cfg.request_gc != NULL) s_cfg.request_gc();
-        vTaskDelay(pdMS_TO_TICKS(DC_PUBLISH_SETTLE_MS));
-        portENTER_CRITICAL(&s_inflight_mtx);
-        inflight_usage_locked(NULL, &outstanding_bytes);
-        portEXIT_CRITICAL(&s_inflight_mtx);
-        heap_need = outstanding_bytes + cap + DC_PUBLISH_HEAP_HEADROOM;
-        largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-        heap_tight = largest_internal < heap_need || largest_dma < heap_need;
-    }
     if (heap_tight) {
         free(cmdbuf);
         free(gz_b64);
@@ -1630,7 +1617,7 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     out->publish_gate_open = device_commands_publish_power_ok();
 
     /* On-board BME280 environment, so every heartbeat carries T/H/P even when
-     * main.lua isn't measuring (broken/missing script, or power-gated). Same
+     * the schedule is idle (broken/missing schedule, or power-gated). Same
      * keys/format as the device.bme280 measurement event (cmd_record_env). */
     if (s_cfg.read_env != NULL) {
         measurement_t m;
@@ -1646,7 +1633,7 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
 }
 
 /* Build + store one ambyte.telemetry/1 heartbeat from one live snapshot.
- * Status reporting stays firmware-owned so a missing/crashed main.lua cannot
+ * Status reporting stays firmware-owned so a missing/invalid schedule cannot
  * silence it. cmd_status_report performs the BME280 read exactly once; this
  * function groups that observation beside health in ONE stored row. It never
  * stores the old companion environment event and never wakes a UART channel. */
@@ -2060,7 +2047,7 @@ static void device_commands_publish_hold_begin(void)
 static void device_commands_publish_hold_end(void)
 {
     if (s_publish_hold > 0 && --s_publish_hold == 0) {
-        /* A raw transaction can end while the outer Lua measurement bracket is
+        /* A raw transaction can end while the outer schedule measurement bracket is
          * still active. Wake the runner here so the newly narrow gate matters. */
         notify_sync();
     }
@@ -2099,7 +2086,7 @@ uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s)
  *                          then verify CMD_END (0xF0) follows (for query commands 31-34)
  *
  * Caller must free response via uart_sensor_response_free().
- * Lua: device.uart_query(ch, {cmd_bytes}, extra_or_nil, expect_raw, timeout_ms)
+ * Low-level binary query used by native adapters.
  * CLI: not exposed directly (use typed ambit_* commands instead)                      */
 cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             const uint8_t *extra, size_t extra_len,
@@ -2131,7 +2118,7 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
 
 /* Ping: send wake byte (0xAA) to the AMBIT sensor, wait for ack (0x80).
  * Result is cached for 10 seconds to avoid hammering the bus.
- * Lua:  device.uart_ping(ch) → true/false
+ * Ping one sensor channel.
  * CLI:  ping_uart <ch>                                                */
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
 {
@@ -2153,7 +2140,7 @@ cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
 }
 
 /* Report connection state of all 4 UART channels.
- * Lua:  device.uart_status() → string
+ * Return the UART transport status.
  * CLI:  uart_status                                                   */
 cmd_result_t cmd_uart_status(void)
 {
@@ -2297,7 +2284,7 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
 
 /* Per-channel AMBIT identity + config cache. Identity/calibration is fetched
  * once via cmd 33 (see ambit_info_fetch below); gains/currents are tracked here
- * at set-time. Written from the measurement (Lua) task, so no lock as long as
+ * at set-time. Written from the single measurement task, so no lock as long as
  * that stays the only writer. */
 #define AMBIT_INFO_NUM_CH 4
 static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
@@ -2309,7 +2296,7 @@ static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
  * evicts round-robin. Merely entering the event log is not delivery: stage the
  * tuple after store, then persist it only when that exact measure_id receives a
  * PUBACK and advances persistence. A brownout or dropped row may duplicate the
- * inventory event later, but can never suppress its only cloud copy. The Lua
+ * inventory event later, but can never suppress its only cloud copy. The measurement
  * measurement task stages while sync_runner acknowledges, so both operations
  * share the dedicated mutex created during device_commands_init(). */
 #define AMBIT_ANNOUNCE_SLOTS AMBIT_ANNOUNCEMENT_SLOTS
@@ -2366,7 +2353,7 @@ static esp_err_t ambit_announce_stage(int slot, const ambit_device_info_t *info,
  *   2. if it still fails, mark it pending here and keep re-trying on later
  *      lookups, rate-limited so a truly nameless/legacy AMBIT can't turn every
  *      measurement into a UART round-trip.
- * Same single-writer story as s_ambit_info (measurement/Lua task), so no lock. */
+ * Same single-writer story as s_ambit_info (measurement task), so no lock. */
 #define AMBIT_CAL_FETCH_TRIES     3      /* attempts inside one identity fetch */
 #define AMBIT_CAL_RETRY_DELAY_MS  150    /* pause between those attempts */
 #define AMBIT_CAL_RETRY_PERIOD_MS 60000  /* floor between later re-attempts */
@@ -2378,8 +2365,7 @@ static struct {
 /* Cmd 1 — Set photodetector gains on the ADPD6100.
  * Values 1-6 map to gain levels (0 = skip / keep current).
  * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
- * Lua:  device.ambit_set_gains(ch, fluo, fluoref, ir, irref, sun, leaf)
- * CLI:  (not exposed — use Lua)                                       */
+ * Native AMBIT gain configuration primitive. */
 cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
                                   uint8_t ir, uint8_t irref,
                                   uint8_t sun, uint8_t leaf)
@@ -2400,7 +2386,7 @@ cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
 /* Cmd 2 — Set LED drive currents (0-126).
  * i620 = 620nm pulsed, i720 = 720nm pulsed, ir = far-red DC.
  * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
- * Lua:  device.ambit_set_currents(ch, i620, i720, ir)                 */
+ * Native AMBIT current configuration primitive. */
 cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
                                      uint8_t ir)
 {
@@ -2417,7 +2403,7 @@ cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
 /* Cmd 10 — Apply stored gains and currents to the ADPD6100 detector.
  * Configures the detector into ARRAY_MODE1. Call after set_gains/set_currents,
  * or omit if cmd_ambit_run() auto-configures when mode differs.
- * Lua:  device.ambit_config_detector(ch)                              */
+ * Native AMBIT detector configuration primitive. */
 cmd_result_t cmd_ambit_config_detector(uint8_t ch)
 {
     uint8_t cmd[8] = { AMBIT_CMD_CONFIG_DETECTOR, 0, 0, 0, 0, 0, 0, 0 };
@@ -2427,7 +2413,7 @@ cmd_result_t cmd_ambit_config_detector(uint8_t ch)
 /* Cmd 32 — Read leaf and chip temperature from the MLX90632 IR sensor.
  * Returns temperatures in Celsius (ambit sends int16 × 10, we divide).
  * Response: 4 bytes (2 × int16_t little-endian).
- * Lua:  device.ambit_get_temp(ch) → {leaf=float, chip=float}
+ * Read leaf and chip temperature.
  * CLI:  ambit_temp <ch>                                               */
 cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp)
 {
@@ -2456,7 +2442,7 @@ cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp)
 
 /* Cmd 31 — Read spectral channels from the AS7341 and compute PAR.
  * Response: 24 bytes = 10 × uint16 channels + 1 × float32 PAR.
- * Lua:  device.ambit_get_spec(ch) → {spec={10 ints}, par=float}
+ * Read spectrum and PAR.
  * CLI:  ambit_spec <ch>                                               */
 cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par)
 {
@@ -2483,8 +2469,7 @@ cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par)
 /* Cmd 34 — Extended temperature read: two leaf algorithms + chip + 4 raw
  * MLX90632 register values for diagnostics.
  * Response: 14 bytes (7 × int16_t: leaf*10, leaf1*10, chip*10, a1..a4).
- * Lua:  device.ambit_get_temp_raw(ch) → {leaf,leaf1,chip,raw={4 ints}}
- * CLI:  (not exposed — use Lua or ambit_temp for basic reading)       */
+ * Read the raw temperature response. */
 cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
                                      float *chip, int16_t raw[4])
 {
@@ -2522,7 +2507,7 @@ cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
  *   info_type=3: ambit_metadata_t (~248 B) — GPS, altitude, user notes
  * Raw struct bytes are copied into `out`. Struct layouts defined in
  * ambit_protocol.h (must match ambit-1 nvs1.h on ESP32 Xtensa alignment).
- * Lua:  device.ambit_get_info(ch, type) → raw bytes string
+ * Read an AMBIT information block.
  * CLI:  ambit_info <ch> <1|2|3>                                       */
 cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
                                  uint8_t *out, size_t out_size, size_t *out_len)
@@ -2599,7 +2584,7 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     };
     memcpy(input.mlx_coef, cal->mlx_coef, sizeof input.mlx_coef);
     memcpy(input.adpd, cal->adpd, sizeof input.adpd);
-    /* This path may run inside the deep Lua measurement→late-calibration
+    /* This path may run inside the deep measurement→late-calibration
      * recovery chain. Keep the bounded device object off that 8-KiB task
      * stack; ownership remains local and event storage consumes it
      * synchronously before free, so no persistent cross-caller scratch races. */
@@ -2772,8 +2757,7 @@ void cmd_ambit_device_info_invalidate(uint8_t ch)
  * Response: FSM handshake — up to 7 data arrays (env, fluor, fluoref,
  * sun, leaf, 730, 730ref), each as {index, uint32_t[], length}.
  * Typical duration: seconds to ~60s depending on sample count.
- * Lua:  device.ambit_run(ch, flat_table, led_persist, allow_int, timeout)
- * CLI:  (not exposed — use Lua scripts for measurement workflows)     */
+ * Run a native AMBIT protocol. */
 cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
                             uint8_t led_persist, bool allow_interrupt,
                             uart_sensor_response_t *response, uint32_t timeout_ms)
@@ -2801,8 +2785,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
  * `length` = total measurement points (uint16, encoded as [1]<<7 | [2]),
  * `interval` = sampling interval, `change_act`/`act` = actinic control.
  * Response: FSM handshake data arrays (same as cmd 21).
- * Lua:  device.ambit_run_mpf(ch, length, interval, change_act, act, timeout)
- * CLI:  (not exposed — use Lua)                                       */
+ * Run the native MPF protocol. */
 cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
                                 bool change_act, uint8_t act,
                                 uart_sensor_response_t *response, uint32_t timeout_ms)
@@ -2828,7 +2811,7 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
  * afterwards, instead of blocking the whole run per channel. The four C3s
  * measure concurrently; the host only ever holds the (single shared) bus for a
  * short trigger/poll/fetch transaction. These deliberately do NOT bracket the
- * measurement gate — the Lua orchestrator asserts it once across the cycle. */
+ * measurement gate — the schedule runner asserts it once across the cycle. */
 
 /* Cmd 22 — Trigger an async (retained) run. Same payload as cmd 21; the ambit
  * acks CMD_DONE (ACK_ONLY) and then runs into its own buffers, staying silent
@@ -2903,7 +2886,7 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
 /* Cmd 5 — Blink the AS7341 LED for visual identification.
  * `ambit_id` 0-3 selects blink pattern, `intensity` 5-253 sets brightness.
  * Blocks until blink completes (a few seconds).
- * Lua:  device.ambit_blink(ch, id, intensity)
+ * Blink an AMBIT indicator.
  * CLI:  ambit_blink <ch> <id> <intensity>                             */
 cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity)
 {
@@ -2915,7 +2898,7 @@ cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity)
  * Measures dark baseline and stores offsets (adpd_lit, adpd_sun, adpd_leaf,
  * adpd_730, adpd_730r) in the ambit's NVS. Factory/maintenance command.
  * Blocks for several seconds.
- * Lua:  device.ambit_calibrate_baseline(ch)                           */
+ * Calibrate the AMBIT baseline. */
 cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch)
 {
     uint8_t cmd[8] = { AMBIT_CMD_CALIBRATE_BASELINE, 0, 0, 0, 0, 0, 0, 0 };
@@ -2928,7 +2911,7 @@ cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch)
  *   type=4: set spectral coefficient
  *   type=5: pulse LED at `var` current for `var2`×100 ms
  * Factory/calibration command.
- * Lua:  device.ambit_actinic(ch, type, var, var2)                     */
+ * Set AMBIT actinic output. */
 cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2)
 {
     uint8_t cmd[8] = { AMBIT_CMD_ACTINIC, type, var, var2, 0, 0, 0, 0 };
@@ -2940,7 +2923,7 @@ cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t va
  * (~248 bytes). The struct's eof_mark must be 2025 for the ambit to
  * accept the write. Data is sent as `extra` before CMD_DONE; the ambit
  * reads it from its UART RX FIFO after acknowledging.
- * Lua:  device.ambit_set_metadata(ch, metadata_string)                */
+ * Set AMBIT metadata. */
 cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t len)
 {
     uint8_t cmd[8] = { AMBIT_CMD_SET_METADATA, 0, 0, 0, 0, 0, 0, 0 };

@@ -1,6 +1,6 @@
 /*
  * sched_runner — task, lifecycle, timebase and job execution for the
- * declarative schedule. Replaces the Lua measurement task (see the epic
+ * declarative schedule. It owns the measurement task (see the epic
  * design: components/sched_spec compiles /littlefs/schedule.yaml or the
  * embedded default into a bounded sched_program_t; this task executes it).
  *
@@ -70,17 +70,17 @@
  * over MQTT publishing (esp-mqtt task = 5, sync_runner = 3). Kept WELL below
  * the network stack — LwIP TCP/IP (18) and Wi-Fi (~23) must stay higher or
  * the radio link breaks; those tasks are bursty/idle so they don't slow us.
- * (Rationale comment moved verbatim from lua_runner.c.) */
+ * (Rationale retained from the previous measurement runner.) */
 #define SCHED_TASK_PRIORITY 10
 /* Pin to APP_CPU (core 1). Wi-Fi (pinned core 0) and LwIP (prio 18) outrank
  * the measurement (prio 10), so an unpinned runner task that lands on core 0
  * gets preempted mid-UART-transaction → FSM/timing jitter. Pinning the
  * timing-sensitive measurement to core 1 keeps it off the radio's core; the
  * slack when it blocks is still reused by other tasks allowed on core 1.
- * (ESP32-S3 is dual-core; moved verbatim from lua_runner.c.) */
+ * (ESP32-S3 is dual-core; retained from the previous runner.) */
 #define SCHED_TASK_CORE 1
 
-/* The schedule lives on internal littlefs next to main.lua's old home;
+/* The schedule lives on internal littlefs;
  * power-loss-safe, no SD anywhere in the path (design decision 7). */
 #define SCHED_PATH "/littlefs/schedule.yaml"
 
@@ -245,7 +245,7 @@ static void apply_location_from_config(void)
         time_sync_set_location(lat, lon, tz);
         ESP_LOGI(TAG, "location from device_config: lat=%.5f lon=%.5f", lat, lon);
     } else if (!s_loc_warned) {
-        /* One WARN per boot, mirroring the Lua script's warning: sun triggers
+        /* One WARN per boot: sun triggers
          * and windows fall back to time_sync's compiled NL default. */
         ESP_LOGW(TAG, "no lat/lon in device_config — sun triggers use the "
                       "compiled default (52.173N 5.819E)");
@@ -475,7 +475,7 @@ static void sched_runner_task(void *arg)
 
     /* Due-model init happens on the task, after start(): boot triggers go
      * pending here, and start happens after clock trust (same call-site
-     * contract as lua_runner), so boot means first trusted time. */
+     * call-site contract), so boot means first trusted time. */
     const int64_t init_mono_us = esp_timer_get_time();
     sched_due_init_mono(&s_due, &s_prog, runner_localize, NULL,
                         wall_now_utc(), init_mono_us);
@@ -486,7 +486,7 @@ static void sched_runner_task(void *arg)
              name ? name : "(unnamed)", (unsigned)s_prog.job_count,
              source_kind_str(s_source.kind), s_source.sha256);
 
-    /* Boot banner continuity with main.lua:119 — the sunrise/sunset line is
+    /* The sunrise/sunset line is
      * the first thing a field tech greps for. */
     {
         int64_t L = timezone_localize(wall_now_utc());
@@ -655,7 +655,7 @@ esp_err_t sched_runner_start(void)
              sched_pool_str(&s_prog, s_prog.workbook_version_id_off) ?: "-");
 
     /* 2. Reserve the shared 64,536 B trace/fallback buffer while the heap is
-     * contiguous (same reasoning as lua_runner's module-register reserve;
+     * contiguous (the shared payload buffer is deliberately reserved early;
      * ambit_ota and CLI raw runs share the buffer). Taken ONCE and never
      * released — stop/start cycles do not pay it again. */
     if (ambit_trace_reserve() != ESP_OK) {
@@ -737,7 +737,7 @@ esp_err_t sched_runner_stop(uint32_t wait_ms)
     /* Actions poll s_should_stop between UART transactions and inside poll
      * loops, so a stop normally lands within one poll interval (500 ms) plus
      * one transaction. A stop during a 30 s fetch returns TIMEOUT, as with
-     * lua_runner, and the task exits on its own when the fetch returns. */
+     * the previous runner, and the task exits when the fetch returns. */
     const TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
     const TickType_t started = xTaskGetTickCount();
     for (;;) {

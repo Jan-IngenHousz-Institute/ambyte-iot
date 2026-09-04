@@ -13,7 +13,7 @@
 #include "sched_spec.h"
 
 /* Failure-streak log throttle (runner-owned, never a YAML knob — flood
- * protection is not optional; the numbers come from legacy_1Hz_spec.lua's fix
+ * protection is not optional; the numbers come from the field fix
  * for the 536 K-line log flood): log the FIRST failure of a streak, every
  * 300th while it persists, and the recovery. Actions never log routine
  * failures themselves — they write fail_detail and run_job is the single

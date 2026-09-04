@@ -4,13 +4,13 @@
 /*
  * sched_runner — executes a compiled sched_program_t on a dedicated task.
  *
- * Lifecycle contract is identical to lua_runner's (the runner replaces it):
+ * Lifecycle contract for the measurement runner:
  * start/stop(wait_ms)/is_running, with stop() returning ESP_ERR_TIMEOUT when
  * the task is still inside a UART transaction — the task then exits on its
  * own once that call returns, and a later start() returns
  * ESP_ERR_INVALID_STATE until it has. app_main's five call sites (boot, OTA
  * workload suspend/resume, SD park, status-LED probe) drive this API exactly
- * as they drove lua_runner.
+ * as they drive the schedule runner.
  *
  * Concurrency (T3 review): a lock-guarded state machine (STOPPED/STARTING/
  * RUNNING/STOPPING) is held separate from the task handle. start() claims
@@ -92,7 +92,7 @@ typedef struct {
  * embedded default as above; reserves the shared AMBIT trace buffer while the
  * heap is contiguous; applies NVS lat/lon to time_sync when provisioned;
  * spawns the runner task (priority 10, core 1 — the rationale comment moved
- * from lua_runner). ESP_ERR_INVALID_STATE when already running. */
+ * from the prior runner). ESP_ERR_INVALID_STATE when already running. */
 esp_err_t sched_runner_start(void);
 
 /* Signal stop and wait up to wait_ms. Actions poll

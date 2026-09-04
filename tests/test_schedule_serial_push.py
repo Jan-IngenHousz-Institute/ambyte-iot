@@ -196,13 +196,5 @@ class ConsoleCommandsTest(unittest.TestCase):
         for dep in ("sd_card", "mbedtls"):
             self.assertIn(dep, CLI_CMAKE)
 
-    def test_legacy_lua_execution_cannot_compete_with_schedule_runner(self):
-        lua = CLI.split("static int cli_cmd_lua(", 1)[1]
-        lua = lua.split("\n}\n", 1)[0]
-        self.assertNotIn("lua_runner_start()", lua)
-        self.assertNotIn("lua_runner_exec(", lua)
-        self.assertEqual(lua.count("schedule runner owns the AMBIT UART"), 2)
-
-
 if __name__ == "__main__":
     unittest.main()

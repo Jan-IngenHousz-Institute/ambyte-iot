@@ -16,8 +16,8 @@
 /* Reassembly caps for an inbound command. esp-mqtt delivers payloads larger than
  * CONFIG_MQTT_BUFFER_SIZE across several MQTT_EVENT_DATA fragments; we stitch them
  * here. Messages up to INBOUND_MSG_MAX use a static (BSS) buffer — no heap churn
- * for routine commands (ping, ota_update, lua_exec). Larger ones (an inline-Lua
- * script_update can be a full ~8 KiB main.lua) use a TRANSIENT heap buffer sized
+ * for routine commands (ping, ota_update, schedule_install). Larger schedule
+ * updates use a TRANSIENT heap buffer sized
  * to the message and freed right after dispatch — no permanent BSS cost on the
  * heap-tight board. Anything over INBOUND_MSG_LARGE_MAX (or unallocatable) is
  * dropped with a warning. */
