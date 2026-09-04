@@ -23,21 +23,20 @@ jobs:
     on: { every: 1m }                       # clock-aligned (:00, :01 …)
     steps:
       - uses: ambit/trace
-        with: { protocol: SS, channels: [0, 1, 2, 3], hold_window: false }
+        with: { protocol: SS, hold_window: false }   # channels absent = all that answer a ping
 
   spectra:
     on: { every: 5m }
     when: { window: day }                   # sunrise..sunset
     steps:
-      - uses: ambit/spectrum
-        with: { channels: [0, 1, 2, 3] }
+      - uses: ambit/spectrum                # channels absent = all present
 
   saturating_flash:
     on: { every: 10m }
     when: { window: day }
     steps:
       - uses: ambit/trace
-        with: { protocol: MPF, channels: [0, 1, 2, 3], hold_window: true }
+        with: { protocol: MPF, hold_window: true }
 
   dark_edge:
     on:
@@ -45,7 +44,7 @@ jobs:
       - { sun: sunrise, offset: -30m }
     steps:
       - uses: ambit/trace
-        with: { protocol: MPF, channels: [0, 1, 2, 3], hold_window: true, tag: edge }
+        with: { protocol: MPF, hold_window: true, tag: edge }
 
   health:
     on:

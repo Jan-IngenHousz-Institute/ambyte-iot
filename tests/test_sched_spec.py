@@ -82,7 +82,12 @@ class SchedSpecTest(unittest.TestCase):
         self.assertRegex(result.stdout, r"SCHED_SPEC_HOST_OK \d+ checks")
 
     def test_check_valid_fixtures(self) -> None:
-        for name in ("schedule_default.yaml", "schedule_legacy_1hz_spec.yaml"):
+        valid = (
+            "schedule_default.yaml",
+            "schedule_legacy_1hz_spec.yaml",
+            "schedule_channels_forms.yaml",
+        )
+        for name in valid:
             with self.subTest(fixture=name):
                 result = self.run_cli("--check", str(FIXTURES / name))
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -104,6 +109,14 @@ class SchedSpecTest(unittest.TestCase):
         self.assertIsInstance(schema, dict)
         for action in ACTIONS:
             self.assertIn(action, result.stdout)
+        # channels is optional on the ambit/* actions (absent = all present)
+        for branch in schema["oneOf"]:
+            uses = branch["properties"]["uses"]["const"]
+            required = branch["properties"]["with"]["required"]
+            if uses.startswith("ambit/"):
+                self.assertNotIn("channels", required, uses)
+            if uses == "ambit/trace":
+                self.assertEqual(required, ["protocol"])
 
     def test_simulate_summer(self) -> None:
         result = self.run_cli(

@@ -289,6 +289,29 @@ static void test_compiler_rules(void)
         free(p);
     }
 
+    /* channels: absent materializes as n == 0 ("all that answer a ping"),
+     * distinct from an explicit restriction list */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  a:\n    on: { every: 5m }\n"
+        "    steps: [ { uses: ambit/spectrum } ]\n"
+        "  b:\n    on: { every: 5m }\n"
+        "    steps: [ { uses: ambit/spectrum, with: { channels: [0, 2] } } ]\n");
+    CHECK(p != NULL);
+    if (p != NULL) {
+        const sched_step_t *a = &p->jobs[0].steps[0];
+        CHECK(a->entry_count == 1);
+        const sched_entry_t *ea = &p->entries[a->entry_start];
+        CHECK(ea->type == SCHED_VAL_CHANNELS && ea->u.chans.n == 0);
+        const sched_step_t *b = &p->jobs[1].steps[0];
+        CHECK(b->entry_count == 1);
+        const sched_entry_t *eb = &p->entries[b->entry_start];
+        CHECK(eb->type == SCHED_VAL_CHANNELS && eb->u.chans.n == 2);
+        CHECK(eb->u.chans.v[0] == 0 && eb->u.chans.v[1] == 2);
+        free(p);
+    }
+
     /* db/store-event: placeholders validated, map entries typed */
     p = COMPILE_OK(
         "schema: jii.ambyte-schedule/v1-draft\n"

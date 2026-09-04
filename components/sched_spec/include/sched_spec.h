@@ -168,7 +168,7 @@ typedef enum {
     SCHED_VAL_FLOAT,
     SCHED_VAL_BOOL,   /* stored in u.i as 0/1 */
     SCHED_VAL_STR,    /* u.str_off */
-    SCHED_VAL_CHANNELS, /* u.chans */
+    SCHED_VAL_CHANNELS, /* u.chans; n == 0 = all channels that answer a ping (input absent) */
 } sched_val_type_t;
 
 typedef struct {

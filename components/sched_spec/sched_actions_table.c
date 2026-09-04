@@ -23,9 +23,15 @@
 #define ACTINIC_DUR_MAX_MS  600000 /* 10 min ≈ longest MPF relaxation; the light must always turn off */
 #define SLEEP_MAX_MS        60000  /* design catalog: device/sleep ≤ 60 s */
 
+/* channels is OPTIONAL on the four ambit actions: the same document is
+ * shared by every device in an experiment, and an explicit channel list is
+ * device topology, not experiment intent. has_default materializes an
+ * absent channels as n == 0 = "all channels that answer a ping" (see
+ * fill_entry); an explicit non-empty list stays valid and means a
+ * deliberate restriction. */
 static const sched_input_decl_t k_trace_inputs[] = {
     { "protocol",        SCHED_IN_STRING,      1, 0, 0, 0, 0, NULL },
-    { "channels",        SCHED_IN_CHANNELS,    1, 0, 0, 0, 0, NULL },
+    { "channels",        SCHED_IN_CHANNELS,    0, 1, 0, 0, 0, NULL },
     { "hold_window",     SCHED_IN_BOOL,        0, 1, 0, 0, 0, NULL },
     { "tag",             SCHED_IN_STRING,      0, 0, 0, 0, 0, NULL }, /* default: protocol name (runtime) */
     { "deadline_margin", SCHED_IN_DURATION_MS, 0, 1,
@@ -33,11 +39,11 @@ static const sched_input_decl_t k_trace_inputs[] = {
 };
 
 static const sched_input_decl_t k_channels_only[] = {
-    { "channels", SCHED_IN_CHANNELS, 1, 0, 0, 0, 0, NULL },
+    { "channels", SCHED_IN_CHANNELS, 0, 1, 0, 0, 0, NULL },
 };
 
 static const sched_input_decl_t k_actinic_inputs[] = {
-    { "channels", SCHED_IN_CHANNELS,    1, 0, 0, 0, 0, NULL },
+    { "channels", SCHED_IN_CHANNELS,    0, 1, 0, 0, 0, NULL },
     { "level",    SCHED_IN_INT,         1, 0, ACTINIC_LEVEL_MIN, ACTINIC_LEVEL_MAX, 0, NULL },
     /* duration is mandatory so a job cannot leave the light on */
     { "duration", SCHED_IN_DURATION_MS, 1, 0, 1, ACTINIC_DUR_MAX_MS, 0, NULL },

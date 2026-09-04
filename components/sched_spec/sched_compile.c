@@ -718,8 +718,14 @@ static bool fill_entry(ctx_t *c, const sched_node_t *v,
             e->type = SCHED_VAL_STR;
             e->u.str_off = pool_add(c, NULL, decl->def_s);
             return !c->failed;
+        case SCHED_IN_CHANNELS:
+            /* absent = "all channels that answer a ping". n == 0 can only
+             * arise here (explicit lists must be non-empty), so the runner
+             * can tell "all present" from "these n". */
+            e->type = SCHED_VAL_CHANNELS; /* u.chans.n stays 0 */
+            return true;
         default:
-            return true; /* CHANNELS/MAP have no defaults */
+            return true; /* MAP has no default */
         }
     }
     switch (decl->type) {

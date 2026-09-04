@@ -1,0 +1,14 @@
+# channels is optional on the ambit/* actions: absent = every channel that
+# answers a ping (the document is shared by every device in an experiment;
+# a channel list is device topology, not experiment intent). An explicit
+# list stays valid and means a deliberate restriction. Both forms compile.
+schema: jii.ambyte-schedule/v1-draft
+name: channels-forms
+
+jobs:
+  all_present:
+    on: { every: 5m }
+    steps: [ { uses: ambit/spectrum } ]                         # channels absent
+  restricted:
+    on: { every: 10m }
+    steps: [ { uses: ambit/spectrum, with: { channels: [0, 2] } } ]
