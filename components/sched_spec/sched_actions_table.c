@@ -70,7 +70,10 @@ static const sched_input_decl_t k_sleep_inputs[] = {
 
 #define ACTION(n, arr) { n, arr, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), NULL, NULL }
 
-static const sched_action_t k_actions[] = {
+/* NOT const: the runner binds run/run_ctx into the rows at start
+ * (sched_action_bind). Everything the compiler and the JSON dump read stays
+ * immutable after that. */
+static sched_action_t k_actions[] = {
     ACTION("ambit/trace",          k_trace_inputs),
     ACTION("ambit/spectrum",       k_channels_only),
     ACTION("ambit/leaf-temp",      k_channels_only),
@@ -94,6 +97,22 @@ const sched_action_t *sched_action_find(const char *name)
         if (strcmp(k_actions[i].name, name) == 0) return &k_actions[i];
     }
     return NULL;
+}
+
+esp_err_t sched_action_bind(const char *name, void *run_ctx,
+                            esp_err_t (*run)(void *ctx,
+                                             const struct sched_step *step,
+                                             const struct sched_program *prog))
+{
+    if (name == NULL || run == NULL) return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < sizeof(k_actions) / sizeof(k_actions[0]); i++) {
+        if (strcmp(k_actions[i].name, name) == 0) {
+            k_actions[i].run     = run;
+            k_actions[i].run_ctx = run_ctx;
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
 }
 
 /* ── db/store-event placeholders (design catalog row) ────────────────── */

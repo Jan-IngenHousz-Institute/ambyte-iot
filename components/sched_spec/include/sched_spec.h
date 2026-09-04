@@ -152,6 +152,14 @@ struct sched_action {
 const sched_action_t *sched_actions_table(size_t *count);
 const sched_action_t *sched_action_find(const char *name);
 
+/* The runner (T3) binds the run function + context for every catalog action
+ * at start; a NULL run means a declarations-only build (host tools, CI
+ * schema dump). ESP_ERR_NOT_FOUND for an unknown name. */
+esp_err_t sched_action_bind(const char *name, void *run_ctx,
+                            esp_err_t (*run)(void *ctx,
+                                             const struct sched_step *step,
+                                             const struct sched_program *prog));
+
 /* JSON Schema draft-07 fragment set: one oneOf branch per action. Returns the
  * would-be length (snprintf semantics); truncation ⇒ return ≥ cap. */
 size_t sched_actions_dump_json(char *buf, size_t cap);

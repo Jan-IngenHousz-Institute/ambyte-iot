@@ -26,6 +26,9 @@
 #define KEY_FLASH_TIME      "flash_time"
 #define KEY_HEARTBEAT_S     "heartbeat_s"
 #define KEY_PUBLISH_GZIP    "publish_gzip"
+#define KEY_LAT             "lat"
+#define KEY_LON             "lon"
+#define KEY_DEPLOYMENT      "deployment"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -168,6 +171,29 @@ esp_err_t device_config_get_heartbeat_s(uint32_t *out)
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     return nvs_get_u32(s_handle, KEY_HEARTBEAT_S, out);
+}
+
+static esp_err_t cfg_get_double(const char *key, double *out)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    size_t len = sizeof(*out);
+    return nvs_get_blob(s_handle, key, out, &len);
+}
+
+esp_err_t device_config_get_lat(double *out)
+{
+    return cfg_get_double(KEY_LAT, out);
+}
+
+esp_err_t device_config_get_lon(double *out)
+{
+    return cfg_get_double(KEY_LON, out);
+}
+
+esp_err_t device_config_get_deployment(char *buf, size_t len)
+{
+    return cfg_get(KEY_DEPLOYMENT, buf, len);
 }
 
 esp_err_t device_config_set_timezone(const char *val)

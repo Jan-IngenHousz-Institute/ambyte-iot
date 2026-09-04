@@ -35,6 +35,8 @@
 #include "uart_stream_cli_support.h"
 #include "uart_stream_support.h"
 #include "lua_runner.h"
+#include "sched_runner.h"
+#include "sched_spec.h"
 #include "script_update.h"
 #include "sync_runner.h"
 #include "event_log.h"
@@ -1712,6 +1714,134 @@ static int cli_cmd_ambit_check(int argc, char **argv)
     return 0;
 }
 
+/* Operator control of the declarative schedule runner (the Lua measurement
+ * task's replacement). `status` shows the source + SHA + per-job next-due and
+ * counters; `validate` compile-checks the staged /littlefs/schedule.yaml.new
+ * without touching the running program. The staging/install trio arrives with
+ * the install-path ticket (T4); the `lua` command stays until T5. */
+static int cli_cmd_schedule(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: schedule <status|run <job>|start|stop|reload|actions|validate>\r\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        sched_source_t src;
+        sched_runner_source(&src);
+        static const char *const k_kind[] = {
+            "NONE", "INSTALLED", "EMBEDDED_DEFAULT", "EMBEDDED_FALLBACK",
+        };
+        printf("schedule: %s  source=%s\r\n",
+               sched_runner_is_running() ? "RUNNING" : "stopped",
+               k_kind[src.kind & 3]);
+        if (src.sha256[0]) printf("  sha256=%s\r\n", src.sha256);
+        if (src.reason[0]) printf("  fallback reason: %s\r\n", src.reason);
+        const sched_program_t *prog = sched_runner_program();
+        if (prog == NULL) {
+            printf("  no program loaded yet\r\n");
+            return 0;
+        }
+        printf("  id=%s version=%s workbook=%s name=%s\r\n",
+               sched_pool_str(prog, prog->id_off) ?: "-",
+               sched_pool_str(prog, prog->version_off) ?: "-",
+               sched_pool_str(prog, prog->workbook_version_id_off) ?: "-",
+               sched_pool_str(prog, prog->name_off) ?: "-");
+        printf("  %-16s %-20s %6s %5s %5s %6s %8s\r\n",
+               "job", "next due (UTC)", "runs", "fail", "skip", "streak", "last ms");
+        const int n = sched_runner_job_count();
+        for (int i = 0; i < n; i++) {
+            sched_job_status_t js;
+            if (sched_runner_job_status(i, &js) != ESP_OK) continue;
+            char due[24] = "-";
+            if (js.boot_pending) {
+                snprintf(due, sizeof due, "now (boot)");
+            } else if (js.next_due_utc >= 0) {
+                time_t t = (time_t)js.next_due_utc;
+                struct tm tm_utc;
+                gmtime_r(&t, &tm_utc);
+                strftime(due, sizeof due, "%Y-%m-%d %H:%M:%S", &tm_utc);
+            }
+            printf("  %-16s %-20s %6lu %5lu %5lu %6lu %8lu\r\n",
+                   js.name, due,
+                   (unsigned long)js.stats.runs, (unsigned long)js.stats.failures,
+                   (unsigned long)js.stats.skipped, (unsigned long)js.stats.fail_streak,
+                   (unsigned long)js.stats.last_duration_ms);
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "run") == 0) {
+        if (argc != 3) {
+            printf("Usage: schedule run <job>\r\n");
+            return 1;
+        }
+        esp_err_t err = sched_runner_dispatch(argv[2]);
+        if (err == ESP_ERR_NOT_FOUND)     printf("unknown job '%s'\r\n", argv[2]);
+        else if (err == ESP_ERR_NO_MEM)   printf("dispatch queue full\r\n");
+        else if (err == ESP_ERR_INVALID_STATE) printf("schedule runner not running\r\n");
+        else                              printf("dispatched %s\r\n", argv[2]);
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (strcmp(argv[1], "start") == 0) {
+        esp_err_t err = sched_runner_start();
+        if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
+        else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
+        else                              printf("started (loads /littlefs/schedule.yaml or the embedded default)\r\n");
+        return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
+    }
+    if (strcmp(argv[1], "stop") == 0) {
+        esp_err_t err = sched_runner_stop(5000);
+        if (err == ESP_ERR_TIMEOUT) {
+            printf("still busy in a UART transaction — it will exit when that returns\r\n");
+        } else {
+            printf("%s\r\n", sched_runner_is_running() ? "stop signaled" : "stopped");
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "reload") == 0) {
+        esp_err_t err = sched_runner_stop(5000);
+        if (err == ESP_ERR_TIMEOUT) {
+            printf("stop timed out (UART busy) — retry when the transaction returns\r\n");
+            return 1;
+        }
+        err = sched_runner_start();
+        if (err != ESP_OK) {
+            printf("reload: start failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("reloaded\r\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "actions") == 0) {
+        /* Two-pass sizing: the dump reports the would-be length. */
+        size_t need = sched_actions_dump_json(NULL, 0);
+        char *json = malloc(need + 1);
+        if (json == NULL) {
+            printf("out of memory (%u B)\r\n", (unsigned)(need + 1));
+            return 1;
+        }
+        sched_actions_dump_json(json, need + 1);
+        printf("%s\r\n", json);
+        free(json);
+        return 0;
+    }
+    if (strcmp(argv[1], "validate") == 0) {
+        /* Compile-check the staged file exactly as a reload would see it;
+         * the running program is untouched. */
+        char err[160];
+        esp_err_t r = sched_runner_validate_file("/littlefs/schedule.yaml.new",
+                                                 err, sizeof err);
+        if (r == ESP_OK) {
+            printf("schedule.yaml.new: valid\r\n");
+            return 0;
+        }
+        printf("schedule.yaml.new: %s\r\n", err);
+        return 1;
+    }
+    printf("unknown subcommand '%s' (status|run|start|stop|reload|actions|validate)\r\n",
+           argv[1]);
+    return 1;
+}
+
 /* Operator control of the Lua measurement script. `exec` runs a snippet in an
  * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
  * db/sync) — the console-side twin of the MQTT lua_exec command. */
@@ -2158,6 +2288,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "lua start|stop|status|release|install|begin|put|commit|abort|exec  control / update the Lua script",
         .func    = cli_cmd_lua,
     };
+    static const esp_console_cmd_t schedule_cmd = {
+        .command = "schedule",
+        .help    = "schedule status|run <job>|start|stop|reload|actions|validate  control the declarative schedule runner",
+        .func    = cli_cmd_schedule,
+    };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
         .help    = "clear Wi-Fi credentials + provisioning flag and reboot",
@@ -2336,6 +2471,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&lua_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&schedule_cmd);
     if (err != ESP_OK) {
         return err;
     }

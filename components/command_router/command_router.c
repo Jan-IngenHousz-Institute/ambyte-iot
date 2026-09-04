@@ -9,6 +9,7 @@
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "script_update.h"
+#include "sched_runner.h"
 #include "device_commands.h"
 
 #define TAG "cmd_router"
@@ -250,6 +251,27 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "lua_exec id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             }
+        }
+    } else if (strcmp(type, "schedule_run") == 0) {
+        /* Dispatch a schedule job on demand: {"job": "<name>"}. The runner
+         * executes it on its own task (sequential with scheduled jobs); this
+         * only enqueues, so it is safe on the MQTT task. The reply is a
+         * schedule_run_result on the status topic. */
+        const cJSON *jjob = cJSON_GetObjectItemCaseSensitive(root, "job");
+        const char *job = cJSON_IsString(jjob) ? jjob->valuestring : NULL;
+        if (job == NULL || job[0] == '\0') {
+            ESP_LOGW(TAG, "schedule_run id=%s missing 'job' — ignoring", id ? id : "");
+        } else {
+            esp_err_t err = sched_runner_dispatch(job);
+            ESP_LOGW(TAG, "schedule_run id=%s job=%s -> %s", id ? id : "", job,
+                     esp_err_to_name(err));
+            char reply[384];
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"schedule_run_result\",\"id\":\"%.64s\",\"ok\":%s,"
+                     "\"job\":\"%.96s\",\"detail\":\"%s\"}",
+                     id ? id : "", err == ESP_OK ? "true" : "false",
+                     job, esp_err_to_name(err));
+            publish_reply(reply);
         }
     } else if (strcmp(type, "set_time") == 0) {
         /* Set the device RTC from a UTC epoch: {"epoch": <UTC seconds>}. The RTC is
