@@ -11,6 +11,7 @@
  */
 
 #include "sched_spec.h"
+#include "sched_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -197,30 +198,25 @@ static bool all_digits(const char *s, size_t len)
     return true;
 }
 
-/* Parse a decimal integer: 1 = ok, 0 = not numeric syntax, -1 = numeric
- * syntax but out of int64 range. The caller must treat -1 as an error, not
- * fall through to string — a 19+-digit value is a typo, not a name. */
-static int parse_int64(const char *s, size_t len, int64_t *out)
+/* Tri-state numeric cores shared with the compiler's signed-duration parser
+ * (sched_internal.h): 1 = ok, 0 = not this syntax, -1 = numeric shape but
+ * out of int64 range. The caller must treat -1 as an error, not fall
+ * through to string — a 19+-digit value is a typo, not a name. */
+int sched_u64_digits(const char *s, size_t len, int64_t *out)
 {
-    size_t i = 0;
-    bool neg = false;
-    if (i < len && s[i] == '-') { neg = true; i++; }
-    if (i >= len) return 0;
+    if (len == 0) return 0;
     int64_t v = 0;
-    for (; i < len; i++) {
+    for (size_t i = 0; i < len; i++) {
         if (s[i] < '0' || s[i] > '9') return 0;
         /* magnitude check before the multiply: no signed-overflow UB */
         if (v > (INT64_MAX - (s[i] - '0')) / 10) return -1;
         v = v * 10 + (s[i] - '0');
     }
-    *out = neg ? -v : v;
+    *out = v;
     return 1;
 }
 
-/* duration: [0-9]+(ms|s|m|h) → milliseconds. "ms" is checked before "m".
- * 1 = ok, 0 = not duration syntax, -1 = numeric but the milliseconds do not
- * fit int64 (magnitude checked before the unit multiply). */
-static int parse_duration(const char *s, size_t len, int64_t *out_ms)
+int sched_duration_ms(const char *s, size_t len, int64_t *out_ms)
 {
     size_t mult, dlen;
     if (len >= 3 && s[len - 2] == 'm' && s[len - 1] == 's') {
@@ -236,13 +232,31 @@ static int parse_duration(const char *s, size_t len, int64_t *out_ms)
     } else {
         return 0;
     }
-    if (!all_digits(s, dlen)) return 0;
     int64_t v;
-    int ri = parse_int64(s, dlen, &v);
+    int ri = sched_u64_digits(s, dlen, &v);
     if (ri <= 0) return ri;
     if (v > INT64_MAX / (int64_t)mult) return -1;
     *out_ms = v * (int64_t)mult;
     return 1;
+}
+
+/* signed decimal integer on top of the shared magnitude core */
+static int parse_int64(const char *s, size_t len, int64_t *out)
+{
+    size_t i = 0;
+    bool neg = false;
+    if (i < len && s[i] == '-') { neg = true; i++; }
+    int64_t v;
+    int ri = sched_u64_digits(s + i, len - i, &v);
+    if (ri <= 0) return ri;
+    *out = neg ? -v : v;
+    return 1;
+}
+
+/* duration: [0-9]+(ms|s|m|h) → milliseconds, via the shared core */
+static int parse_duration(const char *s, size_t len, int64_t *out_ms)
+{
+    return sched_duration_ms(s, len, out_ms);
 }
 
 static bool ieq(const char *s, size_t len, const char *word)
@@ -413,6 +427,13 @@ static sched_node_t *parse_quoted(parser_t *p, cursor_t *c)
             }
         } else if (ch == quote) {
             c->pos++;
+            /* the terminating NUL costs a pool byte too — an empty scalar
+             * reaches this branch without any per-byte check having run */
+            if (p->doc->string_bytes + out + 1 > SCHED_YAML_MAX_STRING_BYTES) {
+                set_err(p, c->line, str_col, "string pool limit (%d bytes)",
+                        SCHED_YAML_MAX_STRING_BYTES);
+                return NULL;
+            }
             buf[out] = '\0';
             p->doc->string_bytes += out + 1; /* budget pre-checked per byte */
             sched_node_t *n = scalar_node(p, c->line, str_col);

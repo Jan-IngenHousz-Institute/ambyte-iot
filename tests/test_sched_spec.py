@@ -68,13 +68,17 @@ class SchedSpecTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
         return subprocess.run(
-            [str(self.cli), *args], cwd=ROOT, capture_output=True, text=True
+            [str(self.cli), *args], cwd=ROOT, capture_output=True, text=True, env=env
         )
 
     def test_unit_host_binary(self) -> None:
+        env = os.environ.copy()
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
         result = subprocess.run(
-            [str(self.unit)], cwd=ROOT, capture_output=True, text=True
+            [str(self.unit)], cwd=ROOT, capture_output=True, text=True, env=env
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("FAIL", result.stdout)

@@ -386,10 +386,13 @@ typedef int64_t (*sched_localize_fn)(void *ctx, int64_t utc_unix);
 typedef struct {
     int64_t due[SCHED_SPEC_MAX_TRIGGERS]; /* local unix, -1 = no future fire */
     int64_t fired_minute;  /* last local minute a cron trigger fired in (DST latch) */
-    uint32_t skipped;      /* slots missed past grace while the gate was open */
+    uint32_t skipped;      /* runnable slots missed past grace; a lower bound
+                            * while skipped_saturated is 1 */
     uint32_t runs;         /* firings handed to the runner */
     uint8_t  boot_pending; /* boot trigger not yet consumed */
     uint8_t  gate_open;    /* last evaluated gate state (on_enter edge detect) */
+    uint8_t  skipped_saturated; /* a stale backlog exceeded the per-poll walk
+                            * budget; the rest was jumped, not counted */
 } sched_due_job_t;
 
 typedef struct {
@@ -409,7 +412,9 @@ void sched_due_init(sched_due_t *d, const sched_program_t *prog,
  * Late slots (older than grace: period for `every`, 600 s otherwise) are
  * counted in `skipped` and dropped (missed: skip) or fired once late
  * (missed: run-once). Slots that passed while the gate was closed advance
- * silently. overlap: queue-one/reject affect execution, which the runner
+ * silently. A poll's stale-slot walk is budget-bounded; a jumped backlog
+ * sets skipped_saturated and leaves skipped a lower bound.
+ * overlap: queue-one/reject affect execution, which the runner
  * owns; the model only ever hands out one firing per poll per job. */
 uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc);
 

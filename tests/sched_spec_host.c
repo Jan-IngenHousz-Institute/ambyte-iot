@@ -209,13 +209,21 @@ static void test_parser_rejections(void)
      * documented "integer out of range" verdict for 19-digit shapes */
     PARSE_ERR("a: 9999999999999999999s\n", "integer out of range");
     PARSE_ERR("a: 9223372036854775807s\n", "duration out of range");
+    CHECK(parse_only_ok("a: 9223372036854775s\n"));          /* exact max seconds */
+    PARSE_ERR("a: 9223372036854776s\n", "duration out of range");
+    CHECK(parse_only_ok("a: 153722867280912m\n"));           /* exact max minutes */
+    PARSE_ERR("a: 153722867280913m\n", "duration out of range");
     PARSE_ERR("a: 2562047788016h\n", "duration out of range"); /* MAX/3.6e6 + 1 */
     CHECK(parse_only_ok("a: 2562047788015h\n"));             /* exact max hours */
     CHECK(parse_only_ok("a: 9223372036854775807ms\n"));
+    PARSE_ERR("a: 9223372036854775808ms\n", "integer out of range");
     /* numeric-shaped but beyond int64: an error, never a silent string */
     PARSE_ERR("a: 9223372036854775808\n", "integer out of range");  /* INT64_MAX + 1 */
     PARSE_ERR("a: 9999999999999999999\n", "integer out of range");  /* 19 digits */
     PARSE_ERR("a: -9223372036854775809\n", "integer out of range");
+    /* Accepted parser limitation: the negative magnitude is checked against
+     * INT64_MAX, so INT64_MIN itself is deliberately not expressible. */
+    PARSE_ERR("a: -9223372036854775808\n", "integer out of range");
     /* boundary: INT64_MAX itself parses */
     {
         sched_yaml_doc_t *dmax = NULL;
@@ -226,6 +234,16 @@ static void test_parser_rejections(void)
         CHECK(rmax != NULL && rmax->u.m.pairs[0].value->scal_kind == SCHED_SCAL_INT &&
               rmax->u.m.pairs[0].value->u.s.i == INT64_MAX);
         sched_yaml_free(dmax);
+    }
+    {
+        sched_yaml_doc_t *dmin = NULL;
+        char emin[128];
+        const char *ymin = "a: -9223372036854775807\n";
+        CHECK(sched_yaml_parse(ymin, strlen(ymin), &dmin, emin, sizeof(emin)) == ESP_OK);
+        const sched_node_t *rmin = sched_yaml_root(dmin);
+        CHECK(rmin != NULL && rmin->u.m.pairs[0].value->scal_kind == SCHED_SCAL_INT &&
+              rmin->u.m.pairs[0].value->u.s.i == -INT64_MAX);
+        sched_yaml_free(dmin);
     }
 
     /* quoted-scalar grammar (review): unterminated quotes are errors even in
@@ -255,6 +273,17 @@ static void test_parser_rejections(void)
             strcat(y, item);
         }
         strcat(y, "  - '123456789'\n");          /* + 10 → 8193: over */
+        PARSE_ERR(y, "string pool limit");
+
+        /* An empty quoted scalar still costs its terminating NUL. Exercise
+         * that closing-quote path after an exact 8192-byte prefix. */
+        y[0] = '\0';
+        for (int i = 0; i < 81; i++) {
+            snprintf(item, sizeof(item), "- '%.100d'\n", i);
+            strcat(y, item);
+        }
+        strcat(y, "- '1234567890'\n");           /* 8181 + 11 = 8192 */
+        strcat(y, "- ''\n");                     /* NUL makes 8193 */
         PARSE_ERR(y, "string pool limit");
         free(y);
     }
@@ -401,6 +430,21 @@ static void test_compiler_rules(void)
                 "    on: { sun: sunrise, offset: 30m, phase: 1s }\n"
                 "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
                 "phase");
+    /* Signed sun/window modifiers use a separate compiler parser from YAML's
+     * duration lexer. It must require at least one digit and guard magnitude
+     * before every decimal/unit multiplication as well. */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { sun: sunrise, offset: \"+h\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "expected a duration");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { sun: sunrise, offset: \"+9223372036854775808ms\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "duration too large");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { sun: sunrise, offset: \"+999999999999999999999999999999999999h\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "duration too large");
     COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
                 "    on: [ boot ]\n"
                 "    frobnicate: 1\n"
@@ -445,6 +489,14 @@ static void test_compiler_rules(void)
                 "unknown protocol");
     COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
                 "    on: { at: \"08:00\" }\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { weekly: { days: [mon], at: \"08:00\" } }\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: dispatch\n"
                 "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
                 "unknown protocol");
 
@@ -557,6 +609,10 @@ static void test_cron_basics(void)
     CHECK(sched_cron_parse("0 0 * * * extra", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0 25 * * *", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0/0 * * * *", &c, err, sizeof(err)) == ESP_FAIL);
+    /* A numeric cron token is bounded input too; reject it without overflowing
+     * the int accumulator used by read_number(). */
+    CHECK(sched_cron_parse("999999999999999999999999999999999999 * * * *",
+                           &c, err, sizeof(err)) == ESP_FAIL);
 
     /* review: "*****" without separators is not cron … */
     CHECK(sched_cron_parse("*****", &c, err, sizeof(err)) == ESP_FAIL);
@@ -770,6 +826,21 @@ static void test_due_model(void)
         free(d);
     }
 
+    /* More than the 4096-slot inner walk cap: the outer loop must continue
+     * without dropping debt. Thirty-five days on a 10-minute grid has 5040
+     * elapsed slots; 5039 are stale and the current slot fires. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 10m }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        t0, identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0 + 35 * 86400) == 1);
+        CHECK(d->jobs[0].skipped == 5039);
+        free(p);
+        free(d);
+    }
+
     /* review T2-2, the exact case: 10 m grid behind a daily 10:00–11:00
      * window, init 10:00, poll ~26 h later. The gate flips twice inside the
      * stale interval; only the runnable slots count (5 left on day 1 + 6 on
@@ -838,6 +909,30 @@ static void test_due_model(void)
     }
     time_sync_set_location(52.173, 5.819, 0);
     time_sync_set_utc_offset_seconds(7200);
+
+    /* re-review 2-2 pin: the shipped 1 Hz sun-gated shape after a
+     * three-week gap is ~1.8 M stale slots. The per-poll walk budget bounds
+     * the work: the backlog is jumped to the grace horizon, skipped stays a
+     * lower bound, and skipped_saturated reports it. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 1s }\n"
+        "    when: { window: { from: sunrise, to: sunset } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 1, 12, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        struct timespec ta, tb;
+        clock_gettime(CLOCK_MONOTONIC, &ta);
+        sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0));
+        clock_gettime(CLOCK_MONOTONIC, &tb);
+        double ms = (double)(tb.tv_sec - ta.tv_sec) * 1e3 +
+                    (double)(tb.tv_nsec - ta.tv_nsec) / 1e6;
+        CHECK(ms < 10.0); /* unbudgeted this was ~650 ms on this host */
+        CHECK(d->jobs[0].skipped_saturated == 1);
+        CHECK(d->jobs[0].skipped > 0 && d->jobs[0].skipped <= 3600);
+        free(p);
+        free(d);
+    }
 
     /* missed: run-once — one make-up fire instead of a skip count */
     d = mk_due(
@@ -1129,8 +1224,8 @@ int main(void)
 {
     test_parser_acceptance();
     test_parser_rejections();
-    test_compiler_rules();
     test_cron_basics();
+    test_compiler_rules();
     test_cron_dst();
     test_windows();
     test_due_model();

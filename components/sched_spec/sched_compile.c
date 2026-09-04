@@ -9,6 +9,7 @@
  */
 
 #include "sched_spec.h"
+#include "sched_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -340,42 +341,31 @@ static const char *trace_protocol(const sched_program_t *prog,
 
 /* ── triggers ────────────────────────────────────────────────────────── */
 
-/* Signed duration: duration scalar, or a string "+30m"/"-15m"/"1h". */
+/* Signed duration: duration scalar, or a string "+30m"/"-15m"/"1h". The
+ * magnitude/unit math is the shared tri-state core (sched_internal.h), so
+ * this path can never diverge from the YAML lexer's overflow behaviour:
+ * a sign with no digits is a grammar error, and out-of-range magnitudes
+ * reject as "duration too large" before any multiply. */
 static bool parse_signed_duration(ctx_t *c, const sched_node_t *n, int64_t *out_ms)
 {
-    if (n->kind != SCHED_NODE_SCALAR) {
-        cerr(c, n, "expected a duration (e.g. 30m, -15m)");
-        return false;
-    }
-    if (n->scal_kind == SCHED_SCAL_DURATION_MS) {
+    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_DURATION_MS) {
         *out_ms = n->u.s.ms;
         return true;
     }
-    if (n->scal_kind == SCHED_SCAL_STR) {
+    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_STR) {
         const char *s = n->u.s.str;
         bool neg = false;
         if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
-        int64_t v = 0, mult = 1;
-        size_t len = strlen(s);
-        size_t dlen = len;
-        if (len >= 2 && s[len - 2] == 'm' && s[len - 1] == 's') { mult = 1; dlen = len - 2; }
-        else if (len >= 1 && s[len - 1] == 's') { mult = 1000; dlen = len - 1; }
-        else if (len >= 1 && s[len - 1] == 'm') { mult = 60000; dlen = len - 1; }
-        else if (len >= 1 && s[len - 1] == 'h') { mult = 3600000; dlen = len - 1; }
-        else {
-            cerr(c, n, "expected a duration (e.g. 30m, -15m)");
+        int64_t v;
+        int rd = sched_duration_ms(s, strlen(s), &v);
+        if (rd == 1) {
+            *out_ms = neg ? -v : v;
+            return true;
+        }
+        if (rd < 0) {
+            cerr(c, n, "duration too large");
             return false;
         }
-        for (size_t i = 0; i < dlen; i++) {
-            if (s[i] < '0' || s[i] > '9') {
-                cerr(c, n, "expected a duration (e.g. 30m, -15m)");
-                return false;
-            }
-            v = v * 10 + (s[i] - '0');
-            if (v > INT64_MAX / 10 / mult) { cerr(c, n, "duration too large"); return false; }
-        }
-        *out_ms = neg ? -(v * mult) : v * mult;
-        return true;
     }
     cerr(c, n, "expected a duration (e.g. 30m, -15m)");
     return false;
