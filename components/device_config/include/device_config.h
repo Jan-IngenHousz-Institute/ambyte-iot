@@ -42,14 +42,16 @@ esp_err_t device_config_get_timezone(char *buf, size_t len);
 esp_err_t device_config_get_flash_time(uint32_t *out);
 
 /* Device position + deployment tag for the schedule runner (sun triggers,
- * db/store-event $lat/$lon/$deployment placeholders). Read-only here — the
- * writers arrive with set_location/provisioning (T4). Absent keys return
+ * db/store-event $lat/$lon/$deployment placeholders). Absent keys return
  * ESP_ERR_NVS_NOT_FOUND and the runner keeps the time_sync compiled default,
  * mirroring the Lua script's warn-and-continue. lat/lon are NVS blobs holding
  * one double each. */
 esp_err_t device_config_get_lat(double *out);
 esp_err_t device_config_get_lon(double *out);
 esp_err_t device_config_get_deployment(char *buf, size_t len);
+esp_err_t device_config_set_lat(double val);
+esp_err_t device_config_set_lon(double val);
+esp_err_t device_config_set_deployment(const char *val);
 /* STATUS heartbeat period in seconds (sync_runner). Optional; caller defaults
  * (300 s) when unset. 0 disables the heartbeat. */
 esp_err_t device_config_get_heartbeat_s(uint32_t *out);

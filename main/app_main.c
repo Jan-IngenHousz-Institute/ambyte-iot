@@ -1184,15 +1184,14 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
     }
 
-    /* Remote Lua control (Stage 4): MQTT script_update replaces /littlefs/main.lua
-     * (syntax-checked, .bak kept) + restarts the runner; MQTT lua_exec runs a
-     * snippet in an ephemeral state. Lazy worker — no steady-state heap cost. */
+    /* MQTT script_update replaces /littlefs/schedule.yaml (compiled with the
+     * runner's validator, .bak kept) and restarts the schedule runner. */
     script_update_config_t script_cfg = {
         .publish          = mqtt_client_get_publish_fn(),
         .is_connected     = mqtt_client_get_is_connected_fn(),
         .status_topic     = status_topic,
         .device_id        = device_id,
-        /* url variant: stop Lua (defragment) AND stop MQTT (free its TLS heap)
+        /* URL variant: stop the runner (defragment) and MQTT (free its TLS heap)
          * around the HTTPS download so the download's TLS handshake gets a clean
          * contiguous heap — same quiesce hooks as OTA. MQTT is resumed before the
          * status reply. */

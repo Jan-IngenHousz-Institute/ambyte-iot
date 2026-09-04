@@ -1,5 +1,6 @@
 #include "device_config.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -181,6 +182,14 @@ static esp_err_t cfg_get_double(const char *key, double *out)
     return nvs_get_blob(s_handle, key, out, &len);
 }
 
+static esp_err_t cfg_set_double(const char *key, double val)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = nvs_set_blob(s_handle, key, &val, sizeof(val));
+    if (err != ESP_OK) return err;
+    return nvs_commit(s_handle);
+}
+
 esp_err_t device_config_get_lat(double *out)
 {
     return cfg_get_double(KEY_LAT, out);
@@ -194,6 +203,24 @@ esp_err_t device_config_get_lon(double *out)
 esp_err_t device_config_get_deployment(char *buf, size_t len)
 {
     return cfg_get(KEY_DEPLOYMENT, buf, len);
+}
+
+esp_err_t device_config_set_lat(double val)
+{
+    if (!isfinite(val) || val < -90.0 || val > 90.0) return ESP_ERR_INVALID_ARG;
+    return cfg_set_double(KEY_LAT, val);
+}
+
+esp_err_t device_config_set_lon(double val)
+{
+    if (!isfinite(val) || val < -180.0 || val > 180.0) return ESP_ERR_INVALID_ARG;
+    return cfg_set_double(KEY_LON, val);
+}
+
+esp_err_t device_config_set_deployment(const char *val)
+{
+    if (val == NULL) return ESP_ERR_INVALID_ARG;
+    return cfg_set(KEY_DEPLOYMENT, val);
 }
 
 esp_err_t device_config_set_timezone(const char *val)

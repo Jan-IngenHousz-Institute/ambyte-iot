@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Source-contract tests for the console serial-push script installer.
+"""Source-contract tests for the console serial-push schedule installer.
 
 The invariants here are the reason the design is safe, and none of them are
 visible from the Python side: the dangerous half of the install has exactly one
@@ -35,7 +35,7 @@ def worker_body(name):
 
 class SharedInstallTailTest(unittest.TestCase):
     def test_verify_and_swap_has_a_single_implementation(self):
-        # Both workers must route through it, so the checksum/syntax/.bak/rename
+        # Both workers must route through it, so checksum/compile/.bak/rename
         # sequence cannot drift between the URL and serial-push paths.
         self.assertEqual(
             SCRIPT_UPDATE.count("static bool verify_and_swap_staged("), 1)
@@ -44,25 +44,25 @@ class SharedInstallTailTest(unittest.TestCase):
     def test_neither_staged_file_worker_swaps_for_itself(self):
         tail = SCRIPT_UPDATE.split("static bool verify_and_swap_staged(", 1)[1]
         tail = tail.split("\n}\n", 1)[0]
-        self.assertIn("rename(LUA_PATH, LUA_PATH_BAK)", tail)
-        self.assertIn("rename(LUA_PATH_NEW, LUA_PATH)", tail)
+        self.assertIn("rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK)", tail)
+        self.assertIn("rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH)", tail)
         # Both staged-file workers must delegate rather than keep a copy.
         # (do_update_impl, the inline MQTT path, legitimately still has its own:
-        # it hashes an in-memory string and drives lua_runner_stop/start directly
+        # it hashes an in-memory string and drives sched_runner_stop/start directly
         # with a stop-timeout path instead of the workload hooks.)
         for name in ("do_update_url_impl", "do_update_local_impl"):
             self.assertNotIn("rename(", code_only(worker_body(name)), name)
 
-    def test_every_failure_path_leaves_main_lua_alone(self):
+    def test_every_failure_path_leaves_schedule_alone(self):
         tail = SCRIPT_UPDATE.split("static bool verify_and_swap_staged(", 1)[1]
         tail = tail.split("\n}\n", 1)[0]
         mismatch = tail.index("sha256 mismatch")
-        syntax = tail.index("syntax check failed")
-        swap = tail.index("rename(LUA_PATH, LUA_PATH_BAK)")
+        syntax = tail.index("schedule compile failed")
+        swap = tail.index("rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK)")
         # Both rejections happen before anything touches the live script.
         self.assertLess(mismatch, swap)
         self.assertLess(syntax, swap)
-        self.assertEqual(tail.count("remove(LUA_PATH_NEW)"), 2)
+        self.assertEqual(tail.count("remove(SCHEDULE_PATH_NEW)"), 2)
 
 
 class LocalWorkerTest(unittest.TestCase):
@@ -75,7 +75,7 @@ class LocalWorkerTest(unittest.TestCase):
                       SCRIPT_UPDATE)
 
     def test_no_sd_gate_staging_is_internal(self):
-        # Since main.lua + staging moved to internal littlefs, the local worker
+        # schedule.yaml + staging are on internal littlefs, so the local worker
         # must NOT take the SD RW-gate: a missing archive card cannot fail a
         # serial push. (The same de-gating applies to the other workers; the
         # whole component is SD-free.)
@@ -84,7 +84,7 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertNotIn("sdcard_io_begin", wrapper)
         self.assertNotIn("sdcard_io_begin", SCRIPT_UPDATE)
 
-    def test_stops_lua_but_never_touches_mqtt(self):
+    def test_stops_runner_but_never_touches_mqtt(self):
         body = self._body()
         # The runner must stop: the file it is executing gets swapped.
         self.assertIn("workload_suspend()", body)
@@ -95,10 +95,10 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertNotIn("comms_resume", code_only(body))
 
     def test_refuses_to_install_nothing(self):
-        self.assertIn("no staged script (lua begin/put first)", self._body())
+        self.assertIn("no staged schedule (schedule begin/put first)", self._body())
 
     def test_hashes_the_staged_file_rather_than_trusting_the_sender(self):
-        self.assertIn("sha256_file(LUA_PATH_NEW, got)", self._body())
+        self.assertIn("sha256_file(SCHEDULE_PATH_NEW, got)", self._body())
 
 
 class ReconnectWaitTest(unittest.TestCase):
@@ -111,29 +111,51 @@ class ReconnectWaitTest(unittest.TestCase):
 
 class StagingPathTest(unittest.TestCase):
     def test_defined_once_and_shared_with_the_console(self):
-        self.assertIn('#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/main.lua.new"',
+        self.assertIn('#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/schedule.yaml.new"',
                       SCRIPT_UPDATE_H)
-        self.assertIn("#define LUA_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH",
+        self.assertIn("#define SCHEDULE_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH",
                       SCRIPT_UPDATE)
         # The CLI must not hardcode its own copy of the path.
-        self.assertNotIn('"/littlefs/main.lua.new"', CLI)
+        self.assertNotIn('"/littlefs/schedule.yaml.new"', CLI)
         self.assertIn("SCRIPT_UPDATE_STAGING_PATH", CLI)
         # Internal flash, not the archive card: a cardless board must install.
-        self.assertNotIn('"/sdcard/main.lua.new"', SCRIPT_UPDATE_H)
+        self.assertNotIn('"/sdcard/schedule.yaml.new"', SCRIPT_UPDATE_H)
+
+
+class IdentityReportTest(unittest.TestCase):
+    def test_script_status_keeps_fleet_identity_names_and_adds_source(self):
+        report = SCRIPT_UPDATE.split("static void report_script(", 1)[1]
+        report = report.split("\n}\n", 1)[0]
+        for field in (
+            "script_sha256",
+            "script_version",
+            "script_built_against_fw",
+            "script_installed_on_fw",
+            "script_metadata_verified",
+        ):
+            self.assertIn(f'\\\"{field}\\\"', report)
+        self.assertIn('\\\"schedule_source\\\"', report)
+        for source in (
+            "none",
+            "installed",
+            "embedded_default",
+            "embedded_fallback",
+        ):
+            self.assertIn(f'"{source}"', report)
 
 
 class ConsoleCommandsTest(unittest.TestCase):
     def test_all_four_subcommands_exist_and_are_advertised(self):
         for sub in ("begin", "put", "commit", "abort"):
             self.assertIn(f'strcmp(argv[1], "{sub}") == 0', CLI)
-        usage = CLI.split('printf("Usage: lua <', 1)[1].split(";", 1)[0]
+        usage = CLI.split('printf("Usage: schedule <', 1)[1].split(";", 1)[0]
         for sub in ("begin", "put", "commit", "abort"):
             self.assertIn(sub, usage)
 
     def test_put_is_bounded_and_base64_only(self):
         self.assertIn("mbedtls_base64_decode(", CLI)
-        self.assertIn("LUA_PUT_TOTAL_MAX", CLI)
-        self.assertIn("lua put: refusing to exceed", CLI)
+        self.assertIn("SCHEDULE_PUT_TOTAL_MAX", CLI)
+        self.assertIn("schedule put: refusing to exceed", CLI)
 
     def test_put_keeps_no_state_between_commands(self):
         # A push abandoned halfway must leak no file handle, so each put opens,
@@ -144,7 +166,7 @@ class ConsoleCommandsTest(unittest.TestCase):
         self.assertIn("fclose(f)", put)
         self.assertNotIn("sdcard_io_begin", put)
 
-    def test_commit_mirrors_lua_install_and_does_not_reboot(self):
+    def test_commit_mirrors_schedule_install_and_does_not_reboot(self):
         commit = CLI.split('strcmp(argv[1], "commit") == 0', 1)[1].split("return 0;", 1)[0]
         # reboot=false: the GUI stays attached to verify, so an in-place restart
         # avoids another USB re-enumeration.

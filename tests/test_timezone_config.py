@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,7 @@ class TimezoneProvisioningTest(unittest.TestCase):
         }
         required["AMBYTE_TIMEZONE"] = "AMT"
         original = os.environ.copy()
+        original_read_pem = BUILD_NVS._read_pem
         try:
             os.environ.clear()
             os.environ.update(required)
@@ -96,6 +98,38 @@ class TimezoneProvisioningTest(unittest.TestCase):
                 ("string", "Europe/Amsterdam"),
             )
         finally:
+            BUILD_NVS._read_pem = original_read_pem
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_collect_values_encodes_optional_site_metadata(self):
+        required = {
+            env: "/tmp/cert.pem" if kind == "file" else "value"
+            for env, _namespace, _key, kind in BUILD_NVS.FIELDS
+        }
+        original = os.environ.copy()
+        original_read_pem = BUILD_NVS._read_pem
+        try:
+            os.environ.clear()
+            os.environ.update(required)
+            BUILD_NVS._read_pem = lambda _path: "PEM"
+            values = BUILD_NVS._collect_values(
+                lat=52.173, lon=5.819, deployment="greenhouse-a"
+            )
+            self.assertEqual(
+                values[("device_cfg", "lat")],
+                ("hex2bin", struct.pack("<d", 52.173).hex()),
+            )
+            self.assertEqual(
+                values[("device_cfg", "lon")],
+                ("hex2bin", struct.pack("<d", 5.819).hex()),
+            )
+            self.assertEqual(
+                values[("device_cfg", "deployment")],
+                ("string", "greenhouse-a"),
+            )
+        finally:
+            BUILD_NVS._read_pem = original_read_pem
             os.environ.clear()
             os.environ.update(original)
 

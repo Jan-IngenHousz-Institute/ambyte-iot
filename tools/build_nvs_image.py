@@ -30,6 +30,9 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
                timezone          AMBYTE_TIMEZONE         (IANA name; defaults to
                                                           Europe/Amsterdam)
+               lat               --lat                    (optional f64 blob)
+               lon               --lon                    (optional f64 blob)
+               deployment        --deployment             (optional string)
                heartbeat_s       AMBYTE_HEARTBEAT_S      (optional; u32 seconds)
                flash_time        <image build time>      (u32 epoch; RTC fallback)
   certs        ca_cert           file at AMBYTE_CA_CERT
@@ -46,9 +49,11 @@ loudly at build time instead of bricking the device.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -298,7 +303,9 @@ def _quote_csv(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
+def _collect_values(*, lat: float | None = None, lon: float | None = None,
+                    deployment: str | None = None
+                    ) -> dict[tuple[str, str], tuple[str, str]]:
     """Return {(namespace, key): (kind, value)} after resolving every field.
     Raises SystemExit on missing required values."""
     out: dict[tuple[str, str], tuple[str, str]] = {}
@@ -334,6 +341,13 @@ def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
     # (added just above from .env/shell) always wins.
     out.setdefault(("device_cfg", "timezone"), ("string", DEFAULT_TIMEZONE))
 
+    if lat is not None:
+        out[("device_cfg", "lat")] = ("hex2bin", struct.pack("<d", lat).hex())
+    if lon is not None:
+        out[("device_cfg", "lon")] = ("hex2bin", struct.pack("<d", lon).hex())
+    if deployment is not None:
+        out[("device_cfg", "deployment")] = ("string", deployment)
+
     # provisioned=1 is constant; not driven by env.
     out[("wifi_prov", "provisioned")] = ("u8", "1")
 
@@ -364,7 +378,7 @@ def _write_csv(values: dict[tuple[str, str], tuple[str, str]], csv_path: Path) -
     for ns in ns_order:
         lines.append(f"{ns},namespace,,")
         for key, enc, value in by_ns[ns]:
-            if enc in ("u8", "u32"):
+            if enc in ("u8", "u32", "hex2bin"):
                 lines.append(f"{key},data,{enc},{value}")
             else:
                 lines.append(f"{key},data,string,{_quote_csv(value)}")
@@ -400,12 +414,26 @@ def main() -> int:
                    help="write the intermediate CSV here (default: alongside --out)")
     p.add_argument("--quiet", action="store_true",
                    help="suppress success message; only print the output path")
+    p.add_argument("--lat", type=float, default=None,
+                   help="optional site latitude (-90..90) persisted for sun scheduling")
+    p.add_argument("--lon", type=float, default=None,
+                   help="optional site longitude (-180..180) persisted for sun scheduling")
+    p.add_argument("--deployment", default=None,
+                   help="optional deployment tag for schedule event placeholders")
     args = p.parse_args()
+
+    if args.lat is not None and (not math.isfinite(args.lat)
+                                 or not -90.0 <= args.lat <= 90.0):
+        p.error("--lat must be between -90 and 90")
+    if args.lon is not None and (not math.isfinite(args.lon)
+                                 or not -180.0 <= args.lon <= 180.0):
+        p.error("--lon must be between -180 and 180")
 
     load_dotenv()
     resolve_cert_bundle()
 
-    values = _collect_values()
+    values = _collect_values(lat=args.lat, lon=args.lon,
+                             deployment=args.deployment)
 
     out_path = args.out.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)

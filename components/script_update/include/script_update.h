@@ -12,23 +12,18 @@ extern "C" {
 #endif
 
 /*
- * Remote Lua control over MQTT (docs/lua-releases.md):
+ * Remote schedule control over MQTT (docs/schedule-releases.md):
  *
- *  - script_update: replace /littlefs/main.lua with an inline-delivered script
- *    and restart the Lua runner. The script is syntax-checked BEFORE the
- *    filesystem is touched; the previous main.lua survives as main.lua.bak.
+ *  - script_update: replace /littlefs/schedule.yaml with an inline-delivered
+ *    schedule and restart the schedule runner. The schedule is compiled BEFORE
+ *    the filesystem is touched; the previous file survives as schedule.yaml.bak.
  *    Optional sha256 integrity check. NVS id latch (success only) dedupes the
  *    retained topic.
- *  - lua_exec: run a short Lua snippet immediately in an ephemeral state
- *    (lua_runner_exec) and publish its result — remote-CLI parity.
- *
- * Both run on a lazy worker task (spawned on demand, exits when idle — zero
- * steady-state heap, same pattern as ambit_ota) so neither blocks the MQTT
- * event task.
+ * Work runs on the shared maintenance worker so it never blocks the MQTT task.
  */
 
-/* Suspend/resume the Lua measurement workload (app_workload_suspend/resume). The
- * `url` variant needs these: stopping Lua frees its 8 KB buffer and defragments
+/* Suspend/resume the schedule workload (app_workload_suspend/resume). The
+ * `url` variant needs these: stopping the runner frees its buffers and defragments
  * the heap so the download's TLS handshake gets its contiguous record buffer. */
 typedef void (*script_workload_fn)(void);
 
@@ -57,12 +52,12 @@ typedef struct {
 /* Prepare the worker plumbing (idempotent; the task itself spawns on demand). */
 esp_err_t script_update_init(const script_update_config_t *cfg);
 
-/* Queue a main.lua replacement. `script` is copied (caller's buffer may die);
+/* Queue a schedule.yaml replacement. `script` is copied (caller's buffer may die);
  * `checksum` (optional, NULL ok) is the lowercase/uppercase hex SHA-256 of the
  * script; `id` dedupes a retained message (latched on success only; NULL = no
  * dedupe). `reboot` = true (the default) restarts the whole device after a
  * successful swap so the new script runs from a fresh boot; false keeps the old
- * in-place behaviour (stop + swap + restart just the Lua runner). Either way the
+ * in-place behaviour (stop + swap + restart just the schedule runner). Either way the
  * id is latched on success FIRST, so a retained trigger can't loop the reboot.
  * `script_version` and `built_against_fw` are optional release provenance;
  * legacy senders may pass NULL. Reports script_status with the active script
@@ -72,11 +67,11 @@ esp_err_t script_update_request(const char *script, const char *checksum, const 
                                 bool reboot, const char *script_version,
                                 const char *built_against_fw);
 
-/* Queue a main.lua replacement fetched from `url` (HTTPS, streamed to SD in 4 KB
+/* Queue a schedule.yaml replacement fetched from `url` (HTTPS, streamed in 4 KB
  * chunks). Unlike the inline variant this needs NO large contiguous MQTT/TLS
- * buffer, so it lands reliably on a fragmented heap — the worker stops Lua first
+ * buffer, so it lands reliably on a fragmented heap — the worker stops the runner first
  * to defragment, downloads, verifies (`checksum` = sha256 hex of the file, optional)
- * and syntax-checks, then swaps + reboots/restarts. Requires workload_suspend/
+ * and compiles, then swaps + reboots/restarts. Requires workload_suspend/
  * resume in the config (else ESP_ERR_INVALID_STATE-style "unavailable" report).
  * `id`/`reboot`/release-provenance semantics match script_update_request. */
 esp_err_t script_update_url_request(const char *url, const char *checksum, const char *id,
@@ -92,30 +87,26 @@ esp_err_t script_update_url_request_immediate(const char *url, const char *check
                                               const char *script_version,
                                               const char *built_against_fw);
 
-/* Where the console's `lua put` stages bytes for script_update_local_request().
+/* Where the console's `schedule put` stages bytes for script_update_local_request().
  * Same file the URL variant downloads into, so both share one install path.
- * On internal littlefs (alongside LUA_PATH), so a serial push works with no SD
+ * On internal littlefs (alongside the active schedule), so a serial push works with no SD
  * card inserted. */
-#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/main.lua.new"
+#define SCRIPT_UPDATE_STAGING_PATH "/littlefs/schedule.yaml.new"
 
-/* Queue a main.lua replacement from bytes ALREADY staged at
+/* Queue a schedule.yaml replacement from bytes ALREADY staged at
  * SCRIPT_UPDATE_STAGING_PATH by the console. Needs no network at all: the
  * operator's PC pushed the script over serial, so onboarding works on a bench
  * with no uplink. Verification is unchanged (sha256 of the staged file against
- * `checksum`, Lua syntax check, previous script kept as main.lua.bak). Unlike the
+ * `checksum`, schedule compile, previous file kept as schedule.yaml.bak). Unlike the
  * URL variant this does not stop MQTT, since nothing here needs the TLS heap.
  * `id`/`reboot`/release-provenance semantics match script_update_request. */
 esp_err_t script_update_local_request(const char *checksum, const char *id,
                                       bool reboot, const char *script_version,
                                       const char *built_against_fw);
 
-/* Hash the active /littlefs/main.lua and return release provenance only when the
+/* Hash the active /littlefs/schedule.yaml and return release provenance only when the
  * stored release digest matches the file. Suitable as a script_identity_read_fn. */
 esp_err_t script_update_get_identity(script_identity_t *out);
-
-/* Queue a snippet for immediate execution (lua_runner_exec, 120 s budget).
- * Reports {"type":"lua_exec_result",...,"ok":…,"result":"…"}. */
-esp_err_t script_update_exec_request(const char *code, const char *id);
 
 #ifdef __cplusplus
 }
