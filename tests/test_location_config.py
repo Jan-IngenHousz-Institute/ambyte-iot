@@ -1,10 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Source-contract coverage for persistent schedule location configuration."""
+"""Executable and source contracts for atomic schedule site configuration."""
 
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+
+from tools.site_state_blob import decode_site_state, encode_site_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,18 +28,70 @@ RUNNER_ACTIONS = (
 
 
 class LocationConfigContractTest(unittest.TestCase):
-    def test_device_config_exposes_bounded_persistent_writers(self):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="device-config-site-host-")
+        cls.host = Path(cls.tmp.name) / "device_config_site_state_host"
+        subprocess.run(
+            [
+                os.environ.get("CC", shutil.which("clang") or "cc"),
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                f"-I{ROOT / 'tests/host_stubs'}",
+                f"-I{ROOT / 'components/device_config/include'}",
+                f"-I{ROOT / 'components/timezone/include'}",
+                str(ROOT / "tests/device_config_site_state_host.c"),
+                str(ROOT / "components/device_config/device_config.c"),
+                "-lm",
+                "-o",
+                str(cls.host),
+            ],
+            check=True,
+            cwd=ROOT,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_device_config_exposes_atomic_bounded_persistent_writers(self):
         for name in ("lat", "lon", "deployment"):
             self.assertIn(f"device_config_set_{name}", DEVICE_CONFIG_H)
             self.assertIn(f"device_config_set_{name}", DEVICE_CONFIG)
-        self.assertIn("nvs_set_blob(s_handle, key, &val, sizeof(val))", DEVICE_CONFIG)
         self.assertIn("device_config_set_location", DEVICE_CONFIG_H)
         grouped = DEVICE_CONFIG.split("esp_err_t device_config_set_location(", 1)[1]
-        self.assertIn("cfg_restore_double(KEY_LAT", grouped)
-        self.assertIn("cfg_restore_double(KEY_LON", grouped)
-        self.assertIn("cfg_restore_string(KEY_DEPLOYMENT", grouped)
+        self.assertIn("site_state_write(&state)", grouped)
+        writer = DEVICE_CONFIG.split("static esp_err_t site_state_write(", 1)[1]
+        writer = writer.split("\n}\n", 1)[0]
+        self.assertEqual(writer.count("nvs_set_blob"), 1)
+        self.assertEqual(writer.count("nvs_commit"), 1)
+        self.assertIn('KEY_SITE_STATE      "site_state"', DEVICE_CONFIG)
         self.assertIn("val < -90.0 || val > 90.0", DEVICE_CONFIG)
         self.assertIn("val < -180.0 || val > 180.0", DEVICE_CONFIG)
+
+    def test_real_device_config_fault_injection(self):
+        result = subprocess.run(
+            [str(self.host)], check=True, cwd=ROOT, capture_output=True, text=True
+        )
+        self.assertIn("site_state fault tests: OK", result.stdout)
+
+    def test_python_provisioners_match_firmware_blob_bytes(self):
+        result = subprocess.run(
+            [str(self.host), "--dump"],
+            check=True,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        firmware_blob = bytes.fromhex(result.stdout.strip())
+        python_blob = encode_site_state(52.173, 5.819, "greenhouse-a")
+        self.assertEqual(firmware_blob, python_blob)
+        decoded = decode_site_state(firmware_blob)
+        self.assertEqual(decoded.lat, 52.173)
+        self.assertEqual(decoded.lon, 5.819)
+        self.assertEqual(decoded.deployment, "greenhouse-a")
 
     def test_mqtt_command_persists_then_applies_and_replies(self):
         branch = COMMAND_ROUTER.split('strcmp(type, "set_location") == 0', 1)[1]
@@ -51,6 +109,8 @@ class LocationConfigContractTest(unittest.TestCase):
         branch = branch.split('strcmp(sub, "interval") == 0', 1)[0]
         self.assertLess(branch.index("device_config_set_location"),
                         branch.index("time_sync_set_location"))
+        self.assertIn("device_config_get_deployment", branch)
+        self.assertIn("deployment=%s", branch)
 
     def test_deployment_placeholder_reads_persisted_value_at_action_time(self):
         placeholder = RUNNER_ACTIONS.split(

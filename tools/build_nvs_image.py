@@ -30,9 +30,7 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
                timezone          AMBYTE_TIMEZONE         (IANA name; defaults to
                                                           Europe/Amsterdam)
-               lat               --lat                    (optional f64 blob)
-               lon               --lon                    (optional f64 blob)
-               deployment        --deployment             (optional string)
+               site_state        --lat/--lon/--deployment (optional atomic blob)
                heartbeat_s       AMBYTE_HEARTBEAT_S      (optional; u32 seconds)
                flash_time        <image build time>      (u32 epoch; RTC fallback)
   certs        ca_cert           file at AMBYTE_CA_CERT
@@ -53,7 +51,6 @@ import math
 import os
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import time
@@ -61,6 +58,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _prov_env import load_dotenv, resolve_cert_bundle, REPO_ROOT  # noqa: E402
+from site_state_blob import encode_site_state  # noqa: E402
 
 # NVS partition size — must match partitions.csv ("nvs, ..., 0x9000, 0x6000").
 NVS_PARTITION_SIZE = 0x6000
@@ -343,12 +341,11 @@ def _collect_values(*, lat: float | None = None, lon: float | None = None,
     # (added just above from .env/shell) always wins.
     out.setdefault(("device_cfg", "timezone"), ("string", DEFAULT_TIMEZONE))
 
-    if lat is not None:
-        out[("device_cfg", "lat")] = ("hex2bin", struct.pack("<d", lat).hex())
-    if lon is not None:
-        out[("device_cfg", "lon")] = ("hex2bin", struct.pack("<d", lon).hex())
-    if deployment is not None:
-        out[("device_cfg", "deployment")] = ("string", deployment)
+    if lat is not None or lon is not None or deployment is not None:
+        out[("device_cfg", "site_state")] = (
+            "hex2bin",
+            encode_site_state(lat, lon, deployment).hex(),
+        )
 
     # provisioned=1 is constant; not driven by env.
     out[("wifi_prov", "provisioned")] = ("u8", "1")

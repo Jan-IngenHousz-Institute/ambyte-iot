@@ -42,19 +42,25 @@ esp_err_t device_config_get_timezone(char *buf, size_t len);
 esp_err_t device_config_get_flash_time(uint32_t *out);
 
 /* Device position + deployment tag for the schedule runner (sun triggers,
- * db/store-event $lat/$lon/$deployment placeholders). Absent keys return
- * ESP_ERR_NVS_NOT_FOUND and the runner keeps the time_sync compiled default,
- * mirroring the Lua script's warn-and-continue. lat/lon are NVS blobs holding
- * one double each. */
+ * db/store-event $lat/$lon/$deployment placeholders). Version-1 firmware keeps
+ * the optional tuple in one fixed, versioned `site_state` NVS blob so one
+ * commit is the power-loss boundary. Getters prefer a valid blob, then fall
+ * back to legacy lat/lon/deployment keys for already-provisioned devices.
+ * A valid blob is authoritative even when one of its presence flags is absent. */
 esp_err_t device_config_get_lat(double *out);
 esp_err_t device_config_get_lon(double *out);
 esp_err_t device_config_get_deployment(char *buf, size_t len);
+/* Read lat/lon and optional deployment from one snapshot. Returns NOT_FOUND
+ * unless both coordinates are present; deployment may be NULL with len 0. */
+esp_err_t device_config_get_location(double *lat, double *lon,
+                                     char *deployment, size_t deployment_len);
+/* Compatibility setters perform a read-modify-write of the same site_state
+ * blob. They never update the legacy individual keys. */
 esp_err_t device_config_set_lat(double val);
 esp_err_t device_config_set_lon(double val);
 esp_err_t device_config_set_deployment(const char *val);
-/* Persist a coherent site update. `deployment == NULL` leaves the tag
- * unchanged. If any write fails, the previous lat/lon/tag values are restored
- * before returning so a rejected command cannot leave a mixed coordinate. */
+/* Persist a coherent site update with one blob write + commit.
+ * `deployment == NULL` preserves the authoritative/legacy tag. */
 esp_err_t device_config_set_location(double lat, double lon,
                                      const char *deployment);
 /* STATUS heartbeat period in seconds (sync_runner). Optional; caller defaults

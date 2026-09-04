@@ -1,6 +1,8 @@
 #include "device_config.h"
 
+#include <float.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -30,6 +32,44 @@
 #define KEY_LAT             "lat"
 #define KEY_LON             "lon"
 #define KEY_DEPLOYMENT      "deployment"
+#define KEY_SITE_STATE      "site_state"
+
+/* Atomic site-state blob, shared byte-for-byte with tools/site_state_blob.py.
+ * Do not cast this to a C struct: explicit offsets avoid ABI padding and make
+ * the provisioning image independent of the Python host's architecture.
+ *
+ *   0..3   "AMST" magic
+ *   4      version (1)
+ *   5      presence flags: lat/lon/deployment
+ *   6      deployment byte length (0..63)
+ *   7      reserved zero
+ *   8..15  latitude IEEE-754 binary64, little-endian
+ *   16..23 longitude IEEE-754 binary64, little-endian
+ *   24..87 deployment bytes, NUL terminator, zero padding
+ *
+ * NVS replaces one key transactionally at nvs_commit(), so a power cut sees
+ * either the complete old blob or the complete new blob. The legacy three
+ * keys remain read-only fallback for devices provisioned before version 1. */
+#define SITE_STATE_BLOB_SIZE        88U
+#define SITE_STATE_VERSION          1U
+#define SITE_STATE_FLAG_LAT         (1U << 0)
+#define SITE_STATE_FLAG_LON         (1U << 1)
+#define SITE_STATE_FLAG_DEPLOYMENT  (1U << 2)
+#define SITE_STATE_KNOWN_FLAGS      (SITE_STATE_FLAG_LAT | SITE_STATE_FLAG_LON | \
+                                     SITE_STATE_FLAG_DEPLOYMENT)
+#define SITE_STATE_DEPLOYMENT_CAP   63U
+
+_Static_assert(sizeof(double) == 8 && DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024,
+               "site_state requires IEEE-754 binary64 double");
+
+typedef struct {
+    bool has_lat;
+    bool has_lon;
+    bool has_deployment;
+    double lat;
+    double lon;
+    char deployment[SITE_STATE_DEPLOYMENT_CAP + 1];
+} site_state_t;
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -182,65 +222,330 @@ static esp_err_t cfg_get_double(const char *key, double *out)
     return nvs_get_blob(s_handle, key, out, &len);
 }
 
-static esp_err_t cfg_set_double(const char *key, double val)
+static uint64_t site_get_u64le(const uint8_t *src)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; i++) value |= (uint64_t)src[i] << (i * 8);
+    return value;
+}
+
+static void site_put_u64le(uint8_t *dst, uint64_t value)
+{
+    for (unsigned i = 0; i < 8; i++) dst[i] = (uint8_t)(value >> (i * 8));
+}
+
+static double site_get_double(const uint8_t *src)
+{
+    uint64_t bits = site_get_u64le(src);
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void site_put_double(uint8_t *dst, double value)
+{
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    site_put_u64le(dst, bits);
+}
+
+static bool bytes_are_zero(const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] != 0) return false;
+    }
+    return true;
+}
+
+static bool bytes_are_utf8(const uint8_t *buf, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        uint8_t c = buf[i++];
+        if (c < 0x80) continue;
+        if (c >= 0xc2 && c <= 0xdf) {
+            if (i >= len || (buf[i++] & 0xc0) != 0x80) return false;
+            continue;
+        }
+        if (c >= 0xe0 && c <= 0xef) {
+            if (i + 1 >= len) return false;
+            uint8_t c1 = buf[i++], c2 = buf[i++];
+            if ((c2 & 0xc0) != 0x80 ||
+                (c == 0xe0 ? c1 < 0xa0 || c1 > 0xbf
+                           : c == 0xed ? c1 < 0x80 || c1 > 0x9f
+                                      : (c1 & 0xc0) != 0x80)) {
+                return false;
+            }
+            continue;
+        }
+        if (c >= 0xf0 && c <= 0xf4) {
+            if (i + 2 >= len) return false;
+            uint8_t c1 = buf[i++], c2 = buf[i++], c3 = buf[i++];
+            if ((c2 & 0xc0) != 0x80 || (c3 & 0xc0) != 0x80 ||
+                (c == 0xf0 ? c1 < 0x90 || c1 > 0xbf
+                           : c == 0xf4 ? c1 < 0x80 || c1 > 0x8f
+                                      : (c1 & 0xc0) != 0x80)) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool site_state_decode(const uint8_t blob[SITE_STATE_BLOB_SIZE],
+                              site_state_t *out)
+{
+    if (memcmp(blob, "AMST", 4) != 0 || blob[4] != SITE_STATE_VERSION ||
+        (blob[5] & ~SITE_STATE_KNOWN_FLAGS) != 0 || blob[7] != 0) {
+        return false;
+    }
+
+    site_state_t state = {0};
+    state.has_lat = (blob[5] & SITE_STATE_FLAG_LAT) != 0;
+    state.has_lon = (blob[5] & SITE_STATE_FLAG_LON) != 0;
+    state.has_deployment = (blob[5] & SITE_STATE_FLAG_DEPLOYMENT) != 0;
+
+    if (state.has_lat) {
+        state.lat = site_get_double(blob + 8);
+        if (!isfinite(state.lat) || state.lat < -90.0 || state.lat > 90.0) return false;
+    } else if (!bytes_are_zero(blob + 8, 8)) {
+        return false;
+    }
+    if (state.has_lon) {
+        state.lon = site_get_double(blob + 16);
+        if (!isfinite(state.lon) || state.lon < -180.0 || state.lon > 180.0) return false;
+    } else if (!bytes_are_zero(blob + 16, 8)) {
+        return false;
+    }
+
+    size_t deployment_len = blob[6];
+    if (state.has_deployment) {
+        if (deployment_len > SITE_STATE_DEPLOYMENT_CAP ||
+            memchr(blob + 24, '\0', deployment_len) != NULL ||
+            !bytes_are_utf8(blob + 24, deployment_len) ||
+            !bytes_are_zero(blob + 24 + deployment_len,
+                            SITE_STATE_DEPLOYMENT_CAP + 1 - deployment_len)) {
+            return false;
+        }
+        memcpy(state.deployment, blob + 24, deployment_len);
+        state.deployment[deployment_len] = '\0';
+    } else if (deployment_len != 0 || !bytes_are_zero(blob + 24, 64)) {
+        return false;
+    }
+
+    *out = state;
+    return true;
+}
+
+static void site_state_encode(const site_state_t *state,
+                              uint8_t blob[SITE_STATE_BLOB_SIZE])
+{
+    memset(blob, 0, SITE_STATE_BLOB_SIZE);
+    memcpy(blob, "AMST", 4);
+    blob[4] = SITE_STATE_VERSION;
+    if (state->has_lat) {
+        blob[5] |= SITE_STATE_FLAG_LAT;
+        site_put_double(blob + 8, state->lat);
+    }
+    if (state->has_lon) {
+        blob[5] |= SITE_STATE_FLAG_LON;
+        site_put_double(blob + 16, state->lon);
+    }
+    if (state->has_deployment) {
+        size_t len = strlen(state->deployment);
+        blob[5] |= SITE_STATE_FLAG_DEPLOYMENT;
+        blob[6] = (uint8_t)len;
+        memcpy(blob + 24, state->deployment, len);
+        /* zero-filled byte 24+len is the required terminator */
+    }
+}
+
+static esp_err_t site_state_read_blob(site_state_t *out)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = nvs_set_blob(s_handle, key, &val, sizeof(val));
+    uint8_t blob[SITE_STATE_BLOB_SIZE];
+    size_t len = sizeof(blob);
+    esp_err_t err = nvs_get_blob(s_handle, KEY_SITE_STATE, blob, &len);
+    if (err != ESP_OK) return err;
+    if (len != sizeof(blob) || !site_state_decode(blob, out)) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t site_state_read_legacy(site_state_t *out)
+{
+    site_state_t state = {0};
+    esp_err_t first_error = ESP_ERR_NVS_NOT_FOUND;
+
+    esp_err_t err = cfg_get_double(KEY_LAT, &state.lat);
+    if (err == ESP_OK) {
+        if (!isfinite(state.lat) || state.lat < -90.0 || state.lat > 90.0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        state.has_lat = true;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        first_error = err;
+    }
+
+    err = cfg_get_double(KEY_LON, &state.lon);
+    if (err == ESP_OK) {
+        if (!isfinite(state.lon) || state.lon < -180.0 || state.lon > 180.0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        state.has_lon = true;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND &&
+               first_error == ESP_ERR_NVS_NOT_FOUND) {
+        first_error = err;
+    }
+
+    err = cfg_get(KEY_DEPLOYMENT, state.deployment, sizeof(state.deployment));
+    if (err == ESP_OK) {
+        state.has_deployment = true;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND &&
+               first_error == ESP_ERR_NVS_NOT_FOUND) {
+        first_error = err;
+    }
+
+    if (state.has_lat || state.has_lon || state.has_deployment) {
+        *out = state;
+        return ESP_OK;
+    }
+    return first_error;
+}
+
+static esp_err_t site_state_read(site_state_t *out)
+{
+    esp_err_t blob_err = site_state_read_blob(out);
+    if (blob_err == ESP_OK) return ESP_OK;
+    if (blob_err == ESP_ERR_INVALID_STATE) return blob_err;
+
+    /* A valid blob is authoritative, including its absent-field flags. Only an
+     * absent/corrupt/unknown blob falls back to the pre-v1 keys. Reads never
+     * depend on migration succeeding: migration happens only on a later write. */
+    if (blob_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "site_state blob ignored (%s); trying legacy keys",
+                 esp_err_to_name(blob_err));
+    }
+    esp_err_t legacy_err = site_state_read_legacy(out);
+    if (legacy_err == ESP_OK) return ESP_OK;
+    return blob_err == ESP_ERR_NVS_NOT_FOUND ? legacy_err : blob_err;
+}
+
+static esp_err_t site_state_write(const site_state_t *state)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    uint8_t blob[SITE_STATE_BLOB_SIZE];
+    site_state_encode(state, blob);
+    esp_err_t err = nvs_set_blob(s_handle, KEY_SITE_STATE, blob, sizeof(blob));
     if (err != ESP_OK) return err;
     return nvs_commit(s_handle);
 }
 
+static esp_err_t site_state_for_update(site_state_t *state)
+{
+    esp_err_t err = site_state_read(state);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(state, 0, sizeof(*state));
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t device_config_get_location(double *lat, double *lon,
+                                     char *deployment, size_t deployment_len)
+{
+    if (lat == NULL || lon == NULL ||
+        (deployment == NULL && deployment_len != 0) ||
+        (deployment != NULL && deployment_len == 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    site_state_t state;
+    esp_err_t err = site_state_read(&state);
+    if (err != ESP_OK) return err;
+    if (!state.has_lat || !state.has_lon) return ESP_ERR_NVS_NOT_FOUND;
+    if (deployment != NULL) {
+        size_t len = state.has_deployment ? strlen(state.deployment) : 0;
+        if (len + 1 > deployment_len) return ESP_ERR_NVS_INVALID_LENGTH;
+        memcpy(deployment, state.has_deployment ? state.deployment : "", len + 1);
+    }
+    *lat = state.lat;
+    *lon = state.lon;
+    return ESP_OK;
+}
+
 esp_err_t device_config_get_lat(double *out)
 {
-    return cfg_get_double(KEY_LAT, out);
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    site_state_t state;
+    esp_err_t err = site_state_read(&state);
+    if (err != ESP_OK) return err;
+    if (!state.has_lat) return ESP_ERR_NVS_NOT_FOUND;
+    *out = state.lat;
+    return ESP_OK;
 }
 
 esp_err_t device_config_get_lon(double *out)
 {
-    return cfg_get_double(KEY_LON, out);
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    site_state_t state;
+    esp_err_t err = site_state_read(&state);
+    if (err != ESP_OK) return err;
+    if (!state.has_lon) return ESP_ERR_NVS_NOT_FOUND;
+    *out = state.lon;
+    return ESP_OK;
 }
 
 esp_err_t device_config_get_deployment(char *buf, size_t len)
 {
-    return cfg_get(KEY_DEPLOYMENT, buf, len);
+    if (buf == NULL || len == 0) return ESP_ERR_INVALID_ARG;
+    site_state_t state;
+    esp_err_t err = site_state_read(&state);
+    if (err != ESP_OK) return err;
+    if (!state.has_deployment) return ESP_ERR_NVS_NOT_FOUND;
+    size_t stored_len = strlen(state.deployment) + 1;
+    if (stored_len > len) return ESP_ERR_NVS_INVALID_LENGTH;
+    memcpy(buf, state.deployment, stored_len);
+    return ESP_OK;
 }
 
 esp_err_t device_config_set_lat(double val)
 {
     if (!isfinite(val) || val < -90.0 || val > 90.0) return ESP_ERR_INVALID_ARG;
-    return cfg_set_double(KEY_LAT, val);
+    site_state_t state;
+    esp_err_t err = site_state_for_update(&state);
+    if (err != ESP_OK) return err;
+    state.lat = val;
+    state.has_lat = true;
+    return site_state_write(&state);
 }
 
 esp_err_t device_config_set_lon(double val)
 {
     if (!isfinite(val) || val < -180.0 || val > 180.0) return ESP_ERR_INVALID_ARG;
-    return cfg_set_double(KEY_LON, val);
+    site_state_t state;
+    esp_err_t err = site_state_for_update(&state);
+    if (err != ESP_OK) return err;
+    state.lon = val;
+    state.has_lon = true;
+    return site_state_write(&state);
 }
 
 esp_err_t device_config_set_deployment(const char *val)
 {
-    /* sched_runner's placeholder buffer is char[64]; reject rather than store
-     * a tag that later reads as ESP_ERR_NVS_INVALID_LENGTH and appears empty. */
-    if (val == NULL || strlen(val) >= 64) return ESP_ERR_INVALID_ARG;
-    return cfg_set(KEY_DEPLOYMENT, val);
-}
-
-static esp_err_t cfg_restore_double(const char *key, bool existed, double value)
-{
-    esp_err_t err = existed ? nvs_set_blob(s_handle, key, &value, sizeof(value))
-                            : nvs_erase_key(s_handle, key);
-    if (err == ESP_ERR_NVS_NOT_FOUND && !existed) return ESP_OK;
+    size_t len = val != NULL ? strlen(val) : 0;
+    if (val == NULL || len > SITE_STATE_DEPLOYMENT_CAP ||
+        !bytes_are_utf8((const uint8_t *)val, len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    site_state_t state;
+    esp_err_t err = site_state_for_update(&state);
     if (err != ESP_OK) return err;
-    return nvs_commit(s_handle);
-}
-
-static esp_err_t cfg_restore_string(const char *key, bool existed, const char *value)
-{
-    esp_err_t err = existed ? nvs_set_str(s_handle, key, value)
-                            : nvs_erase_key(s_handle, key);
-    if (err == ESP_ERR_NVS_NOT_FOUND && !existed) return ESP_OK;
-    if (err != ESP_OK) return err;
-    return nvs_commit(s_handle);
+    strcpy(state.deployment, val);
+    state.has_deployment = true;
+    return site_state_write(&state);
 }
 
 esp_err_t device_config_set_location(double lat, double lon,
@@ -252,44 +557,30 @@ esp_err_t device_config_set_location(double lat, double lon,
         return ESP_ERR_INVALID_ARG;
     }
 
-    double old_lat = 0.0, old_lon = 0.0;
-    char old_deployment[64] = "";
-    esp_err_t lat_read = device_config_get_lat(&old_lat);
-    esp_err_t lon_read = device_config_get_lon(&old_lon);
-    esp_err_t deployment_read = device_config_get_deployment(
-        old_deployment, sizeof(old_deployment));
-    if (lat_read != ESP_OK && lat_read != ESP_ERR_NVS_NOT_FOUND) return lat_read;
-    if (lon_read != ESP_OK && lon_read != ESP_ERR_NVS_NOT_FOUND) return lon_read;
-    if (deployment != NULL && deployment_read != ESP_OK &&
-        deployment_read != ESP_ERR_NVS_NOT_FOUND) {
-        return deployment_read;
-    }
-
-    esp_err_t err = device_config_set_lat(lat);
-    if (err == ESP_OK) err = device_config_set_lon(lon);
-    if (err == ESP_OK && deployment != NULL) {
-        err = device_config_set_deployment(deployment);
-    }
-    if (err == ESP_OK) return ESP_OK;
-
-    /* A setter can fail either before or during nvs_commit, so restore every
-     * member that may have reached flash. Keep attempting after one rollback
-     * error; restoring two of three values is still better than stopping at
-     * the first failure, and the ERROR names both the command and rollback. */
-    esp_err_t rollback = cfg_restore_double(KEY_LAT, lat_read == ESP_OK, old_lat);
-    esp_err_t r = cfg_restore_double(KEY_LON, lon_read == ESP_OK, old_lon);
-    if (rollback == ESP_OK) rollback = r;
     if (deployment != NULL) {
-        r = cfg_restore_string(KEY_DEPLOYMENT, deployment_read == ESP_OK,
-                               old_deployment);
-        if (rollback == ESP_OK) rollback = r;
+        size_t len = strlen(deployment);
+        if (len > SITE_STATE_DEPLOYMENT_CAP ||
+            !bytes_are_utf8((const uint8_t *)deployment, len)) {
+            return ESP_ERR_INVALID_ARG;
+        }
     }
-    if (rollback != ESP_OK) {
-        ESP_LOGE(TAG, "location write failed (%s), rollback also failed (%s)",
-                 esp_err_to_name(err), esp_err_to_name(rollback));
-        return rollback;
+
+    site_state_t state = {0};
+    if (deployment == NULL) {
+        /* Preserve the authoritative deployment flag/value. A missing blob may
+         * use legacy keys; a corrupt blob with no readable legacy tuple fails
+         * closed rather than silently dropping an unknown deployment tag. */
+        esp_err_t err = site_state_for_update(&state);
+        if (err != ESP_OK) return err;
+    } else {
+        strcpy(state.deployment, deployment);
+        state.has_deployment = true;
     }
-    return err;
+    state.lat = lat;
+    state.lon = lon;
+    state.has_lat = true;
+    state.has_lon = true;
+    return site_state_write(&state);
 }
 
 esp_err_t device_config_set_timezone(const char *val)

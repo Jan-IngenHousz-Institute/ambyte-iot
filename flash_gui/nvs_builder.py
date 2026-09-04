@@ -14,7 +14,8 @@ verification.
 Field map mirrors tools/build_nvs_image.py in the firmware repo. Namespaces:
   device_cfg  mqtt_uri, mqtt_client_id, mqtt_topic_root, cmd_topic,
               status_topic, device_id, protocol_id, device_name, device_ver,
-              device_firm, firmware_ver, timezone, flash_time (u32)
+              device_firm, firmware_ver, timezone, site_state (atomic blob),
+              flash_time (u32)
   certs       ca_cert, dev_cert, dev_key          (PEM strings, ≤2048 B each)
   wifi_creds  ssid, pass
   wifi_prov   provisioned (u8 = 1)
@@ -28,7 +29,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import math
-import struct
 import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass
@@ -36,6 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .config import NVS_PARTITION_SIZE
+from tools.site_state_blob import encode_site_state
 
 VENDOR_GEN = Path(__file__).resolve().parent / "vendor" / "nvs_partition_gen.py"
 
@@ -177,9 +178,6 @@ def build_nvs_csv(plan: ProvisioningPlan, flash_time: int | None = None) -> str:
     def u(key: str, enc: str, value: str) -> None:
         lines.append(f"{key},data,{enc},{value}")
 
-    def d(key: str, value: float) -> None:
-        lines.append(f"{key},data,hex2bin,{struct.pack('<d', value).hex()}")
-
     ns("device_cfg")
     s("mqtt_uri", plan.mqtt_uri)
     s("mqtt_client_id", plan.client_id)
@@ -191,12 +189,11 @@ def build_nvs_csv(plan: ProvisioningPlan, flash_time: int | None = None) -> str:
     s("device_firm", plan.device_firmware)
     s("firmware_ver", plan.firmware_version)
     s("timezone", plan.timezone)
-    if plan.lat is not None:
-        d("lat", plan.lat)
-    if plan.lon is not None:
-        d("lon", plan.lon)
-    if plan.deployment is not None:
-        s("deployment", plan.deployment)
+    if (plan.lat is not None or plan.lon is not None
+            or plan.deployment is not None):
+        u("site_state", "hex2bin", encode_site_state(
+            plan.lat, plan.lon, plan.deployment
+        ).hex())
     if plan.command_topic:
         s("cmd_topic", plan.command_topic)
     if plan.status_topic:

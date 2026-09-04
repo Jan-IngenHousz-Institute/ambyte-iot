@@ -408,15 +408,17 @@ def test_nvs_csv_structure():
 
 
 def test_nvs_csv_optional_site_metadata():
-    import struct
-
     csv = build_nvs_csv(
         make_plan(lat=52.173, lon=5.819, deployment="greenhouse-a"),
         flash_time=1786000000,
     )
-    assert f"lat,data,hex2bin,{struct.pack('<d', 52.173).hex()}" in csv
-    assert f"lon,data,hex2bin,{struct.pack('<d', 5.819).hex()}" in csv
-    assert 'deployment,data,string,"greenhouse-a"' in csv
+    from tools.site_state_blob import encode_site_state
+
+    expected = encode_site_state(52.173, 5.819, "greenhouse-a").hex()
+    assert f"site_state,data,hex2bin,{expected}" in csv
+    assert "lat,data," not in csv
+    assert "lon,data," not in csv
+    assert "deployment,data," not in csv
 
 
 def test_nvs_csv_rejects_oversized_deployment():

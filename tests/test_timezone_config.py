@@ -15,11 +15,12 @@ import os
 from pathlib import Path
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from tools.site_state_blob import decode_site_state, encode_site_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,17 +117,14 @@ class TimezoneProvisioningTest(unittest.TestCase):
             values = BUILD_NVS._collect_values(
                 lat=52.173, lon=5.819, deployment="greenhouse-a"
             )
+            encoded = values[("device_cfg", "site_state")]
+            self.assertEqual(encoded, (
+                "hex2bin",
+                encode_site_state(52.173, 5.819, "greenhouse-a").hex(),
+            ))
             self.assertEqual(
-                values[("device_cfg", "lat")],
-                ("hex2bin", struct.pack("<d", 52.173).hex()),
-            )
-            self.assertEqual(
-                values[("device_cfg", "lon")],
-                ("hex2bin", struct.pack("<d", 5.819).hex()),
-            )
-            self.assertEqual(
-                values[("device_cfg", "deployment")],
-                ("string", "greenhouse-a"),
+                decode_site_state(bytes.fromhex(encoded[1])).deployment,
+                "greenhouse-a",
             )
         finally:
             BUILD_NVS._read_pem = original_read_pem

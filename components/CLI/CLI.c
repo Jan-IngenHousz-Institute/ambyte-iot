@@ -1347,8 +1347,11 @@ static int cli_cmd_sync(int argc, char **argv)
             time_sync_set_location(lat, lon, tz);
         }
         double lat, lon; int tz;
+        char deployment[64] = "";
         time_sync_get_location(&lat, &lon, &tz);
-        printf("loc: lat=%.4f lon=%.4f tz=%+d\r\n", lat, lon, tz);
+        (void)device_config_get_deployment(deployment, sizeof(deployment));
+        printf("loc: lat=%.4f lon=%.4f tz=%+d deployment=%s\r\n",
+               lat, lon, tz, deployment[0] ? deployment : "-");
         return 0;
     }
 

@@ -133,7 +133,7 @@ class StagingPathTest(unittest.TestCase):
 
 class IdentityReportTest(unittest.TestCase):
     def test_script_status_keeps_fleet_identity_names_and_adds_source(self):
-        report = SCRIPT_UPDATE.split("static void report_script(", 1)[1]
+        report = SCRIPT_UPDATE.split("static void report_script_impl(", 1)[1]
         report = report.split("\n}\n", 1)[0]
         for field in (
             "script_sha256",
@@ -151,6 +151,16 @@ class IdentityReportTest(unittest.TestCase):
             "embedded_fallback",
         ):
             self.assertIn(f'"{source}"', report)
+
+    def test_installed_source_override_is_explicitly_post_swap_only(self):
+        self.assertNotIn('strcmp(state, "applied")', SCRIPT_UPDATE)
+        self.assertEqual(
+            SCRIPT_UPDATE.count('report_script_installed("applied"'),
+            3,
+        )
+        dedupe = SCRIPT_UPDATE.split("static void script_run(", 1)[1]
+        dedupe = dedupe.split("if (already_applied", 1)[0]
+        self.assertIn('report_script("applied"', dedupe)
 
 
 class ConsoleCommandsTest(unittest.TestCase):

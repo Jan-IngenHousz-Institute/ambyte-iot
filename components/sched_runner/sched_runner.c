@@ -238,8 +238,8 @@ static void compile_embedded_or_die(void)
 static void apply_location_from_config(void)
 {
     double lat, lon;
-    if (device_config_get_lat(&lat) == ESP_OK &&
-        device_config_get_lon(&lon) == ESP_OK) {
+    if (device_config_get_location(&lat, &lon, s_act_ctx.deployment,
+                                   sizeof(s_act_ctx.deployment)) == ESP_OK) {
         int tz;
         time_sync_get_location(NULL, NULL, &tz); /* keep the configured tz */
         time_sync_set_location(lat, lon, tz);
@@ -251,8 +251,6 @@ static void apply_location_from_config(void)
                       "compiled default (52.173N 5.819E)");
         s_loc_warned = true;
     }
-    (void)device_config_get_deployment(s_act_ctx.deployment,
-                                       sizeof(s_act_ctx.deployment));
 }
 
 /* Copy the CLI-visible due-model state out of s_due. Runner task only. */

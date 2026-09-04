@@ -47,6 +47,11 @@ Set site facts through one of three supported paths:
   `{"type":"set_location","id":"site-a","lat":52.173,"lon":5.819,"deployment":"greenhouse-a"}`.
   The `set_location_result` reply echoes the persisted deployment tag.
 
+All three paths write one fixed, versioned `device_cfg/site_state` NVS blob, so
+latitude, longitude, and deployment cross a power loss as one tuple. Firmware
+still reads the former individual keys as a read-only compatibility fallback
+for already-provisioned devices; the next explicit site write migrates them.
+
 ## YAML subset
 
 The device accepts block and flow mappings and sequences, comments, quoted or

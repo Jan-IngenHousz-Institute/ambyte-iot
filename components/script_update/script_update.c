@@ -151,7 +151,8 @@ static void publish_json(const char *msg, int n)
     }
 }
 
-static void report_script(const char *state, const char *id, const char *detail)
+static void report_script_impl(const char *state, const char *id,
+                               const char *detail, bool installed_after_swap)
 {
     char esc_id[SCRIPT_ID_MAX * 2 + 1] = "", esc_detail[192] = "";
     char esc_sha[129] = "", esc_ver[65] = "", esc_built[65] = "", esc_installed[65] = "";
@@ -161,11 +162,11 @@ static void report_script(const char *state, const char *id, const char *detail)
     const esp_app_desc_t *app = esp_app_get_description();
     sched_source_t source = {0};
     sched_runner_source(&source);
-    /* A rebooting install reports after the runner has stopped but after the
-     * validated file has been swapped. Its stale in-memory source describes
-     * the previous program, so report the installed source that will load on
-     * reboot. Other states keep the runner's current source for diagnosis. */
-    if (strcmp(state, "applied") == 0 && !sched_runner_is_running()) {
+    /* Rebooting installs report after a validated file swap while the runner's
+     * in-memory source still names the previous program. Only those explicit
+     * call sites override it: a checksum-less id-only dedupe may also report
+     * `applied` while stopped, but has not verified any installed file. */
+    if (installed_after_swap) {
         source.kind = SCHED_SOURCE_INSTALLED;
     }
     static const char *const source_names[] = {
@@ -191,6 +192,17 @@ static void report_script(const char *state, const char *id, const char *detail)
         source_names[source.kind <= SCHED_SOURCE_EMBEDDED_FALLBACK ? source.kind : 0],
         detail ? ",\"detail\":\"" : "", esc_detail, detail ? "\"" : "");
     if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
+}
+
+static void report_script(const char *state, const char *id, const char *detail)
+{
+    report_script_impl(state, id, detail, false);
+}
+
+static void report_script_installed(const char *state, const char *id,
+                                    const char *detail)
+{
+    report_script_impl(state, id, detail, true);
 }
 
 /* Keep the maintenance gate/worker reserved during the stable per-device slot.
@@ -588,7 +600,7 @@ static void do_update_impl(const script_req_t *r)
         ESP_LOGW(TAG, "schedule.yaml replaced (%u bytes); previous kept as %s — rebooting to run it",
                  (unsigned)len, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)len);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
         esp_restart();                                       /* no return */
     }
@@ -723,7 +735,7 @@ static void do_update_url_impl(const script_req_t *r)
         ESP_LOGW(TAG, "schedule.yaml replaced from url (%u bytes); previous kept as %s — rebooting to run it",
                  (unsigned)n, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
         esp_restart();                                       /* no return */
     }
@@ -790,7 +802,7 @@ static void do_update_local_impl(const script_req_t *r)
         ESP_LOGW(TAG, "schedule.yaml replaced from serial push (%u bytes); previous kept as %s, rebooting to run it",
                  (unsigned)n, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
         esp_restart();                                       /* no return */
     }
