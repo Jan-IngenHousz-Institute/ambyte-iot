@@ -7,5 +7,5 @@ endif()
 idf_component_register(
     SRCS ${bench_diag_srcs}
     INCLUDE_DIRS "include"
-    REQUIRES esp_wifi lwip
+    REQUIRES console device_commands esp_timer esp_wifi lwip
 )

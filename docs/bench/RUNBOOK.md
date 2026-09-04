@@ -13,30 +13,29 @@ broker. Do not use a production device identity against a shared broker.
    git submodule update --init --recursive components/littlefs
    ```
 
-2. Put the accelerated script at the root of the unit's SD card, named exactly
-   `main.lua`:
-
-   ```sh
-   cp docs/bench/main_bench.lua /path/to/mounted-sd/main.lua
-   ```
-
-   Eject the card cleanly, insert it in the powered-off unit, then power the unit.
-   Existing `/sdcard/events` data changes the starting point and time-to-drain;
-   archive and clear it before the first run if it is not part of the test.
-
-3. Build, flash, and monitor the instrumented baseline:
+2. Build, flash, and monitor the instrumented baseline:
 
    ```sh
    pio run -e bench -t upload
    pio device monitor -b 115200
    ```
 
-4. Confirm these boot/runtime markers before timing a run:
+3. Confirm these boot/runtime markers before timing a run:
 
    - `BENCH diagnostics enabled: interval=60s`
-   - `BENCH repro started rate=10/s`
    - `BENCH sample begin` once per minute
    - MQTT connects and PUBACK progress begins
+
+4. Start the finite flood from the console. This example produces the historical
+   ~1.2 KiB payload at 10/s for enough time to cross 150,000 messages:
+
+   ```text
+   bench_flood 10 1200 16000
+   ```
+
+   The command is compiled only in the four `bench*` environments. Accepted
+   ranges are 1–100 Hz, 32–60000 payload bytes, and 1–604800 seconds. Run only
+   one flood at a time.
 
 Keep the serial monitor captured to a file. The firmware SD logger retains the
 WARN summary lines under `/sdcard/logs/`, but the full raw `stats_display()` and
@@ -63,8 +62,9 @@ serial log verbatim so the Wi-Fi lines remain available for comparison.
 
 ## Message count and expected failure
 
-`db.store_event` allocates one monotonic `measure_id` per event. The script logs
-progress every 100 successful stores. Use `last measure_id - first measure_id + 1`
+`bench_flood` allocates one monotonic `measure_id` per event through
+`cmd_store_event` and logs progress every 100 successful stores. Use
+`last measure_id - first measure_id + 1`
 for the generated message count; also record the publisher's acknowledged-id
 progress (STATUS `last_acked_id`, downstream data, or the relevant publish/PUBACK
 logs). Count the messages that actually reached the broker when assigning the
@@ -128,8 +128,8 @@ two reproductions show the same behavior.
 
 ## Count-correlation fallback
 
-If the 10/s run fails, edit only the first setting in `main_bench.lua` to
-`local RATE_HZ = 2`, replace `/sdcard/main.lua`, and repeat the baseline twice.
+If the 10/s run fails, repeat the baseline twice with
+`bench_flood 2 1200 80000`.
 At 2/s, 150,000 messages take about 20.8 hours instead of about 4.2 hours. Failure
 near the same published-message count supports traffic/work correlation; failure
 after similar wall time instead supports a time/uptime mechanism. If 10/s cannot
