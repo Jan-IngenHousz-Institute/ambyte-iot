@@ -1,0 +1,54 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j0:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j1:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j2:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j3:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j4:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j5:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j6:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j7:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j8:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j9:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j10:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j11:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j12:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j13:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j14:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j15:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]
+  j16:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]

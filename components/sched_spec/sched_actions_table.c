@@ -142,8 +142,12 @@ static void jw(jw_t *w, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(w->buf + (w->len < w->cap ? w->len : w->cap),
-                      w->len < w->cap ? w->cap - w->len : 0, fmt, ap);
+    /* NULL/0 probe-safe: vsnprintf(NULL, 0) just counts (C99), so a caller
+     * can size the buffer with sched_actions_dump_json(NULL, 0) without any
+     * pointer arithmetic on NULL here */
+    char  *dst  = (w->buf != NULL && w->len < w->cap) ? w->buf + w->len : NULL;
+    size_t room = dst != NULL ? w->cap - w->len : 0;
+    int n = vsnprintf(dst, room, fmt, ap);
     va_end(ap);
     if (n > 0) w->len += (size_t)n;
 }
@@ -212,12 +216,18 @@ size_t sched_actions_dump_json(char *buf, size_t cap)
         }
         jw(&w, "},\"required\":[");
         bool first = true;
+        bool any_required = false;
         for (uint8_t i = 0; i < act->input_count; i++) {
             if (!act->inputs[i].required) continue;
             jw(&w, "%s\"%s\"", first ? "" : ",", act->inputs[i].name);
             first = false;
+            any_required = true;
         }
-        jw(&w, "],\"additionalProperties\":false}},\"required\":[\"uses\"]}");
+        /* when any input is required, the action object must require `with`
+         * itself — otherwise { "uses": "ambit/trace" } would pass the schema
+         * while the compiler rejects it (the table is source of truth) */
+        jw(&w, "],\"additionalProperties\":false}},\"required\":[\"uses\"%s]}",
+           any_required ? ",\"with\"" : "");
     }
     jw(&w, "]}");
     return w.len;

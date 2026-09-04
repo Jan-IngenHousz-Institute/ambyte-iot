@@ -1,0 +1,25 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+protocols:
+  P:
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+    - { pulses: 1, freq: 1000 }
+jobs:
+  j:
+    on: { every: 5m }
+    steps: [ { uses: device/log, with: { message: hi } } ]

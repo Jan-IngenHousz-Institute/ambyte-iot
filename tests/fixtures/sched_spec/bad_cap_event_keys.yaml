@@ -1,0 +1,10 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j:
+    on: { every: 5m }
+    steps:
+      - uses: db/store-event
+        with:
+          kind: e
+          data: { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1, d5: 1, d6: 1, d7: 1, d8: 1, d9: 1, d10: 1, d11: 1, d12: 1, d13: 1, d14: 1, d15: 1, d16: 1 }

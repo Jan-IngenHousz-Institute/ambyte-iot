@@ -134,12 +134,14 @@ static bool compile_header(ctx_t *c, const sched_node_t *root)
     for (int i = 0; i < (int)(sizeof(k_provenance) / sizeof(k_provenance[0])); i++) {
         const sched_node_t *v = map_get(root, k_provenance[i].key);
         if (v == NULL) continue; /* all provenance keys are optional */
-        const char *text = node_text(v);
-        if (text == NULL) {
+        /* string scalars only: .str is kept for every scalar kind, so a
+         * non-NULL node_text says nothing — id: 123 / version: true /
+         * workbookVersionId: 30m must not compile */
+        if (v->kind != SCHED_NODE_SCALAR || v->scal_kind != SCHED_SCAL_STR) {
             cerr(c, v, "header key '%s' must be a string", k_provenance[i].key);
             return false;
         }
-        *offs[i] = pool_add(c, v, text);
+        *offs[i] = pool_add(c, v, v->u.s.str);
         if (c->failed) return false;
     }
     /* gather the two body keys; reject everything else (strict) */
@@ -315,6 +317,27 @@ static const sched_protocol_t *find_protocol(const sched_program_t *p, const cha
     return NULL;
 }
 
+/* An ambit/trace step's protocol name (NULL if the required input is absent)
+ * and, when margin != NULL, its deadline_margin (default materialized by
+ * compile_with, so this normally just reads the entry). */
+static const char *trace_protocol(const sched_program_t *prog,
+                                  const sched_step_t *step, int64_t *margin)
+{
+    const char *pname = NULL;
+    if (margin != NULL) *margin = TRACE_MARGIN_DEFAULT_MS;
+    for (int e = 0; e < step->entry_count; e++) {
+        const sched_entry_t *en = &prog->entries[step->entry_start + e];
+        const char *iname = step->action->inputs[en->input_idx].name;
+        if (strcmp(iname, "protocol") == 0 && en->type == SCHED_VAL_STR) {
+            pname = sched_pool_str(prog, en->u.str_off);
+        }
+        if (margin != NULL && strcmp(iname, "deadline_margin") == 0) {
+            *margin = en->u.i;
+        }
+    }
+    return pname;
+}
+
 /* ── triggers ────────────────────────────────────────────────────────── */
 
 /* Signed duration: duration scalar, or a string "+30m"/"-15m"/"1h". */
@@ -358,6 +381,29 @@ static bool parse_signed_duration(ctx_t *c, const sched_node_t *n, int64_t *out_
     return false;
 }
 
+/* Exact clock grammar for quoted strings: 1–2 hour digits, ':', exactly 2
+ * minute digits, full consumption. Shared by at/weekly triggers and window
+ * edges — sscanf's %2d:%2d would accept partial matches like "1:2x".
+ * Mirrors the plain-scalar HHMM lexer in sched_yaml.c. */
+static bool parse_clock_str(const char *s, int *hh, int *mm)
+{
+    int i = 0, h, m;
+    if (s[0] < '0' || s[0] > '9') return false;
+    h = s[i++] - '0';
+    if (s[i] >= '0' && s[i] <= '9') h = h * 10 + (s[i++] - '0');
+    if (s[i] != ':') return false;
+    i++;
+    if (s[i] < '0' || s[i] > '9') return false;  /* minutes need both digits */
+    m = s[i++] - '0';
+    if (s[i] < '0' || s[i] > '9') return false;
+    m = m * 10 + (s[i++] - '0');
+    if (s[i] != '\0') return false;              /* suffix or second colon */
+    if (h > 23 || m > 59) return false;
+    *hh = h;
+    *mm = m;
+    return true;
+}
+
 /* HH:MM from an HHMM scalar or a quoted/plain string. */
 static bool parse_hhmm(ctx_t *c, const sched_node_t *n, int *hh, int *mm)
 {
@@ -366,14 +412,9 @@ static bool parse_hhmm(ctx_t *c, const sched_node_t *n, int *hh, int *mm)
         *mm = n->u.s.mm;
         return true;
     }
-    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_STR) {
-        int h = 0, m = 0;
-        if (sscanf(n->u.s.str, "%2d:%2d", &h, &m) == 2 &&
-            strlen(n->u.s.str) <= 5 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
-            *hh = h;
-            *mm = m;
-            return true;
-        }
+    if (n->kind == SCHED_NODE_SCALAR && n->scal_kind == SCHED_SCAL_STR &&
+        parse_clock_str(n->u.s.str, hh, mm)) {
+        return true;
     }
     cerr(c, n, "expected HH:MM");
     return false;
@@ -576,10 +617,9 @@ static bool parse_edge(ctx_t *c, const sched_node_t *n, sched_edge_t *e)
         cerr(c, n, "window edge must be HH:MM or sunrise|sunset[±dur]");
         return false;
     }
-    { /* a quoted "10:00" arrives as STR, not HHMM — accept it too */
+    { /* a quoted "10:00" arrives as STR, not HHMM — accept the exact grammar */
         int h = 0, m = 0;
-        if (sscanf(s, "%2d:%2d", &h, &m) == 2 &&
-            strlen(s) <= 5 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+        if (parse_clock_str(s, &h, &m)) {
             e->kind = SCHED_EDGE_CLOCK;
             e->hh = (uint8_t)h;
             e->mm = (uint8_t)m;
@@ -1108,6 +1148,21 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
         job->step_count++;
     }
 
+    /* Protocol references: resolve every ambit/trace step's protocol here,
+     * once, regardless of trigger kind — a boot/cron/sun trace referencing a
+     * missing protocol must not reach runtime. The duration-vs-period check
+     * below then runs only for every triggers. */
+    for (int si = 0; si < job->step_count; si++) {
+        const sched_step_t *step = &job->steps[si];
+        if (strcmp(step->action->name, "ambit/trace") != 0) continue;
+        const char *pname = trace_protocol(c->prog, step, NULL);
+        if (pname == NULL) continue; /* required-input check already ran */
+        if (find_protocol(c->prog, pname) == NULL) {
+            cerr(c, node, "job '%s' references unknown protocol '%s'", name, pname);
+            return false;
+        }
+    }
+
     /* duration vs period (the critique's highest-value check: the 59-pulse
      * SS on a 1 m grid would have been caught by this) */
     for (int ti = 0; ti < job->trigger_count; ti++) {
@@ -1117,22 +1172,10 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
         for (int si = 0; si < job->step_count; si++) {
             const sched_step_t *step = &job->steps[si];
             if (strcmp(step->action->name, "ambit/trace") != 0) continue;
-            const char *pname = NULL;
             int64_t margin = TRACE_MARGIN_DEFAULT_MS;
-            for (int e = 0; e < step->entry_count; e++) {
-                const sched_entry_t *en = &c->prog->entries[step->entry_start + e];
-                const char *iname = step->action->inputs[en->input_idx].name;
-                if (strcmp(iname, "protocol") == 0 && en->type == SCHED_VAL_STR) {
-                    pname = sched_pool_str(c->prog, en->u.str_off);
-                }
-                if (strcmp(iname, "deadline_margin") == 0) margin = en->u.i;
-            }
+            const char *pname = trace_protocol(c->prog, step, &margin);
             if (pname == NULL) continue; /* required-input check already ran */
             const sched_protocol_t *proto = find_protocol(c->prog, pname);
-            if (proto == NULL) {
-                cerr(c, node, "job '%s' references unknown protocol '%s'", name, pname);
-                return false;
-            }
             /* Pulse-train time + deadline margin vs the grid period. The
              * check exists to catch a protocol whose worst case cannot fit
              * its grid, and the worst case is bounded by the deadline

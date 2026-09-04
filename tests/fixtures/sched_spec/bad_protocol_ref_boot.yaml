@@ -1,0 +1,6 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j:
+    on: [ boot ]
+    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]

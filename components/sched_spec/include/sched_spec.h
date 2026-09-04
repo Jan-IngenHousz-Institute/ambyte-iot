@@ -161,7 +161,9 @@ esp_err_t sched_action_bind(const char *name, void *run_ctx,
                                              const struct sched_program *prog));
 
 /* JSON Schema draft-07 fragment set: one oneOf branch per action. Returns the
- * would-be length (snprintf semantics); truncation ⇒ return ≥ cap. */
+ * would-be length (snprintf semantics); truncation ⇒ return ≥ cap.
+ * Size probe: buf may be NULL with cap == 0 — nothing is written, the return
+ * is the required length (without NUL). */
 size_t sched_actions_dump_json(char *buf, size_t cap);
 
 /* db/store-event value placeholders resolved on device (design catalog row). */

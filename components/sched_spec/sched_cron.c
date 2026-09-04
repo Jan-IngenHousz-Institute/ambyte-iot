@@ -177,11 +177,6 @@ have_range:
 esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
                            char *err, size_t err_cap)
 {
-    static const char *const k_months[12] = {
-        "jan", "feb", "mar", "apr", "may", "jun",
-        "jul", "aug", "sep", "oct", "nov", "dec",
-    };
-    /* note: full names accepted too; these are the prefixes */
     static const char *const k_months_full[12] = {
         "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
@@ -189,40 +184,97 @@ esp_err_t sched_cron_parse(const char *expr, sched_cron_t *out,
     static const char *const k_dow[7] = {
         "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
     };
-    (void)k_months;
     if (expr == NULL || out == NULL) {
         cerr(err, err_cap, "cron: NULL expression");
         return ESP_ERR_INVALID_ARG;
     }
-    /* reject the vixie extensions up front so the error names the cause */
-    for (const char *q = expr; *q != '\0'; q++) {
-        if (*q == 'L' || *q == 'W' || *q == '#' || *q == '@') {
-            cerr(err, err_cap, "cron: L/W/#/@ extensions are not supported");
-            return ESP_FAIL;
+    memset(out, 0, sizeof(*out));
+
+    /* exactly five whitespace-separated fields: "*****" is not cron */
+    const char *f[5];
+    size_t flen[5];
+    int nf = 0;
+    size_t i = 0, len = strlen(expr);
+    while (i < len) {
+        while (i < len && (expr[i] == ' ' || expr[i] == '\t')) i++;
+        if (i >= len) break;
+        if (nf == 5) { nf++; break; } /* a 6th field: mark overflow */
+        f[nf] = expr + i;
+        size_t st = i;
+        while (i < len && expr[i] != ' ' && expr[i] != '\t') i++;
+        flen[nf] = i - st;
+        nf++;
+    }
+    if (nf != 5) {
+        cerr(err, err_cap, "cron: expected exactly 5 whitespace-separated "
+             "fields (min hour dom month dow)");
+        return ESP_FAIL;
+    }
+
+    /* Reject the vixie extensions where they appear as field syntax, without
+     * misfiring on case-insensitive names (JUL, WED): a list piece that is
+     * all letters (a range like mon-fri keeps its hyphen) and long enough to
+     * be a name is left for the field parser; anything else carrying an
+     * L/W/#/@ is the extension syntax, which we do not support. */
+    for (int k = 0; k < 5; k++) {
+        size_t p0 = 0;
+        for (size_t j = 0; j <= flen[k]; j++) {
+            if (j < flen[k] && f[k][j] != ',') continue;
+            size_t plen = j - p0;
+            bool nameish = plen > 0;
+            bool has_lw = false;
+            for (size_t q = p0; q < j; q++) {
+                char ch = f[k][q];
+                if (ch == '#' || ch == '@') {
+                    cerr(err, err_cap, "cron: L/W/#/@ extensions are not supported");
+                    return ESP_FAIL;
+                }
+                if (ch == 'L' || ch == 'l' || ch == 'W' || ch == 'w') has_lw = true;
+                bool letter = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+                if (!letter && ch != '-') nameish = false;
+            }
+            if (has_lw && !(nameish && plen >= 3)) {
+                cerr(err, err_cap, "cron: L/W/#/@ extensions are not supported");
+                return ESP_FAIL;
+            }
+            p0 = j + 1;
         }
     }
-    memset(out, 0, sizeof(*out));
-    pcur_t c = { expr, strlen(expr), 0 };
-    uint64_t bits;
-    bool restricted;
 
-    if (!parse_field(&c, 0, 59, NULL, 0, 0, &bits, &restricted, err, err_cap, "minute")) return ESP_FAIL;
-    out->min = bits;
-    if (!parse_field(&c, 0, 23, NULL, 0, 0, &bits, &restricted, err, err_cap, "hour")) return ESP_FAIL;
-    out->hour = (uint32_t)bits;
-    if (!parse_field(&c, 1, 31, NULL, 0, 0, &bits, &restricted, err, err_cap, "day-of-month")) return ESP_FAIL;
-    out->dom = (uint32_t)bits;
-    out->dom_restricted = restricted ? 1 : 0;
-    if (!parse_field(&c, 1, 12, k_months_full, 12, 1, &bits, &restricted, err, err_cap, "month")) return ESP_FAIL;
-    out->month = (uint16_t)bits;
-    if (!parse_field(&c, 0, 7, k_dow, 7, 0, &bits, &restricted, err, err_cap, "day-of-week")) return ESP_FAIL;
-    out->dow = (uint8_t)bits;
-    out->dow_restricted = restricted ? 1 : 0;
-
-    pskip(&c);
-    if (c.pos != c.len) {
-        cerr(err, err_cap, "cron: trailing content after day-of-week field");
-        return ESP_FAIL;
+    static const struct {
+        int vmin, vmax, name_base;
+        const char *const *names;
+        int n_names;
+        const char *field;
+    } k_fields[5] = {
+        { 0, 59, 0, NULL, 0, "minute" },
+        { 0, 23, 0, NULL, 0, "hour" },
+        { 1, 31, 0, NULL, 0, "day-of-month" },
+        { 1, 12, 1, k_months_full, 12, "month" },
+        { 0, 7, 0, k_dow, 7, "day-of-week" },
+    };
+    for (int k = 0; k < 5; k++) {
+        pcur_t c = { f[k], flen[k], 0 };
+        uint64_t bits;
+        bool restricted;
+        if (!parse_field(&c, k_fields[k].vmin, k_fields[k].vmax,
+                         k_fields[k].names, k_fields[k].n_names,
+                         k_fields[k].name_base, &bits, &restricted,
+                         err, err_cap, k_fields[k].field)) {
+            return ESP_FAIL;
+        }
+        if (c.pos != c.len) {
+            cerr(err, err_cap, "cron: unexpected character in %s field",
+                 k_fields[k].field);
+            return ESP_FAIL;
+        }
+        switch (k) {
+        case 0: out->min = bits; break;
+        case 1: out->hour = (uint32_t)bits; break;
+        case 2: out->dom = (uint32_t)bits; out->dom_restricted = restricted ? 1 : 0; break;
+        case 3: out->month = (uint16_t)bits; break;
+        default: out->dow = (uint8_t)bits; out->dow_restricted = restricted ? 1 : 0; break;
+        }
     }
     return ESP_OK;
 }

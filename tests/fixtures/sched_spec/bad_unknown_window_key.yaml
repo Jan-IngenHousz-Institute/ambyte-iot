@@ -1,0 +1,7 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j:
+    on: { every: 5m }
+    when: { window: { from: "10:00", til: "11:00" } }
+    steps: [ { uses: device/log, with: { message: hi } } ]

@@ -11,8 +11,11 @@
  *   otherwise (plan: "600 s default"). Older slots are missed.
  * - missed: skip counts the slot(s) in job->skipped and drops them, never a
  *   replay burst; missed: run-once fires a single make-up run (the old
- *   catch_up_once). Slots whose due time fell while the gate was closed
- *   advance silently — they were never runnable, so they are not "missed".
+ *   catch_up_once). Only slots whose gate was OPEN at their due time count
+ *   or trigger the make-up — the gate is evaluated per occurrence, since a
+ *   clock or sun window can open and close many times inside one stale
+ *   interval. Slots whose due time fell while the gate was closed advance
+ *   silently — they were never runnable, so they are not "missed".
  * - overlap (skip / queue-one / reject) governs execution while a job is
  *   still running; execution belongs to the runner (T3). The model hands out
  *   at most one firing per job per poll.
@@ -84,29 +87,31 @@ static bool gate_open_at(const sched_job_t *job, int64_t local)
     }
 }
 
-/* Count occurrences of t in [D, limit] and return the first due > limit. */
-static int64_t skip_forward(const sched_trigger_t *t, int64_t D, int64_t limit,
-                            uint32_t *count)
+/* Walk occurrences of t from D up to limit (inclusive), gate-checking each
+ * one: only slots whose gate was open at their due time are runnable — they
+ * count into *count and set *any_open. A gate can flip many times inside
+ * one stale interval, so coalescing arithmetically from the first slot's
+ * gate state would miscount (review T2-2: a 10 m grid behind a daily
+ * 10:00–11:00 window reported 155 skipped where 11 were runnable). Returns
+ * the first due > limit. Bounded by SKIP_COUNT_CAP per call; the caller
+ * re-loops, so total work stays linear in stale slots, each iteration a
+ * cheap window check. */
+static int64_t walk_missed(const sched_trigger_t *t, const sched_job_t *job,
+                           int64_t D, int64_t limit,
+                           uint32_t *count, bool *any_open)
 {
-    uint32_t n = 0;
-    if (t->kind == SCHED_TRIG_EVERY) {
-        /* arithmetic: grid indices floor((x*1000 - phase)/period) */
-        int64_t period = t->u.every.period_ms;
-        int64_t phase  = t->u.every.phase_ms;
-        int64_t i0 = (D * 1000 - phase) / period;
-        int64_t i1 = (limit * 1000 - phase) / period;
-        n = (uint32_t)(i1 - i0 + 1);
-        *count += n;
-        return next_trigger_due(t, limit);
-    }
+    uint32_t iter = 0;
     int64_t cur = D;
-    while (cur >= 0 && cur <= limit && n < SKIP_COUNT_CAP) {
-        n++;
+    while (cur >= 0 && cur <= limit && iter < SKIP_COUNT_CAP) {
+        iter++;
+        if (gate_open_at(job, cur)) {
+            (*count)++;
+            *any_open = true;
+        }
         int64_t next = next_trigger_due(t, cur);
         if (next <= cur) break; /* defensive: dues must advance */
         cur = next;
     }
-    *count += n;
     return cur;
 }
 
@@ -164,21 +169,19 @@ uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc)
                                 : LATE_GRACE_DEFAULT_S;
             while (D >= 0 && D <= L) {
                 if (L - D > grace) {
-                    /* missed slot(s): only count/fire when the slot was
-                     * runnable (gate open at its due time); otherwise advance
-                     * silently. skip_forward lands on the first due past the
-                     * grace horizon, which may still be ≤ L and fireable —
-                     * re-loop instead of dropping it. */
-                    if (gate_open_at(job, D)) {
-                        if (job->missed == SCHED_MISSED_RUN_ONCE) {
-                            fired = true;
-                            D = next_trigger_due(tr, L);
-                            break;
-                        }
-                        D = skip_forward(tr, D, L - grace, &dj->skipped);
+                    /* stale slot(s): walk each occurrence up to the grace
+                     * horizon and gate-check it. skip: runnable slots count
+                     * into job->skipped. run-once: a single make-up fire iff
+                     * at least one missed slot was runnable. The walk lands
+                     * on the first due past the horizon, which may still be
+                     * ≤ L and fireable — re-loop instead of dropping it. */
+                    uint32_t n = 0;
+                    bool any_open = false;
+                    D = walk_missed(tr, job, D, L - grace, &n, &any_open);
+                    if (job->missed == SCHED_MISSED_RUN_ONCE) {
+                        if (any_open) fired = true;
                     } else {
-                        uint32_t sink = 0;
-                        D = skip_forward(tr, D, L - grace, &sink);
+                        dj->skipped += n;
                     }
                     continue;
                 }

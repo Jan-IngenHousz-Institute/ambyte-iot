@@ -117,6 +117,18 @@ class SchedSpecTest(unittest.TestCase):
                 self.assertNotIn("channels", required, uses)
             if uses == "ambit/trace":
                 self.assertEqual(required, ["protocol"])
+        # an action with required inputs must require the outer `with`,
+        # otherwise { uses: ambit/trace } would pass the schema while the
+        # compiler rejects it (review): trace/actinic/log/sleep vs the rest
+        with_required = {"ambit/trace", "ambit/actinic", "device/log", "device/sleep"}
+        for branch in schema["oneOf"]:
+            uses = branch["properties"]["uses"]["const"]
+            outer_required = branch["required"]
+            self.assertIn("uses", outer_required, uses)
+            if uses in with_required:
+                self.assertIn("with", outer_required, uses)
+            else:
+                self.assertNotIn("with", outer_required, uses)
 
     def test_simulate_summer(self) -> None:
         result = self.run_cli(

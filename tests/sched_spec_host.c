@@ -193,6 +193,71 @@ static void test_parser_rejections(void)
     /* depth > 6 */
     PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f:\n            g: 1\n",
               "nesting deeper");
+    /* mixed block/flow (review T2-4): the flow collection on a key's own
+     * line shares the key's depth; further flow nesting counts +1 each */
+    CHECK(parse_only_ok("a:\n  b:\n    c:\n      d:\n        e:\n          f: [0]\n"));
+    PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f: [[0]]\n",
+              "nesting deeper");
+    /* the review's depth-11 document */
+    PARSE_ERR("a:\n  b:\n    c:\n      d:\n        e:\n          f: [[[[[0]]]]]\n",
+              "nesting deeper");
+
+    /* int64 / duration magnitude is checked BEFORE any multiply (review
+     * T2-1: "999999999999999999h" was signed-overflow UB) */
+    PARSE_ERR("a: 999999999999999999h\n", "duration out of range");
+    /* digits alone overflow int64 before the unit is even seen: the
+     * documented "integer out of range" verdict for 19-digit shapes */
+    PARSE_ERR("a: 9999999999999999999s\n", "integer out of range");
+    PARSE_ERR("a: 9223372036854775807s\n", "duration out of range");
+    PARSE_ERR("a: 2562047788016h\n", "duration out of range"); /* MAX/3.6e6 + 1 */
+    CHECK(parse_only_ok("a: 2562047788015h\n"));             /* exact max hours */
+    CHECK(parse_only_ok("a: 9223372036854775807ms\n"));
+    /* numeric-shaped but beyond int64: an error, never a silent string */
+    PARSE_ERR("a: 9223372036854775808\n", "integer out of range");  /* INT64_MAX + 1 */
+    PARSE_ERR("a: 9999999999999999999\n", "integer out of range");  /* 19 digits */
+    PARSE_ERR("a: -9223372036854775809\n", "integer out of range");
+    /* boundary: INT64_MAX itself parses */
+    {
+        sched_yaml_doc_t *dmax = NULL;
+        char emax[128];
+        const char *ymax = "a: 9223372036854775807\n";
+        CHECK(sched_yaml_parse(ymax, strlen(ymax), &dmax, emax, sizeof(emax)) == ESP_OK);
+        const sched_node_t *rmax = sched_yaml_root(dmax);
+        CHECK(rmax != NULL && rmax->u.m.pairs[0].value->scal_kind == SCHED_SCAL_INT &&
+              rmax->u.m.pairs[0].value->u.s.i == INT64_MAX);
+        sched_yaml_free(dmax);
+    }
+
+    /* quoted-scalar grammar (review): unterminated quotes are errors even in
+     * block sequence items; the only escape is \" */
+    PARSE_ERR("a: \"unterminated\n", "unterminated quoted string");
+    PARSE_ERR("a: 'unterminated\n", "unterminated quoted string");
+    PARSE_ERR("a:\n  - \"unterminated\n", "unterminated quoted string");
+    PARSE_ERR("a: \"bad \\n escape\"\n", "unsupported escape");
+    PARSE_ERR("a: \"bad \\\\ escape\"\n", "unsupported escape");
+    PARSE_ERR("a: \"bad \\u1234 escape\"\n", "unsupported escape");
+
+    /* string pool exact boundary: key "a" costs 2, each quoted item costs
+     * len + 1 — land the total on 8192 exactly, then one byte over */
+    {
+        char *y = malloc(16 + 82 * 120);
+        char item[120];
+        strcpy(y, "a:\n");
+        for (int i = 0; i < 81; i++) {           /* 81 × 101 = 8181 */
+            snprintf(item, sizeof(item), "  - '%.100d'\n", i);
+            strcat(y, item);
+        }
+        strcat(y, "  - '12345678'\n");           /* + 9 → 8192 exactly */
+        CHECK(parse_only_ok(y));
+        strcpy(y, "a:\n");
+        for (int i = 0; i < 81; i++) {
+            snprintf(item, sizeof(item), "  - '%.100d'\n", i);
+            strcat(y, item);
+        }
+        strcat(y, "  - '123456789'\n");          /* + 10 → 8193: over */
+        PARSE_ERR(y, "string pool limit");
+        free(y);
+    }
 }
 
 /* ── compiler: beyond the on-disk fixtures ───────────────────────────── */
@@ -363,6 +428,83 @@ static void test_compiler_rules(void)
         "    steps: [ { uses: ambit/trace, with: { protocol: SS, channels: [0] } } ]\n");
     CHECK(p != NULL);
     free(p);
+
+    /* review T2-3: protocol references resolve for EVERY trigger kind,
+     * not only inside the every-trigger duration check */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: [ boot ]\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { cron: \"0 9 * * *\" }\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { sun: sunset }\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { at: \"08:00\" }\n"
+                "    steps: [ { uses: ambit/trace, with: { protocol: NOPE } } ]\n",
+                "unknown protocol");
+
+    /* header provenance keys are string scalars only (review): 123 / true /
+     * 30m keep .str set for every scalar kind, so node_text proves nothing */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nid: 123\njobs:\n  j:\n"
+                "    on: { every: 5m }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "'id' must be a string");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nversion: true\njobs:\n  j:\n"
+                "    on: { every: 5m }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "'version' must be a string");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\nworkbookVersionId: 30m\njobs:\n  j:\n"
+                "    on: { every: 5m }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "'workbookVersionId' must be a string");
+    /* and string provenance is carried through */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "id: urn:jii:schedule:default-multichannel\n"
+        "version: 0.1.0-draft\n"
+        "workbookVersionId: 7b281a2e-d86a-4cc6-8268-81b67315f1ad\n"
+        "jobs:\n  j:\n    on: { every: 5m }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+    CHECK(p != NULL);
+    if (p != NULL) {
+        const char *id = sched_pool_str(p, p->id_off);
+        const char *ver = sched_pool_str(p, p->version_off);
+        const char *wbv = sched_pool_str(p, p->workbook_version_id_off);
+        CHECK(id != NULL && strcmp(id, "urn:jii:schedule:default-multichannel") == 0);
+        CHECK(ver != NULL && strcmp(ver, "0.1.0-draft") == 0);
+        CHECK(wbv != NULL && strcmp(wbv, "7b281a2e-d86a-4cc6-8268-81b67315f1ad") == 0);
+        free(p);
+    }
+
+    /* strict quoted HH:MM (review): partial matches and extra fields reject */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { at: \"1:2x\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "expected HH:MM");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { at: \"1:2\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "expected HH:MM");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: { at: \"10:00:00\" }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "expected HH:MM");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                "    on: [ boot ]\n"
+                "    when: { window: { from: \"9:5x\", to: sunset } }\n"
+                "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+                "window edge");
+    /* sane quoted clocks still compile */
+    p = COMPILE_OK("schema: jii.ambyte-schedule/v1-draft\njobs:\n  j:\n"
+                   "    on: [ { at: \"08:00\" }, { at: \"8:05\" } ]\n"
+                   "    steps: [ { uses: device/log, with: { message: hi } } ]\n");
+    CHECK(p != NULL);
+    free(p);
 }
 
 /* ── cron ────────────────────────────────────────────────────────────── */
@@ -415,6 +557,18 @@ static void test_cron_basics(void)
     CHECK(sched_cron_parse("0 0 * * * extra", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0 25 * * *", &c, err, sizeof(err)) == ESP_FAIL);
     CHECK(sched_cron_parse("0/0 * * * *", &c, err, sizeof(err)) == ESP_FAIL);
+
+    /* review: "*****" without separators is not cron … */
+    CHECK(sched_cron_parse("*****", &c, err, sizeof(err)) == ESP_FAIL);
+    /* … while case-insensitive names that CONTAIN L or W are names */
+    CHECK(sched_cron_parse("0 9 * JUL WED", &c, err, sizeof(err)) == ESP_OK);
+    CHECK(c.month == (1U << 7));  /* July */
+    CHECK(c.dow == (1U << 3));    /* Wednesday */
+    CHECK(c.dom_restricted == 0 && c.dow_restricted == 1);
+    /* but L/W as field syntax stays rejected, at any position */
+    CHECK(sched_cron_parse("0 0 15W * *", &c, err, sizeof(err)) == ESP_FAIL);
+    CHECK(sched_cron_parse("0 0 L-2 * *", &c, err, sizeof(err)) == ESP_FAIL);
+    CHECK(sched_cron_parse("0 0 * * 5L", &c, err, sizeof(err)) == ESP_FAIL);
 
     /* next-fire table (linear local frame) */
     int64_t out;
@@ -616,6 +770,75 @@ static void test_due_model(void)
         free(d);
     }
 
+    /* review T2-2, the exact case: 10 m grid behind a daily 10:00–11:00
+     * window, init 10:00, poll ~26 h later. The gate flips twice inside the
+     * stale interval; only the runnable slots count (5 left on day 1 + 6 on
+     * day 2 = 11), never the whole 155-slot interval arithmetically. */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 10m }\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
+        CHECK(d->jobs[0].skipped == 11);
+        free(p);
+        free(d);
+    }
+
+    /* same staleness with missed: run-once — the make-up fire happens iff a
+     * missed slot had its gate open at ITS due time (not the first stale
+     * one's), then the debt is consumed */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 10m }\n    missed: run-once\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 10, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 1);
+        CHECK(d->jobs[0].skipped == 0);
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 1)) == 0);
+        free(p);
+        free(d);
+    }
+
+    /* first stale slot OUTSIDE the gate: the walk must still find the
+     * runnable slots later in the interval (day 2's 6), not coalesce from
+     * the first slot's gate state */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 10m }\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
+        CHECK(d->jobs[0].skipped == 6);
+        free(p);
+        free(d);
+    }
+
+    /* unresolved sun window (polar day at 78° N): unresolved: skip means no
+     * slot is runnable — nothing counted, nothing fired, dues still advance */
+    time_sync_set_location(78.0, 15.6, 0);
+    time_sync_set_utc_offset_seconds(7200);
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 10m }\n"
+        "    when: { window: { from: sunrise, to: sunset } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 12, 0, 0), identity_localize, &p);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, time_sync_make(2026, 6, 22, 12, 0, 0)) == 0);
+        CHECK(d->jobs[0].skipped == 0);
+        free(p);
+        free(d);
+    }
+    time_sync_set_location(52.173, 5.819, 0);
+    time_sync_set_utc_offset_seconds(7200);
+
     /* missed: run-once — one make-up fire instead of a skip count */
     d = mk_due(
         "schema: jii.ambyte-schedule/v1-draft\n"
@@ -758,6 +981,40 @@ static void test_due_dst(void)
     tzset();
 }
 
+/* ── action table JSON dump ──────────────────────────────────────────── */
+
+static int count_occurrences(const char *hay, const char *needle)
+{
+    int n = 0;
+    size_t nl = strlen(needle);
+    for (const char *s = hay; (s = strstr(s, needle)) != NULL; s += nl) n++;
+    return n;
+}
+
+static void test_actions_dump(void)
+{
+    /* NULL/0 size probe: nothing written, return is the needed length */
+    size_t need = sched_actions_dump_json(NULL, 0);
+    CHECK(need > 100);
+    char *buf = malloc(need + 1);
+    memset(buf, 0xAA, need + 1);
+    size_t got = sched_actions_dump_json(buf, need + 1);
+    CHECK(got == need);
+    CHECK(buf[need] == '\0');
+    /* actions with required inputs require the outer `with` (review):
+     * trace/actinic/log/sleep do; spectrum/leaf-temp/status-report/
+     * store-event must not */
+    CHECK(count_occurrences(buf, "\"required\":[\"uses\",\"with\"]") == 4);
+    CHECK(count_occurrences(buf, "\"required\":[\"uses\"]") == 4);
+    /* truncation reports the would-be length (snprintf semantics); scratch
+     * buffer so the counts above stay valid */
+    {
+        char scratch[16];
+        CHECK(sched_actions_dump_json(scratch, sizeof(scratch)) == need);
+    }
+    free(buf);
+}
+
 int main(void)
 {
     test_parser_acceptance();
@@ -768,6 +1025,7 @@ int main(void)
     test_windows();
     test_due_model();
     test_due_dst();
+    test_actions_dump();
 
     printf("SIZES sched_program_t=%zu job=%zu trigger=%zu entry=%zu protocol=%zu "
            "cron=%zu window=%zu due=%zu due_job=%zu\n",

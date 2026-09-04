@@ -197,25 +197,30 @@ static bool all_digits(const char *s, size_t len)
     return true;
 }
 
-static bool parse_int64(const char *s, size_t len, int64_t *out)
+/* Parse a decimal integer: 1 = ok, 0 = not numeric syntax, -1 = numeric
+ * syntax but out of int64 range. The caller must treat -1 as an error, not
+ * fall through to string — a 19+-digit value is a typo, not a name. */
+static int parse_int64(const char *s, size_t len, int64_t *out)
 {
     size_t i = 0;
     bool neg = false;
     if (i < len && s[i] == '-') { neg = true; i++; }
-    if (i >= len) return false;
+    if (i >= len) return 0;
     int64_t v = 0;
-    int digits = 0;
     for (; i < len; i++) {
-        if (s[i] < '0' || s[i] > '9') return false;
-        if (++digits > 18) return false; /* stays far from int64 overflow */
+        if (s[i] < '0' || s[i] > '9') return 0;
+        /* magnitude check before the multiply: no signed-overflow UB */
+        if (v > (INT64_MAX - (s[i] - '0')) / 10) return -1;
         v = v * 10 + (s[i] - '0');
     }
     *out = neg ? -v : v;
-    return true;
+    return 1;
 }
 
-/* duration: [0-9]+(ms|s|m|h) → milliseconds. "ms" is checked before "m". */
-static bool parse_duration(const char *s, size_t len, int64_t *out_ms)
+/* duration: [0-9]+(ms|s|m|h) → milliseconds. "ms" is checked before "m".
+ * 1 = ok, 0 = not duration syntax, -1 = numeric but the milliseconds do not
+ * fit int64 (magnitude checked before the unit multiply). */
+static int parse_duration(const char *s, size_t len, int64_t *out_ms)
 {
     size_t mult, dlen;
     if (len >= 3 && s[len - 2] == 'm' && s[len - 1] == 's') {
@@ -225,16 +230,19 @@ static bool parse_duration(const char *s, size_t len, int64_t *out_ms)
         case 's': mult = 1000; break;
         case 'm': mult = 60000; break;
         case 'h': mult = 3600000; break;
-        default: return false;
+        default: return 0;
         }
         dlen = len - 1;
     } else {
-        return false;
+        return 0;
     }
+    if (!all_digits(s, dlen)) return 0;
     int64_t v;
-    if (!all_digits(s, dlen) || !parse_int64(s, dlen, &v)) return false;
+    int ri = parse_int64(s, dlen, &v);
+    if (ri <= 0) return ri;
+    if (v > INT64_MAX / (int64_t)mult) return -1;
     *out_ms = v * (int64_t)mult;
-    return true;
+    return 1;
 }
 
 static bool ieq(const char *s, size_t len, const char *word)
@@ -291,12 +299,17 @@ static sched_node_t *resolve_plain(parser_t *p, const char *s, size_t len,
     if (n == NULL) return NULL;
 
     int64_t iv;
+    int ri = parse_int64(s, len, &iv);
     if (ieq(s, len, "true") || ieq(s, len, "false")) {
         n->scal_kind = SCHED_SCAL_BOOL;
         n->u.s.b = (s[0] == 't' || s[0] == 'T') ? 1 : 0;
-    } else if (parse_int64(s, len, &iv)) {
+    } else if (ri == 1) {
         n->scal_kind = SCHED_SCAL_INT;
         n->u.s.i = iv;
+    } else if (ri < 0) {
+        /* numeric-shaped but out of int64 range: a typo, not a name */
+        set_err(p, line, col, "integer out of range: '%.*s'", (int)len, s);
+        return NULL;
     } else {
         /* float: exactly -?[0-9]+\.[0-9]+ (no exponent; hand-parsed so the
          * result is locale-independent) */
@@ -319,9 +332,13 @@ static sched_node_t *resolve_plain(parser_t *p, const char *s, size_t len,
             n->u.s.f = (start == 1) ? -v : v;
         } else {
             int64_t ms;
-            if (parse_duration(s, len, &ms)) {
+            int rd = parse_duration(s, len, &ms);
+            if (rd == 1) {
                 n->scal_kind = SCHED_SCAL_DURATION_MS;
                 n->u.s.ms = ms;
+            } else if (rd < 0) {
+                set_err(p, line, col, "duration out of range: '%.*s'", (int)len, s);
+                return NULL;
             } else {
                 const char *colon = memchr(s, ':', len);
                 if (colon != NULL) {
@@ -331,8 +348,8 @@ static sched_node_t *resolve_plain(parser_t *p, const char *s, size_t len,
                     bool hhmm = hlen >= 1 && hlen <= 2 && mlen == 2 &&
                                 all_digits(s, hlen) && all_digits(colon + 1, mlen);
                     if (hhmm) {
-                        parse_int64(s, hlen, &hh);
-                        parse_int64(colon + 1, mlen, &mm);
+                        (void)parse_int64(s, hlen, &hh);       /* ≤ 2 digits: cannot fail */
+                        (void)parse_int64(colon + 1, mlen, &mm);
                         /* an out-of-range clock shape is an error, not a
                          * plain string: 25:00 is a typo, not a name */
                         if (hh > 23 || mm > 59) {
@@ -375,36 +392,46 @@ static sched_node_t *parse_quoted(parser_t *p, cursor_t *c)
 {
     char quote = c->s[c->pos];
     int str_col = c->col0 + (int)c->pos;
-    size_t start = ++c->pos;
+    c->pos++;
     char *buf = arena_alloc(p->doc, c->len - c->pos + 1);
     if (buf == NULL) { set_err(p, c->line, str_col, "out of memory"); return NULL; }
     size_t out = 0;
     while (c->pos < c->len) {
         char ch = c->s[c->pos];
-        if (quote == '"' && ch == '\\' && c->pos + 1 < c->len && c->s[c->pos + 1] == '"') {
-            buf[out++] = '"';
-            c->pos += 2;
-            continue;
-        }
-        if (ch == quote) {
-            c->pos++;
-            buf[out] = '\0';
-            if (p->doc->string_bytes + out + 1 > SCHED_YAML_MAX_STRING_BYTES) {
-                set_err(p, c->line, str_col, "string pool limit (%d bytes)",
-                        SCHED_YAML_MAX_STRING_BYTES);
+        if (quote == '"' && ch == '\\') {
+            /* the only supported escape is \" — anything else (\n, \\,
+             * \uXXXX) is an error, so a file cannot silently mean something
+             * other than what a non-YAML reader sees */
+            if (c->pos + 1 < c->len && c->s[c->pos + 1] == '"') {
+                ch = '"';
+                c->pos += 2;
+            } else {
+                set_err(p, c->line, c->col0 + (int)c->pos,
+                        "unsupported escape (only \\\" is allowed inside "
+                        "double quotes)");
                 return NULL;
             }
-            p->doc->string_bytes += out + 1;
+        } else if (ch == quote) {
+            c->pos++;
+            buf[out] = '\0';
+            p->doc->string_bytes += out + 1; /* budget pre-checked per byte */
             sched_node_t *n = scalar_node(p, c->line, str_col);
             if (n == NULL) return NULL;
             n->scal_kind = SCHED_SCAL_STR;
             n->u.s.str = buf;
             return n;
+        } else {
+            c->pos++;
+        }
+        /* enforce the string budget BEFORE the write: this byte plus the
+         * eventual NUL must fit what is left of the pool */
+        if (p->doc->string_bytes + out + 2 > SCHED_YAML_MAX_STRING_BYTES) {
+            set_err(p, c->line, str_col, "string pool limit (%d bytes)",
+                    SCHED_YAML_MAX_STRING_BYTES);
+            return NULL;
         }
         buf[out++] = ch;
-        c->pos++;
     }
-    (void)start;
     set_err(p, c->line, str_col, "unterminated quoted string");
     return NULL;
 }
@@ -435,6 +462,13 @@ static bool grow_items(parser_t *p, sched_node_t *n, int line, int col)
 
 static sched_node_t *parse_flow_map(parser_t *p, cursor_t *c, int depth)
 {
+    /* collections self-check their depth before allocating; children recurse
+     * with depth + 1 and are checked the same way on entry */
+    if (depth > SCHED_YAML_MAX_DEPTH) {
+        set_err(p, c->line, c->col0 + (int)c->pos,
+                "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
+        return NULL;
+    }
     sched_node_t *n = node_new(p, SCHED_NODE_MAP, c->line, c->col0 + (int)c->pos);
     if (n == NULL) return NULL;
     c->pos++; /* '{' */
@@ -462,11 +496,6 @@ static sched_node_t *parse_flow_map(parser_t *p, cursor_t *c, int depth)
         }
         sched_node_t *val = parse_flow_value(p, c, depth + 1);
         if (val == NULL) return NULL;
-        if (depth + 1 > SCHED_YAML_MAX_DEPTH) {
-            set_err(p, c->line, c->col0 + (int)c->pos,
-                    "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
-            return NULL;
-        }
         for (int i = 0; i < n->u.m.count; i++) {
             if (strlen(n->u.m.pairs[i].key) == klen &&
                 memcmp(n->u.m.pairs[i].key, c->s + kstart, klen) == 0) {
@@ -494,6 +523,11 @@ static sched_node_t *parse_flow_map(parser_t *p, cursor_t *c, int depth)
 
 static sched_node_t *parse_flow_seq(parser_t *p, cursor_t *c, int depth)
 {
+    if (depth > SCHED_YAML_MAX_DEPTH) {
+        set_err(p, c->line, c->col0 + (int)c->pos,
+                "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
+        return NULL;
+    }
     sched_node_t *n = node_new(p, SCHED_NODE_SEQ, c->line, c->col0 + (int)c->pos);
     if (n == NULL) return NULL;
     c->pos++; /* '[' */
@@ -502,11 +536,6 @@ static sched_node_t *parse_flow_seq(parser_t *p, cursor_t *c, int depth)
     while (c->pos < c->len) {
         sched_node_t *item = parse_flow_value(p, c, depth + 1);
         if (item == NULL) return NULL;
-        if (depth + 1 > SCHED_YAML_MAX_DEPTH) {
-            set_err(p, c->line, c->col0 + (int)c->pos,
-                    "nesting deeper than %d", SCHED_YAML_MAX_DEPTH);
-            return NULL;
-        }
         if (!grow_items(p, n, c->line, c->col0)) return NULL;
         n->u.q.items[n->u.q.count++] = item;
         skip_ws(c);
@@ -548,9 +577,14 @@ static sched_node_t *parse_flow_value(parser_t *p, cursor_t *c, int depth)
 }
 
 /* Whole-line inline value (after `key:` or `- `): flow collection, quoted
- * string, or plain scalar to end of line. col = 1-based column of s[0]. */
+ * string, or plain scalar to end of line. col = 1-based column of s[0].
+ * depth = the containing block collection's depth: a flow collection on the
+ * key's (or dash's) own line adds no indentation level, so it occupies that
+ * same depth and self-checks it on entry; each further nested flow collection
+ * costs +1 via parse_flow_value. Scalars are leaves and uncounted. One depth
+ * counter thus runs across block and flow nesting. */
 static sched_node_t *parse_inline(parser_t *p, const char *s, size_t len,
-                                  int line, int col)
+                                  int line, int col, int depth)
 {
     cursor_t c = { s, len, 0, line, col };
     skip_ws(&c);
@@ -561,9 +595,9 @@ static sched_node_t *parse_inline(parser_t *p, const char *s, size_t len,
     char ch = c.s[c.pos];
     sched_node_t *n;
     if (ch == '{') {
-        n = parse_flow_map(p, &c, 1);
+        n = parse_flow_map(p, &c, depth);
     } else if (ch == '[') {
-        n = parse_flow_seq(p, &c, 1);
+        n = parse_flow_seq(p, &c, depth);
     } else if (ch == '"' || ch == '\'') {
         n = parse_quoted(p, &c);
     } else {
@@ -659,7 +693,8 @@ static sched_node_t *parse_mapping(parser_t *p, int ind, int depth,
             }
             if (val == NULL) return NULL;
         } else {
-            val = parse_inline(p, rest, (size_t)rest_len, lineno, rest_col);
+            val = parse_inline(p, rest, (size_t)rest_len, lineno, rest_col,
+                               depth);
             if (val == NULL) return NULL;
             if (!have_first) p->pos++;
         }
@@ -708,7 +743,8 @@ static sched_node_t *parse_sequence(parser_t *p, int ind, int depth)
             }
             if (item == NULL) return NULL;
         } else if (rest[0] == '{' || rest[0] == '[') {
-            item = parse_inline(p, rest, (size_t)rest_len, ln->lineno, rest_col);
+            item = parse_inline(p, rest, (size_t)rest_len, ln->lineno, rest_col,
+                                depth);
             if (item == NULL) return NULL;
             p->pos++;
         } else if (is_key_char(rest[0], true)) {
@@ -725,12 +761,16 @@ static sched_node_t *parse_sequence(parser_t *p, int ind, int depth)
                                      ln->lineno, rest_col);
                 if (item == NULL) return NULL;
             } else {
-                item = resolve_plain(p, rest, (size_t)rest_len, ln->lineno, rest_col);
+                /* scalar item: route through the inline parser so quoted
+                 * items get the same grammar as mapping values */
+                item = parse_inline(p, rest, (size_t)rest_len, ln->lineno,
+                                    rest_col, depth);
                 if (item == NULL) return NULL;
                 p->pos++;
             }
         } else {
-            item = resolve_plain(p, rest, (size_t)rest_len, ln->lineno, rest_col);
+            item = parse_inline(p, rest, (size_t)rest_len, ln->lineno, rest_col,
+                                depth);
             if (item == NULL) return NULL;
             p->pos++;
         }
