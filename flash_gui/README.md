@@ -107,19 +107,19 @@ price:
 macOS builds are not notarized either: expect the Gatekeeper right-click-Open
 dance.
 
-### The Lua script is pushed, not downloaded
+### The Schedule script is pushed, not downloaded
 
 The GUI streams the selected script down the console it already holds open
-(`lua begin` / `lua put` / `lua commit`), so **the board needs no network to be
+(`schedule begin` / `schedule put` / `schedule commit`), so **the board needs no network to be
 onboarded**. The bytes are cached and digest-checked on the PC; the firmware
-re-hashes what it received, syntax-checks it, and keeps the previous script as
-`main.lua.bak`, exactly as it does for a remote install.
+re-hashes what it received, compiles it, and keeps the previous schedule as
+`schedule.yaml.bak`, exactly as it does for a remote install.
 
 Chunks are base64 and 144 bytes each, giving a 200-character command line. The
 binding limit is **not** the console's 512-byte `max_cmdline_length` but the
 USB-Serial-JTAG driver's 256-byte `rx_buffer_size`, which ESP-IDF fixes and the
 REPL does not expose; a longer line is swallowed and the command never answers.
-Measured on hardware: a 224-character line works, 264 hangs. Each `lua put`
+Measured on hardware: a 224-character line works, 264 hangs. Each `schedule put`
 replies with the staged file's own size, so a dropped chunk is caught as it
 happens rather than at the final digest check.
 
@@ -129,7 +129,7 @@ That fallback is the only path that needs the board on Wi-Fi.
 
 ### GitHub rate limits
 
-The GUI reads the repo's release list to find the firmware, the Lua catalog and
+The GUI reads the repo's release list to find the firmware, the Schedule catalog and
 the latest GUI version. Unauthenticated GitHub allows **60 requests/hour per
 IP**, and an office behind one NAT shares that budget across every operator.
 
@@ -162,15 +162,15 @@ Once per session:
    member of). During each board run, openJII binds the device to this
    experiment and returns its authoritative broker endpoint and ingest topic
    prefix; the GUI does not construct or edit either value.
-4. Pick the **Lua script**. The GUI always loads the newest stable `lua-v*`
-   catalog and lists the released `.lua` files it contains; `main.lua` is the
+4. Pick the **Schedule script**. The GUI always loads the newest stable `schedule-v*`
+   catalog and lists the released `.yaml` files it contains; `default.yaml` is the
    default when available.
 5. Enter the **Wi-Fi SSID/password** the boards should join.
 
 Per board: plug it in via USB-C → **Refresh** → pick the port → **On-board
 device** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
-RTC, selected Lua script).
+RTC, selected Schedule script).
 
 ## Factory PCBA flash + test (`factory_test`)
 
@@ -226,9 +226,9 @@ connection failure).
    cert + key + Amazon Root CA 1, Wi-Fi credentials, MQTT broker from openJII,
    client id = openJII Thing name (required by the AWS IoT policy),
    server-provided topic prefix plus the API-required sensor version/id suffix,
-   command/status topics, and the selected Lua release's provenance
+   command/status topics, and the selected Schedule release's provenance
    (sha256/version/campaign). Alongside it, a littlefs image of the internal
-   script partition carrying that release's `main.lua`, built host-side (no
+   script partition carrying that release's `default.yaml`, built host-side (no
    mklittlefs needed).
 4. **Flash** — the latest GitHub release (`ambyte-iot-v*.zip`, cached locally,
    version shown in the GUI) + the NVS image + the littlefs image, offsets
@@ -240,22 +240,22 @@ connection failure).
    20–35 s, but SD recovery can take longer and the USB port may re-enumerate),
    keeping one serial handle open so polling cannot repeatedly reset the board,
    then sets the exact current UTC epoch with `rtc set` (applies immediately).
-6. **Lua script** — with a firmware that runs main.lua from internal flash
+6. **Schedule script** — with a firmware that runs schedule.yaml from internal flash
    (littlefs), the baked image + NVS provenance already verify, so this step
    usually confirms and moves on. Otherwise it pushes the selected immutable
    release asset down the console (no device network needed); the firmware
-   checks SHA-256 and Lua syntax, keeps the previous file as `main.lua.bak`,
-   atomically installs it as `main.lua`, and restarts Lua in place. On older
+   checks SHA-256 and schedule syntax, keeps the previous file as `schedule.yaml.bak`,
+   atomically installs it as `schedule.yaml`, and restarts the runner in place. On older
    firmware without the push commands it falls back to the firmware's URL
    downloader (the only path that needs the board online). Verification keeps
    the same serial connection open while this asynchronous operation
    completes.
 7. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`,
-   and the active Lua file identity, then reports PASS/FAIL per item. SD card
+   and the active Schedule file identity, then reports PASS/FAIL per item. SD card
    presence is reported for information only — it is not required: the event
-   store and main.lua are internal; a card serves archive/logs/AMBIT OTA only.
+   store and schedule.yaml are internal; a card serves archive/logs/AMBIT OTA only.
    On failure, **Retry provisioning** repairs name/timezone and retries the
-   Lua install over the console — never a re-flash.
+   Schedule install over the console — never a re-flash.
 
 ### Onboarding sequence
 
@@ -266,16 +266,16 @@ sequenceDiagram
     participant GitHub
     participant Device
     GUI->>GitHub: Fetch releases
-    GitHub-->>GUI: Latest firmware + latest lua-v catalog
-    GUI->>GitHub: Fetch manifests for released .lua assets
+    GitHub-->>GUI: Latest firmware + latest schedule-v catalog
+    GUI->>GitHub: Fetch manifests for released .yaml assets
     GUI->>openJII: Register + issue/rotate credentials
     GUI->>openJII: POST device onboarding + selected experiment
     openJII-->>GUI: Thing, MQTT endpoint, ingest topic prefix
     GUI->>Device: Flash firmware + per-device NVS
     GUI->>Device: Set RTC and verify configuration
-    GUI->>Device: lua install <immutable URL + SHA + release metadata>
-    Device->>GitHub: Stream selected .lua asset
-    Device->>Device: Verify, parse, atomic swap, restart Lua
+    GUI->>Device: schedule install <immutable URL + SHA + release metadata>
+    Device->>GitHub: Stream selected .yaml asset
+    Device->>Device: Verify, parse, atomic swap, restart Schedule
     GUI->>Device: Poll active script identity
     Device-->>GUI: Verified SHA and release metadata
 ```
@@ -306,9 +306,9 @@ sequenceDiagram
   contract-required `/{sensorVersion}/{sensorId}` suffix because that portion
   is device-owned; the firmware appends its final protocol segment at publish
   time.
-- Firmware and Lua are independent release streams. The GUI scans the release
+- Firmware and Schedule are independent release streams. The GUI scans the release
   feed separately for the newest stable firmware `vX.Y.Z` flash bundle and the
-  highest stable `lua-vX.Y.Z` catalog, so a Lua or GUI release can never be
+  highest stable `schedule-vX.Y.Z` catalog, so a Schedule or GUI release can never be
   mistaken for firmware.
 
 ## Files
@@ -319,7 +319,7 @@ flash_gui/
   gui.py             Tkinter app (worker threads, never blocks the UI)
   procedure.py       the per-board state machine + retry paths
   config.py          environments, topic conventions, persisted settings
-  release_fetch.py   firmware download/cache + latest Lua catalog validation
+  release_fetch.py   firmware download/cache + latest Schedule catalog validation
   nvs_builder.py     per-board NVS image (identity/certs/Wi-Fi/RTC seed)
   esptool_ops.py     esptool>=5 scripting API (read MAC, flash, NVS-only)
   ambyte_serial.py   firmware console client (probe / cfg / rtc / verify)

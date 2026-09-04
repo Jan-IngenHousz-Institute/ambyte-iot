@@ -39,7 +39,7 @@ NVS_OFFSET = 0x9000
 NVS_PARTITION_SIZE = 0x6000
 
 # littlefs @ 0x620000 size 0x80000 (partitions.csv): the firmware's internal
-# script home. Provisioning bakes main.lua into an image flashed here so a
+# script home. Provisioning bakes schedule.yaml into an image flashed here so a
 # fresh board runs the selected release without an SD seed step.
 LITTLEFS_OFFSET = 0x620000
 LITTLEFS_PARTITION_SIZE = 0x80000
@@ -152,7 +152,7 @@ class Settings:
     experiment_name: str = ""
     wifi_ssid: str = ""
     wifi_password: str = ""
-    lua_script_name: str = "main"
+    schedule_script_name: str = "default"
     api_keys: dict = field(default_factory=dict)   # env key -> "jii_..." key
 
     @classmethod

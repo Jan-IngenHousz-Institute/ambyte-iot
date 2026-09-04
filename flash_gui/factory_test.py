@@ -125,13 +125,13 @@ def parse_selftest(reply: str) -> SelftestResult:
     )
 
 
-def _lua_stop_best_effort(con: AmbyteConsole, log) -> None:
+def _schedule_stop_best_effort(con: AmbyteConsole, log) -> None:
     """A running measurement script could hold the I2C bus mid-selftest. On a
     factory-fresh board nothing is running and this is a no-op; on a re-test
     of a provisioned board it keeps the suite deterministic. Never fatal."""
     try:
-        con.command("lua stop", timeout=10.0)
-        log("Lua runner stopped for the test window.")
+        con.command("schedule stop", timeout=10.0)
+        log("Schedule runner stopped for the test window.")
     except ConsoleError:
         pass
 
@@ -373,7 +373,7 @@ def run(argv: list[str] | None = None) -> int:
 
     led_operator: bool | None = None
     try:
-        _lua_stop_best_effort(con, log)
+        _schedule_stop_best_effort(con, log)
         log("Running selftest...")
         try:
             reply = con.command("selftest", timeout=SELFTEST_TIMEOUT_S)

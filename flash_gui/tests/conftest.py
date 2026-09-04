@@ -3,7 +3,7 @@
 
 """Keep every test out of the developer's real cache.
 
-release_fetch caches the release listing and the immutable Lua manifests under
+release_fetch caches the release listing and the immutable Schedule manifests under
 the user config dir. Without this, tests both pollute a real machine and leak
 into each other: a manifest cached by one test was served to the next, which hid
 a validation failure the second test existed to prove.

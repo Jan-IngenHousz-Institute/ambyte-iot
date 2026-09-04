@@ -12,17 +12,17 @@ clearly-reported state:
   2. credentials  openJII register + issue/rotate + onboard, BEFORE flashing,
                   so an API failure means nothing was written to the board
   3. nvs          bake the per-board NVS image (identity, certs, Wi-Fi,
-                  timezone, MQTT, flash_time, Lua release provenance) and the
-                  littlefs image carrying the selected main.lua
+                  timezone, MQTT, flash_time, Schedule release provenance) and the
+                  littlefs image carrying the selected schedule as schedule.yaml
   4. flash        release images + nvs.bin + littlefs.bin in one esptool
                   session; a mid-way failure leaves the chip in the ROM
                   bootloader = re-flashable
   5. rtc          wait for the freshly booted console, set the exact UTC epoch
-  6. lua          push the selected latest-catalog release asset down this
+  6. schedule          push the selected latest-catalog release asset down this
                   console (no device network needed) and let the firmware verify
                   + swap it; falls back to the firmware's URL updater on older
                   firmware. Previous script kept as .bak either way
-  7. verify       read back name / timezone / RTC / Lua identity; per-item
+  7. verify       read back name / timezone / RTC / Schedule identity; per-item
                   pass/fail
 
 Retry paths (no full restart needed):
@@ -45,11 +45,11 @@ from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
                      LITTLEFS_OFFSET, MAX_NAME_LEN, NVS_OFFSET, PROTOCOL_ID,
                      OPENJII_DEVICE_TYPE, TOPIC_SENSOR_VERSION, Environment,
                      default_command_topic, default_status_topic)
-from .littlefs_image import build_main_lua_image
+from .littlefs_image import build_schedule_image
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient
 from . import release_fetch
-from .release_fetch import (LuaScriptRelease, ReleaseError,
+from .release_fetch import (ScheduleScriptRelease, ReleaseError,
                             ReleaseImages)
 
 # Accept the RTC as correct within this window of host-now. Generous: it
@@ -61,26 +61,26 @@ RTC_TOLERANCE_S = 120
 # re-enumeration can push field devices past 90 s. Keep rescanning for three
 # minutes before declaring the board unavailable.
 CONSOLE_BOOT_DEADLINE_S = 180.0
-# URL installs temporarily stop Lua + MQTT, download over HTTPS, verify, swap,
-# reconnect MQTT, and restart Lua. Normal runs finish in seconds; tolerate a
+# URL installs temporarily stop Schedule + MQTT, download over HTTPS, verify, swap,
+# reconnect MQTT, and restart Schedule. Normal runs finish in seconds; tolerate a
 # degraded Wi-Fi reconnect without turning a safe in-progress update into a
 # false failure.
-LUA_INSTALL_DEADLINE_S = 360.0
+SCHEDULE_INSTALL_DEADLINE_S = 360.0
 # The URL install is asynchronous. Give the worker time to download, hash,
 # syntax-check, swap, and restart before asking the SD-backed identity reader.
 # Querying immediately can block the CLI behind the same SD operation.
-LUA_INSTALL_SETTLE_S = 15.0
+SCHEDULE_INSTALL_SETTLE_S = 15.0
 # Nothing was printed between "install queued" and the verdict, so a healthy
 # 6-minute wait for a slow download looked identical to a hung flasher, and the
 # operator cannot attach a serial monitor to check because the GUI holds the
 # port. Report what the device is reporting instead.
-LUA_INSTALL_PROGRESS_S = 15.0
+SCHEDULE_INSTALL_PROGRESS_S = 15.0
 # The device fetches the script itself over HTTPS, so no Wi-Fi means no install.
 # Association is not instant after the reboot in step 5, so wait briefly rather
 # than failing on the first read; but wait here, where the cause is obvious,
-# instead of burning the full LUA_INSTALL_DEADLINE_S on a board that was never
+# instead of burning the full SCHEDULE_INSTALL_DEADLINE_S on a board that was never
 # going to download anything.
-LUA_WIFI_DEADLINE_S = 60.0
+SCHEDULE_WIFI_DEADLINE_S = 60.0
 
 
 class ProcedureError(RuntimeError):
@@ -158,7 +158,7 @@ class SessionContext:
     env: Environment
     client: OpenJIIClient
     release: ReleaseImages
-    lua_script: LuaScriptRelease
+    schedule_script: ScheduleScriptRelease
     experiment_id: str
     timezone: str
     wifi_ssid: str
@@ -175,7 +175,7 @@ class DeviceRun:
     identity: DeviceIdentity | None = None
     plan: ProvisioningPlan | None = None
     nvs_path: Path | None = None
-    lua_image_path: Path | None = None
+    schedule_image_path: Path | None = None
     verify_results: list[VerifyItem] = field(default_factory=list)
 
 
@@ -289,10 +289,10 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
         device_version=DEVICE_VERSION,
         device_firmware=DEVICE_FIRMWARE,
         firmware_version=ctx.release.version,
-        lua_sha256=ctx.lua_script.sha256,
-        lua_script_version=ctx.lua_script.script_version,
-        lua_built_against_fw=ctx.lua_script.built_against_fw,
-        lua_campaign_id=ctx.lua_script.campaign_id,
+        schedule_sha256=ctx.schedule_script.sha256,
+        schedule_script_version=ctx.schedule_script.script_version,
+        schedule_built_against_fw=ctx.schedule_script.built_against_fw,
+        schedule_campaign_id=ctx.schedule_script.campaign_id,
     )
     run.plan = plan
 
@@ -304,29 +304,29 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
         raise ProcedureError("nvs", str(exc)) from exc
     log(f"NVS image ready: {out.name}")
 
-    # Bake main.lua into a littlefs image for the internal script partition:
+    # Bake schedule.yaml into a littlefs image for the internal script partition:
     # first boot then finds the selected release already installed (and the NVS
-    # provenance above makes `lua release` verify it), so the Lua step needs no
+    # provenance above makes `schedule release` verify it), so the Schedule step needs no
     # SD card and no download. Older flashed firmware simply ignores both.
-    log(f"Baking {ctx.lua_script.asset_name} into the littlefs image...")
-    lua_out = CACHE_DIR / "littlefs" / f"littlefs-{run.preflight.mac.replace(':', '')}.bin"
+    log(f"Baking {ctx.schedule_script.asset_name} into the littlefs image...")
+    schedule_out = CACHE_DIR / "littlefs" / f"littlefs-{run.preflight.mac.replace(':', '')}.bin"
     try:
         # Surface a cold-cache download in the same operator log as the rest of
         # provisioning. script_bytes still supports log=None for silent callers,
         # but there is no reason to hide useful progress in the GUI.
-        blob = release_fetch.script_bytes(ctx.lua_script, log=log)
-        run.lua_image_path = build_main_lua_image(blob, lua_out)
+        blob = release_fetch.script_bytes(ctx.schedule_script, log=log)
+        run.schedule_image_path = build_schedule_image(blob, schedule_out)
     except Exception as exc:
         raise ProcedureError("nvs", f"littlefs image: {exc}") from exc
-    log(f"littlefs image ready: {lua_out.name}")
+    log(f"littlefs image ready: {schedule_out.name}")
 
 
 # ── step 4: flash ────────────────────────────────────────────────────────────
 def flash(ctx: SessionContext, run: DeviceRun, log=print) -> None:
     assert run.nvs_path, "prepare_provisioning must run first"
     images = list(ctx.release.flash_files) + [(NVS_OFFSET, run.nvs_path)]
-    if run.lua_image_path is not None:
-        images.append((LITTLEFS_OFFSET, run.lua_image_path))
+    if run.schedule_image_path is not None:
+        images.append((LITTLEFS_OFFSET, run.schedule_image_path))
     images.sort(key=lambda item: item[0])
     log(f"Flashing {ctx.release.tag} + provisioning "
         f"({len(images)} images) on {run.port}...")
@@ -381,7 +381,7 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
         except ConsoleError as exc:
             results.append(VerifyItem("RTC (UTC)", False, str(exc)))
 
-        # Informational, never a failure: since the event store and main.lua
+        # Informational, never a failure: since the event store and schedule.yaml
         # live on internal flash, the SD card only serves archive/logs/AMBIT
         # OTA. Operators used to read a missing card as an onboarding failure.
         try:
@@ -391,7 +391,7 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
         if sd is True:
             log("SD card: mounted (archive/logs/AMBIT OTA roles only).")
         elif sd is False:
-            log("SD card: absent — OK, Lua and the event store are internal. "
+            log("SD card: absent — OK, Schedule and the event store are internal. "
                 "Insert one only if this unit needs AMBIT OTA or log pulls.")
         else:
             log("SD card: not reported by this firmware (older than the "
@@ -422,7 +422,7 @@ def _require_network(con, ssid: str, log=print) -> None:
     gateway with no uplink (or broken DNS) looks identical from here. This only
     removes the case that is knowable up front.
     """
-    deadline = time.time() + LUA_WIFI_DEADLINE_S
+    deadline = time.time() + SCHEDULE_WIFI_DEADLINE_S
     announced = False
     while True:
         try:
@@ -439,36 +439,36 @@ def _require_network(con, ssid: str, log=print) -> None:
         remaining = deadline - time.time()
         if remaining <= 0:
             raise ProcedureError(
-                "lua",
+                "schedule",
                 f"the board never got an IP on '{ssid}' within "
-                f"{LUA_WIFI_DEADLINE_S:.0f}s, so it cannot download the Lua "
+                f"{SCHEDULE_WIFI_DEADLINE_S:.0f}s, so it cannot download the Schedule "
                 "script. Check the SSID and password for "
                 "this session, and that the access point is in range and "
                 "handing out addresses. Nothing was changed on the board; "
                 "use Retry provisioning once the network is up.")
         if not announced:
             log(f"Waiting for the board to join '{ssid}' "
-                f"(up to {LUA_WIFI_DEADLINE_S:.0f}s)...")
+                f"(up to {SCHEDULE_WIFI_DEADLINE_S:.0f}s)...")
             announced = True
         time.sleep(3.0)
 
 
-def install_lua_script(ctx: SessionContext, run: DeviceRun,
+def install_schedule_script(ctx: SessionContext, run: DeviceRun,
                        log=print) -> VerifyItem:
-    """Install and positively verify the selected released Lua asset.
+    """Install and positively verify the selected released Schedule asset.
 
     The console only submits an immutable URL + manifest identity. All byte
-    transfer, hashing, syntax validation, atomic SD swap, .bak recovery, and
+    transfer, hashing, compile validation, atomic littlefs swap, .bak recovery, and
     runner restart remain firmware-owned in script_update.
     """
-    script = ctx.lua_script
+    script = ctx.schedule_script
     try:
         con = ambyte_serial.connect_after_boot(
             run.port, deadline_s=CONSOLE_BOOT_DEADLINE_S, log=log)
     except ConsoleError as exc:
-        raise ProcedureError("lua", str(exc)) from exc
+        raise ProcedureError("schedule", str(exc)) from exc
 
-    def matches(status: ambyte_serial.LuaReleaseStatus) -> bool:
+    def matches(status: ambyte_serial.ScheduleReleaseStatus) -> bool:
         return (
             status.sha256 == script.sha256
             and status.script_version == script.script_version
@@ -480,17 +480,17 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
     try:
         current = None
         try:
-            current = con.lua_release()
+            current = con.schedule_release()
         except ConsoleError as exc:
-            # A blank/new SD legitimately has no /sdcard/main.lua identity yet.
+            # A blank device legitimately has no /littlefs/schedule.yaml identity yet.
             # Submit the install anyway; unsupported older firmware will reject
-            # the following `lua install` command with an actionable reply.
-            log(f"No active Lua release identity yet ({exc}); installing the selection.")
+            # the following `schedule install` command with an actionable reply.
+            log(f"No active Schedule release identity yet ({exc}); installing the selection.")
 
         if current is not None and matches(current):
-            log(f"Lua {script.asset_name} ({script.tag}) is already active and verified.")
+            log(f"Schedule {script.asset_name} ({script.tag}) is already active and verified.")
             return VerifyItem(
-                "Lua script", True,
+                "Schedule script", True,
                 f"{script.asset_name} from {script.tag}; sha256={script.sha256}")
 
         # Preferred: stream the script down this console, so the board needs no
@@ -508,7 +508,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
             log(f"Pushing {script.asset_name} from {script.tag} "
                 f"({len(blob)} bytes) over serial...")
             try:
-                con.lua_push(
+                con.schedule_push(
                     blob,
                     script.sha256,
                     script.campaign_id,
@@ -521,7 +521,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 log("This firmware cannot accept a serial push; "
                     "falling back to a device-side download.")
             except ConsoleError as exc:
-                raise ProcedureError("lua", str(exc)) from exc
+                raise ProcedureError("schedule", str(exc)) from exc
 
         if not pushed:
             # Only this path needs the board on the network.
@@ -529,7 +529,7 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
             log(f"Installing {script.asset_name} from {script.tag} "
                 f"({script.size_bytes} bytes)...")
             try:
-                con.lua_install(
+                con.schedule_install(
                     script.asset_url,
                     script.sha256,
                     script.campaign_id,
@@ -537,34 +537,34 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                     script.built_against_fw,
                 )
             except ConsoleError as exc:
-                raise ProcedureError("lua", str(exc)) from exc
+                raise ProcedureError("schedule", str(exc)) from exc
 
-        deadline = time.time() + LUA_INSTALL_DEADLINE_S
+        deadline = time.time() + SCHEDULE_INSTALL_DEADLINE_S
         last_detail = "the previous script is still active"
         if pushed:
             # The bytes are already staged on the device; what remains is the
             # firmware's local hash + syntax check + SD swap, and our serial
-            # read-back of `lua release`. No network is involved at all.
-            log(f"Lua install queued; the firmware verifies the pushed script "
-                f"on-device (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
+            # read-back of `schedule release`. No network is involved at all.
+            log(f"Schedule install queued; the firmware verifies the pushed script "
+                f"on-device (up to {SCHEDULE_INSTALL_DEADLINE_S:.0f}s)...")
         else:
-            log(f"Lua install queued; the device downloads and verifies it over "
-                f"Wi-Fi (up to {LUA_INSTALL_DEADLINE_S:.0f}s)...")
-        next_progress = time.time() + LUA_INSTALL_SETTLE_S + LUA_INSTALL_PROGRESS_S
+            log(f"Schedule install queued; the device downloads and verifies it over "
+                f"Wi-Fi (up to {SCHEDULE_INSTALL_DEADLINE_S:.0f}s)...")
+        next_progress = time.time() + SCHEDULE_INSTALL_SETTLE_S + SCHEDULE_INSTALL_PROGRESS_S
 
         def report_progress() -> None:
             nonlocal next_progress
             now = time.time()
             if now < next_progress:
                 return
-            next_progress = now + LUA_INSTALL_PROGRESS_S
+            next_progress = now + SCHEDULE_INSTALL_PROGRESS_S
             log(f"Still waiting for {script.asset_name} "
                 f"({deadline - now:.0f}s left): {last_detail}.")
 
-        time.sleep(LUA_INSTALL_SETTLE_S)
+        time.sleep(SCHEDULE_INSTALL_SETTLE_S)
         while time.time() < deadline:
             try:
-                current = con.lua_release(timeout=20.0)
+                current = con.schedule_release(timeout=20.0)
             except ConsoleError as exc:
                 # A busy SD identity read or asynchronous firmware log can make
                 # one command miss its prompt. Keep the same serial handle: a
@@ -591,10 +591,10 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
                 continue
 
             if matches(current):
-                log(f"Lua install verified: {script.asset_name} from {script.tag}, "
+                log(f"Schedule install verified: {script.asset_name} from {script.tag}, "
                     f"sha256={current.sha256}.")
                 return VerifyItem(
-                    "Lua script", True,
+                    "Schedule script", True,
                     f"{script.asset_name} from {script.tag}; sha256={current.sha256}")
             # Short digests: the log pane is narrow, and 64 hex chars per line
             # every 15 s buries the part that changes. The full sha256 is in the
@@ -608,10 +608,10 @@ def install_lua_script(ctx: SessionContext, run: DeviceRun,
             time.sleep(2.0)
 
         raise ProcedureError(
-            "lua",
+            "schedule",
             f"{script.asset_name} was not verified within "
-            f"{LUA_INSTALL_DEADLINE_S:.0f}s ({last_detail}); the previous "
-            "main.lua remains recoverable")
+            f"{SCHEDULE_INSTALL_DEADLINE_S:.0f}s ({last_detail}); the previous "
+            "schedule.yaml remains recoverable")
     finally:
         con.close()
 

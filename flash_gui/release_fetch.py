@@ -39,15 +39,16 @@ from .tls import ssl_context
 API_ROOT = "https://api.github.com"
 ASSET_PREFIX = "ambyte-iot-v"
 ASSET_SUFFIX = ".zip"
-LUA_TAG_RE = re.compile(r"^lua-v(\d+)\.(\d+)\.(\d+)$")
-LUA_ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.lua$")
+SCHEDULE_TAG_RE = re.compile(r"^schedule-v(\d+)\.(\d+)\.(\d+)$")
+SCHEDULE_ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.yaml$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SCHEDULE_MAX_BYTES = 16 * 1024  # SCHED_YAML_MAX_FILE_BYTES in firmware
 MANIFEST = "flasher_args.json"
 # Written next to the unpacked images so a half-finished download is never
 # mistaken for a good cache entry.
 STAMP = ".complete.json"
 USER_AGENT = "ambyte-flash-gui"
-# The firmware, Lua and application-update fetchers all want this exact
+# The firmware, Schedule and application-update fetchers all want this exact
 # listing, so it is fetched once and shared: unauthenticated GitHub allows 60
 # requests/hour per IP, and a NATed office shares one budget across every
 # operator.
@@ -56,9 +57,9 @@ RELEASES_CACHE = CACHE_DIR / "releases.json"
 # Release assets are immutable (the repo publishes immutable releases), so a
 # manifest fetched once for a given URL can never change. Caching them forever
 # is what lets a warm PC bootstrap a whole onboarding session offline.
-MANIFEST_CACHE = CACHE_DIR / "lua_manifests.json"
+MANIFEST_CACHE = CACHE_DIR / "schedule_manifests.json"
 # Script bodies, keyed by digest so a name can never collide across releases.
-SCRIPTS_CACHE_DIR = CACHE_DIR / "lua_scripts"
+SCRIPTS_CACHE_DIR = CACHE_DIR / "schedule_scripts"
 # Short enough that a release published mid-session is picked up, long enough
 # to collapse the two startup fetches into one request.
 RELEASES_TTL_SECONDS = 300
@@ -75,8 +76,8 @@ class ReleaseError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class LuaScriptRelease:
-    """One immutable script choice from a published Lua catalog release."""
+class ScheduleScriptRelease:
+    """One immutable script choice from a published Schedule catalog release."""
 
     tag: str
     asset_name: str
@@ -90,17 +91,17 @@ class LuaScriptRelease:
 
 
 @dataclass(frozen=True)
-class LuaCatalogRelease:
-    """The newest stable lua-v* release and its validated script choices."""
+class ScheduleCatalogRelease:
+    """The newest stable schedule-v* release and its validated script choices."""
 
     tag: str
-    scripts: tuple[LuaScriptRelease, ...]
+    scripts: tuple[ScheduleScriptRelease, ...]
 
 
 def pick_firmware_release(releases: list) -> dict | None:
     """The newest published FIRMWARE release from a /releases listing.
 
-    The repo's release stream carries more than firmware: lua-v* script
+    The repo's release stream carries more than firmware: schedule-v* script
     releases and flash-gui-v* tool releases share it, and GitHub's
     /releases/latest simply returns the most recently published one, and the day
     flash-gui-v0.1.0 was tagged, "latest" stopped carrying a firmware zip and
@@ -125,18 +126,18 @@ def pick_firmware_release(releases: list) -> dict | None:
     return max(candidates, key=lambda r: r.get("published_at") or "")
 
 
-def pick_lua_release(releases: list) -> dict | None:
-    """The newest stable lua-v* release containing a usable script catalog.
+def pick_schedule_release(releases: list) -> dict | None:
+    """The newest stable schedule-v* release containing a usable script catalog.
 
-    A catalog entry is a plain ``*.lua`` asset plus its adjacent
-    ``*.lua.manifest.json`` contract. Releases of other units, prereleases,
-    drafts, and incomplete Lua releases are ignored.
+    A catalog entry is a plain ``*.yaml`` asset plus its adjacent
+    ``*.yaml.manifest.json`` contract. Releases of other units, prereleases,
+    drafts, and incomplete Schedule releases are ignored.
     """
 
-    def is_lua_catalog(rel: dict) -> bool:
+    def is_schedule_catalog(rel: dict) -> bool:
         if rel.get("draft") or rel.get("prerelease"):
             return False
-        if LUA_TAG_RE.fullmatch(rel.get("tag_name") or "") is None:
+        if SCHEDULE_TAG_RE.fullmatch(rel.get("tag_name") or "") is None:
             return False
         names = {
             asset.get("name")
@@ -145,18 +146,18 @@ def pick_lua_release(releases: list) -> dict | None:
         }
         return any(
             isinstance(name, str)
-            and LUA_ASSET_RE.fullmatch(name)
+            and SCHEDULE_ASSET_RE.fullmatch(name)
             and f"{name}.manifest.json" in names
             for name in names
         )
 
-    candidates = [r for r in releases if isinstance(r, dict) and is_lua_catalog(r)]
+    candidates = [r for r in releases if isinstance(r, dict) and is_schedule_catalog(r)]
     if not candidates:
         return None
     return max(
         candidates,
         key=lambda r: tuple(
-            int(part) for part in LUA_TAG_RE.fullmatch(r["tag_name"]).groups()),
+            int(part) for part in SCHEDULE_TAG_RE.fullmatch(r["tag_name"]).groups()),
     )
 
 
@@ -244,7 +245,7 @@ def _write_cache_file(path: Path, payload: Any) -> None:
 
 
 def _cached_manifest(url: str) -> Any:
-    """A Lua release manifest, fetched at most once per URL, ever.
+    """A Schedule release manifest, fetched at most once per URL, ever.
 
     Falls back to the stored copy when GitHub is unreachable, so a bench that
     has already seen this release keeps working with no connectivity.
@@ -354,7 +355,7 @@ def fetch_gui_update(
     fallback_messages: list[str] = []
 
     def capture(message: str) -> None:
-        # Firmware and Lua may safely operate from the last immutable catalog,
+        # Firmware and Schedule may safely operate from the last immutable catalog,
         # but an update banner must not claim "UP TO DATE" when GitHub could
         # not be checked. _release_list logs only when it falls back to stale
         # data, so preserve that warning and turn it into an unknown state.
@@ -375,17 +376,17 @@ def fetch_gui_update(
         ) from exc
 
 
-def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRelease:
+def _validated_schedule_script(tag: str, asset: dict, manifest: Any) -> ScheduleScriptRelease:
     """Validate one release asset against its immutable schema-1 manifest."""
     asset_name = asset.get("name") or ""
-    if LUA_ASSET_RE.fullmatch(asset_name) is None:
-        raise ReleaseError(f"invalid Lua release asset name: {asset_name!r}")
+    if SCHEDULE_ASSET_RE.fullmatch(asset_name) is None:
+        raise ReleaseError(f"invalid Schedule release asset name: {asset_name!r}")
     if not isinstance(manifest, dict):
         raise ReleaseError(f"{asset_name}.manifest.json is not a JSON object")
 
-    version = tag.removeprefix("lua-v")
-    script_name = asset_name.removesuffix(".lua")
-    campaign_id = tag if script_name == "main" else f"{tag}:{script_name}"
+    version = tag.removeprefix("schedule-v")
+    script_name = asset_name.removesuffix(".yaml")
+    campaign_id = tag if script_name == "default" else f"{tag}:{script_name}"
     asset_url = asset.get("browser_download_url") or ""
     sha256 = manifest.get("sha256")
     size_bytes = manifest.get("size_bytes")
@@ -403,7 +404,7 @@ def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRele
          "manifest built_against_fw is missing"),
         (isinstance(sha256, str) and SHA256_RE.fullmatch(sha256) is not None,
          "manifest sha256 is invalid"),
-        (isinstance(size_bytes, int) and size_bytes >= 0,
+        (isinstance(size_bytes, int) and 0 < size_bytes <= SCHEDULE_MAX_BYTES,
          "manifest size_bytes is invalid"),
         (size_bytes == asset.get("size"),
          "manifest size_bytes does not match the release asset"),
@@ -427,7 +428,7 @@ def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRele
         raise ReleaseError(
             f"{asset_name}: manifest script_update does not match its release identity")
 
-    return LuaScriptRelease(
+    return ScheduleScriptRelease(
         tag=tag,
         asset_name=asset_name,
         script_name=script_name,
@@ -440,13 +441,13 @@ def _validated_lua_script(tag: str, asset: dict, manifest: Any) -> LuaScriptRele
     )
 
 
-def fetch_latest_lua_catalog(log=print) -> LuaCatalogRelease:
-    """Resolve and validate every selectable script in the latest Lua release."""
+def fetch_latest_schedule_catalog(log=print) -> ScheduleCatalogRelease:
+    """Resolve and validate every selectable script in the latest Schedule release."""
     releases = _release_list(log=log)
-    release = pick_lua_release(releases if isinstance(releases, list) else [])
+    release = pick_schedule_release(releases if isinstance(releases, list) else [])
     if release is None:
         raise ReleaseError(
-            f"no stable lua-vX.Y.Z catalog with .lua assets and manifests found "
+            f"no stable schedule-vX.Y.Z catalog with .yaml assets and manifests found "
             f"among the newest 100 releases of {FIRMWARE_REPO}.")
 
     tag = release["tag_name"]
@@ -455,21 +456,21 @@ def fetch_latest_lua_catalog(log=print) -> LuaCatalogRelease:
         for asset in release.get("assets") or []
         if isinstance(asset, dict) and asset.get("name")
     }
-    scripts: list[LuaScriptRelease] = []
+    scripts: list[ScheduleScriptRelease] = []
     for asset_name in sorted(
-            name for name in assets if LUA_ASSET_RE.fullmatch(name)):
+            name for name in assets if SCHEDULE_ASSET_RE.fullmatch(name)):
         manifest_asset = assets.get(f"{asset_name}.manifest.json")
         if manifest_asset is None:
             raise ReleaseError(
                 f"{tag} asset {asset_name} has no companion manifest")
         manifest_url = manifest_asset.get("browser_download_url") or ""
         manifest = _cached_manifest(manifest_url)
-        scripts.append(_validated_lua_script(tag, assets[asset_name], manifest))
+        scripts.append(_validated_schedule_script(tag, assets[asset_name], manifest))
 
     if not scripts:
-        raise ReleaseError(f"{tag} contains no selectable Lua scripts")
-    log(f"Lua catalog {tag}: {len(scripts)} released script(s).")
-    return LuaCatalogRelease(tag=tag, scripts=tuple(scripts))
+        raise ReleaseError(f"{tag} contains no selectable Schedule scripts")
+    log(f"Schedule catalog {tag}: {len(scripts)} released script(s).")
+    return ScheduleCatalogRelease(tag=tag, scripts=tuple(scripts))
 
 
 class ReleaseImages:
@@ -518,7 +519,7 @@ def fetch_latest(log=print) -> ReleaseImages:
     """Download (or reuse from cache) the newest published firmware release.
 
     Deliberately NOT /releases/latest: that endpoint returns the most recently
-    published release of ANY kind, and this repo also publishes lua-v* and
+    published release of ANY kind, and this repo also publishes schedule-v* and
     flash-gui-v* releases. pick_firmware_release() filters to real firmware
     releases (vX.Y.Z + flash-bundle asset, no drafts/prereleases).
     """
@@ -593,7 +594,7 @@ def _download(url: str, dest: Path, expect_size: int | None) -> None:
     tmp.replace(dest)
 
 
-def script_bytes(script: LuaScriptRelease, log=print) -> bytes:
+def script_bytes(script: ScheduleScriptRelease, log=print) -> bytes:
     """The script's exact released bytes, cached and digest-checked.
 
     Cached under the release digest so the name can never collide across
@@ -609,7 +610,7 @@ def script_bytes(script: LuaScriptRelease, log=print) -> bytes:
     if log is None:
         log = lambda _message: None
 
-    cached = SCRIPTS_CACHE_DIR / f"{script.sha256}.lua"
+    cached = SCRIPTS_CACHE_DIR / f"{script.sha256}.yaml"
     if cached.is_file():
         blob = cached.read_bytes()
         if hashlib.sha256(blob).hexdigest() == script.sha256:

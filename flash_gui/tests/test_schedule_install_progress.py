@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""The Lua install wait must narrate itself.
+"""The Schedule install wait must narrate itself.
 
 It polls silently for up to 6 minutes while the device downloads the script over
 Wi-Fi. With no output, a healthy slow download was indistinguishable from a hung
@@ -12,7 +12,7 @@ GUI holds the port for the duration.
 import pytest
 
 from flash_gui import ambyte_serial, procedure
-from flash_gui.ambyte_serial import ConsoleError, LuaReleaseStatus
+from flash_gui.ambyte_serial import ConsoleError, ScheduleReleaseStatus
 from flash_gui.procedure import ProcedureError
 
 SHA = "a" * 64
@@ -36,13 +36,13 @@ class _FakeConsole:
         self._replies = list(replies)
         self.closed = False
 
-    def lua_install(self, *args, **kwargs):
+    def schedule_install(self, *args, **kwargs):
         return None
 
     def wifi_connected(self, timeout=10.0):
         return True
 
-    def lua_release(self, timeout=10.0):
+    def schedule_release(self, timeout=10.0):
         reply = self._replies.pop(0) if self._replies else self._stale()
         if isinstance(reply, Exception):
             raise reply
@@ -50,7 +50,7 @@ class _FakeConsole:
 
     @staticmethod
     def _stale():
-        return LuaReleaseStatus(sha256="b" * 64, script_version="0.9.0",
+        return ScheduleReleaseStatus(sha256="b" * 64, script_version="0.9.0",
                                 built_against_fw="v1.8.1",
                                 installed_on_fw="v1.8.1", verified=True,
                                 running=True)
@@ -69,17 +69,17 @@ def wired(monkeypatch):
     def run(console, script_sha=SHA):
         monkeypatch.setattr(ambyte_serial, "connect_after_boot",
                             lambda *a, **k: console)
-        script = procedure.LuaScriptRelease(
-            tag="lua-v1.2.0", asset_name="main.lua", script_name="main",
+        script = procedure.ScheduleScriptRelease(
+            tag="schedule-v1.2.0", asset_name="default.yaml", script_name="default",
             script_version="1.2.0", built_against_fw="v1.8.1",
-            asset_url="https://example.test/main.lua", sha256=script_sha,
-            size_bytes=6731, campaign_id="lua-v1.2.0")
+            asset_url="https://example.test/default.yaml", sha256=script_sha,
+            size_bytes=6731, campaign_id="schedule-v1.2.0")
         ctx = object.__new__(procedure.SessionContext)
-        ctx.lua_script = script
+        ctx.schedule_script = script
         ctx.wifi_ssid = "protoMUSIC-GATEWAY"
         run_state = object.__new__(procedure.DeviceRun)
         run_state.port = "COM7"
-        return procedure.install_lua_script(ctx, run_state, log=messages.append)
+        return procedure.install_schedule_script(ctx, run_state, log=messages.append)
 
     return run, messages, clock
 
@@ -90,7 +90,7 @@ def test_progress_is_reported_while_the_device_downloads(wired):
     with pytest.raises(ProcedureError):
         run(_FakeConsole([]))
 
-    progress = [m for m in messages if m.startswith("Still waiting for main.lua")]
+    progress = [m for m in messages if m.startswith("Still waiting for default.yaml")]
     # Roughly one line per 15 s across 360 s, not a single silent block.
     assert len(progress) >= 15
     # Each line carries what the device reports and how long is left.
@@ -111,7 +111,7 @@ def test_progress_lines_are_spaced_not_emitted_every_poll(wired):
 def test_console_hiccups_are_surfaced_rather_than_swallowed(wired):
     run, messages, _clock = wired
     with pytest.raises(ProcedureError):
-        run(_FakeConsole([ConsoleError("'lua release' got no prompt back")] * 200))
+        run(_FakeConsole([ConsoleError("'schedule release' got no prompt back")] * 200))
     progress = [m for m in messages if m.startswith("Still waiting")]
     assert progress, "a console that never answers must still report progress"
     assert "no prompt back" in progress[0]
@@ -119,7 +119,7 @@ def test_console_hiccups_are_surfaced_rather_than_swallowed(wired):
 
 def test_success_still_returns_immediately_without_noise(wired):
     run, messages, _clock = wired
-    good = LuaReleaseStatus(sha256=SHA, script_version="1.2.0",
+    good = ScheduleReleaseStatus(sha256=SHA, script_version="1.2.0",
                             built_against_fw="v1.8.1",
                             installed_on_fw="v1.8.1", verified=True,
                             running=True)
@@ -142,7 +142,7 @@ class _WifiConsole(_FakeConsole):
             raise state
         return state
 
-    def lua_install(self, *a, **k):
+    def schedule_install(self, *a, **k):
         self.installed = True
 
 
@@ -153,8 +153,8 @@ def test_no_ip_fails_fast_instead_of_after_the_full_install_deadline(wired):
     with pytest.raises(ProcedureError, match="never got an IP"):
         run(console)
     # Fails on the Wi-Fi budget, not the 360 s install budget.
-    assert clock.now - started < procedure.LUA_INSTALL_DEADLINE_S
-    assert clock.now - started >= procedure.LUA_WIFI_DEADLINE_S
+    assert clock.now - started < procedure.SCHEDULE_INSTALL_DEADLINE_S
+    assert clock.now - started >= procedure.SCHEDULE_WIFI_DEADLINE_S
     # And crucially, never queued a download that could not have worked.
     assert not console.installed
 
