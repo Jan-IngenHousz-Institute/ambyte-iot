@@ -26,7 +26,9 @@ broker. Do not use a production device identity against a shared broker.
    - `BENCH sample begin` once per minute
    - MQTT connects and PUBACK progress begins
 
-4. Stop the schedule so the flood is the only producer of measurement ids, then
+4. Stop the schedule so scheduled measurement rounds no longer compete with the
+   flood. The five-minute firmware heartbeat can still consume occasional ids,
+   which is why the completion line's `stored=` count is authoritative. Then
    start the finite flood. This example produces the historical ~1.2 KiB payload
    at 10/s for enough time to cross 150,000 messages:
 
