@@ -43,7 +43,8 @@ _Static_assert(PAYLOAD_V3_MAX_SEGMENTS == 16U,
  * [0,63000) trace data and [63000,64536) fallback metadata. event_log consumes
  * both synchronously before unlock, so neither aliases live bytes or escapes
  * its ownership window. The buffer is shared by the main Lua task, lua exec,
- * and the future schedule runner, hence the lazily published mutex. */
+ * and the future schedule runner, hence the lazily published mutex. A
+ * uint16/compact-storage v2 will shrink this need. */
 static char *s_payload;
 static SemaphoreHandle_t s_payload_mtx;
 static portMUX_TYPE s_payload_mtx_init_lock = portMUX_INITIALIZER_UNLOCKED;

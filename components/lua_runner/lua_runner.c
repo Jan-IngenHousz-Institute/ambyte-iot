@@ -1133,6 +1133,9 @@ static int ambit_push_result(lua_State *L, esp_err_t err,
 {
     if (err == ESP_ERR_INVALID_RESPONSE)
         return lua_push_nil_reason(L, "ambit run returned no arrays");
+    /* Deliberate adapter delta: payload-reserve OOM returns nil+reason instead
+     * of the old luaL_error longjmp, so it cannot leak the payload mutex. Lua
+     * is removed in T5, so no lasting script contract depends on the old raise. */
     if (err != ESP_OK)
         return lua_push_nil_reason(L, esp_err_to_name(err));
 
@@ -1147,6 +1150,7 @@ static int ambit_push_result(lua_State *L, esp_err_t err,
 static int l_ambit_run(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    /* Intentional hardening delta: reject invalid channels in the adapter. */
     if (ch >= UART_SENSOR_NUM_CHANNELS)
         return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -1245,6 +1249,7 @@ static int l_ambit_trigger(lua_State *L)
 
     ambit_capture_protocol_ref(L, 3, &opts.protocol_ref);
     ambit_trace_segment_t trace[PAYLOAD_V3_MAX_SEGMENTS];
+    /* Intentional hardening delta: validate before clearing a retained result. */
     ambit_read_segments(L, 2, nseg, trace);
     cmd_result_t res = ambit_trace_trigger(ch, trace, (size_t)nseg, &opts,
                                            &s_ambit_pending[ch]);
