@@ -3,4 +3,4 @@ name: neg
 jobs:
   j:
     on: { every: 5m }
-    steps: [ { uses: db/store-event, with: { data: { magic: $unknown_thing } } } ]
+    steps: [ { uses: db/store-event, with: { kind: k, data: { magic: $unknown_thing } } } ]

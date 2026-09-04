@@ -1736,19 +1736,18 @@ static int cli_cmd_schedule(int argc, char **argv)
                k_kind[src.kind & 3]);
         if (src.sha256[0]) printf("  sha256=%s\r\n", src.sha256);
         if (src.reason[0]) printf("  fallback reason: %s\r\n", src.reason);
-        const sched_program_t *prog = sched_runner_program();
-        if (prog == NULL) {
+        const int n = sched_runner_job_count();
+        if (n == 0) {
             printf("  no program loaded yet\r\n");
             return 0;
         }
-        printf("  id=%s version=%s workbook=%s name=%s\r\n",
-               sched_pool_str(prog, prog->id_off) ?: "-",
-               sched_pool_str(prog, prog->version_off) ?: "-",
-               sched_pool_str(prog, prog->workbook_version_id_off) ?: "-",
-               sched_pool_str(prog, prog->name_off) ?: "-");
+        sched_header_t hdr;
+        if (sched_runner_header(&hdr) == ESP_OK) {
+            printf("  id=%s version=%s workbook=%s name=%s\r\n",
+                   hdr.id, hdr.version, hdr.workbook, hdr.name);
+        }
         printf("  %-16s %-20s %6s %5s %5s %6s %8s\r\n",
                "job", "next due (UTC)", "runs", "fail", "skip", "streak", "last ms");
-        const int n = sched_runner_job_count();
         for (int i = 0; i < n; i++) {
             sched_job_status_t js;
             if (sched_runner_job_status(i, &js) != ESP_OK) continue;

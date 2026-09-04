@@ -935,6 +935,116 @@ static void test_due_model(void)
     }
 }
 
+/* ── clock-step re-anchor (T3 review blocker 1) ────────────────────────── */
+
+static void test_due_reanchor(void)
+{
+    sched_program_t *p;
+    int64_t t0 = time_sync_make(2026, 6, 21, 0, 0, 0); /* grid-aligned */
+    const char *every_1m =
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 1m }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n";
+
+    /* backward 1 h correction: without re-anchor the stale due (t0+120)
+     * would silence the 1 m job for ~1 h; re-anchor resumes it within one
+     * period on the new timebase */
+    sched_due_t *d = mk_due(every_1m, t0, identity_localize, &p);
+    CHECK(d != NULL);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0 + 60) == 1);            /* fired; next due t0+120 */
+        int64_t now = t0 + 60 - 3600;                      /* RTC corrected back 1 h */
+        CHECK(sched_due_poll(d, now) == 0);                /* stale due: silent */
+        sched_due_reanchor(d, now);
+        CHECK(d->jobs[0].due[0] == now + 60);              /* re-anchored grid */
+        CHECK(sched_due_poll(d, now + 30) == 0);
+        CHECK(sched_due_poll(d, now + 60) == 1);           /* resumes within a period */
+        CHECK(d->jobs[0].skipped == 0);                    /* no fake missed slots */
+        CHECK(d->jobs[0].runs == 2);
+        free(p);
+        free(d);
+    }
+
+    /* forward ~2 h correction: dues at/past the new now are LEFT for poll's
+     * late-grace/missed accounting — counted skipped slots, then the in-grace
+     * slot fires (grace for every 1m is the period, 60 s) */
+    d = mk_due(every_1m, t0, identity_localize, &p);
+    CHECK(d != NULL);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0 + 60) == 1);
+        int64_t now = t0 + 7260;                           /* RTC corrected forward */
+        sched_due_reanchor(d, now);
+        CHECK(d->jobs[0].due[0] == t0 + 120);              /* past due untouched */
+        CHECK(sched_due_poll(d, now) == 1);                /* t0+7260 slot fires */
+        CHECK(d->jobs[0].skipped == 119);                  /* t0+120..t0+7200 counted */
+        free(p);
+        free(d);
+    }
+
+    /* boot pending is not re-armed by a re-anchor (backward step after the
+     * boot firing was consumed) */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: [ boot, { every: 1m } ]\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        t0, identity_localize, &p);
+    CHECK(d != NULL);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0) == 1);                 /* boot fires */
+        CHECK(d->jobs[0].boot_pending == 0);
+        sched_due_reanchor(d, t0 + 60 - 3600);
+        CHECK(d->jobs[0].boot_pending == 0);               /* stays consumed */
+        CHECK(sched_due_poll(d, t0 + 60 - 3600) == 0);     /* no boot refire */
+        free(p);
+        free(d);
+    }
+
+    /* fired-minute latch preserved: a sub-minute backward step re-anchors the
+     * cron due into the minute that already fired, and the latch is what
+     * prevents the double-fire */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { cron: \"* * * * *\" }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        t0, identity_localize, &p);
+    CHECK(d != NULL);
+    if (d != NULL) {
+        CHECK(sched_due_poll(d, t0 + 60) == 1);
+        int64_t latch = d->jobs[0].fired_minute;
+        sched_due_reanchor(d, t0 + 30);                    /* 30 s backward */
+        CHECK(d->jobs[0].fired_minute == latch);           /* latch preserved */
+        CHECK(d->jobs[0].due[0] == t0 + 60);               /* re-anchored into */
+        CHECK(sched_due_poll(d, t0 + 60) == 0);            /* ...but no refire */
+        CHECK(sched_due_poll(d, t0 + 120) == 1);           /* next minute normal */
+        CHECK(d->jobs[0].runs == 2);
+        free(p);
+        free(d);
+    }
+
+    /* gate state preserved and re-anchor without a step is a no-op on the
+     * grid: windowed job mid-window keeps gate_open, no spurious entry edge */
+    d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n  j:\n    on: { every: 5m }\n"
+        "    when: { window: { from: \"10:00\", to: \"11:00\" } }\n"
+        "    steps: [ { uses: device/log, with: { message: hi } } ]\n",
+        time_sync_make(2026, 6, 21, 9, 59, 0), identity_localize, &p);
+    CHECK(d != NULL);
+    if (d != NULL) {
+        int64_t ten = time_sync_make(2026, 6, 21, 10, 0, 0);
+        CHECK(sched_due_poll(d, ten) == 1);                /* on_enter */
+        CHECK(d->jobs[0].gate_open == 1);
+        int64_t due_before = d->jobs[0].due[0];
+        sched_due_reanchor(d, ten + 120);                  /* no clock step */
+        CHECK(d->jobs[0].due[0] == due_before);            /* grid unchanged */
+        CHECK(d->jobs[0].gate_open == 1);                  /* gate preserved */
+        CHECK(sched_due_poll(d, ten + 300) == 1);          /* grid, no 2nd entry */
+        CHECK(d->jobs[0].runs == 2);
+        free(p);
+        free(d);
+    }
+}
+
 /* DST through the due model with the libc offset: fall-back fires the
  * doubled wall minute once; spring-forward counts the nonexistent slot as
  * skipped, never fired. */
@@ -1002,10 +1112,10 @@ static void test_actions_dump(void)
     CHECK(got == need);
     CHECK(buf[need] == '\0');
     /* actions with required inputs require the outer `with` (review):
-     * trace/actinic/log/sleep do; spectrum/leaf-temp/status-report/
-     * store-event must not */
-    CHECK(count_occurrences(buf, "\"required\":[\"uses\",\"with\"]") == 4);
-    CHECK(count_occurrences(buf, "\"required\":[\"uses\"]") == 4);
+     * trace/actinic/store-event/log/sleep do; spectrum/leaf-temp/
+     * status-report must not */
+    CHECK(count_occurrences(buf, "\"required\":[\"uses\",\"with\"]") == 5);
+    CHECK(count_occurrences(buf, "\"required\":[\"uses\"]") == 3);
     /* truncation reports the would-be length (snprintf semantics); scratch
      * buffer so the counts above stay valid */
     {
@@ -1024,6 +1134,7 @@ int main(void)
     test_cron_dst();
     test_windows();
     test_due_model();
+    test_due_reanchor();
     test_due_dst();
     test_actions_dump();
 

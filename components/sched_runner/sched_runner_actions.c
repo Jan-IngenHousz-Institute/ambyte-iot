@@ -16,8 +16,13 @@
  *
  * Inputs arrive pre-validated and typed by the compiler; these functions
  * never parse. Every action polls sched_runner_should_stop() between UART
- * transactions so sched_runner_stop() lands within one poll interval plus
- * one transaction. Sensor actions are ping-gated: the 5-minute negative ping
+ * transactions — before/after every poll, fetch, read or pulse, and before
+ * moving to the next channel — so sched_runner_stop() lands within one poll
+ * interval plus one transaction. Routine failures are NOT logged here (the
+ * failure-streak throttle in run_job is the single logging path, or a
+ * persistently failing job floods the log); the action records the reason in
+ * ctx->fail_detail via act_fail() and run_job logs it when the throttle
+ * decides to. Sensor actions are ping-gated: the 5-minute negative ping
  * cache in uart_sensors is the absent-channel flood fix and stays in
  * firmware, so a schedule that names an empty channel costs one ping per
  * cache TTL, not one wake burst per firing.
@@ -87,6 +92,17 @@ static bool ch_present(uint8_t ch)
     return r.status == ESP_OK && connected;
 }
 
+/* Record a routine failure's context for run_job's throttled log line and
+ * return ESP_FAIL. The action itself stays silent (single logging path). */
+static esp_err_t act_fail(sched_runner_act_ctx_t *ctx, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ctx->fail_detail, sizeof(ctx->fail_detail), fmt, ap);
+    va_end(ap);
+    return ESP_FAIL;
+}
+
 /* Interruptible sleep in 100 ms chunks; returns false when the runner is
  * stopping. The chunk bounds the stop latency, not the timing accuracy. */
 static bool act_sleep_ms(uint32_t ms)
@@ -138,8 +154,9 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                             ? sched_pool_str(prog, e_proto->u.str_off) : NULL;
     const sched_protocol_t *proto = pname ? find_protocol(prog, pname) : NULL;
     if (proto == NULL) {
-        ESP_LOGW(TAG, "%s: unknown protocol '%s'", ctx->job_name, pname ? pname : "?");
-        return ESP_ERR_NOT_FOUND;
+        /* The compiler guarantees the reference; a miss is a build bug, and
+         * it fails every firing — route it through the throttled path. */
+        return act_fail(ctx, "unknown protocol '%s'", pname ? pname : "?");
     }
     /* tag is what lands in protocol_ref.protocol (the v3 metadata.protocol
      * column the Databricks filters match on); default = protocol name. */
@@ -183,12 +200,13 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         if (!(mask & (1u << ch))) continue;
         if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
+        if (sched_runner_should_stop()) break; /* between ping and trigger */
         cmd_result_t r = ambit_trace_trigger(ch, segs, (size_t)nseg, &opts, &s_pend[ch]);
         if (r.status == ESP_OK) {
             t0[ch] = esp_timer_get_time() / 1000;
             pending_count++;
         } else {
-            ESP_LOGW(TAG, "%s ch%u: trigger failed: %s", tag, ch, r.message);
+            (void)act_fail(ctx, "ch%u trigger: %s", ch, r.message);
         }
     }
 
@@ -198,10 +216,12 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         int64_t now = esp_timer_get_time() / 1000;
         for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
             if (t0[ch] == 0) continue;
+            if (sched_runner_should_stop()) break; /* before the next channel */
             int64_t elapsed = now - t0[ch];
             if (elapsed < est_ms * POLL_START_PCT / 100) continue;
             uint8_t st = 0xFF;
             cmd_result_t pr = cmd_ambit_poll(ch, &st, TRACE_POLL_TIMEOUT_MS);
+            if (sched_runner_should_stop()) break; /* between poll and fetch */
             if (pr.status == ESP_OK && st == AMBIT_ASYNC_DONE) {
                 ambit_trace_result_t res;
                 cmd_result_t fr = ambit_trace_fetch(ch, &s_pend[ch], true,
@@ -212,19 +232,19 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                              (long long)res.measure_id);
                     fetched++;
                 } else {
-                    ESP_LOGW(TAG, "%s ch%u: fetch failed: %s", tag, ch, fr.message);
+                    (void)act_fail(ctx, "ch%u fetch: %s", ch, fr.message);
                     chan_failed++;
                 }
                 t0[ch] = 0;
                 pending_count--;
             } else if (pr.status == ESP_OK && st == AMBIT_ASYNC_ERROR) {
-                ESP_LOGW(TAG, "%s ch%u: ambit reported run error", tag, ch);
+                (void)act_fail(ctx, "ch%u: ambit reported run error", ch);
                 t0[ch] = 0;
                 pending_count--;
                 chan_failed++;
             } else if (elapsed > est_ms + margin_ms) {
-                ESP_LOGW(TAG, "%s ch%u: no result after %lldms — ambit broken?",
-                         tag, ch, (long long)elapsed);
+                (void)act_fail(ctx, "ch%u: no result after %lldms — ambit broken?",
+                               ch, (long long)elapsed);
                 t0[ch] = 0;
                 pending_count--;
                 chan_failed++;
@@ -239,8 +259,13 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
      * failed" are job failures; a partial round (one of two channels stored)
      * is a success with a warning trail, as under main.lua. A stop abort is
      * neither (run_job skips counting when should_stop is set). */
-    if (pending_count + fetched + chan_failed == 0) return ESP_FAIL;
-    if (fetched == 0 && !sched_runner_should_stop()) return ESP_FAIL;
+    if (pending_count + fetched + chan_failed == 0) {
+        return act_fail(ctx, "no AMBIT responded");
+    }
+    if (fetched == 0 && !sched_runner_should_stop()) {
+        if (ctx->fail_detail[0] == '\0') (void)act_fail(ctx, "no channel stored");
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -270,6 +295,7 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
         if (!(mask & (1u << ch))) continue;
         if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
+        if (sched_runner_should_stop()) break; /* between ping and read */
         present++;
         int64_t start_ms = now_wall_ms();
         uint16_t spec[10] = { 0 };
@@ -277,7 +303,7 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
         cmd_result_t r = cmd_ambit_get_spec(ch, spec, &par);
         int64_t end_ms = now_wall_ms();
         if (r.status != ESP_OK) {
-            ESP_LOGW(TAG, "%s: spectra ch%u: read failed: %s", ctx->job_name, ch, r.message);
+            (void)act_fail(ctx, "spectra ch%u: read failed: %s", ch, r.message);
             continue;
         }
         char payload[160];
@@ -289,7 +315,7 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
         /* legacy_1Hz_spec.lua:185-192: a missing stored id is a failure, not
          * a warning — a measurement that didn't persist didn't happen. */
         if (mid < 0) {
-            ESP_LOGW(TAG, "%s: spectra ch%u: PAR=%.2f store failed", ctx->job_name, ch, (double)par);
+            (void)act_fail(ctx, "spectra ch%u: PAR=%.2f store failed", ch, (double)par);
             continue;
         }
         ESP_LOGI(TAG, "%s: spectra ch%u: PAR=%.2f id=%lld",
@@ -297,8 +323,10 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
         stored_ok++;
     }
     if (present == 0) {
-        ESP_LOGW(TAG, "%s: spectra: no AMBIT responded", ctx->job_name);
-        return ESP_FAIL;
+        return act_fail(ctx, "spectra: no AMBIT responded");
+    }
+    if (stored_ok != present && ctx->fail_detail[0] == '\0') {
+        (void)act_fail(ctx, "spectra: %d/%d channels stored", stored_ok, present);
     }
     return stored_ok == present ? ESP_OK : ESP_FAIL;
 }
@@ -313,13 +341,14 @@ static esp_err_t act_ambit_leaf_temp(void *vctx, const sched_step_t *step,
         if (!(mask & (1u << ch))) continue;
         if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
+        if (sched_runner_should_stop()) break; /* between ping and read */
         present++;
         int64_t start_ms = now_wall_ms();
         float leaf = 0, chip = 0;
         cmd_result_t r = cmd_ambit_get_temp(ch, &leaf, &chip);
         int64_t end_ms = now_wall_ms();
         if (r.status != ESP_OK) {
-            ESP_LOGW(TAG, "%s: leaf-temp ch%u: read failed: %s", ctx->job_name, ch, r.message);
+            (void)act_fail(ctx, "leaf-temp ch%u: read failed: %s", ch, r.message);
             continue;
         }
         char payload[64];
@@ -327,12 +356,12 @@ static esp_err_t act_ambit_leaf_temp(void *vctx, const sched_step_t *step,
                  (double)leaf, (double)chip);
         int64_t mid = store_small(ch, "get_temp", payload, start_ms, end_ms);
         if (mid < 0) {
-            ESP_LOGW(TAG, "%s: leaf-temp ch%u: store failed", ctx->job_name, ch);
+            (void)act_fail(ctx, "leaf-temp ch%u: store failed", ch);
             continue;
         }
         stored_ok++;
     }
-    if (present == 0) return ESP_FAIL;
+    if (present == 0) return act_fail(ctx, "leaf-temp: no AMBIT responded");
     return stored_ok == present ? ESP_OK : ESP_FAIL;
 }
 
@@ -359,12 +388,13 @@ static esp_err_t act_ambit_actinic(void *vctx, const sched_step_t *step,
 
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (!(mask & (1u << ch))) continue;
+        if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
+        if (sched_runner_should_stop()) break; /* between ping and info read */
         ambit_device_info_t info;
         cmd_result_t ir = cmd_ambit_device_info(ch, &info);
         if (ir.status != ESP_OK || !info.valid) {
-            ESP_LOGW(TAG, "%s: actinic ch%u: no device info (%s)",
-                     ctx->job_name, ch, ir.message);
+            (void)act_fail(ctx, "actinic ch%u: no device info (%s)", ch, ir.message);
             result = ESP_FAIL;
             continue;
         }
@@ -377,10 +407,13 @@ static esp_err_t act_ambit_actinic(void *vctx, const sched_step_t *step,
     while (remaining > 0 && !sched_runner_should_stop()) {
         const int chunk = remaining > ACTINIC_CHUNK_MS ? ACTINIC_CHUNK_MS : (int)remaining;
         for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
-            if (!(mask & (1u << ch)) || !ch_present(ch)) continue;
+            if (sched_runner_should_stop()) break; /* before the next channel */
+            if (!(mask & (1u << ch))) continue;
+            if (!ch_present(ch)) continue;
+            if (sched_runner_should_stop()) break; /* between ping and pulse */
             cmd_result_t r = cmd_ambit_actinic(ch, 5, dac[ch], (uint8_t)(chunk / 100));
             if (r.status != ESP_OK) {
-                ESP_LOGW(TAG, "%s: actinic ch%u: %s", ctx->job_name, ch, r.message);
+                (void)act_fail(ctx, "actinic ch%u: %s", ch, r.message);
                 result = ESP_FAIL;
             } else {
                 lit[ch] = true;
@@ -416,127 +449,49 @@ static esp_err_t act_status_report(void *vctx, const sched_step_t *step,
     }
     cmd_result_t r = cmd_store_status_event();
     if (r.status != ESP_OK) {
-        ESP_LOGW(TAG, "%s: status-report: %s", ctx->job_name, r.message);
-        return ESP_FAIL;
+        return act_fail(ctx, "status-report: %s", r.message);
     }
     return ESP_OK;
 }
 
 /* ── db/store-event ────────────────────────────────────────────────────── */
 
-/* Minimal JSON object writer for the compiler-validated flat maps: keys are
- * schedule-authored strings, values typed scalars with $-placeholders
- * resolved on device (design catalog row). Bounded: ≤16 keys per map, values
- * out of the 4 KiB string pool. */
-
-typedef struct {
-    char  *buf;
-    size_t cap, len;
-    bool   overflow;
-} jw_t;
-
-static void jw_raw(jw_t *w, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(w->buf + (w->len < w->cap ? w->len : w->cap),
-                      w->len < w->cap ? w->cap - w->len : 0, fmt, ap);
-    va_end(ap);
-    if (n < 0 || w->len + (size_t)n >= w->cap) w->overflow = true;
-    if (n > 0) w->len += (size_t)n;
-}
-
-static void jw_str(jw_t *w, const char *s)
-{
-    jw_raw(w, "\"");
-    for (const char *p = s; *p != '\0' && !w->overflow; p++) {
-        if (*p == '"' || *p == '\\') jw_raw(w, "\\%c", *p);
-        else jw_raw(w, "%c", *p);
-    }
-    jw_raw(w, "\"");
-}
-
-/* Resolve a $-placeholder to its typed JSON token. Unset device facts
- * resolve to "" / 0 rather than failing the event — a partially-provisioned
- * unit still reports. */
-static void jw_placeholder(jw_t *w, const char *ph, const sched_runner_act_ctx_t *ctx)
+/* Resolve a $-placeholder to its typed JSON token (the writer itself lives in
+ * sched_runner_json.c, host-tested). Unset device facts resolve to "" / 0
+ * rather than failing the event — a partially-provisioned unit still
+ * reports. */
+static void jw_placeholder(sched_jw_t *w, const char *ph,
+                           const sched_runner_act_ctx_t *ctx)
 {
     if (strcmp(ph, "$deployment") == 0) {
-        jw_str(w, ctx->deployment);
+        sched_jw_str(w, ctx->deployment);
     } else if (strcmp(ph, "$lat") == 0 || strcmp(ph, "$lon") == 0) {
         double lat, lon;
         time_sync_get_location(&lat, &lon, NULL);
-        jw_raw(w, "%.5f", strcmp(ph, "$lat") == 0 ? lat : lon);
+        sched_jw_raw(w, "%.5f", strcmp(ph, "$lat") == 0 ? lat : lon);
     } else if (strcmp(ph, "$tz") == 0) {
         char tz[48] = "";
         (void)device_config_get_timezone(tz, sizeof(tz));
-        jw_str(w, tz);
+        sched_jw_str(w, tz);
     } else if (strcmp(ph, "$boot_epoch") == 0) {
-        jw_raw(w, "%lld", (long long)ctx->boot_epoch);
+        sched_jw_raw(w, "%lld", (long long)ctx->boot_epoch);
     } else if (strcmp(ph, "$uptime_ms") == 0) {
-        jw_raw(w, "%lld", (long long)(esp_timer_get_time() / 1000));
+        sched_jw_raw(w, "%lld", (long long)(esp_timer_get_time() / 1000));
     } else if (strcmp(ph, "$sd_ready") == 0) {
         bool ready = false;
         (void)cmd_sd_ready(&ready);
-        jw_raw(w, "%s", ready ? "true" : "false");
+        sched_jw_raw(w, "%s", ready ? "true" : "false");
     } else if (strcmp(ph, "$job.runs") == 0) {
-        jw_raw(w, "%lu", (unsigned long)ctx->runs);
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->runs);
     } else if (strcmp(ph, "$job.failures") == 0) {
-        jw_raw(w, "%lu", (unsigned long)ctx->failures);
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->failures);
     } else if (strcmp(ph, "$job.skipped") == 0) {
-        jw_raw(w, "%lu", (unsigned long)ctx->skipped);
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->skipped);
     } else if (strcmp(ph, "$job.fail_streak") == 0) {
-        jw_raw(w, "%lu", (unsigned long)ctx->fail_streak);
+        sched_jw_raw(w, "%lu", (unsigned long)ctx->fail_streak);
     } else {
-        jw_str(w, ph); /* compiler validated the set; unreachable */
+        sched_jw_str(w, ph); /* compiler validated the set; unreachable */
     }
-}
-
-static void jw_value(jw_t *w, const sched_entry_t *en, const sched_program_t *prog,
-                     const sched_runner_act_ctx_t *ctx)
-{
-    switch (en->type) {
-    case SCHED_VAL_INT:   jw_raw(w, "%lld", (long long)en->u.i); break;
-    case SCHED_VAL_FLOAT: jw_raw(w, "%g", en->u.f); break;
-    case SCHED_VAL_BOOL:  jw_raw(w, "%s", en->u.i ? "true" : "false"); break;
-    default: {
-        const char *s = sched_pool_str(prog, en->u.str_off);
-        if (s != NULL && s[0] == '$') jw_placeholder(w, s, ctx);
-        else jw_str(w, s ? s : "");
-        break;
-    }
-    }
-}
-
-/* Serialize one flat map input (data/metadata). Returns false on overflow. */
-static bool build_map_json(char *buf, size_t cap, const char *input_name,
-                           const char *extra_key, const char *extra_val,
-                           const sched_step_t *step, const sched_program_t *prog,
-                           const sched_runner_act_ctx_t *ctx)
-{
-    jw_t w = { buf, cap, 0, false };
-    jw_raw(&w, "{");
-    bool first = true;
-    if (extra_key != NULL) {
-        jw_str(&w, extra_key);
-        jw_raw(&w, ":");
-        jw_str(&w, extra_val);
-        first = false;
-    }
-    for (int e = 0; e < step->entry_count; e++) {
-        const sched_entry_t *en = &prog->entries[step->entry_start + e];
-        const sched_input_decl_t *decl = &step->action->inputs[en->input_idx];
-        if (strcmp(decl->name, input_name) != 0 || en->key_off == SCHED_POOL_NONE) {
-            continue;
-        }
-        jw_raw(&w, "%s", first ? "" : ",");
-        jw_str(&w, sched_pool_str(prog, en->key_off));
-        jw_raw(&w, ":");
-        jw_value(&w, en, prog, ctx);
-        first = false;
-    }
-    jw_raw(&w, "}");
-    return !w.overflow;
 }
 
 static esp_err_t act_db_store_event(void *vctx, const sched_step_t *step,
@@ -554,24 +509,27 @@ static esp_err_t act_db_store_event(void *vctx, const sched_step_t *step,
     int64_t measure_id = 0;
     cmd_result_t idr = cmd_next_measure_id(&measure_id);
     if (idr.status != ESP_OK) {
-        ESP_LOGW(TAG, "%s: store-event: no measure id: %s", ctx->job_name, idr.message);
-        return ESP_FAIL;
+        return act_fail(ctx, "store-event: no measure id: %s", idr.message);
     }
 
-    /* kind stamps into data.kind (design catalog row). 768 B covers 16 keys
-     * of realistic field data with placeholder expansions; overflow fails the
-     * step loudly instead of storing a torn object. */
+    /* kind stamps into data.kind (design catalog row). The compiler REQUIRES
+     * kind (T3 review blocker 5: an omitted kind — e.g. a store-event step
+     * with no `with:` at all — reached jw_str(NULL) and reboot-looped the
+     * device); the runtime guard stays as belt-and-braces — absent kind
+     * simply omits the member instead of dereferencing NULL. 768 B covers
+     * 16 keys of realistic field data with placeholder expansions; overflow
+     * fails the step loudly instead of storing a torn object. */
     char payload[768], metadata[768];
-    if (!build_map_json(payload, sizeof payload, "data", "kind", kind,
-                        step, prog, ctx)) {
-        ESP_LOGW(TAG, "%s: store-event: data map too large", ctx->job_name);
-        return ESP_FAIL;
+    if (!sched_build_map_json(payload, sizeof payload, "data",
+                              kind != NULL ? "kind" : NULL, kind,
+                              step, prog, ctx, jw_placeholder)) {
+        return act_fail(ctx, "store-event: data map too large");
     }
     const bool has_meta = step_input(step, prog, "metadata") != NULL;
-    if (has_meta && !build_map_json(metadata, sizeof metadata, "metadata",
-                                    NULL, NULL, step, prog, ctx)) {
-        ESP_LOGW(TAG, "%s: store-event: metadata map too large", ctx->job_name);
-        return ESP_FAIL;
+    if (has_meta && !sched_build_map_json(metadata, sizeof metadata, "metadata",
+                                          NULL, NULL, step, prog, ctx,
+                                          jw_placeholder)) {
+        return act_fail(ctx, "store-event: metadata map too large");
     }
 
     const int64_t now = now_wall_ms();
@@ -586,8 +544,7 @@ static esp_err_t act_db_store_event(void *vctx, const sched_step_t *step,
     };
     cmd_result_t r = cmd_store_event(&d);
     if (r.status != ESP_OK) {
-        ESP_LOGW(TAG, "%s: store-event: %s", ctx->job_name, r.message);
-        return ESP_FAIL;
+        return act_fail(ctx, "store-event: %s", r.message);
     }
     ESP_LOGI(TAG, "%s: stored event id=%lld %s", ctx->job_name,
              (long long)measure_id, payload);

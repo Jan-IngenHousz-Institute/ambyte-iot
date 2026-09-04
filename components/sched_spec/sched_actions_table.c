@@ -57,7 +57,10 @@ static const sched_input_decl_t k_store_event_inputs[] = {
     { "channel",  SCHED_IN_INT,    0, 0, 0, SCHED_SPEC_MAX_CHANNELS - 1, 0, NULL },
     { "data",     SCHED_IN_MAP,    0, 0, 0, 0, 0, NULL },
     { "metadata", SCHED_IN_MAP,    0, 0, 0, 0, 0, NULL },
-    { "kind",     SCHED_IN_STRING, 0, 0, 0, 0, 0, NULL }, /* stamped into data.kind */
+    /* required: every custom event carries data.kind (catalog wording), and
+     * the runner stamps it unconditionally — an omitted kind would dereference
+     * NULL on device (T3 review blocker 5) */
+    { "kind",     SCHED_IN_STRING, 1, 0, 0, 0, 0, NULL },
 };
 
 static const sched_input_decl_t k_log_inputs[] = {

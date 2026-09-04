@@ -35,3 +35,8 @@ graphify-out/
 # PyInstaller writes its spec next to the invocation (flash-gui-build.yml);
 # build/ and /dist/ are already ignored above.
 ambyte-flash-gui.spec
+
+# Configure-time generated headers belong in the build dir; the ESP-IDF
+# requirements scan used to leak them into the repo root (cmake fixed, this
+# is belt-and-braces).
+default_yaml_embed.h

@@ -198,8 +198,11 @@ static bool app_wifi_provisioned(void)
 }
 
 /* Pause/resume the schedule runner task for the maintenance workers (self-OTA,
- * AMBIT OTA/probe/flash, script update) — stopping it frees its heap (AMBIT
- * payload buffer + transient state) and the shared UART. REFCOUNTED: the workers run on
+ * AMBIT OTA/probe/flash, script update). Stopping it quiesces the shared UART
+ * and frees the task/TCB (~9 KB); the 64,536 B AMBIT payload reserve is taken
+ * once at first start and stays RESIDENT across stop/start (deliberate — one
+ * early contiguous block beats per-trace fragmentation, and the Lua era held
+ * the same reserve). REFCOUNTED: the workers run on
  * independent tasks, so overlapping suspend windows must not let one worker's
  * resume restart the runner inside another's quiesced window. */
 static portMUX_TYPE s_workload_mux    = portMUX_INITIALIZER_UNLOCKED;
@@ -216,6 +219,12 @@ static void app_workload_suspend(void)
     }
 }
 
+/* The runner's worst-case unwind after a stop request: one 30 s trace fetch
+ * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval and cleanup. Resume must
+ * out-retry that, or a stop that timed out leaves measurement permanently
+ * dead (T3 review blocker 3). */
+#define WORKLOAD_RESUME_RETRIES 90 /* 90 × 500 ms = 45 s > 30 s fetch + margin */
+
 static void app_workload_resume(void)
 {
     taskENTER_CRITICAL(&s_workload_mux);
@@ -227,9 +236,11 @@ static void app_workload_resume(void)
      * stop TIMED OUT (a step was stuck in a long C call), the old task is still
      * unwinding and start returns INVALID_STATE — without a retry the measurement
      * loop would silently stay dead until a manual `schedule start`/reboot.
-     * Retry until the old task exits. */
+     * Retry until the old task exits: the runner's lifecycle state machine
+     * (STOPPED/STARTING/RUNNING/STOPPING) serializes the retry against any
+     * concurrent CLI `schedule start`, so exactly one task comes up. */
     esp_err_t err = ESP_OK;
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < WORKLOAD_RESUME_RETRIES; i++) {
         err = sched_runner_start();
         if (err != ESP_ERR_INVALID_STATE) break;
         vTaskDelay(pdMS_TO_TICKS(500));

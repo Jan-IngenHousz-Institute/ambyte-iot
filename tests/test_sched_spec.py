@@ -117,10 +117,14 @@ class SchedSpecTest(unittest.TestCase):
                 self.assertNotIn("channels", required, uses)
             if uses == "ambit/trace":
                 self.assertEqual(required, ["protocol"])
+            # kind is required on store-event (T3 review: NULL deref on device)
+            if uses == "db/store-event":
+                self.assertIn("kind", required, uses)
         # an action with required inputs must require the outer `with`,
         # otherwise { uses: ambit/trace } would pass the schema while the
-        # compiler rejects it (review): trace/actinic/log/sleep vs the rest
-        with_required = {"ambit/trace", "ambit/actinic", "device/log", "device/sleep"}
+        # compiler rejects it (review): trace/actinic/store-event/log/sleep
+        with_required = {"ambit/trace", "ambit/actinic", "db/store-event",
+                         "device/log", "device/sleep"}
         for branch in schema["oneOf"]:
             uses = branch["properties"]["uses"]["const"]
             outer_required = branch["required"]

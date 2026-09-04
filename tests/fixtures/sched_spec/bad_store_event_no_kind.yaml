@@ -1,0 +1,8 @@
+schema: jii.ambyte-schedule/v1-draft
+name: neg
+jobs:
+  j:
+    on: { every: 5m }
+    # kind is required: every custom event carries data.kind, and the runner
+    # stamps it unconditionally (T3 review blocker 5: NULL dereference)
+    steps: [ { uses: db/store-event, with: { data: { a: 1 } } } ]

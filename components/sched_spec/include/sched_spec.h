@@ -417,6 +417,19 @@ uint32_t sched_due_poll(sched_due_t *d, int64_t now_utc);
  * entry; -1 when nothing can fire (e.g. dispatch-only program). */
 int64_t sched_due_next(const sched_due_t *d, int64_t now_utc);
 
+/* Clock-step re-anchor: call after the wall clock was set/corrected (the
+ * runner detects the step by comparing wall vs monotonic elapsed), BEFORE the
+ * next poll. Dues still ahead of the new now were anchored to the old,
+ * larger timebase (backward correction) and are recomputed from the new local
+ * now, so an every-job resumes within one period instead of waiting out a
+ * stale due. Dues already at/past the new now are left alone so the next
+ * poll applies the late-grace/missed accounting (a forward correction
+ * surfaces as counted skipped slots or one make-up run, per `missed:`).
+ * boot_pending, skipped/runs counters, the fired-minute latch and the gate
+ * state are preserved: re-anchoring must not re-arm a consumed boot trigger,
+ * erase statistics, or manufacture an on_enter edge. */
+void sched_due_reanchor(sched_due_t *d, int64_t now_utc);
+
 #ifdef __cplusplus
 }
 #endif

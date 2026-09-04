@@ -12,6 +12,16 @@
  * workload suspend/resume, SD park, status-LED probe) drive this API exactly
  * as they drove lua_runner.
  *
+ * Concurrency (T3 review): a lock-guarded state machine (STOPPED/STARTING/
+ * RUNNING/STOPPING) is held separate from the task handle. start() claims
+ * STARTING before compiling, so concurrent starts (CLI `schedule start` vs a
+ * maintenance resume) cannot spawn two runner tasks or share the static
+ * program mid-compile. stop()/dispatch() wake a static, never-deleted
+ * semaphore outside the state lock, so there is no task-handle lifetime to
+ * race; the semaphore also gates a new task until start() has published its
+ * state. dispatch() outside RUNNING is rejected with ESP_ERR_INVALID_STATE,
+ * never silently discarded. Status queries snapshot under the same lock.
+ *
  * The schedule source is /littlefs/schedule.yaml; when it is absent the
  * embedded default (components/sched_runner/default.yaml) runs instead, and
  * when it fails to compile the embedded default runs as EMBEDDED_FALLBACK
@@ -64,6 +74,16 @@ typedef struct {
     sched_job_stats_t stats;
 } sched_job_status_t;
 
+/* Document-header provenance snapshot for `schedule status` (pool strings
+ * copied out under the lifecycle lock — the program is never handed out by
+ * pointer, a reload cannot tear a reader). */
+typedef struct {
+    char id[96];
+    char version[32];
+    char workbook[64];
+    char name[48];
+} sched_header_t;
+
 /* Load and start. Compiles /littlefs/schedule.yaml, falling back to the
  * embedded default as above; reserves the shared AMBIT trace buffer while the
  * heap is contiguous; applies NVS lat/lon to time_sync when provisioned;
@@ -96,9 +116,10 @@ void      sched_runner_source(sched_source_t *out);
 /* Stats for one job; ESP_ERR_NOT_FOUND when the name is unknown. */
 esp_err_t sched_runner_stats(const char *job, sched_job_stats_t *out);
 
-/* Program/header access for the CLI. sched_runner_program() is NULL before
- * the first successful start; the program is const once loaded. */
-const sched_program_t *sched_runner_program(void);
+/* Status snapshots for the CLI. All copy out under the lifecycle lock and
+ * return ESP_ERR_INVALID_STATE while a compile is in flight (STARTING) or
+ * before the first start; the program itself is never handed out. */
+esp_err_t sched_runner_header(sched_header_t *out);
 int       sched_runner_job_count(void);
 esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out);
 

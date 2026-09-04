@@ -256,7 +256,9 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         /* Dispatch a schedule job on demand: {"job": "<name>"}. The runner
          * executes it on its own task (sequential with scheduled jobs); this
          * only enqueues, so it is safe on the MQTT task. The reply is a
-         * schedule_run_result on the status topic. */
+         * schedule_run_result on the status topic. Built with cJSON: the job
+         * name is attacker-controlled MQTT input and must be JSON-escaped,
+         * not interpolated (a quote in it would tear the reply). */
         const cJSON *jjob = cJSON_GetObjectItemCaseSensitive(root, "job");
         const char *job = cJSON_IsString(jjob) ? jjob->valuestring : NULL;
         if (job == NULL || job[0] == '\0') {
@@ -265,13 +267,20 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             esp_err_t err = sched_runner_dispatch(job);
             ESP_LOGW(TAG, "schedule_run id=%s job=%s -> %s", id ? id : "", job,
                      esp_err_to_name(err));
-            char reply[384];
-            snprintf(reply, sizeof(reply),
-                     "{\"type\":\"schedule_run_result\",\"id\":\"%.64s\",\"ok\":%s,"
-                     "\"job\":\"%.96s\",\"detail\":\"%s\"}",
-                     id ? id : "", err == ESP_OK ? "true" : "false",
-                     job, esp_err_to_name(err));
-            publish_reply(reply);
+            cJSON *reply = cJSON_CreateObject();
+            if (reply != NULL) {
+                cJSON_AddStringToObject(reply, "type", "schedule_run_result");
+                cJSON_AddStringToObject(reply, "id", id ? id : "");
+                cJSON_AddBoolToObject(reply, "ok", err == ESP_OK);
+                cJSON_AddStringToObject(reply, "job", job);
+                cJSON_AddStringToObject(reply, "detail", esp_err_to_name(err));
+                char *json = cJSON_PrintUnformatted(reply);
+                if (json != NULL) {
+                    publish_reply(json);
+                    cJSON_free(json);
+                }
+                cJSON_Delete(reply);
+            }
         }
     } else if (strcmp(type, "set_time") == 0) {
         /* Set the device RTC from a UTC epoch: {"epoch": <UTC seconds>}. The RTC is

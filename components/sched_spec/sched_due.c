@@ -21,6 +21,10 @@
  *   at most one firing per job per poll.
  * - on_enter: a gated job fires once when its window transitions closed →
  *   open (the legacy script's "immediate sample on entering a phase").
+ * - re-anchor: after a wall-clock step the runner calls sched_due_reanchor()
+ *   before polling; dues stranded in the future by a backward correction are
+ *   recomputed from the new now, past dues keep the missed-slot path, and no
+ *   trigger/counter/gate state is re-armed or erased.
  * - DST: dues are absolute local times and only move forward, so the
  *   fall-back double wall minute cannot refire; fired_minute latches the
  *   cron minute as belt-and-braces for the minute-tick path. Spring-forward
@@ -239,4 +243,26 @@ int64_t sched_due_next(const sched_due_t *d, int64_t now_utc)
         if (cand >= 0 && (best < 0 || cand < best)) best = cand;
     }
     return best;
+}
+
+void sched_due_reanchor(sched_due_t *d, int64_t now_utc)
+{
+    const sched_program_t *prog = d->prog;
+    int64_t L = d->localize(d->localize_ctx, now_utc);
+    for (int j = 0; j < prog->job_count; j++) {
+        const sched_job_t *job = &prog->jobs[j];
+        sched_due_job_t *dj = &d->jobs[j];
+        for (int i = 0; i < job->trigger_count; i++) {
+            /* Only dues anchored AHEAD of the new now are stale in the way a
+             * backward correction produces; recompute them from the new local
+             * now. Dues at/past now stay for poll()'s missed-slot accounting
+             * (forward step → counted skips or one make-up run). */
+            if (dj->due[i] > L) {
+                dj->due[i] = next_trigger_due(&job->triggers[i], L);
+            }
+        }
+        /* boot_pending, skipped, runs, fired_minute and gate_open are
+         * deliberately NOT touched: a consumed boot trigger stays consumed,
+         * counters survive, and no spurious on_enter edge is manufactured. */
+    }
 }
