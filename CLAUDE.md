@@ -55,9 +55,11 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.
-- **version.txt is load-bearing**: STATUS telemetry reports the compiled `app_version` (the
-  NVS `device_firmware`/`device_version` strings are junk — whole fleet says "1"). Bump it
-  every release; IDF reads it at CMake *configure* time (touch CMakeLists.txt to force).
+- **semantic-release owns firmware versions**: the validated PR title determines the next
+  `vX.Y.Z`, and PR CI injects that preview through `AMBYTE_PROJECT_VER` into the exact binary
+  later promoted on `main`. Do not add a manual `version.txt`; local builds use ESP-IDF's
+  Git-derived version. STATUS reports the compiled `app_version` (the NVS
+  `device_firmware`/`device_version` strings are junk — the whole fleet says "1").
 - **Two release units**: firmware keeps `vX.Y.Z`; `schedule/**` releases independently as
   `schedule-vX.Y.Z`. The path filter must be applied to commit analysis *and* release notes so a
   schedule-only commit cannot bump firmware later. Schedule assets carry SHA + built-against firmware.
