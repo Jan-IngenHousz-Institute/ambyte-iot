@@ -189,6 +189,27 @@ int main(void)
     CHECK_SCALAR(v2_full, "channel", "uart_1");
     CHECK_SCALAR(v2_full, "device", "AmbitV003");
 
+    /* prefix collision: "device_id" must not answer a "device" query, and
+     * vice versa. find_key compares the WHOLE quoted key length, which is
+     * what makes this exact rather than a prefix match */
+    const char *collide = "{\"device_id\":\"LONGER\",\"device\":\"SHORT\"}";
+    CHECK_SCALAR(collide, "device", "SHORT");
+    const char *collide_only_long = "{\"device_id\":\"LONGER\",\"tag\":\"T\"}";
+    CHECK_ABSENT(collide_only_long, "device");
+    /* and the reverse order, so neither is answered by position */
+    const char *collide_rev = "{\"device\":\"SHORT\",\"device_id\":\"LONGER\"}";
+    CHECK_SCALAR(collide_rev, "device", "SHORT");
+
+    /* braces and brackets INSIDE a string value must not de-sync the depth
+     * counter: strings are skipped wholesale, so the object does not appear
+     * to end early (which would report a later key as absent) */
+    const char *braces = "{\"tag\":\"a{b}c[d]e\",\"channel\":\"uart_9\","
+                         "\"protocol\":{\"name\":\"}{\",\"tag\":\"edge\"}}";
+    CHECK_SCALAR(braces, "tag", "a{b}c[d]e");
+    CHECK_SCALAR(braces, "channel", "uart_9");
+    CHECK_SCALAR(braces, "protocol.name", "}{");
+    CHECK_SCALAR(braces, "protocol.tag", "edge");
+
     /* escaped quotes inside an earlier string value must not wedge the scan
      * or fake a key boundary */
     const char *escaped = "{\"schema\":\"ambit.trace/3\","

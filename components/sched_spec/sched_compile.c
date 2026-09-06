@@ -100,8 +100,9 @@ static sched_entry_t *entry_add(ctx_t *c, const sched_node_t *n)
  * and nowhere else. */
 
 /* name/filename fit the publish-envelope snapshot fields (sched_header_t's
- * char[48]) — a longer string would silently truncate on the wire. */
-#define MACRO_FIELD_CAP 47
+ * char[48]) — a longer string would silently truncate on the wire. Defined in
+ * sched_spec.h so sched_runner.c can compile-assert that coupling. */
+#define MACRO_FIELD_CAP SCHED_SPEC_MACRO_FIELD_CAP
 
 /* 8-4-4-4-12 hex (either case). The platform keys macro execution per row on
  * this id, so a mistyped id must fail at install/CI time, not at ingest. */

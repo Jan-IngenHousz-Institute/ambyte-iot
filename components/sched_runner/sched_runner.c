@@ -122,6 +122,21 @@ _Static_assert((int)SCHED_PROV_COND_FIELD_SCHEMA == (int)SCHED_COND_FIELD_SCHEMA
                (int)SCHED_PROV_COND_OP_EQ == (int)SCHED_COND_OP_EQ &&
                (int)SCHED_PROV_COND_OP_NEQ == (int)SCHED_COND_OP_NEQ,
                "provenance port condition enums must mirror sched_spec.h");
+/* sched_runner_header() copies pool strings with a bounded memcpy rather than
+ * snprintf (see hdr_copy) precisely because truncation is impossible, not
+ * merely improbable. That is only true while every compiler cap stays below
+ * its destination width — pin it here so widening MACRO_FIELD_CAP without
+ * widening the snapshot fails the build instead of silently truncating a
+ * macro name, filename or condition value onto the wire. */
+_Static_assert(SCHED_SPEC_MACRO_FIELD_CAP <
+               sizeof(((sched_header_t *)0)->macros[0].name) &&
+               SCHED_SPEC_MACRO_FIELD_CAP <
+               sizeof(((sched_header_t *)0)->macros[0].filename) &&
+               SCHED_SPEC_MACRO_FIELD_CAP <
+               sizeof(((sched_header_t *)0)->macros[0].conds[0].value) &&
+               SCHED_SPEC_MACRO_FIELD_CAP <
+               sizeof(((schedule_provenance_macro_t *)0)->conds[0].value),
+               "macro field cap must fit every snapshot field it is copied into");
 
 /* Spinlock critical sections are never held across a blocking call — only
  * state/flag reads+writes and short struct copies. The one exception is each
@@ -847,6 +862,31 @@ esp_err_t sched_runner_stats(const char *job_name, sched_job_stats_t *out)
     return ESP_OK;
 }
 
+/* Bounded copy for the header snapshot, deliberately NOT snprintf.
+ *
+ * Every call site below runs inside taskENTER_CRITICAL(&s_state_mux) — a
+ * spinlock, so interrupts are masked to level 3, which includes the Wi-Fi
+ * MAC/DMA interrupt. A fully-stamped header is 4 document strings + 8 macros ×
+ * (3 strings + 4 condition values) = 60 copies per call, once per publish; at
+ * the measured ~17 events/s drain rate, sixty newlib vfprintf entries would
+ * put this section in the hundreds of microseconds, interrupts-off, on the
+ * exact path whose RX servicing latency the Jul 27-28 churn incident was about
+ * (see CLAUDE.md). strlen+memcpy makes the same 60 copies single-digit µs.
+ *
+ * Truncation is impossible rather than merely unlikely: the compiler caps
+ * every source string (uuid ids, ≤47-char names/filenames/condition values)
+ * below the fixed destination widths, which is the same argument sched_runner.h
+ * already makes for the struct being spinlock-safe. The clamp is kept anyway
+ * so a corrupt pool truncates instead of overrunning the caller's struct. */
+static void hdr_copy(char *dst, size_t cap, const char *src)
+{
+    if (cap == 0) return;
+    if (src == NULL) { dst[0] = '\0'; return; }
+    size_t n = strnlen(src, cap - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 esp_err_t sched_runner_header(sched_header_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_STATE;
@@ -859,30 +899,37 @@ esp_err_t sched_runner_header(sched_header_t *out)
         const char *ver  = sched_pool_str(&s_prog, s_prog.version_off);
         const char *wb   = sched_pool_str(&s_prog, s_prog.workbook_version_id_off);
         const char *name = sched_pool_str(&s_prog, s_prog.name_off);
-        snprintf(out->id, sizeof(out->id), "%s", id ? id : "-");
-        snprintf(out->version, sizeof(out->version), "%s", ver ? ver : "-");
-        snprintf(out->workbook, sizeof(out->workbook), "%s", wb ? wb : "-");
-        snprintf(out->name, sizeof(out->name), "%s", name ? name : "-");
+        hdr_copy(out->id, sizeof(out->id), id ? id : "-");
+        hdr_copy(out->version, sizeof(out->version), ver ? ver : "-");
+        hdr_copy(out->workbook, sizeof(out->workbook), wb ? wb : "-");
+        hdr_copy(out->name, sizeof(out->name), name ? name : "-");
         out->has_workbook = wb != NULL;
         /* Bounded by SCHED_SPEC_MAX_MACROS (8 × ~340 B): s_state_mux is a
          * spinlock, so the whole snapshot copy must stay small — the fixed
-         * field caps in sched_header_t are what guarantee that. */
+         * field caps in sched_header_t are what guarantee that, and hdr_copy
+         * is what keeps the 60 worst-case copies cheap. */
         out->macro_count = s_prog.macro_count;
         for (int i = 0; i < s_prog.macro_count; i++) {
             const char *mid  = sched_pool_str(&s_prog, s_prog.macros[i].id_off);
             const char *mnam = sched_pool_str(&s_prog, s_prog.macros[i].name_off);
             const char *mfn  = sched_pool_str(&s_prog, s_prog.macros[i].filename_off);
-            snprintf(out->macros[i].id, sizeof(out->macros[i].id), "%s", mid ? mid : "");
-            snprintf(out->macros[i].name, sizeof(out->macros[i].name), "%s", mnam ? mnam : "");
-            snprintf(out->macros[i].filename, sizeof(out->macros[i].filename), "%s", mfn ? mfn : "");
-            out->macros[i].cond_count = s_prog.macros[i].cond_count;
-            for (int j = 0; j < s_prog.macros[i].cond_count; j++) {
+            hdr_copy(out->macros[i].id, sizeof(out->macros[i].id), mid ? mid : "");
+            hdr_copy(out->macros[i].name, sizeof(out->macros[i].name), mnam ? mnam : "");
+            hdr_copy(out->macros[i].filename, sizeof(out->macros[i].filename), mfn ? mfn : "");
+            /* Clamp for symmetry with sched_runner_provenance_port below: the
+             * compiler's ≤ 4 check is the only thing standing between a
+             * corrupt program and a 50-B-per-slot overwrite of the CALLER's
+             * struct, from inside a critical section. */
+            uint8_t cc = s_prog.macros[i].cond_count;
+            if (cc > SCHED_SPEC_MAX_MACRO_CONDS) cc = SCHED_SPEC_MAX_MACRO_CONDS;
+            out->macros[i].cond_count = cc;
+            for (int j = 0; j < cc; j++) {
                 const char *cval = sched_pool_str(&s_prog,
                                                   s_prog.macros[i].conds[j].value_off);
                 out->macros[i].conds[j].field = s_prog.macros[i].conds[j].field;
                 out->macros[i].conds[j].op = s_prog.macros[i].conds[j].op;
-                snprintf(out->macros[i].conds[j].value,
-                         sizeof(out->macros[i].conds[j].value), "%s",
+                hdr_copy(out->macros[i].conds[j].value,
+                         sizeof(out->macros[i].conds[j].value),
                          cval ? cval : "");
             }
         }

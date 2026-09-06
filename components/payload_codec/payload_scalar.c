@@ -89,13 +89,27 @@ static bool copy_string_value(const char *p, char *out, size_t cap)
     return true;
 }
 
+/* Widest path segment these buffers must hold, +1 for the NUL. The caller's
+ * key paths come from ONE closed set: cond_key_path() in
+ * components/device_commands/envelope_provenance.c, which mirrors
+ * sched_compile.c's `when:` field table. The longest segment today is
+ * "sensor_id" (9) / "protocol" (8). This coupling is worth pinning because
+ * the failure mode is silent: a ≥ 12-char field name makes payload_scalar
+ * return false, which reads as "absent" and flips every eq/neq using it,
+ * per row, with nothing failing at compile or install time. Adding a longer
+ * field means raising this and the two buffers below together. */
+#define PAYLOAD_SCALAR_SEGMENT_CAP 12
+_Static_assert(PAYLOAD_SCALAR_SEGMENT_CAP > sizeof("sensor_id") - 1 &&
+               PAYLOAD_SCALAR_SEGMENT_CAP > sizeof("protocol") - 1,
+               "path segment buffers must hold every addressable field name");
+
 bool payload_scalar(const char *json, const char *key_path, char *out, size_t cap)
 {
     if (json == NULL || key_path == NULL || out == NULL || cap == 0) return false;
     out[0] = '\0';
 
     /* key_path: "key" or "parent.key" (one level, exactly one dot) */
-    char parent[12], key[12];
+    char parent[PAYLOAD_SCALAR_SEGMENT_CAP], key[PAYLOAD_SCALAR_SEGMENT_CAP];
     const char *dot = strchr(key_path, '.');
     if (dot == NULL) {
         if (strlen(key_path) >= sizeof(key)) return false;

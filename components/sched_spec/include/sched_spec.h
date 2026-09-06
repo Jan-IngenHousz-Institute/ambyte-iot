@@ -56,6 +56,12 @@ extern "C" {
  * canonical v3 schemas" — needs exactly four schema-neq conditions; anything
  * more expressive belongs in openJII branch-cell compilation, not here. */
 #define SCHED_SPEC_MAX_MACRO_CONDS 4
+/* Longest macro name / filename / condition value the compiler accepts. Lives
+ * in the header, not in sched_compile.c, because sched_runner.c's snapshot
+ * copy is only truncation-free as long as this stays below every destination
+ * width in sched_header_t; that coupling is now _Static_asserted there instead
+ * of merely commented. */
+#define SCHED_SPEC_MACRO_FIELD_CAP 47
 
 /* YAML subset limits (plan "The YAML subset"): the file lives on littlefs and
  * is parsed in a transient heap arena on a 512 KiB SRAM part, so the arena

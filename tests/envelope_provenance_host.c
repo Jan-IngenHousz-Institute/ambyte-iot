@@ -194,6 +194,30 @@ int main(void)
     CHECK(strstr(part, "has space") == NULL);
     CHECK(strstr(part, "macro_00000000") != NULL);
 
+    /* THE worst case the PROVENANCE_PART_CAP arithmetic claims to bound:
+     * 8 macros, every string filled to its buffer width, every one of them
+     * applying to the row. Real headroom is 5 B, so this is the check that
+     * fails first if a field width grows without the cap growing with it. */
+    schedule_provenance_t widest = prov_with_macros(8);
+    memset(widest.workbook_version_id, 'w', sizeof(widest.workbook_version_id) - 1);
+    widest.workbook_version_id[sizeof(widest.workbook_version_id) - 1] = '\0';
+    for (int i = 0; i < 8; i++) {
+        memset(widest.macros[i].id, 'i', sizeof(widest.macros[i].id) - 1);
+        widest.macros[i].id[sizeof(widest.macros[i].id) - 1] = '\0';
+        memset(widest.macros[i].name, 'n', sizeof(widest.macros[i].name) - 1);
+        widest.macros[i].name[sizeof(widest.macros[i].name) - 1] = '\0';
+        memset(widest.macros[i].filename, 'f',
+               sizeof(widest.macros[i].filename) - 1);
+        widest.macros[i].filename[sizeof(widest.macros[i].filename) - 1] = '\0';
+    }
+    n = envelope_provenance_part(&widest, TRACE_ROW, part, sizeof(part));
+    CHECK(n > 0);
+    CHECK(n == (int)strlen(part));
+    CHECK(n < (int)sizeof(part));            /* fits, with the documented 5 B */
+    CHECK(macro_entries(part) == 8);
+    CHECK(strstr(part, "\"}],") != NULL);    /* closed, not truncated */
+    CHECK(part[n - 1] == ',');
+
     /* a corrupt count → nothing is emitted */
     schedule_provenance_t corrupt = prov_with_macros(1);
     corrupt.macro_count = SCHEDULE_PROVENANCE_MAX_MACROS + 1;
@@ -232,6 +256,13 @@ int main(void)
     n = envelope_provenance_part(&routed, V2_ROW, part, sizeof(part));
     CHECK(strcmp(part, "\"workbook_version_id\":\"" WB_ID "\",") == 0);
     CHECK(n == (int)strlen(part));
+
+    /* the per-row field cache must not survive the call: re-rendering the
+     * trace row right after the v2 row (where `schema` resolved to ABSENT)
+     * has to route to the trace macro again, not to nothing */
+    envelope_provenance_part(&routed, TRACE_ROW, part, sizeof(part));
+    CHECK(macro_entries(part) == 1);
+    CHECK(strstr(part, "\"name\":\"ambyte-trace\"") != NULL);
 
     /* the legacy idiom: schema neq ×4 (exactly the condition cap) matches the
      * v2 row and nothing canonical — absent-field neq is TRUE, which is what
