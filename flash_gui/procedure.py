@@ -245,20 +245,21 @@ def schedule_source(ctx: SessionContext, log=print) -> ScheduleSource:
         programming.yaml_text, programming.workbook_version_id, macros,
         log=log)
     blob = stamped.encode("utf-8")
+    version_id = programming.workbook_version_id.strip()
     number = programming.workbook_version_number
     script_version = (f"wb-v{number}" if isinstance(number, int)
-                      else f"wb-{programming.workbook_version_id[:8]}")
+                      else f"wb-{version_id[:8]}")
     return ScheduleSource(
         origin="workbook",
         label=f"workbook v{number}" if isinstance(number, int)
-              else f"workbook {programming.workbook_version_id[:8]}",
+              else f"workbook {version_id[:8]}",
         blob=blob,
         sha256=hashlib.sha256(blob).hexdigest(),
         script_version=script_version,
-        campaign_id=f"workbook-{programming.workbook_version_id}",
+        campaign_id=f"workbook-{version_id}",
         built_against_fw=fw_version or "unknown",
         asset_url=None,
-        workbook_version_id=programming.workbook_version_id,
+        workbook_version_id=version_id,
     )
 
 

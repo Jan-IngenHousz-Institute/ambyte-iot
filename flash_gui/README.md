@@ -158,7 +158,7 @@ Once per session:
 2. Click **Sign in (API key)** — a browser opens on the openJII *API keys*
    page; create a key there (shown once, `jii_...`) and paste it into the
    dialog. The key is validated and remembered per environment.
-4. Pick the **experiment** from the dropdown (active experiments you are a
+3. Pick the **experiment** from the dropdown (active experiments you are a
    member of). During each board run, openJII binds the device to this
    experiment and returns its authoritative broker endpoint and ingest topic
    prefix; the GUI does not construct or edit either value. Selecting an
@@ -169,17 +169,18 @@ Once per session:
    is new enough to compile it) and installs it instead of the catalog
    default. When there is no such cell, a persistent warning says so and the
    released default is installed.
-5. Pick the **Schedule script**. The GUI always loads the newest stable `schedule-v*`
+4. Pick the **Schedule script**. The GUI always loads the newest stable `schedule-v*`
    catalog and lists the released `.yaml` files it contains; `default.yaml` is the
    default when available. When workbook programming was found, this combobox is
    the explicit **override**: touching it installs the chosen catalog asset
    instead of the workbook's schedule.
-6. Enter the **Wi-Fi SSID/password** the boards should join.
+5. Enter the **Wi-Fi SSID/password** the boards should join.
 
 Per board: plug it in via USB-C → **Refresh** → pick the port → **On-board
 device** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
-RTC, selected Schedule script).
+RTC, installed schedule — including its stamped workbook id when installed
+from a workbook).
 
 ## Factory PCBA flash + test (`factory_test`)
 

@@ -49,11 +49,21 @@ from pathlib import Path
 SCHEMA_PREFIX = "jii.ambyte-schedule/"
 
 # First firmware release whose sched_spec compiler accepts the `macros:`
-# header key (stream A of the workbook-loop plan). Placeholder chosen during
-# stream D — confirm against the released stream-A firmware before stamping
-# macros onto a fleet. workbookVersionId needs no gate: every compiler with
-# the document header already accepts it.
+# header key (stream A of the workbook-loop plan, PR #53, released as
+# v2.1.0). workbookVersionId needs no gate: every compiler with the document
+# header already accepts it.
 MACROS_HEADER_MIN_FW = "2.1.0"
+
+# The macro contract the stream-A device compiler enforces (verified against
+# its sched_host build in review D): uuid-shaped ids, names/filenames of
+# [A-Za-z0-9_.:-] up to 47 chars, at most 8 entries. Validated host-side so a
+# bad workbook fails at install time with a clear message instead of an
+# on-device compile rejection after the push.
+MAX_MACROS = 8
+MACRO_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,47}$")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 # Top-level keys the stamping owns and therefore replaces on a re-stamp.
 _STAMPED_KEYS = ("workbookVersionId", "macros")
@@ -78,6 +88,36 @@ class ScheduleStampError(RuntimeError):
     compiler rejected it)."""
 
 
+class MacroContractError(ValueError):
+    """A macro entry (or the workbookVersionId) violates the device compiler's
+    macro contract — caught before anything is stamped or pushed."""
+
+
+def validate_macro_contract(workbook_version_id: str, macros) -> None:
+    """Mirror the stream-A device compiler's header contract, host-side.
+
+    Raises MacroContractError (a ValueError) naming the offending field.
+    """
+    if not UUID_RE.fullmatch(workbook_version_id or ""):
+        raise MacroContractError(
+            f"workbookVersionId {workbook_version_id!r} is not uuid-shaped")
+    macros = tuple(macros or ())
+    if len(macros) > MAX_MACROS:
+        raise MacroContractError(
+            f"macros: {len(macros)} entries exceed the device cap of "
+            f"{MAX_MACROS}")
+    for macro in macros:
+        if not UUID_RE.fullmatch(macro.id or ""):
+            raise MacroContractError(
+                f"macro id {macro.id!r} is not uuid-shaped")
+        for field_name, value in (("name", macro.name),
+                                  ("filename", macro.filename)):
+            if not MACRO_NAME_RE.fullmatch(value or ""):
+                raise MacroContractError(
+                    f"macro {field_name} {value!r} must match "
+                    f"{MACRO_NAME_RE.pattern} (macro id {macro.id})")
+
+
 def is_schedule_yaml(text: str) -> bool:
     """True when the text has a top-level `schema: jii.ambyte-schedule/…` line.
 
@@ -91,23 +131,35 @@ def is_schedule_yaml(text: str) -> bool:
     return value.startswith(SCHEMA_PREFIX)
 
 
-def parse_fw_version(text: str) -> tuple[int, int, int] | None:
-    """'v2.1.0' / '2.1.0' / '2.1.0-rc1' → (2, 1, 0); None when unparseable."""
-    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
+def parse_fw_version(text: str) -> tuple[int, int, int, str] | None:
+    """'v2.1.0' → (2, 1, 0, ''); '2.1.0-rc1' → (2, 1, 0, 'rc1').
+
+    The fourth element is the prerelease suffix ("" for a final release);
+    None when the text is not semver-shaped at all.
+    """
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?",
+                     (text or "").strip())
     if match is None:
         return None
-    return tuple(int(part) for part in match.groups())
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)),
+            match.group(4) or "")
 
 
 def firmware_supports_macros(fw_version: str) -> bool:
     """True when the flashed firmware's compiler accepts the macros: header.
 
     An unparseable version fails closed: silently dropping the macro list is
-    exactly the failure this gate exists to prevent.
+    exactly the failure this gate exists to prevent. Semver ordering applies:
+    a prerelease of exactly the floor version (2.1.0-rc1) predates the final
+    and does NOT pass.
     """
     parsed = parse_fw_version(fw_version)
     minimum = parse_fw_version(MACROS_HEADER_MIN_FW)
-    return parsed is not None and parsed >= minimum
+    if parsed is None:
+        return False
+    if parsed[:3] != minimum[:3]:
+        return parsed[:3] > minimum[:3]
+    return parsed[3] == ""
 
 
 def _yaml_scalar(value: str) -> str:
@@ -194,8 +246,11 @@ def stamp_header(yaml_text: str, workbook_version_id: str, macros,
     be flow style, which the device parser rejects).
 
     Raises ScheduleStampError when the text is not an Ambyte schedule or the
-    host compiler rejects the result. `checker(text) -> str | None` overrides
-    the compiler in tests (returns the error text, None when it compiles).
+    host compiler rejects the result, and MacroContractError (a ValueError
+    naming the offending field) when a macro entry or the workbookVersionId
+    violates the device compiler's header contract. `checker(text) ->
+    str | None` overrides the compiler in tests (returns the error text, None
+    when it compiles).
     """
     if not isinstance(yaml_text, str) or not is_schedule_yaml(yaml_text):
         raise ScheduleStampError(
@@ -203,6 +258,8 @@ def stamp_header(yaml_text: str, workbook_version_id: str, macros,
             f"'schema: {SCHEMA_PREFIX}…' line")
     if not workbook_version_id or not workbook_version_id.strip():
         raise ScheduleStampError("workbook_version_id is required")
+    macros = tuple(macros or ())
+    validate_macro_contract(workbook_version_id.strip(), macros)
     newline = "\r\n" if "\r\n" in yaml_text.split("\n", 1)[0] else "\n"
 
     lines = _strip_stamped(yaml_text.splitlines(keepends=True))
@@ -219,7 +276,7 @@ def stamp_header(yaml_text: str, workbook_version_id: str, macros,
         raise ScheduleStampError("no header anchor (schema/description) found")
 
     lines[anchor + 1:anchor + 1] = stamped_block(
-        workbook_version_id.strip(), tuple(macros or ()), newline)
+        workbook_version_id.strip(), macros, newline)
     stamped = "".join(lines)
 
     if validate:

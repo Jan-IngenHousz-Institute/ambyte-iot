@@ -230,15 +230,44 @@ def test_comments_and_body_survive_byte_for_byte():
 
 
 def test_values_that_would_change_type_are_quoted():
+    # Reserved-word values pass the macro contract but must not come back as
+    # a YAML bool; stamp_header quotes them.
     macro = WorkbookMacro(id=MACRO_ID, name="true", filename="macro_x")
     stamped = schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID, [macro],
                                           checker=OK)
     assert 'name: "true"' in stamped
-    spaced = WorkbookMacro(id=MACRO_ID, name="ambyte trace",
-                           filename="macro_x")
-    stamped = schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID, [spaced],
-                                          checker=OK)
-    assert 'name: "ambyte trace"' in stamped
+    # Values outside the contract never reach stamp_header (see the contract
+    # tests); the emitter itself still quotes anything non-plain, e.g. spaces.
+    block = "".join(schedule_stamp.stamped_block(
+        VERSION_ID, [WorkbookMacro(id=MACRO_ID, name="ambyte trace",
+                                   filename="macro_x")]))
+    assert 'name: "ambyte trace"' in block
+
+
+def test_macro_contract_is_enforced_before_stamping():
+    def expect(field, macros=(MACRO,), version_id=VERSION_ID):
+        with pytest.raises(ValueError, match=field):
+            schedule_stamp.stamp_header(SCHEDULE_YAML, version_id, macros,
+                                        checker=OK)
+
+    expect("workbookVersionId", version_id="not-a-uuid")
+    expect("id", macros=(WorkbookMacro(id="not-a-uuid", name="m",
+                                       filename="macro_x"),))
+    expect("name", macros=(WorkbookMacro(id=MACRO_ID, name="has space",
+                                         filename="macro_x"),))
+    expect("name", macros=(WorkbookMacro(id=MACRO_ID, name="x" * 48,
+                                         filename="macro_x"),))
+    expect("filename", macros=(WorkbookMacro(id=MACRO_ID, name="m",
+                                             filename="macro/x"),))
+    expect("macros", macros=tuple(
+        WorkbookMacro(id=f"47b03f78-1111-2222-3333-4444555{i:07d}",
+                      name=f"m{i}", filename=f"macro_{i}")
+        for i in range(9)))
+    # The boundary values are accepted.
+    schedule_stamp.stamp_header(
+        SCHEDULE_YAML, VERSION_ID,
+        [WorkbookMacro(id=MACRO_ID, name="x" * 47, filename="macro_x")],
+        checker=OK)
 
 
 def test_rejects_non_schedule_text():
@@ -283,9 +312,13 @@ def test_pre_stream_a_compiler_is_tolerated_for_macros_only():
 
 def test_firmware_gate():
     assert schedule_stamp.firmware_supports_macros("2.1.0")
+    assert schedule_stamp.firmware_supports_macros("v2.1.0")
+    assert schedule_stamp.firmware_supports_macros("2.2.0")
     assert schedule_stamp.firmware_supports_macros("v2.10.0")
     assert not schedule_stamp.firmware_supports_macros("2.0.9")
     assert not schedule_stamp.firmware_supports_macros("1.9.9")
+    # A prerelease of exactly the floor version predates the final (semver).
+    assert not schedule_stamp.firmware_supports_macros("2.1.0-rc1")
     # Unparseable fails closed: never stamp macros onto an unknown firmware.
     assert not schedule_stamp.firmware_supports_macros("")
     assert not schedule_stamp.firmware_supports_macros("dev-build")

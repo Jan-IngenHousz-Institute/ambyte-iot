@@ -583,13 +583,23 @@ class App(ttk.Frame):
                 self._post(self._apply_programming_error, experiment.id,
                            str(exc))
                 return
+            except Exception as exc:
+                # A dead worker must never leave the in-flight gate wedged:
+                # onboarding would report "wait a moment" forever.
+                self._post(self._apply_programming_error, experiment.id,
+                           f"lookup failed: {type(exc).__name__}: {exc}")
+                return
             self._post(self._apply_programming, experiment.id, prog)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _apply_programming(self, experiment_id: str,
                            prog: WorkbookProgramming | None) -> None:
-        self._programming_pending_id = None
+        # Clear the in-flight marker only for the lookup it belongs to: a
+        # stale result from a previously selected experiment must not unblock
+        # onboarding while the CURRENT experiment's lookup is still running.
+        if experiment_id == self._programming_pending_id:
+            self._programming_pending_id = None
         exp = self._current_experiment()
         if exp is None or exp.id != experiment_id:
             return  # the operator moved on while the lookup was in flight
@@ -615,7 +625,8 @@ class App(ttk.Frame):
 
     def _apply_programming_error(self, experiment_id: str,
                                  detail: str) -> None:
-        self._programming_pending_id = None
+        if experiment_id == self._programming_pending_id:
+            self._programming_pending_id = None
         exp = self._current_experiment()
         if exp is None or exp.id != experiment_id:
             return
