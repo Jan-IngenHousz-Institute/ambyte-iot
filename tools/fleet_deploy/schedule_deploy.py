@@ -458,6 +458,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="released Schedule asset name without the .yaml suffix",
     )
     parser.add_argument(
+        "--experiment",
+        default=None,
+        help="NOT SUPPORTED — accepted only to fail with guidance. A "
+        "workbook-stamped schedule has no immutable release URL for devices "
+        "to download, so fleet delivery needs an artifact host (tracked). "
+        "Install workbook programming with the flash GUI over serial today.",
+    )
+    parser.add_argument(
         "--version-op",
         choices=["any", *sorted(fleet.VERSION_OPS)],
         default="any",
@@ -487,6 +495,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.experiment:
+        # Fleet delivery publishes a script_update carrying an immutable
+        # release-asset URL the device downloads; a per-experiment
+        # workbook-stamped YAML has no URL, so this cannot reuse the resolve +
+        # stamp path (flash_gui.schedule_stamp) until an artifact host exists.
+        # Rejected as a flag so device and fleet semantics cannot drift apart
+        # silently.
+        print(
+            "--experiment is not supported: workbook-stamped schedules are "
+            "installed by the flash GUI over serial today; fleet delivery "
+            "needs an artifact host — tracked.",
+            file=sys.stderr,
+        )
+        return 2
     if not 1 <= args.percentage <= 100:
         parser.error("--percentage must be 1-100")
     if args.version_op != "any" and fleet.parse_version(args.version or "") is None:
