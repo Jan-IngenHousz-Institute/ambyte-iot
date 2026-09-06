@@ -23,7 +23,7 @@ from tkinter import font as tkfont
 
 from . import app_update, esptool_ops, procedure, release_fetch, timezones
 from .config import ENVIRONMENTS, Settings
-from .openjii_client import OpenJIIClient, OpenJIIError
+from .openjii_client import OpenJIIClient, OpenJIIError, WorkbookProgramming
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
                         clean_device_name)
 
@@ -105,6 +105,14 @@ class App(ttk.Frame):
         self.busy = False
         self.local_tz = timezones.local_iana_zone()
         self.gui_release_url = app_update.RELEASES_PAGE
+        # Workbook programming of the selected experiment, resolved async at
+        # selection time. When set (and not overridden via the Schedule
+        # combobox), onboarding installs the stamped workbook schedule instead
+        # of the released catalog default.
+        self.programming: WorkbookProgramming | None = None
+        self.programming_experiment_id: str | None = None
+        self.programming_override = False
+        self._programming_pending_id: str | None = None
 
         self._build_application_frame()
         self._build_session_frame()
@@ -196,15 +204,16 @@ class App(ttk.Frame):
         self.exp_refresh_btn.grid(row=1, column=3, sticky="e", padx=(8, 0),
                                   pady=(6, 0))
 
-        ttk.Label(frame, text="Schedule script:").grid(row=2, column=0, sticky="w",
-                                                   pady=(6, 0))
+        self.schedule_row_label = ttk.Label(frame, text="Schedule script:")
+        self.schedule_row_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.schedule_script_var = tk.StringVar()
         self.schedule_script_box = ttk.Combobox(
             frame, textvariable=self.schedule_script_var, state="disabled")
         self.schedule_script_box.grid(row=2, column=1, columnspan=2, sticky="we",
                                  pady=(6, 0))
         self.schedule_script_box.bind(
-            "<<ComboboxSelected>>", lambda e: self._on_schedule_script_selected())
+            "<<ComboboxSelected>>",
+            lambda e: self._on_schedule_script_selected(user=True))
         self.schedule_refresh_btn = ttk.Button(
             frame, text="Refresh", command=self._fetch_schedule_catalog_async)
         self.schedule_refresh_btn.grid(row=2, column=3, sticky="e", padx=(8, 0),
@@ -239,6 +248,18 @@ class App(ttk.Frame):
         ttk.Label(frame, textvariable=self.fw_var).pack(anchor="w")
         self.schedule_release_var = tk.StringVar(value="Schedule release: fetching...")
         ttk.Label(frame, textvariable=self.schedule_release_var).pack(anchor="w")
+        # Where the installed schedule comes from for the selected experiment
+        # (workbook programming cell vs released catalog default).
+        self.schedule_source_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.schedule_source_var).pack(anchor="w")
+        # Persistent, non-blocking warning when the selected experiment's
+        # workbook has no Ambyte programming cell: the install still works,
+        # but nothing will process the data platform-side.
+        self.workbook_warn_var = tk.StringVar(value="")
+        self.workbook_warn_label = ttk.Label(
+            frame, textvariable=self.workbook_warn_var,
+            foreground="#a15c00", wraplength=720)
+        self.workbook_warn_label.pack(anchor="w")
 
     def _build_device_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Device", padding=8)
@@ -495,7 +516,7 @@ class App(ttk.Frame):
             (script for script in self.schedule_catalog.scripts
              if script.asset_name == selected), None)
 
-    def _on_schedule_script_selected(self) -> None:
+    def _on_schedule_script_selected(self, user: bool = False) -> None:
         script = self._selected_schedule_script()
         if script is None:
             return
@@ -503,6 +524,108 @@ class App(ttk.Frame):
         self.settings.save()
         self.log(
             f"Selected Schedule script: {script.asset_name} from {script.tag}.")
+        if user and self._programming_active():
+            # The workbook cell is the default source; touching the combobox
+            # is the explicit operator override back to a catalog asset.
+            self.programming_override = True
+            self.log("Override: installing the selected catalog script instead "
+                     "of the workbook's programming cell.")
+            self._apply_programming_labels()
+
+    # ── workbook programming (schedule install source) ───────────────────
+    def _programming_active(self) -> bool:
+        """The resolved programming applies to the currently selected
+        experiment and the operator has not overridden it."""
+        exp = self._current_experiment()
+        return (self.programming is not None and exp is not None
+                and self.programming_experiment_id == exp.id)
+
+    def _apply_programming_labels(self) -> None:
+        """Row label + status line for the workbook-programming states.
+
+        Only owns the UI when a programming cell applies to the current
+        experiment; the no-cell and lookup-failed states set their own labels
+        in _apply_programming/_apply_programming_error.
+        """
+        if not self._programming_active():
+            self.schedule_row_label.configure(text="Schedule script:")
+            return
+        self.schedule_row_label.configure(text="Schedule override:")
+        self.workbook_warn_var.set("")
+        if self.programming_override:
+            self.schedule_source_var.set(
+                "Schedule: catalog override active (workbook programming "
+                "ignored)")
+            return
+        prog = self.programming
+        version = (f" v{prog.workbook_version_number}"
+                   if prog.workbook_version_number is not None else "")
+        self.schedule_source_var.set(
+            f"Schedule: from workbook{version} ({len(prog.macros)} macros)")
+
+    _NO_PROGRAMMING_WARNING = (
+        "This experiment's workbook has no Ambyte programming cell. "
+        "Installing the released default schedule. Data will arrive but no "
+        "macro will process it — attach the 'Ambyte baseline' workbook "
+        "(or fork it) so processing works out of the box.")
+
+    def _resolve_programming_async(self, experiment) -> None:
+        if not self.client:
+            return
+        self._programming_pending_id = experiment.id
+        self.schedule_source_var.set("Schedule: checking the workbook...")
+        self.workbook_warn_var.set("")
+
+        def work():
+            try:
+                prog = self.client.resolve_programming(experiment.id)
+            except OpenJIIError as exc:
+                self._post(self._apply_programming_error, experiment.id,
+                           str(exc))
+                return
+            self._post(self._apply_programming, experiment.id, prog)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_programming(self, experiment_id: str,
+                           prog: WorkbookProgramming | None) -> None:
+        self._programming_pending_id = None
+        exp = self._current_experiment()
+        if exp is None or exp.id != experiment_id:
+            return  # the operator moved on while the lookup was in flight
+        self.programming = prog
+        self.programming_experiment_id = experiment_id
+        self.programming_override = False
+        if prog is None:
+            self.schedule_source_var.set(
+                "Schedule: released catalog default (workbook has no "
+                "programming cell)")
+            self.workbook_warn_var.set(self._NO_PROGRAMMING_WARNING)
+            self.log("The selected experiment's workbook has no Ambyte "
+                     "programming cell; the released default schedule will "
+                     "be installed.")
+        else:
+            version = (f"v{prog.workbook_version_number}"
+                       if prog.workbook_version_number is not None
+                       else prog.workbook_version_id[:8])
+            self.log(f"Workbook programming found ({version}, "
+                     f"{len(prog.macros)} macro(s)); it will be stamped and "
+                     "installed instead of the catalog default.")
+        self._apply_programming_labels()
+
+    def _apply_programming_error(self, experiment_id: str,
+                                 detail: str) -> None:
+        self._programming_pending_id = None
+        exp = self._current_experiment()
+        if exp is None or exp.id != experiment_id:
+            return
+        self.programming = None
+        self.programming_experiment_id = None
+        self.schedule_source_var.set(
+            "Schedule: workbook lookup failed — using the catalog default")
+        self.workbook_warn_var.set("")
+        self.log(f"Workbook programming lookup failed: {detail}")
+        self._apply_programming_labels()
 
     # ── auth + experiments ───────────────────────────────────────────────
     def _env(self):
@@ -515,6 +638,13 @@ class App(ttk.Frame):
         self.user_label.set("not signed in")
         self.exp_box.configure(state="disabled", values=[])
         self.exp_var.set("")
+        self.programming = None
+        self.programming_experiment_id = None
+        self.programming_override = False
+        self._programming_pending_id = None
+        self.schedule_source_var.set("")
+        self.workbook_warn_var.set("")
+        self._apply_programming_labels()
         key = self.settings.api_key(self.env_var.get())
         if key:
             self._validate_key_async(key, on_startup=True)
@@ -596,6 +726,11 @@ class App(ttk.Frame):
         self.settings.experiment_id = exp.id
         self.settings.experiment_name = exp.name
         self.settings.save()
+        self.programming = None
+        self.programming_experiment_id = None
+        self.programming_override = False
+        self._apply_programming_labels()
+        self._resolve_programming_async(exp)
 
     # ── the procedure ────────────────────────────────────────────────────
     def _session_ready(self) -> str | None:
@@ -610,6 +745,10 @@ class App(ttk.Frame):
             return "the Schedule release or script selection is not available yet."
         if not self._current_experiment():
             return "select an experiment first."
+        exp = self._current_experiment()
+        if self._programming_pending_id == exp.id:
+            return ("the workbook programming lookup is still running; "
+                    "wait a moment.")
         if not self.ssid_var.get().strip():
             return "enter the Wi-Fi SSID the boards should join."
         if not self._selected_port():
@@ -632,6 +771,9 @@ class App(ttk.Frame):
         assert schedule_script is not None, "_session_ready must validate the Schedule selection"
         experiment = self._current_experiment()
         assert experiment is not None, "_session_ready must validate the experiment selection"
+        programming = (self.programming
+                       if self._programming_active()
+                       and not self.programming_override else None)
         return SessionContext(
             env=self._env(),
             client=self.client,
@@ -641,6 +783,7 @@ class App(ttk.Frame):
             timezone=self.local_tz,
             wifi_ssid=self.settings.wifi_ssid,
             wifi_password=self.settings.wifi_password,
+            programming=programming,
         )
 
     def _onboard(self) -> None:

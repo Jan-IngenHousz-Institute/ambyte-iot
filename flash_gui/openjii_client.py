@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import CERTS_DIR, OPENJII_DEVICE_TYPE, Environment
+from .schedule_stamp import is_schedule_yaml
 from .tls import ssl_context
 
 USER_AGENT = "ambyte-flash-gui"
@@ -60,6 +61,35 @@ class Experiment:
     id: str
     name: str
     status: str
+
+
+@dataclass(frozen=True)
+class WorkbookMacro:
+    """One macro cell of a workbook version, resolved to its pipeline identity.
+
+    `filename` is the macro-sandbox module name the platform executes; it only
+    exists on the persisted macro, not on the cell, so resolving it costs one
+    GET /macros/{id} per cell.
+    """
+
+    id: str
+    name: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class WorkbookProgramming:
+    """The installable schedule found in an experiment's pinned workbook version.
+
+    `yaml_text` is the programming cell's raw content — deliberately generic
+    (no ids); whoever installs it stamps the header (see schedule_stamp).
+    """
+
+    yaml_text: str
+    workbook_id: str
+    workbook_version_id: str
+    workbook_version_number: int | None
+    macros: tuple[WorkbookMacro, ...]
 
 
 @dataclass
@@ -259,6 +289,99 @@ class OpenJIIClient:
             device_type=device_type.strip(),
             endpoint=endpoint.strip(),
             topic_prefix=topic_prefix.strip().strip("/"),
+        )
+
+    # ── workbook programming (schedule install source) ───────────────────
+    def get_experiment(self, experiment_id: str) -> dict:
+        """The experiment detail; carries the pinned workbookId/versionId."""
+        status, payload = self._request(
+            "GET", f"/api/v1/experiments/{experiment_id}")
+        if status != 200 or not isinstance(payload, dict):
+            raise OpenJIIError(f"reading experiment {experiment_id} failed "
+                               f"({status}): {self._error_text(payload)}")
+        return payload
+
+    def get_workbook_version(self, workbook_id: str, version_id: str) -> dict:
+        """One immutable workbook version, including its cells."""
+        status, payload = self._request(
+            "GET", f"/api/v1/workbooks/{workbook_id}/versions/{version_id}")
+        if status != 200 or not isinstance(payload, dict):
+            raise OpenJIIError(
+                f"reading workbook version {version_id} failed ({status}): "
+                f"{self._error_text(payload)}")
+        return payload
+
+    def get_macro(self, macro_id: str) -> dict:
+        """The persisted macro; `filename` is what the pipeline executes."""
+        status, payload = self._request("GET", f"/api/v1/macros/{macro_id}")
+        if status != 200 or not isinstance(payload, dict):
+            raise OpenJIIError(f"reading macro {macro_id} failed ({status}): "
+                               f"{self._error_text(payload)}")
+        return payload
+
+    def resolve_programming(self, experiment_id: str,
+                            log=None) -> WorkbookProgramming | None:
+        """The Ambyte schedule pinned to this experiment via its workbook.
+
+        The programming cell is the version's command cell whose YAML carries a
+        top-level ``schema: jii.ambyte-schedule/...`` line. Returns None — never
+        raises — when the experiment has no pinned workbook version or the
+        pinned version has no such cell; HTTP failures raise OpenJIIError.
+        """
+        experiment = self.get_experiment(experiment_id)
+        workbook_id = experiment.get("workbookId")
+        version_id = experiment.get("workbookVersionId")
+        if not isinstance(workbook_id, str) or not workbook_id \
+                or not isinstance(version_id, str) or not version_id:
+            return None
+
+        version = self.get_workbook_version(workbook_id, version_id)
+        cells = version.get("cells")
+        if not isinstance(cells, list):
+            raise OpenJIIError(
+                f"workbook version {version_id} returned no cell list.")
+
+        yaml_text = None
+        macros: list[WorkbookMacro] = []
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            payload = cell.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if cell.get("type") == "command" and yaml_text is None:
+                content = payload.get("content")
+                if (payload.get("format") == "yaml"
+                        and isinstance(content, str)
+                        and is_schedule_yaml(content)):
+                    yaml_text = content
+            elif cell.get("type") == "macro":
+                macro_id = payload.get("macroId")
+                if not isinstance(macro_id, str) or not macro_id:
+                    continue
+                macro = self.get_macro(macro_id)
+                filename = macro.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    raise OpenJIIError(
+                        f"macro {macro_id} has no filename — the pipeline "
+                        "cannot key its output table without it.")
+                name = macro.get("name") or payload.get("name") or macro_id
+                macros.append(WorkbookMacro(id=macro.get("id") or macro_id,
+                                            name=str(name),
+                                            filename=filename))
+
+        if yaml_text is None:
+            return None
+        if log is not None:
+            log(f"openJII: workbook {workbook_id} version {version_id} has an "
+                f"Ambyte programming cell ({len(macros)} macro(s)).")
+        number = version.get("versionNumber", version.get("version"))
+        return WorkbookProgramming(
+            yaml_text=yaml_text,
+            workbook_id=workbook_id,
+            workbook_version_id=version_id,
+            workbook_version_number=number if isinstance(number, int) else None,
+            macros=tuple(macros),
         )
 
     # ── the full provisioning round ──────────────────────────────────────
