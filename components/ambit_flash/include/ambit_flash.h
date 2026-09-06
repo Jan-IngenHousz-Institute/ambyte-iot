@@ -24,7 +24,7 @@ typedef struct {
  * connect via the ROM bootloader, read its chip type + MAC, then reset it back to
  * its application. Proves the end-to-end flasher path with no external hardware.
  *
- * Takes the shared UART bus for the duration (quiesce Lua first — a busy bus
+ * Takes the shared UART bus for the duration (quiesce measurement first — a busy bus
  * returns ESP_ERR_TIMEOUT). `out` may be NULL. Returns ESP_OK only when the ROM
  * answered.
  */
@@ -50,7 +50,7 @@ typedef struct {
  * survives. Works on bare / bricked / any-firmware units (ROM bootloader path).
  *
  * `baud` = link speed after the stub connect (0 => default). Takes the shared UART
- * bus for the whole operation — quiesce Lua first (a busy bus returns ESP_ERR_TIMEOUT).
+ * bus for the whole operation — quiesce measurement first (a busy bus returns ESP_ERR_TIMEOUT).
  * `out` may be NULL. Returns ESP_OK only when all four regions verified.
  */
 esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
@@ -75,7 +75,7 @@ esp_err_t ambit_flash_find_target(ambit_flash_target_t *out);
  * target — including the exact `ambit_flash <ch> <ver>` to run on a mismatch.
  * Returns the number of present channels that differ from the target, or -1 if no
  * SD target image is present. Read-only and bus-mutex-serialised, so it is safe to
- * run with the Lua measurement loop active. */
+ * run with the schedule runner active. */
 int ambit_flash_check(void);
 
 /* Boot-time firmware sync (Phase 3 full): find the SD target image, read each
@@ -86,7 +86,7 @@ int ambit_flash_check(void);
  * per-channel NVS fail counter skips a channel after repeated failed attempts
  * for the same target so a broken unit can't add a doomed flash to every boot.
  *
- * MUST run before the Lua measurement loop starts (it takes the shared UART bus
+ * MUST run before the schedule runner starts (it takes the shared UART bus
  * without any quiesce dance, and probing hard-resets all four AMBITs via the
  * shared enable line). Returns the number of channels flashed AND verified at
  * the target version, or -1 if no SD target image is present. */

@@ -1,7 +1,7 @@
-# Fleet deploy (Ambyte OTA, Lua, and AMBIT OTA)
+# Fleet deploy (Ambyte OTA, schedules, and AMBIT OTA)
 
 Targeted, staged rollouts to the Ambyte fleet, from the three manual GitHub
-Actions workflows (**Fleet deploy (OTA)**, **Fleet deploy (Lua)**, and **Fleet
+Actions workflows (**Fleet deploy (OTA)**, **Fleet deploy (Schedule)**, and **Fleet
 deploy (AMBIT via Ambyte)**) or locally.
 
 This is the productionized successor of the manual `utility-fleetOTA`
@@ -206,7 +206,7 @@ workflows. After selecting that cohort, the runner sends a unique correlated
 `ambit_versions` query to each gateway and records every channel's presence and
 numeric `major.minor.patch` version. A prerelease such as
 `v1.1.2-recovery.1` therefore expects the device-reported numeric identity
-`1.1.2`. Current gateway firmware stops the Lua schedule and waits for any
+`1.1.2`. Current gateway firmware stops the schedule runner and waits for any
 already-triggered SS/MPF run to finish before reading versions, so a scheduled
 measurement cannot masquerade as missing hardware. The runner additionally
 retries incomplete, busy, absent, or unversioned inventory after a bounded idle
@@ -267,44 +267,45 @@ python tools/fleet_deploy/ambit_deploy.py \
 Do not use this workflow for bare, bricked, or pre-cooperative-OTA AMBITs; they
 require the ROM-flasher recovery path.
 
-## Deploying a Lua release
+## Deploying a schedule release
 
-Use **Actions -> Fleet deploy (Lua) -> Run workflow**. Its targeting form
+Use **Actions -> Fleet deploy (Schedule) -> Run workflow**. Its targeting form
 matches Fleet deploy (OTA): environment, release tag or `latest`, firmware
 predicate, deterministic percentage, optional exact devices, and discovery
-window. Select `main` for the default schedule or `legacy_1Hz_spec` for the
-one-channel cmd 31 experiment; either payload is installed on-device as
-`main.lua`. The form also controls whether the device reboots after the swap.
-Dry-run is the default; it publishes correlated ping commands to discover
-firmware versions but publishes no `script_update` command.
+window. Select `default` for the site-independent schedule or
+`legacy_1hz_spec` for the one-channel cmd 31 experiment; either payload is
+installed on-device as `/littlefs/schedule.yaml`. The form also controls whether
+the device reboots after the swap. Dry-run is the default; it publishes
+correlated ping commands to discover firmware versions but publishes no
+`script_update` command.
 
-`latest` considers only published `lua-v*` releases. Before connecting to IoT,
-the deploy tool verifies the manifest schema, tag and version identity,
+`latest` considers only published `schedule-v*` releases. Before connecting to
+IoT, the deploy tool verifies the manifest schema, tag and version identity,
 immutable asset URL, byte count, and SHA-256. `built_against_fw` is reported as
 provenance and is not an automatic compatibility constraint.
 
 For all workflows, `latest` means the highest stable semantic version inside
 that repository/release family: `v*` for Ambyte OTA and AMBIT OTA, and
-`lua-v*` for Lua. It does not depend on which release happened to be published
-most recently.
+`schedule-v*` for schedules. It does not depend on which release happened to
+be published most recently.
 
 For a local exact-device preview:
 
 ```sh
-python tools/fleet_deploy/lua_deploy.py \
-    --profile <sso-profile> --tag lua-v1.0.0 \
-    --script-name legacy_1Hz_spec \
+python tools/fleet_deploy/schedule_deploy.py \
+    --profile <sso-profile> --tag schedule-v1.0.0 \
+    --script-name legacy_1hz_spec \
     --devices "E8:F6:0A:B1:1D:D4" --dry-run
 ```
 
 Drop `--dry-run` to publish. The result artifact and job summary classify each
 target as `accepted`, `applied`, `failed`, `busy`, or `no_reply`.
 
-| Lua outcome | Meaning | Action |
+| Schedule outcome | Meaning | Action |
 |---|---|---|
 | `applied` | Device reported the manifest's expected active SHA-256 | none |
-| `applied (sha mismatch)` | Device said applied but reported different or unavailable active bytes | inspect the SD card and re-run; the workflow fails |
-| `failed` | Download, verification, syntax check, or swap failed | fix the reported cause and re-run |
+| `applied (sha mismatch)` | Device said applied but reported different or unavailable active bytes | inspect `/littlefs/schedule.yaml` and re-run; the workflow fails |
+| `failed` | Download, verification, compile, or swap failed | fix the reported cause and re-run |
 | `busy` | Device explicitly refused because another maintenance operation was active | re-run later |
 | `accepted` | Device accepted but no terminal result arrived in the wait window | inspect telemetry, then sweep again |
 | `no_reply` | No correlated acknowledgement arrived | confirm connectivity and sweep again |

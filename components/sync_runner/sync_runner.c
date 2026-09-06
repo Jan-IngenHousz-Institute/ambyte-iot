@@ -73,7 +73,7 @@
 /* Stagger the first drain past boot-time noise (Wi-Fi join, TLS, DB boot scan). */
 #define SYNC_RUNNER_START_DELAY_MS  10000U
 /* The first pass additionally waits for app_main's boot-complete signal (CLI up,
- * AMBIT auto-flash done, Lua started) so the backlog drain can never compete
+ * AMBIT auto-flash done, schedule started) so the backlog drain can never compete
  * with the startup sequence — the fixed stagger alone was decoupled from the
  * remaining boot work and a large backlog starved the prio-2 console. Capped so
  * a wedged boot step can't silence the publisher forever. */
@@ -84,12 +84,12 @@
  * Most drains are notification-driven; this is just the safety heartbeat. */
 #define SYNC_RUNNER_FALLBACK_MS     30000U
 #define SYNC_RUNNER_TASK_NAME    "sync_runner"
-/* 8 KiB matches lua_runner. cmd_mqtt_publish_next_event heap-allocates the
+/* 8 KiB covers cmd_mqtt_publish_next_event, which heap-allocates the
  * envelope; event_log claim reads as much as the active record cap (64 KiB
  * normally) into its one-time PSRAM-backed s_line buffer. Neither scales this
  * task's stack with record size. */
 #define SYNC_RUNNER_TASK_STACK   8192
-#define SYNC_RUNNER_TASK_PRIO    3   /* below lua_runner (5), above idle */
+#define SYNC_RUNNER_TASK_PRIO    3   /* below sched_runner (10), above idle */
 
 /* ── Connectivity / liveness watchdog ────────────────────────────────────
  * A device that SHOULD be publishing (external power, valid clock, events
@@ -657,7 +657,7 @@ static void sync_runner_wd_task(void *arg)
         bool periodic = (now_tick - last_periodic) >= wd_tick_ticks;
 
         /* Keep the backdated boot-marker semantics, but do not create STATUS
-         * until app_main has finished AMBIT boot flash + Lua startup. The boot
+         * until app_main has finished AMBIT boot flash + schedule startup. The boot
          * completion notification wakes this task, so the marker is immediate. */
         if (s_boot_complete) store_heartbeat(now_tick, hb_ticks, &last_hb);
 

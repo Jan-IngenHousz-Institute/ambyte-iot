@@ -1,5 +1,6 @@
 #include "command_router.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,7 +10,10 @@
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "script_update.h"
+#include "sched_runner.h"
 #include "device_commands.h"
+#include "device_config.h"
+#include "time_sync.h"
 
 #define TAG "cmd_router"
 
@@ -190,14 +194,14 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
-        /* Replace /littlefs/main.lua. Two delivery modes:
+        /* Replace /littlefs/schedule.yaml. Two delivery modes:
          *   - `url`   : download the script over HTTPS (reliable on a fragmented
          *               heap — tiny command, chunked download). Preferred for big
          *               scripts. `checksum` = sha256 hex of the fetched file.
          *   - `script`: inline (legacy alias `payload`). Capped at the 16 KB MQTT
          *               message and needs a contiguous TLS buffer to be received.
          * Optional `reboot` (bool, default true) restarts the device after a
-         * successful swap; false keeps the in-place Lua-runner restart. */
+         * successful swap; false keeps the in-place schedule-runner restart. */
         const cJSON *jscript = cJSON_GetObjectItemCaseSensitive(root, "script");
         if (!cJSON_IsString(jscript)) {
             jscript = cJSON_GetObjectItemCaseSensitive(root, "payload");
@@ -237,19 +241,81 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                          id ? id : "", (unsigned)strlen(script), reboot ? "reboot" : "in-place");
             }
         }
-    } else if (strcmp(type, "lua_exec") == 0) {
-        /* Run a Lua snippet immediately (ephemeral state, alongside main.lua);
-         * the result publishes as lua_exec_result on the status topic. */
-        const cJSON *jcode = cJSON_GetObjectItemCaseSensitive(root, "code");
-        const char *code = cJSON_IsString(jcode) ? jcode->valuestring : NULL;
-        if (code == NULL || code[0] == '\0') {
-            ESP_LOGW(TAG, "lua_exec id=%s missing 'code' — ignoring", id ? id : "");
+    } else if (strcmp(type, "schedule_run") == 0) {
+        /* Dispatch a schedule job on demand: {"job": "<name>"}. The runner
+         * executes it on its own task (sequential with scheduled jobs); this
+         * only enqueues, so it is safe on the MQTT task. The reply is a
+         * schedule_run_result on the status topic. Built with cJSON: the job
+         * name is attacker-controlled MQTT input and must be JSON-escaped,
+         * not interpolated (a quote in it would tear the reply). */
+        const cJSON *jjob = cJSON_GetObjectItemCaseSensitive(root, "job");
+        const char *job = cJSON_IsString(jjob) ? jjob->valuestring : NULL;
+        if (job == NULL || job[0] == '\0') {
+            ESP_LOGW(TAG, "schedule_run id=%s missing 'job' — ignoring", id ? id : "");
         } else {
-            esp_err_t err = script_update_exec_request(code, id);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "lua_exec id=%s dispatch failed: %s",
-                         id ? id : "", esp_err_to_name(err));
+            esp_err_t err = sched_runner_dispatch(job);
+            ESP_LOGW(TAG, "schedule_run id=%s job=%s -> %s", id ? id : "", job,
+                     esp_err_to_name(err));
+            cJSON *reply = cJSON_CreateObject();
+            if (reply != NULL) {
+                cJSON_AddStringToObject(reply, "type", "schedule_run_result");
+                cJSON_AddStringToObject(reply, "id", id ? id : "");
+                cJSON_AddBoolToObject(reply, "ok", err == ESP_OK);
+                cJSON_AddStringToObject(reply, "job", job);
+                cJSON_AddStringToObject(reply, "detail", esp_err_to_name(err));
+                char *json = cJSON_PrintUnformatted(reply);
+                if (json != NULL) {
+                    publish_reply(json);
+                    cJSON_free(json);
+                }
+                cJSON_Delete(reply);
             }
+        }
+    } else if (strcmp(type, "set_location") == 0) {
+        /* Persist and apply site position. Safe as a retained command: unlike
+         * set_time these values do not become stale while a device is offline. */
+        const cJSON *jlat = cJSON_GetObjectItemCaseSensitive(root, "lat");
+        const cJSON *jlon = cJSON_GetObjectItemCaseSensitive(root, "lon");
+        const cJSON *jdeployment = cJSON_GetObjectItemCaseSensitive(root, "deployment");
+        const char *deployment = cJSON_IsString(jdeployment) ? jdeployment->valuestring : NULL;
+        esp_err_t err = ESP_ERR_INVALID_ARG;
+        if (cJSON_IsNumber(jlat) && cJSON_IsNumber(jlon) &&
+            isfinite(jlat->valuedouble) && isfinite(jlon->valuedouble) &&
+            jlat->valuedouble >= -90.0 && jlat->valuedouble <= 90.0 &&
+            jlon->valuedouble >= -180.0 && jlon->valuedouble <= 180.0 &&
+            (jdeployment == NULL || cJSON_IsString(jdeployment))) {
+            err = device_config_set_location(jlat->valuedouble,
+                                             jlon->valuedouble,
+                                             deployment);
+            if (err == ESP_OK) {
+                int tz = 0;
+                time_sync_get_location(NULL, NULL, &tz);
+                time_sync_set_location(jlat->valuedouble, jlon->valuedouble, tz);
+            }
+        }
+        ESP_LOGW(TAG, "set_location id=%s -> %s", id ? id : "", esp_err_to_name(err));
+        char applied_deployment[64] = "";
+        (void)device_config_get_deployment(applied_deployment,
+                                           sizeof(applied_deployment));
+        cJSON *reply = cJSON_CreateObject();
+        if (reply != NULL) {
+            cJSON_AddStringToObject(reply, "type", "set_location_result");
+            cJSON_AddStringToObject(reply, "id", id ? id : "");
+            cJSON_AddBoolToObject(reply, "ok", err == ESP_OK);
+            cJSON_AddNumberToObject(reply, "lat",
+                cJSON_IsNumber(jlat) && isfinite(jlat->valuedouble)
+                    ? jlat->valuedouble : 0.0);
+            cJSON_AddNumberToObject(reply, "lon",
+                cJSON_IsNumber(jlon) && isfinite(jlon->valuedouble)
+                    ? jlon->valuedouble : 0.0);
+            cJSON_AddStringToObject(reply, "deployment", applied_deployment);
+            cJSON_AddStringToObject(reply, "detail", esp_err_to_name(err));
+            char *encoded = cJSON_PrintUnformatted(reply);
+            if (encoded != NULL) {
+                publish_reply(encoded);
+                cJSON_free(encoded);
+            }
+            cJSON_Delete(reply);
         }
     } else if (strcmp(type, "set_time") == 0) {
         /* Set the device RTC from a UTC epoch: {"epoch": <UTC seconds>}. The RTC is

@@ -13,7 +13,7 @@ extern "C" {
  *
  * The device clock and every stored/published timestamp are UTC
  * (measurement_time_utc); the cloud renders local time from the IANA name in the
- * MQTT envelope. But the ON-DEVICE scheduler (components/time_sync + sched.lua)
+ * MQTT envelope. But the ON-DEVICE scheduler (components/time_sync + sched_spec)
  * reasons in LOCAL wall time — "08:00", "30 min after sunset", the day/night
  * gate. This module bridges the two: it turns the configured IANA name into a
  * libc POSIX-TZ rule (which embeds the DST transition dates — no tzdata files

@@ -40,6 +40,29 @@ esp_err_t device_config_get_timezone(char *buf, size_t len);
  * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
  * or behind it, so a correct clock is never moved. */
 esp_err_t device_config_get_flash_time(uint32_t *out);
+
+/* Device position + deployment tag for the schedule runner (sun triggers,
+ * db/store-event $lat/$lon/$deployment placeholders). Version-1 firmware keeps
+ * the optional tuple in one fixed, versioned `site_state` NVS blob so one
+ * commit is the power-loss boundary. Getters prefer a valid blob, then fall
+ * back to legacy lat/lon/deployment keys for already-provisioned devices.
+ * A valid blob is authoritative even when one of its presence flags is absent. */
+esp_err_t device_config_get_lat(double *out);
+esp_err_t device_config_get_lon(double *out);
+esp_err_t device_config_get_deployment(char *buf, size_t len);
+/* Read lat/lon and optional deployment from one snapshot. Returns NOT_FOUND
+ * unless both coordinates are present; deployment may be NULL with len 0. */
+esp_err_t device_config_get_location(double *lat, double *lon,
+                                     char *deployment, size_t deployment_len);
+/* Compatibility setters perform a read-modify-write of the same site_state
+ * blob. They never update the legacy individual keys. */
+esp_err_t device_config_set_lat(double val);
+esp_err_t device_config_set_lon(double val);
+esp_err_t device_config_set_deployment(const char *val);
+/* Persist a coherent site update with one blob write + commit.
+ * `deployment == NULL` preserves the authoritative/legacy tag. */
+esp_err_t device_config_set_location(double lat, double lon,
+                                     const char *deployment);
 /* STATUS heartbeat period in seconds (sync_runner). Optional; caller defaults
  * (300 s) when unset. 0 disables the heartbeat. */
 esp_err_t device_config_get_heartbeat_s(uint32_t *out);

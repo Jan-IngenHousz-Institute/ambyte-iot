@@ -20,6 +20,8 @@ import sys
 import tempfile
 import unittest
 
+from tools.site_state_blob import decode_site_state, encode_site_state
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -86,6 +88,7 @@ class TimezoneProvisioningTest(unittest.TestCase):
         }
         required["AMBYTE_TIMEZONE"] = "AMT"
         original = os.environ.copy()
+        original_read_pem = BUILD_NVS._read_pem
         try:
             os.environ.clear()
             os.environ.update(required)
@@ -96,8 +99,41 @@ class TimezoneProvisioningTest(unittest.TestCase):
                 ("string", "Europe/Amsterdam"),
             )
         finally:
+            BUILD_NVS._read_pem = original_read_pem
             os.environ.clear()
             os.environ.update(original)
+
+    def test_collect_values_encodes_optional_site_metadata(self):
+        required = {
+            env: "/tmp/cert.pem" if kind == "file" else "value"
+            for env, _namespace, _key, kind in BUILD_NVS.FIELDS
+        }
+        original = os.environ.copy()
+        original_read_pem = BUILD_NVS._read_pem
+        try:
+            os.environ.clear()
+            os.environ.update(required)
+            BUILD_NVS._read_pem = lambda _path: "PEM"
+            values = BUILD_NVS._collect_values(
+                lat=52.173, lon=5.819, deployment="greenhouse-a"
+            )
+            encoded = values[("device_cfg", "site_state")]
+            self.assertEqual(encoded, (
+                "hex2bin",
+                encode_site_state(52.173, 5.819, "greenhouse-a").hex(),
+            ))
+            self.assertEqual(
+                decode_site_state(bytes.fromhex(encoded[1])).deployment,
+                "greenhouse-a",
+            )
+        finally:
+            BUILD_NVS._read_pem = original_read_pem
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_collect_values_rejects_oversized_deployment(self):
+        with self.assertRaisesRegex(ValueError, "63-byte"):
+            BUILD_NVS._collect_values(deployment="x" * 64)
 
 
 class GeneratedTableContractTest(unittest.TestCase):

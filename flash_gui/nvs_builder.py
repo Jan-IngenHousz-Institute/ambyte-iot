@@ -14,7 +14,8 @@ verification.
 Field map mirrors tools/build_nvs_image.py in the firmware repo. Namespaces:
   device_cfg  mqtt_uri, mqtt_client_id, mqtt_topic_root, cmd_topic,
               status_topic, device_id, protocol_id, device_name, device_ver,
-              device_firm, firmware_ver, timezone, flash_time (u32)
+              device_firm, firmware_ver, timezone, site_state (atomic blob),
+              flash_time (u32)
   certs       ca_cert, dev_cert, dev_key          (PEM strings, ≤2048 B each)
   wifi_creds  ssid, pass
   wifi_prov   provisioned (u8 = 1)
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import math
 import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .config import NVS_PARTITION_SIZE
+from tools.site_state_blob import encode_site_state
 
 VENDOR_GEN = Path(__file__).resolve().parent / "vendor" / "nvs_partition_gen.py"
 
@@ -91,13 +94,16 @@ class ProvisioningPlan:
     device_firmware: str
     firmware_version: str         # the release version being flashed
     ca_cert_pem: str = AMAZON_ROOT_CA1
-    # Lua release provenance (script_upd namespace): pre-seeds the identity the
+    lat: float | None = None
+    lon: float | None = None
+    deployment: str | None = None
+    # Schedule release provenance (script_upd namespace): pre-seeds the identity the
     # firmware would record after an on-device install, so a board flashed with
-    # the littlefs main.lua image verifies as already-installed. All-or-none.
-    lua_sha256: str | None = None
-    lua_script_version: str | None = None
-    lua_built_against_fw: str | None = None
-    lua_campaign_id: str | None = None
+    # the littlefs schedule.yaml image verifies as already-installed. All-or-none.
+    schedule_sha256: str | None = None
+    schedule_script_version: str | None = None
+    schedule_built_against_fw: str | None = None
+    schedule_campaign_id: str | None = None
 
     def validate(self) -> None:
         required = {
@@ -114,20 +120,29 @@ class ProvisioningPlan:
         if missing:
             raise NvsBuildError("missing provisioning value(s): "
                                 + ", ".join(missing))
-        lua = (self.lua_sha256, self.lua_script_version,
-               self.lua_built_against_fw, self.lua_campaign_id)
-        if any(v is not None for v in lua) and not all(
-                (v or "").strip() for v in lua):
-            raise NvsBuildError("Lua provenance is all-or-none: sha256, "
+        schedule = (self.schedule_sha256, self.schedule_script_version,
+                    self.schedule_built_against_fw, self.schedule_campaign_id)
+        if any(v is not None for v in schedule) and not all(
+                (v or "").strip() for v in schedule):
+            raise NvsBuildError("Schedule provenance is all-or-none: sha256, "
                                 "script_version, built_against_fw, campaign_id")
-        if self.lua_sha256 is not None:
-            sha = self.lua_sha256.strip()
+        if self.schedule_sha256 is not None:
+            sha = self.schedule_sha256.strip()
             if len(sha) != 64 or any(c not in "0123456789abcdefABCDEF"
                                      for c in sha):
-                raise NvsBuildError("lua_sha256 must be 64 hex digits")
+                raise NvsBuildError("schedule_sha256 must be 64 hex digits")
         if len(self.timezone) > 47:
             raise NvsBuildError(f"timezone '{self.timezone}' exceeds the "
                                 "firmware's 47-char buffer")
+        if self.lat is not None and (not math.isfinite(self.lat)
+                                     or not -90.0 <= self.lat <= 90.0):
+            raise NvsBuildError("lat must be between -90 and 90")
+        if self.lon is not None and (not math.isfinite(self.lon)
+                                     or not -180.0 <= self.lon <= 180.0):
+            raise NvsBuildError("lon must be between -180 and 180")
+        if self.deployment is not None and len(
+                self.deployment.encode("utf-8")) > 63:
+            raise NvsBuildError("deployment must fit the firmware's 63-byte buffer")
         for label, pem in (("CA cert", self.ca_cert_pem),
                            ("device cert", self.device_cert_pem),
                            ("device key", self.device_key_pem)):
@@ -174,6 +189,11 @@ def build_nvs_csv(plan: ProvisioningPlan, flash_time: int | None = None) -> str:
     s("device_firm", plan.device_firmware)
     s("firmware_ver", plan.firmware_version)
     s("timezone", plan.timezone)
+    if (plan.lat is not None or plan.lon is not None
+            or plan.deployment is not None):
+        u("site_state", "hex2bin", encode_site_state(
+            plan.lat, plan.lon, plan.deployment
+        ).hex())
     if plan.command_topic:
         s("cmd_topic", plan.command_topic)
     if plan.status_topic:
@@ -197,15 +217,15 @@ def build_nvs_csv(plan: ProvisioningPlan, flash_time: int | None = None) -> str:
     # console wifi_join deliberately does not set it.
     u("provisioned", "u8", "1")
 
-    if plan.lua_sha256 is not None:
-        # Lua release provenance for the baked-in littlefs main.lua image
-        # (components/script_update NVS keys): `lua release` verifies the
-        # flashed script against these, so the onboarding Lua step is a no-op.
+    if plan.schedule_sha256 is not None:
+        # Schedule release provenance for the baked-in littlefs schedule.yaml image
+        # (components/script_update NVS keys): `schedule release` verifies the
+        # flashed script against these, so the onboarding Schedule step is a no-op.
         ns("script_upd")
-        s("applied_id", plan.lua_campaign_id)
-        s("script_sha", plan.lua_sha256.lower())
-        s("script_ver", plan.lua_script_version)
-        s("built_fw", plan.lua_built_against_fw)
+        s("applied_id", plan.schedule_campaign_id)
+        s("script_sha", plan.schedule_sha256.lower())
+        s("script_ver", plan.schedule_script_version)
+        s("built_fw", plan.schedule_built_against_fw)
         s("install_fw", plan.firmware_version)
 
     return "\n".join(lines) + "\n"

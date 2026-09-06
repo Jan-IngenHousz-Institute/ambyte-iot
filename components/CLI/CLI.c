@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,7 +35,8 @@
 #include "uart_sensors.h"
 #include "uart_stream_cli_support.h"
 #include "uart_stream_support.h"
-#include "lua_runner.h"
+#include "sched_runner.h"
+#include "sched_spec.h"
 #include "script_update.h"
 #include "sync_runner.h"
 #include "event_log.h"
@@ -51,12 +53,12 @@
 #include "esp_heap_trace.h"
 #endif
 
-/* `lua put` framing. max_cmdline_length is 512 (see cli_start), so one chunk
+/* `schedule put` framing. max_cmdline_length is 512 (see cli_start), so one chunk
  * decodes to at most 384 bytes; the buffer is sized for the whole line. */
-#define LUA_PUT_CHUNK_MAX 512
-/* A runaway push must not fill the internal partition. The largest released
- * script today is legacy_1Hz_spec.lua at ~15 KB. */
-#define LUA_PUT_TOTAL_MAX (64U * 1024U)
+#define SCHEDULE_PUT_CHUNK_MAX 512
+/* The serial path shares the parser's 16 KiB input cap: accepting more here
+ * would only waste flash writes before commit rejected the file. */
+#define SCHEDULE_PUT_TOTAL_MAX SCHED_YAML_MAX_FILE_BYTES
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
@@ -170,12 +172,11 @@ static int cli_cmd_status(int argc, char **argv)
         printf(" - DB: %s\r\n", dres.message);
     }
 
-    /* SD card: archive/log/recovery roles only since the event store and
-     * main.lua moved to internal flash — an absent card is informational,
-     * not a failure. */
+    /* SD card: archive/log/AMBIT-update roles only; schedules and the event
+     * store live on internal flash, so an absent card is informational. */
     printf(" - SD card: %s\r\n",
            sdcard_is_mounted() ? "mounted (archive/logs/AMBIT OTA only)"
-                               : "absent (OK — Lua and the event store are internal)");
+                               : "absent (OK — schedule and event store are internal)");
 
     /* Battery / input power (MP2731 charger). */
     power_reading_t pw;
@@ -1291,7 +1292,7 @@ static int cli_cmd_sync(int argc, char **argv)
 {
     time_t now_t = 0;
     cmd_read_rtc(&now_t);                        /* UTC — RTC holds UTC by design */
-    /* Localize like the Lua scheduler does, so `sync` previews match what jobs
+    /* Localize like the schedule runner does, so `sync` previews match what jobs
      * actually fire on (DST-correct via the applied timezone). */
     const int64_t now = timezone_localize((int64_t)now_t);
 
@@ -1320,13 +1321,35 @@ static int cli_cmd_sync(int argc, char **argv)
 
     if (strcmp(sub, "loc") == 0) {
         if (argc >= 4) {
+            char *lat_end = NULL, *lon_end = NULL;
+            double lat = strtod(argv[2], &lat_end);
+            double lon = strtod(argv[3], &lon_end);
+            if (lat_end == argv[2] || *lat_end != '\0' ||
+                lon_end == argv[3] || *lon_end != '\0' ||
+                !isfinite(lat) || !isfinite(lon) ||
+                lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+                printf("Usage: sync loc <lat -90..90> <lon -180..180> [tz]\r\n");
+                return 1;
+            }
+            esp_err_t err = device_config_set_location(lat, lon, NULL);
+            if (err != ESP_OK) {
+                printf("location persist failed: %s\r\n", esp_err_to_name(err));
+                return 1;
+            }
             int tz; time_sync_get_location(NULL, NULL, &tz);
-            if (argc >= 5) tz = atoi(argv[4]);
-            time_sync_set_location(strtod(argv[2], NULL), strtod(argv[3], NULL), tz);
+            if (argc >= 5) {
+                tz = atoi(argv[4]);
+                printf("timezone offset is runtime-only; use `cfg set timezone <IANA-name>` "
+                       "to persist it\r\n");
+            }
+            time_sync_set_location(lat, lon, tz);
         }
         double lat, lon; int tz;
+        char deployment[64] = "";
         time_sync_get_location(&lat, &lon, &tz);
-        printf("loc: lat=%.4f lon=%.4f tz=%+d\r\n", lat, lon, tz);
+        (void)device_config_get_deployment(deployment, sizeof(deployment));
+        printf("loc: lat=%.4f lon=%.4f tz=%+d deployment=%s\r\n",
+               lat, lon, tz, deployment[0] ? deployment : "-");
         return 0;
     }
 
@@ -1500,7 +1523,7 @@ static int cli_cmd_ota_mark_valid(int argc, char **argv)
 }
 
 /* Stream a new AMBIT (C3) firmware image over UART. Non-blocking: queues the
- * request and the ambit_ota worker downloads to SD, suspends Lua+MQTT, streams,
+ * request and the ambit_ota worker downloads to SD, suspends measurement+MQTT, streams,
  * and the sensor reboots into the new slot. Watch the log for progress. Use
  * `ambit_info <ch> 2` before/after to read the version. */
 static int cli_cmd_ambit_ota(int argc, char **argv)
@@ -1508,7 +1531,7 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
     if (argc != 3) {
         printf("Usage: ambit_ota <channel 0-3 | all> <firmware-url>\r\n");
         printf("  'all' = every present channel (sequential). URL must be a direct .bin\r\n");
-        printf("  (raw.githubusercontent.com/...), not a /blob//tree/ page. Suspends Lua+MQTT.\r\n");
+        printf("  (raw.githubusercontent.com/...), not a /blob//tree/ page. Suspends measurement+MQTT.\r\n");
         return 1;
     }
     uint8_t ch;
@@ -1538,7 +1561,7 @@ static int cli_cmd_ambit_ota(int argc, char **argv)
  * (`run`) using the ambyte reset/boot lines. After `enter` the chip STAYS in
  * download mode — verify with esptool on the FFC tap:
  *   esptool --chip esp32c3 --port <COM> --before no_reset --after no_reset chip_id
- * Stop Lua first (`lua stop`) so the shared UART bus is free. */
+ * Stop the schedule first (`schedule stop`) so the shared UART bus is free. */
 static int cli_cmd_ambit_dl(int argc, char **argv)
 {
     if (argc != 3 ||
@@ -1553,7 +1576,7 @@ static int cli_cmd_ambit_dl(int argc, char **argv)
     }
     esp_err_t err = uart_sensors_flash_session_begin((uint8_t)ch, 2000);
     if (err != ESP_OK) {
-        printf("bus busy (%s) — try `lua stop` first\r\n", esp_err_to_name(err));
+        printf("bus busy (%s) — try `schedule stop` first\r\n", esp_err_to_name(err));
         return 1;
     }
     if (strcmp(argv[2], "enter") == 0) {
@@ -1586,12 +1609,12 @@ static bool cli_parse_channel(const char *s, int *ch)
 /* Host-driven ROM flasher probe: force the AMBIT on <ch> into ESP32-C3 ROM
  * download mode over the FFC, connect via esp-serial-flasher, read chip + MAC,
  * then reset it back to its app. No PC/tap needed — the ambyte is the flasher.
- * Stop Lua first (`lua stop`) so the shared UART bus is free. NOTE: the reset
+ * Stop the schedule first (`schedule stop`) so the shared UART bus is free. NOTE: the reset
  * strap is shared, so a probe hard-resets ALL FOUR AMBITs. */
 static int cli_cmd_ambit_probe(int argc, char **argv)
 {
     if (argc != 2) {
-        printf("Usage: ambit_probe <0-3|all>   (stop Lua first: `lua stop`)\r\n");
+        printf("Usage: ambit_probe <0-3|all>   (stop schedule first: `schedule stop`)\r\n");
         return 1;
     }
     int from, to;
@@ -1613,7 +1636,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
             printf("ch%d: AMBIT ROM OK — chip=%d MAC=%02x:%02x:%02x:%02x:%02x:%02x\r\n",
                    ch, r.chip, r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5]);
         } else {
-            printf("ch%d: no ROM response (%s) — check wiring / that Lua is stopped\r\n",
+            printf("ch%d: no ROM response (%s) — check wiring / that schedule is stopped\r\n",
                    ch, esp_err_to_name(err));
             failures++;
         }
@@ -1623,7 +1646,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
 
 /* Full ROM flash of an AMBIT from an SD firmware folder (bootloader/partitions/
  * boot_app0/app.bin). Works on bare / bricked / any-firmware units. Preserves NVS
- * calibration (0x9000 untouched). Stop Lua first (`lua stop`); confirm afterward
+ * calibration (0x9000 untouched). Stop the schedule first (`schedule stop`); confirm afterward
  * with `ambit_versions`. */
 static int cli_cmd_ambit_flash(int argc, char **argv)
 {
@@ -1632,7 +1655,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
         printf("  version X  => /sdcard/ambit_fw/X/{bootloader,partitions,boot_app0,app}.bin\r\n");
         printf("  all        => queue a background sweep of every ROM-answering channel\r\n");
         printf("                (version form only; watch the log, confirm with ambit_versions)\r\n");
-        printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop Lua first.\r\n");
+        printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop schedule first.\r\n");
         return 1;
     }
     if (strcmp(argv[1], "all") == 0) {
@@ -1647,7 +1670,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
             return 1;
         }
         /* Run on the ambit_ota worker (same path as the MQTT trigger): quiesces
-         * Lua + MQTT itself and sweeps every channel whose ROM answers — a 4-
+         * measurement + MQTT itself and sweeps every channel whose ROM answers — a 4-
          * channel sweep can take minutes, too long to block the console. NULL id:
          * operator-initiated, never deduped. */
         esp_err_t err = ambit_ota_request_flash(AMBIT_OTA_CH_ALL, argv[2], NULL);
@@ -1658,7 +1681,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
             return 1;
         }
         printf("queued: flash all ROM-answering channels from /sdcard/ambit_fw/%s\r\n"
-               "  (~10-60 s per channel; Lua+MQTT pause during the sweep)\r\n"
+               "  (~10-60 s per channel; measurement+MQTT pause during the sweep)\r\n"
                "  watch the log; confirm afterward with `ambit_versions`.\r\n", argv[2]);
         return 0;
     }
@@ -1691,7 +1714,7 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
 
 /* Detect + report AMBIT firmware drift vs the SD target image (no flashing). Finds
  * the highest /sdcard/ambit_fw/<major.minor.batch>/ with the 4 region files and
- * compares each present AMBIT's running version to it. Read-only; safe with Lua up. */
+ * compares each present AMBIT's running version to it. Read-only; safe while measuring. */
 static int cli_cmd_ambit_check(int argc, char **argv)
 {
     (void)argv;
@@ -1712,129 +1735,214 @@ static int cli_cmd_ambit_check(int argc, char **argv)
     return 0;
 }
 
-/* Operator control of the Lua measurement script. `exec` runs a snippet in an
- * ephemeral state ALONGSIDE a running main.lua (same env: device/ambit/uart/
- * db/sync) — the console-side twin of the MQTT lua_exec command. */
-static int cli_cmd_lua(int argc, char **argv)
+/* Operator control of the declarative schedule runner. `status` shows source,
+ * SHA and per-job counters; install and serial staging both feed the same
+ * compile/checksum/atomic-swap tail in script_update. */
+static int cli_cmd_schedule(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: lua <start|stop|status|release|install|begin|put|commit"
-               "|abort|exec>\r\n");
+        printf("Usage: schedule <status|run <job>|start|stop|reload|actions|validate|"
+               "release|install|begin|put|commit|abort>\r\n");
         return 1;
     }
-    if (strcmp(argv[1], "start") == 0) {
-        esp_err_t err = lua_runner_start();
-        if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
-        else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
-        else                              printf("started (loads /littlefs/main.lua)\r\n");
-        return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
-    }
-    if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = lua_runner_stop(5000);
-        if (err == ESP_ERR_TIMEOUT) {
-            printf("still busy in a C call (e.g. a long UART read) — it will exit "
-                   "when that returns\r\n");
-        } else {
-            printf("%s\r\n", lua_runner_is_running() ? "stop signaled" : "stopped");
+    if (strcmp(argv[1], "status") == 0) {
+        sched_source_t src;
+        sched_runner_source(&src);
+        static const char *const k_kind[] = {
+            "NONE", "INSTALLED", "EMBEDDED_DEFAULT", "EMBEDDED_FALLBACK",
+        };
+        printf("schedule: %s  source=%s\r\n",
+               sched_runner_is_running() ? "RUNNING" : "stopped",
+               k_kind[src.kind & 3]);
+        if (src.sha256[0]) printf("  sha256=%s\r\n", src.sha256);
+        if (src.reason[0]) printf("  fallback reason: %s\r\n", src.reason);
+        const int n = sched_runner_job_count();
+        if (n == 0) {
+            printf("  no program loaded yet\r\n");
+            return 0;
+        }
+        sched_header_t hdr;
+        if (sched_runner_header(&hdr) == ESP_OK) {
+            printf("  id=%s version=%s workbook=%s name=%s\r\n",
+                   hdr.id, hdr.version, hdr.workbook, hdr.name);
+        }
+        printf("  %-16s %-20s %6s %5s %5s %6s %8s\r\n",
+               "job", "next due (UTC)", "runs", "fail", "skip", "streak", "last ms");
+        for (int i = 0; i < n; i++) {
+            sched_job_status_t js;
+            if (sched_runner_job_status(i, &js) != ESP_OK) continue;
+            char due[24] = "-";
+            if (js.boot_pending) {
+                snprintf(due, sizeof due, "now (boot)");
+            } else if (js.next_due_utc >= 0) {
+                time_t t = (time_t)js.next_due_utc;
+                struct tm tm_utc;
+                gmtime_r(&t, &tm_utc);
+                strftime(due, sizeof due, "%Y-%m-%d %H:%M:%S", &tm_utc);
+            }
+            char skipped[16];
+            snprintf(skipped, sizeof skipped,
+                     js.stats.skipped_saturated ? ">=%lu" : "%lu",
+                     (unsigned long)js.stats.skipped);
+            printf("  %-16s %-20s %6lu %5lu %5s %6lu %8lu\r\n",
+                   js.name, due,
+                   (unsigned long)js.stats.runs, (unsigned long)js.stats.failures,
+                   skipped, (unsigned long)js.stats.fail_streak,
+                   (unsigned long)js.stats.last_duration_ms);
         }
         return 0;
     }
-    if (strcmp(argv[1], "status") == 0) {
-        printf("lua script: %s\r\n", lua_runner_is_running() ? "RUNNING" : "stopped");
+    if (strcmp(argv[1], "run") == 0) {
+        if (argc != 3) {
+            printf("Usage: schedule run <job>\r\n");
+            return 1;
+        }
+        esp_err_t err = sched_runner_dispatch(argv[2]);
+        if (err == ESP_ERR_NOT_FOUND)     printf("unknown job '%s'\r\n", argv[2]);
+        else if (err == ESP_ERR_NO_MEM)   printf("dispatch queue full\r\n");
+        else if (err == ESP_ERR_INVALID_STATE) printf("schedule runner not running\r\n");
+        else                              printf("dispatched %s\r\n", argv[2]);
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (strcmp(argv[1], "start") == 0) {
+        esp_err_t err = sched_runner_start();
+        if (err == ESP_ERR_INVALID_STATE) printf("already running\r\n");
+        else if (err != ESP_OK)           printf("start failed: %s\r\n", esp_err_to_name(err));
+        else                              printf("started (loads /littlefs/schedule.yaml or the embedded default)\r\n");
+        return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
+    }
+    if (strcmp(argv[1], "stop") == 0) {
+        esp_err_t err = sched_runner_stop(5000);
+        if (err == ESP_ERR_TIMEOUT) {
+            printf("still busy in a UART transaction — it will exit when that returns\r\n");
+        } else {
+            printf("%s\r\n", sched_runner_is_running() ? "stop signaled" : "stopped");
+        }
         return 0;
+    }
+    if (strcmp(argv[1], "reload") == 0) {
+        esp_err_t err = sched_runner_stop(5000);
+        if (err == ESP_ERR_TIMEOUT) {
+            printf("stop timed out (UART busy) — retry when the transaction returns\r\n");
+            return 1;
+        }
+        err = sched_runner_start();
+        if (err != ESP_OK) {
+            printf("reload: start failed: %s\r\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("reloaded\r\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "actions") == 0) {
+        /* Two-pass sizing: the dump reports the would-be length. */
+        size_t need = sched_actions_dump_json(NULL, 0);
+        char *json = malloc(need + 1);
+        if (json == NULL) {
+            printf("out of memory (%u B)\r\n", (unsigned)(need + 1));
+            return 1;
+        }
+        sched_actions_dump_json(json, need + 1);
+        printf("%s\r\n", json);
+        free(json);
+        return 0;
+    }
+    if (strcmp(argv[1], "validate") == 0) {
+        /* Compile-check the staged file exactly as a reload would see it;
+         * the running program is untouched. */
+        char err[160];
+        esp_err_t r = sched_runner_validate_file(SCRIPT_UPDATE_STAGING_PATH,
+                                                 err, sizeof err);
+        if (r == ESP_OK) {
+            printf("schedule.yaml.new: valid\r\n");
+            return 0;
+        }
+        printf("schedule.yaml.new: %s\r\n", err);
+        return 1;
     }
     if (strcmp(argv[1], "release") == 0) {
         script_identity_t identity;
         esp_err_t err = script_update_get_identity(&identity);
         if (err != ESP_OK) {
-            printf("lua release unavailable: %s\r\n", esp_err_to_name(err));
+            printf("schedule release unavailable: %s\r\n", esp_err_to_name(err));
             return 1;
         }
-        printf("lua release: sha256=%s version=%s built_against_fw=%s "
+        printf("schedule release: sha256=%s version=%s built_against_fw=%s "
                "installed_on_fw=%s verified=%s running=%s\r\n",
                identity.sha256,
                identity.version[0] ? identity.version : "-",
                identity.built_against_fw[0] ? identity.built_against_fw : "-",
                identity.installed_on_fw[0] ? identity.installed_on_fw : "-",
                identity.release_metadata_verified ? "true" : "false",
-               lua_runner_is_running() ? "true" : "false");
+               sched_runner_is_running() ? "true" : "false");
         return 0;
     }
     if (strcmp(argv[1], "install") == 0) {
         if (argc != 7) {
-            printf("Usage: lua install <https-url> <sha256> <id> "
+            printf("Usage: schedule install <https-url> <sha256> <id> "
                    "<script-version> <built-against-fw>\r\n");
             return 1;
         }
         if (strncmp(argv[2], "https://", 8) != 0 || strlen(argv[3]) != 64) {
-            printf("lua install requires an HTTPS URL and 64-digit SHA-256\r\n");
+            printf("schedule install requires an HTTPS URL and 64-digit SHA-256\r\n");
             return 1;
         }
         for (size_t i = 0; i < 64; i++) {
             if (!isxdigit((unsigned char)argv[3][i])) {
-                printf("lua install SHA-256 must be hexadecimal\r\n");
+                printf("schedule install SHA-256 must be hexadecimal\r\n");
                 return 1;
             }
         }
-        /* The GUI remains attached to this console and verifies the active
-         * identity, so use the in-place path: the existing script-update worker
-         * still stops Lua/MQTT, downloads + hashes + parses, atomically swaps,
-         * preserves .bak, then restarts Lua without another USB re-enumeration. */
+        /* The GUI stays attached to verify identity, so restart the runner in
+         * place instead of rebooting and forcing another USB enumeration. */
         esp_err_t err = script_update_url_request_immediate(
             argv[2], argv[3], argv[4], false, argv[5], argv[6]);
         if (err != ESP_OK) {
-            printf("lua install queue failed: %s\r\n", esp_err_to_name(err));
+            printf("schedule install queue failed: %s\r\n", esp_err_to_name(err));
             return 1;
         }
-        printf("lua install queued: id=%s\r\n", argv[4]);
+        printf("schedule install queued: id=%s\r\n", argv[4]);
         return 0;
     }
-    /* ── serial push: `lua begin` / `lua put` / `lua commit` / `lua abort` ──
-     * Lets the operator's PC stream a script down this console instead of the
-     * board fetching it over HTTPS, so onboarding needs no device network at all.
-     * Deliberately stateless between commands: each `put` opens, appends, closes
-     * and re-stats, so an abandoned push leaks no handle, and the reported total
-     * is the file itself rather than a counter that could disagree with it.
-     * Staging is on internal littlefs (SCRIPT_UPDATE_STAGING_PATH), so no SD
-     * gate: a missing archive card must not fail a serial push. */
+    /* Serial push deliberately keeps no open handle or process state between
+     * commands. The staged file itself is the authoritative byte count. */
     if (strcmp(argv[1], "begin") == 0) {
-        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "wb");   /* truncates */
-        bool ok = (f != NULL);
+        FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "wb");
+        bool ok = f != NULL;
         if (ok) fclose(f);
         if (!ok) {
-            printf("lua begin: cannot open %s\r\n", SCRIPT_UPDATE_STAGING_PATH);
+            printf("schedule begin: cannot open %s\r\n", SCRIPT_UPDATE_STAGING_PATH);
             return 1;
         }
-        printf("lua begin: ready\r\n");
+        printf("schedule begin: ready\r\n");
         return 0;
     }
     if (strcmp(argv[1], "put") == 0) {
         if (argc != 3) {
-            printf("Usage: lua put <base64-chunk>\r\n");
+            printf("Usage: schedule put <base64-chunk>\r\n");
             return 1;
         }
-        /* A 512-byte console line decodes to at most 384 bytes. */
-        unsigned char raw[LUA_PUT_CHUNK_MAX];
+        unsigned char raw[SCHEDULE_PUT_CHUNK_MAX];
         size_t olen = 0;
         if (mbedtls_base64_decode(raw, sizeof raw, &olen,
                                   (const unsigned char *)argv[2],
                                   strlen(argv[2])) != 0) {
-            printf("lua put: invalid base64\r\n");
+            printf("schedule put: invalid base64\r\n");
             return 1;
         }
-        long before = 0;
         struct stat st;
         if (stat(SCRIPT_UPDATE_STAGING_PATH, &st) != 0) {
-            printf("lua put: no staged file, run `lua begin` first\r\n");
+            printf("schedule put: no staged file, run `schedule begin` first\r\n");
             return 1;
         }
-        before = (long)st.st_size;
-        if ((size_t)before + olen > LUA_PUT_TOTAL_MAX) {
-            printf("lua put: refusing to exceed %u bytes\r\n", (unsigned)LUA_PUT_TOTAL_MAX);
+        long before = (long)st.st_size;
+        if ((size_t)before + olen > SCHEDULE_PUT_TOTAL_MAX) {
+            printf("schedule put: refusing to exceed %u bytes\r\n",
+                   (unsigned)SCHEDULE_PUT_TOTAL_MAX);
             return 1;
         }
         FILE *f = fopen(SCRIPT_UPDATE_STAGING_PATH, "ab");
-        bool ok = (f != NULL) && fwrite(raw, 1, olen, f) == olen;
+        bool ok = f != NULL && fwrite(raw, 1, olen, f) == olen;
         if (f != NULL) {
             if (fflush(f) != 0) ok = false;
             fclose(f);
@@ -1842,68 +1950,45 @@ static int cli_cmd_lua(int argc, char **argv)
         long after = ok && stat(SCRIPT_UPDATE_STAGING_PATH, &st) == 0
                      ? (long)st.st_size : -1;
         if (!ok || after != before + (long)olen) {
-            printf("lua put: write failed\r\n");
+            printf("schedule put: write failed\r\n");
             return 1;
         }
-        printf("lua put: %ld bytes\r\n", after);
+        printf("schedule put: %ld bytes\r\n", after);
         return 0;
     }
     if (strcmp(argv[1], "commit") == 0) {
         if (argc != 6) {
-            printf("Usage: lua commit <sha256> <id> <script-version> "
+            printf("Usage: schedule commit <sha256> <id> <script-version> "
                    "<built-against-fw>\r\n");
             return 1;
         }
         if (strlen(argv[2]) != 64) {
-            printf("lua commit requires a 64-digit SHA-256\r\n");
+            printf("schedule commit requires a 64-digit SHA-256\r\n");
             return 1;
         }
         for (size_t i = 0; i < 64; i++) {
             if (!isxdigit((unsigned char)argv[2][i])) {
-                printf("lua commit SHA-256 must be hexadecimal\r\n");
+                printf("schedule commit SHA-256 must be hexadecimal\r\n");
                 return 1;
             }
         }
-        /* reboot=false for the same reason as `lua install`: the GUI stays on
-         * this console to verify the identity, so an in-place runner restart
-         * avoids another USB re-enumeration. */
         esp_err_t err = script_update_local_request(argv[2], argv[3], false,
-                                                   argv[4], argv[5]);
+                                                    argv[4], argv[5]);
         if (err != ESP_OK) {
-            printf("lua commit queue failed: %s\r\n", esp_err_to_name(err));
+            printf("schedule commit queue failed: %s\r\n", esp_err_to_name(err));
             return 1;
         }
-        printf("lua commit queued: id=%s\r\n", argv[3]);
+        printf("schedule commit queued: id=%s\r\n", argv[3]);
         return 0;
     }
     if (strcmp(argv[1], "abort") == 0) {
         (void)remove(SCRIPT_UPDATE_STAGING_PATH);
-        printf("lua abort: discarded\r\n");
+        printf("schedule abort: discarded\r\n");
         return 0;
     }
-    if (strcmp(argv[1], "exec") == 0) {
-        if (argc < 3) {
-            printf("Usage: lua exec <code...>   e.g. lua exec return device.uptime_ms()\r\n");
-            return 1;
-        }
-        /* Rejoin argv[2..] — the console splits on spaces. */
-        char code[512] = "";
-        size_t off = 0;
-        for (int i = 2; i < argc && off < sizeof(code) - 1; i++) {
-            off += (size_t)snprintf(code + off, sizeof(code) - off, "%s%s",
-                                    i > 2 ? " " : "", argv[i]);
-        }
-        char result[256] = "";
-        esp_err_t err = lua_runner_exec(code, 120000, result, sizeof result);
-        if (err == ESP_OK) {
-            printf("ok: %s\r\n", result[0] ? result : "(no return value)");
-            return 0;
-        }
-        printf("error (%s): %s\r\n", esp_err_to_name(err), result);
-        return 1;
-    }
-    printf("unknown subcommand '%s' "
-           "(start|stop|status|release|install|exec)\r\n", argv[1]);
+    printf("unknown subcommand '%s' (status|run|start|stop|reload|actions|validate|"
+           "release|install|begin|put|commit|abort)\r\n",
+           argv[1]);
     return 1;
 }
 
@@ -2140,12 +2225,12 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t ambit_probe_cmd = {
         .command = "ambit_probe",
-        .help    = "ambit_probe <0-3|all>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop Lua first)",
+        .help    = "ambit_probe <0-3|all>  enter ROM download + connect via esp-serial-flasher, read chip+MAC (stop schedule first)",
         .func    = cli_cmd_ambit_probe,
     };
     static const esp_console_cmd_t ambit_flash_cmd = {
         .command = "ambit_flash",
-        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop Lua first)",
+        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop schedule first)",
         .func    = cli_cmd_ambit_flash,
     };
     static const esp_console_cmd_t ambit_check_cmd = {
@@ -2153,10 +2238,10 @@ static esp_err_t cli_register_commands(void)
         .help    = "ambit_check  report each AMBIT's version vs the SD target /sdcard/ambit_fw/<M.m.b> (no flashing)",
         .func    = cli_cmd_ambit_check,
     };
-    static const esp_console_cmd_t lua_cmd = {
-        .command = "lua",
-        .help    = "lua start|stop|status|release|install|begin|put|commit|abort|exec  control / update the Lua script",
-        .func    = cli_cmd_lua,
+    static const esp_console_cmd_t schedule_cmd = {
+        .command = "schedule",
+        .help    = "schedule status|run|start|stop|reload|actions|validate|release|install|begin|put|commit|abort",
+        .func    = cli_cmd_schedule,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
@@ -2335,7 +2420,7 @@ static esp_err_t cli_register_commands(void)
         return err;
     }
 
-    err = esp_console_cmd_register(&lua_cmd);
+    err = esp_console_cmd_register(&schedule_cmd);
     if (err != ESP_OK) {
         return err;
     }
@@ -2443,15 +2528,12 @@ esp_err_t cli_start(void)
     /* The IDF default (2) parks the console below every worker on the chip
      * (sync_runner 3, ambit_ota 4, esp-mqtt 5) — under boot/publish load the
      * prompt starved. 6 keeps typing responsive above all of those while
-     * staying below lua_runner (10), whose measurement timing must not be
-     * preempted by console echo. */
+     * staying below the schedule runner (10), whose measurement timing must
+     * not be preempted by console echo. */
     repl_config.task_priority = 6;
-    /* `lua exec` runs a full Lua state (luaL_openlibs + every ambyte module +
-     * lua_pcall) INLINE on this console task — the same workload the dedicated
-     * Lua tasks run on 8 KB stacks (LUA_RUNNER_TASK_STACK / SCRIPT_TASK_STACK).
-     * The ESP-IDF default REPL stack (4096) overflows under it (observed:
-     * "stack overflow in task console_repl" after `lua exec`). Size for that
-     * workload PLUS this task's own line-edit/dispatch frames on top. */
+    /* Keep the pre-removal 12 KiB stack until the inline recovery commands
+     * (ambit_flash, selftest, schedule validate/put) have measured high-water
+     * margins. Avoid trading a small unmeasured saving for a field panic. */
     repl_config.task_stack_size = 12288;
 
     esp_err_t err = cli_create_repl(&repl_config);

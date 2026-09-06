@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Bake a littlefs image of the `littlefs` partition with main.lua inside.
+"""Bake a littlefs image of the `littlefs` partition with schedule.yaml inside.
 
-Since the firmware keeps its script on internal flash (/littlefs/main.lua), a
+Since the firmware keeps its schedule on internal flash (/littlefs/schedule.yaml), a
 fresh board no longer needs the SD seed step: flashing this image at the
 littlefs partition offset delivers the selected release script together with
 the firmware, before first boot.
@@ -30,21 +30,26 @@ _LOOKAHEAD_SIZE = 128       # CONFIG_LITTLEFS_LOOKAHEAD_SIZE
 _BLOCK_CYCLES = 512         # CONFIG_LITTLEFS_BLOCK_CYCLES
 _NAME_MAX = 64              # CONFIG_LITTLEFS_OBJ_NAME_LEN
 
-MAIN_LUA_NAME = "main.lua"
+SCHEDULE_NAME = "schedule.yaml"
+SCHEDULE_MAX_BYTES = 16 * 1024  # SCHED_YAML_MAX_FILE_BYTES in firmware
 
 
 class LittlefsImageError(RuntimeError):
     """The image could not be built or did not survive a read-back check."""
 
 
-def build_main_lua_image(script: bytes, out_path: Path) -> Path:
-    """Write a littlefs image containing /main.lua with `script` as content.
+def build_schedule_image(script: bytes, out_path: Path) -> Path:
+    """Write a littlefs image containing /schedule.yaml with `script` as content.
 
     The rest of the partition is left erased (0xFF). The built image is
     verified by re-mounting it and comparing the file bytes before returning.
     """
     if not script:
-        raise LittlefsImageError("refusing to bake an empty main.lua")
+        raise LittlefsImageError("refusing to bake an empty schedule.yaml")
+    if len(script) > SCHEDULE_MAX_BYTES:
+        raise LittlefsImageError(
+            f"schedule.yaml exceeds the firmware's {SCHEDULE_MAX_BYTES}-byte limit"
+        )
     from littlefs import LittleFS, UserContext   # lazy: host-only dependency
 
     ctx = UserContext(buffsize=LITTLEFS_PARTITION_SIZE)
@@ -57,7 +62,7 @@ def build_main_lua_image(script: bytes, out_path: Path) -> Path:
                       block_cycles=_BLOCK_CYCLES, name_max=_NAME_MAX)
         fs.format()
         fs.mount()
-        with fs.open(MAIN_LUA_NAME, "wb") as f:
+        with fs.open(SCHEDULE_NAME, "wb") as f:
             f.write(script)
         fs.unmount()
     except Exception as exc:
@@ -72,13 +77,13 @@ def build_main_lua_image(script: bytes, out_path: Path) -> Path:
                       read_size=_READ_SIZE, prog_size=_PROG_SIZE,
                       cache_size=_CACHE_SIZE, lookahead_size=_LOOKAHEAD_SIZE,
                       block_cycles=_BLOCK_CYCLES, name_max=_NAME_MAX)
-        with fs.open(MAIN_LUA_NAME, "rb") as f:
+        with fs.open(SCHEDULE_NAME, "rb") as f:
             got = f.read()
         fs.unmount()
     except Exception as exc:
         raise LittlefsImageError(f"freshly built image does not mount: {exc}") from exc
     if got != script:
-        raise LittlefsImageError("read-back of main.lua differs from the scripted bytes")
+        raise LittlefsImageError("read-back of schedule.yaml differs from the scripted bytes")
 
     out_path = Path(out_path).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)

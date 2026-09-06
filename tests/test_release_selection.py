@@ -22,7 +22,7 @@ class ReleaseSelectionTest(unittest.TestCase):
                 "publishedAt": "2026-02-01T00:00:00Z",
             },
             {
-                "tagName": "lua-v9.0.0",
+                "tagName": "schedule-v9.0.0",
                 "isDraft": False,
                 "isPrerelease": False,
             },
@@ -33,23 +33,23 @@ class ReleaseSelectionTest(unittest.TestCase):
         releases = [
             {"tagName": "v9.0.0", "isDraft": False, "isPrerelease": False},
             {
-                "tagName": "lua-v1.1.0-rc.1",
+                "tagName": "schedule-v1.1.0-rc.1",
                 "isDraft": False,
                 "isPrerelease": True,
             },
             {
-                "tagName": "lua-v1.0.0",
+                "tagName": "schedule-v1.0.0",
                 "isDraft": False,
                 "isPrerelease": False,
             },
         ]
         self.assertEqual(
-            release_selection.select_latest(releases, "lua"), "lua-v1.0.0"
+            release_selection.select_latest(releases, "schedule"), "schedule-v1.0.0"
         )
         with self.assertRaises(ValueError):
-            release_selection.parse_tag("lua-v01.0.0", "lua")
+            release_selection.parse_tag("schedule-v01.0.0", "schedule")
         with self.assertRaises(ValueError):
-            release_selection.parse_tag("lua-v1.0.0.x", "lua")
+            release_selection.parse_tag("schedule-v1.0.0.x", "schedule")
 
     def test_ambit_uses_v_tags_and_latest_is_stable_only(self) -> None:
         releases = [
@@ -59,7 +59,7 @@ class ReleaseSelectionTest(unittest.TestCase):
                 "isDraft": False,
                 "isPrerelease": True,
             },
-            {"tagName": "lua-v9.0.0", "isDraft": False, "isPrerelease": False},
+            {"tagName": "schedule-v9.0.0", "isDraft": False, "isPrerelease": False},
         ]
         self.assertEqual(
             release_selection.select_latest(releases, "ambit"), "v1.1.1"

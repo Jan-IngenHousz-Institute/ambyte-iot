@@ -12,7 +12,7 @@ extern "C" {
  *
  * Parses a JSON command delivered on the device's command topic and dispatches on
  * its "type" field. The shared inbound channel for both the OTA trigger (Stage 3)
- * and the Lua script push (Stage 4). Register command_router_get_received_fn() with
+ * and schedule installation. Register command_router_get_received_fn() with
  * the transport (mqtt_client_get_set_received_handler_fn) after init.
  *
  * Command shape:

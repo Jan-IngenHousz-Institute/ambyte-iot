@@ -7,9 +7,9 @@
 │  main/app_main.c  (composition root)            │
 │  REQUIRES: everything — wires ports to adapters │
 ├─────────────────────────────────────────────────┤
-│  Adapters: CLI, lua_runner                      │
+│  Adapters: CLI, sched_runner                    │
 │  REQUIRES: device_commands (+ i2c_bus for CLI,  │
-│            lua for lua_runner)                  │
+│            sched_spec for sched_runner)         │
 │  MUST NOT depend on: bme280, pcf2131tfy_rtc,    │
 │            ambyte_status, persistence, sd_card  │
 ├─────────────────────────────────────────────────┤
@@ -34,9 +34,9 @@
 
 2. **device_commands/** implements the `cmd_*()` API using domain port function pointers received via `device_commands_init()`. It never includes infrastructure headers directly. REQUIRES only `domain`.
 
-3. **Infrastructure components** (bme280, pcf2131tfy_rtc, ambyte_status, persistence, sd_card) implement domain ports. They depend on `domain` for the port typedefs and on their hardware drivers (e.g., `i2c_bus`, `driver`, `fatfs`). They must not depend on `device_commands`, `CLI`, or `lua_runner`.
+3. **Infrastructure components** (bme280, pcf2131tfy_rtc, ambyte_status, persistence, sd_card) implement domain ports. They depend on `domain` for the port typedefs and on their hardware drivers (e.g., `i2c_bus`, `driver`, `fatfs`). They must not depend on `device_commands`, `CLI`, or `sched_runner`.
 
-4. **Adapter components** (CLI, lua_runner) depend on `device_commands` to call `cmd_*()` functions. They must not include any infrastructure component header directly. Exception: CLI uses `i2c_bus` for native `i2cscan` command.
+4. **Adapter components** (CLI, sched_runner) depend on `device_commands` to call `cmd_*()` functions. They must not include any infrastructure component header directly. Exception: CLI uses `i2c_bus` for native `i2cscan` command; sched_runner uses the compiled schedule model and fused AMBIT trace adapter.
 
 5. **main/app_main.c** is the composition root. It is the only place that depends on all components, creates port adapter function pointers from infrastructure, and passes them to `device_commands_init()`.
 

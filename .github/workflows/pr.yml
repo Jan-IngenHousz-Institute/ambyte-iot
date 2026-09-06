@@ -1,4 +1,4 @@
-name: Firmware and Lua PR
+name: Firmware and schedule PR
 
 on:
   pull_request:
@@ -93,9 +93,9 @@ jobs:
           }
 
           FIRMWARE_VERSION=$(preview_unit firmware .)
-          LUA_VERSION=$(preview_unit lua lua)
+          SCHEDULE_VERSION=$(preview_unit schedule schedule)
           FIRMWARE_WILL_RELEASE=false
-          LUA_WILL_RELEASE=false
+          SCHEDULE_WILL_RELEASE=false
           if [[ -n "${FIRMWARE_VERSION}" ]]; then
             BUILD_VERSION="${FIRMWARE_VERSION}"
             ZIP_NAME="ambyte-iot-v${FIRMWARE_VERSION}.zip"
@@ -104,24 +104,24 @@ jobs:
             BUILD_VERSION="pr-${PR_NUMBER}-${PR_HEAD_SHA:0:12}"
             ZIP_NAME="ambyte-iot-${BUILD_VERSION}.zip"
           fi
-          if [[ -n "${LUA_VERSION}" ]]; then LUA_WILL_RELEASE=true; fi
+          if [[ -n "${SCHEDULE_VERSION}" ]]; then SCHEDULE_WILL_RELEASE=true; fi
 
           if [[ -n "${FIRMWARE_VERSION}" ]]; then
-            LUA_BUILT_AGAINST_FW="${FIRMWARE_VERSION}"
+            SCHEDULE_BUILT_AGAINST_FW="${FIRMWARE_VERSION}"
           else
-            LUA_BUILT_AGAINST_FW=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1 | sed 's/^v//')
+            SCHEDULE_BUILT_AGAINST_FW=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1 | sed 's/^v//')
           fi
-          if [[ -z "${LUA_BUILT_AGAINST_FW}" ]]; then
-            echo "::error::Cannot determine the firmware version Lua was built against"
+          if [[ -z "${SCHEDULE_BUILT_AGAINST_FW}" ]]; then
+            echo "::error::Cannot determine the firmware version the schedule was built against"
             exit 1
           fi
 
           echo "firmware-build-version=${BUILD_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "firmware-version=${FIRMWARE_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "firmware-will-release=${FIRMWARE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
-          echo "lua-version=${LUA_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "lua-will-release=${LUA_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
-          echo "lua-built-against-fw=${LUA_BUILT_AGAINST_FW}" >> "${GITHUB_OUTPUT}"
+          echo "schedule-version=${SCHEDULE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "schedule-will-release=${SCHEDULE_WILL_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "schedule-built-against-fw=${SCHEDULE_BUILT_AGAINST_FW}" >> "${GITHUB_OUTPUT}"
           echo "zip-name=${ZIP_NAME}" >> "${GITHUB_OUTPUT}"
           {
             echo "## Release preview"
@@ -131,10 +131,10 @@ jobs:
             else
               echo "- Firmware: no release"
             fi
-            if [[ "${LUA_WILL_RELEASE}" == "true" ]]; then
-              echo "- Lua: **lua-v${LUA_VERSION}** (built against firmware ${LUA_BUILT_AGAINST_FW})"
+            if [[ "${SCHEDULE_WILL_RELEASE}" == "true" ]]; then
+              echo "- Schedule: **schedule-v${SCHEDULE_VERSION}** (built against firmware ${SCHEDULE_BUILT_AGAINST_FW})"
             else
-              echo "- Lua: no release"
+              echo "- Schedule: no release"
             fi
             echo
             echo "- Title: \`${PR_TITLE}\`"
@@ -145,6 +145,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Install Python tooling dependencies
+        run: python -m pip install --disable-pip-version-check -r flash_gui/requirements.txt
 
       - name: Install PlatformIO
         run: |
@@ -206,32 +209,42 @@ jobs:
           (cd dist/bundle && zip -9 -r "../${ZIP_NAME}" .)
           rm -rf dist/bundle
 
-      - name: Build Lua release candidate
-        if: steps.preview.outputs.lua-will-release == 'true'
+      - name: Build schedule release candidate
+        if: steps.preview.outputs.schedule-will-release == 'true'
         env:
-          LUA_VERSION: ${{ steps.preview.outputs.lua-version }}
-          BUILT_AGAINST_FW: ${{ steps.preview.outputs.lua-built-against-fw }}
+          SCHEDULE_VERSION: ${{ steps.preview.outputs.schedule-version }}
+          BUILT_AGAINST_FW: ${{ steps.preview.outputs.schedule-built-against-fw }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq lua5.4
-          LUA_SCRIPTS=(main legacy_1Hz_spec)
-          for SCRIPT in "${LUA_SCRIPTS[@]}"; do
-            luac5.4 -p "lua/${SCRIPT}.lua"
-            python tools/build_lua_release.py \
-              --source "lua/${SCRIPT}.lua" \
-              --asset-name "${SCRIPT}.lua" \
+          cc -std=c11 -O2 -Icomponents/sched_spec/include \
+            -Icomponents/time_sync/include -Itests/host_stubs \
+            tools/sched_host.c components/sched_spec/*.c \
+            components/time_sync/time_sync.c -lm -o "${RUNNER_TEMP}/sched_host"
+          "${RUNNER_TEMP}/sched_host" --schema > dist/actions.schema.json
+          SCHEDULES=(default legacy_1hz_spec)
+          for SCRIPT in "${SCHEDULES[@]}"; do
+            "${RUNNER_TEMP}/sched_host" --check "schedule/${SCRIPT}.yaml"
+            {
+              echo "### Simulated schedule/${SCRIPT}.yaml"
+              echo '```text'
+              "${RUNNER_TEMP}/sched_host" --simulate "schedule/${SCRIPT}.yaml" \
+                --date 2026-06-21 --tz-offset-s 7200 --lat 52.173 --lon 5.819
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            python tools/build_schedule_release.py \
+              --source "schedule/${SCRIPT}.yaml" \
+              --asset-name "${SCRIPT}.yaml" \
               --output-dir dist \
-              --version "${LUA_VERSION}" \
+              --version "${SCHEDULE_VERSION}" \
               --built-against-fw "${BUILT_AGAINST_FW}" \
               --repository "${REPOSITORY}"
-            MANIFEST="dist/${SCRIPT}.lua.manifest.json"
+            MANIFEST="dist/${SCRIPT}.yaml.manifest.json"
             test "$(jq -r .script_name "${MANIFEST}")" = "${SCRIPT}"
-            test "$(jq -r .script_version "${MANIFEST}")" = "${LUA_VERSION}"
+            test "$(jq -r .script_version "${MANIFEST}")" = "${SCHEDULE_VERSION}"
             test "$(jq -r .built_against_fw "${MANIFEST}")" = "${BUILT_AGAINST_FW}"
-            test "$(sha256sum "dist/${SCRIPT}.lua" | awk '{print $1}')" = \
+            test "$(sha256sum "dist/${SCRIPT}.yaml" | awk '{print $1}')" = \
               "$(jq -r .sha256 "${MANIFEST}")"
           done
 

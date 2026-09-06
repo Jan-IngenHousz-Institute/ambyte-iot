@@ -1,5 +1,6 @@
 #include "script_update.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,28 +17,24 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "lauxlib.h"
-#include "lua.h"
-#include "lua_runner.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
+#include "sched_runner.h"
+#include "sched_spec.h"
 
 #define TAG "script_upd"
 
 #define SCRIPT_ID_MAX       64
-#define SCRIPT_EXEC_TIMEOUT_MS 120000   /* snippets may run multi-second AMBIT measurements */
-#define SCRIPT_RESULT_MAX   192
 #define SCRIPT_REBOOT_DELAY_MS 500   /* let the 'applied' reply flush before esp_restart (matches ota_update) */
 
-/* Canonical script home moved to internal flash (littlefs) alongside the
- * internal event store: script delivery is flashing/OTA, and internal littlefs
- * survives SD death — a remote script push must never fail because the archive
- * card is missing. Must match lua_runner's LUA_SCRIPT_PATH. */
-#define LUA_PATH       "/littlefs/main.lua"
-/* Public so the console's `lua put` can stage into the same file this installs
+/* Canonical schedule home is internal flash alongside the internal event store:
+ * schedule delivery is flashing/OTA, and a remote push must never depend on the
+ * corruption-prone archive card. Must match sched_runner's installed path. */
+#define SCHEDULE_PATH       "/littlefs/schedule.yaml"
+/* Public so the console's `schedule put` stages into the same file this installs
  * from; one definition, not two that can drift. */
-#define LUA_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH
-#define LUA_PATH_BAK   "/littlefs/main.lua.bak"
+#define SCHEDULE_PATH_NEW   SCRIPT_UPDATE_STAGING_PATH
+#define SCHEDULE_PATH_BAK   "/littlefs/schedule.yaml.bak"
 
 #define NVS_NS         "script_upd"
 #define KEY_APPLIED    "applied_id"
@@ -47,9 +44,8 @@
 #define KEY_INSTALL_FW  "install_fw"
 
 #define OP_UPDATE       0
-#define OP_EXEC         1
 #define OP_UPDATE_URL   2
-/* Bytes already staged at main.lua.new by the console (`lua begin`/`lua put`),
+/* Bytes already staged by the console (`schedule begin`/`schedule put`),
  * so the board needs no network to install a script. */
 #define OP_UPDATE_LOCAL 3
 
@@ -155,7 +151,8 @@ static void publish_json(const char *msg, int n)
     }
 }
 
-static void report_script(const char *state, const char *id, const char *detail)
+static void report_script_impl(const char *state, const char *id,
+                               const char *detail, bool installed_after_swap)
 {
     char esc_id[SCRIPT_ID_MAX * 2 + 1] = "", esc_detail[192] = "";
     char esc_sha[129] = "", esc_ver[65] = "", esc_built[65] = "", esc_installed[65] = "";
@@ -163,6 +160,18 @@ static void report_script(const char *state, const char *id, const char *detail)
     script_identity_t identity = {0};
     bool identity_ok = script_update_get_identity(&identity) == ESP_OK;
     const esp_app_desc_t *app = esp_app_get_description();
+    sched_source_t source = {0};
+    sched_runner_source(&source);
+    /* Rebooting installs report after a validated file swap while the runner's
+     * in-memory source still names the previous program. Only those explicit
+     * call sites override it: a checksum-less id-only dedupe may also report
+     * `applied` while stopped, but has not verified any installed file. */
+    if (installed_after_swap) {
+        source.kind = SCHED_SOURCE_INSTALLED;
+    }
+    static const char *const source_names[] = {
+        "none", "installed", "embedded_default", "embedded_fallback",
+    };
     json_escape(esc_id, sizeof esc_id, id);
     json_escape(esc_detail, sizeof esc_detail, detail);
     json_escape(esc_sha, sizeof esc_sha, identity.sha256);
@@ -175,26 +184,25 @@ static void report_script(const char *state, const char *id, const char *detail)
         "{\"type\":\"script_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"state\":\"%s\""
         ",\"app_version\":\"%s\",\"script_sha256\":\"%s\",\"script_version\":\"%s\""
         ",\"script_built_against_fw\":\"%s\",\"script_installed_on_fw\":\"%s\""
-        ",\"script_metadata_verified\":%s%s%s%s}",
+        ",\"script_metadata_verified\":%s,\"schedule_source\":\"%s\"%s%s%s}",
         s_cfg.device_id ? s_cfg.device_id : "", esc_id, state,
         esc_fw, identity_ok ? esc_sha : "", identity_ok ? esc_ver : "",
         identity_ok ? esc_built : "", identity_ok ? esc_installed : "",
         identity_ok && identity.release_metadata_verified ? "true" : "false",
+        source_names[source.kind <= SCHED_SOURCE_EMBEDDED_FALLBACK ? source.kind : 0],
         detail ? ",\"detail\":\"" : "", esc_detail, detail ? "\"" : "");
     if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
 }
 
-static void report_exec(const char *id, bool ok, const char *result)
+static void report_script(const char *state, const char *id, const char *detail)
 {
-    char esc_id[SCRIPT_ID_MAX * 2 + 1] = "", esc_res[SCRIPT_RESULT_MAX * 2 + 1] = "";
-    json_escape(esc_id, sizeof esc_id, id);
-    json_escape(esc_res, sizeof esc_res, result);
-    char msg[640];
-    int n = snprintf(msg, sizeof msg,
-        "{\"type\":\"lua_exec_result\",\"device_id\":\"%s\",\"id\":\"%s\",\"ok\":%s,"
-        "\"result\":\"%s\"}",
-        s_cfg.device_id ? s_cfg.device_id : "", esc_id, ok ? "true" : "false", esc_res);
-    if (n > 0 && (size_t)n < sizeof msg) publish_json(msg, n);
+    report_script_impl(state, id, detail, false);
+}
+
+static void report_script_installed(const char *state, const char *id,
+                                    const char *detail)
+{
+    report_script_impl(state, id, detail, true);
 }
 
 /* Keep the maintenance gate/worker reserved during the stable per-device slot.
@@ -214,7 +222,7 @@ static void wait_for_fleet_slot(void)
     }
 }
 
-/* ── OP_UPDATE: replace the internal main.lua ──────────────────────────────────── */
+/* ── OP_UPDATE: replace the internal schedule.yaml ────────────────────────────── */
 
 /* SHA-256(text) == checksum (hex, case-insensitive)? */
 static bool sha256_text(const char *text, char hex[65])
@@ -278,9 +286,9 @@ esp_err_t script_update_get_identity(script_identity_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
-    /* main.lua is on internal littlefs now — no unmount can free the volume
+    /* schedule.yaml is on internal littlefs — no unmount can free the volume
      * mid-read, so the old SD RW-gate (audit R-6) is unnecessary here. */
-    esp_err_t err = sha256_file(LUA_PATH, out->sha256);
+    esp_err_t err = sha256_file(SCHEDULE_PATH, out->sha256);
     if (err != ESP_OK) return err;
 
     nvs_handle_t h;
@@ -294,7 +302,7 @@ esp_err_t script_update_get_identity(script_identity_t *out)
         nvs_read_string(h, KEY_BUILT_FW, out->built_against_fw, sizeof out->built_against_fw);
         nvs_read_string(h, KEY_INSTALL_FW, out->installed_on_fw, sizeof out->installed_on_fw);
         /* Legacy pushes record the exact digest but carry no release tuple.
-         * Keep those distinguishable from a manifest-backed Lua release. */
+         * Keep those distinguishable from a manifest-backed schedule release. */
         if (out->version[0] != '\0' && out->built_against_fw[0] != '\0') {
             out->release_metadata_verified = true;
         } else {
@@ -317,43 +325,54 @@ static bool request_already_active(const script_req_t *r)
     if (r->checksum[0] == '\0') return true;
 
     char active_sha[65] = "";
-    esp_err_t err = sha256_file(LUA_PATH, active_sha);
+    esp_err_t err = sha256_file(SCHEDULE_PATH, active_sha);
     if (err != ESP_OK) return false;
     return strncasecmp(active_sha, r->checksum, 64) == 0;
 }
 
-/* Parse-only syntax check in a bare state (no env needed — nothing executes). */
-static bool syntax_ok(const char *script, char *err, size_t err_cap)
+/* Compile into heap scratch state so install validation and runner loading use
+ * the same parser, action catalog and semantic checks without growing this
+ * maintenance worker's stack by sizeof(sched_program_t). */
+static bool schedule_ok(const char *text, size_t len, char *err, size_t err_cap)
 {
-    lua_State *L = luaL_newstate();
-    if (L == NULL) {
-        snprintf(err, err_cap, "out of memory for syntax check");
+    sched_program_t *scratch = malloc(sizeof(*scratch));
+    if (scratch == NULL) {
+        snprintf(err, err_cap, "out of memory for schedule validation");
         return false;
     }
-    bool ok = (luaL_loadstring(L, script) == LUA_OK);
-    if (!ok) {
-        const char *msg = lua_tostring(L, -1);
-        snprintf(err, err_cap, "%s", msg ? msg : "syntax error");
-    }
-    lua_close(L);
+    bool ok = sched_compile_text(text, len, scratch, err, err_cap) == ESP_OK;
+    free(scratch);
     return ok;
 }
 
-/* Parse-only syntax check straight from a file (url variant — the script is
- * staged on littlefs, not in RAM). luaL_loadfile compiles without executing. */
-static bool syntax_ok_file(const char *path, char *err, size_t err_cap)
+static bool sched_spec_compile_file(const char *path, char *err, size_t err_cap)
 {
-    lua_State *L = luaL_newstate();
-    if (L == NULL) {
-        snprintf(err, err_cap, "out of memory for syntax check");
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        snprintf(err, err_cap, "%s: %s", path, strerror(errno));
         return false;
     }
-    bool ok = (luaL_loadfile(L, path) == LUA_OK);
-    if (!ok) {
-        const char *msg = lua_tostring(L, -1);
-        snprintf(err, err_cap, "%s", msg ? msg : "syntax error");
+    char *buf = malloc(SCHED_YAML_MAX_FILE_BYTES + 1);
+    if (buf == NULL) {
+        fclose(f);
+        snprintf(err, err_cap, "out of memory for schedule validation");
+        return false;
     }
-    lua_close(L);
+    size_t len = fread(buf, 1, SCHED_YAML_MAX_FILE_BYTES + 1, f);
+    bool ok = !ferror(f) && len <= SCHED_YAML_MAX_FILE_BYTES;
+    fclose(f);
+    if (!ok) {
+        if (len > SCHED_YAML_MAX_FILE_BYTES) {
+            snprintf(err, err_cap, "schedule exceeds %u-byte limit",
+                     (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+        } else {
+            snprintf(err, err_cap, "schedule read failed");
+        }
+        free(buf);
+        return false;
+    }
+    ok = schedule_ok(buf, len, err, err_cap);
+    free(buf);
     return ok;
 }
 
@@ -417,6 +436,13 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
         esp_http_client_cleanup(c);
         return ESP_FAIL;
     }
+    if (clen > SCHED_YAML_MAX_FILE_BYTES) {
+        ESP_LOGE(TAG, "download is %lld bytes; schedule limit is %u",
+                 (long long)clen, (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     FILE *f = fopen(path, "wb");
     if (f == NULL) {
@@ -443,6 +469,12 @@ static esp_err_t download_to_file_sha256(const char *url, const char *path,
         int r = esp_http_client_read(c, (char *)buf, SCRIPT_DL_BUF);
         if (r < 0) { err = ESP_FAIL; break; }
         if (r == 0) break;   /* EOF */
+        if ((size_t)r > SCHED_YAML_MAX_FILE_BYTES - total) {
+            ESP_LOGE(TAG, "chunked download exceeds %u-byte schedule limit",
+                     (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+            err = ESP_ERR_INVALID_SIZE;
+            break;
+        }
         mbedtls_sha256_update(&sha, buf, (size_t)r);
         if (fwrite(buf, 1, (size_t)r, f) != (size_t)r) { err = ESP_ERR_NO_MEM; wr_ok = false; break; }
         total += (size_t)r;
@@ -498,11 +530,17 @@ static void do_update_impl(const script_req_t *r)
     char got[65];
 
     /* On-receipt ack: tell the operator the command was received before doing any
-     * work (syntax check + staging write + Lua stop can take a few seconds, and the
+     * work (compile + staging write + runner stop can take a few seconds, and the
      * fleet-OTA notebook waits for an initial reply). MQTT stays up on the inline
      * path, so this lands immediately. */
     report_script("accepted", r->id, NULL);
 
+    if (len > SCHED_YAML_MAX_FILE_BYTES) {
+        snprintf(detail, sizeof detail, "schedule exceeds %u-byte limit",
+                 (unsigned)SCHED_YAML_MAX_FILE_BYTES);
+        report_script("failed", r->id, detail);
+        return;
+    }
     if (!sha256_text(r->text, got)) {
         report_script("failed", r->id, "sha256 failed");
         return;
@@ -513,79 +551,79 @@ static void do_update_impl(const script_req_t *r)
         report_script("failed", r->id, "sha256 mismatch");
         return;
     }
-    if (!syntax_ok(r->text, detail, sizeof detail)) {
-        ESP_LOGE(TAG, "syntax check failed: %s — main.lua untouched", detail);
+    if (!schedule_ok(r->text, len, detail, sizeof detail)) {
+        ESP_LOGE(TAG, "schedule compile failed: %s — schedule.yaml untouched", detail);
         report_script("failed", r->id, detail);
         return;
     }
     /* Stage the new script next to the live one, fully flushed before any swap. */
-    FILE *f = fopen(LUA_PATH_NEW, "wb");
+    FILE *f = fopen(SCHEDULE_PATH_NEW, "wb");
     if (f == NULL) {
-        report_script("failed", r->id, "cannot open " LUA_PATH_NEW);
+        report_script("failed", r->id, "cannot open " SCHEDULE_PATH_NEW);
         return;
     }
     bool wr_ok = (fwrite(r->text, 1, len, f) == len);
     if (wr_ok) { fflush(f); fsync(fileno(f)); }
     fclose(f);
     if (!wr_ok) {
-        remove(LUA_PATH_NEW);
+        remove(SCHEDULE_PATH_NEW);
         report_script("failed", r->id, "staging write failed");
         return;
     }
 
     /* Stop the runner before the swap; a stop timeout means the script is wedged
      * in a long C call — leave everything untouched and let the operator retry. */
-    if (lua_runner_stop(5000) == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "lua task still busy — not swapping; retry in a moment");
-        report_script("failed", r->id, "lua task busy; retry");
+    if (sched_runner_stop(5000) == ESP_ERR_TIMEOUT) {
+        ESP_LOGE(TAG, "schedule task still busy — not swapping; retry in a moment");
+        report_script("failed", r->id, "schedule task busy; retry");
         return;
     }
 
-    /* Swap: previous script survives as main.lua.bak (manual recovery path).
-     * rename() is atomic on littlefs (power-safe by design); a missing old main.lua (first install) is fine. */
-    remove(LUA_PATH_BAK);
-    (void)rename(LUA_PATH, LUA_PATH_BAK);
-    if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
-        ESP_LOGE(TAG, "rename to %s failed — restarting the old script", LUA_PATH);
-        (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
-        (void)lua_runner_start();
+    /* Swap: the previous schedule survives as schedule.yaml.bak. rename() is
+     * atomic on littlefs; a missing active file on first install is fine. */
+    remove(SCHEDULE_PATH_BAK);
+    (void)rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK);
+    if (rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH) != 0) {
+        ESP_LOGE(TAG, "rename to %s failed — restarting the old schedule", SCHEDULE_PATH);
+        (void)rename(SCHEDULE_PATH_BAK, SCHEDULE_PATH);   /* best-effort restore */
+        (void)sched_runner_start();
         report_script("failed", r->id, "rename failed");
         return;
     }
 
-    /* Reboot path (default): the new main.lua is in place and the runner is
+    /* Reboot path (default): the new schedule is in place and the runner is
      * already stopped — a full restart runs it from a fresh boot (clean heap,
      * ordered startup). Latch FIRST so a retained trigger dedupes on reconnect
      * and can't loop the reboot (same guard as ota_update). */
     if (r->reboot) {
         identity_set(r, got);
-        ESP_LOGW(TAG, "main.lua replaced (%u bytes); previous kept as %s — rebooting to run it",
-                 (unsigned)len, LUA_PATH_BAK);
+        ESP_LOGW(TAG, "schedule.yaml replaced (%u bytes); previous kept as %s — rebooting to run it",
+                 (unsigned)len, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)len);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
         esp_restart();                                       /* no return */
     }
 
-    /* In-place path (reboot=false): restart just the Lua runner on the new file. */
-    esp_err_t err = lua_runner_start();
+    /* In-place path (reboot=false): restart the schedule runner on the new file. */
+    esp_err_t err = sched_runner_start();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "runner restart failed: %s (script IS installed — `lua start` manually)",
+        ESP_LOGE(TAG, "runner restart failed: %s (schedule IS installed — `schedule start` manually)",
                  esp_err_to_name(err));
         report_script("failed", r->id, "script installed but runner restart failed");
         return;
     }
 
     identity_set(r, got);
-    ESP_LOGW(TAG, "main.lua replaced (%u bytes) + runner restarted; previous kept as %s",
-             (unsigned)len, LUA_PATH_BAK);
+    ESP_LOGW(TAG, "schedule.yaml replaced (%u bytes) + runner restarted; previous kept as %s",
+             (unsigned)len, SCHEDULE_PATH_BAK);
     snprintf(detail, sizeof detail, "%u bytes", (unsigned)len);
     report_script("applied", r->id, detail);
 }
 
-/* ── OP_UPDATE_URL: download the internal main.lua from a URL ───────────────────────
+/* ── OP_UPDATE_URL: download the internal schedule.yaml from a URL ─────────────────
  * The command message is tiny (just the URL), so it's received even on a
- * fragmented heap; the heavy transfer is a chunked HTTPS download AFTER Lua is
+ * fragmented heap; the heavy transfer is a chunked HTTPS download after the runner is
  * stopped (heap defragmented). This is the reliable path for large scripts —
  * inline 16 KB MQTT delivery needs a contiguous TLS record buffer the fragmented
  * heap can't provide. `r->text` holds the URL. */
@@ -597,33 +635,33 @@ static void do_update_url(const script_req_t *r)
     do_update_url_impl(r);
 }
 
-/* Everything after the bytes are staged at LUA_PATH_NEW: verify the digest,
- * syntax-check, rotate .bak, swap atomically, record provenance. Shared by the
+/* Everything after the bytes are staged at SCHEDULE_PATH_NEW: verify the digest,
+ * compile, rotate .bak, swap atomically, record provenance. Shared by the
  * URL worker and the serial-push worker so the ONLY difference between them is
- * how main.lua.new got written; the dangerous half has exactly one
- * implementation. Leaves main.lua untouched on every failure path. */
+ * how schedule.yaml.new got written; the dangerous half has exactly one
+ * implementation. Leaves schedule.yaml untouched on every failure path. */
 static bool verify_and_swap_staged(const script_req_t *r, const char *got, size_t n,
                                    char *detail, size_t detail_cap)
 {
     if (r->checksum[0] != '\0' &&
         (strlen(r->checksum) != 64 || strncasecmp(got, r->checksum, 64) != 0)) {
         ESP_LOGE(TAG, "checksum mismatch, script rejected");
-        remove(LUA_PATH_NEW);
+        remove(SCHEDULE_PATH_NEW);
         snprintf(detail, detail_cap, "sha256 mismatch");
         return false;
     }
-    if (!syntax_ok_file(LUA_PATH_NEW, detail, detail_cap)) {
-        ESP_LOGE(TAG, "syntax check failed: %s, main.lua untouched", detail);
-        remove(LUA_PATH_NEW);
+    if (!sched_spec_compile_file(SCHEDULE_PATH_NEW, detail, detail_cap)) {
+        ESP_LOGE(TAG, "schedule compile failed: %s, schedule.yaml untouched", detail);
+        remove(SCHEDULE_PATH_NEW);
         return false;
     }
     ESP_LOGW(TAG, "staged %u bytes, sha256=%s", (unsigned)n, got);
-    /* Swap: previous script survives as main.lua.bak (manual recovery path). */
-    remove(LUA_PATH_BAK);
-    (void)rename(LUA_PATH, LUA_PATH_BAK);
-    if (rename(LUA_PATH_NEW, LUA_PATH) != 0) {
-        ESP_LOGE(TAG, "rename to %s failed", LUA_PATH);
-        (void)rename(LUA_PATH_BAK, LUA_PATH);   /* best-effort restore */
+    /* Swap: previous schedule survives as schedule.yaml.bak (manual recovery). */
+    remove(SCHEDULE_PATH_BAK);
+    (void)rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK);
+    if (rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH) != 0) {
+        ESP_LOGE(TAG, "rename to %s failed", SCHEDULE_PATH);
+        (void)rename(SCHEDULE_PATH_BAK, SCHEDULE_PATH);   /* best-effort restore */
         snprintf(detail, detail_cap, "rename failed");
         return false;
     }
@@ -655,7 +693,7 @@ static void do_update_url_impl(const script_req_t *r)
         ESP_LOGI(TAG, "local script URL install: skipping fleet jitter");
     }
 
-    /* Quiesce like the OTAs: stop Lua (frees its 8 KB buffer + UART, defragments)
+    /* Quiesce like the OTAs: stop the runner (frees buffers + UART, defragments)
      * AND stop MQTT (frees its TLS heap) so the download's HTTPS handshake gets a
      * clean, contiguous heap on this PSRAM-less board. MQTT is resumed before we
      * report. */
@@ -667,12 +705,12 @@ static void do_update_url_impl(const script_req_t *r)
     char got[65] = "";
 
     {
-        esp_err_t err = download_to_file_sha256(r->text, LUA_PATH_NEW, got, &n);
+        esp_err_t err = download_to_file_sha256(r->text, SCHEDULE_PATH_NEW, got, &n);
         if (err != ESP_OK) {
             snprintf(detail, sizeof detail, "download failed (%s)", esp_err_to_name(err));
             ESP_LOGE(TAG, "%s", detail);
         } else {
-            /* Lua already stopped; rename() is atomic on littlefs. */
+            /* The runner is already stopped; rename() is atomic on littlefs. */
             applied = verify_and_swap_staged(r, got, n, detail, sizeof detail);
         }
     }
@@ -694,18 +732,18 @@ static void do_update_url_impl(const script_req_t *r)
     }
 
     if (r->reboot) {
-        ESP_LOGW(TAG, "main.lua replaced from url (%u bytes); previous kept as %s — rebooting to run it",
-                 (unsigned)n, LUA_PATH_BAK);
+        ESP_LOGW(TAG, "schedule.yaml replaced from url (%u bytes); previous kept as %s — rebooting to run it",
+                 (unsigned)n, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));   /* flush the MQTT reply */
         esp_restart();                                       /* no return */
     }
 
-    /* In-place: restart the Lua runner on the new script. */
+    /* In-place: restart the schedule runner on the new file. */
     s_cfg.workload_resume();
-    ESP_LOGW(TAG, "main.lua replaced from url (%u bytes) + runner restarted; previous kept as %s",
-             (unsigned)n, LUA_PATH_BAK);
+    ESP_LOGW(TAG, "schedule.yaml replaced from url (%u bytes) + runner restarted; previous kept as %s",
+             (unsigned)n, SCHEDULE_PATH_BAK);
     snprintf(detail, sizeof detail, "%u bytes", (unsigned)n);
     report_script("applied", r->id, detail);
 }
@@ -732,7 +770,7 @@ static void do_update_local_impl(const script_req_t *r)
         return;
     }
 
-    /* Stop Lua: the file it is executing is about to be swapped. Deliberately NO
+    /* Stop the runner: its source file is about to be swapped. Deliberately NO
      * comms_suspend, unlike the URL worker: there is no HTTPS download here that
      * needs the TLS heap, and keeping MQTT up also skips the reconnect wait on
      * the way out. This path is driven by an operator on the local console. */
@@ -742,11 +780,11 @@ static void do_update_local_impl(const script_req_t *r)
     size_t n = 0;
     char   got[65] = "";
 
-    long staged = file_size(LUA_PATH_NEW);
+    long staged = file_size(SCHEDULE_PATH_NEW);
     if (staged <= 0) {
-        snprintf(detail, sizeof detail, "no staged script (lua begin/put first)");
+        snprintf(detail, sizeof detail, "no staged schedule (schedule begin/put first)");
         ESP_LOGE(TAG, "%s", detail);
-    } else if (sha256_file(LUA_PATH_NEW, got) != ESP_OK) {
+    } else if (sha256_file(SCHEDULE_PATH_NEW, got) != ESP_OK) {
         snprintf(detail, sizeof detail, "cannot hash staged script");
         ESP_LOGE(TAG, "%s", detail);
     } else {
@@ -761,35 +799,19 @@ static void do_update_local_impl(const script_req_t *r)
     }
 
     if (r->reboot) {
-        ESP_LOGW(TAG, "main.lua replaced from serial push (%u bytes); previous kept as %s, rebooting to run it",
-                 (unsigned)n, LUA_PATH_BAK);
+        ESP_LOGW(TAG, "schedule.yaml replaced from serial push (%u bytes); previous kept as %s, rebooting to run it",
+                 (unsigned)n, SCHEDULE_PATH_BAK);
         snprintf(detail, sizeof detail, "%u bytes; rebooting", (unsigned)n);
-        report_script("applied", r->id, detail);
+        report_script_installed("applied", r->id, detail);
         vTaskDelay(pdMS_TO_TICKS(SCRIPT_REBOOT_DELAY_MS));
         esp_restart();                                       /* no return */
     }
 
     s_cfg.workload_resume();
-    ESP_LOGW(TAG, "main.lua replaced from serial push (%u bytes) + runner restarted; previous kept as %s",
-             (unsigned)n, LUA_PATH_BAK);
+    ESP_LOGW(TAG, "schedule.yaml replaced from serial push (%u bytes) + runner restarted; previous kept as %s",
+             (unsigned)n, SCHEDULE_PATH_BAK);
     snprintf(detail, sizeof detail, "%u bytes", (unsigned)n);
     report_script("applied", r->id, detail);
-}
-
-/* ── OP_EXEC: run a snippet now ───────────────────────────────────────────── */
-
-static void do_exec(const script_req_t *r)
-{
-    ESP_LOGW(TAG, "lua_exec id=%s: %u bytes", r->id[0] ? r->id : "(none)",
-             (unsigned)strlen(r->text));
-    char result[SCRIPT_RESULT_MAX] = "";
-    esp_err_t err = lua_runner_exec(r->text, SCRIPT_EXEC_TIMEOUT_MS, result, sizeof result);
-    if (err == ESP_OK) {
-        ESP_LOGW(TAG, "lua_exec ok: %s", result[0] ? result : "(no return value)");
-    } else {
-        ESP_LOGE(TAG, "lua_exec failed (%s): %s", esp_err_to_name(err), result);
-    }
-    report_exec(r->id, err == ESP_OK, result);
 }
 
 /* ── shared maintenance worker dispatch (fix #3) ──────────────────────────── */
@@ -797,12 +819,12 @@ static void do_exec(const script_req_t *r)
 /* Run one queued script/exec op in the shared maintenance worker. Owns and frees
  * `arg` (a heap script_req_t) AND its ->text. Previously this ran on a per-op
  * lazy task with a 10 KB stack, whose xTaskCreate failed (ESP_ERR_NO_MEM) on the
- * fragmented field heap — so a remote main.lua push (the primary recovery path)
+ * fragmented field heap — so a remote schedule push (the primary recovery path)
  * could not launch. It now runs on the single resident maintenance worker. */
 static void script_run(void *arg)
 {
     script_req_t *r = arg;
-    if (r->op != OP_EXEC && request_already_active(r)) {
+    if (request_already_active(r)) {
         ESP_LOGI(TAG, "script_update id=%s already active — reporting identity",
                  r->id);
         report_script("applied", r->id, "already applied; checksum verified");
@@ -810,7 +832,7 @@ static void script_run(void *arg)
         free(r);
         return;
     }
-    if (r->op != OP_EXEC && already_applied(r->id)) {
+    if (already_applied(r->id)) {
         ESP_LOGW(TAG, "script_update id=%s latch matched but active checksum drifted — reapplying",
                  r->id);
     }
@@ -820,14 +842,12 @@ static void script_run(void *arg)
     if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
         ESP_LOGW(TAG, "another maintenance op in progress — script op=%u id=%s dropped",
                  r->op, r->id[0] ? r->id : "(none)");
-        if (r->op == OP_EXEC) report_exec(r->id, false, "device busy (maintenance in progress)");
-        else                  report_script("busy", r->id, "another maintenance op is in progress");
+        report_script("busy", r->id, "another maintenance op is in progress");
         free(r->text);
         free(r);
         return;
     }
-    if (r->op == OP_EXEC)            do_exec(r);
-    else if (r->op == OP_UPDATE_URL) do_update_url(r);
+    if (r->op == OP_UPDATE_URL) do_update_url(r);
     else if (r->op == OP_UPDATE_LOCAL) do_update_local(r);
     else                            do_update(r);
     if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
@@ -858,7 +878,7 @@ esp_err_t script_update_init(const script_update_config_t *cfg)
     if (cfg == NULL) return ESP_ERR_INVALID_ARG;
     s_cfg   = *cfg;
     s_ready = true;   /* ops dispatch to the shared maintenance worker via s_cfg.submit */
-    ESP_LOGI(TAG, "script/exec module ready (shared maintenance worker)");
+    ESP_LOGI(TAG, "schedule update module ready (shared maintenance worker)");
     return ESP_OK;
 }
 
@@ -944,9 +964,4 @@ esp_err_t script_update_local_request(const char *checksum, const char *id,
      * the request is self-describing in logs. */
     return request_common(OP_UPDATE_LOCAL, SCRIPT_UPDATE_STAGING_PATH, checksum, id,
                           reboot, false, script_version, built_against_fw);
-}
-
-esp_err_t script_update_exec_request(const char *code, const char *id)
-{
-    return request_common(OP_EXEC, code, NULL, id, false, false, NULL, NULL); /* exec is never deduped/rebooted */
 }

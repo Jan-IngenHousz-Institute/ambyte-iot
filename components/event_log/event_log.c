@@ -6,7 +6,7 @@
  * docs/append-log-persistence-plan.md for the design rationale; the Step-0 spike
  * proved this write pattern is corruption-free on the field card.
  *
- * Concurrency: every public op runs under s_mtx, serialising the Lua task
+ * Concurrency: every public op runs under s_mtx, serialising the schedule runner
  * (store), the sync-runner drain (claim plus deferred ack/error marks), the
  * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), and the CLI
  * (stats). MQTT/Wi-Fi event tasks never enter this component: device_commands
@@ -86,11 +86,13 @@ static esp_err_t evstore_free_bytes(uint64_t *out_free)
 #define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
 #define EVLOG_LEGACY_SD_DIR  "/sdcard/events"              /* pre-internal-store firmware backlog */
 #define EVLOG_ARCHIVE_DIR    "/sdcard/archive"             /* bulk archive of synced records */
-/* lua_runner's binding case is the permanent new-firmware v2 fallback:
+/* ambit_trace's binding case is the permanent new-firmware v2 fallback:
  * 62,999 payload + 1,535 metadata + 543 arrun command + 113 fixed header +
  * 2 framing = 65,192 B, strictly below EVLOG_RECORD_CAP_NORMAL (65,552) with
  * 360 B spare. Canonical v3 rows leave metadata empty and are smaller. The
- * producer names every term and proves the positive margin with static asserts. */
+ * producer names every term and proves the positive margin with static asserts
+ * against this component's public cap (a reverse include here would create an
+ * event_log <-> ambit_trace component dependency cycle). */
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
 #define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
 #define EVLOG_FLUSH_EVERY_N  8                /* fsync every N records. Was 1 (per-record) to shrink the
@@ -102,7 +104,7 @@ static esp_err_t evstore_free_bytes(uint64_t *out_free)
                                                * erase block on power loss). Batching trades ≤8 records /
                                                * ≤1.5 s of loss — which at-least-once delivery already
                                                * tolerates — for ~8× less FAT exposure; a corrupted FAT loses
-                                               * the ENTIRE backlog + main.lua. The low-battery persistence
+                                               * the ENTIRE backlog. The low-battery persistence
                                                * park (app_main) closes the predictable-brownout case. Claims
                                                * of tail records still flush first, so publishing never sees a
                                                * stale tail. */
@@ -197,7 +199,7 @@ static int64_t   s_skipped       = 0;   /* records/files skipped at the cursor w
 static int64_t   s_dropped       = 0;   /* records refused/dropped at store (too-large, full, short-write) */
 static int64_t   s_last_acked_id = 0;   /* highest measure_id confirmed synced (PUBACK) */
 /* Storage-full is distinct from card-loss: a full card is HEALTHY, so we pause
- * writes WITHOUT reporting an I/O error (which would unmount it + restart Lua).
+ * writes WITHOUT reporting an I/O error (which would unmount it + restart measurement).
  * The drain keeps running, frees space, and store admission re-enables writes. */
 static volatile bool s_write_full = false;
 /* Head-of-line OOM tracking: a record too big to strdup on the fragmented heap is
@@ -904,7 +906,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         }
     }
     /* Storage-full admission control: a full card is healthy, so refuse cleanly
-     * (no I/O-error report → no unmount/Lua-restart thrash) and let the drain free
+     * (no I/O-error report → no unmount/measurement-restart thrash) and let the drain free
      * space. Re-enable once the drain has recovered headroom (audit C1/C2). */
     if (s_write_full) {
         uint64_t freeb = 0;
@@ -1036,7 +1038,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         s_dropped++;
         /* Distinguish a FULL store (healthy — pause writes, keep draining) from a
          * media fault (report I/O error → latch). A false fault report on a
-         * full-but-healthy store causes the remount/Lua-restart thrash (audit C1).
+         * full-but-healthy store causes the remount/measurement-restart thrash (audit C1).
          * Recovery (evict synced files first) is shared with every other
          * ENOSPC-class path via evlog_full_recovery_locked(). */
         uint64_t freeb = 0;

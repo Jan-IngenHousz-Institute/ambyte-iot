@@ -6,10 +6,16 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "device_commands.h"
+#include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -22,9 +28,192 @@
 #define BENCH_DIAG_INTERVAL_MS 60000U
 #define BENCH_DIAG_STACK       4096U
 #define BENCH_DIAG_PRIORITY    1U
+#define BENCH_FLOOD_STACK      4096U
+#define BENCH_FLOOD_PRIORITY   2U
+#define BENCH_FLOOD_HZ_MAX     100U
+#define BENCH_FLOOD_BYTES_MIN  48U
+#define BENCH_FLOOD_BYTES_MAX  60000U
+#define BENCH_FLOOD_SECONDS_MAX (7U * 24U * 60U * 60U)
 
 static const char *TAG = "bench_diag";
 static TaskHandle_t s_task;
+static TaskHandle_t s_flood_task;
+
+typedef struct {
+    uint32_t hz;
+    uint32_t bytes;
+    uint32_t seconds;
+} bench_flood_config_t;
+
+static bench_flood_config_t s_flood_cfg;
+
+_Static_assert(configTICK_RATE_HZ >= BENCH_FLOOD_HZ_MAX,
+               "bench_flood rate must not exceed the FreeRTOS tick rate");
+
+static bool parse_u32(const char *text, uint32_t min, uint32_t max, uint32_t *out)
+{
+    if (text == NULL || text[0] == '\0' || out == NULL) return false;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < min || value > max) {
+        return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+static bool build_flood_payload(char *payload, size_t bytes, int64_t sequence,
+                                size_t *required_out)
+{
+    const int prefix_len = snprintf(payload, bytes + 1U,
+                                    "{\"sequence\":%lld,\"padding\":\"",
+                                    (long long)sequence);
+    static const char suffix[] = "\"}";
+    if (prefix_len < 0) {
+        if (required_out != NULL) *required_out = 0;
+        return false;
+    }
+    const size_t required = (size_t)prefix_len + sizeof(suffix) - 1U;
+    if (required_out != NULL) *required_out = required;
+    if (required > bytes) {
+        return false;
+    }
+    const size_t pad_len = bytes - (size_t)prefix_len - (sizeof(suffix) - 1U);
+    memset(payload + prefix_len, 'x', pad_len);
+    memcpy(payload + prefix_len + pad_len, suffix, sizeof(suffix));
+    return true;
+}
+
+static void bench_flood_task(void *arg)
+{
+    const bench_flood_config_t cfg = *(const bench_flood_config_t *)arg;
+    char *payload = malloc((size_t)cfg.bytes + 1U);
+    if (payload == NULL) {
+        ESP_LOGE(TAG, "BENCH flood allocation failed: bytes=%u", (unsigned)cfg.bytes);
+        s_flood_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const uint64_t target = (uint64_t)cfg.hz * (uint64_t)cfg.seconds;
+    TickType_t wake = xTaskGetTickCount();
+    uint32_t tick_remainder = 0;
+    uint64_t attempted = 0;
+    uint64_t stored = 0;
+    uint64_t failed = 0;
+    int64_t first_id = 0;
+    int64_t last_id = 0;
+
+    ESP_LOGW(TAG, "BENCH flood started: rate=%u/s payload=%u bytes duration=%us",
+             (unsigned)cfg.hz, (unsigned)cfg.bytes, (unsigned)cfg.seconds);
+    while (attempted < target) {
+        int64_t measure_id = 0;
+        cmd_result_t id_result = cmd_next_measure_id(&measure_id);
+        size_t payload_required = 0;
+        if (id_result.status != ESP_OK) {
+            failed++;
+            if (failed == 1U || failed % 100U == 0U) {
+                ESP_LOGE(TAG, "BENCH flood id fetch failed: count=%llu %s",
+                         (unsigned long long)failed, id_result.message);
+            }
+        } else if (!build_flood_payload(payload, cfg.bytes, measure_id,
+                                        &payload_required)) {
+            failed++;
+            if (failed == 1U || failed % 100U == 0U) {
+                ESP_LOGE(TAG, "BENCH flood payload too small: count=%llu id=%lld bytes=%u required=%u",
+                         (unsigned long long)failed, (long long)measure_id,
+                         (unsigned)cfg.bytes, (unsigned)payload_required);
+            }
+        } else {
+            const int64_t now_ms = (int64_t)time(NULL) * 1000LL;
+            const measurement_event_desc_t event = {
+                .measure_id = measure_id,
+                .channel = "",
+                .device = "bench",
+                .tag = MEASUREMENT_TAG_MEASUREMENT,
+                .cmd_raw = "bench_flood",
+                .start_ms = now_ms,
+                .end_ms = now_ms,
+                .metadata_json = NULL,
+                .payload_json = payload,
+            };
+            cmd_result_t store_result = cmd_store_event(&event);
+            if (store_result.status == ESP_OK) {
+                if (first_id == 0) first_id = measure_id;
+                last_id = measure_id;
+                stored++;
+                if (stored % 100U == 0U) {
+                    ESP_LOGW(TAG, "BENCH flood progress: stored=%llu failed=%llu first_id=%lld last_id=%lld",
+                             (unsigned long long)stored, (unsigned long long)failed,
+                             (long long)first_id,
+                             (long long)measure_id);
+                }
+            } else {
+                failed++;
+                if (failed == 1U || failed % 100U == 0U) {
+                    ESP_LOGE(TAG, "BENCH flood store failed: count=%llu id=%lld %s",
+                             (unsigned long long)failed, (long long)measure_id,
+                             store_result.message);
+                }
+            }
+        }
+        attempted++;
+
+        /* Fractional tick accumulation preserves the requested average rate
+         * when hz does not divide configTICK_RATE_HZ. The static assertion makes
+         * every interval at least one tick, so no sub-tick residual can spin. */
+        const uint32_t tick_numerator = configTICK_RATE_HZ + tick_remainder;
+        const TickType_t period_ticks = (TickType_t)(tick_numerator / cfg.hz);
+        tick_remainder = tick_numerator % cfg.hz;
+        vTaskDelayUntil(&wake, period_ticks);
+    }
+
+    ESP_LOGW(TAG, "BENCH flood complete: attempted=%llu stored=%llu failed=%llu first_id=%lld last_id=%lld",
+             (unsigned long long)attempted,
+             (unsigned long long)stored, (unsigned long long)failed,
+             (long long)first_id, (long long)last_id);
+    free(payload);
+    s_flood_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static int bench_flood_command(int argc, char **argv)
+{
+    bench_flood_config_t cfg;
+    if (argc != 4 ||
+        !parse_u32(argv[1], 1U, BENCH_FLOOD_HZ_MAX, &cfg.hz) ||
+        !parse_u32(argv[2], BENCH_FLOOD_BYTES_MIN, BENCH_FLOOD_BYTES_MAX, &cfg.bytes) ||
+        !parse_u32(argv[3], 1U, BENCH_FLOOD_SECONDS_MAX, &cfg.seconds)) {
+        printf("usage: bench_flood <hz:1-%u> <bytes:%u-%u> <seconds:1-%u>\r\n",
+               (unsigned)BENCH_FLOOD_HZ_MAX,
+               (unsigned)BENCH_FLOOD_BYTES_MIN,
+               (unsigned)BENCH_FLOOD_BYTES_MAX,
+               (unsigned)BENCH_FLOOD_SECONDS_MAX);
+        return 1;
+    }
+    if (s_flood_task != NULL) {
+        printf("bench_flood already running\r\n");
+        return 1;
+    }
+
+    s_flood_cfg = cfg;
+    if (xTaskCreate(bench_flood_task, "bench_flood", BENCH_FLOOD_STACK,
+                    &s_flood_cfg, BENCH_FLOOD_PRIORITY, &s_flood_task) != pdPASS) {
+        s_flood_task = NULL;
+        printf("bench_flood: task creation failed\r\n");
+        return 1;
+    }
+    printf("bench_flood started\r\n");
+    return 0;
+}
+
+static const esp_console_cmd_t s_bench_flood_cmd = {
+    .command = "bench_flood",
+    .help = "bench_flood <hz> <bytes> <seconds>  store synthetic events (bench only)",
+    .hint = NULL,
+    .func = bench_flood_command,
+};
 
 /* lwIP owns the upper CONFIG_LWIP_MAX_SOCKETS descriptors. F_GETFL is one of
  * lwip_fcntl's two supported commands and safely acquires/releases a socket
@@ -122,6 +311,12 @@ esp_err_t bench_diag_start(void)
         return ps_err;
     }
 #endif
+
+    const esp_err_t console_err = esp_console_cmd_register(&s_bench_flood_cmd);
+    if (console_err != ESP_OK) {
+        ESP_LOGE(TAG, "bench_flood registration failed: %s", esp_err_to_name(console_err));
+        return console_err;
+    }
 
     if (xTaskCreate(bench_diag_task, "bench_diag", BENCH_DIAG_STACK, NULL,
                     BENCH_DIAG_PRIORITY, &s_task) != pdPASS) {

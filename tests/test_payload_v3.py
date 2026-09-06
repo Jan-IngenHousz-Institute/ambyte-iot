@@ -189,6 +189,47 @@ class PayloadV3Test(unittest.TestCase):
         self.assertEqual(ambient["t0"], 2.989)
         self.assertEqual(ambient["dt"], 6.832)
 
+    def test_schedule_tag_is_additive_and_never_replaces_the_protocol(self) -> None:
+        # 2026-09 soak: dark-edge traces published protocol.name="edge", so the
+        # MPF protocol was unrecoverable and a protocol filter missed them.
+        tagged = self.records["TRACE_TAGGED"]
+        self.assertEqual(tagged["protocol"]["name"], "MPF")
+        self.assertEqual(tagged["protocol"]["tag"], "edge")
+        self.assertEqual(tagged["tag"], "MEASUREMENT")  # envelope tag is separate
+        v2_metadata = self.records["TRACE_TAGGED_V2_METADATA"]
+        self.assertEqual(v2_metadata["protocol"], "MPF")
+        self.assertEqual(v2_metadata["protocol_tag"], "edge")
+
+    def test_spectrum_is_a_schema_tagged_family_not_the_legacy_v2_envelope(self) -> None:
+        spectrum = self.records["SPECTRUM"]
+        self.assertEqual(spectrum["schema"], "ambit.spectrum/1")
+        self.assertEqual(spectrum["tag"], "MEASUREMENT")
+        self.assertEqual(spectrum["channel"], "uart_0")
+        self.assertEqual(spectrum["sensor_id"], "3C:DC:75:0D:FD:20")
+        self.assertEqual(spectrum["cal_version"], "c96cda1b")
+        self.assertEqual(
+            spectrum["observations"]["par"], {"u": "umol.m-2.s-1", "v": 12.75}
+        )
+        self.assertEqual(
+            spectrum["observations"]["spectrum"],
+            {"u": "count", "v": list(range(10))},
+        )
+        # None of the legacy v2 spelling survives.
+        raw = self.raw_records["SPECTRUM"]
+        for legacy in ('"v":2', "cmd_raw", "startTicks_UTC", '"spec"'):
+            self.assertNotIn(legacy, raw)
+
+        # A 320 B production buffer overflowed on the bench, so the worst case
+        # must stay inside the cap that producers size against, with headroom.
+        header = (ROOT / "components/payload_codec/include/payload_v3.h").read_text()
+        cap = int(
+            header.split("#define PAYLOAD_V3_SPECTRUM_CAP", 1)[1].split("U", 1)[0].strip()
+        )
+        worst = int(self.raw_records["SPECTRUM_MAX_LEN"])
+        self.assertLess(worst, cap)
+        actions = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
+        self.assertIn("char payload[PAYLOAD_V3_SPECTRUM_CAP]", actions)
+
     def test_telemetry_is_one_grouped_object_and_empty_snapshot_is_stable(self) -> None:
         telemetry = self.records["TELEMETRY"]
         self.assertEqual(telemetry["schema"], "ambyte.telemetry/1")
@@ -281,63 +322,90 @@ class PayloadV3Test(unittest.TestCase):
         self.assertNotIn("ambit_info_fetch", heartbeat)
         self.assertIn("input.attached_count = 0", heartbeat)
         self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 2)
+        # attached_sensors borrows pointers into the info structs, so each slot
+        # needs its OWN record. One loop-scoped `ai` made every slot alias the
+        # last channel's strings (2026-09 soak: one sensor_id on both UARTs).
+        self.assertIn("ambit_device_info_t infos[PAYLOAD_V3_MAX_ATTACHED]", heartbeat)
+        self.assertNotIn("ambit_device_info_t ai;", heartbeat)
+        self.assertIn(".sensor_id = ai->device_id", heartbeat)
 
-        lua_source = (ROOT / "components/lua_runner/lua_runner.c").read_text()
-        self.assertNotIn("AMBIT_RUN_METADATA_CAP", lua_source)
-        self.assertIn("payload_v3_build_trace_lossless", lua_source)
-        self.assertNotIn("char fallback_metadata[", lua_source)
-        self.assertIn("payload + AMBIT_RUN_PAYLOAD_CAP", lua_source)
-        self.assertIn("char *candidate = malloc(AMBIT_RUN_BUFFER_CAP)", lua_source)
-        self.assertIn("opts.metadata ignored %u unsupported key(s)", lua_source)
-        sync_run = lua_source.split("static int l_ambit_run", 1)[1].split(
-            "/* Parallel-run phase 1", 1
+        trace_source = (ROOT / "components/ambit_trace/ambit_trace.c").read_text()
+        trace_header = (ROOT / "components/ambit_trace/include/ambit_trace.h").read_text()
+        runner_source = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
+        runner_core = (ROOT / "components/sched_runner/sched_runner.c").read_text()
+        self.assertIn("AMBIT_RUN_METADATA_CAP", trace_header)
+        self.assertRegex(
+            trace_header,
+            r"(?s)typedef struct \{.*uint8_t type;.*bool far_red;.*"
+            r"uint16_t pulses;.*uint16_t freq;.*int16_t actinic;.*"
+            r"uint8_t subsampling;.*\} ambit_trace_segment_t;",
+        )
+        self.assertIn("payload_v3_build_trace_lossless", trace_source)
+        self.assertNotIn("char fallback_metadata[", trace_source)
+        self.assertIn("payload + AMBIT_RUN_PAYLOAD_CAP", trace_source)
+        self.assertIn("char *candidate = malloc(AMBIT_RUN_BUFFER_CAP)", trace_source)
+        sync_run = runner_source.split("static esp_err_t act_ambit_trace", 1)[1].split(
+            "/* ── ambit/spectrum", 1
         )[0]
         self.assertLess(
-            sync_run.index("ambit_capture_protocol_ref(L, 3"),
-            sync_run.index("cmd_ambit_run(ch"),
+            sync_run.index("snprintf(opts.protocol_ref.protocol"),
+            sync_run.index("ambit_trace_trigger(ch"),
         )
-        route_store = lua_source.split("static int ambit_decode_store_push", 1)[1].split(
-            "static int l_ambit_run", 1
+        # The protocol field carries the protocol; the tag rides its own slot.
+        self.assertIn('sizeof(opts.protocol_ref.protocol),\n             "%s", pname)', sync_run)
+        self.assertIn("snprintf(opts.protocol_ref.tag", sync_run)
+        self.assertIn("protocol_tag = protocol_ref != NULL && protocol_ref->tag[0]", trace_source)
+        # ambit/spectrum publishes the schema-tagged family, not the v2 envelope.
+        spectrum_run = runner_source.split("static int64_t store_spectrum", 1)[1]
+        self.assertIn("payload_v3_build_spectrum", spectrum_run)
+        self.assertNotIn('"{\\"spec\\":[', runner_source)
+        self.assertIn("ambit_trace_trigger", sync_run)
+        self.assertIn("ambit_trace_fetch", sync_run)
+        self.assertIn(".type        = proto->segments[i].type", sync_run)
+        self.assertIn(".far_red     = proto->segments[i].far_red != 0", sync_run)
+        self.assertIn(".pulses      = proto->segments[i].pulses", sync_run)
+        self.assertIn(".freq        = proto->segments[i].freq", sync_run)
+        self.assertIn(".actinic     = proto->segments[i].actinic", sync_run)
+        self.assertIn(".subsampling = proto->segments[i].subsampling", sync_run)
+
+        run_array_builder = trace_source.split(
+            "uint8_t *ambit_trace_build_run_arr", 1
+        )[1].split("int64_t ambit_trace_estimate_ms", 1)[0]
+        self.assertIn("line[0] = segments[i].type", run_array_builder)
+        self.assertIn("line[1] = segments[i].far_red ? 1U : 0U", run_array_builder)
+        self.assertIn("line[2] = (uint8_t)(segments[i].pulses >> 8)", run_array_builder)
+        self.assertIn("line[3] = (uint8_t)segments[i].pulses", run_array_builder)
+        self.assertIn("line[4] = (uint8_t)(segments[i].freq >> 8)", run_array_builder)
+        self.assertIn("line[5] = (uint8_t)segments[i].freq", run_array_builder)
+        self.assertIn("line[6] = ambit_actinic_to_dac", run_array_builder)
+        self.assertIn("line[7] = segments[i].subsampling", run_array_builder)
+        self.assertNotIn("payload_v3_build_trace_lossless", runner_source)
+
+        route_store = trace_source.split("esp_err_t ambit_trace_decode_store", 1)[1].split(
+            "cmd_result_t ambit_trace_trigger", 1
         )[0]
-        self.assertEqual(route_store.count("cmd_store_event(&d)"), 1)
+        self.assertEqual(route_store.count("cmd_store_event(&desc)"), 1)
         self.assertIn("payload_v3_build_trace_lossless", route_store)
         self.assertNotIn("cJSON_Parse", route_store)
-        self.assertIn("char *payload = ambit_payload_reserve_locked()", route_store)
+        self.assertIn("char *payload = payload_reserve_locked()", route_store)
         self.assertIn("char *fallback_metadata = payload + AMBIT_RUN_PAYLOAD_CAP", route_store)
-        self.assertIn(".payload_json  = payload", route_store)
-        self.assertNotIn("s_ambit_payload +", route_store)
-        self.assertNotIn("s_ambit_payload",
-                         route_store.replace("s_ambit_payload_mtx", ""))
-        self.assertLess(route_store.index("xSemaphoreTake(s_ambit_payload_mtx"),
-                        route_store.index("ambit_payload_reserve_locked()"))
+        self.assertIn(".payload_json = payload", route_store)
+        self.assertNotIn("s_payload +", route_store)
+        self.assertLess(route_store.index("xSemaphoreTake(s_payload_mtx"),
+                        route_store.index("payload_reserve_locked()"))
 
-        reservation = lua_source.split(
-            "static char *ambit_payload_reserve_locked", 1
-        )[1].split("/* ambit.run(channel", 1)[0]
-        self.assertIn("if (s_ambit_payload == NULL)", reservation)
-        self.assertIn("s_ambit_payload = candidate", reservation)
-        self.assertEqual(lua_source.count("s_ambit_payload = candidate"), 1)
-        self.assertEqual(lua_source.count("malloc(AMBIT_RUN_BUFFER_CAP)"), 1)
-        self.assertEqual(lua_source.count("ambit_payload_reserve_locked()"), 2)
+        reservation = trace_source.split(
+            "static char *payload_reserve_locked", 1
+        )[1].split("esp_err_t ambit_trace_reserve", 1)[0]
+        self.assertIn("if (s_payload == NULL)", reservation)
+        self.assertIn("s_payload = candidate", reservation)
+        self.assertEqual(trace_source.count("s_payload = candidate"), 1)
+        self.assertEqual(trace_source.count("malloc(AMBIT_RUN_BUFFER_CAP)"), 1)
+        self.assertEqual(trace_source.count("payload_reserve_locked()"), 2)
 
-        registration = lua_source.split("static void lua_register_ambit_module", 1)[1].split(
-            "static void lua_register_device_module", 1
-        )[0]
-        self.assertLess(registration.index("ambit_payload_mtx_ensure()"),
-                        registration.index("ambit_payload_reserve_locked()"))
-        self.assertLess(registration.index("xSemaphoreTake(s_ambit_payload_mtx"),
-                        registration.index("ambit_payload_reserve_locked()"))
-        self.assertLess(registration.index("ambit_payload_reserve_locked()"),
-                        registration.index("xSemaphoreGive(s_ambit_payload_mtx)"))
-        self.assertNotIn("s_ambit_payload =", registration)
-
-        fetch = lua_source.split("static int l_ambit_fetch", 1)[1].split(
-            "/* ── ambit.* bindings", 1
-        )[0]
-        self.assertLess(
-            fetch.index("payload_v3_can_fetch_retained"),
-            fetch.index("cmd_ambit_fetch(ch"),
-        )
+        self.assertIn("ambit_trace_reserve()", runner_core)
+        self.assertNotIn("payload_reserve_locked", runner_core)
+        self.assertNotIn("cmd_ambit_fetch", sync_run)
 
         self.assertNotIn("char payload[1536]", announcement)
         self.assertIn("malloc(AMBIT_DEVICE_PAYLOAD_CAP)", announcement)

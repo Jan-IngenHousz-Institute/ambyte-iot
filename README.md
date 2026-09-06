@@ -1,6 +1,6 @@
 # Ambyte IoT
 
-ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. The measurement schedule is a **Lua script** (`/littlefs/main.lua`, delivered by flashing or MQTT `script_update`; an SD card carrying `main.lua` is the manual offline-recovery source) — no reflash to change what/when the device measures. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
+ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. A declarative YAML document at `/littlefs/schedule.yaml` controls what and when the device measures; it is compile-checked before an atomic install, so schedule changes need no firmware reflash. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
 
 Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on the host from `.env` + a `device_certs/<bundle>/` PEM set and flashed into the NVS partition next to the firmware — **no BLE companion app, no runtime provisioning round-trip** (BLE provisioning is deprecated/compiled out).
 
@@ -17,7 +17,7 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **Onboard sensors** | BME280 (T/H/P), PCF2131 RTC, MP2731 battery charger / power-path (all I2C) |
 | **Transport** | MQTT v5 over mutual TLS → AWS IoT Core (device cert + private key from NVS) |
 | **Storage** | Append-only `event_log` on internal littlefs (`/evstore/events/`, the 9.4 MiB `storage` partition); read cursor + `next_id` HWM in NVS; SD = bulk archive (`/sdcard/archive/`) + logs + AMBIT firmware. **SQLite has been removed.** |
-| **Scripting** | Lua 5.4 VM running `/littlefs/main.lua`; hot-updatable over MQTT |
+| **Scheduling** | Declarative YAML catalog; compile-checked and hot-updatable over MQTT or serial |
 | **Power** | Radio publishing gated on external power (MP2731); DFS clock scaling 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
 | **License** | Firmware and hardware: CERN-OHL-S v2 ([LICENSE](LICENSE)). Host-side software: GPL-3.0 ([LICENSE.GPL-3.0](LICENSE.GPL-3.0)) |
@@ -40,31 +40,29 @@ cp .env.example .env && $EDITOR .env          # Wi-Fi creds, MQTT URI, topic roo
 pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 
-# 4. Seed a measurement schedule (first flash only): put main.lua on an SD card —
-#    the device imports it into its internal home (/littlefs/main.lua) at boot and
-#    no longer needs the card. Subsequent updates go over MQTT (script_update).
-cp lua/main.lua  /path/to/AMBYTE_SD/main.lua
+# 4. The firmware embeds schedule/default.yaml. To install another catalog
+#    entry, use `schedule install` over MQTT/console or the flash GUI.
 ```
 
-The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs `/littlefs/main.lua`, stores measurements to the internal `event_log` (`/evstore`), and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock. Synced records are bulk-archived to the SD card (when present) once per 1000 stores.
+The device boots, seeds its Wi-Fi/MQTT/TLS from NVS, connects to AWS IoT Core, runs the installed schedule (or the embedded default), stores measurements to the internal `event_log` (`/evstore`), and `sync_runner` drains them to the cloud whenever it is on external power with a valid clock. Synced records are bulk-archived to the SD card (when present) once per 1000 stores.
 
 ---
 
 ## Architecture / runtime overview
 
-The firmware uses a hexagonal **ports-and-adapters** design. The `domain` component is header-only and defines the port interfaces (`sensing_port`, `persistence_port`, `messaging_port`, `uart_sensor_port`, `device_status_port`). `main/app_main.c` is the composition root that wires concrete driver adapters into `device_commands` (the business-logic core). `device_commands` is called directly by both the CLI and the Lua VM — there is no command queue/IPC between them.
+The firmware uses a hexagonal **ports-and-adapters** design. The `domain` component is header-only and defines the port interfaces (`sensing_port`, `persistence_port`, `messaging_port`, `uart_sensor_port`, `device_status_port`). `main/app_main.c` is the composition root that wires concrete driver adapters into `device_commands` (the business-logic core). The CLI and `sched_runner` call this command layer; there is no command queue/IPC between them.
 
 ### Data flow
 
 ```
-  /sdcard/main.lua  (Lua 5.4 schedule: sync.*/device.*/ambit.*)
-        |  measure + store  (never publishes directly)
+  /littlefs/schedule.yaml or embedded default.yaml
+        |  sched_runner: compile, arm, measure + store (never publishes directly)
         v
   device_commands  ──drives──> uart_sensors ──UART──> AMBIT x4 (ESP32-C3)
         |                       bme280 / mp2731 / rtc (I2C)
         |  store one JSON event per measurement
         v
-  event_log  (append-only, /sdcard/events/ev-NNNNNN.log; cursor+next_id in NVS)
+  event_log  (append-only, /evstore/events/ev-NNNNNN.log; cursor+next_id in NVS)
         |  claim oldest PENDING (one in-flight slot)
         v
   sync_runner  (SOLE publisher; wakes on store; power+clock gated)
@@ -83,16 +81,16 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 6. Non-blocking Wi-Fi (`wifi_manager_connect_stored_async`) + `on_got_ip`/`on_wifi_disconnect` handlers.
 7. I2C + RTC + clock bootstrap + BME280 + MP2731.
 8. `uart_sensors_init` (auto-pings 4 channels) → SD card mount → LittleFS mount → `event_log_init` → SD hot-plug monitor.
-9. `device_commands_init` (composition) → **CLI** (first, so the operator has a prompt during the rest) → `sync_runner_start` (first drain held by the boot-complete latch) → LED blinker → `ambit_flash_boot_sync` (power-gated AMBIT auto-flash from SD, pre-Lua) → Lua runner → **boot complete**: deferred MQTT start + upload drain released. (`on_got_ip` parks the MQTT start while boot is in progress so the TLS handshake/backlog can't starve the startup sequence.)
+9. `device_commands_init` (composition) → **CLI** (first, so the operator has a prompt during the rest) → `sync_runner_start` (first drain held by the boot-complete latch) → LED blinker → `ambit_flash_boot_sync` (power-gated AMBIT auto-flash from SD, before measurement) → schedule runner → **boot complete**: deferred MQTT start + upload drain released. (`on_got_ip` parks the MQTT start while boot is in progress so the TLS handshake/backlog can't starve the startup sequence.)
 
 ### Tasks (each created inside its own component)
 
 - **sync_runner** — the only MQTT publisher; also emits the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
-- **lua_runner** — runs `/sdcard/main.lua` once, self-deletes on return/stop, restarts on SD reinsert. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement isn't preempted by the Wi-Fi/LwIP stack on core 0.
+- **sched_runner** — compiles the installed schedule or embedded default, arms wall-clock triggers against monotonic deadlines, and executes fused actions. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement is not preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
 - **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
 - **sd_keeper** — the only event-pipeline SD writer: migrates a legacy `/sdcard/events` backlog into the internal store (post-OTA, oldest-first, duplicate-safe) and bulk-archives fully-synced files to `/sdcard/archive/arc-<first_id>.log` once per 1000 stores.
-- **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap).
+- **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap); `script_update` is the retained component/API name for atomic schedule installation.
 - **mqtt_client / wifi** run on the esp-mqtt / esp-netif event loops.
 
 ### Clock bootstrap
@@ -254,7 +252,7 @@ Stress-testing 4 AMBIT channels every few seconds corrupted the SQLite events DB
 
 - **On-disk format v2:** rotating tab-delimited files `/sdcard/events/ev-NNNNNN.log` (rolled past 256 KiB), one newline-terminated record per event, 9 fields: `measure_id · channel · device · tag · cmd_raw · start_ms · end_ms · metadata · payload`.
 - **Durability:** the store is littlefs on the internal 9.4 MiB `storage` partition (`/evstore`) — copy-on-write, power-loss-safe: a brownout can lose at most the ≤8 records since the last batched flush (every 8 records / 1500 ms), never tear framing or the filesystem. Read cursor + `next_id` HWM live in NVS. Fully-synced rotated files are **retained** for the bulk SD archive and **evicted oldest-first when space runs low** — unsynced records always win; writes are refused only when nothing synced remains to evict.
-- **SD card role:** bulk archive (`/sdcard/archive/`, one burst per 1000 stores), WARN/ERROR logs, AMBIT firmware images, and offline `main.lua` recovery. A dead, absent, or corrupted card no longer affects measurement or publishing.
+- **SD card role:** bulk archive (`/sdcard/archive/`, one burst per 1000 stores), WARN/ERROR logs, and AMBIT firmware images. A dead, absent, or corrupted card no longer affects measurement or publishing.
 - **IDs:** `measure_id` is monotonic int64, HWM persisted to NVS every 64 ids and **re-seeded above the SD log's max on boot** (NVS is wiped on every reflash, but the SD log survives, and openJII dedupes on `(device_id, measure_id)`).
 
 ### Inspecting / decoding telemetry
@@ -269,7 +267,7 @@ For live wire inspection without the firmware in the loop, use [docs/mqtt_tls_te
 
 ### Publish pipeline (`sync_runner`, sole publisher)
 
-Lua **never** touches MQTT. [components/sync_runner](components/sync_runner) is the only publisher: it wakes on store (event-driven, not polled; a burst of N stores collapses into one drain) and drains all PENDING events **one message in flight at a time** at **QoS 1**, advancing the cursor on PUBACK (at-least-once; duplicates deduped downstream). Draining runs only while `sync_runner_is_allowed()`:
+[components/sync_runner](components/sync_runner) is the only publisher: it wakes on store (event-driven, not polled; a burst of N stores collapses into one drain) and drains all PENDING events **one message in flight at a time** at **QoS 1**, advancing the cursor on PUBACK (at-least-once; duplicates deduped downstream). Draining runs only while `sync_runner_is_allowed()`:
 
 - **no measurement in progress** (don't compete with latency-sensitive UART reads), **and**
 - **on external power** (Phase-1 power gate; battery-queued events flush when power returns), **and**
@@ -279,11 +277,11 @@ Lua **never** touches MQTT. [components/sync_runner](components/sync_runner) is 
 
 ### TELEMETRY heartbeat
 
-A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) so telemetry survives a missing/crashed `main.lua`. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Release metadata is included only when its persisted digest still matches the actual SD file.
+A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) independently of the measurement schedule. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Schedule release metadata is included only when its persisted digest still matches the installed schedule.
 
 ### Payload schema
 
-Each stored event becomes exactly one MQTT message. New AMBIT runs, gateway heartbeats, and sensor inventory changes store complete canonical `ambit.trace/3`, `ambyte.telemetry/1`, and `ambit.device/1` objects in the existing event-log payload column; the publisher places that object directly in the unchanged outer `sample` envelope. Old v2 SD backlog and generic Lua events retain the legacy v2 builder, so queued data is not rewritten. `channel` (`uart_<n>` / null) identifies the port and `device` is the human sensor name or gateway identity. The normative fields, units, time models, formatting, and dual-read rule are in [docs/mqtt-payload.md](docs/mqtt-payload.md).
+Each stored event becomes exactly one MQTT message. New AMBIT runs, spectrum reads, gateway heartbeats, and sensor inventory changes store complete canonical `ambit.trace/3`, `ambit.spectrum/1`, `ambyte.telemetry/1`, and `ambit.device/1` objects in the existing event-log payload column; the publisher places that object directly in the unchanged outer `sample` envelope. Old v2 SD backlog and generic stored events retain the legacy v2 builder, so queued data is not rewritten. `channel` (`uart_<n>` / null) identifies the port and `device` is the human sensor name or gateway identity. The normative fields, units, time models, formatting, and dual-read rule are in [docs/mqtt-payload.md](docs/mqtt-payload.md).
 
 Transport gzip is opt-in and **off by default**: `cfg set publish_gzip 1` makes canonical v3 publishes carry `sample` as `base64(gzip(...))` with the pipeline's existing `_sample_encoding: "gzip+base64"` marker (deflate from the ESP32-S3 ROM tdefl, kept only when strictly smaller, fail-open to plain JSON). Details in docs/mqtt-payload.md §14a.
 
@@ -293,7 +291,7 @@ Transport gzip is opt-in and **off by default**: `cfg set publish_gzip 1` makes 
 
 The **AMBIT** is an external multispeq-style measurement device (leaf photosynthesis / fluorescence, spectral, PAR, leaf/chip temperature), each built on an ESP8685 (ESP32-C3 die) running Arduino firmware. Up to four attach as channels; the ambyte is the host/gateway.
 
-- **UART topology:** CH0=UART1, CH1=UART2, CH2/CH3 share UART0 (per-query GPIO remap). A bus mutex serializes measurement / OTA / ROM-flash / Lua so nothing collides (busy bus → `ESP_ERR_TIMEOUT`).
+- **UART topology:** CH0=UART1, CH1=UART2, CH2/CH3 share UART0 (per-query GPIO remap). A bus mutex serializes measurement / OTA / ROM-flash operations so nothing collides (busy bus → `ESP_ERR_TIMEOUT`).
 - **Binary protocol** ([ambit_protocol.h](components/device_commands/include/ambit_protocol.h)): `RUN`(21)/`RUN_MPF`(20) synchronous measurements; `GET_SPEC`(31), `GET_TEMP`(32); config `SET_GAINS`(1)/`SET_CURRENTS`(2); actions `BLINK`(5)/`CALIBRATE_BASELINE`(6)/`ACTINIC`(4); `GET_INFO`(33) sub-types CALIBRATION/FW/METADATA; `SET_METADATA`(37). Typed C wrappers are `cmd_ambit_*` in `device_commands`.
 - **Parallel trigger → poll → fetch** (cmds 22/23/24): so long multi-second runs don't block the shared UART — `trigger` starts a retained run, `poll` reads one async state byte (BUSY inferred from poll timeout), `fetch` streams the buffered arrays. HW-working with real `arrun` events published via `run_trace`.
 - **Identity/calibration caching:** fetched once per channel after (re)connect (`GET_INFO` 33): `device_id`, `fw_version` (major.minor.batch), `cal_version` (CRC32), `ambit_name`, and the full calibration object. `ambit.device/1` inventory is emitted only when the stable `(sensor_id, firmware, cal_version)` tuple changes; the tuple is persisted in NVS so reconnects, reboots, and channel movement do not duplicate unchanged inventory.
@@ -302,8 +300,8 @@ The **AMBIT** is an external multispeq-style measurement device (leaf photosynth
 
 - **Strategy B — cooperative app-OTA over UART** ([components/ambit_ota](components/ambit_ota)): the ambyte downloads a C3 `.bin` from HTTPS to SD, then streams it in ≤200-byte CRC16 chunks (cmds 25–29) into the AMBIT's spare OTA slot with C3-side rollback. Needs a **running, cooperating** AMBIT. Trigger: CLI `ambit_ota <ch> <url>` or MQTT `{type:ambit_ota}` (`ch` can be `all`/0xFF). The protected manual **Fleet deploy (AMBIT via Ambyte)** workflow verifies an immutable public `Jan-IngenHousz-Institute/ambit` release and manifest, deterministically selects gateways, preflights every channel with correlated `ambit_versions`, tracks all-channel OTA outcomes, and verifies executed gateways by version effect. Firmware creates a measurement-safe idle window before each version sweep; the host also retries and reconciles incomplete, busy, absent, or unversioned inventory without accepting conflicting evidence. Same-version recovery reflashes require an explicit device list. See [fleet deploy documentation](tools/fleet_deploy/README.md#deploying-ambit-firmware-through-ambytes).
 - **Strategy A — ROM-bootloader UART flasher** ([components/ambit_flash](components/ambit_flash) + vendored [components/esp_serial_flasher](components/esp_serial_flasher)): the **universal** path for **bare / bricked / pre-OTA** units. It drives the C3 hardware straps (shared `CHIP_EN` reset on IO1, per-channel `GPIO9` boot strap) to force one target into the ROM download mode, then flashes 4 region images from `/sdcard/ambit_fw/<ver>/` (`bootloader.bin@0x0`, `partitions.bin@0x8000`, `boot_app0.bin@0xe000`, `app.bin@0x10000`) with per-region MD5 verify. Missing canonical recovery directories are created before the file preflight, allowing old SD cards to be staged remotely; all four non-empty files are still required before the AMBIT is touched. **NVS at `0x9000` is never written**, so per-unit AMBIT calibration survives. A successful flash invalidates the cached AMBIT identity so later STATUS/events report the new firmware. CLI: `ambit_probe`, `ambit_dl`, `ambit_flash <ch> <ver>`.
-- **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. Read-only + bus-mutex-serialised so safe with Lua active.
-- **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before Lua starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on the same power condition as MQTT publishing (skips to the next powered boot on battery) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
+- **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. Read-only + bus-mutex-serialised so safe with measurement active.
+- **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before measurement starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on the same power condition as MQTT publishing (skips to the next powered boot on battery) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
 
 ---
 
@@ -320,14 +318,13 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 - `url` must be a **direct** `.bin`: a GitHub Release asset (`…/releases/download/<tag>/firmware.bin`) or `raw.githubusercontent.com/...`. `github.com/.../tree/` or `/blob/` web URLs serve HTML and are rejected.
 - Requires the **dual-OTA partition layout** (`ota_0`/`ota_1` + `otadata`, `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`) — a one-time USB reflash migrates legacy single-app units (see Factory reset caution above).
 
-### Remote Lua delivery (Stage 4)
+### Remote schedule delivery
 
 [components/script_update](components/script_update), dispatched by `command_router`:
 
-- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable Lua release catalog has a manifest containing this ready-to-publish object.
-- Legacy inline form `{type:script_update,id,script,checksum?}` remains supported. Both forms perform SHA-256 verification (when supplied) → Lua syntax check → `main.lua.new` + fsync → stop runner → keep `main.lua.bak` → atomic rename → persist identity → reboot/restart. Inline cap 16 KiB.
-- `{type:lua_exec,...}` — runs a snippet in an ephemeral Lua state (120 s budget) and publishes the result.
-- Terminal `script_status` and the next STATUS heartbeat report the active script/firmware combination. CLI twins remain `lua start|stop|status|exec`. See [Lua releases and rollout](docs/lua-releases.md).
+- Preferred release form: `{type:script_update,id,url,checksum,script_version,built_against_fw}`. Each selectable asset in the immutable schedule catalog has a manifest containing this ready-to-publish object.
+- The retained inline form `{type:script_update,id,script,checksum?}` carries YAML text. Both forms perform SHA-256 verification (when supplied) → schedule compilation → `schedule.yaml.new` + fsync → stop runner → keep `schedule.yaml.bak` → atomic rename → persist identity → reboot/restart. Input is capped at 16 KiB.
+- Terminal `schedule release` and the next STATUS heartbeat report the active schedule/firmware combination. See [Schedule releases and authoring](docs/schedule-releases.md).
 
 ---
 
@@ -339,15 +336,12 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ---
 
-## SD card
+## SD card and schedules
 
-- The measurement schedule is `/sdcard/main.lua`, loaded via `luaL_loadfile()` once at boot ([components/lua_runner](components/lua_runner)). Released sources live in the [Lua catalog](lua): `main.lua` is the default and `legacy_1Hz_spec.lua` is the opt-in cmd 31 experiment. For a manual iteration, copy the chosen source to the card as `main.lua` and reset; for a traceable rollout, select it in the independently versioned Lua deploy workflow.
-- Behaviour when the script is missing: no SD mounted → Lua task skipped, CLI+MQTT continue; SD mounted but no `main.lua` → task starts, fails the load, exits cleanly.
-- **Hot pull/reinsert recovery** ([components/sd_card](components/sd_card)): no card-detect pin, so a monitor polls `sdmmc_get_status` (CMD13, 2000 ms) plus a **lock-free error-driven loss latch** (writers call `sdcard_report_io_error/ok` and gate on `sdcard_io_lost()`) — needed because CMD13 alone loses the race to a task stuck in a multi-second failing transfer (priority inversion, the historic sdmmc `0x107` flood). On loss the Lua runner stops and `event_log_on_sd_lost` fires; on reinsert `event_log_on_sd_restored` runs and Lua restarts. `sd_logger` buffers WARN/ERROR in a RAM ring while the card is absent and flushes on remount.
-
-Lua binding tables exposed to scripts (see the `luaL_Reg` arrays in `lua_runner.c`): `device.*` (rtc/status/power/sd_ready/sleep_ms/log/PWM/…), `uart.*` (raw transport), `db.*` (`store_event`/`next_id`, for custom/derived events), `ambit.*` (ping/spec/leaf_temp/run/trigger/poll/fetch/run_mpf/set_gains/set_currents/blink/calibrate/actinic/set_metadata), and `sync.*` (interval/clock/weekly/sunrise-sunset scheduling from lat/lon + tz). The old `mqtt` Lua table was removed — scripts no longer publish.
-
-The production field schedule is [lua/main.lua](lua/main.lua), with [lua/legacy_1Hz_spec.lua](lua/legacy_1Hz_spec.lua) available for the selected legacy-sensor cohort. The accelerated diagnostic schedule remains [docs/bench/main_bench.lua](docs/bench/main_bench.lua).
+- The measurement schedule lives on internal littlefs at `/littlefs/schedule.yaml`; when absent or invalid, the runner uses its embedded default. It never depends on the SD card.
+- Released sources live in the [schedule catalog](schedule): `default.yaml` is the field default and `legacy_1hz_spec.yaml` is the opt-in channel-0 experiment. Install them through the release workflow, MQTT, serial CLI, or flash GUI.
+- The SD hot-plug monitor exists for archive, logs, and AMBIT firmware. It polls `sdmmc_get_status` (CMD13, 2000 ms) plus a lock-free error-driven loss latch; `sd_logger` buffers WARN/ERROR in RAM while the card is absent and flushes on remount.
+- Catalog actions are fixed firmware operations (`ambit/trace`, spectrum, leaf temperature, actinic, status, event store, log, and sleep). Raw commissioning operations remain CLI-only.
 
 ---
 
@@ -377,7 +371,7 @@ uv run python tools/get_mac.py                                  # print running 
 components/
   domain/            # header-only ports (sensing/persistence/messaging/uart/device_status)
   device_commands/   # business-logic core; cmd_* ops; envelope builder; in-flight slot + reaper
-  command_router/    # inbound MQTT JSON dispatch (ping/ota_update/script_update/lua_exec)
+  command_router/    # inbound MQTT JSON dispatch (ping/OTA/schedule/location)
   event_log/         # append-only SD event store (REPLACES SQLite)
   sync_runner/       # sole MQTT publisher; power/clock gate; heartbeat; connectivity watchdog
   mqtt_client/       # esp-mqtt wrapper (mutual TLS to AWS IoT)
@@ -386,9 +380,10 @@ components/
   ambit_flash/       # AMBIT ROM-bootloader UART flasher (Strategy A) + version-drift check
   esp_serial_flasher/# vendored Espressif esp-serial-flasher (used only by ambit_flash)
   ota_update/        # ambyte self-OTA over MQTT (dual slot + rollback)
-  script_update/     # remote Lua delivery (main.lua replace + lua_exec)
-  lua/ lua_runner/   # Lua 5.4 VM + bindings; runs /sdcard/main.lua
-  time_sync/         # pure RTC/local-time scheduling math (sync.* Lua surface)
+  script_update/     # atomic schedule download/stage/compile/install worker
+  sched_spec/        # bounded YAML compiler, action catalog, due/window model
+  sched_runner/      # schedule lifecycle + fused device actions
+  time_sync/         # pure RTC/local-time and solar scheduling math
   bme280/            # I2C temp/humidity/pressure
   mp2731/            # I2C battery charger / power-path (power gate + battery telemetry)
   pcf2131tfy_rtc/    # PCF2131 RTC driver + system-clock sync
@@ -404,7 +399,8 @@ components/
 
 main/                # app_main.c composition root
 tools/               # host scripts: NVS builder, PlatformIO hook, get_mac/save_mac
-docs/                # payload/OTA/flash plans, mqtt_tls_test_client.py, example Lua scripts
+schedule/            # released YAML schedules + generated action schema
+docs/                # payload/OTA/flash plans and mqtt_tls_test_client.py
 planning/            # DDD phase plan + LLM prompts + HW-test notes
 device_certs/        # (gitignored) AWS IoT PEM bundles
 ambyteiot_ambit_demo.ipynb / ambit-demo-workbook.jii  # telemetry decode/analysis workbooks
@@ -431,8 +427,8 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 | MQTT connects then immediately disconnects | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 | Telemetry stops but no data loss / device on external power | In-flight slot may have stalled — check the `inflight` CLI command; the 60 s reaper + MQTT-disconnect clear should recover it, else the 1 h watchdog reboots |
 | Events pile up in `event_log`, nothing publishes | Expected on battery (power gate) or before the clock is valid (< 2024) — verify external power and RTC/clock |
-| `Lua runner not started: SD card not mounted` | Insert an SD card with `main.lua` at the root (copy [lua/main.lua](lua/main.lua)) |
-| `failed to load /sdcard/main.lua` | SD mounted but file missing/unreadable — check the card has `main.lua` at the root |
+| Installed schedule is rejected | Run `schedule status` for the compile error; the embedded default remains active |
+| Schedule update does not take effect | Check `schedule release`, then use `schedule reload` or reboot after a successful install |
 | sdmmc `0x107` errors after pulling the SD card | Hot-plug recovery should latch the loss and remount on reinsert; if it floods, this path needs the HW pull/reinsert verification still pending (see Status) |
 | Wrong PAR / spectral values on an AMBIT | Check AMBIT calibration / `spec_coef`; version drift (`ambit_check`) may indicate a stale AMBIT firmware |
 
@@ -442,7 +438,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 
 - `main` is the release branch; work happens on feature branches (e.g. the current `feature/publish-reliability-hardening`) and lands on `main` via pull request.
 - **Build before you commit:** `pio run -e esp32-s3-devkitm-1` must pass (the single buildable env). Provisioning artifacts (`.env`, `device_certs/`, `flashed_macs.csv`) are gitignored — never commit them.
-- Keep the ports/adapters boundary intact: business logic lives in `device_commands` behind the `domain` port interfaces; drivers are adapters wired in `main/app_main.c`. Don't let Lua or the CLI reach past `device_commands`.
+- Keep the ports/adapters boundary intact: business logic lives in `device_commands` behind the `domain` port interfaces; drivers are adapters wired in `main/app_main.c`. Do not let `sched_runner` or the CLI reach past `device_commands`.
 - Much of the roadmap below is code-complete but **awaiting hardware verification** — note HW-test status in the PR when a change touches those paths.
 
 ---
@@ -483,7 +479,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 
 **Recent (this branch, needs the HW pass above):** stale-slot reaper +
 MQTT-disconnect clear, connectivity watchdog (1 h no-PUBACK reboot), large-publish
-heap hardening (defer-gate + Lua-GC settle + early event free + 2 KiB TLS out
+heap hardening (defer-gate + early event free + 2 KiB TLS out
 records), `evlog`/`inflight`/`netwd` CLI, dropped the derived `fluo` payload key
 (computed downstream from `s_630`/`r_630`), AMBIT fw 1.0.0 SD image under
 [docs/example_sdFolder/ambit_fw/1.0.0](docs/example_sdFolder/ambit_fw/1.0.0).
@@ -498,7 +494,7 @@ This repository is dual-licensed, split by what the code is rather than where it
 
 | Scope | Licence | Text |
 | --- | --- | --- |
-| Hardware design and firmware: `components/`, `main/`, `lua/`, `test/`, `CMakeLists.txt`, `partitions.csv`, `platformio.ini`, `sdkconfig*` | CERN Open Hardware Licence Version 2, Strongly Reciprocal (CERN-OHL-S v2) | [LICENSE](LICENSE) |
+| Hardware design and firmware: `components/`, `main/`, `schedule/`, `test/`, `CMakeLists.txt`, `partitions.csv`, `platformio.ini`, `sdkconfig*` | CERN Open Hardware Licence Version 2, Strongly Reciprocal (CERN-OHL-S v2) | [LICENSE](LICENSE) |
 | Host-side software: `flash_gui/`, `tools/`, `tests/`, `release.config.js` | GNU General Public License v3.0 | [LICENSE.GPL-3.0](LICENSE.GPL-3.0) |
 
 CERN-OHL-S is a hardware licence, so it does not cleanly govern the host-side

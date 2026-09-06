@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from flash_gui import config, gui, procedure                   # noqa: E402
 from flash_gui import openjii_client, release_fetch, tls       # noqa: E402
 from flash_gui.ambyte_serial import (AmbyteConsole, ConsoleError,  # noqa: E402
-                                    LuaReleaseStatus, expand_mac_token)
+                                    ScheduleReleaseStatus, expand_mac_token)
 from flash_gui.nvs_builder import (AMAZON_ROOT_CA1,            # noqa: E402
                                    NvsBuildError, ProvisioningPlan,
                                    build_nvs_csv, build_nvs_image)
@@ -28,10 +28,10 @@ from flash_gui.openjii_client import (DeviceIdentity, DeviceOnboarding,  # noqa:
 from flash_gui.procedure import (DeviceRun, PreflightInfo, SessionContext,  # noqa: E402
                                  clean_device_name, mqtt_uri_from_endpoint)
 from flash_gui.release_fetch import (ReleaseError, ReleaseImages,  # noqa: E402
-                                     LuaScriptRelease,
-                                     fetch_latest_lua_catalog,
+                                     ScheduleScriptRelease,
+                                     fetch_latest_schedule_catalog,
                                      pick_firmware_release,
-                                     pick_lua_release)
+                                     pick_schedule_release)
 
 
 MAC = "E8:F6:0A:B1:1F:34"
@@ -344,12 +344,12 @@ def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatc
         env=config.ENVIRONMENTS["dev"],
         client=client,
         release=SimpleNamespace(version="1.6.0"),
-        lua_script=SimpleNamespace(
-            asset_name="main.lua",
+        schedule_script=SimpleNamespace(
+            asset_name="default.yaml",
             sha256="abc123",
             script_version="2.0.0",
             built_against_fw="1.6.0",
-            campaign_id="lua-v2.0.0",
+            campaign_id="schedule-v2.0.0",
         ),
         experiment_id="experiment-id",
         timezone="Europe/Amsterdam",
@@ -365,7 +365,7 @@ def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatc
                         lambda plan, path: path)
     monkeypatch.setattr(procedure.release_fetch, "script_bytes",
                         lambda script, log=None: b"print('ready')\n")
-    monkeypatch.setattr(procedure, "build_main_lua_image",
+    monkeypatch.setattr(procedure, "build_schedule_image",
                         lambda blob, path: path)
 
     procedure.prepare_provisioning(context, run, log=lambda _message: None)
@@ -407,6 +407,36 @@ def test_nvs_csv_structure():
     assert "firmware_ver,data,string," in csv
 
 
+def test_nvs_csv_optional_site_metadata():
+    csv = build_nvs_csv(
+        make_plan(lat=52.173, lon=5.819, deployment="greenhouse-a"),
+        flash_time=1786000000,
+    )
+    from tools.site_state_blob import encode_site_state
+
+    expected = encode_site_state(52.173, 5.819, "greenhouse-a").hex()
+    assert f"site_state,data,hex2bin,{expected}" in csv
+    assert "lat,data," not in csv
+    assert "lon,data," not in csv
+    assert "deployment,data," not in csv
+
+
+def test_nvs_csv_rejects_oversized_deployment():
+    with pytest.raises(NvsBuildError, match="63-byte"):
+        build_nvs_csv(make_plan(deployment="x" * 64))
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("lat", float("nan")),
+    ("lat", 90.01),
+    ("lon", float("inf")),
+    ("lon", -180.01),
+])
+def test_nvs_csv_rejects_invalid_site_coordinates(field, value):
+    with pytest.raises(NvsBuildError):
+        build_nvs_csv(make_plan(**{field: value}))
+
+
 def test_nvs_csv_rejects_missing_required():
     with pytest.raises(NvsBuildError):
         build_nvs_csv(make_plan(wifi_ssid=""))
@@ -422,48 +452,48 @@ def test_nvs_csv_rejects_long_timezone():
         build_nvs_csv(make_plan(timezone="A/" + "b" * 50))
 
 
-# ── Lua provenance in NVS + the littlefs main.lua image ─────────────────────
-LUA_SHA = "ab" * 32
+# ── Schedule provenance in NVS + the littlefs schedule.yaml image ────────────────────
+SCHEDULE_SHA = "ab" * 32
 
 
-def test_nvs_csv_lua_provenance_absent_by_default():
+def test_nvs_csv_schedule_provenance_absent_by_default():
     csv = build_nvs_csv(make_plan(), flash_time=1786000000)
     assert "script_upd" not in csv
 
 
-def test_nvs_csv_lua_provenance_rows():
-    csv = build_nvs_csv(make_plan(lua_sha256=LUA_SHA,
-                                  lua_script_version="1.2.0",
-                                  lua_built_against_fw="1.7.0",
-                                  lua_campaign_id="lua-v1.2.0"),
+def test_nvs_csv_schedule_provenance_rows():
+    csv = build_nvs_csv(make_plan(schedule_sha256=SCHEDULE_SHA,
+                                  schedule_script_version="1.2.0",
+                                  schedule_built_against_fw="1.7.0",
+                                  schedule_campaign_id="schedule-v1.2.0"),
                         flash_time=1786000000)
     ns = [ln.split(",")[0] for ln in csv.splitlines() if ",namespace," in ln]
     assert ns[-1] == "script_upd"
-    assert f'script_sha,data,string,"{LUA_SHA}"' in csv
-    assert 'applied_id,data,string,"lua-v1.2.0"' in csv
+    assert f'script_sha,data,string,"{SCHEDULE_SHA}"' in csv
+    assert 'applied_id,data,string,"schedule-v1.2.0"' in csv
     assert 'script_ver,data,string,"1.2.0"' in csv
     assert 'built_fw,data,string,"1.7.0"' in csv
     # install_fw is the firmware release being flashed
     assert 'install_fw,data,string,"1.6.0"' in csv
 
 
-def test_nvs_csv_lua_provenance_all_or_none():
+def test_nvs_csv_schedule_provenance_all_or_none():
     with pytest.raises(NvsBuildError):
-        build_nvs_csv(make_plan(lua_sha256=LUA_SHA))
+        build_nvs_csv(make_plan(schedule_sha256=SCHEDULE_SHA))
 
 
-def test_nvs_csv_lua_provenance_bad_sha():
+def test_nvs_csv_schedule_provenance_bad_sha():
     with pytest.raises(NvsBuildError):
-        build_nvs_csv(make_plan(lua_sha256="zz",
-                                lua_script_version="1.2.0",
-                                lua_built_against_fw="1.7.0",
-                                lua_campaign_id="lua-v1.2.0"))
+        build_nvs_csv(make_plan(schedule_sha256="zz",
+                                schedule_script_version="1.2.0",
+                                schedule_built_against_fw="1.7.0",
+                                schedule_campaign_id="schedule-v1.2.0"))
 
 
 def test_littlefs_image_roundtrip(tmp_path):
-    from flash_gui.littlefs_image import build_main_lua_image
-    script = b'print("hello from main.lua")\n' * 40
-    out = build_main_lua_image(script, tmp_path / "littlefs.bin")
+    from flash_gui.littlefs_image import build_schedule_image
+    script = b'schema: jii.ambyte-schedule/v1-draft\nactions: []\n'
+    out = build_schedule_image(script, tmp_path / "littlefs.bin")
     assert out.is_file()
     assert out.stat().st_size == config.LITTLEFS_PARTITION_SIZE
     # independent read-back via a fresh mount of the written bytes
@@ -473,16 +503,23 @@ def test_littlefs_image_roundtrip(tmp_path):
                   block_count=config.LITTLEFS_PARTITION_SIZE // 4096,
                   read_size=128, prog_size=128, cache_size=512,
                   lookahead_size=128, block_cycles=512, name_max=64)
-    with fs.open("main.lua", "rb") as f:
+    with fs.open("schedule.yaml", "rb") as f:
         assert f.read() == script
     fs.unmount()
 
 
 def test_littlefs_image_rejects_empty(tmp_path):
     from flash_gui.littlefs_image import (LittlefsImageError,
-                                          build_main_lua_image)
+                                          build_schedule_image)
     with pytest.raises(LittlefsImageError):
-        build_main_lua_image(b"", tmp_path / "littlefs.bin")
+        build_schedule_image(b"", tmp_path / "littlefs.bin")
+
+
+def test_littlefs_image_rejects_schedule_larger_than_firmware_limit(tmp_path):
+    from flash_gui.littlefs_image import (LittlefsImageError,
+                                          build_schedule_image)
+    with pytest.raises(LittlefsImageError, match="16384-byte limit"):
+        build_schedule_image(b"x" * (16 * 1024 + 1), tmp_path / "littlefs.bin")
 
 
 def test_packaged_littlefs_smoke_seam(tmp_path):
@@ -539,13 +576,13 @@ def _rel(tag, assets=("ambyte-iot-" + "v1.0.0" + ".zip",), published="2026-01-01
             "assets": [{"name": a} for a in assets]}
 
 
-def test_picker_skips_flash_gui_and_lua_releases():
+def test_picker_skips_flash_gui_and_schedule_releases():
     # The exact incident: flash-gui-v0.1.0 published AFTER v1.6.1 hijacked
     # /releases/latest and carried no firmware zip.
     releases = [
         _rel("flash-gui-v0.1.0", assets=("ambyte-flash-gui-windows.zip",),
              published="2026-08-07T07:27:43Z"),
-        _rel("lua-v1.2.0", assets=("lua-release.zip",),
+        _rel("schedule-v1.2.0", assets=("schedule-release.zip",),
              published="2026-08-07T00:00:00Z"),
         _rel("v1.6.1", assets=("firmware.bin", "ambyte-iot-v1.6.1.zip"),
              published="2026-08-06T22:03:47Z"),
@@ -570,33 +607,33 @@ def test_picker_skips_prerelease_draft_and_assetless():
 def test_picker_returns_none_when_no_firmware_release():
     releases = [
         _rel("flash-gui-v0.1.0", assets=("ambyte-flash-gui-linux.tar.gz",)),
-        _rel("lua-v1.0.0", assets=("lua.zip",)),
+        _rel("schedule-v1.0.0", assets=("schedule.zip",)),
     ]
     assert pick_firmware_release(releases) is None
     assert pick_firmware_release([]) is None
 
 
-# ── Lua release catalog picker ───────────────────────────────────────────────
-def _lua_rel(tag, scripts=("main",), published="2026-01-01T00:00:00Z",
+# ── Schedule release catalog picker ───────────────────────────────────────────────
+def _schedule_rel(tag, scripts=("default",), published="2026-01-01T00:00:00Z",
              prerelease=False, draft=False):
     assets = []
     for script in scripts:
         assets.extend((
-            {"name": f"{script}.lua", "size": 10,
-             "browser_download_url": f"https://example.test/{tag}/{script}.lua"},
-            {"name": f"{script}.lua.manifest.json", "size": 500,
+            {"name": f"{script}.yaml", "size": 10,
+             "browser_download_url": f"https://example.test/{tag}/{script}.yaml"},
+            {"name": f"{script}.yaml.manifest.json", "size": 500,
              "browser_download_url":
-                 f"https://example.test/{tag}/{script}.lua.manifest.json"},
+                 f"https://example.test/{tag}/{script}.yaml.manifest.json"},
         ))
     return {"tag_name": tag, "prerelease": prerelease, "draft": draft,
             "published_at": published, "assets": assets}
 
 
-def _lua_manifest(tag="lua-v1.2.3", script="main"):
-    version = tag.removeprefix("lua-v")
-    asset_url = f"https://example.test/{tag}/{script}.lua"
+def _schedule_manifest(tag="schedule-v1.2.3", script="default"):
+    version = tag.removeprefix("schedule-v")
+    asset_url = f"https://example.test/{tag}/{script}.yaml"
     digest = "a" * 64
-    campaign = tag if script == "main" else f"{tag}:{script}"
+    campaign = tag if script == "default" else f"{tag}:{script}"
     return {
         "schema_version": 1,
         "script_name": script,
@@ -617,66 +654,66 @@ def _lua_manifest(tag="lua-v1.2.3", script="main"):
     }
 
 
-def test_lua_picker_uses_highest_stable_catalog_version():
+def test_schedule_picker_uses_highest_stable_catalog_version():
     releases = [
-        _lua_rel("lua-v1.9.0", published="2026-09-01T00:00:00Z"),
-        _lua_rel("lua-v2.0.0", published="2026-08-01T00:00:00Z"),
-        _lua_rel("lua-v3.0.0", prerelease=True),
-        _lua_rel("v9.0.0"),
-        _lua_rel("lua-v2.1.0", scripts=()),
+        _schedule_rel("schedule-v1.9.0", published="2026-09-01T00:00:00Z"),
+        _schedule_rel("schedule-v2.0.0", published="2026-08-01T00:00:00Z"),
+        _schedule_rel("schedule-v3.0.0", prerelease=True),
+        _schedule_rel("v9.0.0"),
+        _schedule_rel("schedule-v2.1.0", scripts=()),
     ]
-    assert pick_lua_release(releases)["tag_name"] == "lua-v2.0.0"
+    assert pick_schedule_release(releases)["tag_name"] == "schedule-v2.0.0"
 
 
-def test_fetch_latest_lua_catalog_validates_and_lists_all_scripts(monkeypatch):
-    release = _lua_rel("lua-v1.2.3", scripts=("main", "legacy_1Hz_spec"))
+def test_fetch_latest_schedule_catalog_validates_and_lists_all_scripts(monkeypatch):
+    release = _schedule_rel("schedule-v1.2.3", scripts=("default", "legacy_1hz_spec"))
     responses = {
-        "https://example.test/lua-v1.2.3/main.lua.manifest.json":
-            _lua_manifest(script="main"),
-        "https://example.test/lua-v1.2.3/legacy_1Hz_spec.lua.manifest.json":
-            _lua_manifest(script="legacy_1Hz_spec"),
+        "https://example.test/schedule-v1.2.3/default.yaml.manifest.json":
+            _schedule_manifest(script="default"),
+        "https://example.test/schedule-v1.2.3/legacy_1hz_spec.yaml.manifest.json":
+            _schedule_manifest(script="legacy_1hz_spec"),
     }
 
     monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
     monkeypatch.setattr(release_fetch, "_get_json", lambda url: responses[url])
-    catalog = fetch_latest_lua_catalog(log=lambda _message: None)
-    assert catalog.tag == "lua-v1.2.3"
+    catalog = fetch_latest_schedule_catalog(log=lambda _message: None)
+    assert catalog.tag == "schedule-v1.2.3"
     assert [script.asset_name for script in catalog.scripts] == [
-        "legacy_1Hz_spec.lua", "main.lua"]
-    assert catalog.scripts[0].campaign_id == "lua-v1.2.3:legacy_1Hz_spec"
+        "default.yaml", "legacy_1hz_spec.yaml"]
+    assert catalog.scripts[1].campaign_id == "schedule-v1.2.3:legacy_1hz_spec"
 
 
-def test_fetch_latest_lua_catalog_rejects_manifest_drift(monkeypatch):
-    release = _lua_rel("lua-v1.2.3")
-    manifest = _lua_manifest()
+def test_fetch_latest_schedule_catalog_rejects_manifest_drift(monkeypatch):
+    release = _schedule_rel("schedule-v1.2.3")
+    manifest = _schedule_manifest()
     manifest["sha256"] = "not-a-digest"
     monkeypatch.setattr(release_fetch, "_release_list", lambda log=None: [release])
     monkeypatch.setattr(release_fetch, "_get_json", lambda url: manifest)
     with pytest.raises(ReleaseError, match="sha256"):
-        fetch_latest_lua_catalog(log=lambda _message: None)
+        fetch_latest_schedule_catalog(log=lambda _message: None)
 
 
-def test_console_parses_lua_release_and_queues_immutable_install():
+def test_console_parses_schedule_release_and_queues_immutable_install():
     console = object.__new__(AmbyteConsole)
     commands = []
 
     def command(cmd, timeout=5.0):
         commands.append((cmd, timeout))
-        if cmd == "lua release":
-            return ("lua release: sha256=" + "a" * 64
+        if cmd == "schedule release":
+            return ("schedule release: sha256=" + "a" * 64
                     + " version=1.2.3 built_against_fw=1.7.0 "
                     "installed_on_fw=1.7.1 verified=true running=true\n"
                     "ambyte> ")
-        return "lua install queued: id=lua-v1.2.3\nambyte> "
+        return "schedule install queued: id=schedule-v1.2.3\nambyte> "
 
     console.command = command
-    status = console.lua_release()
+    status = console.schedule_release()
     assert status.sha256 == "a" * 64
     assert status.verified and status.running
-    console.lua_install(
-        "https://example.test/lua-v1.2.3/main.lua", "a" * 64,
-        "lua-v1.2.3", "1.2.3", "1.7.0")
-    assert commands[-1][0].startswith("lua install https://example.test/")
+    console.schedule_install(
+        "https://example.test/schedule-v1.2.3/default.yaml", "a" * 64,
+        "schedule-v1.2.3", "1.2.3", "1.7.0")
+    assert commands[-1][0].startswith("schedule install https://example.test/")
 
 
 def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
@@ -711,16 +748,16 @@ def test_connect_after_boot_keeps_port_open_while_waiting(monkeypatch):
 
 
 def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch):
-    script = LuaScriptRelease(
-        tag="lua-v1.2.3",
-        asset_name="main.lua",
-        script_name="main",
+    script = ScheduleScriptRelease(
+        tag="schedule-v1.2.3",
+        asset_name="default.yaml",
+        script_name="default",
         script_version="1.2.3",
         built_against_fw="1.7.0",
-        asset_url="https://example.test/lua-v1.2.3/main.lua",
+        asset_url="https://example.test/schedule-v1.2.3/default.yaml",
         sha256="a" * 64,
         size_bytes=10,
-        campaign_id="lua-v1.2.3",
+        campaign_id="schedule-v1.2.3",
     )
 
     class FakeConsole:
@@ -729,13 +766,13 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
             self.install_args = None
             self.close_count = 0
 
-        def lua_release(self, timeout=10.0):
+        def schedule_release(self, timeout=10.0):
             self.status_reads += 1
             if self.status_reads == 1:
-                raise ConsoleError("main.lua is absent")
+                raise ConsoleError("default.yaml is absent")
             if self.status_reads == 2:
-                raise ConsoleError("'lua release' got no prompt back within 20s")
-            return LuaReleaseStatus(
+                raise ConsoleError("'schedule release' got no prompt back within 20s")
+            return ScheduleReleaseStatus(
                 sha256="a" * 64,
                 script_version="1.2.3",
                 built_against_fw="1.7.0",
@@ -744,7 +781,7 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
                 running=True,
             )
 
-        def lua_install(self, *args):
+        def schedule_install(self, *args):
             self.install_args = args
 
         def wifi_connected(self, timeout=10.0):
@@ -765,8 +802,8 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
         connect)
     monkeypatch.setattr(procedure.time, "sleep", lambda _seconds: None)
 
-    result = procedure.install_lua_script(
-        SimpleNamespace(lua_script=script, wifi_ssid="test-ap"),
+    result = procedure.install_schedule_script(
+        SimpleNamespace(schedule_script=script, wifi_ssid="test-ap"),
         SimpleNamespace(port="/dev/ttyACM0"),
         log=lambda _message: None,
     )

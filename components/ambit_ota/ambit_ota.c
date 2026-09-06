@@ -25,7 +25,7 @@
  * connect/MD5 machinery on this same stack. The task is spawned on demand and
  * exits when idle, so the extra 2 KiB is transient, not resident. */
 #define AMBIT_OTA_TASK_STACK   10240
-#define AMBIT_OTA_TASK_PRIO    4          /* below lua_runner(10); not latency-critical */
+#define AMBIT_OTA_TASK_PRIO    4          /* below sched_runner(10); not latency-critical */
 #define AMBIT_OTA_URL_MAX      256
 #define AMBIT_OTA_MAX_RETRY    4          /* per-chunk resend attempts on CRC/transport error */
 #define AMBIT_OTA_REBOOT_WAIT_MS 5000     /* let the C3 reboot into the new image before re-querying */
@@ -33,9 +33,9 @@
 #define AMBIT_OTA_ID_MAX       64
 #define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
 #define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
-/* main.lua's longest normal autonomous trace is SS: 59 pulses at 1 Hz plus
- * setup. Stopping Lua prevents a new trigger; this delay lets an already-started
- * AMBIT run finish before maintenance probes the deliberately-silent UART. */
+/* The schedule runner estimates autonomous traces with ambit_trace_estimate_ms().
+ * Suspending it prevents a new trigger; this conservative bound lets any
+ * already-started shipped trace finish before maintenance probes the UART. */
 #define AMBIT_IDLE_SETTLE_MS   65000U
 /* Presence ping and cmd 33/2 are separate UART transactions. Field sweeps show
  * that the first identity reply can occasionally be dropped even after a valid
@@ -53,7 +53,7 @@
 #define KEY_FLASH_FAIL_ID      "fl_fail_id"   /* last FAILED flash id + attempt count: a */
 #define KEY_FLASH_FAIL_N       "fl_fail_n"    /* retained trigger with a persistent failure
                                                * (missing SD folder, no ROM answer) must not
-                                               * bounce Lua+MQTT and hard-reset the AMBITs
+                                               * bounce measurement+MQTT and hard-reset the AMBITs
                                                * forever — cap the retries per id */
 #define AMBIT_FLASH_FAIL_MAX   3
 
@@ -103,7 +103,7 @@ static bool already_applied(const char *key, const char *id)
  * A FAILED flash id is remembered with an attempt count. Success-only latching
  * keeps transient failures retryable, but a flash whose failure is persistent
  * (typo'd version, unstaged SD, zero ROM-answering channels) would otherwise
- * loop forever off a retained trigger — each cycle bouncing Lua + MQTT and
+ * loop forever off a retained trigger — each cycle bouncing measurement + MQTT and
  * hard-resetting every AMBIT. After AMBIT_FLASH_FAIL_MAX attempts the id is
  * refused; the operator retries under a fresh id once the cause is fixed. */
 static uint8_t flash_fail_count(const char *id)
@@ -211,7 +211,7 @@ static void report_busy(const ambit_ota_req_t *r)
 }
 
 /* Hold the maintenance gate and shared worker during the per-device slot, but
- * leave MQTT and Lua active until the existing quiesce sequence begins. */
+ * leave MQTT and measurement active until the existing quiesce sequence begins. */
 static void wait_for_fleet_slot(void)
 {
     uint32_t delay_s = 0;
@@ -461,7 +461,7 @@ static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
         if (cr.status == ESP_OK && st == 0) {
             ESP_LOGW(TAG, "AMBIT%u image confirmed — rollback cancelled", ch + 1);
             /* Running fw changed: refresh the identity cache so STATUS and
-             * event provenance report the new version (Lua is suspended, the
+             * event provenance report the new version (the runner is suspended, the
              * bus is ours — safe to fetch inline). */
             cmd_ambit_device_info_invalidate(ch);
             ambit_device_info_t inf;
@@ -475,7 +475,7 @@ static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
 }
 
 /* Establish a deterministic maintenance window for identity and OTA sweeps.
- * lua_runner_stop() can only unwind the host task; a trigger already accepted
+ * sched_runner_stop() can only unwind the host task; a trigger already accepted
  * by an AMBIT continues autonomously and keeps its binary router quiet until the
  * trace completes. Once that maximum interval has elapsed, discard cached ping
  * failures captured during the run so every presence decision reaches the wire. */
@@ -614,13 +614,11 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
  * Sweep all channels (cmd 33/2), log a per-channel line, and publish one JSON
  * report. Runs on the worker task (off the MQTT loop).
  *
- * The normal Lua schedule starts a 59-second SS run every minute. AMBIT is
- * deliberately quiet on the shared UART while that run owns its binary router,
- * so mutex serialization alone produces false "absent" inventory for almost
- * the entire minute. Stop Lua, allow the already-triggered autonomous run to
- * finish, then sweep in the resulting deterministic idle window. The longest
- * normal trace is the 59-pulse/1 Hz SS run (~59.3 s including setup); 65 s keeps
- * margin without approaching the host's 90 s correlated-query deadline. */
+ * AMBIT is deliberately quiet on the shared UART while an autonomous run owns
+ * its binary router, so mutex serialization alone can produce false "absent"
+ * inventory. Suspend the schedule runner and wait beyond the longest shipped
+ * ambit_trace_estimate_ms() result before sweeping the deterministic idle
+ * window; 65 s retains margin below the host's 90 s query deadline. */
 
 static bool ambit_read_fw_version(uint8_t ch, ambit_fw_info_t *fw)
 {
@@ -692,7 +690,7 @@ static void ambit_do_versions(const char *id)
  * Drive each requested channel's straps into download mode, read chip + MAC,
  * reset back to the app, and publish one ambit_probe JSON report. Works with no
  * cooperating app firmware — this is how a remote operator distinguishes
- * "bricked but flashable" from "hardware absent". Lua is stopped for the window
+ * "bricked but flashable" from "hardware absent". Measurement is stopped for the window
  * (the flasher needs the shared UART); MQTT stays up (op takes seconds and
  * needs no TLS heap), so the report publishes immediately. */
 static void ambit_do_probe(const ambit_ota_req_t *r)
@@ -727,7 +725,7 @@ static void ambit_do_probe(const ambit_ota_req_t *r)
                 sep, c, pr.chip, pr.mac[0], pr.mac[1], pr.mac[2],
                 pr.mac[3], pr.mac[4], pr.mac[5]);
         } else if (err == ESP_ERR_TIMEOUT) {
-            /* Couldn't take the UART bus (Lua didn't stop in time) — the channel
+            /* Couldn't take the UART bus (measurement didn't stop in time) — the channel
              * state is UNKNOWN, not absent. Report it distinctly so a remote
              * operator doesn't conclude "hardware dead" from a busy bus. */
             ESP_LOGW(TAG, "AMBIT%u: bus busy — probe indeterminate", c + 1);
@@ -755,7 +753,7 @@ static void ambit_do_probe(const ambit_ota_req_t *r)
  * Strategy A over MQTT: flash the 4 region images (NVS@0x9000 never written) on
  * one channel, or on every channel whose ROM answers a probe — deliberately NOT
  * ping-gated like the OTA sweep, because reviving units whose app firmware is
- * dead/ancient is this op's main job. Quiesces Lua + MQTT for the whole sweep
+ * dead/ancient is this op's main job. Quiesces measurement + MQTT for the whole sweep
  * (the flasher owns the UART for ~10-60 s per channel and must not compete for
  * heap), then resumes and reports per channel. */
 static void ambit_do_flash(const ambit_ota_req_t *r)
@@ -796,7 +794,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
             ambit_flash_probe_result_t pr;
             esp_err_t perr = ambit_flash_probe(c, &pr);
             if (perr == ESP_ERR_TIMEOUT) {
-                /* Bus still held (Lua didn't stop) — indeterminate, not absent. */
+                /* Bus still held (measurement didn't stop) — indeterminate, not absent. */
                 ESP_LOGW(TAG, "AMBIT%u: bus busy — skipping (state unknown)", c + 1);
                 res[c] = FL_BUSY;
                 continue;

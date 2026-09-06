@@ -82,10 +82,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # sdkconfig (sdkconfig.esp32-s3-devkitm-1) so PlatformIO regenerates it.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
-# Standalone heap leak tracing — DIAGNOSTIC ONLY. It found the leak (a Lua GC
-# starvation: sched.run blocks in C between cycles, starving Lua's alloc-driven
-# incremental GC, so measurement result tables piled up ~6 KB/min). Fixed with a
-# collectgarbage("collect") per sched.run cycle. Re-enable these two lines (the
+# Standalone heap leak tracing — DIAGNOSTIC ONLY. It found a historical script-VM
+# collector starvation while measurement blocked in C between cycles, which
+# accumulated result tables at ~6 KB/min. Re-enable these two lines (the
 # `heaptrace start|stop|dump` CLI command compiles back in via #ifdef) if another
 # leak ever needs chasing; off by default to reclaim ~17 KiB static .bss.
 # CONFIG_HEAP_TRACING_STANDALONE=y
@@ -102,7 +101,7 @@ CONFIG_PM_ENABLE=y
 # ── PSRAM (2 MB QUAD, module N16R2) ────────────────────────────────────────────
 # The production module physically has 2 MB QUAD PSRAM. Enabling it is the
 # config-level fix for the internal-DRAM heap fragmentation that stalled large
-# MQTT publishes (arrun traces ~3-9 KB) and starved Lua/TLS reconnects on the
+# MQTT publishes (arrun traces ~3-9 KB) and starved TLS reconnects on the
 # ~24 KB fragmented internal heap. ALWAYSINTERNAL=1024 is the load-bearing knob:
 # allocations >1 KB (envelope copy, esp-mqtt outbox copy, mbedTLS cert-flight)
 # spill to PSRAM so internal DRAM de-fragments; a higher threshold leaves them

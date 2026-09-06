@@ -39,7 +39,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
-#include "lua_runner.h"
+#include "sched_runner.h"
 #include "mp2731.h"
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
@@ -197,11 +197,13 @@ static bool app_wifi_provisioned(void)
     return provisioned;
 }
 
-/* Pause/resume the Lua measurement task for the maintenance workers (self-OTA,
- * AMBIT OTA/probe/flash, script update) — stopping it frees its heap (8 KB AMBIT
- * buffer + transient tables) and the shared UART. REFCOUNTED: the workers run on
+/* Pause/resume the schedule runner task for the maintenance workers (self-OTA,
+ * AMBIT OTA/probe/flash, script update). Stopping it quiesces the shared UART
+ * and frees the task/TCB (~9 KB); the 64,536 B AMBIT payload reserve is taken
+ * once at first start and stays RESIDENT across stop/start (deliberate — one
+ * early contiguous block beats per-trace fragmentation). REFCOUNTED: the workers run on
  * independent tasks, so overlapping suspend windows must not let one worker's
- * resume restart Lua inside another's quiesced window. */
+ * resume restart the runner inside another's quiesced window. */
 static portMUX_TYPE s_workload_mux    = portMUX_INITIALIZER_UNLOCKED;
 static int          s_workload_susp_n = 0;
 
@@ -210,11 +212,17 @@ static void app_workload_suspend(void)
     taskENTER_CRITICAL(&s_workload_mux);
     bool first = (s_workload_susp_n++ == 0);
     taskEXIT_CRITICAL(&s_workload_mux);
-    if (first && lua_runner_stop(5000) != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Lua task did not stop before the maintenance op — "
+    if (first && sched_runner_stop(5000) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "schedule runner did not stop before the maintenance op — "
                           "UART may be busy / heap may fragment");
     }
 }
+
+/* The runner's worst-case unwind after a stop request: one 30 s trace fetch
+ * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval and cleanup. Resume must
+ * out-retry that, or a stop that timed out leaves measurement permanently
+ * dead (T3 review blocker 3). */
+#define WORKLOAD_RESUME_RETRIES 90 /* 90 × 500 ms = 45 s > 30 s fetch + margin */
 
 static void app_workload_resume(void)
 {
@@ -223,29 +231,32 @@ static void app_workload_resume(void)
     taskEXIT_CRITICAL(&s_workload_mux);
     if (!last) return;
 
-    /* Reloads /littlefs/main.lua. If the preceding stop TIMED OUT (script was stuck
-     * in a long C call), the old task is still unwinding and start returns
-     * INVALID_STATE — without a retry the measurement loop would silently stay
-     * dead until a manual `lua start`/reboot. Retry until the old task exits. */
+    /* Reloads /littlefs/schedule.yaml (or the embedded default). If the preceding
+     * stop TIMED OUT (a step was stuck in a long C call), the old task is still
+     * unwinding and start returns INVALID_STATE — without a retry the measurement
+     * loop would silently stay dead until a manual `schedule start`/reboot.
+     * Retry until the old task exits: the runner's lifecycle state machine
+     * (STOPPED/STARTING/RUNNING/STOPPING) serializes the retry against any
+     * concurrent CLI `schedule start`, so exactly one task comes up. */
     esp_err_t err = ESP_OK;
-    for (int i = 0; i < 20; i++) {
-        err = lua_runner_start();
+    for (int i = 0; i < WORKLOAD_RESUME_RETRIES; i++) {
+        err = sched_runner_start();
         if (err != ESP_ERR_INVALID_STATE) break;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (err != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Lua restart after maintenance op: %s", esp_err_to_name(err));
+        ESP_LOGW(APP_TAG, "schedule runner restart after maintenance op: %s", esp_err_to_name(err));
     }
 }
 
 /* Global maintenance lock (Item D). The three maintenance workers — self-OTA
- * (ota_update), AMBIT OTA/flash/probe/versions (ambit_ota), and script update/
- * exec (script_update) — run on INDEPENDENT tasks with no shared "maintenance in
+ * (ota_update), AMBIT OTA/flash/probe/versions (ambit_ota), and schedule update
+ * (script_update) — run on INDEPENDENT tasks with no shared "maintenance in
  * progress" gate. Two close-spaced commands of different types (or a QoS1
  * redelivery of one) could otherwise overlap: one worker resuming MQTT while
  * another still holds an HTTPS/TLS session → two TLS sessions on this no-PSRAM
  * board → OOM/crash — the exact thing the per-op quiesce exists to prevent; or one
- * worker's esp_restart firing while another is mid main.lua rename → no main.lua.
+ * worker's esp_restart firing while another is mid schedule rename.
  * A single flag, taken at each worker's op entry and released on completion, makes
  * the three mutually exclusive; a second concurrent op of any type is rejected as
  * "busy"/"dropped". */
@@ -307,20 +318,20 @@ static void app_comms_resume(void)
 }
 
 /* ── Shared maintenance worker (fix #3) ───────────────────────────────────
- * The three update workers (self-OTA, AMBIT OTA/flash/probe/versions, script
- * update/exec) used to each spawn their own task ON DEMAND with a ~10 KB stack.
+ * The three update workers (self-OTA, AMBIT OTA/flash/probe/versions, schedule
+ * update) used to each spawn their own task ON DEMAND with a ~10 KB stack.
  * On the field's fragmented, no-PSRAM heap (largest free block seen pegged at
  * ~3.3 KB) that lazy xTaskCreate returned ESP_ERR_NO_MEM, so the very commands
- * meant to RECOVER a degraded unit (push a new main.lua, reflash a mismatched
+ * meant to RECOVER a degraded unit (push a new schedule, reflash a mismatched
  * AMBIT) could not even launch — observed 2026-07-20 as "script_update(url) …
  * dispatch failed: ESP_ERR_NO_MEM". The maintenance lock already makes the three
  * mutually exclusive, so ONE resident worker suffices. Created here while the
- * heap is still clean (before Lua starts), its stack can never fail to allocate;
+ * heap is still clean (before the schedule runner starts), its stack can never fail to allocate;
  * dispatch is now just a small (~few-hundred-byte) job enqueue that fits even a
  * fragmented heap. Net resident cost is one stack (~10 KB) — replacing the old
  * resident 8 KB OTA task plus two on-demand 10 KB stacks. */
 #define MAINT_WORKER_STACK 10240   /* max of the three old stacks (OTA 8K, ambit/script 10K) */
-#define MAINT_WORKER_PRIO  4       /* same as the three old workers; below lua_runner(10) */
+#define MAINT_WORKER_PRIO  4       /* same as the three old workers; below sched_runner(10) */
 #define MAINT_WORKER_QLEN  4       /* a couple of ops may queue behind a long URL update */
 
 typedef struct {
@@ -361,19 +372,11 @@ static void app_maint_worker(void *arg)
  * 10 s later, the backlog drain) at that moment starved the rest of the boot;
  * the console REPL sometimes never came up. on_got_ip therefore PARKS the MQTT
  * start until app_open_boot_gate() runs at the end of the startup sequence
- * (CLI, AMBIT firmware sync, Lua). Mux-guarded: on_got_ip runs on the
- * esp_event task, concurrent with app_main. */
+ * (CLI, AMBIT firmware sync, the schedule runner). Mux-guarded: on_got_ip
+ * runs on the esp_event task, concurrent with app_main. */
 static portMUX_TYPE s_boot_mux      = portMUX_INITIALIZER_UNLOCKED;
 static bool         s_boot_complete = false;
 static bool         s_mqtt_deferred = false;
-
-static bool app_boot_is_complete(void)
-{
-    taskENTER_CRITICAL(&s_boot_mux);
-    bool done = s_boot_complete;
-    taskEXIT_CRITICAL(&s_boot_mux);
-    return done;
-}
 
 /* MQTT reconnects can land while the publisher is sleeping on its 30 s safety
  * fallback. Wake it immediately; sync_runner_notify() is a no-op before start. */
@@ -518,9 +521,9 @@ static esp_err_t app_init_i2c_and_sensors(void)
     }
 
     /* Install the DST rule for the configured IANA timezone so the RTC-based
-     * scheduler (sched.lua) fires jobs on LOCAL wall time. The RTC and every
+     * schedule runner fires jobs on LOCAL wall time. The RTC and every
      * stored timestamp stay UTC; this only affects on-device scheduling. Applied
-     * before Lua starts (app_init_littlefs, later in the boot sequence). */
+     * before the schedule runner starts (app_init_littlefs, later in boot). */
     char tz[48];
     if (device_config_get_timezone(tz, sizeof(tz)) != ESP_OK) {
         tz[0] = '\0';
@@ -565,69 +568,23 @@ static esp_err_t app_init_sdcard(void)
     return ESP_OK;
 }
 
-/* Byte-compare two small files (scripts are a few KB). Any read error counts as
- * "different", which errs toward importing — the safe direction for recovery. */
-static bool app_scripts_identical(const char *a, const char *b)
-{
-    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
-    bool same = (fa != NULL && fb != NULL);
-    while (same) {
-        char ba[256], bb[256];
-        size_t na = fread(ba, 1, sizeof ba, fa);
-        size_t nb = fread(bb, 1, sizeof bb, fb);
-        if (na != nb || memcmp(ba, bb, na) != 0) same = false;
-        else if (na < sizeof ba) break;              /* simultaneous EOF, all equal */
-    }
-    if (fa) fclose(fa);
-    if (fb) fclose(fb);
-    return same;
-}
-
 /* Hot-plug callback: fired by the sd_monitor task on every mount-state
- * transition. With the event store and main.lua both on INTERNAL flash, SD loss
- * no longer stops anything — measurement, storage, and publishing continue; only
- * the archive/log/AMBIT-firmware roles pause (each self-gates on mount state).
- * An INSERT is the manual offline-recovery moment: a card carrying main.lua
- * (written on a laptop, for a unit with no internet) is imported into the
- * internal home and the runner restarted on it. */
+ * transition. With the event store and the schedule both on INTERNAL flash, SD
+ * loss no longer stops anything — measurement, storage, and publishing continue;
+ * only the archive/log/AMBIT-firmware roles pause (each self-gates on mount
+ * state). No import runs on insertion; the embedded default schedule covers a
+ * blank unit and installed schedules live on internal littlefs. */
 static void app_on_sd_state_change(bool mounted)
 {
     if (!mounted) {
         ESP_LOGW(APP_TAG, "SD out — archive/logs paused; measurement + publishing unaffected");
-        return;
-    }
-
-    struct stat st;
-    bool sd_has_script = (stat("/sdcard/main.lua", &st) == 0 && st.st_size > 0);
-    /* During boot (e.g. an SD bounce while the AMBIT firmware sync is mid-flash)
-     * leave Lua to the boot sequence — starting it here would break
-     * ambit_flash_boot_sync's pre-Lua exclusive-UART assumption. */
-    if (!app_boot_is_complete()) {
-        ESP_LOGI(APP_TAG, "SD mounted during boot — recovery import deferred to boot sequence");
-        return;
-    }
-    if (!sd_has_script) {
-        return;                     /* archive-only card: keeper task handles it */
-    }
-    if (app_scripts_identical("/sdcard/main.lua", "/littlefs/main.lua")) {
-        return;                     /* recovery card already applied — don't churn Lua */
-    }
-    ESP_LOGW(APP_TAG, "SD carries a different main.lua — importing (offline recovery) and restarting Lua");
-    lua_runner_stop(5000);
-    (void)lua_runner_import_script("/sdcard/main.lua");
-    /* The SD copy is left in place (a tech may carry one card to many devices);
-     * the byte-compare above makes re-inserts and reboots no-ops. */
-    esp_err_t err = lua_runner_start();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(APP_TAG, "Lua restart after import failed: %s", esp_err_to_name(err));
     }
 }
 
 /* Pre-reboot power-safety hook (Item B). Every esp_restart() in the tree (OTA,
  * script_update, connectivity watchdog, CLI reboot, Wi-Fi clear) previously fired
  * with no fsync/unmount, and FATFS is not power-safe — a torn FAT/dir-entry write
- * could orphan clusters or, rarely, leave an unmountable card, which would stop
- * the measurement loop entirely (main.lua lives on the SD). Registering ONE
+ * could orphan clusters or, rarely, leave an unmountable card. Registering ONE
  * shutdown handler here (esp_register_shutdown_handler runs it before every
  * esp_restart) drains + closes the buffered SD writers and cleanly unmounts, so
  * ALL reboot paths benefit without touching each call site. Runs with the
@@ -649,15 +606,14 @@ static void app_prepare_reboot(void)
  * and on a solar unit that happens on a schedule (every deep-discharge night).
  * Until now the device kept writing the event log right up to the brownout —
  * so each battery death rolled the dice on a FAT-metadata write in flight, which
- * is the leading candidate for the fleet's recurring corrupt-card bricks (a
- * corrupt FAT takes the whole backlog AND main.lua with it).
+ * is the leading candidate for the fleet's recurring corrupt-card bricks.
  *
  * This guard watches the MP2731 while on battery and, once the voltage sits
  * below the park floor, parks the SD CARD ONLY — flush + close the sd_logger
  * file, unmount — well before the rail can collapse. Since the event store
- * moved to internal littlefs (power-loss-safe), Lua, storage, and publishing
- * all keep running to the very end: riding the battery down now PRESERVES
- * measurements instead of risking the volume that holds them. When external
+ * moved to internal littlefs (power-loss-safe), the schedule runner, storage,
+ * and publishing all keep running to the very end: riding the battery down now
+ * PRESERVES measurements instead of risking the volume that holds them. When external
  * power returns (or the battery recovers), the card is remounted and the
  * archive/log roles resume.
  *
@@ -671,8 +627,8 @@ static void app_prepare_reboot(void)
 #define PWRGUARD_PARK_N          3   /* consecutive low reads (45 s) — rides out sag/ADC steps */
 #define PWRGUARD_RESUME_MV    3600   /* battery-only resume level (> park + rebound) */
 #define PWRGUARD_RESUME_N        4   /* consecutive good reads (60 s) before un-parking */
-/* The un-park path runs esp_vfs_fat_sdmmc_mount + event_log reopen + Lua start —
- * the same heavy fan-out the SD monitor carries 12 KB for; 8 KB was marginal
+/* The un-park path runs esp_vfs_fat_sdmmc_mount + event_log reopen — the same
+ * heavy fan-out the SD monitor carries 12 KB for; 8 KB was marginal
  * there. Created once at boot while the heap is still clean. */
 #define PWRGUARD_TASK_STACK  12288
 
@@ -704,12 +660,13 @@ static void app_power_guard_task(void *arg)
             ESP_LOGW(APP_TAG, "battery %umV on battery power — parking the SD (FAT) "
                               "before brownout can tear it; measurement continues on "
                               "the internal store", (unsigned)p.battery_mv);
-            /* Park scope shrank with the internal store: Lua, the event log, and
-             * publishing all keep running — littlefs on internal flash is
-             * power-loss-safe, so riding the battery down now PRESERVES data
-             * instead of risking it. Only the journal-less FAT card needs to be
-             * out of harm's way. Monitor first so no remount/teardown can race
-             * the flush + unmount below (same order as app_prepare_reboot). */
+            /* Park scope shrank with the internal store: the schedule runner,
+             * the event log, and publishing all keep running — littlefs on
+             * internal flash is power-loss-safe, so riding the battery down now
+             * PRESERVES data instead of risking it. Only the journal-less FAT
+             * card needs to be out of harm's way. Monitor first so no remount/
+             * teardown can race the flush + unmount below (same order as
+             * app_prepare_reboot). */
             sdcard_monitor_suspend();
             sd_logger_pause();               /* drain ring, fsync + close (resumable) */
             esp_err_t err = ESP_OK;
@@ -736,8 +693,9 @@ static void app_power_guard_task(void *arg)
             /* Remount HERE (not via the monitor): the monitor was suspended while
              * it believed the card mounted, so an un-parked remount on its own
              * probe would look like no transition. Nothing else needs restoring —
-             * the event store and Lua never stopped. If the mount fails (card
-             * pulled while parked), the resumed monitor's retry takes over. */
+             * the event store and the schedule runner never stopped. If the mount
+             * fails (card pulled while parked), the resumed monitor's retry takes
+             * over. */
             if (sdcard_mount() != ESP_OK) {
                 ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
             }
@@ -862,7 +820,7 @@ static esp_err_t app_init_evstore(void)
  * notice. Priority 2 (with the other background housekeeping). */
 #define SD_KEEPER_PERIOD_MS       60000
 #define SD_KEEPER_MIGRATE_FILES   4       /* per pass: bounds mutex hold + task burst */
-#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no Lua/mount fan-out */
+#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no mount fan-out */
 
 static void app_sd_keeper_task(void *arg)
 {
@@ -886,31 +844,18 @@ static void app_sd_keeper_task(void *arg)
     }
 }
 
-static void app_start_lua_runner(void)
+static void app_start_sched_runner(void)
 {
-    /* Script home is internal (/littlefs/main.lua). A unit that has never
-     * received a script (fresh flash, no OTA yet) falls back to the SD card —
-     * the manual offline-recovery source — importing it into the internal home
-     * first so the next boot no longer needs the card. */
-    if (!lua_runner_script_present()) {
-        struct stat st;
-        if (stat("/sdcard/main.lua", &st) == 0 && st.st_size > 0 &&
-            lua_runner_import_script("/sdcard/main.lua") == ESP_OK) {
-            ESP_LOGW(APP_TAG, "no internal main.lua — imported from SD (offline recovery)");
-        } else {
-            ESP_LOGW(APP_TAG, "Lua runner not started: no main.lua (deliver via "
-                              "script_update OTA or an SD recovery card)");
-            return;
-        }
-    }
-
-    const esp_err_t err = lua_runner_start();
+    /* The runner compiles /littlefs/schedule.yaml when present and otherwise
+     * runs the embedded default — so there is no "no script" dead end and no
+     * SD recovery import: a fresh flash measures. */
+    const esp_err_t err = sched_runner_start();
     if (err != ESP_OK) {
-        ESP_LOGE(APP_TAG, "Lua runner failed to start: %s", esp_err_to_name(err));
+        ESP_LOGE(APP_TAG, "schedule runner failed to start: %s", esp_err_to_name(err));
         return;
     }
 
-    ESP_LOGI(APP_TAG, "Lua runner started");
+    ESP_LOGI(APP_TAG, "schedule runner started");
 }
 
 static void app_start_cli(void)
@@ -1214,7 +1159,7 @@ void app_main(void)
     }
 
     /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered
-     * (`ambit_ota <ch> <url>`): downloads the C3 image to SD, suspends Lua + MQTT,
+     * (`ambit_ota <ch> <url>`): downloads the C3 image to SD, suspends measurement + MQTT,
      * streams it to the sensor over the binary UART link; the AMBIT verifies and
      * reboots into its spare slot. Same quiesce hooks as the self-OTA. */
     ambit_ota_config_t ambit_ota_cfg = {
@@ -1235,15 +1180,14 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
     }
 
-    /* Remote Lua control (Stage 4): MQTT script_update replaces /littlefs/main.lua
-     * (syntax-checked, .bak kept) + restarts the runner; MQTT lua_exec runs a
-     * snippet in an ephemeral state. Lazy worker — no steady-state heap cost. */
+    /* MQTT script_update replaces /littlefs/schedule.yaml (compiled with the
+     * runner's validator, .bak kept) and restarts the schedule runner. */
     script_update_config_t script_cfg = {
         .publish          = mqtt_client_get_publish_fn(),
         .is_connected     = mqtt_client_get_is_connected_fn(),
         .status_topic     = status_topic,
         .device_id        = device_id,
-        /* url variant: stop Lua (defragment) AND stop MQTT (free its TLS heap)
+        /* URL variant: stop the runner (defragment) and MQTT (free its TLS heap)
          * around the HTTPS download so the download's TLS handshake gets a clean
          * contiguous heap — same quiesce hooks as OTA. MQTT is resumed before the
          * status reply. */
@@ -1260,11 +1204,12 @@ void app_main(void)
     }
 
     /* Start the single shared maintenance worker now — the heap is still clean
-     * (Lua has not started), so its stack allocation cannot fail the way the old
-     * per-op lazy spawns did on a fragmented heap. Must run AFTER the three
-     * *_init() calls above so their configs (used by the worker's boot-confirm
-     * and job handlers) are stored. If it can't start, remote OTA / AMBIT flash /
-     * script update are unavailable, but the device still measures + publishes. */
+     * (the schedule runner has not started), so its stack allocation cannot fail
+     * like the old per-op lazy spawns did on a fragmented heap. Must run AFTER
+     * the three *_init() calls above so their configs (used by the worker's
+     * boot-confirm and job handlers) are stored. If it can't start, remote OTA /
+     * AMBIT flash / script update are unavailable, but the device still measures
+     * and publishes. */
     s_maint_q = xQueueCreate(MAINT_WORKER_QLEN, sizeof(maint_job_t));
     if (s_maint_q == NULL ||
         xTaskCreatePinnedToCore(app_maint_worker, "maint", MAINT_WORKER_STACK,
@@ -1307,7 +1252,7 @@ void app_main(void)
 
     /* Kick off Wi-Fi WITHOUT blocking the boot. A missing AP (reason=201,
      * NO_AP_FOUND) would otherwise stall here for the full connect timeout,
-     * delaying everything below — sensors, SD, and the Lua measurement loop, none
+     * delaying everything below — sensors, SD, and the schedule runner, none
      * of which depend on Wi-Fi. Publishing is power-gated and drains in the
      * background once on_got_ip fires; the connect + MQTT start complete
      * asynchronously via the events registered above. */
@@ -1362,7 +1307,7 @@ void app_main(void)
     if (err == ESP_OK) {
         lfs_available = true;
     } else {
-        ESP_LOGE(APP_TAG, "LittleFS unavailable — main.lua home missing");
+        ESP_LOGE(APP_TAG, "LittleFS unavailable — schedule/script home missing");
     }
 
     /* ── Persistence (append-only event log on the INTERNAL store) ──
@@ -1470,7 +1415,6 @@ void app_main(void)
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
-        .request_gc             = lua_runner_request_gc,
         .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
         .watchdog_armed         = sync_runner_watchdog_armed,
         .publish_gzip_enabled   = device_config_publish_gzip_enabled,
@@ -1484,9 +1428,10 @@ void app_main(void)
     }
 
     /* ── CLI ──────────────────────────────────────────────────────────
-     * Console first: everything below (sync runner, AMBIT firmware sync, Lua)
-     * can take seconds to minutes, and the operator needs a live prompt while
-     * it runs. Commands degrade gracefully for anything not started yet. */
+     * Console first: everything below (sync runner, AMBIT firmware sync, the
+     * schedule runner) can take seconds to minutes, and the operator needs a
+     * live prompt while it runs. Commands degrade gracefully for anything not
+     * started yet. */
     app_start_cli();
 
     /* ── Background MQTT sync + STATUS heartbeat ─────────────────────── */
@@ -1506,14 +1451,13 @@ void app_main(void)
                           "nightly reboot, and connection/memory/PUBACK self-healing disabled");
     }
 
-    /* ── Field-status LED blinker (firmware-owned; Lua no longer drives the
-     * LED). Probes are cheap reads of already-cached state. ─────────────── */
+    /* ── Field-status LED blinker. Probes are cheap reads of cached state. ── */
     {
         static const ambyte_blinker_config_t blink_cfg = {
             .sd_mounted        = sdcard_is_mounted,
             .wifi_connected    = wifi_manager_is_connected,
             .provisioned       = app_wifi_provisioned,
-            .script_running    = lua_runner_is_running,
+            .script_running    = sched_runner_is_running,
             .on_external_power = device_commands_publish_power_ok,
             .battery_mv        = device_commands_last_battery_mv,
         };
@@ -1523,8 +1467,9 @@ void app_main(void)
     }
 
     /* ── AMBIT firmware sync from SD ──────────────────────────────────
-     * BEFORE Lua ever starts: the shared UART is still free (no quiesce dance)
-     * and probing may hard-reset all four AMBITs. Bricked/blank units are
+     * BEFORE the runner starts: the shared UART is still free (no quiesce
+     * dance) and probing may hard-reset all four AMBITs — ambit_flash assumes
+     * exclusive UART before the runner exists. Bricked/blank units are
      * revived via the ROM bootloader; flashing is power-gated like MQTT
      * publishing. Detect-only `ambit_check` remains available from the CLI. */
     if (sd_available && uart_available) {
@@ -1532,15 +1477,20 @@ void app_main(void)
     }
 
     /* ── Start the measurement loop ───────────────────────────────── */
-    app_start_lua_runner();
+    app_start_sched_runner();
 
     /* ── Boot complete: release MQTT + the upload drain ───────────────
-     * Everything is initialized and Lua is running — the TLS handshake and
-     * backlog drain can no longer compete with the startup sequence. */
+     * Everything is initialized and the schedule runner is up — the TLS
+     * handshake and backlog drain can no longer compete with the startup
+     * sequence. */
     app_open_boot_gate();
 
 #if CONFIG_AMBYTE_BENCH_DIAG
-    ESP_ERROR_CHECK(bench_diag_start());
+    const esp_err_t bench_diag_err = bench_diag_start();
+    if (bench_diag_err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "bench diagnostics unavailable: %s",
+                 esp_err_to_name(bench_diag_err));
+    }
 #endif
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu, largest block: %u",

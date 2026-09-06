@@ -53,7 +53,7 @@ def test_all_release_consumers_share_a_single_request(monkeypatch):
     first = release_fetch._release_list(log=lambda _m: None)
     second = release_fetch._release_list(log=lambda _m: None)
     assert first == second == [{"tag_name": "v1.0.0"}]
-    # Firmware, Lua and GUI-update workers all enter through this locked cache.
+    # Firmware, Schedule and GUI-update workers all enter through this locked cache.
     assert len(calls) == 1
 
 
@@ -164,10 +164,10 @@ def test_manifests_are_fetched_once_and_reused_forever(monkeypatch):
 
     def fake_get(url):
         calls.append(url)
-        return {"schema_version": 1, "tag": "lua-v1.2.0"}
+        return {"schema_version": 1, "tag": "schedule-v1.2.0"}
 
     monkeypatch.setattr(release_fetch, "_get_json", fake_get)
-    url = "https://example.test/lua-v1.2.0/main.lua.manifest.json"
+    url = "https://example.test/schedule-v1.2.0/default.yaml.manifest.json"
     first = release_fetch._cached_manifest(url)
     second = release_fetch._cached_manifest(url)
     assert first == second

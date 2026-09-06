@@ -26,7 +26,7 @@ esp_err_t uart_sensors_init(void);
  * shared FFC/UART so the ambyte can flash it via the ROM bootloader. Reset
  * (CHIP_EN) is shared across all channels; the boot strap (GPIO9) is per
  * channel. Lines are open-drain against the AMBIT's pull-ups. Only use inside a
- * quiesced context (Lua stopped) — a download-entry pulses the shared reset, so
+ * quiesced context (measurement stopped) — a download-entry pulses the shared reset, so
  * all four AMBITs reboot (only the target enters download mode). Sequence:
  *   flash_session_begin(ch, wait) → enter_download(ch) → <flash over UART0>
  *   → run_app(ch) → flash_session_end(ch).
@@ -39,7 +39,7 @@ esp_err_t uart_sensors_enter_download(uint8_t ch);   /* session must be held */
 esp_err_t uart_sensors_run_app(uint8_t ch);          /* session must be held */
 
 /* Forget positive and negative ping results for every channel. Maintenance
- * operations call this only after stopping Lua and waiting for autonomous AMBIT
+ * operations call this only after stopping measurement and waiting for autonomous AMBIT
  * measurements to finish, so their presence checks always reach the wire rather
  * than reusing a five-minute negative result captured while an AMBIT was busy. */
 void uart_sensors_invalidate_ping_cache(void);

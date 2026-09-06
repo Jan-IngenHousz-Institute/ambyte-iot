@@ -24,12 +24,12 @@ SEMVER_SUFFIX = (
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 FIRMWARE_TAG_RE = re.compile(rf"^v{SEMVER_SUFFIX}$")
-LUA_TAG_RE = re.compile(rf"^lua-v{SEMVER_SUFFIX}$")
+SCHEDULE_TAG_RE = re.compile(rf"^schedule-v{SEMVER_SUFFIX}$")
 AMBIT_TAG_RE = FIRMWARE_TAG_RE
 TAG_PATTERNS = {
     "ambit": AMBIT_TAG_RE,
     "ota": FIRMWARE_TAG_RE,
-    "lua": LUA_TAG_RE,
+    "schedule": SCHEDULE_TAG_RE,
 }
 
 
@@ -37,7 +37,7 @@ def parse_tag(tag: str, kind: str):
     pattern = TAG_PATTERNS[kind]
     if pattern.fullmatch(tag) is None:
         raise ValueError(f"{tag!r} is not a valid {kind} release tag")
-    prefix = "lua-v" if kind == "lua" else "v"
+    prefix = "schedule-v" if kind == "schedule" else "v"
     parsed = fleet.parse_version(tag.removeprefix(prefix))
     if parsed is None:  # defensive: regex and fleet semver parser must agree
         raise ValueError(f"{tag!r} has no parseable semantic version")

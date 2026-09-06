@@ -36,8 +36,8 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _STATUS_MAC_RE = re.compile(r"-\s*MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _RTC_RE = re.compile(r"RTC:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\((\d+)\)")
-_LUA_RELEASE_RE = re.compile(
-    r"lua release:\s+sha256=([0-9A-Fa-f]{64})\s+version=(\S+)\s+"
+_SCHEDULE_RELEASE_RE = re.compile(
+    r"schedule release:\s+sha256=([0-9A-Fa-f]{64})\s+version=(\S+)\s+"
     r"built_against_fw=(\S+)\s+installed_on_fw=(\S+)\s+"
     r"verified=(true|false)\s+running=(true|false)")
 _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
@@ -46,7 +46,7 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 # already means the board holds a DHCP lease.
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
 _SD_RE = re.compile(r"SD card:\s*(mounted|absent)", re.IGNORECASE)
-_LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
+_SCHEDULE_PUT_RE = re.compile(r"schedule put:\s*(\d+)\s*bytes")
 # NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
 # driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
 # USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT and which the REPL does not let us size
@@ -54,7 +54,7 @@ _LUA_PUT_RE = re.compile(r"lua put:\s*(\d+)\s*bytes")
 # the line never reaches the parser, so the command simply never answers.
 # Measured on hardware: a 224-character line works, 264 hangs. 144 raw bytes
 # encodes to 192, so the line is 200 characters, comfortably clear of 256.
-LUA_PUT_CHUNK_BYTES = 144
+SCHEDULE_PUT_CHUNK_BYTES = 144
 FAILURE_MARK = "Command returned non-zero error code"
 
 # The firmware expands this token at boot; over `cfg get` it comes back raw.
@@ -100,7 +100,7 @@ class ProbeResult:
 
 
 @dataclass(frozen=True)
-class LuaReleaseStatus:
+class ScheduleReleaseStatus:
     sha256: str
     script_version: str
     built_against_fw: str
@@ -212,7 +212,7 @@ class AmbyteConsole:
     def sd_mounted(self, timeout: float = 10.0) -> bool | None:
         """Whether the archive SD card is mounted, or None if it does not say.
 
-        Since the event store and main.lua live on internal flash, the card is
+        Since the event store and schedule.yaml live on internal flash, the card is
         optional — this is for operator information, never a gate. None means
         the firmware predates the status line.
         """
@@ -261,18 +261,18 @@ class AmbyteConsole:
             raise ConsoleError(f"rtc set confirmation not understood:\n{reply[-300:]}")
         return int(m.group(2))
 
-    def lua_install(self, url: str, sha256: str, campaign_id: str,
+    def schedule_install(self, url: str, sha256: str, campaign_id: str,
                     script_version: str, built_against_fw: str) -> None:
         """Queue the firmware's safe URL installer for one released script."""
         args = (url, sha256, campaign_id, script_version, built_against_fw)
         if any(not value or any(ch.isspace() for ch in value) for value in args):
-            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
-        cmd = "lua install " + " ".join(args)
+            raise ConsoleError("Schedule release fields must be non-empty and whitespace-free")
+        cmd = "schedule install " + " ".join(args)
         reply = self.command(cmd, timeout=10.0)
-        if "lua install queued:" not in reply or FAILURE_MARK in reply:
-            raise ConsoleError(f"Lua install request failed:\n{reply[-500:]}")
+        if "schedule install queued:" not in reply or FAILURE_MARK in reply:
+            raise ConsoleError(f"Schedule install request failed:\n{reply[-500:]}")
 
-    def lua_push(self, blob: bytes, sha256: str, campaign_id: str,
+    def schedule_push(self, blob: bytes, sha256: str, campaign_id: str,
                  script_version: str, built_against_fw: str,
                  log=None) -> None:
         """Stream a script down this console and install it, no device network.
@@ -282,61 +282,61 @@ class AmbyteConsole:
         """
         args = (sha256, campaign_id, script_version, built_against_fw)
         if any(not value or any(ch.isspace() for ch in value) for value in args):
-            raise ConsoleError("Lua release fields must be non-empty and whitespace-free")
+            raise ConsoleError("Schedule release fields must be non-empty and whitespace-free")
 
-        reply = self.command("lua begin", timeout=10.0)
-        if "lua begin: ready" not in reply:
-            # Older firmware answers the `lua <start|stop|...>` usage line and a
+        reply = self.command("schedule begin", timeout=10.0)
+        if "schedule begin: ready" not in reply:
+            # Older firmware answers the `schedule <start|stop|...>` usage line and a
             # non-zero exit; that is a capability signal, not a failure.
-            if "Usage: lua" in reply or FAILURE_MARK in reply:
+            if "Usage: schedule" in reply or FAILURE_MARK in reply:
                 raise UnsupportedConsoleCommand(
-                    "this firmware has no `lua begin`/`lua put`")
-            raise ConsoleError(f"lua begin failed:\n{reply[-500:]}")
+                    "this firmware has no `schedule begin`/`schedule put`")
+            raise ConsoleError(f"schedule begin failed:\n{reply[-500:]}")
 
         sent = 0
-        for offset in range(0, len(blob), LUA_PUT_CHUNK_BYTES):
-            chunk = blob[offset:offset + LUA_PUT_CHUNK_BYTES]
+        for offset in range(0, len(blob), SCHEDULE_PUT_CHUNK_BYTES):
+            chunk = blob[offset:offset + SCHEDULE_PUT_CHUNK_BYTES]
             encoded = base64.b64encode(chunk).decode("ascii")
-            reply = self.command(f"lua put {encoded}", timeout=15.0)
-            match = _LUA_PUT_RE.search(reply)
+            reply = self.command(f"schedule put {encoded}", timeout=15.0)
+            match = _SCHEDULE_PUT_RE.search(reply)
             if match is None or FAILURE_MARK in reply:
-                self._lua_abort_quietly()
-                raise ConsoleError(f"lua put failed at byte {sent}:\n{reply[-500:]}")
+                self._schedule_abort_quietly()
+                raise ConsoleError(f"schedule put failed at byte {sent}:\n{reply[-500:]}")
             sent += len(chunk)
             # The device reports the staged file's own size, so a silently
             # dropped chunk is caught here rather than by the digest at commit.
             if int(match.group(1)) != sent:
-                self._lua_abort_quietly()
+                self._schedule_abort_quietly()
                 raise ConsoleError(
                     f"device staged {match.group(1)} bytes after {sent} were sent")
             if log is not None:
                 log(f"Pushed {sent}/{len(blob)} bytes of {script_version}.")
 
-        reply = self.command("lua commit " + " ".join(args), timeout=15.0)
-        if "lua commit queued:" not in reply or FAILURE_MARK in reply:
-            self._lua_abort_quietly()
-            raise ConsoleError(f"lua commit failed:\n{reply[-500:]}")
+        reply = self.command("schedule commit " + " ".join(args), timeout=15.0)
+        if "schedule commit queued:" not in reply or FAILURE_MARK in reply:
+            self._schedule_abort_quietly()
+            raise ConsoleError(f"schedule commit failed:\n{reply[-500:]}")
 
-    def _lua_abort_quietly(self) -> None:
+    def _schedule_abort_quietly(self) -> None:
         """Drop a half-pushed staging file; never mask the original error."""
         try:
-            self.command("lua abort", timeout=10.0)
+            self.command("schedule abort", timeout=10.0)
         except ConsoleError:
             pass
 
-    def lua_release(self, timeout: float = 10.0) -> LuaReleaseStatus:
-        """Read the active /sdcard/main.lua identity and runner state."""
-        reply = self.command("lua release", timeout=timeout)
+    def schedule_release(self, timeout: float = 10.0) -> ScheduleReleaseStatus:
+        """Read the active /littlefs/schedule.yaml identity and runner state."""
+        reply = self.command("schedule release", timeout=timeout)
         if FAILURE_MARK in reply:
-            raise ConsoleError(f"Lua release status failed:\n{reply[-500:]}")
-        match = _LUA_RELEASE_RE.search(reply)
+            raise ConsoleError(f"Schedule release status failed:\n{reply[-500:]}")
+        match = _SCHEDULE_RELEASE_RE.search(reply)
         if match is None:
-            raise ConsoleError(f"Lua release status not understood:\n{reply[-500:]}")
+            raise ConsoleError(f"Schedule release status not understood:\n{reply[-500:]}")
 
         def value(raw: str) -> str:
             return "" if raw == "-" else raw
 
-        return LuaReleaseStatus(
+        return ScheduleReleaseStatus(
             sha256=match.group(1).lower(),
             script_version=value(match.group(2)),
             built_against_fw=value(match.group(3)),

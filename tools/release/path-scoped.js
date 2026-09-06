@@ -6,12 +6,12 @@
  * pattern. The repository has two independent release units without forcing a
  * disruptive firmware-directory move:
  *
- *   repository root -> firmware, every tracked path except lua/**
- *   lua/            -> field script, only lua/**
+ *   repository root -> firmware, every tracked path except schedule/**
+ *   schedule/       -> field schedule, only schedule/**
  *
  * Filtering both analysis and release-note steps matters. Merely skipping the
- * firmware job on a Lua-only merge is insufficient: the next firmware release
- * would otherwise re-read that Lua commit from history and bump firmware late.
+ * firmware job on a schedule-only merge is insufficient: the next firmware
+ * release would otherwise re-read that commit and bump firmware late.
  */
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -24,14 +24,14 @@ const gitRoot = () =>
 
 const releaseUnit = () => {
   const relative = path.relative(gitRoot(), process.cwd());
-  return relative === "lua" ? "lua" : "firmware";
+  return relative === "schedule" ? "schedule" : "firmware";
 };
 
 const normalized = (file) => file.split(path.sep).join("/");
 
 // Paths that belong to NO release unit: the desktop flash GUI and its build
 // workflow are host-side tooling. A feat/fix there must not bump or rebuild
-// firmware any more than a Lua-only commit may.
+// firmware any more than a schedule-only commit may.
 const isUnreleased = (candidate) =>
   candidate === "flash_gui" ||
   candidate.startsWith("flash_gui/") ||
@@ -39,8 +39,8 @@ const isUnreleased = (candidate) =>
 
 export const isRelevantFile = (file, unit = releaseUnit()) => {
   const candidate = normalized(file);
-  const isLua = candidate === "lua" || candidate.startsWith("lua/");
-  return unit === "lua" ? isLua : !isLua && !isUnreleased(candidate);
+  const isSchedule = candidate === "schedule" || candidate.startsWith("schedule/");
+  return unit === "schedule" ? isSchedule : !isSchedule && !isUnreleased(candidate);
 };
 
 export const onlyRelevantCommits = async (commits, unit = releaseUnit()) => {

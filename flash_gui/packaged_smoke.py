@@ -12,8 +12,8 @@ from pathlib import Path
 
 from . import release_fetch
 from .config import LITTLEFS_PARTITION_SIZE
-from .littlefs_image import build_main_lua_image
-from .release_fetch import LuaScriptRelease
+from .littlefs_image import build_schedule_image
+from .release_fetch import ScheduleScriptRelease
 
 
 REPORT_NAME = "packaged-littlefs-smoke.txt"
@@ -27,13 +27,13 @@ def run_littlefs_smoke(report_path: Path | None = None) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script_blob = b"return { packaged_smoke = true }\n"
-            source = root / "released-main.lua"
+            source = root / "released-default.yaml"
             source.write_bytes(script_blob)
             digest = hashlib.sha256(script_blob).hexdigest()
-            script = LuaScriptRelease(
-                tag="lua-v0.0.0",
-                asset_name="main.lua",
-                script_name="main",
+            script = ScheduleScriptRelease(
+                tag="schedule-v0.0.0",
+                asset_name="default.yaml",
+                script_name="default",
                 script_version="0.0.0",
                 built_against_fw="v0.0.0",
                 asset_url=source.as_uri(),
@@ -53,7 +53,7 @@ def run_littlefs_smoke(report_path: Path | None = None) -> None:
                 release_fetch.SCRIPTS_CACHE_DIR = previous_cache
 
             output = Path(directory) / "littlefs.bin"
-            build_main_lua_image(fetched_blob, output)
+            build_schedule_image(fetched_blob, output)
             if output.stat().st_size != LITTLEFS_PARTITION_SIZE:
                 raise RuntimeError(
                     f"littlefs smoke image is {output.stat().st_size} bytes, "

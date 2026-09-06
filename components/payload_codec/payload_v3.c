@@ -390,6 +390,10 @@ bool payload_v3_build_trace(char *out, size_t cap,
     if (input->protocol_id != NULL && input->protocol_id[0] != '\0') {
         jw_append(&w, "%s\"id\":", comma ? "," : ""); jw_string(&w, input->protocol_id); comma = true;
     }
+    /* Sibling of name, never a substitute for it. */
+    if (input->protocol_tag != NULL && input->protocol_tag[0] != '\0') {
+        jw_append(&w, "%s\"tag\":", comma ? "," : ""); jw_string(&w, input->protocol_tag); comma = true;
+    }
     jw_append(&w, "%s\"cmd\":", comma ? "," : ""); jw_string(&w, input->protocol_cmd);
     jw_append(&w, ",\"segments\":[");
     for (size_t i = 0; i < input->segment_count; ++i) {
@@ -535,6 +539,12 @@ static bool build_legacy_metadata(char *out, size_t cap,
         jw_append(&w, ",\"protocol_id\":");
         jw_string(&w, input->protocol_id);
     }
+    /* The v2 route must not silently drop the firing label either; legacy
+     * consumers ignore unknown metadata keys. */
+    if (input->protocol_tag != NULL && input->protocol_tag[0] != '\0') {
+        jw_append(&w, ",\"protocol_tag\":");
+        jw_string(&w, input->protocol_tag);
+    }
     jw_append(&w, "}");
     return w.ok;
 }
@@ -603,6 +613,47 @@ static void write_attached(json_writer_t *w, const payload_v3_telemetry_input_t 
         jw_append(w, "}");
     }
     jw_append(w, "]");
+}
+
+/* The spectrum read was the last producer still emitting the pre-v3 envelope
+ * (`{"v":2,"cmd_raw":"get_par",…}`), which left one schedule shipping two
+ * payload generations — the 2026-09 soak had 644 such rows next to
+ * ambit.trace/3. It carries no arrays and no protocol, so it gets its own small
+ * family rather than being forced through the trace shape. */
+bool payload_v3_build_spectrum(char *out, size_t cap,
+                               const payload_v3_spectrum_input_t *input,
+                               char *error, size_t error_cap)
+{
+    json_writer_t w;
+    jw_init(&w, out, cap);
+    if (input == NULL || input->device == NULL || input->channel == NULL ||
+        !isfinite(input->par)) {
+        set_error(error, error_cap, "invalid spectrum input");
+        return false;
+    }
+    jw_append(&w, "{\"schema\":\"ambit.spectrum/1\",\"measure_id\":%lld,\"channel\":",
+              (long long)input->measure_id);
+    jw_string(&w, input->channel);
+    jw_append(&w, ",\"device\":"); jw_string(&w, input->device);
+    if (input->sensor_id != NULL && input->sensor_id[0] != '\0') {
+        jw_append(&w, ",\"sensor_id\":"); jw_string(&w, input->sensor_id);
+    }
+    jw_append(&w, ",\"tag\":\"MEASUREMENT\",\"time\":{\"start_utc\":%lld,\"end_utc\":%lld},"
+                  "\"cal_version\":",
+              (long long)input->start_utc_ms, (long long)input->end_utc_ms);
+    if (input->calibration_present)
+        jw_append(&w, "\"%08x\"", (unsigned)input->cal_version);
+    else
+        jw_append(&w, "null");
+    /* Same {u,v} observation shape as telemetry; `spec` counts are raw ADC. */
+    jw_append(&w, ",\"observations\":{\"par\":{\"u\":\"umol.m-2.s-1\",\"v\":%.2f},"
+                  "\"spectrum\":{\"u\":\"count\",\"v\":[", input->par);
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        jw_append(&w, "%s%u", i ? "," : "", (unsigned)input->spectrum[i]);
+    }
+    jw_append(&w, "]}}}");
+    if (!w.ok) set_error(error, error_cap, "spectrum payload exceeds buffer");
+    return w.ok;
 }
 
 bool payload_v3_build_telemetry(char *out, size_t cap,
@@ -762,6 +813,7 @@ bool payload_v3_is_canonical_object(const char *json)
      * must change atomically with any new firmware-owned family. */
 #define SCHEMA_PREFIX(s) strncmp(json, (s), sizeof(s) - 1U) == 0
     return SCHEMA_PREFIX("{\"schema\":\"ambit.trace/3\"") ||
+           SCHEMA_PREFIX("{\"schema\":\"ambit.spectrum/1\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambyte.telemetry/1\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambit.device/1\"");
 #undef SCHEMA_PREFIX

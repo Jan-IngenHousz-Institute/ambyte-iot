@@ -33,7 +33,7 @@ STEPS = [
     ("nvs", "NVS image"),
     ("flash", "Flash"),
     ("provision", "RTC + reboot"),
-    ("lua", "Lua script"),
+    ("schedule", "Schedule script"),
     ("verify", "Verify"),
 ]
 STEP_ICONS = {"pending": "·", "running": "▶", "ok": "✓", "fail": "✗"}
@@ -99,7 +99,7 @@ class App(ttk.Frame):
         self.client: OpenJIIClient | None = None
         self.user_label = tk.StringVar(value="not signed in")
         self.release: release_fetch.ReleaseImages | None = None
-        self.lua_catalog: release_fetch.LuaCatalogRelease | None = None
+        self.schedule_catalog: release_fetch.ScheduleCatalogRelease | None = None
         self.experiments: list = []
         self.current_run: DeviceRun | None = None
         self.busy = False
@@ -115,7 +115,7 @@ class App(ttk.Frame):
         self._refresh_ports()
         self._fetch_gui_update_async()
         self._fetch_release_async()
-        self._fetch_lua_catalog_async()
+        self._fetch_schedule_catalog_async()
         if self.settings.api_key(self.settings.environment):
             self._validate_key_async(self.settings.api_key(
                 self.settings.environment), on_startup=True)
@@ -196,18 +196,18 @@ class App(ttk.Frame):
         self.exp_refresh_btn.grid(row=1, column=3, sticky="e", padx=(8, 0),
                                   pady=(6, 0))
 
-        ttk.Label(frame, text="Lua script:").grid(row=2, column=0, sticky="w",
+        ttk.Label(frame, text="Schedule script:").grid(row=2, column=0, sticky="w",
                                                    pady=(6, 0))
-        self.lua_script_var = tk.StringVar()
-        self.lua_script_box = ttk.Combobox(
-            frame, textvariable=self.lua_script_var, state="disabled")
-        self.lua_script_box.grid(row=2, column=1, columnspan=2, sticky="we",
+        self.schedule_script_var = tk.StringVar()
+        self.schedule_script_box = ttk.Combobox(
+            frame, textvariable=self.schedule_script_var, state="disabled")
+        self.schedule_script_box.grid(row=2, column=1, columnspan=2, sticky="we",
                                  pady=(6, 0))
-        self.lua_script_box.bind(
-            "<<ComboboxSelected>>", lambda e: self._on_lua_script_selected())
-        self.lua_refresh_btn = ttk.Button(
-            frame, text="Refresh", command=self._fetch_lua_catalog_async)
-        self.lua_refresh_btn.grid(row=2, column=3, sticky="e", padx=(8, 0),
+        self.schedule_script_box.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_schedule_script_selected())
+        self.schedule_refresh_btn = ttk.Button(
+            frame, text="Refresh", command=self._fetch_schedule_catalog_async)
+        self.schedule_refresh_btn.grid(row=2, column=3, sticky="e", padx=(8, 0),
                                   pady=(6, 0))
 
         ttk.Label(frame, text="Wi-Fi SSID:").grid(row=3, column=0, sticky="w",
@@ -237,8 +237,8 @@ class App(ttk.Frame):
         self.tz_label.pack(anchor="w")
         self.fw_var = tk.StringVar(value="Firmware release: fetching...")
         ttk.Label(frame, textvariable=self.fw_var).pack(anchor="w")
-        self.lua_release_var = tk.StringVar(value="Lua release: fetching...")
-        ttk.Label(frame, textvariable=self.lua_release_var).pack(anchor="w")
+        self.schedule_release_var = tk.StringVar(value="Schedule release: fetching...")
+        ttk.Label(frame, textvariable=self.schedule_release_var).pack(anchor="w")
 
     def _build_device_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Device", padding=8)
@@ -323,10 +323,10 @@ class App(ttk.Frame):
             self.busy = busy
             self.onboard_btn.configure(
                 state="disabled" if busy else "normal")
-            self.lua_script_box.configure(
-                state="disabled" if busy or self.lua_catalog is None
+            self.schedule_script_box.configure(
+                state="disabled" if busy or self.schedule_catalog is None
                 else "readonly")
-            self.lua_refresh_btn.configure(
+            self.schedule_refresh_btn.configure(
                 state="disabled" if busy else "normal")
         self._post(apply)
 
@@ -447,62 +447,62 @@ class App(ttk.Frame):
                 self.log(f"Firmware release fetch failed: {exc}")
         threading.Thread(target=work, daemon=True).start()
 
-    def _fetch_lua_catalog_async(self) -> None:
-        self.lua_catalog = None
-        self.lua_script_box.configure(state="disabled", values=[])
-        self.lua_script_var.set("")
-        self.lua_release_var.set("Lua release: fetching...")
-        self.lua_refresh_btn.configure(state="disabled")
+    def _fetch_schedule_catalog_async(self) -> None:
+        self.schedule_catalog = None
+        self.schedule_script_box.configure(state="disabled", values=[])
+        self.schedule_script_var.set("")
+        self.schedule_release_var.set("Schedule release: fetching...")
+        self.schedule_refresh_btn.configure(state="disabled")
 
         def work():
             try:
-                catalog = release_fetch.fetch_latest_lua_catalog(log=self.log)
+                catalog = release_fetch.fetch_latest_schedule_catalog(log=self.log)
             except release_fetch.ReleaseError as exc:
                 detail = str(exc)
                 def show_error():
-                    self.lua_release_var.set(f"Lua release: ERROR — {detail}")
+                    self.schedule_release_var.set(f"Schedule release: ERROR — {detail}")
                     if not self.busy:
-                        self.lua_refresh_btn.configure(state="normal")
+                        self.schedule_refresh_btn.configure(state="normal")
                 self._post(show_error)
-                self.log(f"Lua release fetch failed: {detail}")
+                self.log(f"Schedule release fetch failed: {detail}")
                 return
 
             def apply():
-                self.lua_catalog = catalog
+                self.schedule_catalog = catalog
                 values = [script.asset_name for script in catalog.scripts]
-                self.lua_script_box.configure(
+                self.schedule_script_box.configure(
                     values=values,
                     state="disabled" if self.busy else "readonly")
-                preferred = f"{self.settings.lua_script_name}.lua"
+                preferred = f"{self.settings.schedule_script_name}.yaml"
                 selected = preferred if preferred in values else (
-                    "main.lua" if "main.lua" in values else values[0])
-                self.lua_script_var.set(selected)
-                self._on_lua_script_selected()
-                self.lua_release_var.set(
-                    f"Lua release: {catalog.tag} ({len(values)} scripts)")
+                    "default.yaml" if "default.yaml" in values else values[0])
+                self.schedule_script_var.set(selected)
+                self._on_schedule_script_selected()
+                self.schedule_release_var.set(
+                    f"Schedule release: {catalog.tag} ({len(values)} scripts)")
                 if not self.busy:
-                    self.lua_refresh_btn.configure(state="normal")
+                    self.schedule_refresh_btn.configure(state="normal")
 
             self._post(apply)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _selected_lua_script(self) -> release_fetch.LuaScriptRelease | None:
-        if self.lua_catalog is None:
+    def _selected_schedule_script(self) -> release_fetch.ScheduleScriptRelease | None:
+        if self.schedule_catalog is None:
             return None
-        selected = self.lua_script_var.get()
+        selected = self.schedule_script_var.get()
         return next(
-            (script for script in self.lua_catalog.scripts
+            (script for script in self.schedule_catalog.scripts
              if script.asset_name == selected), None)
 
-    def _on_lua_script_selected(self) -> None:
-        script = self._selected_lua_script()
+    def _on_schedule_script_selected(self) -> None:
+        script = self._selected_schedule_script()
         if script is None:
             return
-        self.settings.lua_script_name = script.script_name
+        self.settings.schedule_script_name = script.script_name
         self.settings.save()
         self.log(
-            f"Selected Lua script: {script.asset_name} from {script.tag}.")
+            f"Selected Schedule script: {script.asset_name} from {script.tag}.")
 
     # ── auth + experiments ───────────────────────────────────────────────
     def _env(self):
@@ -606,8 +606,8 @@ class App(ttk.Frame):
             return "sign in to openJII first (API key)."
         if self.release is None:
             return "the firmware release is not available yet."
-        if self._selected_lua_script() is None:
-            return "the Lua release or script selection is not available yet."
+        if self._selected_schedule_script() is None:
+            return "the Schedule release or script selection is not available yet."
         if not self._current_experiment():
             return "select an experiment first."
         if not self.ssid_var.get().strip():
@@ -628,15 +628,15 @@ class App(ttk.Frame):
         self.settings.wifi_ssid = self.ssid_var.get().strip()
         self.settings.wifi_password = self.wifi_pass_var.get()
         self.settings.save()
-        lua_script = self._selected_lua_script()
-        assert lua_script is not None, "_session_ready must validate the Lua selection"
+        schedule_script = self._selected_schedule_script()
+        assert schedule_script is not None, "_session_ready must validate the Schedule selection"
         experiment = self._current_experiment()
         assert experiment is not None, "_session_ready must validate the experiment selection"
         return SessionContext(
             env=self._env(),
             client=self.client,
             release=self.release,
-            lua_script=lua_script,
+            schedule_script=schedule_script,
             experiment_id=experiment.id,
             timezone=self.local_tz,
             wifi_ssid=self.settings.wifi_ssid,
@@ -726,9 +726,9 @@ class App(ttk.Frame):
 
         config_ok = all(r.passed for r in results)
         if config_ok:
-            self._set_step("lua", "running")
-            results.append(procedure.install_lua_script(ctx, run, log=self.log))
-            self._set_step("lua", "ok")
+            self._set_step("schedule", "running")
+            results.append(procedure.install_schedule_script(ctx, run, log=self.log))
+            self._set_step("schedule", "ok")
 
         all_ok = config_ok and all(r.passed for r in results)
         self._set_step("verify", "ok" if all_ok else "fail")
@@ -751,7 +751,7 @@ class App(ttk.Frame):
             self.log("The board is still in a re-flashable state. Fix the "
                      "connection and click 'Retry flash'.")
             self._post(self.retry_flash_btn.configure, {"state": "normal"})
-        elif exc.step in ("provision", "lua", "verify"):
+        elif exc.step in ("provision", "schedule", "verify"):
             self._post(self.retry_prov_btn.configure, {"state": "normal"})
         self._post(messagebox.showerror, "On-boarding failed", str(exc))
 

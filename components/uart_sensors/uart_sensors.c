@@ -256,7 +256,7 @@ static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
  * via the ROM bootloader. The reset line is SHARED, so a download-entry briefly
  * resets all four AMBITs; only the target (its boot strap held low) enters
  * download mode — the others reboot into their application. Only call inside the
- * quiesced flash context (Lua stopped), where no other channel transaction is
+ * quiesced flash context (measurement stopped), where no other channel transaction is
  * in flight. */
 
 /* Configure CHIP_EN (shared) + the four per-channel boot straps as open-drain,

@@ -1,0 +1,48 @@
+schema: jii.ambyte-schedule/v1-draft
+id: urn:jii:schedule:legacy-1hz-spec
+version: 0.1.0-draft
+name: legacy-1hz-spec
+description: Legacy channel-0 spectra at 1 Hz by day, with a slow fallback at night.
+
+jobs:
+  fast:
+    # Six-field cron adds seconds before the conventional five fields. A
+    # regular seconds-first expression advances from a monotonic deadline.
+    schedule:
+      cron: "* * * * * *"
+    when:
+      window:
+        from: sunrise-1h
+        to: sunset+1h
+        unresolved: skip
+    overlap: skip
+    missed: skip
+    steps:
+      - uses: ambit/spectrum
+        with:
+          channels:
+            - 0
+
+  slow:
+    schedule:
+      cron: "*/10 * * * *"
+    when:
+      window:
+        from: sunset+1h
+        to: sunrise-1h
+        # If solar time cannot be resolved, retain the safe slow cadence.
+        unresolved: run
+    steps:
+      - uses: ambit/spectrum
+        with:
+          channels:
+            - 0
+
+  hourly_status:
+    schedule:
+      cron: "0 * * * *"
+    steps:
+      - uses: device/status-report
+        with:
+          tags:
+            script: legacy_1Hz_spec

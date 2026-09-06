@@ -1,0 +1,3 @@
+#ifndef AMBYTE_HOST_STUB_NVS_FLASH_H
+#define AMBYTE_HOST_STUB_NVS_FLASH_H
+#endif
