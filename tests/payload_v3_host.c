@@ -371,10 +371,110 @@ static void print_device_fixture(void)
     assert(!payload_v3_build_device(output, sizeof output, &input, error, sizeof error));
 }
 
+/* A schedule `tag:` must be additive. Regression for the 2026-09 soak, where
+ * every dark-edge trace published protocol.name="edge" and lost "MPF". */
+static void print_tagged_trace_fixture(void)
+{
+    uint32_t temp[] = {2500, 2510};
+    uint32_t counts[] = {10, 11, 12, 13};
+    uint32_t timing[] = {1000, 2001000};
+    payload_v3_array_t arrays[] = {{0, 2, temp}, {1, 4, counts}, {7, 2, timing}};
+    payload_v3_segment_t segment = {2, 4, 2, 7, 1};
+    payload_v3_trace_input_t input = {
+        .measure_id = 7,
+        .channel = "uart_0",
+        .device = "AmbitV003",
+        .sensor_id = "10:91:A8:4F:4F:C0",
+        .start_utc_ms = 100,
+        .end_utc_ms = 2200,
+        .protocol_name = "MPF",
+        .protocol_tag = "edge",
+        .protocol_cmd = "arrun edge",
+        .segments = &segment,
+        .segment_count = 1,
+        .calibration_present = true,
+        .cal_version = 0x439a0ac8,
+        .tick_factor = 0.854,
+        .arrays = arrays,
+        .array_count = 3,
+    };
+    char output[4096], metadata[1536], error[128];
+    assert(payload_v3_build_trace(output, sizeof output, &input, error, sizeof error));
+    printf("TRACE_TAGGED=%s\n", output);
+
+    /* The v2 fallback route must keep both axes too. */
+    input.calibration_present = false;
+    assert(payload_v3_build_trace_lossless(output, sizeof output, metadata,
+                                           sizeof metadata, &input, error,
+                                           sizeof error) == PAYLOAD_TRACE_ROUTE_V2);
+    printf("TRACE_TAGGED_V2_METADATA=%s\n", metadata);
+    input.calibration_present = true;
+
+    /* No tag: no member, and the protocol is unaffected. */
+    input.protocol_tag = NULL;
+    assert(payload_v3_build_trace(output, sizeof output, &input, error, sizeof error));
+    assert(strstr(output, "\"tag\":\"edge\"") == NULL);
+    assert(strstr(output, "\"name\":\"MPF\"") != NULL);
+}
+
+static void print_spectrum_fixture(void)
+{
+    payload_v3_spectrum_input_t input = {
+        .measure_id = 65928,
+        .channel = "uart_0",
+        .device = "AD81",
+        .sensor_id = "3C:DC:75:0D:FD:20",
+        .start_utc_ms = 1788718542591LL,
+        .end_utc_ms = 1788718542944LL,
+        .calibration_present = true,
+        .cal_version = 0xc96cda1bU,
+        .par = 12.75,
+        .spectrum = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+    };
+    char output[512], error[128];
+    assert(payload_v3_build_spectrum(output, sizeof output, &input, error, sizeof error));
+    printf("SPECTRUM=%s\n", output);
+    assert(payload_v3_is_canonical_object(output));
+
+    /* Unread calibration is reported as null, never as CRC 00000000. */
+    input.calibration_present = false;
+    assert(payload_v3_build_spectrum(output, sizeof output, &input, error, sizeof error));
+    assert(strstr(output, "\"cal_version\":null") != NULL);
+    input.calibration_present = true;
+
+    /* Absent identity omits the join key rather than emitting an empty one. */
+    input.sensor_id = NULL;
+    assert(payload_v3_build_spectrum(output, sizeof output, &input, error, sizeof error));
+    assert(strstr(output, "sensor_id") == NULL);
+    input.sensor_id = "3C:DC:75:0D:FD:20";
+
+    input.par = NAN;
+    assert(!payload_v3_build_spectrum(output, sizeof output, &input, error, sizeof error));
+    input.par = 12.75;
+    /* A truncated object must fail rather than publish partial JSON. */
+    assert(!payload_v3_build_spectrum(output, 32, &input, error, sizeof error));
+
+    /* Worst case MUST fit the cap every producer sizes its buffer with. The
+     * first bench build used a 320 B literal and overflowed on real hardware,
+     * so this asserts against PAYLOAD_V3_SPECTRUM_CAP itself, not a roomy
+     * local. Longest ambit_name (19 chars), full-width bins, widest PAR. */
+    char exact[PAYLOAD_V3_SPECTRUM_CAP];
+    input.device = "AmbitVeryLongName01";
+    input.par = -1234.56;
+    input.measure_id = 9223372036854775807LL;
+    input.start_utc_ms = 1788718542591LL;
+    input.end_utc_ms = 1788718542944LL;
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) input.spectrum[i] = 65535U;
+    assert(payload_v3_build_spectrum(exact, sizeof exact, &input, error, sizeof error));
+    printf("SPECTRUM_MAX_LEN=%u\n", (unsigned)strlen(exact));
+}
+
 int main(void)
 {
     print_trace_fixtures();
     test_lossless_trace_routes();
+    print_tagged_trace_fixture();
+    print_spectrum_fixture();
     print_telemetry_fixture();
     print_device_fixture();
     return 0;

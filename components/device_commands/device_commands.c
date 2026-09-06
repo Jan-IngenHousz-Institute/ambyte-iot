@@ -1744,22 +1744,30 @@ cmd_result_t cmd_store_status_event(void)
     }
 
     char channels[PAYLOAD_V3_MAX_ATTACHED][12];
+    /* One info record PER SLOT, not one reused local. payload_v3_attached_sensor_t
+     * stores borrowed pointers into these structs and the builder only reads them
+     * after the loop, so a single loop-scoped `ai` made every slot alias the last
+     * channel's strings — the 2026-09 soak showed both UARTs reporting one
+     * sensor_id, differing only in the by-value cal_version. ~76 B/slot on the
+     * 7680 B watchdog stack. */
+    ambit_device_info_t infos[PAYLOAD_V3_MAX_ATTACHED];
     for (uint8_t ch = 0; ch < PAYLOAD_V3_MAX_ATTACHED; ++ch) {
-        ambit_device_info_t ai;
-        if (!cmd_ambit_device_info_cached(ch, &ai)) continue;
-        const size_t slot = input.attached_count++;
+        const size_t slot = input.attached_count;
+        ambit_device_info_t *ai = &infos[slot];
+        if (!cmd_ambit_device_info_cached(ch, ai)) continue;
+        input.attached_count++;
         snprintf(channels[slot], sizeof channels[slot], "uart_%u", (unsigned)ch);
         input.attached[slot] = (payload_v3_attached_sensor_t) {
             .present = true,
             .channel = channels[slot],
-            .sensor_id = ai.device_id,
-            .firmware = ai.fw_version,
-            .hardware_revision = ai.hw_rev,
-            .name = ai.ambit_name,
+            .sensor_id = ai->device_id,
+            .firmware = ai->fw_version,
+            .hardware_revision = ai->hw_rev,
+            .name = ai->ambit_name,
             /* Calibration is optional in telemetry cache references. A failed
              * calibration fetch must not masquerade as CRC 00000000. */
-            .cal_version_present = ai.tick_factor > 0.0f,
-            .cal_version = ai.cal_version,
+            .cal_version_present = ai->tick_factor > 0.0f,
+            .cal_version = ai->cal_version,
         };
     }
 

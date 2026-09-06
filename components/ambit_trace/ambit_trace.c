@@ -322,6 +322,8 @@ esp_err_t ambit_trace_decode_store(uart_sensor_response_t *resp, uint8_t ch,
                     ? protocol_ref->protocol : NULL,
                 .protocol_id = protocol_ref != NULL && protocol_ref->protocol_id[0]
                     ? protocol_ref->protocol_id : NULL,
+                .protocol_tag = protocol_ref != NULL && protocol_ref->tag[0]
+                    ? protocol_ref->tag : NULL,
                 .protocol_cmd = cmd,
                 .segments = segments,
                 .segment_count = segment_count,

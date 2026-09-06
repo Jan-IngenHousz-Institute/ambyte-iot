@@ -13,6 +13,15 @@ extern "C" {
 #define PAYLOAD_V3_MAX_ARRAYS   12U
 #define PAYLOAD_V3_MAX_ATTACHED  4U
 #define PAYLOAD_V3_TICK_FACTOR_MAX 100.0
+/* AMBIT cmd 35 returns a fixed ten-bin spectrum plus a PAR scalar. */
+#define PAYLOAD_V3_SPECTRUM_BINS 10U
+/* Every producer MUST size its output buffer with this, not a hand-guessed
+ * literal: a 320 B guess overflowed on the bench with a real 20-char ambit_name
+ * and full-width bin counts, and the action correctly failed the store rather
+ * than publishing a truncated object. Worst case ≈ 416 B — fixed keys ~210,
+ * escaped device name ≤ 40, sensor_id 32, two epoch-ms stamps ~30, ten bins at
+ * "65535," = 60 — so 512 leaves headroom without another heap tenant. */
+#define PAYLOAD_V3_SPECTRUM_CAP 512U
 
 typedef struct {
     uint8_t type;
@@ -37,6 +46,10 @@ typedef struct {
     int64_t end_utc_ms;
     const char *protocol_name;
     const char *protocol_id;
+    /* Schedule-supplied label for WHY this run fired (e.g. "edge"). Orthogonal
+     * to protocol_name — it is emitted as its own member so a consumer can still
+     * filter on the protocol. Optional; NULL/"" omits it. */
+    const char *protocol_tag;
     const char *protocol_cmd;
     const payload_v3_segment_t *segments;
     size_t segment_count;
@@ -149,6 +162,21 @@ typedef struct {
     double tick_factor;
 } payload_v3_device_input_t;
 
+/* Point read from AMBIT cmd 35 (`get_par`). Small enough to carry its samples
+ * by value, unlike a trace's borrowed arrays. */
+typedef struct {
+    int64_t measure_id;
+    const char *channel;
+    const char *device;
+    const char *sensor_id;
+    int64_t start_utc_ms;
+    int64_t end_utc_ms;
+    bool calibration_present;
+    uint32_t cal_version;
+    double par;
+    uint16_t spectrum[PAYLOAD_V3_SPECTRUM_BINS];
+} payload_v3_spectrum_input_t;
+
 typedef enum {
     PAYLOAD_TRACE_ROUTE_ERROR = 0,
     PAYLOAD_TRACE_ROUTE_V3,
@@ -167,6 +195,9 @@ bool payload_v3_build_trace(char *out, size_t cap,
 payload_trace_route_t payload_v3_build_trace_lossless(
     char *out, size_t cap, char *metadata, size_t metadata_cap,
     const payload_v3_trace_input_t *input, char *error, size_t error_cap);
+bool payload_v3_build_spectrum(char *out, size_t cap,
+                               const payload_v3_spectrum_input_t *input,
+                               char *error, size_t error_cap);
 bool payload_v3_build_telemetry(char *out, size_t cap,
                                 const payload_v3_telemetry_input_t *input,
                                 char *error, size_t error_cap);

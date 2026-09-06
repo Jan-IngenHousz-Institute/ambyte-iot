@@ -189,6 +189,47 @@ class PayloadV3Test(unittest.TestCase):
         self.assertEqual(ambient["t0"], 2.989)
         self.assertEqual(ambient["dt"], 6.832)
 
+    def test_schedule_tag_is_additive_and_never_replaces_the_protocol(self) -> None:
+        # 2026-09 soak: dark-edge traces published protocol.name="edge", so the
+        # MPF protocol was unrecoverable and a protocol filter missed them.
+        tagged = self.records["TRACE_TAGGED"]
+        self.assertEqual(tagged["protocol"]["name"], "MPF")
+        self.assertEqual(tagged["protocol"]["tag"], "edge")
+        self.assertEqual(tagged["tag"], "MEASUREMENT")  # envelope tag is separate
+        v2_metadata = self.records["TRACE_TAGGED_V2_METADATA"]
+        self.assertEqual(v2_metadata["protocol"], "MPF")
+        self.assertEqual(v2_metadata["protocol_tag"], "edge")
+
+    def test_spectrum_is_a_schema_tagged_family_not_the_legacy_v2_envelope(self) -> None:
+        spectrum = self.records["SPECTRUM"]
+        self.assertEqual(spectrum["schema"], "ambit.spectrum/1")
+        self.assertEqual(spectrum["tag"], "MEASUREMENT")
+        self.assertEqual(spectrum["channel"], "uart_0")
+        self.assertEqual(spectrum["sensor_id"], "3C:DC:75:0D:FD:20")
+        self.assertEqual(spectrum["cal_version"], "c96cda1b")
+        self.assertEqual(
+            spectrum["observations"]["par"], {"u": "umol.m-2.s-1", "v": 12.75}
+        )
+        self.assertEqual(
+            spectrum["observations"]["spectrum"],
+            {"u": "count", "v": list(range(10))},
+        )
+        # None of the legacy v2 spelling survives.
+        raw = self.raw_records["SPECTRUM"]
+        for legacy in ('"v":2', "cmd_raw", "startTicks_UTC", '"spec"'):
+            self.assertNotIn(legacy, raw)
+
+        # A 320 B production buffer overflowed on the bench, so the worst case
+        # must stay inside the cap that producers size against, with headroom.
+        header = (ROOT / "components/payload_codec/include/payload_v3.h").read_text()
+        cap = int(
+            header.split("#define PAYLOAD_V3_SPECTRUM_CAP", 1)[1].split("U", 1)[0].strip()
+        )
+        worst = int(self.raw_records["SPECTRUM_MAX_LEN"])
+        self.assertLess(worst, cap)
+        actions = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
+        self.assertIn("char payload[PAYLOAD_V3_SPECTRUM_CAP]", actions)
+
     def test_telemetry_is_one_grouped_object_and_empty_snapshot_is_stable(self) -> None:
         telemetry = self.records["TELEMETRY"]
         self.assertEqual(telemetry["schema"], "ambyte.telemetry/1")
@@ -281,6 +322,12 @@ class PayloadV3Test(unittest.TestCase):
         self.assertNotIn("ambit_info_fetch", heartbeat)
         self.assertIn("input.attached_count = 0", heartbeat)
         self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 2)
+        # attached_sensors borrows pointers into the info structs, so each slot
+        # needs its OWN record. One loop-scoped `ai` made every slot alias the
+        # last channel's strings (2026-09 soak: one sensor_id on both UARTs).
+        self.assertIn("ambit_device_info_t infos[PAYLOAD_V3_MAX_ATTACHED]", heartbeat)
+        self.assertNotIn("ambit_device_info_t ai;", heartbeat)
+        self.assertIn(".sensor_id = ai->device_id", heartbeat)
 
         trace_source = (ROOT / "components/ambit_trace/ambit_trace.c").read_text()
         trace_header = (ROOT / "components/ambit_trace/include/ambit_trace.h").read_text()
@@ -304,6 +351,14 @@ class PayloadV3Test(unittest.TestCase):
             sync_run.index("snprintf(opts.protocol_ref.protocol"),
             sync_run.index("ambit_trace_trigger(ch"),
         )
+        # The protocol field carries the protocol; the tag rides its own slot.
+        self.assertIn('sizeof(opts.protocol_ref.protocol),\n             "%s", pname)', sync_run)
+        self.assertIn("snprintf(opts.protocol_ref.tag", sync_run)
+        self.assertIn("protocol_tag = protocol_ref != NULL && protocol_ref->tag[0]", trace_source)
+        # ambit/spectrum publishes the schema-tagged family, not the v2 envelope.
+        spectrum_run = runner_source.split("static int64_t store_spectrum", 1)[1]
+        self.assertIn("payload_v3_build_spectrum", spectrum_run)
+        self.assertNotIn('"{\\"spec\\":[', runner_source)
         self.assertIn("ambit_trace_trigger", sync_run)
         self.assertIn("ambit_trace_fetch", sync_run)
         self.assertIn(".type        = proto->segments[i].type", sync_run)

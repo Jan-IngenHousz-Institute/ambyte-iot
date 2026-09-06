@@ -40,9 +40,17 @@ typedef struct {
     uint8_t subsampling; /* 0 none, 1 every pulse, 2 every 8 averaged. */
 } ambit_trace_segment_t;
 
+/* A schedule's optional `tag:` is a SECOND axis, not a rename. Until fw 2.0.0 it
+ * was written straight into `protocol`, so every dark-edge trace published
+ * protocol.name="edge" and the MPF protocol became unrecoverable from the
+ * payload (2026-09 soak). Tags are short labels, so this does not need the
+ * 256 B protocol caps. */
+#define AMBIT_PROTOCOL_TAG_CAP 32U
+
 typedef struct {
     char protocol[AMBIT_PROTOCOL_FIELD_CAP];
     char protocol_id[AMBIT_PROTOCOL_FIELD_CAP];
+    char tag[AMBIT_PROTOCOL_TAG_CAP];
 } ambit_protocol_ref_t;
 
 typedef struct {

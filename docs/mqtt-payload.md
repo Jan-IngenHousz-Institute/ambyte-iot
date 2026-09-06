@@ -82,6 +82,8 @@ consumers use (`device_id`, `measure_id`) as the event identity (§1).
                                         //   present only when the run was launched from
                                         //   a platform protocol. See the delivery note
                                         //   below: no Ambyte-side mechanism exists yet.
+    "tag": "edge",                      // schedule label for WHY this run fired;
+                                        //   OPTIONAL, additive to `name` (see note)
     "cmd": "arrun 1,0,2,0,0,59,0,1,0,1",// replayable device-vocabulary command
     "segments": [                       // decoded stimulus, one per arrun line
       { "pulses": 59, "freq": 1, "actinic": 0 }   // actinic = post-PAR→DAC byte
@@ -116,6 +118,15 @@ Notes:
 - Everything under `protocol` describes the **requested** stimulus. An
   interrupted run is not currently marked; consumers detect it by series
   lengths shorter than `segments` promise.
+- **`protocol.tag` is a second axis, never a rename of `protocol.name`.** A
+  schedule job sets it (the released `dark_edge` job uses `tag: edge`) to say
+  *why* a run fired, while `name` keeps saying *what* was run. Firmware ≤ 2.0.0
+  wrote the tag into `name`, so every dark-edge trace published
+  `protocol.name = "edge"` and its MPF protocol was unrecoverable from the
+  payload — a consumer filtering on `protocol.name = 'MPF'` silently missed
+  them. Consumers MUST filter protocol on `name` and treat `tag` as an
+  additional grouping key. On the v2 fallback route the pair spells
+  `metadata.protocol` / `metadata.protocol_tag`.
 - **`protocol.id` delivery is future work on the Ambyte path.** On the lean
   ingest topic (no `{protocolId}` segment) this field is the pipeline's only
   protocol attribution — but today **no mechanism delivers a protocol id to
@@ -135,7 +146,7 @@ The measurement object is produced twice; fields split by who can know them:
 | class | fields | Ambyte path | direct/app path |
 |---|---|---|---|
 | sensor-known (identical from both producers when available, given §5's encoding rules) | `schema`, `device`, `sensor_id`, `series`, `protocol.segments`, `protocol.cal_version`, `protocol.tick_factor`, `time.duration_ms` | `sensor_id` is REQUIRED from the cached cmd-33 identity; series decoded from the binary FSM arrays; `segments` from the sent run bytes; `cal_version`/`tick_factor` from the cal-struct read | emits `sensor_id` when the sensor/host exposes it; omission is allowed only for a legacy/direct host that genuinely cannot obtain it |
-| transport-filled (the sensor has no wall clock or ID counter) | `time.start_utc`, `time.end_utc`, `measure_id`, `channel`, `tag`, `protocol.name`, `protocol.id`, `protocol.cmd`, `protocol.gains`, `protocol.currents` | Ambyte clock, event log, schedule metadata | host app (phone/browser) clock and protocol context |
+| transport-filled (the sensor has no wall clock or ID counter) | `time.start_utc`, `time.end_utc`, `measure_id`, `channel`, `tag`, `protocol.name`, `protocol.id`, `protocol.tag`, `protocol.cmd`, `protocol.gains`, `protocol.currents` | Ambyte clock, event log, schedule metadata | host app (phone/browser) clock and protocol context |
 
 `measure_id` and `channel` are therefore **optional**: a host without an event
 log omits `measure_id` (the pipeline's row hash covers identity) and a host
@@ -305,9 +316,46 @@ require idx-8 firmware.
   every raw array, uses `cal_version:null` when unavailable, and includes
   `metadata.sensor_id` whenever identity is known. It has no `schema` key and
   never mixes v2/v3 fields.
-- spectrum, leaf-temperature, and generic `db/store-event` schedule actions
-  families remain permanently v2 unless separately migrated. T5 dual-read and
-  the v2 compat view are therefore permanent, not a backlog-drain window.
+- The spectrum action migrated to `ambit.spectrum/1` (§8a). Leaf-temperature
+  and the generic `db/store-event` schedule action remain permanently v2 unless
+  separately migrated. Dual-read and the v2 compat view are therefore
+  permanent, not a backlog-drain window.
+
+## 8a. Spectrum object (normative, Ambyte only)
+
+The `ambit/spectrum` schedule action reads AMBIT cmd 35 (`get_par`): a
+ten-bin spectrum plus a PAR scalar. It has no arrays and no stimulus, so it is
+its own small family rather than a degenerate trace.
+
+```jsonc
+{
+  "schema": "ambit.spectrum/1",
+  "measure_id": 65928,
+  "channel": "uart_0",
+  "device": "AD81",                     // sensor self-identification (ambit_name)
+  "sensor_id": "3C:DC:75:0D:FD:20",     // OPTIONAL: omitted when identity is uncached
+  "tag": "MEASUREMENT",
+  "time": { "start_utc": 1788718542591, "end_utc": 1788718542944 },
+  "cal_version": "c96cda1b",            // null when calibration is unread
+  "observations": {
+    "par":      { "u": "umol.m-2.s-1", "v": 0.00 },
+    "spectrum": { "u": "count", "v": [0,0,0,0,0,0,0,0,0,0] }
+  }
+}
+```
+
+Notes:
+
+- The `{u, v}` observation shape matches `ambyte.telemetry/1`, not the trace
+  `series` shape: these are point reads, not time series, so there is no
+  `t0`/`dt`/`t`.
+- `cal_version` follows the trace rule — `null` when calibration was never
+  read, never a fabricated CRC of `00000000`.
+- Until fw 2.0.0 this action emitted the **legacy v2 envelope**
+  (`{"v":2,…,"cmd_raw":"get_par","data":{"spec":[…],"par":…}}`), so one
+  schedule shipped two payload generations at once. Rows stored before the
+  migration keep that shape and are read through the v2 compat view; the
+  `cmd_raw` column still records `get_par` for replay.
 
 ## 9. Ambyte telemetry object (normative, Ambyte only)
 

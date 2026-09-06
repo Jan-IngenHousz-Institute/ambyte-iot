@@ -158,11 +158,14 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
          * it fails every firing — route it through the throttled path. */
         return act_fail(ctx, "unknown protocol '%s'", pname ? pname : "?");
     }
-    /* tag is what lands in protocol_ref.protocol (the v3 metadata.protocol
-     * column the Databricks filters match on); default = protocol name. */
+    /* tag labels WHY the job fired ("edge"); it rides alongside the protocol
+     * name rather than replacing it. Writing it into protocol_ref.protocol —
+     * which fw ≤ 2.0.0 did — made protocol.name="edge" and lost "MPF" entirely,
+     * so a filter on the protocol silently missed every tagged run. `label` is
+     * console-only, where the tag is the more useful of the two. */
     const char *tag = (e_tag && e_tag->type == SCHED_VAL_STR)
                           ? sched_pool_str(prog, e_tag->u.str_off) : NULL;
-    if (tag == NULL) tag = pname;
+    const char *label = tag != NULL ? tag : pname;
     const bool hold_window = e_hold != NULL && e_hold->u.i != 0;
     const int64_t margin_ms = e_margin ? e_margin->u.i : 15000;
 
@@ -192,7 +195,10 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         .protocol_ref    = { { 0 } },
     };
     snprintf(opts.protocol_ref.protocol, sizeof(opts.protocol_ref.protocol),
-             "%s", tag);
+             "%s", pname);
+    if (tag != NULL) {
+        snprintf(opts.protocol_ref.tag, sizeof(opts.protocol_ref.tag), "%s", tag);
+    }
 
     int pending_count = 0;
     int64_t t0[UART_SENSOR_NUM_CHANNELS] = { 0 };
@@ -228,7 +234,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                                                     TRACE_FETCH_TIMEOUT_MS, &res);
                 if (fr.status == ESP_OK) {
                     ESP_LOGI(TAG, "%s ch%u: %u points, %.1fC, stored %lld",
-                             tag, ch, (unsigned)res.points, res.leaf_temp,
+                             label, ch, (unsigned)res.points, res.leaf_temp,
                              (long long)res.measure_id);
                     fetched++;
                 } else {
@@ -285,6 +291,51 @@ static int64_t store_small(uint8_t ch, const char *cmd_raw, const char *payload,
     return ambit_store_small(ch, dev, cmd_raw, meta, start_ms, end_ms, payload);
 }
 
+/* Spectra are on the schema-tagged v3 family, so their provenance lives inside
+ * the payload and the v2 metadata splice above does not apply. cmd_raw is still
+ * stored for replay diagnostics; the publisher routes on the schema prefix. */
+static int64_t store_spectrum(uint8_t ch, const uint16_t *spec, float par,
+                              int64_t start_ms, int64_t end_ms)
+{
+    ambit_device_info_t info;
+    const char *dev = ambit_device_name(ch, &info);
+    char chan[12];
+    snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+    int64_t mid = 0;
+    if (cmd_next_measure_id(&mid).status != ESP_OK) return -1;
+
+    payload_v3_spectrum_input_t in = {
+        .measure_id          = mid,
+        .channel             = chan,
+        .device              = dev,
+        .sensor_id           = info.valid ? info.device_id : NULL,
+        .start_utc_ms        = start_ms,
+        .end_utc_ms          = end_ms,
+        .calibration_present = info.valid,
+        .cal_version         = info.cal_version,
+        .par                 = (double)par,
+    };
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) in.spectrum[i] = spec[i];
+
+    char payload[PAYLOAD_V3_SPECTRUM_CAP];
+    char err[96];
+    if (!payload_v3_build_spectrum(payload, sizeof payload, &in, err, sizeof err)) {
+        ESP_LOGE(TAG, "spectrum payload build failed: %s", err);
+        return -1;
+    }
+    measurement_event_desc_t d = {
+        .measure_id = mid,
+        .channel    = chan,
+        .device     = dev,
+        .tag        = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw    = "get_par",
+        .start_ms   = start_ms,
+        .end_ms     = end_ms,
+        .payload_json = payload,
+    };
+    return cmd_store_event(&d).status == ESP_OK ? mid : -1;
+}
+
 static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
                                     const sched_program_t *prog)
 {
@@ -306,12 +357,7 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
             (void)act_fail(ctx, "spectra ch%u: read failed: %s", ch, r.message);
             continue;
         }
-        char payload[160];
-        snprintf(payload, sizeof payload,
-                 "{\"spec\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"par\":%.2f}",
-                 spec[0], spec[1], spec[2], spec[3], spec[4],
-                 spec[5], spec[6], spec[7], spec[8], spec[9], (double)par);
-        int64_t mid = store_small(ch, "get_par", payload, start_ms, end_ms);
+        int64_t mid = store_spectrum(ch, spec, par, start_ms, end_ms);
         /* A missing stored id is a failure, not a warning — a measurement
          * that did not persist did not happen. */
         if (mid < 0) {
