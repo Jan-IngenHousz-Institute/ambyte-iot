@@ -1418,6 +1418,7 @@ void app_main(void)
         .last_wd_reboot_reason  = sync_runner_get_last_wd_reboot_reason,
         .watchdog_armed         = sync_runner_watchdog_armed,
         .publish_gzip_enabled   = device_config_publish_gzip_enabled,
+        .schedule_provenance    = sched_runner_provenance_port,
     };
     device_commands_init(&cmd_cfg);
     if (persistence_available) {

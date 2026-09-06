@@ -44,6 +44,13 @@ extern "C" {
  * blow the static budget: 256 × 16 B = 4 KiB. Shipped schedules use < 40. */
 #define SCHED_SPEC_MAX_ENTRIES    256
 #define SCHED_SPEC_STRING_POOL    4096 /* names, tags, messages; shipped use < 400 B */
+/* Workbook macro cells stamped into the header at install time (the
+ * workbook→device→macro loop: the envelope publishes this list verbatim and
+ * the platform keys macro execution on it). 8 entries × (36-char uuid +
+ * ≤47-char name + ≤47-char filename + NULs) ≤ ~1.1 KiB of string pool —
+ * a quarter of the pool in the worst case, nothing for shipped schedules,
+ * which declare none. */
+#define SCHED_SPEC_MAX_MACROS     8
 
 /* YAML subset limits (plan "The YAML subset"): the file lives on littlefs and
  * is parsed in a transient heap arena on a 512 KiB SRAM part, so the arena
@@ -214,6 +221,15 @@ typedef struct {
     sched_segment_t segments[SCHED_SPEC_MAX_SEGMENTS];
 } sched_protocol_t;
 
+/* One workbook macro reference (header `macros:` entry): the platform's join
+ * key (id, a uuid) plus the human/tooling strings. Pool offsets, like every
+ * other string in the program, so the static program stays relocation-free. */
+typedef struct {
+    uint16_t id_off;
+    uint16_t name_off;
+    uint16_t filename_off;
+} sched_macro_t;
+
 /* Cron bitmasks. Five fields mean minute/hour/dom/month/dow; a sixth field is
  * accepted before them for second-level schedules. */
 typedef struct {
@@ -321,10 +337,13 @@ typedef struct sched_program {
     uint16_t workbook_version_id_off; /* openJII workbook uuid or NONE */
     uint16_t name_off;
     uint16_t description_off;
+    uint8_t  macro_count;             /* entries in macros[] (≤ SCHED_SPEC_MAX_MACROS) */
+    uint8_t  _pad;
     uint8_t  protocol_count;
     uint8_t  job_count;
     uint16_t entry_count;
     uint16_t pool_used;
+    sched_macro_t    macros[SCHED_SPEC_MAX_MACROS];
     sched_protocol_t protocols[SCHED_SPEC_MAX_PROTOCOLS];
     sched_job_t      jobs[SCHED_SPEC_MAX_JOBS];
     sched_entry_t    entries[SCHED_SPEC_MAX_ENTRIES];

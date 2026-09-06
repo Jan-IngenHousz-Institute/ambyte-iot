@@ -101,6 +101,11 @@
 
 /* ── lifecycle state (guarded by s_state_mux) ──────────────────────────── */
 
+/* The envelope provenance port (domain) and the compiler cap must agree, or
+ * a fully-stamped header would silently lose macros on the wire. */
+_Static_assert(SCHEDULE_PROVENANCE_MAX_MACROS == SCHED_SPEC_MAX_MACROS,
+               "envelope provenance port must hold every compiled macro");
+
 /* Spinlock critical sections are never held across a blocking call — only
  * state/flag reads+writes and short struct copies. The one exception is each
  * first xSemaphoreCreateBinaryStatic: it only initializes caller-owned
@@ -841,6 +846,19 @@ esp_err_t sched_runner_header(sched_header_t *out)
         snprintf(out->version, sizeof(out->version), "%s", ver ? ver : "-");
         snprintf(out->workbook, sizeof(out->workbook), "%s", wb ? wb : "-");
         snprintf(out->name, sizeof(out->name), "%s", name ? name : "-");
+        out->has_workbook = wb != NULL;
+        /* Bounded by SCHED_SPEC_MAX_MACROS (8 × ~140 B): s_state_mux is a
+         * spinlock, so the whole snapshot copy must stay small — the fixed
+         * field caps in sched_header_t are what guarantee that. */
+        out->macro_count = s_prog.macro_count;
+        for (int i = 0; i < s_prog.macro_count; i++) {
+            const char *mid  = sched_pool_str(&s_prog, s_prog.macros[i].id_off);
+            const char *mnam = sched_pool_str(&s_prog, s_prog.macros[i].name_off);
+            const char *mfn  = sched_pool_str(&s_prog, s_prog.macros[i].filename_off);
+            snprintf(out->macros[i].id, sizeof(out->macros[i].id), "%s", mid ? mid : "");
+            snprintf(out->macros[i].name, sizeof(out->macros[i].name), "%s", mnam ? mnam : "");
+            snprintf(out->macros[i].filename, sizeof(out->macros[i].filename), "%s", mfn ? mfn : "");
+        }
     }
     taskEXIT_CRITICAL(&s_state_mux);
     return ret;
@@ -852,6 +870,33 @@ int sched_runner_job_count(void)
     int n = s_prog_valid ? s_prog.job_count : 0;
     taskEXIT_CRITICAL(&s_state_mux);
     return n;
+}
+
+/* Envelope provenance adapter (schedule_provenance_port.h). device_commands
+ * splices workbook provenance into every publish envelope but cannot include
+ * this component (sched_runner already REQUIRES device_commands — a direct
+ * call would close the cycle), so app_main wires this translation instead.
+ * Presence rides the snapshot's explicit has_workbook / macro_count — never
+ * the CLI's "-" sentinel string. */
+esp_err_t sched_runner_provenance_port(schedule_provenance_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_STATE;
+    sched_header_t hdr;
+    esp_err_t ret = sched_runner_header(&hdr);
+    if (ret != ESP_OK) return ret;
+    memset(out, 0, sizeof(*out));
+    if (hdr.has_workbook) {
+        snprintf(out->workbook_version_id, sizeof(out->workbook_version_id),
+                 "%s", hdr.workbook);
+    }
+    out->macro_count = hdr.macro_count;
+    for (int i = 0; i < hdr.macro_count && i < SCHEDULE_PROVENANCE_MAX_MACROS; i++) {
+        snprintf(out->macros[i].id, sizeof(out->macros[i].id), "%s", hdr.macros[i].id);
+        snprintf(out->macros[i].name, sizeof(out->macros[i].name), "%s", hdr.macros[i].name);
+        snprintf(out->macros[i].filename, sizeof(out->macros[i].filename), "%s",
+                 hdr.macros[i].filename);
+    }
+    return ESP_OK;
 }
 
 esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out)

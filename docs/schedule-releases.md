@@ -31,7 +31,22 @@ version: 1.0.0                    # optional provenance
 workbookVersionId: 01234567-89ab-cdef-0123-456789abcdef  # optional
 name: example                     # optional display name
 description: A readable note.     # optional
+macros:                           # optional; ≤ 8 entries
+  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040  # uuid, required per entry
+    name: ambyte-trace            # required; ≤ 47 chars, [A-Za-z0-9_.:-] only
+    filename: macro_8feac276a118  # required; ≤ 47 chars, [A-Za-z0-9_.:-] only
 ```
+
+`workbookVersionId` and `macros` are not authored by hand: whatever installs
+the schedule onto a device (the flash GUI or the fleet deploy tool) resolves
+the experiment's pinned workbook version and stamps them, so one generic YAML
+stays valid for every experiment. The firmware carries them as provenance and
+publishes them verbatim in every MQTT envelope (`workbook_version_id` and
+`macros`, see `docs/mqtt-payload.md` §2); the platform keys per-row macro
+execution on `macros[].id` + `workbook_version_id`. The character restriction
+exists because the envelope splices the strings without JSON escaping.
+`macros:` entries with unknown keys, non-string values, or a non-uuid `id`
+are compile errors, as is a ninth entry.
 
 Per-device latitude, longitude, timezone, deployment, and identity belong in
 NVS `device_config`; never fork a schedule per site for those values.

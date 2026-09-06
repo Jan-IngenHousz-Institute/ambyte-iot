@@ -99,6 +99,115 @@ static sched_entry_t *entry_add(ctx_t *c, const sched_node_t *n)
  * workbook integration is still settling the exact idiom) is a change here
  * and nowhere else. */
 
+/* name/filename fit the publish-envelope snapshot fields (sched_header_t's
+ * char[48]) — a longer string would silently truncate on the wire. */
+#define MACRO_FIELD_CAP 47
+
+/* 8-4-4-4-12 hex (either case). The platform keys macro execution per row on
+ * this id, so a mistyped id must fail at install/CI time, not at ingest. */
+static bool macro_id_is_uuid(const char *s)
+{
+    static const int k_groups[] = { 8, 4, 4, 4, 12 };
+    size_t pos = 0;
+    for (int g = 0; g < 5; g++) {
+        for (int i = 0; i < k_groups[g]; i++) {
+            char ch = s[pos++];
+            bool hex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                       (ch >= 'A' && ch <= 'F');
+            if (!hex) return false;
+        }
+        if (g < 4 && s[pos++] != '-') return false;
+    }
+    return s[pos] == '\0';
+}
+
+/* The publish envelope splices macro strings into the JSON verbatim — an
+ * escaping pass on every publish is not worth its code size when the set of
+ * legitimate characters is this small. Restricting the alphabet HERE, at
+ * compile time, is what makes the unescaped splice provably safe. */
+static bool macro_str_safe(const char *s)
+{
+    if (*s == '\0') return false;
+    for (; *s != '\0'; s++) {
+        char ch = *s;
+        bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                  (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' ||
+                  ch == ':' || ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* Optional top-level `macros:` block — the workbook macro cells the installer
+ * stamps into the header (see plan "workbook → device → macro → dashboard").
+ * The firmware carries the list as provenance and publishes it verbatim in
+ * the envelope; it never acts on it, like the other header keys. */
+static bool compile_macros(ctx_t *c, const sched_node_t *node)
+{
+    if (node->kind != SCHED_NODE_SEQ) {
+        cerr(c, node, "'macros' must be a block sequence of "
+             "{id, name, filename} mappings");
+        return false;
+    }
+    if (node->u.q.count > SCHED_SPEC_MAX_MACROS) {
+        cerr(c, node, "'macros' has %d entries; the cap is %d "
+             "(see SCHED_SPEC_MAX_MACROS)", node->u.q.count, SCHED_SPEC_MAX_MACROS);
+        return false;
+    }
+    for (int i = 0; i < node->u.q.count; i++) {
+        const sched_node_t *item = node->u.q.items[i];
+        if (item->kind != SCHED_NODE_MAP) {
+            cerr(c, item, "macro entry must be a mapping {id, name, filename}");
+            return false;
+        }
+        const sched_node_t *vals[3];
+        static const char *const k_keys[] = { "id", "name", "filename" };
+        for (int f = 0; f < 3; f++) vals[f] = map_get(item, k_keys[f]);
+        if (vals[0] == NULL || vals[1] == NULL || vals[2] == NULL) {
+            cerr(c, item, "macro entry requires id, name and filename");
+            return false;
+        }
+        for (int k = 0; k < item->u.m.count; k++) {
+            const char *key = item->u.m.pairs[k].key;
+            if (strcmp(key, "id") != 0 && strcmp(key, "name") != 0 &&
+                strcmp(key, "filename") != 0) {
+                cerr(c, item->u.m.pairs[k].value, "unknown macro key '%s'", key);
+                return false;
+            }
+        }
+        sched_macro_t *m = &c->prog->macros[c->prog->macro_count];
+        uint16_t *offs[3] = { &m->id_off, &m->name_off, &m->filename_off };
+        for (int f = 0; f < 3; f++) {
+            const sched_node_t *v = vals[f];
+            /* same string-scalar rule as the other header keys: every scalar
+             * keeps .str, so 123 / true / 30m must not compile */
+            if (v->kind != SCHED_NODE_SCALAR || v->scal_kind != SCHED_SCAL_STR) {
+                cerr(c, v, "macro '%s' must be a string", k_keys[f]);
+                return false;
+            }
+            const char *s = v->u.s.str;
+            if (f == 0 && !macro_id_is_uuid(s)) {
+                cerr(c, v, "macro 'id' must be a uuid (8-4-4-4-12 hex)");
+                return false;
+            }
+            if (f > 0 && strlen(s) > MACRO_FIELD_CAP) {
+                cerr(c, v, "macro '%s' is %d chars; the envelope snapshot caps "
+                     "it at %d", k_keys[f], (int)strlen(s), MACRO_FIELD_CAP);
+                return false;
+            }
+            if (!macro_str_safe(s)) {
+                cerr(c, v, "macro '%s' may only contain [A-Za-z0-9_.:-] "
+                     "(spliced into the publish envelope unescaped)", k_keys[f]);
+                return false;
+            }
+            *offs[f] = pool_add(c, v, s);
+            if (c->failed) return false;
+        }
+        c->prog->macro_count++;
+    }
+    return true;
+}
+
 static bool compile_header(ctx_t *c, const sched_node_t *root)
 {
     if (root->kind != SCHED_NODE_MAP) {
@@ -141,10 +250,14 @@ static bool compile_header(ctx_t *c, const sched_node_t *root)
         *offs[i] = pool_add(c, v, v->u.s.str);
         if (c->failed) return false;
     }
+    /* optional macro list (gathered here so the strict loop below can treat
+     * 'macros' as a known header key) */
+    const sched_node_t *macros = map_get(root, "macros");
+    if (macros != NULL && !compile_macros(c, macros)) return false;
     /* gather the two body keys; reject everything else (strict) */
     for (int i = 0; i < root->u.m.count; i++) {
         const char *key = root->u.m.pairs[i].key;
-        bool header_key = strcmp(key, "schema") == 0;
+        bool header_key = strcmp(key, "schema") == 0 || strcmp(key, "macros") == 0;
         for (size_t k = 0; k < sizeof(k_provenance) / sizeof(k_provenance[0]); k++) {
             header_key = header_key || strcmp(key, k_provenance[k].key) == 0;
         }
