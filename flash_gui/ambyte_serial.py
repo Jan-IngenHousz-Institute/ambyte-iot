@@ -47,6 +47,11 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
 _SD_RE = re.compile(r"SD card:\s*(mounted|absent)", re.IGNORECASE)
 _SCHEDULE_PUT_RE = re.compile(r"schedule put:\s*(\d+)\s*bytes")
+# `schedule status` prints the program header as
+# "  id=<id> version=<v> workbook=<wb> name=<name>" (CLI.c); workbook is "-"
+# when the schedule carries no workbookVersionId. Firmware predating the
+# workbook provenance prints no such line at all.
+_SCHEDULE_HDR_RE = re.compile(r"(?m)^\s*id=\S+ version=\S+ workbook=(\S+)")
 # NOT bounded by max_cmdline_length (512). The real limit is the USB-Serial-JTAG
 # driver's rx_buffer_size, which ESP-IDF fixes at 256 bytes in
 # USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT and which the REPL does not let us size
@@ -344,6 +349,20 @@ class AmbyteConsole:
             verified=match.group(5) == "true",
             running=match.group(6) == "true",
         )
+
+    def schedule_status_workbook(self, timeout: float = 10.0) -> str | None:
+        """The workbookVersionId the running schedule carries, from
+        `schedule status`. Returns "" when the header line reports "-"
+        (schedule has none) and None when the firmware predates the header
+        print entirely — callers must not fail a board for being old."""
+        reply = self.command("schedule status", timeout=timeout)
+        if FAILURE_MARK in reply:
+            raise ConsoleError(f"schedule status failed:\n{reply[-500:]}")
+        match = _SCHEDULE_HDR_RE.search(reply)
+        if match is None:
+            return None
+        value = match.group(1)
+        return "" if value == "-" else value
 
     def reboot(self) -> None:
         """Fire `reboot`; the port will drop and re-enumerate."""

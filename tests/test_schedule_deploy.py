@@ -202,6 +202,38 @@ class ManifestTest(unittest.TestCase):
             )
 
 
+class ExperimentFlagTest(unittest.TestCase):
+    """--experiment is deliberately REJECTED: fleet delivery publishes an
+    immutable release-asset URL the device downloads, and a workbook-stamped
+    YAML has no URL until an artifact host exists. The flag exists so the
+    answer is a clear message instead of silent drift between the device
+    (flash GUI) and fleet install paths."""
+
+    def test_experiment_flag_is_rejected_with_guidance_before_any_network(
+            self) -> None:
+        import io
+        import contextlib
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(schedule_deploy, "fetch_release") as fetch,
+            mock.patch.object(
+                schedule_deploy.fleet, "boto_session"
+            ) as boto,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = schedule_deploy.main(
+                ["--tag", TAG, "--experiment",
+                 "665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"]
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn("flash GUI", stderr.getvalue())
+        self.assertIn("artifact host", stderr.getvalue())
+        fetch.assert_not_called()
+        boto.assert_not_called()
+
+
 class TargetingTest(unittest.TestCase):
     def test_device_normalization_reuses_fleet_contract(self) -> None:
         devices = schedule_deploy.parse_devices(
