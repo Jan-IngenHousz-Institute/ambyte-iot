@@ -77,12 +77,27 @@ before this feature does, so nothing already in the field changes behaviour.
 `when:` is not hand-authored either: the flash GUI compiles it from the pinned
 workbook version's BRANCH cells, mapping each path whose `gotoCellId` is a
 macro cell into that macro's conditions (`flash_gui/openjii_client.py`
-`_compile_macro_routing`). Branch content the device cannot express (an
-unknown field, an ordering operator, conditions read off a cell other than
-the schedule command cell, or two paths targeting one macro) fails the
-install rather than misrouting rows. Firmware below
-`schedule_stamp.MACRO_WHEN_MIN_FW` gets the same macros stamped without
-`when:`. See `docs/mqtt-payload.md` §2.1 for the resulting wire shapes.
+`_compile_macro_routing`). Two rules decide what happens to a path:
+
+- **Skipped**, leaving the macro unrouted (= applies to every row): paths that
+  lead anywhere but a macro cell, paths with no `gotoCellId`, and paths whose
+  conditions read a cell other than the schedule command cell. That last one
+  is deliberate — one workbook legitimately drives the mobile flow and the
+  Ambyte at once, and a mobile branch into a shared macro cell must not fail
+  the Ambyte install. A conditionless path (the branch's default) likewise
+  compiles to "every row", which is why `defaultPathId` needs no special
+  handling.
+- **Fails the install**: content the device cannot express on a path it would
+  otherwise compile — an unknown field, an ordering operator, more than four
+  conditions, or two paths targeting one macro (the device holds a single
+  AND-ed set per macro, so web-side OR routing is not representable).
+
+Branch compilation runs only when the firmware about to be flashed is at or
+above `schedule_stamp.MACRO_WHEN_MIN_FW`. Below it — and for an unknown
+version, which fails closed the same way — the branches are not read at all
+and the same macros are stamped without `when:`, so a fleet that will never
+evaluate the routing cannot be blocked by a workbook it cannot express. See
+`docs/mqtt-payload.md` §2.1 for the resulting wire shapes.
 
 Per-device latitude, longitude, timezone, deployment, and identity belong in
 NVS `device_config`; never fork a schedule per site for those values.

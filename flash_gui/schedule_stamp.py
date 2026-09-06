@@ -63,8 +63,12 @@ SCHEMA_PREFIX = "jii.ambyte-schedule/"
 MACROS_HEADER_MIN_FW = "2.1.0"
 
 # First firmware release whose publisher evaluates the per-macro `when:`
-# routing block. PLACEHOLDER — confirm against the actual release that ships
-# the device-side `when:` support before relying on this gate.
+# routing block: the next minor after MACROS_HEADER_MIN_FW, because that is
+# what semantic-release derives from a `feat:` PR title. Confirm at release
+# time — semantic-release reads the MERGED title, so a `fix:` title (2.1.1) or
+# another feat landing first (2.3.0) moves the real version. Wrong-high strips
+# routing and the feature goes inert but safe; wrong-low stamps `when:` onto
+# firmware that rejects the key at boot and falls back to the embedded default.
 MACRO_WHEN_MIN_FW = "2.2.0"
 
 # The macro contract the stream-A device compiler enforces (verified against

@@ -51,6 +51,7 @@ from .config import (CACHE_DIR, DEVICE_FIRMWARE, DEVICE_ID, DEVICE_VERSION,
 from .littlefs_image import build_schedule_image
 from .nvs_builder import ProvisioningPlan, build_nvs_image
 from .openjii_client import DeviceIdentity, OpenJIIClient, WorkbookProgramming
+from .schedule_stamp import ScheduleStampError
 from . import release_fetch
 from .release_fetch import (ScheduleScriptRelease, ReleaseError,
                             ReleaseImages)
@@ -227,6 +228,17 @@ def schedule_source(ctx: SessionContext, log=print) -> ScheduleSource:
     fw_version = getattr(ctx.release, "version", "") or ""
     if schedule_stamp.firmware_supports_macros(fw_version):
         if schedule_stamp.firmware_supports_macro_when(fw_version):
+            # The routing in `programming` was compiled against a firmware
+            # version, and only when that version evaluates `when:`. Stamping
+            # a snapshot resolved for older/unknown firmware onto firmware
+            # that DOES evaluate it would publish every macro on every row
+            # while looking like the workbook declares no routing.
+            if not getattr(programming, "routing_compiled", False):
+                raise ScheduleStampError(
+                    "the workbook was resolved before the firmware release "
+                    f"was known, so branch routing was not compiled; firmware "
+                    f"{fw_version} evaluates when:. Re-select the experiment "
+                    "and start the procedure again.")
             macros = programming.macros
             log(f"Workbook programming: stamping workbookVersionId="
                 f"{programming.workbook_version_id} and {len(macros)} macro(s) "

@@ -91,8 +91,29 @@ MACRO_PAYLOAD = {"id": MACRO_ID, "name": "ambyte-trace",
                  "filename": "macro_8feac276a118", "language": "python"}
 
 
-def _branch_cell(paths, cell_id="cell-3"):
+def _branch_cell(paths, cell_id="cell-3", default_path_id=None):
+    """A schema-conformant zBranchCell.
+
+    `paths` sits at the CELL top level with no `payload` wrapper, unlike
+    zCommandCell/zMacroCell. Getting this fixture wrong is what let a client
+    that dropped every real branch cell ship green, so it is deliberately
+    shaped after the API schema rather than after the client's convenience.
+    """
+    cell = {"id": cell_id, "type": "branch", "paths": paths}
+    if default_path_id is not None:
+        cell["defaultPathId"] = default_path_id
+    return cell
+
+
+def _wrapped_branch_cell(paths, cell_id="cell-3"):
+    """The tolerated payload-wrapped alias, which the API does not emit."""
     return {"id": cell_id, "type": "branch", "payload": {"paths": paths}}
+
+
+def _path(conditions, goto=MACRO_CELL_ID, path_id="path-1"):
+    """A schema-conformant zBranchPath (id/label/color are real fields)."""
+    return {"id": path_id, "label": "to macro", "color": "#00aaff",
+            "conditions": conditions, "gotoCellId": goto}
 
 
 def _condition(field="schema", operator="eq", value="ambit.trace/3",
@@ -202,17 +223,36 @@ def test_a_macro_without_filename_is_an_error_not_a_silent_drop():
 
 
 # ── branch cells → per-macro when: routing ───────────────────────────────────
+# Routing compiles only for firmware that evaluates it, so every test here
+# resolves against a version at or above the gate.
+WHEN_FW = schedule_stamp.MACRO_WHEN_MIN_FW
+PRE_WHEN_FW = schedule_stamp.MACROS_HEADER_MIN_FW
+
+
 def test_branch_path_compiles_to_a_when_block():
+    # The API shape: `paths` at the branch cell's top level, no payload wrap.
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition()],
-                       "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path([_condition()])], default_path_id="path-1"),
     ])
-    prog = client.resolve_programming(EXPERIMENT_ID)
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+    assert prog.routing_compiled
     assert prog.macros == (WorkbookMacro(
         id=MACRO_ID, name="ambyte-trace", filename="macro_8feac276a118",
         when=(MacroCondition(field="schema", op="eq", value="ambit.trace/3"),)),)
+
+
+def test_payload_wrapped_branch_cell_is_tolerated():
+    # Not what the API emits, but a hand-built or older cell still resolves.
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _wrapped_branch_cell([_path([_condition()])]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+    assert prog.macros[0].when == (
+        MacroCondition(field="schema", op="eq", value="ambit.trace/3"),)
 
 
 def test_branch_conditions_are_anded_in_order_including_dotted_fields():
@@ -223,9 +263,9 @@ def test_branch_conditions_are_anded_in_order_including_dotted_fields():
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": conditions, "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path(conditions)]),
     ])
-    prog = client.resolve_programming(EXPERIMENT_ID)
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
     assert prog.macros[0].when == (
         MacroCondition(field="schema", op="eq", value="ambit.trace/3"),
         MacroCondition(field="protocol.name", op="neq", value="modbus"),
@@ -238,9 +278,34 @@ def test_branch_routing_to_a_non_macro_cell_is_ignored():
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition()], "gotoCellId": "cell-9"}]),
+        _branch_cell([_path([_condition()], goto="cell-9")]),
     ])
-    prog = client.resolve_programming(EXPERIMENT_ID)
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+    assert prog.macros[0].when == ()
+
+
+def test_a_path_with_no_gotocellid_is_ignored():
+    # zBranchPath.gotoCellId is optional; a dangling path is not an error.
+    dangling = _path([_condition()])
+    del dangling["gotoCellId"]
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([dangling]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+    assert prog.macros[0].when == ()
+
+
+def test_a_conditionless_default_path_routes_the_macro_to_every_row():
+    # defaultPathId is ignored on purpose: the default path is itself in
+    # `paths`, and with no conditions it compiles to when == () = always.
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([_path([])], default_path_id="path-1"),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
     assert prog.macros[0].when == ()
 
 
@@ -248,64 +313,97 @@ def test_branch_condition_on_an_unknown_field_is_an_error():
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition(field="owner")],
-                       "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path([_condition(field="owner")])]),
     ])
     with pytest.raises(OpenJIIError,
                        match="branch cell cell-3 path 0.*owner"):
-        client.resolve_programming(EXPERIMENT_ID)
+        client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
 
 
 def test_branch_ordering_operator_is_an_error_not_a_silent_drop():
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition(operator="gt", value="2")],
-                       "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path([_condition(operator="gt", value="2")])]),
     ])
     with pytest.raises(OpenJIIError, match="'gt'"):
-        client.resolve_programming(EXPERIMENT_ID)
+        client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
 
 
-def test_branch_condition_must_read_the_command_cells_output():
+def test_a_path_reading_another_cells_output_is_skipped_not_an_error():
+    # One workbook legitimately serves the mobile flow and the Ambyte. A
+    # mobile branch into a shared macro cell must leave the macro unrouted
+    # (pre-feature behaviour), never hard-fail the Ambyte install.
+    logged = []
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition(source="cell-9")],
-                       "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path([_condition(source="cell-9")])]),
     ])
-    with pytest.raises(OpenJIIError, match="'cell-9'"):
-        client.resolve_programming(EXPERIMENT_ID)
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW,
+                                      log=logged.append)
+    assert prog.macros[0].when == ()
+    assert any("cell-9" in line and "not compiled" in line for line in logged)
+
+
+def test_an_unsupported_field_on_a_foreign_path_does_not_fail_the_install():
+    # The foreign-source check runs FIRST, so another flow's branch may use
+    # fields this device has never heard of without blocking anything.
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([_path([_condition(source="cell-9", field="owner",
+                                        operator="gt")])]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+    assert prog.macros[0].when == ()
 
 
 def test_two_paths_to_the_same_macro_are_an_error():
     # The device expresses ONE AND-ed condition set per macro; web-side OR
     # routing (two paths landing on the same macro) is not representable.
-    path = {"conditions": [_condition()], "gotoCellId": MACRO_CELL_ID}
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([dict(path), dict(path)]),
+        _branch_cell([_path([_condition()], path_id="p1"),
+                      _path([_condition()], path_id="p2")]),
     ])
     with pytest.raises(OpenJIIError, match="ambyte-trace"):
-        client.resolve_programming(EXPERIMENT_ID)
+        client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
 
 
 def test_more_than_four_conditions_is_an_error():
     client = _programming_client([
         _command_cell(SCHEDULE_YAML),
         _macro_cell(),
-        _branch_cell([{"conditions": [_condition(value=f"v{i}")
-                                      for i in range(5)],
-                       "gotoCellId": MACRO_CELL_ID}]),
+        _branch_cell([_path([_condition(value=f"v{i}") for i in range(5)])]),
     ])
     with pytest.raises(OpenJIIError, match="5 conditions"):
-        client.resolve_programming(EXPERIMENT_ID)
+        client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
+
+
+def test_below_the_when_gate_branch_cells_are_not_compiled_at_all():
+    # Firmware that will never evaluate when: must not be blocked by routing
+    # it cannot express, so compilation is skipped rather than validated.
+    logged = []
+    unrepresentable = _branch_cell([_path([_condition(operator="gt")],
+                                          path_id="p1"),
+                                    _path([_condition(field="owner")],
+                                          path_id="p2")])
+    cells = [_command_cell(SCHEDULE_YAML), _macro_cell(), unrepresentable]
+    prog = _programming_client(cells).resolve_programming(
+        EXPERIMENT_ID, fw_version=PRE_WHEN_FW, log=logged.append)
+    assert prog.macros == (MACRO,)
+    assert not prog.routing_compiled
+    assert any("NOT compiled into macro routing" in line for line in logged)
+    # An unknown/unfetched firmware version fails closed the same way.
+    prog = _programming_client(cells).resolve_programming(EXPERIMENT_ID)
+    assert not prog.routing_compiled and prog.macros == (MACRO,)
 
 
 def test_no_branch_cells_keeps_macros_unrouted_and_byte_compatible():
     client = _programming_client([_command_cell(SCHEDULE_YAML), _macro_cell()])
-    prog = client.resolve_programming(EXPERIMENT_ID)
+    prog = client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
     assert prog.macros == (MACRO,)  # when defaults to (): always applies
     stamped = schedule_stamp.stamp_header(
         prog.yaml_text, prog.workbook_version_id, prog.macros, checker=OK)
@@ -322,7 +420,7 @@ def test_authored_macros_block_in_the_command_cell_is_an_error():
     client = _programming_client(
         [_command_cell(yaml_with_macros), _macro_cell()])
     with pytest.raises(OpenJIIError, match="remove the macros: block"):
-        client.resolve_programming(EXPERIMENT_ID)
+        client.resolve_programming(EXPERIMENT_ID, fw_version=WHEN_FW)
 
 
 # ── stamp_header ─────────────────────────────────────────────────────────────

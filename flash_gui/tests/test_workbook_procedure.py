@@ -43,11 +43,12 @@ CATALOG = SimpleNamespace(
     asset_url="https://example.test/default.yaml", size_bytes=6731)
 
 
-def _programming(version_number=3, macros=(MACRO,)):
+def _programming(version_number=3, macros=(MACRO,), routing_compiled=True):
     return WorkbookProgramming(
         yaml_text=SCHEDULE_YAML, workbook_id="wb-id",
         workbook_version_id=VERSION_ID,
-        workbook_version_number=version_number, macros=macros)
+        workbook_version_number=version_number, macros=macros,
+        routing_compiled=routing_compiled)
 
 
 def _ctx(programming=None, fw="2.1.0"):
@@ -136,6 +137,26 @@ def test_when_routing_is_gated_separately_on_the_flashed_firmware():
         log=lambda _m: None)
     assert b"when:" in source.blob
     assert b"ambit.trace/3" in source.blob
+
+
+def test_a_snapshot_resolved_without_routing_never_installs_on_when_firmware():
+    # The workbook lookup compiles routing only for firmware that evaluates
+    # it, so a snapshot resolved before the release was known carries when ==
+    # () for that reason, not because the workbook declares no routing.
+    # Stamping it onto when:-capable firmware would publish every macro on
+    # every row while looking like the workbook declares no branches at all.
+    ctx = _ctx(programming=_programming(macros=(MACRO,),
+                                        routing_compiled=False), fw="2.2.0")
+    with pytest.raises(schedule_stamp.ScheduleStampError,
+                       match="Re-select the experiment"):
+        procedure.schedule_source(ctx, log=lambda _m: None)
+
+    # Below the gate the same snapshot installs exactly as it does today.
+    source = procedure.schedule_source(
+        _ctx(programming=_programming(macros=(MACRO,), routing_compiled=False),
+             fw="2.1.0"),
+        log=lambda _m: None)
+    assert source.blob == _stamped().encode("utf-8")
 
 
 # ── the serial install path ──────────────────────────────────────────────────
