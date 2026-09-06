@@ -74,8 +74,16 @@ jobs:
           set -euo pipefail
           SUBJECT=$(git log -1 --pretty=%s)
           PR_NUMBER=$(printf '%s' "${SUBJECT}" | sed -nE 's/.*\(#([0-9]+)\).*/\1/p')
+          # The subject is only a hint. A squash merge whose subject was
+          # overridden without the "(#N)" suffix used to fail here even though
+          # the merge commit is still unambiguously associated with its PR, so
+          # fall back to asking the API which PR this SHA was merged by.
           if [[ -z "${PR_NUMBER}" ]]; then
-            echo "::error::Release commit subject has no squash PR number: ${SUBJECT}"
+            PR_NUMBER=$(gh api "repos/${REPO}/commits/$(git rev-parse HEAD)/pulls" \
+              --jq '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last | .number // empty')
+          fi
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "::error::Release commit subject has no squash PR number, and no merged PR is associated with this commit: ${SUBJECT}"
             exit 1
           fi
           HEAD_SHA=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid -q .headRefOid)
