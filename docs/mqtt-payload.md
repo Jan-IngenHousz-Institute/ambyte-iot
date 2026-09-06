@@ -42,8 +42,8 @@ consumers dedupe on (`device_id`, `measure_id`).
   "timezone": "Europe/Amsterdam",       // NVS; omitted if unset
   "workbook_version_id": "1c7b82b5-…",  // optional; present when the installed
                                         // schedule header declares workbookVersionId
-  "macros": [                           // optional; present when the installed
-    { "id": "47b03f78-…",               // schedule header declares a macros: block
+  "macros": [                           // optional; the macros of the installed
+    { "id": "47b03f78-…",               // header that apply to THIS row
       "name": "ambyte-trace",           // (≤ 8 entries, id always a uuid)
       "filename": "macro_8feac276a118" }
   ],
@@ -73,6 +73,41 @@ time, not measure time**: a battery-backlogged event measured under schedule
 A but published after schedule B was installed carries B's provenance. Macro
 `id`/`name`/`filename` characters are restricted to `[A-Za-z0-9_.:-]` by the
 schedule compiler, so the envelope splices them unescaped.
+
+### 2.1 `macros` is per row, not per schedule
+
+The platform runs, per published row, exactly the macros that row's envelope
+lists, and writes one output row per (row, macro) **even when the macro
+returns `{}`**. A device that published one static list on every row would
+therefore give a per-family macro (trace / spectrum / telemetry) a table that
+is mostly empty. So each header macro may carry a `when:` block of up to 4
+AND-ed `{field, op, value}` conditions (`docs/schedule-releases.md`), compiled
+from the workbook's branch cells, and the publisher renders **only the macros
+whose conditions all hold for the row it is publishing**:
+
+| row (`sample[0].schema`) | `macros` rendered from the same header |
+| --- | --- |
+| `ambit.trace/3` | `[ambyte-trace]` |
+| `ambit.spectrum/1` | `[ambyte-spectrum]` |
+| `ambyte.telemetry/1` | `[ambyte-telemetry]` |
+| a v2 backlog row (no `schema` key) | key omitted entirely |
+
+Consequences for consumers:
+
+- **`macros` may be absent while `workbook_version_id` is present.** That is
+  "no macro applies to this row", not "no workbook" — do not treat it as
+  missing provenance.
+- The conditions are evaluated against `sample[0]` **as stored**, by a bounded
+  scanner (`components/payload_codec/payload_scalar.c`), not a JSON parser.
+  Only these string leaves are addressable: `schema`, `tag`, `channel`,
+  `device`, `sensor_id`, `protocol.name`, `protocol.tag`. Matching is
+  depth-exact, so a telemetry row's nested `health.attached_sensors[].channel`
+  never answers a top-level `channel` condition.
+- An **absent** field makes `eq` false and `neq` true. That asymmetry is what
+  makes "every row the four canonical v3 families do not cover" expressible as
+  four `schema neq` conditions — v2 backlog rows carry no `schema` at all.
+- A macro with no `when:` block applies to every row, which is exactly how
+  every schedule stamped before this feature behaves.
 
 The schema belongs to the single `sample[0]` object. Producers MUST NOT put a
 schema tag on the outer envelope, mix v2 and v3 keys in one sample object, or

@@ -105,6 +105,23 @@
  * a fully-stamped header would silently lose macros on the wire. */
 _Static_assert(SCHEDULE_PROVENANCE_MAX_MACROS == SCHED_SPEC_MAX_MACROS,
                "envelope provenance port must hold every compiled macro");
+_Static_assert(SCHEDULE_PROVENANCE_MAX_MACRO_CONDS == SCHED_SPEC_MAX_MACRO_CONDS,
+               "envelope provenance port must hold every compiled condition");
+/* schedule_provenance_port.h restates sched_spec.h's condition field/op enums
+ * (device_commands cannot include sched_spec.h) — pin the mirroring so the
+ * two closed sets cannot drift apart silently. The (int) casts are load-bearing
+ * for the build, not cosmetic: these are two distinct anonymous enum types and
+ * GCC's -Werror=enum-compare rejects comparing them directly. */
+_Static_assert((int)SCHED_PROV_COND_FIELD_SCHEMA == (int)SCHED_COND_FIELD_SCHEMA &&
+               (int)SCHED_PROV_COND_FIELD_TAG == (int)SCHED_COND_FIELD_TAG &&
+               (int)SCHED_PROV_COND_FIELD_CHANNEL == (int)SCHED_COND_FIELD_CHANNEL &&
+               (int)SCHED_PROV_COND_FIELD_DEVICE == (int)SCHED_COND_FIELD_DEVICE &&
+               (int)SCHED_PROV_COND_FIELD_SENSOR_ID == (int)SCHED_COND_FIELD_SENSOR_ID &&
+               (int)SCHED_PROV_COND_FIELD_PROTOCOL_NAME == (int)SCHED_COND_FIELD_PROTOCOL_NAME &&
+               (int)SCHED_PROV_COND_FIELD_PROTOCOL_TAG == (int)SCHED_COND_FIELD_PROTOCOL_TAG &&
+               (int)SCHED_PROV_COND_OP_EQ == (int)SCHED_COND_OP_EQ &&
+               (int)SCHED_PROV_COND_OP_NEQ == (int)SCHED_COND_OP_NEQ,
+               "provenance port condition enums must mirror sched_spec.h");
 
 /* Spinlock critical sections are never held across a blocking call — only
  * state/flag reads+writes and short struct copies. The one exception is each
@@ -847,7 +864,7 @@ esp_err_t sched_runner_header(sched_header_t *out)
         snprintf(out->workbook, sizeof(out->workbook), "%s", wb ? wb : "-");
         snprintf(out->name, sizeof(out->name), "%s", name ? name : "-");
         out->has_workbook = wb != NULL;
-        /* Bounded by SCHED_SPEC_MAX_MACROS (8 × ~140 B): s_state_mux is a
+        /* Bounded by SCHED_SPEC_MAX_MACROS (8 × ~340 B): s_state_mux is a
          * spinlock, so the whole snapshot copy must stay small — the fixed
          * field caps in sched_header_t are what guarantee that. */
         out->macro_count = s_prog.macro_count;
@@ -858,6 +875,16 @@ esp_err_t sched_runner_header(sched_header_t *out)
             snprintf(out->macros[i].id, sizeof(out->macros[i].id), "%s", mid ? mid : "");
             snprintf(out->macros[i].name, sizeof(out->macros[i].name), "%s", mnam ? mnam : "");
             snprintf(out->macros[i].filename, sizeof(out->macros[i].filename), "%s", mfn ? mfn : "");
+            out->macros[i].cond_count = s_prog.macros[i].cond_count;
+            for (int j = 0; j < s_prog.macros[i].cond_count; j++) {
+                const char *cval = sched_pool_str(&s_prog,
+                                                  s_prog.macros[i].conds[j].value_off);
+                out->macros[i].conds[j].field = s_prog.macros[i].conds[j].field;
+                out->macros[i].conds[j].op = s_prog.macros[i].conds[j].op;
+                snprintf(out->macros[i].conds[j].value,
+                         sizeof(out->macros[i].conds[j].value), "%s",
+                         cval ? cval : "");
+            }
         }
     }
     taskEXIT_CRITICAL(&s_state_mux);
@@ -895,6 +922,17 @@ esp_err_t sched_runner_provenance_port(schedule_provenance_t *out)
         snprintf(out->macros[i].name, sizeof(out->macros[i].name), "%s", hdr.macros[i].name);
         snprintf(out->macros[i].filename, sizeof(out->macros[i].filename), "%s",
                  hdr.macros[i].filename);
+        out->macros[i].cond_count = hdr.macros[i].cond_count;
+        if (out->macros[i].cond_count > SCHEDULE_PROVENANCE_MAX_MACRO_CONDS) {
+            out->macros[i].cond_count = SCHEDULE_PROVENANCE_MAX_MACRO_CONDS;
+        }
+        for (int j = 0; j < out->macros[i].cond_count; j++) {
+            out->macros[i].conds[j].field = hdr.macros[i].conds[j].field;
+            out->macros[i].conds[j].op = hdr.macros[i].conds[j].op;
+            snprintf(out->macros[i].conds[j].value,
+                     sizeof(out->macros[i].conds[j].value), "%s",
+                     hdr.macros[i].conds[j].value);
+        }
     }
     return ESP_OK;
 }

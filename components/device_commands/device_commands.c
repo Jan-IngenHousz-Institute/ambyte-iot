@@ -1117,8 +1117,10 @@ static char *dc_gzip_sample_b64(const char *payload_json)
  * schedule header at install time). The rendering is the pure, host-tested
  * envelope_provenance_part(); this shim only fetches the schedule runner's
  * header snapshot through the config port, once per publish, so a schedule
- * reload takes effect on the next envelope. When the header declares
- * neither key the part is empty and the envelope is byte-identical to today.
+ * reload takes effect on the next envelope; the event's payload JSON is
+ * threaded through so each macro's `when:` conditions filter the part for
+ * THIS row. When the header declares neither key the part is empty and the
+ * envelope is byte-identical to today.
  *
  * Static, not stack: cmd_mqtt_publish_next_event has exactly one caller task
  * (the sync_runner drain loop), and its 8 KiB stack already carries the
@@ -1129,12 +1131,14 @@ static char *dc_gzip_sample_b64(const char *payload_json)
 static schedule_provenance_t s_prov;
 static char s_wbpart[1440];
 
-static void dc_build_provenance_part(void)
+static void dc_build_provenance_part(const char *payload_json)
 {
     s_wbpart[0] = '\0';
     if (s_cfg.schedule_provenance == NULL ||
         s_cfg.schedule_provenance(&s_prov) != ESP_OK) return;
-    envelope_provenance_part(&s_prov, s_wbpart, sizeof(s_wbpart));
+    /* payload_json routes each macro's `when:` conditions against THIS event:
+     * the rendered s_wbpart lists only the macros openJII should run for it. */
+    envelope_provenance_part(&s_prov, payload_json, s_wbpart, sizeof(s_wbpart));
 }
 
 cmd_result_t cmd_mqtt_publish_next_event(void)
@@ -1256,8 +1260,10 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", s_cfg.timezone);
     }
     /* Workbook provenance ("" when the schedule header declares none — the
-     * envelope then stays byte-identical to an unstamped schedule). */
-    dc_build_provenance_part();
+     * envelope then stays byte-identical to an unstamped schedule). Built once
+     * per publish, filtered against THIS event's payload so the six sizing
+     * sites below still see the exact part that goes on the wire. */
+    dc_build_provenance_part(e.payload_json);
 
     const char *meta = e.metadata_json;          /* already a JSON object, or NULL */
     const char *fw   = s_cfg.device_firmware  ? s_cfg.device_firmware  : "";

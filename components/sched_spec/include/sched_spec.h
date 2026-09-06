@@ -51,6 +51,11 @@ extern "C" {
  * a quarter of the pool in the worst case, nothing for shipped schedules,
  * which declare none. */
 #define SCHED_SPEC_MAX_MACROS     8
+/* Per-macro `when:` conditions (per-row publish routing). Capped at 4 because
+ * the legacy/v2 idiom — "this macro applies to every payload EXCEPT the four
+ * canonical v3 schemas" — needs exactly four schema-neq conditions; anything
+ * more expressive belongs in openJII branch-cell compilation, not here. */
+#define SCHED_SPEC_MAX_MACRO_CONDS 4
 
 /* YAML subset limits (plan "The YAML subset"): the file lives on littlefs and
  * is parsed in a transient heap arena on a 512 KiB SRAM part, so the arena
@@ -221,13 +226,45 @@ typedef struct {
     sched_segment_t segments[SCHED_SPEC_MAX_SEGMENTS];
 } sched_protocol_t;
 
+/* A payload field a macro `when:` condition can test. Closed set: the scanner
+ * (payload_scalar.c) can only address these, and an open field set would let
+ * a stamped schedule reference payload keys the firmware cannot find — the
+ * condition would silently misfire per row instead of failing at install. */
+typedef enum {
+    SCHED_COND_FIELD_SCHEMA,
+    SCHED_COND_FIELD_TAG,
+    SCHED_COND_FIELD_CHANNEL,
+    SCHED_COND_FIELD_DEVICE,
+    SCHED_COND_FIELD_SENSOR_ID,
+    SCHED_COND_FIELD_PROTOCOL_NAME, /* "protocol.name" — one level into the protocol object */
+    SCHED_COND_FIELD_PROTOCOL_TAG,  /* "protocol.tag" */
+} sched_cond_field_t;
+
+/* String comparison only. gt/lt/gte/lte are REJECTED at compile time with a
+ * not-supported error: every addressable field is a string on the wire, and
+ * an ordering comparison over string payloads is a silent-semantics trap
+ * (is "9" > "10"?) that must not compile until it is designed properly. */
+typedef enum {
+    SCHED_COND_OP_EQ,
+    SCHED_COND_OP_NEQ,
+} sched_cond_op_t;
+
 /* One workbook macro reference (header `macros:` entry): the platform's join
  * key (id, a uuid) plus the human/tooling strings. Pool offsets, like every
- * other string in the program, so the static program stays relocation-free. */
+ * other string in the program, so the static program stays relocation-free.
+ * cond_count == 0 (no `when:` block) means the macro applies to every row —
+ * the exact behaviour every already-stamped schedule keeps. */
 typedef struct {
     uint16_t id_off;
     uint16_t name_off;
     uint16_t filename_off;
+    uint8_t  cond_count; /* ≤ SCHED_SPEC_MAX_MACRO_CONDS */
+    uint8_t  _pad;
+    struct {
+        uint8_t  field;    /* sched_cond_field_t */
+        uint8_t  op;       /* sched_cond_op_t */
+        uint16_t value_off; /* compare value in the string pool */
+    } conds[SCHED_SPEC_MAX_MACRO_CONDS];
 } sched_macro_t;
 
 /* Cron bitmasks. Five fields mean minute/hour/dom/month/dow; a sixth field is

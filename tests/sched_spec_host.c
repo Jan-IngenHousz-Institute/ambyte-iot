@@ -815,6 +815,240 @@ static void test_compiler_rules(void)
                 "'macros' must be a block sequence");
 #undef MACRO_JOB
 
+    /* header macros: `when:` per-row publish routing — the compiled form of
+     * openJII branch cells. Accept first … */
+#define MACRO_JOB \
+    "jobs:\n" \
+    "  j:\n" \
+    "    schedule:\n" \
+    "      cron: \"0 */5 * * * *\"\n" \
+    "    steps:\n" \
+    "      - uses: device/log\n" \
+    "        with:\n" \
+    "          message: hi\n"
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "macros:\n"
+        "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+        "    name: ambyte-trace\n"
+        "    filename: macro_8feac276a118\n"
+        "    when:\n"
+        "      - field: schema\n"
+        "        op: eq\n"
+        "        value: ambit.trace/3\n"
+        "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470041\n"
+        "    name: ambyte-ch1\n"
+        "    filename: macro_0123abcd\n"
+        "    when:\n"
+        "      - field: channel\n"
+        "        op: eq\n"
+        "        value: uart_1\n"
+        "      - field: protocol.name\n"
+        "        op: neq\n"
+        "        value: SS\n"
+        "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470042\n"
+        "    name: ambyte-all\n"
+        "    filename: macro_every_row\n"
+        MACRO_JOB);
+    CHECK(p != NULL);
+    if (p != NULL) {
+        CHECK(p->macro_count == 3);
+        CHECK(p->macros[0].cond_count == 1);
+        CHECK(p->macros[0].conds[0].field == SCHED_COND_FIELD_SCHEMA);
+        CHECK(p->macros[0].conds[0].op == SCHED_COND_OP_EQ);
+        const char *cv = sched_pool_str(p, p->macros[0].conds[0].value_off);
+        CHECK(cv != NULL && strcmp(cv, "ambit.trace/3") == 0);
+        CHECK(p->macros[1].cond_count == 2);
+        CHECK(p->macros[1].conds[0].field == SCHED_COND_FIELD_CHANNEL);
+        CHECK(p->macros[1].conds[0].op == SCHED_COND_OP_EQ);
+        CHECK(p->macros[1].conds[1].field == SCHED_COND_FIELD_PROTOCOL_NAME);
+        CHECK(p->macros[1].conds[1].op == SCHED_COND_OP_NEQ);
+        cv = sched_pool_str(p, p->macros[1].conds[1].value_off);
+        CHECK(cv != NULL && strcmp(cv, "SS") == 0);
+        /* absent when: == always applies (every already-stamped schedule) */
+        CHECK(p->macros[2].cond_count == 0);
+        free(p);
+    }
+    /* the legacy/v2 idiom fills the cap exactly: schema neq ×4 */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "macros:\n"
+        "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+        "    name: ambyte-legacy\n"
+        "    filename: macro_legacy_v2\n"
+        "    when:\n"
+        "      - field: schema\n"
+        "        op: neq\n"
+        "        value: ambit.trace/3\n"
+        "      - field: schema\n"
+        "        op: neq\n"
+        "        value: ambit.spectrum/1\n"
+        "      - field: schema\n"
+        "        op: neq\n"
+        "        value: ambyte.telemetry/1\n"
+        "      - field: schema\n"
+        "        op: neq\n"
+        "        value: ambit.device/1\n"
+        MACRO_JOB);
+    CHECK(p != NULL);
+    if (p != NULL) {
+        CHECK(p->macro_count == 1);
+        CHECK(p->macros[0].cond_count == 4);
+        for (int j = 0; j < 4; j++) {
+            CHECK(p->macros[0].conds[j].field == SCHED_COND_FIELD_SCHEMA);
+            CHECK(p->macros[0].conds[j].op == SCHED_COND_OP_NEQ);
+        }
+        free(p);
+    }
+    /* … then strict on every `when:` shape rule. */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: unit\n"
+    "        op: eq\n"
+    "        value: Cel\n"
+    MACRO_JOB,
+                "unknown macro 'when' field 'unit'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: matches\n"
+    "        value: ambit.trace/3\n"
+    MACRO_JOB,
+                "unknown macro 'when' op 'matches'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: channel\n"
+    "        op: gt\n"
+    "        value: uart_1\n"
+    MACRO_JOB,
+                "numeric comparison is not supported yet");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: channel\n"
+    "        op: lte\n"
+    "        value: uart_1\n"
+    MACRO_JOB,
+                "numeric comparison is not supported yet");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: neq\n"
+    "        value: ambit.trace/3\n"
+    "      - field: schema\n"
+    "        op: neq\n"
+    "        value: ambit.spectrum/1\n"
+    "      - field: schema\n"
+    "        op: neq\n"
+    "        value: ambyte.telemetry/1\n"
+    "      - field: schema\n"
+    "        op: neq\n"
+    "        value: ambit.device/1\n"
+    "      - field: tag\n"
+    "        op: eq\n"
+    "        value: MEASUREMENT\n"
+    MACRO_JOB,
+                "the cap is 4");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: eq\n"
+    "        value: has space\n"
+    MACRO_JOB,
+                "may only contain [A-Za-z0-9_.:/-]");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: eq\n"
+    MACRO_JOB,
+                "macro 'when' condition requires field, op and value");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: eq\n"
+    "        value: ambit.trace/3\n"
+    "        weight: 2\n"
+    MACRO_JOB,
+                "unknown macro 'when' key 'weight'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when: schema\n"
+    MACRO_JOB,
+                "macro 'when' must be a block sequence");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - schema\n"
+    MACRO_JOB,
+                "macro 'when' condition must be a mapping");
+    /* the replaced per-`kinds` design stays rejected: unknown macro key */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    kinds:\n"
+    "      - trace\n"
+    MACRO_JOB,
+                "unknown macro key 'kinds'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m\n"
+    "    filename: f\n"
+    "    when:\n"
+    "      - field: schema\n"
+    "        op: eq\n"
+    "        value: \"this value is deliberately longer than forty-seven characters\"\n"
+    MACRO_JOB,
+                "macro 'when' value is");
+    /* '/' stays rejected for the spliced fields — only when-values widen */
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: ambit.trace/3\n"
+    "    filename: f\n"
+    MACRO_JOB,
+                "may only contain [A-Za-z0-9_.:-]");
+#undef MACRO_JOB
+
     /* Removed trigger aliases stay rejected: authored schedules use cron. */
     COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
     "jobs:\n"
