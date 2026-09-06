@@ -11,13 +11,15 @@ sched_host build when a C toolchain and the source tree are present.
 
 import hashlib
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from flash_gui import schedule_stamp
-from flash_gui.openjii_client import (OpenJIIClient, OpenJIIError,
-                                      WorkbookMacro, WorkbookProgramming)
+from flash_gui.openjii_client import (MacroCondition, OpenJIIClient,
+                                      OpenJIIError, WorkbookMacro,
+                                      WorkbookProgramming)
 from flash_gui.schedule_stamp import ScheduleStampError
 
 EXPERIMENT_ID = "665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"
@@ -77,6 +79,39 @@ def _command_cell(content, fmt="yaml", name=None):
 def _macro_cell(macro_id=MACRO_ID):
     return {"id": "cell-2", "type": "macro",
             "payload": {"macroId": macro_id, "language": "python"}}
+
+
+# Branch-cell fixtures: the web app routes on branch paths
+# ({conditions: [{sourceCellId, field, operator, value}], gotoCellId}); the
+# command cell is "cell-1", the macro cell "cell-2" (see the helpers above).
+COMMAND_CELL_ID = "cell-1"
+MACRO_CELL_ID = "cell-2"
+
+MACRO_PAYLOAD = {"id": MACRO_ID, "name": "ambyte-trace",
+                 "filename": "macro_8feac276a118", "language": "python"}
+
+
+def _branch_cell(paths, cell_id="cell-3"):
+    return {"id": cell_id, "type": "branch", "payload": {"paths": paths}}
+
+
+def _condition(field="schema", operator="eq", value="ambit.trace/3",
+               source=COMMAND_CELL_ID):
+    return {"sourceCellId": source, "field": field,
+            "operator": operator, "value": value}
+
+
+def _programming_client(cells, macro_payload=MACRO_PAYLOAD):
+    """A client for one experiment pinning a version with the given cells."""
+    responses = {
+        f"/api/v1/experiments/{EXPERIMENT_ID}": (
+            200, {"workbookId": WORKBOOK_ID, "workbookVersionId": VERSION_ID}),
+        f"/api/v1/workbooks/{WORKBOOK_ID}/versions/{VERSION_ID}": (
+            200, _version_payload(cells)),
+    }
+    if macro_payload is not None:
+        responses[f"/api/v1/macros/{MACRO_ID}"] = (200, macro_payload)
+    return _client(responses)
 
 
 # ── resolve_programming ──────────────────────────────────────────────────────
@@ -163,6 +198,130 @@ def test_a_macro_without_filename_is_an_error_not_a_silent_drop():
                                              "name": "ambyte-trace"}),
     })
     with pytest.raises(OpenJIIError, match="filename"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+# ── branch cells → per-macro when: routing ───────────────────────────────────
+def test_branch_path_compiles_to_a_when_block():
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition()],
+                       "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID)
+    assert prog.macros == (WorkbookMacro(
+        id=MACRO_ID, name="ambyte-trace", filename="macro_8feac276a118",
+        when=(MacroCondition(field="schema", op="eq", value="ambit.trace/3"),)),)
+
+
+def test_branch_conditions_are_anded_in_order_including_dotted_fields():
+    conditions = [
+        _condition(),
+        _condition(field="protocol.name", operator="neq", value="modbus"),
+    ]
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": conditions, "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID)
+    assert prog.macros[0].when == (
+        MacroCondition(field="schema", op="eq", value="ambit.trace/3"),
+        MacroCondition(field="protocol.name", op="neq", value="modbus"),
+    )
+
+
+def test_branch_routing_to_a_non_macro_cell_is_ignored():
+    # Web-side control flow between other cells is none of the device's
+    # business; only paths landing on a macro cell compile to when:.
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition()], "gotoCellId": "cell-9"}]),
+    ])
+    prog = client.resolve_programming(EXPERIMENT_ID)
+    assert prog.macros[0].when == ()
+
+
+def test_branch_condition_on_an_unknown_field_is_an_error():
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition(field="owner")],
+                       "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    with pytest.raises(OpenJIIError,
+                       match="branch cell cell-3 path 0.*owner"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+def test_branch_ordering_operator_is_an_error_not_a_silent_drop():
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition(operator="gt", value="2")],
+                       "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    with pytest.raises(OpenJIIError, match="'gt'"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+def test_branch_condition_must_read_the_command_cells_output():
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition(source="cell-9")],
+                       "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    with pytest.raises(OpenJIIError, match="'cell-9'"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+def test_two_paths_to_the_same_macro_are_an_error():
+    # The device expresses ONE AND-ed condition set per macro; web-side OR
+    # routing (two paths landing on the same macro) is not representable.
+    path = {"conditions": [_condition()], "gotoCellId": MACRO_CELL_ID}
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([dict(path), dict(path)]),
+    ])
+    with pytest.raises(OpenJIIError, match="ambyte-trace"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+def test_more_than_four_conditions_is_an_error():
+    client = _programming_client([
+        _command_cell(SCHEDULE_YAML),
+        _macro_cell(),
+        _branch_cell([{"conditions": [_condition(value=f"v{i}")
+                                      for i in range(5)],
+                       "gotoCellId": MACRO_CELL_ID}]),
+    ])
+    with pytest.raises(OpenJIIError, match="5 conditions"):
+        client.resolve_programming(EXPERIMENT_ID)
+
+
+def test_no_branch_cells_keeps_macros_unrouted_and_byte_compatible():
+    client = _programming_client([_command_cell(SCHEDULE_YAML), _macro_cell()])
+    prog = client.resolve_programming(EXPERIMENT_ID)
+    assert prog.macros == (MACRO,)  # when defaults to (): always applies
+    stamped = schedule_stamp.stamp_header(
+        prog.yaml_text, prog.workbook_version_id, prog.macros, checker=OK)
+    today = schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID, [MACRO],
+                                        checker=OK)
+    assert stamped == today
+    assert "when:" not in stamped
+
+
+def test_authored_macros_block_in_the_command_cell_is_an_error():
+    # The replaced design let the authored YAML declare macros; routing now
+    # comes from the workbook's branch cells, so the block is rejected.
+    yaml_with_macros = SCHEDULE_YAML + "macros:\n  - id: old-style\n"
+    client = _programming_client(
+        [_command_cell(yaml_with_macros), _macro_cell()])
+    with pytest.raises(OpenJIIError, match="remove the macros: block"):
         client.resolve_programming(EXPERIMENT_ID)
 
 
@@ -270,6 +429,67 @@ def test_macro_contract_is_enforced_before_stamping():
         checker=OK)
 
 
+def test_when_block_is_emitted_block_style_and_restamps():
+    routed = WorkbookMacro(
+        id=MACRO_ID, name="ambyte-trace", filename="macro_8feac276a118",
+        when=(MacroCondition(field="schema", op="eq", value="ambit.trace/3"),
+              MacroCondition(field="protocol.name", op="neq", value="modbus")))
+    stamped = schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID, [routed],
+                                          checker=OK)
+    block = stamped.split("macros:\n", 1)[1].split("\n\n", 1)[0]
+    # The device-side parser is block-only: no flow collections anywhere.
+    assert "[" not in block and "{" not in block and "]" not in block
+    assert "    when:" in block
+    assert "      - field: schema" in block
+    assert "        op: eq" in block
+    # '/' is outside the plain-scalar set, so the value is quoted.
+    assert '        value: "ambit.trace/3"' in block
+    assert "      - field: protocol.name" in block
+    # The nested when: block is indented, so a re-stamp replaces it whole.
+    twice = schedule_stamp.stamp_header(stamped, VERSION_ID, [routed],
+                                        checker=OK)
+    assert twice == stamped
+
+
+def test_when_contract_is_enforced_before_stamping():
+    def macro_with(when):
+        return WorkbookMacro(id=MACRO_ID, name="m", filename="macro_x",
+                             when=when)
+
+    def expect(needle, when):
+        with pytest.raises(ValueError, match=needle):
+            schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID,
+                                        [macro_with(when)], checker=OK)
+
+    good = MacroCondition(field="schema", op="eq", value="ambit.trace/3")
+    expect("field", (MacroCondition(field="owner", op="eq", value="x"),))
+    expect("op", (MacroCondition(field="schema", op="gt", value="x"),))
+    expect("value", (MacroCondition(field="schema", op="eq",
+                                    value="has space"),))
+    expect("value", (MacroCondition(field="schema", op="eq", value="x" * 48),))
+    expect("repeats", (good, good))
+    expect("exceed", tuple(replace(good, value=f"v{i}") for i in range(5)))
+    # The boundary values are accepted: '/' is deliberately in the charset
+    # (schema ids need it), 47 chars pass, and the same field+op with a
+    # different value is a distinct condition, not a duplicate.
+    schedule_stamp.stamp_header(
+        SCHEDULE_YAML, VERSION_ID,
+        [macro_with((good, replace(good, value="x" * 47),
+                     MacroCondition(field="tag", op="neq", value="pilot")))],
+        checker=OK)
+
+
+def test_macro_when_firmware_gate():
+    assert schedule_stamp.firmware_supports_macro_when("2.2.0")
+    assert schedule_stamp.firmware_supports_macro_when("v2.2.0")
+    assert schedule_stamp.firmware_supports_macro_when("2.10.0")
+    assert not schedule_stamp.firmware_supports_macro_when("2.1.9")
+    # Same fail-closed semantics as the macros-header gate.
+    assert not schedule_stamp.firmware_supports_macro_when("2.2.0-rc1")
+    assert not schedule_stamp.firmware_supports_macro_when("")
+    assert not schedule_stamp.firmware_supports_macro_when("dev-build")
+
+
 def test_rejects_non_schedule_text():
     with pytest.raises(ScheduleStampError, match="schema"):
         schedule_stamp.stamp_header("hello: world\n", VERSION_ID, [MACRO],
@@ -340,6 +560,30 @@ def test_real_compiler_validates_default_schedule_stamp():
     # This checkout predates stream A, so macros exercise the tolerated path;
     # once stream A lands this same call validates directly.
     schedule_stamp.stamp_header(yaml_text, VERSION_ID, [MACRO])
+
+
+@pytest.mark.skipif(not HAVE_TOOLCHAIN, reason="no C toolchain / source tree")
+def test_real_compiler_accepts_the_stamped_when_block():
+    # The seam between the two halves of this feature: the block-style `when:`
+    # the stamper writes has to be exactly what the device compiler parses.
+    # A Python-side reconstruction of the grammar would not prove that.
+    routed = replace(MACRO, when=(
+        MacroCondition(field="schema", op="eq", value="ambit.trace/3"),
+        MacroCondition(field="protocol.name", op="neq", value="SS"),
+    ))
+    stamped = schedule_stamp.stamp_header(SCHEDULE_YAML, VERSION_ID, [routed])
+    assert "    when:\n      - field: schema\n" in stamped
+    # '/' is not plain-safe, so the scalar quotes; the device parser unquotes
+    assert '        value: "ambit.trace/3"\n' in stamped
+    assert "        value: SS\n" in stamped
+    # And prove the compiler actually ran rather than silently no-opping (a
+    # missing binary reports "no error"): the same document with a field the
+    # device cannot address has to come back with a compile error.
+    assert schedule_stamp._check_with_sched_host(stamped) is None
+    unaddressable = stamped.replace("      - field: schema\n",
+                                    "      - field: measure_id\n")
+    error = schedule_stamp._check_with_sched_host(unaddressable)
+    assert error is not None and "measure_id" in error
 
 
 @pytest.mark.skipif(not HAVE_TOOLCHAIN, reason="no C toolchain / source tree")

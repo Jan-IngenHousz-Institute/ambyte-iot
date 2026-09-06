@@ -39,9 +39,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import schedule_stamp
 from .config import CERTS_DIR, OPENJII_DEVICE_TYPE, Environment
 from .schedule_stamp import is_schedule_yaml
 from .tls import ssl_context
@@ -64,17 +65,38 @@ class Experiment:
 
 
 @dataclass(frozen=True)
+class MacroCondition:
+    """One device-evaluable routing condition of a macro's `when:` block.
+
+    Compiled from a workbook branch path (see resolve_programming). `op` is
+    the device spelling of the workbook's operator — only eq/neq survive the
+    compile; ordering comparisons are rejected because the device cannot
+    express them.
+    """
+
+    field: str
+    op: str
+    value: str
+
+
+@dataclass(frozen=True)
 class WorkbookMacro:
     """One macro cell of a workbook version, resolved to its pipeline identity.
 
     `filename` is the macro-sandbox module name the platform executes; it only
     exists on the persisted macro, not on the cell, so resolving it costs one
-    GET /macros/{id} per cell.
+    GET /macros/{id} per cell. `when` is the routing compiled from the
+    workbook's branch cells; empty means the macro applies to every row.
     """
 
     id: str
     name: str
     filename: str
+    when: tuple[MacroCondition, ...] = ()
+
+    def without_when(self) -> WorkbookMacro:
+        """This macro with its routing stripped (the pre-when firmware gate)."""
+        return replace(self, when=())
 
 
 @dataclass(frozen=True)
@@ -327,6 +349,13 @@ class OpenJIIClient:
         top-level ``schema: jii.ambyte-schedule/...`` line. Returns None — never
         raises — when the experiment has no pinned workbook version or the
         pinned version has no such cell; HTTP failures raise OpenJIIError.
+
+        Per-macro routing is compiled from the version's BRANCH cells: a path
+        whose ``gotoCellId`` is a macro cell becomes that macro's ``when:``
+        block (see _compile_macro_routing). Workbook content the device cannot
+        express — an unknown field, an ordering operator, conditions sourced
+        off a non-command cell, OR routing across several paths — raises
+        OpenJIIError rather than silently misrouting rows.
         """
         experiment = self.get_experiment(experiment_id)
         workbook_id = experiment.get("workbookId")
@@ -342,7 +371,10 @@ class OpenJIIClient:
                 f"workbook version {version_id} returned no cell list.")
 
         yaml_text = None
+        command_cell_id = None
         macros: list[WorkbookMacro] = []
+        macro_index_by_cell: dict[str, int] = {}  # macro CELL id → macros index
+        branch_cells: list[dict] = []
         for cell in cells:
             if not isinstance(cell, dict):
                 continue
@@ -355,6 +387,7 @@ class OpenJIIClient:
                         and isinstance(content, str)
                         and is_schedule_yaml(content)):
                     yaml_text = content
+                    command_cell_id = cell.get("id")
             elif cell.get("type") == "macro":
                 macro_id = payload.get("macroId")
                 if not isinstance(macro_id, str) or not macro_id:
@@ -366,15 +399,29 @@ class OpenJIIClient:
                         f"macro {macro_id} has no filename — the pipeline "
                         "cannot key its output table without it.")
                 name = macro.get("name") or payload.get("name") or macro_id
+                cell_id = cell.get("id")
+                if isinstance(cell_id, str) and cell_id:
+                    macro_index_by_cell[cell_id] = len(macros)
                 macros.append(WorkbookMacro(id=macro.get("id") or macro_id,
                                             name=str(name),
                                             filename=filename))
+            elif cell.get("type") == "branch":
+                branch_cells.append(cell)
 
         if yaml_text is None:
             return None
+        if schedule_stamp.has_authored_macros_block(yaml_text):
+            raise OpenJIIError(
+                "the workbook's command cell carries an authored `macros:` "
+                "block — routing comes from workbook branches; remove the "
+                "macros: block from the command cell.")
+        macros = _compile_macro_routing(branch_cells, macros,
+                                        macro_index_by_cell, command_cell_id)
         if log is not None:
+            routed = sum(1 for m in macros if m.when)
             log(f"openJII: workbook {workbook_id} version {version_id} has an "
-                f"Ambyte programming cell ({len(macros)} macro(s)).")
+                f"Ambyte programming cell ({len(macros)} macro(s), "
+                f"{routed} with branch routing).")
         number = version.get("versionNumber", version.get("version"))
         return WorkbookProgramming(
             yaml_text=yaml_text,
@@ -420,6 +467,91 @@ class OpenJIIClient:
                               private_key_pem=key,
                               bundle_dir=bundle,
                               rotated=rotated)
+
+
+def _compile_macro_routing(branch_cells: list[dict],
+                           macros: list[WorkbookMacro],
+                           macro_index_by_cell: dict[str, int],
+                           command_cell_id) -> list[WorkbookMacro]:
+    """Fold the version's branch cells into per-macro `when:` blocks.
+
+    A branch path whose ``gotoCellId`` names a macro cell of the pinned
+    version becomes that macro's routing: its conditions must all read the
+    schedule COMMAND cell's output (that is what the publisher evaluates —
+    the row being published), stay within the device-addressable field/op
+    sets, and fit the device's cap of AND-ed conditions per macro. Paths
+    routing anywhere else in the workbook are none of the device's business
+    and are ignored. Macros no branch path targets keep ``when == ()`` —
+    they apply to every row, exactly as before this feature.
+
+    Anything the device cannot express raises OpenJIIError naming the branch
+    cell and path: a silently dropped or miscompiled condition misroutes
+    rows, which is worse than failing the install.
+    """
+    whens: dict[int, tuple[MacroCondition, ...]] = {}  # macros index → routing
+    for branch in branch_cells:
+        branch_id = branch.get("id") or "(no id)"
+        payload = branch.get("payload")
+        paths = payload.get("paths") if isinstance(payload, dict) else None
+        if not isinstance(paths, list):
+            raise OpenJIIError(
+                f"branch cell {branch_id} has no paths list — cannot check "
+                "its routing against the device contract.")
+        for index, path in enumerate(paths):
+            where = f"branch cell {branch_id} path {index}"
+            if not isinstance(path, dict):
+                raise OpenJIIError(f"{where} is not an object.")
+            goto = path.get("gotoCellId")
+            if goto not in macro_index_by_cell:
+                continue  # routes to a non-macro cell: web-side control flow
+            conditions = path.get("conditions") or []
+            if not isinstance(conditions, list):
+                raise OpenJIIError(f"{where} has a malformed conditions list.")
+            if len(conditions) > schedule_stamp.MAX_MACRO_CONDITIONS:
+                raise OpenJIIError(
+                    f"{where} has {len(conditions)} conditions — the device "
+                    f"expresses at most "
+                    f"{schedule_stamp.MAX_MACRO_CONDITIONS} AND-ed conditions "
+                    "per macro.")
+            compiled = []
+            for cond in conditions:
+                if not isinstance(cond, dict):
+                    raise OpenJIIError(f"{where} has a malformed condition.")
+                source = cond.get("sourceCellId")
+                if source != command_cell_id:
+                    raise OpenJIIError(
+                        f"{where} condition reads cell {source!r} — routing "
+                        "must be off the schedule command cell's output "
+                        f"({command_cell_id!r}), the row being published.")
+                field = cond.get("field")
+                if field not in schedule_stamp.MACRO_WHEN_FIELDS:
+                    raise OpenJIIError(
+                        f"{where} condition field {field!r} is not "
+                        "device-addressable (one of: "
+                        f"{', '.join(sorted(schedule_stamp.MACRO_WHEN_FIELDS))}).")
+                operator = cond.get("operator")
+                if operator not in schedule_stamp.MACRO_WHEN_OPS:
+                    raise OpenJIIError(
+                        f"{where} condition operator {operator!r} cannot be "
+                        "expressed on device (eq|neq only).")
+                value = cond.get("value")
+                if not isinstance(value, str):
+                    raise OpenJIIError(
+                        f"{where} condition value must be a string, got "
+                        f"{value!r}.")
+                compiled.append(MacroCondition(field=field, op=operator,
+                                               value=value))
+            target = macro_index_by_cell[goto]
+            if target in whens:
+                macro = macros[target]
+                raise OpenJIIError(
+                    f"macro '{macro.name}' ({macro.id}) is targeted by more "
+                    "than one branch path — the device expresses a single "
+                    "AND-ed condition set per macro, so web-side OR routing "
+                    "is not representable. Rework the workbook branches.")
+            whens[target] = tuple(compiled)
+    return [replace(macro, when=whens.get(i, ()))
+            for i, macro in enumerate(macros)]
 
 
 def _write_bundle(thing_name: str, creds: dict, log=print) -> Path:

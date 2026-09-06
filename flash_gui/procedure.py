@@ -226,11 +226,22 @@ def schedule_source(ctx: SessionContext, log=print) -> ScheduleSource:
 
     fw_version = getattr(ctx.release, "version", "") or ""
     if schedule_stamp.firmware_supports_macros(fw_version):
-        macros = programming.macros
-        log(f"Workbook programming: stamping workbookVersionId="
-            f"{programming.workbook_version_id} and {len(macros)} macro(s) "
-            f"(firmware {fw_version} ≥ "
-            f"{schedule_stamp.MACROS_HEADER_MIN_FW} knows the macros header).")
+        if schedule_stamp.firmware_supports_macro_when(fw_version):
+            macros = programming.macros
+            log(f"Workbook programming: stamping workbookVersionId="
+                f"{programming.workbook_version_id} and {len(macros)} macro(s) "
+                f"with branch routing (firmware {fw_version} ≥ "
+                f"{schedule_stamp.MACRO_WHEN_MIN_FW} evaluates when:).")
+        else:
+            # The header predates the publisher's when: support: stamp the
+            # same macro list with routing stripped — byte-identical to the
+            # pre-routing behaviour, so every row keeps every macro.
+            macros = tuple(m.without_when() for m in programming.macros)
+            log(f"Workbook programming: stamping workbookVersionId="
+                f"{programming.workbook_version_id} and {len(macros)} macro(s) "
+                f"WITHOUT when: routing — firmware {fw_version} predates "
+                f"{schedule_stamp.MACRO_WHEN_MIN_FW}, which introduced "
+                "per-macro routing. Macros apply to every row.")
     else:
         # Pre-stream-A firmware rejects the macros: key at boot and silently
         # falls back to the embedded default; stamping only the version id
