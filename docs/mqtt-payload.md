@@ -32,7 +32,7 @@ MQTT message, FIFO. QoS 1, retain 0, publish window of 16 slots / 64 KiB
 outstanding; delivery is **at-least-once** and the cloud does not dedupe —
 consumers dedupe on (`device_id`, `measure_id`).
 
-## 2. Envelope (outer object — Ambyte only, unchanged from v2)
+## 2. Envelope (outer object — Ambyte only, unchanged from v2 except the two additive optional provenance keys)
 
 ```jsonc
 {
@@ -40,6 +40,13 @@ consumers dedupe on (`device_id`, `measure_id`).
   "timestamp": "2026-08-05T21:26:00Z",  // event observation/start time as ISO-8601
   "device_battery": 3.912,              // volts; omitted if never read
   "timezone": "Europe/Amsterdam",       // NVS; omitted if unset
+  "workbook_version_id": "1c7b82b5-…",  // optional; present when the installed
+                                        // schedule header declares workbookVersionId
+  "macros": [                           // optional; present when the installed
+    { "id": "47b03f78-…",               // schedule header declares a macros: block
+      "name": "ambyte-trace",           // (≤ 8 entries, id always a uuid)
+      "filename": "macro_8feac276a118" }
+  ],
   "device_id":       "10:00:3B:72:22:44", // Ambyte STA MAC
   "device_name":     "AmbyteOnAir",
   "device_version":  "1",
@@ -55,6 +62,17 @@ time, not publish time): `time.start_utc` for `ambit.trace/3`, and
 envelope fields are populated exactly as in v2. `device_battery` is the latest
 gateway battery reading at envelope-build time and is not a replacement for
 the observation-time value in `ambyte.telemetry/1.health.power`.
+
+`workbook_version_id` and `macros` are the workbook provenance stamped into
+the schedule header at install time (the workbook → device → macro loop:
+`macros[].id` + `workbook_version_id` is the platform's per-row macro
+execution key). Each key is present only when the installed schedule header
+declares it; a schedule without them publishes **byte-identically** to before
+these fields existed. They are read from the running schedule **at publish
+time, not measure time**: a battery-backlogged event measured under schedule
+A but published after schedule B was installed carries B's provenance. Macro
+`id`/`name`/`filename` characters are restricted to `[A-Za-z0-9_.:-]` by the
+schedule compiler, so the envelope splices them unescaped.
 
 The schema belongs to the single `sample[0]` object. Producers MUST NOT put a
 schema tag on the outer envelope, mix v2 and v3 keys in one sample object, or

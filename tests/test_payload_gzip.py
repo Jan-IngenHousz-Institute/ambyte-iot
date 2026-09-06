@@ -21,7 +21,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Mirror of DC_V3_GZ_EVENT_ENVELOPE_FMT (device_commands.c). Keep in sync: the
+# Mirror of DC_V3_GZ_EVENT_ENVELOPE_FMT (device_commands/include/
+# envelope_provenance.h). Keep in sync: the
 # assertions below pin the transport contract the OpenJII ingest relies on.
 GZ_ENVELOPE_FMT = (
     '{{"sample":"{b64}","_sample_encoding":"gzip+base64",'

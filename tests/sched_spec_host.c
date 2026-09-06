@@ -682,6 +682,139 @@ static void test_compiler_rules(void)
         free(p);
     }
 
+    /* header macros: block — the workbook macro cells stamped at install.
+     * Valid list carried through the string pool … */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "workbookVersionId: 7b281a2e-d86a-4cc6-8268-81b67315f1ad\n"
+        "macros:\n"
+        "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+        "    name: ambyte-trace\n"
+        "    filename: macro_8feac276a118\n"
+        "  - id: 2EC3531A-D938-408B-AB77-6CD47AD86E59\n"
+        "    name: ambyte.spectrum_v2\n"
+        "    filename: macro_0123abcd:prod\n"
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      cron: \"0 */5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n");
+    CHECK(p != NULL);
+    if (p != NULL) {
+        CHECK(p->macro_count == 2);
+        const char *mid = sched_pool_str(p, p->macros[0].id_off);
+        const char *mnam = sched_pool_str(p, p->macros[0].name_off);
+        const char *mfn = sched_pool_str(p, p->macros[0].filename_off);
+        CHECK(mid != NULL && strcmp(mid, "47b03f78-a0d4-4b1d-bcd6-6e0b7d470040") == 0);
+        CHECK(mnam != NULL && strcmp(mnam, "ambyte-trace") == 0);
+        CHECK(mfn != NULL && strcmp(mfn, "macro_8feac276a118") == 0);
+        /* uppercase hex uuids are accepted (the platform is case-insensitive) */
+        mid = sched_pool_str(p, p->macros[1].id_off);
+        CHECK(mid != NULL && strcmp(mid, "2EC3531A-D938-408B-AB77-6CD47AD86E59") == 0);
+        mnam = sched_pool_str(p, p->macros[1].name_off);
+        CHECK(mnam != NULL && strcmp(mnam, "ambyte.spectrum_v2") == 0);
+        free(p);
+    }
+    /* … and strict on every shape rule. A minimal valid job is appended to
+     * each bad header so only the macros block can be the failure. */
+#define MACRO_JOB \
+    "jobs:\n" \
+    "  j:\n" \
+    "    schedule:\n" \
+    "      cron: \"0 */5 * * * *\"\n" \
+    "    steps:\n" \
+    "      - uses: device/log\n" \
+    "        with:\n" \
+    "          message: hi\n"
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: m1\n"
+    "    filename: f1\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470041\n"
+    "    name: m2\n"
+    "    filename: f2\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470042\n"
+    "    name: m3\n"
+    "    filename: f3\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470043\n"
+    "    name: m4\n"
+    "    filename: f4\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470044\n"
+    "    name: m5\n"
+    "    filename: f5\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470045\n"
+    "    name: m6\n"
+    "    filename: f6\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470046\n"
+    "    name: m7\n"
+    "    filename: f7\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470047\n"
+    "    name: m8\n"
+    "    filename: f8\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470048\n"
+    "    name: m9\n"
+    "    filename: f9\n"
+    MACRO_JOB,
+                "'macros' has 9 entries; the cap is 8");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: not-a-uuid\n"
+    "    name: ambyte-trace\n"
+    "    filename: macro_8feac276a118\n"
+    MACRO_JOB,
+                "macro 'id' must be a uuid");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78a0d44b1dbcd66e0b7d470040\n"
+    "    name: ambyte-trace\n"
+    "    filename: macro_8feac276a118\n"
+    MACRO_JOB,
+                "macro 'id' must be a uuid");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: ambyte-trace\n"
+    "    filename: macro_8feac276a118\n"
+    "    language: python\n"
+    MACRO_JOB,
+                "unknown macro key 'language'");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: 30m\n"
+    "    filename: macro_8feac276a118\n"
+    MACRO_JOB,
+                "macro 'name' must be a string");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: has space\n"
+    "    filename: macro_8feac276a118\n"
+    MACRO_JOB,
+                "may only contain [A-Za-z0-9_.:-]");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: ambyte-trace\n"
+    "    filename: \"quo\\\"ted\"\n"
+    MACRO_JOB,
+                "may only contain [A-Za-z0-9_.:-]");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros:\n"
+    "  - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040\n"
+    "    name: ambyte-trace\n"
+    MACRO_JOB,
+                "macro entry requires id, name and filename");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+    "macros: ambyte-trace\n"
+    MACRO_JOB,
+                "'macros' must be a block sequence");
+#undef MACRO_JOB
+
     /* Removed trigger aliases stay rejected: authored schedules use cron. */
     COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
     "jobs:\n"

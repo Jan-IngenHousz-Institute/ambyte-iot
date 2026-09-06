@@ -38,6 +38,7 @@
 
 #include "esp_err.h"
 #include "sched_spec.h"
+#include "schedule_provenance_port.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +87,21 @@ typedef struct {
     char version[32];
     char workbook[64];
     char name[48];
+    /* Explicit presence for the publish envelope: workbook spells "unset" as
+     * the CLI's "-" sentinel string, which an envelope consumer must never
+     * have to parse. has_workbook is the omit-when-unset signal. */
+    bool    has_workbook;
+    /* Header `macros:` list, compiled by sched_spec. Fixed-size and small on
+     * purpose: sched_runner_header() copies the whole snapshot under the
+     * lifecycle SPINLOCK, so the copy must stay bounded (8 × 136 B here).
+     * Widths mirror the compiler caps (36-char uuid id; ≤47-char name and
+     * filename) — nothing can truncate. */
+    uint8_t macro_count;
+    struct {
+        char id[40];
+        char name[48];
+        char filename[48];
+    } macros[SCHED_SPEC_MAX_MACROS];
 } sched_header_t;
 
 /* Load and start. Compiles /littlefs/schedule.yaml, falling back to the
@@ -126,6 +142,12 @@ esp_err_t sched_runner_stats(const char *job, sched_job_stats_t *out);
 esp_err_t sched_runner_header(sched_header_t *out);
 int       sched_runner_job_count(void);
 esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out);
+
+/* device_commands config port (schedule_provenance_port.h), wired in
+ * app_main: the publish envelope's workbook provenance, translated from the
+ * header snapshot. ESP_ERR_INVALID_STATE before the first start — the
+ * envelope then omits both provenance keys. */
+esp_err_t sched_runner_provenance_port(schedule_provenance_t *out);
 
 /* Compile-check a file without touching the running program (CLI
  * `schedule validate` on the staged /littlefs/schedule.yaml.new). err

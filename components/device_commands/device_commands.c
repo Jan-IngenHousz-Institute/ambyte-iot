@@ -13,6 +13,7 @@
 #include "ambit_protocol.h"
 #include "ambit_announcement.h"
 #include "clock_trust.h"
+#include "envelope_provenance.h"
 #include "payload_gzip.h"
 #include "payload_v3.h"
 #include "timezone.h"
@@ -58,34 +59,10 @@
 #define AMBYTE_PUBLISH_CAP_IS_DEFAULT 0
 #endif
 
-#define DC_EVENT_ENVELOPE_FMT \
-        "{\"sample\":[{" \
-            "\"v\":2,\"measure_id\":%lld,\"startTicks_UTC\":%lld,\"endTicks_UTC\":%lld," \
-            "\"timestamp_local\":\"%s\"," \
-            "\"published\":\"%s\",\"channel\":%s,\"device\":%s," \
-            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s" \
-        "}]," \
-        "\"timestamp\":\"%s\",%s%s" \
-        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
-        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
-
-#define DC_V3_EVENT_ENVELOPE_FMT \
-        "{\"sample\":[%s],\"timestamp\":\"%s\",%s%s" \
-        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
-        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
-
-/* Gzip transport variant of the v3 envelope, emitted only while the runtime
- * publish_gzip switch is on AND the compressed form is strictly smaller.
- * `sample` becomes base64(gzip("[<canonical v3 object>]")) — the exact JSON
- * text the plain envelope would splice — and `_sample_encoding` is the marker
- * the OpenJII Silver layer already reverses for the mobile uploader
- * (decompress_sample_value). The outer envelope stays plain JSON so broker
- * routing and raw storage are unaffected. */
-#define DC_V3_GZ_EVENT_ENVELOPE_FMT \
-        "{\"sample\":\"%s\",\"_sample_encoding\":\"gzip+base64\"," \
-        "\"timestamp\":\"%s\",%s%s" \
-        "\"device_id\":\"%s\",\"device_name\":\"%s\"," \
-        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}"
+/* The three DC_*_ENVELOPE_FMT format strings live in envelope_provenance.h
+ * (with the pure provenance-part builder) so the host test renders the REAL
+ * production formats — a malformed key here would otherwise pass every
+ * Python-side envelope reconstruction test. */
 
 /* Large-publish heap gate (Track 1) — see the gate in cmd_mqtt_publish_next_event.
  * An arrun envelope can now approach 64 KiB and needs an outbox copy plus a
@@ -1133,6 +1110,33 @@ static char *dc_gzip_sample_b64(const char *payload_json)
     return b64;
 }
 
+/* ── workbook provenance splice ──────────────────────────────────────── *
+ * One optional envelope part beside battpart/tzpart: "workbook_version_id"
+ * (the experiment's pinned workbook version — the platform's macro-execution
+ * join key) and "macros" (the workbook's macro cells, stamped into the
+ * schedule header at install time). The rendering is the pure, host-tested
+ * envelope_provenance_part(); this shim only fetches the schedule runner's
+ * header snapshot through the config port, once per publish, so a schedule
+ * reload takes effect on the next envelope. When the header declares
+ * neither key the part is empty and the envelope is byte-identical to today.
+ *
+ * Static, not stack: cmd_mqtt_publish_next_event has exactly one caller task
+ * (the sync_runner drain loop), and its 8 KiB stack already carries the
+ * claim/envelope path — 2.6 KiB of additional stack frame is not an option.
+ * s_wbpart is sized to the worst case documented in envelope_provenance.c
+ * (88 B workbook key + 1348 B macros key + slack), so the part can never be
+ * dropped for lack of room on a valid snapshot. */
+static schedule_provenance_t s_prov;
+static char s_wbpart[1440];
+
+static void dc_build_provenance_part(void)
+{
+    s_wbpart[0] = '\0';
+    if (s_cfg.schedule_provenance == NULL ||
+        s_cfg.schedule_provenance(&s_prov) != ESP_OK) return;
+    envelope_provenance_part(&s_prov, s_wbpart, sizeof(s_wbpart));
+}
+
 cmd_result_t cmd_mqtt_publish_next_event(void)
 {
     if (!s_initialized || s_cfg.publish == NULL ||
@@ -1251,6 +1255,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (s_cfg.timezone != NULL && s_cfg.timezone[0] != '\0') {
         snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", s_cfg.timezone);
     }
+    /* Workbook provenance ("" when the schedule header declares none — the
+     * envelope then stays byte-identical to an unstamped schedule). */
+    dc_build_provenance_part();
 
     const char *meta = e.metadata_json;          /* already a JSON object, or NULL */
     const char *fw   = s_cfg.device_firmware  ? s_cfg.device_firmware  : "";
@@ -1277,11 +1284,11 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     int n;
     if (canonical_v3) {
         n = snprintf(NULL, 0, DC_V3_EVENT_ENVELOPE_FMT,
-                     e.payload_json, meas_ts, battpart, tzpart,
+                     e.payload_json, meas_ts, battpart, tzpart, s_wbpart,
                      s_mac_str, dn, dv, fw);
         if (gz_b64 != NULL) {
             int n_gz = snprintf(NULL, 0, DC_V3_GZ_EVENT_ENVELOPE_FMT,
-                                gz_b64, meas_ts, battpart, tzpart,
+                                gz_b64, meas_ts, battpart, tzpart, s_wbpart,
                                 s_mac_str, dn, dv, fw);
             /* Keep gzip only when strictly smaller: base64 costs 4/3× and tiny
              * telemetry objects can lose to their own gzip header. */
@@ -1297,7 +1304,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
             (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
             meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
             meta ? meta : "null", e.payload_json,
-            meas_ts, battpart, tzpart,
+            meas_ts, battpart, tzpart, s_wbpart,
             s_mac_str, dn, dv, fw);
     }
     if (n < 0) {
@@ -1389,18 +1396,18 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
 
     if (canonical_v3 && gz_b64 != NULL) {
         n = snprintf(payload, cap, DC_V3_GZ_EVENT_ENVELOPE_FMT,
-                     gz_b64, meas_ts, battpart, tzpart,
+                     gz_b64, meas_ts, battpart, tzpart, s_wbpart,
                      s_mac_str, dn, dv, fw);
     } else if (canonical_v3) {
         n = snprintf(payload, cap, DC_V3_EVENT_ENVELOPE_FMT,
-                     e.payload_json, meas_ts, battpart, tzpart,
+                     e.payload_json, meas_ts, battpart, tzpart, s_wbpart,
                      s_mac_str, dn, dv, fw);
     } else {
         n = snprintf(payload, cap, DC_EVENT_ENVELOPE_FMT,
             (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
             meas_local, pub_ts, chanbuf, devbuf, cmdfield, e.tag,
             meta ? meta : "null", e.payload_json,
-            meas_ts, battpart, tzpart,
+            meas_ts, battpart, tzpart, s_wbpart,
             s_mac_str, dn, dv, fw);
     }
     free(cmdbuf);

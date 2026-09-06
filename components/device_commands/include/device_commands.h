@@ -11,6 +11,7 @@
 #include "ambit_announcement_port.h"
 #include "messaging_port.h"
 #include "persistence_port.h"
+#include "schedule_provenance_port.h"
 #include "sensing_port.h"
 #include "script_identity_port.h"
 #include "uart_sensor_port.h"
@@ -96,6 +97,15 @@ typedef struct {
      * the envelope encoding changes; storage and the legacy v2 path never
      * compress. */
     bool                              (*publish_gzip_enabled)(void);
+
+    /* Schedule-header provenance for the publish envelope (the workbook →
+     * device → macro loop): fills the "workbook_version_id" and "macros"
+     * splice, read once per publish so a schedule reload takes effect without
+     * a reboot. NULL or any error = omit both keys and the envelope stays
+     * byte-identical to today. A function pointer, not a direct
+     * sched_runner call, because sched_runner already depends on this
+     * component — the composition root (app_main) wires the two. */
+    schedule_provenance_fn              schedule_provenance;
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);

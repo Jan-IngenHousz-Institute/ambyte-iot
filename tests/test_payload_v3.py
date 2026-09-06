@@ -412,6 +412,31 @@ class PayloadV3Test(unittest.TestCase):
         self.assertLess(announcement.index("free(payload)"),
                         announcement.index("ambit_announce_stage(announce_slot, e, mid)"))
 
+        # Workbook provenance splice (the workbook → device → macro loop). The
+        # three production formats live in envelope_provenance.h so the host
+        # test renders the real strings; each takes the provenance part as a
+        # third optional splice beside battpart/tzpart. The byte-locked
+        # no-header path and the rendered-JSON contract are asserted in
+        # tests/test_envelope_provenance.py against these exact macros.
+        env_header = (ROOT / "components/device_commands/include/envelope_provenance.h").read_text()
+        for fmt in ("DC_EVENT_ENVELOPE_FMT", "DC_V3_EVENT_ENVELOPE_FMT",
+                    "DC_V3_GZ_EVENT_ENVELOPE_FMT"):
+            body = env_header.split(f"#define {fmt}", 1)[1].split("\n\n", 1)[0]
+            self.assertIn('%s%s%s', body, fmt)
+        self.assertEqual(publisher.count("s_wbpart"), 6)  # 3 pre-size + 3 real snprintf
+        self.assertIn("dc_build_provenance_part();", publisher)
+        self.assertIn("envelope_provenance_part(&s_prov, s_wbpart, sizeof(s_wbpart));", source)
+        prov_source = (ROOT / "components/device_commands/envelope_provenance.c").read_text()
+        self.assertIn('"\\"workbook_version_id\\":\\"%s\\","', prov_source)
+        self.assertIn('"\\"macros\\":["', prov_source)
+        # app_main (composition root) wires the sched_runner adapter — a direct
+        # call from device_commands would close the component cycle.
+        app_main = (ROOT / "main/app_main.c").read_text()
+        self.assertIn(".schedule_provenance    = sched_runner_provenance_port,", app_main)
+        runner_header = (ROOT / "components/sched_runner/include/sched_runner.h").read_text()
+        self.assertIn("bool    has_workbook;", runner_header)
+        self.assertIn("macros[SCHED_SPEC_MAX_MACROS];", runner_header)
+
 
 if __name__ == "__main__":
     unittest.main()
