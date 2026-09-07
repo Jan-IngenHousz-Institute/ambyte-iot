@@ -35,6 +35,10 @@ macros:                           # optional; ≤ 8 entries
   - id: 47b03f78-a0d4-4b1d-bcd6-6e0b7d470040  # uuid, required per entry
     name: ambyte-trace            # required; ≤ 47 chars, [A-Za-z0-9_.:-] only
     filename: macro_8feac276a118  # required; ≤ 47 chars, [A-Za-z0-9_.:-] only
+    when:                         # optional; ≤ 4 AND-ed conditions
+      - field: schema             # closed set, see below
+        op: eq                    # eq | neq
+        value: ambit.trace/3      # ≤ 47 chars, [A-Za-z0-9_.:/-] only
 ```
 
 `workbookVersionId` and `macros` are not authored by hand: whatever installs
@@ -47,6 +51,53 @@ execution on `macros[].id` + `workbook_version_id`. The character restriction
 exists because the envelope splices the strings without JSON escaping.
 `macros:` entries with unknown keys, non-string values, or a non-uuid `id`
 are compile errors, as is a ninth entry.
+
+### Per-macro `when:` routing
+
+The platform writes one output row per (published row, macro), so a macro
+that only makes sense for one payload family would otherwise fill its table
+with empty rows. `when:` is how a macro says which rows it applies to: a
+block sequence of at most 4 `{field, op, value}` mappings, **all** of which
+must hold for the publisher to list that macro in a row's envelope. A macro
+with no `when:` applies to every row, which is what every schedule stamped
+before this feature does, so nothing already in the field changes behaviour.
+
+- `field` is one of `schema`, `tag`, `channel`, `device`, `sensor_id`,
+  `protocol.name`, `protocol.tag`. Anything else is a compile error: an
+  unaddressable field would misfire silently on every row instead of failing
+  at install.
+- `op` is `eq` or `neq`. `gt`/`lt`/`gte`/`lte` are rejected with an explicit
+  "not supported yet" error rather than being accepted as string comparisons.
+- `value` is a string of `[A-Za-z0-9_.:/-]`, ≤ 47 chars. `/` is in the set
+  only here, because schema ids like `ambit.trace/3` need it; macro
+  `name`/`filename` keep the narrower alphabet.
+- An **absent** field makes `eq` false and `neq` true, so a "legacy v2 rows
+  only" macro is four `schema neq` conditions, exactly filling the cap.
+
+`when:` is not hand-authored either: the flash GUI compiles it from the pinned
+workbook version's BRANCH cells, mapping each path whose `gotoCellId` is a
+macro cell into that macro's conditions (`flash_gui/openjii_client.py`
+`_compile_macro_routing`). Two rules decide what happens to a path:
+
+- **Skipped**, leaving the macro unrouted (= applies to every row): paths that
+  lead anywhere but a macro cell, paths with no `gotoCellId`, and paths whose
+  conditions read a cell other than the schedule command cell. That last one
+  is deliberate — one workbook legitimately drives the mobile flow and the
+  Ambyte at once, and a mobile branch into a shared macro cell must not fail
+  the Ambyte install. A conditionless path (the branch's default) likewise
+  compiles to "every row", which is why `defaultPathId` needs no special
+  handling.
+- **Fails the install**: content the device cannot express on a path it would
+  otherwise compile — an unknown field, an ordering operator, more than four
+  conditions, or two paths targeting one macro (the device holds a single
+  AND-ed set per macro, so web-side OR routing is not representable).
+
+Branch compilation runs only when the firmware about to be flashed is at or
+above `schedule_stamp.MACRO_WHEN_MIN_FW`. Below it — and for an unknown
+version, which fails closed the same way — the branches are not read at all
+and the same macros are stamped without `when:`, so a fleet that will never
+evaluate the routing cannot be blocked by a workbook it cannot express. See
+`docs/mqtt-payload.md` §2.1 for the resulting wire shapes.
 
 Per-device latitude, longitude, timezone, deployment, and identity belong in
 NVS `device_config`; never fork a schedule per site for those values.

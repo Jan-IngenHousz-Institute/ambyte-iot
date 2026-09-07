@@ -37,8 +37,11 @@ class _FakeLabel:
         self.options.update(kw)
 
 
-def _app(current_id="exp-B", pending="exp-B"):
+def _app(current_id="exp-B", pending="exp-B", release=None):
     app = object.__new__(gui.App)
+    # The release drives whether branch routing is compiled, so the lookup
+    # reads it; App.__init__ always sets the attribute, None until fetched.
+    app.release = release
     app.programming = None
     app.programming_experiment_id = None
     app.programming_override = False
@@ -108,7 +111,7 @@ def test_unexpected_worker_exception_unblocks_onboarding(monkeypatch):
     messages = []
     app.log = messages.append
 
-    def broken(_experiment_id):
+    def broken(_experiment_id, **_kwargs):
         raise json.JSONDecodeError("Expecting value", "doc", 0)
 
     _resolve_with(monkeypatch, app,
@@ -119,10 +122,35 @@ def test_unexpected_worker_exception_unblocks_onboarding(monkeypatch):
     assert any("JSONDecodeError" in m for m in messages)
 
 
+def test_the_lookup_passes_the_flashed_release_version_through(monkeypatch):
+    # Branch routing compiles only for firmware that evaluates when:, so the
+    # lookup has to tell the client which firmware this session will flash.
+    seen = {}
+
+    def capture(experiment_id, **kwargs):
+        seen.update(kwargs, experiment_id=experiment_id)
+        return _prog()
+
+    app = _app(current_id="exp-B", pending=None,
+               release=SimpleNamespace(version="2.2.0"))
+    _resolve_with(monkeypatch, app,
+                  SimpleNamespace(resolve_programming=capture))
+    assert seen["experiment_id"] == "exp-B"
+    assert seen["fw_version"] == "2.2.0"
+
+    # Release not fetched yet: "" is fail-closed, and schedule_source refuses
+    # to stamp the resulting uncompiled snapshot onto when:-capable firmware.
+    seen.clear()
+    app = _app(current_id="exp-B", pending=None, release=None)
+    _resolve_with(monkeypatch, app,
+                  SimpleNamespace(resolve_programming=capture))
+    assert seen["fw_version"] == ""
+
+
 def test_openjii_error_keeps_its_own_message(monkeypatch):
     app = _app(current_id="exp-B", pending=None)
 
-    def refused(_experiment_id):
+    def refused(_experiment_id, **_kwargs):
         raise OpenJIIError("the API key was rejected")
 
     _resolve_with(monkeypatch, app,

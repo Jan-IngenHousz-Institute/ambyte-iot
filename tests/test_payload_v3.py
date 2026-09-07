@@ -424,8 +424,14 @@ class PayloadV3Test(unittest.TestCase):
             body = env_header.split(f"#define {fmt}", 1)[1].split("\n\n", 1)[0]
             self.assertIn('%s%s%s', body, fmt)
         self.assertEqual(publisher.count("s_wbpart"), 6)  # 3 pre-size + 3 real snprintf
-        self.assertIn("dc_build_provenance_part();", publisher)
-        self.assertIn("envelope_provenance_part(&s_prov, s_wbpart, sizeof(s_wbpart));", source)
+        # Built ONCE per publish, before the sizing sites, and fed this row's
+        # payload so the six s_wbpart splices above all see the same
+        # per-row-filtered part (the exact-pre-sizing invariant).
+        self.assertEqual(publisher.count("dc_build_provenance_part("), 1)
+        self.assertIn("dc_build_provenance_part(e.payload_json);", publisher)
+        self.assertIn(
+            "envelope_provenance_part(&s_prov, payload_json, s_wbpart, sizeof(s_wbpart));",
+            source)
         prov_source = (ROOT / "components/device_commands/envelope_provenance.c").read_text()
         self.assertIn('"\\"workbook_version_id\\":\\"%s\\","', prov_source)
         self.assertIn('"\\"macros\\":["', prov_source)

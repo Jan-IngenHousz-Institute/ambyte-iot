@@ -47,9 +47,13 @@ class EnvelopeProvenanceTest(unittest.TestCase):
             "-fno-omit-frame-pointer",
             f"-I{ROOT / 'components/device_commands/include'}",
             f"-I{ROOT / 'components/domain/include'}",
+            f"-I{ROOT / 'components/payload_codec/include'}",
             f"-I{ROOT / 'tests/host_stubs'}",
             str(ROOT / "tests/envelope_provenance_host.c"),
             str(ROOT / "components/device_commands/envelope_provenance.c"),
+            # the real scanner the per-row `when:` filter routes with, not a
+            # stub: a scanner that mis-reads a key would misroute every row
+            str(ROOT / "components/payload_codec/payload_scalar.c"),
             "-o",
             str(binary),
         ]
@@ -94,6 +98,27 @@ class EnvelopeProvenanceTest(unittest.TestCase):
                 raw = self.envelopes[key]
                 self.assertLess(raw.index('"workbook_version_id"'),
                                 raw.index('"device_id"'))
+
+    def test_routed_rows_carry_only_their_own_macro(self) -> None:
+        # The feature's wire contract: openJII runs, per published row,
+        # exactly the macros that row's envelope lists. One header with three
+        # schema-conditioned macros, three different rows.
+        trace = json.loads(self.envelopes["V3_ROUTED_TRACE"])
+        self.assertEqual(trace["sample"][0]["schema"], "ambit.trace/3")
+        self.assertEqual([m["name"] for m in trace["macros"]], ["ambyte-trace"])
+        self.assertEqual(trace["workbook_version_id"], WB_ID)
+
+        tele = json.loads(self.envelopes["V3_ROUTED_TELEMETRY"])
+        self.assertEqual(tele["sample"][0]["schema"], "ambyte.telemetry/1")
+        self.assertEqual([m["name"] for m in tele["macros"]],
+                         ["ambyte-telemetry"])
+        self.assertEqual(tele["macros"][0]["filename"], "macro_tele03")
+
+        # a v2 backlog row matches none of the three: no macros key at all,
+        # but the workbook id still identifies the pinned version
+        v2 = json.loads(self.envelopes["V2_ROUTED_UNMATCHED"])
+        self.assertNotIn("macros", v2)
+        self.assertEqual(v2["workbook_version_id"], WB_ID)
 
     def test_no_provenance_envelope_is_byte_identical_to_today(self) -> None:
         raw = self.envelopes["V3_NOPROV"]

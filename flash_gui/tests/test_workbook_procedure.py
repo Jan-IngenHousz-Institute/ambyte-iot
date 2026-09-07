@@ -17,7 +17,8 @@ import pytest
 
 from flash_gui import ambyte_serial, procedure, schedule_stamp
 from flash_gui.ambyte_serial import AmbyteConsole, ScheduleReleaseStatus
-from flash_gui.openjii_client import WorkbookMacro, WorkbookProgramming
+from flash_gui.openjii_client import (MacroCondition, WorkbookMacro,
+                                      WorkbookProgramming)
 from flash_gui.procedure import ProcedureError
 
 VERSION_ID = "1c7b82b5-0000-1111-2222-333333333333"
@@ -42,11 +43,12 @@ CATALOG = SimpleNamespace(
     asset_url="https://example.test/default.yaml", size_bytes=6731)
 
 
-def _programming(version_number=3, macros=(MACRO,)):
+def _programming(version_number=3, macros=(MACRO,), routing_compiled=True):
     return WorkbookProgramming(
         yaml_text=SCHEDULE_YAML, workbook_id="wb-id",
         workbook_version_id=VERSION_ID,
-        workbook_version_number=version_number, macros=macros)
+        workbook_version_number=version_number, macros=macros,
+        routing_compiled=routing_compiled)
 
 
 def _ctx(programming=None, fw="2.1.0"):
@@ -105,10 +107,56 @@ def test_macros_are_gated_on_the_flashed_firmware():
 
     messages = []
     source = procedure.schedule_source(_ctx(programming=_programming(),
-                                            fw="2.1.0"),
+                                            fw="2.2.0"),
                                        log=messages.append)
     assert b"macros:" in source.blob
-    assert any("2.1.0" in m and "macro(s)" in m for m in messages)
+    assert any("2.2.0" in m and "macro(s)" in m for m in messages)
+
+
+ROUTED_MACRO = WorkbookMacro(
+    id="47b03f78-1111-2222-3333-444455556666", name="ambyte-trace",
+    filename="macro_8feac276a118",
+    when=(MacroCondition(field="schema", op="eq", value="ambit.trace/3"),))
+
+
+def test_when_routing_is_gated_separately_on_the_flashed_firmware():
+    # 2.1.x knows the macros header but not when:: the same list is stamped
+    # with the routing stripped, byte-identical to the unrouted output.
+    messages = []
+    source = procedure.schedule_source(
+        _ctx(programming=_programming(macros=(ROUTED_MACRO,)), fw="2.1.0"),
+        log=messages.append)
+    assert b"macros:" in source.blob
+    assert b"when:" not in source.blob
+    assert b"ambit.trace/3" not in source.blob
+    assert any("WITHOUT when: routing" in m for m in messages)
+    assert source.blob == _stamped().encode("utf-8")
+
+    source = procedure.schedule_source(
+        _ctx(programming=_programming(macros=(ROUTED_MACRO,)), fw="2.2.0"),
+        log=lambda _m: None)
+    assert b"when:" in source.blob
+    assert b"ambit.trace/3" in source.blob
+
+
+def test_a_snapshot_resolved_without_routing_never_installs_on_when_firmware():
+    # The workbook lookup compiles routing only for firmware that evaluates
+    # it, so a snapshot resolved before the release was known carries when ==
+    # () for that reason, not because the workbook declares no routing.
+    # Stamping it onto when:-capable firmware would publish every macro on
+    # every row while looking like the workbook declares no branches at all.
+    ctx = _ctx(programming=_programming(macros=(MACRO,),
+                                        routing_compiled=False), fw="2.2.0")
+    with pytest.raises(schedule_stamp.ScheduleStampError,
+                       match="Re-select the experiment"):
+        procedure.schedule_source(ctx, log=lambda _m: None)
+
+    # Below the gate the same snapshot installs exactly as it does today.
+    source = procedure.schedule_source(
+        _ctx(programming=_programming(macros=(MACRO,), routing_compiled=False),
+             fw="2.1.0"),
+        log=lambda _m: None)
+    assert source.blob == _stamped().encode("utf-8")
 
 
 # ── the serial install path ──────────────────────────────────────────────────

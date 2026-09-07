@@ -93,14 +93,24 @@ typedef struct {
     bool    has_workbook;
     /* Header `macros:` list, compiled by sched_spec. Fixed-size and small on
      * purpose: sched_runner_header() copies the whole snapshot under the
-     * lifecycle SPINLOCK, so the copy must stay bounded (8 × 136 B here).
-     * Widths mirror the compiler caps (36-char uuid id; ≤47-char name and
-     * filename) — nothing can truncate. */
+     * lifecycle SPINLOCK, so the copy must stay bounded (8 × ~340 B here,
+     * up from ~140 B before per-macro `when:` conditions). Widths mirror the
+     * compiler caps (36-char uuid id; ≤47-char name, filename and condition
+     * values) — nothing can truncate. */
     uint8_t macro_count;
     struct {
         char id[40];
         char name[48];
         char filename[48];
+        /* Compiled `when:` conditions (sched_spec.h's sched_macro_t.conds),
+         * materialized so the envelope's per-row filter never has to walk the
+         * program pool. cond_count == 0 = macro applies to every row. */
+        uint8_t cond_count;
+        struct {
+            uint8_t field;     /* sched_cond_field_t */
+            uint8_t op;        /* sched_cond_op_t */
+            char    value[48];
+        } conds[SCHED_SPEC_MAX_MACRO_CONDS];
     } macros[SCHED_SPEC_MAX_MACROS];
 } sched_header_t;
 

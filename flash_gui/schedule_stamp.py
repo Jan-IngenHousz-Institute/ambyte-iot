@@ -25,6 +25,14 @@ silently falls back to the embedded default (sched_runner.c), so callers stamp
 ``workbookVersionId`` always and ``macros:`` only when the flashed firmware is
 new enough — see MACROS_HEADER_MIN_FW and firmware_supports_macros().
 
+Each macro can carry a ``when:`` block of AND-ed routing conditions compiled
+from the workbook's BRANCH cells (see openjii_client.resolve_programming); a
+macro without ``when:`` applies to every row. The publisher-side support for
+``when:`` lands after the header itself, so it has its own gate —
+MACRO_WHEN_MIN_FW and firmware_supports_macro_when(); below it the caller
+stamps the same macros with the routing stripped, byte-identical to the
+pre-routing behaviour.
+
 Validation can run the result through the same compiler sources the device
 builds (tools/sched_host.c over components/sched_spec). It is OPTIONAL: when
 the source tree or a C compiler is unavailable (the packaged GUI ships
@@ -54,6 +62,15 @@ SCHEMA_PREFIX = "jii.ambyte-schedule/"
 # header already accepts it.
 MACROS_HEADER_MIN_FW = "2.1.0"
 
+# First firmware release whose publisher evaluates the per-macro `when:`
+# routing block: the next minor after MACROS_HEADER_MIN_FW, because that is
+# what semantic-release derives from a `feat:` PR title. Confirm at release
+# time — semantic-release reads the MERGED title, so a `fix:` title (2.1.1) or
+# another feat landing first (2.3.0) moves the real version. Wrong-high strips
+# routing and the feature goes inert but safe; wrong-low stamps `when:` onto
+# firmware that rejects the key at boot and falls back to the embedded default.
+MACRO_WHEN_MIN_FW = "2.2.0"
+
 # The macro contract the stream-A device compiler enforces (verified against
 # its sched_host build in review D): uuid-shaped ids, names/filenames of
 # [A-Za-z0-9_.:-] up to 47 chars, at most 8 entries. Validated host-side so a
@@ -64,6 +81,19 @@ MACRO_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,47}$")
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+# The device-side `when:` contract: at most 4 AND-ed conditions per macro,
+# each {field, op, value} with field/op from the closed sets the published
+# row can address (ordering comparisons gt/lt/gte/lte are rejected by the
+# device, so they never appear here) and value a short printable string —
+# '/' is in the charset deliberately, schema ids like ambit.trace/3 need it.
+MAX_MACRO_CONDITIONS = 4
+MACRO_WHEN_FIELDS = frozenset({
+    "schema", "tag", "channel", "device", "sensor_id",
+    "protocol.name", "protocol.tag",
+})
+MACRO_WHEN_OPS = frozenset({"eq", "neq"})
+MACRO_WHEN_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,47}$")
 
 # Top-level keys the stamping owns and therefore replaces on a re-stamp.
 _STAMPED_KEYS = ("workbookVersionId", "macros")
@@ -116,6 +146,32 @@ def validate_macro_contract(workbook_version_id: str, macros) -> None:
                 raise MacroContractError(
                     f"macro {field_name} {value!r} must match "
                     f"{MACRO_NAME_RE.pattern} (macro id {macro.id})")
+        when = tuple(getattr(macro, "when", ()) or ())
+        if len(when) > MAX_MACRO_CONDITIONS:
+            raise MacroContractError(
+                f"macro {macro.id} when: {len(when)} conditions exceed the "
+                f"device cap of {MAX_MACRO_CONDITIONS}")
+        seen = set()
+        for cond in when:
+            if cond.field not in MACRO_WHEN_FIELDS:
+                raise MacroContractError(
+                    f"macro {macro.id} when field {cond.field!r} is not "
+                    "device-addressable (one of: "
+                    f"{', '.join(sorted(MACRO_WHEN_FIELDS))})")
+            if cond.op not in MACRO_WHEN_OPS:
+                raise MacroContractError(
+                    f"macro {macro.id} when op {cond.op!r} is not expressible "
+                    "on device (eq|neq only)")
+            if not MACRO_WHEN_VALUE_RE.fullmatch(cond.value or ""):
+                raise MacroContractError(
+                    f"macro {macro.id} when value {cond.value!r} must match "
+                    f"{MACRO_WHEN_VALUE_RE.pattern}")
+            key = (cond.field, cond.op, cond.value)
+            if key in seen:
+                raise MacroContractError(
+                    f"macro {macro.id} when repeats the exact condition "
+                    f"{cond.field} {cond.op} {cond.value!r}")
+            seen.add(key)
 
 
 def is_schedule_yaml(text: str) -> bool:
@@ -129,6 +185,17 @@ def is_schedule_yaml(text: str) -> bool:
         return False
     value = match.group(1).strip().strip('"').strip("'")
     return value.startswith(SCHEMA_PREFIX)
+
+
+# Top-level `macros:` in the AUTHORED command cell. Routing is compiled from
+# the workbook's branch cells now, so an authored block is a stale source of
+# truth and resolve_programming rejects it outright.
+_AUTHORED_MACROS_RE = re.compile(r"(?m)^macros:")
+
+
+def has_authored_macros_block(text: str) -> bool:
+    """True when schedule text carries a top-level authored `macros:` key."""
+    return _AUTHORED_MACROS_RE.search(text or "") is not None
 
 
 def parse_fw_version(text: str) -> tuple[int, int, int, str] | None:
@@ -145,21 +212,32 @@ def parse_fw_version(text: str) -> tuple[int, int, int, str] | None:
             match.group(4) or "")
 
 
-def firmware_supports_macros(fw_version: str) -> bool:
-    """True when the flashed firmware's compiler accepts the macros: header.
-
-    An unparseable version fails closed: silently dropping the macro list is
-    exactly the failure this gate exists to prevent. Semver ordering applies:
-    a prerelease of exactly the floor version (2.1.0-rc1) predates the final
-    and does NOT pass.
-    """
+def _fw_at_least(fw_version: str, minimum: str) -> bool:
+    """Semver floor check. An unparseable version fails closed: silently
+    dropping a header feature is exactly the failure these gates exist to
+    prevent. A prerelease of exactly the floor version (2.1.0-rc1) predates
+    the final and does NOT pass."""
     parsed = parse_fw_version(fw_version)
-    minimum = parse_fw_version(MACROS_HEADER_MIN_FW)
+    floor = parse_fw_version(minimum)
     if parsed is None:
         return False
-    if parsed[:3] != minimum[:3]:
-        return parsed[:3] > minimum[:3]
+    if parsed[:3] != floor[:3]:
+        return parsed[:3] > floor[:3]
     return parsed[3] == ""
+
+
+def firmware_supports_macros(fw_version: str) -> bool:
+    """True when the flashed firmware's compiler accepts the macros: header."""
+    return _fw_at_least(fw_version, MACROS_HEADER_MIN_FW)
+
+
+def firmware_supports_macro_when(fw_version: str) -> bool:
+    """True when the flashed firmware's publisher evaluates per-macro `when:`.
+
+    Same fail-closed semantics as firmware_supports_macros: below the gate the
+    caller stamps the same macros with the routing stripped.
+    """
+    return _fw_at_least(fw_version, MACRO_WHEN_MIN_FW)
 
 
 def _yaml_scalar(value: str) -> str:
@@ -224,7 +302,11 @@ def _without_macros(text: str) -> str:
 
 def stamped_block(workbook_version_id: str, macros, newline: str = "\n"
                   ) -> list[str]:
-    """The inserted header lines: block style, 2-space indent, never flow."""
+    """The inserted header lines: block style, 2-space indent, never flow.
+
+    `when:` conditions are emitted as a nested block sequence under their
+    macro — the device-side parser is block-only, so no flow ``[...]``.
+    """
     lines = [f"workbookVersionId: {_yaml_scalar(workbook_version_id)}{newline}"]
     if macros:
         lines.append(f"macros:{newline}")
@@ -233,6 +315,16 @@ def stamped_block(workbook_version_id: str, macros, newline: str = "\n"
             lines.append(f"    name: {_yaml_scalar(macro.name)}{newline}")
             lines.append(
                 f"    filename: {_yaml_scalar(macro.filename)}{newline}")
+            when = tuple(getattr(macro, "when", ()) or ())
+            if when:
+                lines.append(f"    when:{newline}")
+                for cond in when:
+                    lines.append(
+                        f"      - field: {_yaml_scalar(cond.field)}{newline}")
+                    lines.append(
+                        f"        op: {_yaml_scalar(cond.op)}{newline}")
+                    lines.append(
+                        f"        value: {_yaml_scalar(cond.value)}{newline}")
     return lines
 
 

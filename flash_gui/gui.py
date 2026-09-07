@@ -578,7 +578,14 @@ class App(ttk.Frame):
 
         def work():
             try:
-                prog = self.client.resolve_programming(experiment.id)
+                # The release drives whether branch routing is compiled at
+                # all, so pass it through; "" (release not fetched yet) is
+                # fail-closed and procedure.schedule_source refuses to stamp
+                # such a snapshot onto when:-capable firmware.
+                prog = self.client.resolve_programming(
+                    experiment.id,
+                    fw_version=getattr(self.release, "version", "") or "",
+                    log=self.log)
             except OpenJIIError as exc:
                 self._post(self._apply_programming_error, experiment.id,
                            str(exc))

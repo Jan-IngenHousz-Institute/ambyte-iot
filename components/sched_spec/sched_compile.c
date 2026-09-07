@@ -100,8 +100,9 @@ static sched_entry_t *entry_add(ctx_t *c, const sched_node_t *n)
  * and nowhere else. */
 
 /* name/filename fit the publish-envelope snapshot fields (sched_header_t's
- * char[48]) — a longer string would silently truncate on the wire. */
-#define MACRO_FIELD_CAP 47
+ * char[48]) — a longer string would silently truncate on the wire. Defined in
+ * sched_spec.h so sched_runner.c can compile-assert that coupling. */
+#define MACRO_FIELD_CAP SCHED_SPEC_MACRO_FIELD_CAP
 
 /* 8-4-4-4-12 hex (either case). The platform keys macro execution per row on
  * this id, so a mistyped id must fail at install/CI time, not at ingest. */
@@ -125,28 +126,163 @@ static bool macro_id_is_uuid(const char *s)
  * escaping pass on every publish is not worth its code size when the set of
  * legitimate characters is this small. Restricting the alphabet HERE, at
  * compile time, is what makes the unescaped splice provably safe. */
-static bool macro_str_safe(const char *s)
+static bool str_safe_alpha(const char *s, bool allow_slash)
 {
     if (*s == '\0') return false;
     for (; *s != '\0'; s++) {
         char ch = *s;
         bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
                   (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' ||
-                  ch == ':' || ch == '-';
+                  ch == ':' || ch == '-' || (allow_slash && ch == '/');
         if (!ok) return false;
+    }
+    return true;
+}
+
+static bool macro_str_safe(const char *s)
+{
+    return str_safe_alpha(s, false);
+}
+
+/* when-values get '/' on top of the macro alphabet because the fields they
+ * compare against are payload content, not stamped tooling strings: schema
+ * ids like "ambit.trace/3" cannot be written without it. '/' needs no JSON
+ * escaping, so the deviation does not weaken the splice-safety argument — but
+ * it is deliberately NOT extended to id/name/filename, whose narrower
+ * alphabet is the long-standing envelope contract. */
+static bool macro_when_value_safe(const char *s)
+{
+    return str_safe_alpha(s, true);
+}
+
+/* One `when:` condition: {field, op, value}, all three required, no other
+ * keys — the same strictness idiom as the macro entry itself. */
+static bool compile_macro_cond(ctx_t *c, const sched_node_t *item,
+                               sched_macro_t *m)
+{
+    if (item->kind != SCHED_NODE_MAP) {
+        cerr(c, item, "macro 'when' condition must be a mapping "
+             "{field, op, value}");
+        return false;
+    }
+    static const char *const k_keys[] = { "field", "op", "value" };
+    const sched_node_t *vals[3];
+    for (int f = 0; f < 3; f++) vals[f] = map_get(item, k_keys[f]);
+    if (vals[0] == NULL || vals[1] == NULL || vals[2] == NULL) {
+        cerr(c, item, "macro 'when' condition requires field, op and value");
+        return false;
+    }
+    for (int k = 0; k < item->u.m.count; k++) {
+        const char *key = item->u.m.pairs[k].key;
+        if (strcmp(key, "field") != 0 && strcmp(key, "op") != 0 &&
+            strcmp(key, "value") != 0) {
+            cerr(c, item->u.m.pairs[k].value,
+                 "unknown macro 'when' key '%s'", key);
+            return false;
+        }
+    }
+    static const struct { const char *name; uint8_t field; } k_fields[] = {
+        { "schema",        SCHED_COND_FIELD_SCHEMA },
+        { "tag",           SCHED_COND_FIELD_TAG },
+        { "channel",       SCHED_COND_FIELD_CHANNEL },
+        { "device",        SCHED_COND_FIELD_DEVICE },
+        { "sensor_id",     SCHED_COND_FIELD_SENSOR_ID },
+        { "protocol.name", SCHED_COND_FIELD_PROTOCOL_NAME },
+        { "protocol.tag",  SCHED_COND_FIELD_PROTOCOL_TAG },
+    };
+    const char *field = node_text(vals[0]);
+    uint8_t cond_field = 0;
+    bool field_ok = false;
+    for (size_t k = 0; k < sizeof(k_fields) / sizeof(k_fields[0]); k++) {
+        if (field != NULL && strcmp(field, k_fields[k].name) == 0) {
+            cond_field = k_fields[k].field;
+            field_ok = true;
+            break;
+        }
+    }
+    if (!field_ok) {
+        cerr(c, vals[0], "unknown macro 'when' field '%s' (want schema, tag, "
+             "channel, device, sensor_id, protocol.name or protocol.tag)",
+             field != NULL ? field : "?");
+        return false;
+    }
+    const char *op = node_text(vals[1]);
+    if (op == NULL) {
+        cerr(c, vals[1], "macro 'when' op must be eq or neq");
+        return false;
+    }
+    if (strcmp(op, "gt") == 0 || strcmp(op, "lt") == 0 ||
+        strcmp(op, "gte") == 0 || strcmp(op, "lte") == 0) {
+        cerr(c, vals[1], "macro 'when' op '%s': numeric comparison is not "
+             "supported yet (only eq/neq)", op);
+        return false;
+    }
+    uint8_t cond_op;
+    if (strcmp(op, "eq") == 0)       cond_op = SCHED_COND_OP_EQ;
+    else if (strcmp(op, "neq") == 0) cond_op = SCHED_COND_OP_NEQ;
+    else {
+        cerr(c, vals[1], "unknown macro 'when' op '%s' (want eq or neq)", op);
+        return false;
+    }
+    if (vals[2]->kind != SCHED_NODE_SCALAR ||
+        vals[2]->scal_kind != SCHED_SCAL_STR) {
+        cerr(c, vals[2], "macro 'when' value must be a string");
+        return false;
+    }
+    const char *value = vals[2]->u.s.str;
+    if (strlen(value) > MACRO_FIELD_CAP) {
+        cerr(c, vals[2], "macro 'when' value is %d chars; the envelope "
+             "snapshot caps it at %d", (int)strlen(value), MACRO_FIELD_CAP);
+        return false;
+    }
+    if (!macro_when_value_safe(value)) {
+        cerr(c, vals[2], "macro 'when' value may only contain "
+             "[A-Za-z0-9_.:/-] (compared against payload text verbatim)");
+        return false;
+    }
+    m->conds[m->cond_count].field = cond_field;
+    m->conds[m->cond_count].op = cond_op;
+    m->conds[m->cond_count].value_off = pool_add(c, vals[2], value);
+    if (c->failed) return false;
+    m->cond_count++;
+    return true;
+}
+
+/* Optional per-macro `when:` block — the compiled form of openJII branch
+ * cells ({sourceCellId, field, operator, value} → gotoCellId): the publisher
+ * evaluates the conditions against each row it publishes and renders only the
+ * macros whose conditions ALL hold, so openJII runs per row exactly the
+ * macros that row's envelope lists. */
+static bool compile_macro_when(ctx_t *c, const sched_node_t *when,
+                               sched_macro_t *m)
+{
+    if (when->kind != SCHED_NODE_SEQ) {
+        cerr(c, when, "macro 'when' must be a block sequence of "
+             "{field, op, value} mappings");
+        return false;
+    }
+    if (when->u.q.count < 1 || when->u.q.count > SCHED_SPEC_MAX_MACRO_CONDS) {
+        cerr(c, when, "macro 'when' has %d conditions; the cap is %d "
+             "(see SCHED_SPEC_MAX_MACRO_CONDS)",
+             when->u.q.count, SCHED_SPEC_MAX_MACRO_CONDS);
+        return false;
+    }
+    for (int i = 0; i < when->u.q.count; i++) {
+        if (!compile_macro_cond(c, when->u.q.items[i], m)) return false;
     }
     return true;
 }
 
 /* Optional top-level `macros:` block — the workbook macro cells the installer
  * stamps into the header (see plan "workbook → device → macro → dashboard").
- * The firmware carries the list as provenance and publishes it verbatim in
- * the envelope; it never acts on it, like the other header keys. */
+ * The firmware carries the list as provenance, filters it per published row
+ * through each entry's optional `when:` conditions, and publishes the
+ * matching subset in the envelope; it never executes the macros itself. */
 static bool compile_macros(ctx_t *c, const sched_node_t *node)
 {
     if (node->kind != SCHED_NODE_SEQ) {
         cerr(c, node, "'macros' must be a block sequence of "
-             "{id, name, filename} mappings");
+             "{id, name, filename[, when]} mappings");
         return false;
     }
     if (node->u.q.count > SCHED_SPEC_MAX_MACROS) {
@@ -157,7 +293,7 @@ static bool compile_macros(ctx_t *c, const sched_node_t *node)
     for (int i = 0; i < node->u.q.count; i++) {
         const sched_node_t *item = node->u.q.items[i];
         if (item->kind != SCHED_NODE_MAP) {
-            cerr(c, item, "macro entry must be a mapping {id, name, filename}");
+            cerr(c, item, "macro entry must be a mapping {id, name, filename[, when]}");
             return false;
         }
         const sched_node_t *vals[3];
@@ -167,15 +303,17 @@ static bool compile_macros(ctx_t *c, const sched_node_t *node)
             cerr(c, item, "macro entry requires id, name and filename");
             return false;
         }
+        const sched_node_t *when = map_get(item, "when");
         for (int k = 0; k < item->u.m.count; k++) {
             const char *key = item->u.m.pairs[k].key;
             if (strcmp(key, "id") != 0 && strcmp(key, "name") != 0 &&
-                strcmp(key, "filename") != 0) {
+                strcmp(key, "filename") != 0 && strcmp(key, "when") != 0) {
                 cerr(c, item->u.m.pairs[k].value, "unknown macro key '%s'", key);
                 return false;
             }
         }
         sched_macro_t *m = &c->prog->macros[c->prog->macro_count];
+        m->cond_count = 0;
         uint16_t *offs[3] = { &m->id_off, &m->name_off, &m->filename_off };
         for (int f = 0; f < 3; f++) {
             const sched_node_t *v = vals[f];
@@ -203,6 +341,7 @@ static bool compile_macros(ctx_t *c, const sched_node_t *node)
             *offs[f] = pool_add(c, v, s);
             if (c->failed) return false;
         }
+        if (when != NULL && !compile_macro_when(c, when, m)) return false;
         c->prog->macro_count++;
     }
     return true;
