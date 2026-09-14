@@ -211,10 +211,21 @@ testing whatever is on the board.
 Each run writes one JSON file (parsed tests, raw measured values, flashed
 release tag, the verbatim serial transcript) plus one appended row in
 `results.csv`; nothing is ever overwritten — a retest is a new row. The LED
-is left ON by the firmware, confirmed by the operator (recorded as attested,
-skippable with `--no-led` for unattended runs), then switched off. Exit code:
+is driven red by the firmware, confirmed by the operator (recorded as
+attested, skippable with `--no-led` for unattended runs), then switched off.
+Expect it to **blink** rather than glow: the firmware's field-status blinker
+owns the LED and, on a station with no SD card fitted, flashes the red
+"SD not mounted" state every 3 s over the selftest's steady red. Any red
+flash is a successful LED write, so the answer is "y". Exit code:
 0 = board PASS, 1 = board FAIL, 2 = the run could not complete (flash or
 connection failure).
+
+A normal cycle is ~35–40 s. The S3 sometimes stays parked in its ROM
+download mode after the post-flash reset (silent board, port present); the
+tool detects that within ~10 s and fires another reset on its own. If the
+tool asks for it, **unplug the board's USB cable and plug it back in** — a
+physical power cycle always clears the download-mode latch, and the run
+continues automatically; no restart needed.
 
 ## What one procedure does
 

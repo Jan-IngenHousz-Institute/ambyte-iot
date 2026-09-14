@@ -177,6 +177,29 @@ class AmbyteConsole:
         except (OSError, serial.SerialException) as exc:
             raise ConsoleError(f"port {self.port} went away: {exc}") from exc
 
+    def listen(self, seconds: float) -> tuple[bool, int]:
+        """Passively classify the board: (prompt_seen, bytes_seen).
+
+        Sends one empty-line nudge up front (so an idle-but-alive REPL shows
+        its prompt) then only reads. A BOOTING board streams ESP_LOG traffic
+        long before the prompt exists; a chip parked in the S3's ROM download
+        mode is bit-for-bit silent. That asymmetry lets a caller conclude
+        "parked" after ~10 s of true silence instead of waiting out a full
+        console deadline (see factory_test.connect_console)."""
+        self._ser.reset_input_buffer()
+        self._write_line("")
+        deadline = time.time() + seconds
+        buf = ""
+        seen = 0
+        while time.time() < deadline:
+            got = self._read_available()
+            if got:
+                seen += len(got)
+                buf += got
+                if PROMPT in _ANSI_RE.sub("", buf):
+                    return True, seen
+        return False, seen
+
     def command(self, cmd: str, timeout: float = 5.0) -> str:
         """Send one command, return the ANSI-stripped reply text.
 

@@ -122,6 +122,30 @@ def _session(port: str, baud: int):
     return esp
 
 
+def nudge_reset(port: str, log=None) -> None:
+    """One more app-boot attempt for a board that stayed silent after a reset.
+
+    The watchdog-reset escape from the ROM downloader is FLAKY on Windows
+    usbser — bench-observed 2026-09-02 at roughly a coin flip per attempt,
+    with identical binaries booting on one try and re-parking in download
+    mode on the next. When it fails the chip sits in the downloader, where a
+    fresh esptool connect + another watchdog reset is cheap and independent —
+    so callers loop this with a console-wait between attempts instead of
+    trusting any single reset."""
+    tee = _Tee(log)
+    try:
+        with redirect_stdout(tee):
+            esp = detect_chip(port=port, baud=115200,
+                              connect_attempts=CONNECT_ATTEMPTS)
+            try:
+                _reset_to_app(esp)
+            finally:
+                _close_port(esp)
+    except Exception as exc:
+        raise EsptoolError(f"reset nudge on {port} failed: {exc}\n"
+                           f"{tee.tail()}") from exc
+
+
 def read_mac(port: str, log=None) -> str:
     """The base (Wi-Fi STA) MAC as AA:BB:CC:DD:EE:FF — the board's serial
     number in the openJII registry and in the AMBYTE_<MAC> naming scheme."""

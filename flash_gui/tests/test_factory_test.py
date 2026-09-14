@@ -174,6 +174,66 @@ def test_write_logs_records_flashed_tag(tmp_path):
     assert record["flashed"] == "v1.0.7"
 
 
+class _FakeConsole:
+    """Scripted AmbyteConsole stand-in: each entry is what one open board
+    session reports — ('silent',), ('traffic',) or ('prompt',)."""
+
+    script: list = []
+    log: list = []
+
+    def __init__(self, port):
+        self.port = port
+        if not _FakeConsole.script:
+            raise OSError("no more scripted sessions")
+        self._state = _FakeConsole.script.pop(0)
+        _FakeConsole.log.append(self._state)
+
+    def listen(self, seconds):
+        if self._state == "prompt":
+            return True, 100
+        return False, (50 if self._state == "traffic" else 0)
+
+    def wait_prompt(self, timeout):
+        return False   # traffic-but-no-prompt sessions never reach the prompt
+
+    def close(self):
+        pass
+
+
+def _wire_fake_console(monkeypatch, script):
+    from flash_gui import factory_test
+    _FakeConsole.script = list(script)
+    _FakeConsole.log = []
+    monkeypatch.setattr(factory_test, "AmbyteConsole", _FakeConsole)
+    monkeypatch.setattr(factory_test, "esp_jtag_ports", lambda: ["COM7"])
+    monkeypatch.setattr(factory_test.time, "sleep", lambda s: None)
+
+
+def test_connect_console_nudges_a_parked_board(monkeypatch):
+    """A silent (download-mode-parked) board gets an immediate reset nudge —
+    the escape is flaky, so the loop must keep firing until the prompt."""
+    from flash_gui import factory_test
+
+    nudged = []
+    monkeypatch.setattr(factory_test, "nudge_reset", nudged.append)
+    _wire_fake_console(monkeypatch, ["silent", "silent", "prompt"])
+
+    con = factory_test.connect_console("COM7", 600.0, lambda _msg: None)
+    assert isinstance(con, _FakeConsole)
+    assert nudged == ["COM7", "COM7"]
+
+
+def test_connect_console_gives_up_with_replug_advice(monkeypatch):
+    from flash_gui import factory_test
+    from flash_gui.ambyte_serial import ConsoleError
+
+    monkeypatch.setattr(factory_test, "nudge_reset", lambda port: None)
+    _wire_fake_console(monkeypatch, ["silent"] * 50)
+
+    with pytest.raises(ConsoleError, match="Unplug the board"):
+        factory_test.connect_console("COM7", 0.0, lambda _msg: None)
+
+
 def test_overall_verdict_rules():
     """A firmware-PASS board with a dead LED is an overall FAIL; a skipped
     prompt (--no-led) leaves the firmware verdict untouched."""

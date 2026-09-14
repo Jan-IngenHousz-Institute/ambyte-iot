@@ -42,9 +42,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import serial
+
 from .ambyte_serial import (AmbyteConsole, ConsoleError, connect_after_boot,
                             esp_jtag_ports)
-from .esptool_ops import EsptoolError, flash_images
+from .esptool_ops import EsptoolError, flash_images, nudge_reset
 from .release_fetch import (MANIFEST, ReleaseError, ReleaseImages,
                             fetch_latest)
 
@@ -62,6 +64,15 @@ _KV_RE = re.compile(r"(\w+)=(\S+)")
 # 112 addresses; 30 s is an order of magnitude of headroom, not a guess at
 # the happy path.
 SELFTEST_TIMEOUT_S = 30.0
+
+# Park detection. A booting board streams boot/app logs from the first
+# seconds; a chip parked in the S3's ROM download mode is bit-for-bit silent.
+# So a port that is OPEN and totally silent for this long is parked — nudge
+# another reset immediately instead of waiting out a console deadline.
+PARK_SILENCE_S = 10.0
+# A board that IS talking gets this long to reach the prompt (CLI is up
+# ~13-15 s into a good boot; margin for a first-boot littlefs format).
+CONSOLE_WAIT_SLICE_S = 45.0
 
 CSV_FIELDS = ["timestamp_utc", "mac", "fw", "overall", "firmware_verdict",
               "led_operator", "failed_tests", "operator", "station", "json_file"]
@@ -154,7 +165,7 @@ def ask_operator_led() -> bool:
     """Blocking y/n prompt. The LED is the one thing the board cannot verify
     about itself, so this answer is recorded as operator-attested."""
     while True:
-        answer = input("Is the red LED lit? [y/n] ").strip().lower()
+        answer = input("Is the LED lit or blinking red [y/n] ").strip().lower()
         if answer in ("y", "yes"):
             return True
         if answer in ("n", "no"):
@@ -282,6 +293,96 @@ def flash_board(port: str, images: ReleaseImages, log) -> None:
     log("Flash complete; board resetting into the app.")
 
 
+def connect_console(port: str | None, deadline_s: float, log) -> AmbyteConsole:
+    """Console session that survives a re-parked chip, fast.
+
+    Open the board's port and CLASSIFY it instead of blindly waiting: a
+    booting board streams log traffic within seconds (prompt follows ~13-15 s
+    into boot), while a chip parked in the ROM downloader is bit-for-bit
+    silent — so ~10 s of true silence means parked, and another reset goes
+    out immediately rather than after a long console deadline. A board that
+    arrives already parked is rescued by the same loop."""
+    end = time.time() + deadline_s
+    attempt = 0
+    said_wait = False
+    while time.time() < end:
+        candidates = ([port] if port else []) + \
+            [p for p in esp_jtag_ports() if p != port]
+        con = None
+        for cand in candidates:
+            try:
+                con = AmbyteConsole(cand)
+                break
+            except (OSError, serial.SerialException):
+                continue        # ghost / mid-re-enumeration / busy
+        if con is None:
+            if not said_wait:
+                log("Waiting for the board's USB port to enumerate...")
+                said_wait = True
+            time.sleep(1.0)
+            continue
+
+        target = con.port
+        saw_traffic = False
+        try:
+            prompt, seen = con.listen(
+                min(PARK_SILENCE_S, max(0.5, end - time.time())))
+            saw_traffic = seen > 0
+            if not prompt and saw_traffic:
+                # Booting: logs are flowing, the prompt just isn't up yet.
+                prompt = con.wait_prompt(
+                    timeout=min(CONSOLE_WAIT_SLICE_S, max(0.5, end - time.time())))
+            if prompt:
+                log(f"Console up on {target}.")
+                return con
+        except ConsoleError:
+            # Port died under us — the chip reset mid-listen. Rescan.
+            con.close()
+            continue
+        con.close()
+
+        if time.time() >= end:
+            break
+        if not saw_traffic and target not in esp_jtag_ports():
+            # The "silence" came from a ghost handle: the board re-enumerated
+            # under us (Windows keeps the dead name readable for a moment).
+            # It may be booting fine on the new name — rescan, don't reset.
+            continue
+        attempt += 1
+        log(("Board is silent — parked in the S3 ROM downloader; "
+             if not saw_traffic else
+             "Board is talking but shows no console prompt; ")
+            + f"firing reset attempt {attempt}.")
+        if attempt == 2:
+            # The automated escape is flaky; a VBUS power cycle is not. The
+            # loop keeps rescanning ports, so a replug needs no restart.
+            log(">> If this keeps failing: unplug the board's USB cable and "
+                "plug it back in — the test continues automatically.")
+        # Re-resolve the port at nudge time and ride out re-enumeration: the
+        # name the dead session used can be gone by now (observed: 'reset
+        # nudge failed: port is busy or doesn't exist' mid-re-enumeration).
+        nudge_end = time.time() + 10.0
+        while True:
+            live = esp_jtag_ports()
+            try:
+                nudge_reset(live[0] if live else target)
+                break
+            except EsptoolError as exc:
+                if time.time() >= nudge_end:
+                    log(f"Reset nudge failed: {exc}")
+                    break
+                time.sleep(2.0)
+        # Leave the strap-sensitive early-boot window untouched before the
+        # next round of port-open attempts.
+        time.sleep(5.0)
+
+    raise ConsoleError(
+        f"no ambyte console within {deadline_s:.0f}s despite {attempt} reset "
+        "attempt(s). Unplug the board's USB cable and plug it back in — a "
+        "physical power cycle always clears the S3's download-mode latch — "
+        "then run the test again.")
+
+
 def resolve_port(requested: str | None, log) -> str | None:
     """Pick the board's port. None is fine — connect_after_boot rescans every
     Espressif JTAG port anyway (the S3 re-enumerates on each reset)."""
@@ -366,7 +467,7 @@ def run(argv: list[str] | None = None) -> int:
             port = await_port(port, args.connect_timeout, log)
             flash_board(port, images, log)
             flashed_tag = images.tag
-        con = connect_after_boot(port, deadline_s=args.connect_timeout, log=log)
+        con = connect_console(port, args.connect_timeout, log)
     except (FactoryTestError, ConsoleError, EsptoolError, ReleaseError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
