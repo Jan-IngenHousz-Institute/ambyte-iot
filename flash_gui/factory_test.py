@@ -165,7 +165,7 @@ def ask_operator_led() -> bool:
     """Blocking y/n prompt. The LED is the one thing the board cannot verify
     about itself, so this answer is recorded as operator-attested."""
     while True:
-        answer = input("Is the LED lit or blinking red [y/n] ").strip().lower()
+        answer = input("Is the red LED lit or blinking? [y/n] ").strip().lower()
         if answer in ("y", "yes"):
             return True
         if answer in ("n", "no"):
