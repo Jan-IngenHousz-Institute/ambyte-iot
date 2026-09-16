@@ -47,6 +47,7 @@
 #include "sd_logger.h"
 #include "event_log.h"
 #include "sync_runner.h"
+#include "status_heartbeat.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
 
@@ -186,6 +187,17 @@ static esp_err_t app_start_wifi(void)
     }
     ESP_LOGI(APP_TAG, "Wi-Fi station started");
     return ESP_OK;
+}
+
+/* Heartbeats bypass the external-power gate, but preserve the sensor hold and
+ * the legacy whole-measurement rollback switch used by the bulk publisher. */
+static bool app_heartbeat_publish_allowed(void)
+{
+#if AMBYTE_PUBLISH_GATE_LEGACY
+    return !device_commands_measurement_active();
+#else
+    return !device_commands_publish_hold_active();
+#endif
 }
 
 /* bool(void) adapter over wifi_manager_is_provisioned(bool*) for the
@@ -1435,7 +1447,26 @@ void app_main(void)
      * started yet. */
     app_start_cli();
 
-    /* ── Background MQTT sync + STATUS heartbeat ─────────────────────── */
+    /* Operational liveness must survive the external-power publishing gate
+     * and failed storage initialization. Keep this outside persistence_available:
+     * the durable TELEMETRY records below still queue normally on battery. */
+    const status_heartbeat_config_t heartbeat_cfg = {
+        .publish          = mqtt_client_get_publish_fn(),
+        .mqtt_connected   = mqtt_client_get_is_connected_fn(),
+        .wifi_connected   = wifi_manager_is_connected,
+        .publish_allowed  = app_heartbeat_publish_allowed,
+        .read_power       = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
+        .sd_ready         = sdcard_is_mounted,
+        .status_topic     = status_topic,
+        .device_id        = device_id,
+        .firmware_version = running_app != NULL ? running_app->version : "",
+    };
+    esp_err_t heartbeat_err = status_heartbeat_start(&heartbeat_cfg);
+    if (heartbeat_err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "status heartbeat not started: %s", esp_err_to_name(heartbeat_err));
+    }
+
+    /* ── Background MQTT sync + stored TELEMETRY heartbeat ──────────── */
     if (persistence_available) {
         uint32_t heartbeat_s = 300;                       /* default 5 min */
         (void)device_config_get_heartbeat_s(&heartbeat_s); /* NVS override */
@@ -1448,7 +1479,7 @@ void app_main(void)
             mqtt_client_get_set_connect_handler_fn()(app_on_mqtt_connect, NULL);
         }
     } else {
-        ESP_LOGW(APP_TAG, "persistence unavailable — background sync, STATUS heartbeat, "
+        ESP_LOGW(APP_TAG, "persistence unavailable — background sync, stored TELEMETRY, "
                           "nightly reboot, and connection/memory/PUBACK self-healing disabled");
     }
 

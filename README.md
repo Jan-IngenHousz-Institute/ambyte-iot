@@ -1,6 +1,6 @@
 # Ambyte IoT
 
-ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. A declarative YAML document at `/littlefs/schedule.yaml` controls what and when the device measures; it is compile-checked before an atomic install, so schedule changes need no firmware reflash. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit only spends radio energy when it has external power.
+ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. A declarative YAML document at `/littlefs/schedule.yaml` controls what and when the device measures; it is compile-checked before an atomic install, so schedule changes need no firmware reflash. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit reserves bulk uploads for external power while still reporting liveness on battery.
 
 Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on the host from `.env` + a `device_certs/<bundle>/` PEM set and flashed into the NVS partition next to the firmware — **no BLE companion app, no runtime provisioning round-trip** (BLE provisioning is deprecated/compiled out).
 
@@ -18,7 +18,7 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **Transport** | MQTT v5 over mutual TLS → AWS IoT Core (device cert + private key from NVS) |
 | **Storage** | Append-only `event_log` on internal littlefs (`/evstore/events/`, the 9.4 MiB `storage` partition); read cursor + `next_id` HWM in NVS; SD = bulk archive (`/sdcard/archive/`) + logs + AMBIT firmware. **SQLite has been removed.** |
 | **Scheduling** | Declarative YAML catalog; compile-checked and hot-updatable over MQTT or serial |
-| **Power** | Radio publishing gated on external power (MP2731); DFS clock scaling 40–160 MHz (`esp_pm`) |
+| **Power** | Bulk uploads gated on external power (MP2731); 15-minute connected status on battery; DFS 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
 | **License** | Firmware and hardware: CERN-OHL-S v2 ([LICENSE](LICENSE)). Host-side software: GPL-3.0 ([LICENSE.GPL-3.0](LICENSE.GPL-3.0)) |
 
@@ -85,7 +85,8 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 
 ### Tasks (each created inside its own component)
 
-- **sync_runner** — the only MQTT publisher; also emits the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
+- **sync_runner** — the only measurement-queue publisher; also stores the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
+- **status_heartbeat** — a small direct MQTT status report every 15 minutes while connected, including on battery or with storage unavailable. Does not drain the measurement queue.
 - **sched_runner** — compiles the installed schedule or embedded default, arms wall-clock triggers against monotonic deadlines, and executes fused actions. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement is not preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
 - **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
@@ -279,6 +280,29 @@ For live wire inspection without the firmware in the loop, use [docs/mqtt_tls_te
 
 A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) independently of the measurement schedule. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Schedule release metadata is included only when its persisted digest still matches the installed schedule.
 
+Stored telemetry follows the measurement FIFO and can wait for external power.
+For live reachability, an independent `status_heartbeat` task publishes a compact
+`type: heartbeat` message directly to the configured MQTT **status topic** (the
+same topic as command replies). Reports use a MAC-staggered 0–899-second phase on a fixed 15-minute uptime
+grid. An overdue report sends on the first connected poll, then returns to
+that grid; a reconnect never postpones it.
+Brief sensor transactions defer due reports, checked every second; the legacy
+whole-measurement hold remains supported. Repeated link drops cannot keep
+restarting a pending deadline.
+It includes device identity, running firmware, uptime, battery/input voltage,
+charging state and SD mount status. A failed/absent charger read reports
+`power: null`; it never suppresses the heartbeat. Battery voltage, external
+power, missing SD/internal storage, invalid clock and schedule state do not
+gate this operational message. `heartbeat_s=0` disables stored telemetry only.
+
+Wi-Fi **and MQTT** must be connected and the device must remain powered. A due
+report is retried every 30 seconds after a failed submission or an outage; only
+one fresh snapshot is sent on recovery, then normal per-device phasing resumes. Transport QoS 1 provides delivery retry,
+but an accepted submission is not proof of broker receipt. There is no offline
+heartbeat backlog. This status-topic message is separate from the warehouse
+measurement envelope and does not by itself add a dashboard display. The bulk
+upload power gate and low-battery SD protection remain in force.
+
 ### Payload schema
 
 Each stored event becomes exactly one MQTT message. New AMBIT runs, spectrum reads, gateway heartbeats, and sensor inventory changes store complete canonical `ambit.trace/3`, `ambit.spectrum/1`, `ambyte.telemetry/1`, and `ambit.device/1` objects in the existing event-log payload column; the publisher places that object directly in the unchanged outer `sample` envelope. Old v2 SD backlog and generic stored events retain the legacy v2 builder, so queued data is not rewritten. `channel` (`uart_<n>` / null) identifies the port and `device` is the human sensor name or gateway identity. The normative fields, units, time models, formatting, and dual-read rule are in [docs/mqtt-payload.md](docs/mqtt-payload.md).
@@ -373,7 +397,8 @@ components/
   device_commands/   # business-logic core; cmd_* ops; envelope builder; in-flight slot + reaper
   command_router/    # inbound MQTT JSON dispatch (ping/OTA/schedule/location)
   event_log/         # append-only SD event store (REPLACES SQLite)
-  sync_runner/       # sole MQTT publisher; power/clock gate; heartbeat; connectivity watchdog
+  sync_runner/       # measurement FIFO publisher; power/clock gate; stored telemetry; watchdog
+  status_heartbeat/  # direct status-topic liveness every 15 min, including on battery
   mqtt_client/       # esp-mqtt wrapper (mutual TLS to AWS IoT)
   uart_sensors/      # AMBIT UART bus (4 channels) + ROM-flash reset/boot control lines
   ambit_ota/         # AMBIT app-OTA over UART (Strategy B)
@@ -426,7 +451,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 | Device boots and logs `Device not provisioned` | NVS image wasn't flashed — confirm `extra_scripts = pre:tools/extra_script.py` in `platformio.ini` and that `.env` resolves to non-empty values |
 | MQTT connects then immediately disconnects | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 | Telemetry stops but no data loss / device on external power | In-flight slot may have stalled — check the `inflight` CLI command; the 60 s reaper + MQTT-disconnect clear should recover it, else the 1 h watchdog reboots |
-| Events pile up in `event_log`, nothing publishes | Expected on battery (power gate) or before the clock is valid (< 2024) — verify external power and RTC/clock |
+| Events pile up in `event_log`, measurements do not publish | Expected on battery (power gate) or before the clock is valid (< 2024). The independent 15-minute status-topic heartbeat still reports while Wi-Fi/MQTT are connected. |
 | Installed schedule is rejected | Run `schedule status` for the compile error; the embedded default remains active |
 | Schedule update does not take effect | Check `schedule release`, then use `schedule reload` or reboot after a successful install |
 | sdmmc `0x107` errors after pulling the SD card | Hot-plug recovery should latch the loss and remount on reinsert; if it floods, this path needs the HW pull/reinsert verification still pending (see Status) |
