@@ -60,7 +60,7 @@ class DeviceCasingTest(unittest.TestCase):
                 inner.topics.append(topic)
                 ping = json.loads(payload)
                 inner.callback(
-                    "experiment/data_ingest/v1/x/multispeq/v1.0/"
+                    "experiment/data_ingest/v1/x/ambyte/v1.0/"
                     + self.UPPER
                     + "/status",
                     json.dumps({"type": "pong", "id": ping["id"], "fw": "1.6.6"}).encode(),
@@ -200,6 +200,21 @@ class EffectPollingTest(unittest.TestCase):
             ),
             "accepted_no_final",
         )
+
+
+class StatusTopicTest(unittest.TestCase):
+    def test_status_filter_matches_every_device_family(self) -> None:
+        # openJII-onboarded Ambytes publish under `.../ambyte/v1.0/...`; legacy
+        # units under `.../multispeq/v1.0/...`. One filter must hear both.
+        pattern = fleet_deploy.STATUS_TOPIC.split("/")
+        for family in ("ambyte", "multispeq"):
+            topic = f"experiment/data_ingest/v1/e1/{family}/v1.0/AMBYTE_00:11:22:33:44:55/status"
+            parts = topic.split("/")
+            self.assertEqual(len(parts), len(pattern))
+            self.assertTrue(all(p == "+" or p == q for p, q in zip(pattern, parts)), topic)
+            self.assertEqual(
+                fleet_deploy.device_from_status_topic(topic), "AMBYTE_00:11:22:33:44:55"
+            )
 
 
 if __name__ == "__main__":
