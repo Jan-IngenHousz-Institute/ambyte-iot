@@ -17,8 +17,10 @@ typedef struct {
 
 /* Start once after MQTT and power-driver initialization. Copies the config;
  * string storage must outlive the task. One small QoS-1 status-topic message
- * at a MAC-staggered point within 15 minutes of connection, then every 15
- * minutes of uptime. Brief sensor holds defer a due report (checked every 1 s).
+ * at a MAC-staggered point within 15 minutes of boot, then on that 15-minute
+ * uptime grid. An overdue report sends on the first connected poll, then
+ * returns to the grid; reconnections never postpone it. Brief sensor holds
+ * defer a due report (checked every 1 s).
  * Retries failed
  * submissions / overdue offline reports every 30 s, without offline buffering.
  *

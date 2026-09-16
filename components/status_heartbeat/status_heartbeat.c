@@ -57,6 +57,13 @@ static esp_err_t publish_heartbeat(int64_t uptime_ms)
     return err;
 }
 
+static int64_t next_phase_after(int64_t now_ms, int64_t phase_ms)
+{
+    int64_t elapsed = (now_ms - phase_ms) % HEARTBEAT_INTERVAL_MS;
+    if (elapsed < 0) elapsed += HEARTBEAT_INTERVAL_MS;
+    return now_ms + HEARTBEAT_INTERVAL_MS - elapsed;
+}
+
 static void heartbeat_task(void *arg)
 {
     (void)arg;
@@ -65,19 +72,12 @@ static void heartbeat_task(void *arg)
         ESP_LOGW("heartbeat", "MAC jitter unavailable; using slot 0");
     }
     const int64_t phase_ms = (int64_t)slot * 1000;
-    int64_t next_due_ms = 0;
-    bool was_connected = false;
+    int64_t next_due_ms = phase_ms;
     for (;;) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const bool connected = s_cfg.wifi_connected() && s_cfg.mqtt_connected();
         uint32_t sleep_ms = HEARTBEAT_POLL_MS;
         if (connected) {
-            if (!was_connected && now_ms >= next_due_ms) {
-                /* Stagger boot AND recovery: all gateways otherwise become due
-                 * together after a site outage. One fresh report within the
-                 * first 15 minutes, then the normal 15-minute interval. */
-                next_due_ms = now_ms + phase_ms;
-            }
             if (now_ms >= next_due_ms) {
                 if (s_cfg.publish_allowed != NULL && !s_cfg.publish_allowed()) {
                     /* Keep the raw-sensor hold (including the legacy full-cycle
@@ -85,7 +85,12 @@ static void heartbeat_task(void *arg)
                      * with a repeated measurement and starve every report. */
                     sleep_ms = 1000;
                 } else if (publish_heartbeat(now_ms) == ESP_OK) {
-                    next_due_ms = now_ms + HEARTBEAT_INTERVAL_MS;
+                    /* Return to this device's phase on the uptime grid. Never
+                     * push an overdue deadline forward on reconnection: links
+                     * with up-times shorter than the MAC slot would otherwise
+                     * suppress reports forever. A recovery snapshot can be
+                     * followed by the next grid report in less than 15 min. */
+                    next_due_ms = next_phase_after(now_ms, phase_ms);
                 } else {
                     ESP_LOGW("heartbeat", "status submission failed; retry in 30 s");
                 }
@@ -95,7 +100,6 @@ static void heartbeat_task(void *arg)
                 sleep_ms = (uint32_t)remaining_ms;
             }
         }
-        was_connected = connected;
         /* A failed submission or an offline interval never consumes the due
          * report. Reconnection sends ONE fresh snapshot, not a night's backlog.
          * Monotonic uptime keeps this alive with an unset/jumping wall clock. */
