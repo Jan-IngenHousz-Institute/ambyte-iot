@@ -59,7 +59,10 @@ import time
 import urllib.request
 
 COMMAND_TOPIC_FMT = "device/scripts/v1/Ambyte/2/{device}"
-STATUS_TOPIC = "experiment/data_ingest/v1/+/multispeq/v1.0/+/status"
+# Devices onboarded through openJII publish under their registry family
+# (`.../ambyte/v1.0/...`, flash GUI since PR #45); older units use `multispeq`.
+# Wildcard the family or every post-August device is "silent" to every command.
+STATUS_TOPIC = "experiment/data_ingest/v1/+/+/v1.0/+/status"
 LOG_GROUP = "AWSIotLogsV2"
 CLIENT_ID_RE = re.compile(
     r"^AMBYTE_[0-9A-F]{2}(:[0-9A-F]{2}){5}$", re.IGNORECASE
@@ -265,7 +268,7 @@ def mqtt_connection(session, sub_topic, on_message, client_id="fleet-deploy"):
 
 
 def device_from_status_topic(topic):
-    """experiment/data_ingest/v1/<uuid>/multispeq/v1.0/<clientId>/status:
+    """experiment/data_ingest/v1/<uuid>/<family>/v1.0/<clientId>/status:
     the topic's clientId is the reliable per-device key; the payload's
     device_id is NOT unique across the fleet."""
     parts = topic.split("/")
