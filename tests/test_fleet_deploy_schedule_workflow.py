@@ -46,6 +46,7 @@ class ScheduleWorkflowTest(unittest.TestCase):
             ),
             "reboot": "reboot: ${{ inputs.reboot }}",
             "dry_run": "dry-run: ${{ inputs.dry_run }}",
+            "experiment_id": "experiment-id: ${{ inputs.experiment_id }}",
         }
         for input_name, forwarding in inputs.items():
             with self.subTest(input_name=input_name):
@@ -56,6 +57,22 @@ class ScheduleWorkflowTest(unittest.TestCase):
         self.assertIn("environment: fleet-deploy-${{ inputs.environment }}", SCHEDULE_WORKFLOW)
         self.assertIn("uses: ./.github/actions/fleet-deploy", SCHEDULE_WORKFLOW)
         self.assertIn("kind: schedule", SCHEDULE_WORKFLOW)
+
+    def test_experiment_mode_is_wired_through_the_shared_action(self) -> None:
+        # The openJII environment must be the SAME selector as the AWS
+        # environment: a prod experiment resolved against a dev fleet (or the
+        # reverse) would stamp the wrong workbook onto the wrong devices.
+        self.assertIn("openjii-environment: ${{ inputs.environment }}", SCHEDULE_WORKFLOW)
+        self.assertIn("openjii-api-key: ${{ secrets.OPENJII_API_KEY }}", SCHEDULE_WORKFLOW)
+        self.assertIn("OPENJII_API_KEY: ${{ inputs.openjii-api-key }}", DEPLOY_ACTION)
+        self.assertIn(
+            'ARGS+=(--experiment "${EXPERIMENT_ID}" --openjii-env "${OPENJII_ENV}")',
+            DEPLOY_ACTION,
+        )
+        # Catalog mode and experiment mode are exclusive on the command line.
+        experiment_branch = DEPLOY_ACTION.index('if [[ -n "${EXPERIMENT_ID}" ]]')
+        catalog_branch = DEPLOY_ACTION.index('ARGS+=(--script-name "${SCRIPT_NAME}")')
+        self.assertLess(experiment_branch, catalog_branch)
 
     def test_shared_action_scopes_latest_and_requires_kind_assets(self) -> None:
         self.assertIn("gh release list", DEPLOY_ACTION)

@@ -313,3 +313,54 @@ target as `accepted`, `applied`, `failed`, `busy`, or `no_reply`.
 A live run fails when any device reports `failed`/a SHA mismatch, or when no
 target confirms the expected SHA as applied. This prevents an all-busy or
 all-silent campaign from appearing successful.
+
+## Deploying an experiment's workbook schedule
+
+Set `experiment_id` in **Fleet deploy (Schedule)** (or run
+`schedule_deploy.py --experiment <uuid> --openjii-env dev|prod`) to install the
+schedule that the experiment's pinned workbook version carries in its
+`schema: jii.ambyte-schedule/...` command cell. The tool resolves and stamps it
+with the flash GUI's own code (`flash_gui/openjii_client.py`,
+`flash_gui/schedule_stamp.py`), so bench installs and fleet installs produce the
+same bytes for the same firmware:
+
+| Device firmware | Header stamped | Class in the summary |
+|---|---|---|
+| >= 2.2.0 | `workbookVersionId` + `macros` with `when:` routing from the branch cells | `when` |
+| 2.1.x | `workbookVersionId` + `macros` without routing | `macros` |
+| 2.0.x | `workbookVersionId` only | `id-only` |
+| < 2.0.0, legacy `"1"`, or silent | excluded: Lua-era firmware has no YAML runner; OTA it first | `excluded` |
+
+Differences from a catalog release:
+
+- **Targets are the experiment's Ambytes only** (`GET /experiments/{id}/devices`),
+  never CloudWatch discovery. An explicit `devices` list must be a subset of
+  them; anything else fails closed before pinging.
+- **Delivery is inline.** A stamped YAML is unique per experiment and firmware
+  class, so it has no immutable release URL; the command carries the text in
+  `script` with its SHA-256 in `checksum`. The firmware caps an inline message at
+  16 KiB and needs a contiguous TLS buffer, so the whole JSON payload is
+  size-checked host-side and heap-pressed devices answer `busy` or `dropped`
+  rather than applying. One campaign is published per firmware class; the
+  campaign id is `workbook-<versionId>:<sha256[:8]>`, so a re-stamp of the same
+  workbook version for a newer firmware is a new id and the device's NVS latch
+  does not swallow it.
+- **Credentials.** The run needs a personal openJII API key with collaborator
+  access to the experiment (and the `iot-devices` flag) in the environment
+  secret `OPENJII_API_KEY` of `fleet-deploy-dev` / `fleet-deploy-prod`. The
+  openJII environment is always the same selector as the AWS environment.
+- `release_tag` and `script` are ignored in this mode (the shared action still
+  resolves a catalog release so the form stays uniform).
+
+Local preview against two known gateways:
+
+```sh
+OPENJII_API_KEY=jii_... python tools/fleet_deploy/schedule_deploy.py \
+    --profile <sso-profile> --experiment 81a85e53-7971-4e00-b531-a1ac043b61f3 \
+    --openjii-env prod --devices "20:6E:F1:F6:E1:A8 20:6E:F1:FA:79:9C" --dry-run
+```
+
+The result artifact adds `experiment`, `workbook_version_id`, `variants`
+(class, SHA-256, size, campaign id, devices) and `excluded` (device -> reason).
+The outcome table and the live-run failure rules are the catalog ones, applied
+per variant SHA.

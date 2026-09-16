@@ -202,36 +202,232 @@ class ManifestTest(unittest.TestCase):
             )
 
 
-class ExperimentFlagTest(unittest.TestCase):
-    """--experiment is deliberately REJECTED: fleet delivery publishes an
-    immutable release-asset URL the device downloads, and a workbook-stamped
-    YAML has no URL until an artifact host exists. The flag exists so the
-    answer is a clear message instead of silent drift between the device
-    (flash GUI) and fleet install paths."""
+EXPERIMENT = "665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"
+WORKBOOK_VERSION = "0f6c1b2e-8a44-4d19-9c3e-5b7a0d21f8ac"
+PROGRAMMING_YAML = (
+    "schema: jii.ambyte-schedule/v1-draft\n"
+    "description: field programming\n"
+    "jobs:\n"
+    "  manual:\n"
+    "    schedule: dispatch\n"
+    "    steps:\n"
+    "      - uses: device/status-report\n"
+)
 
-    def test_experiment_flag_is_rejected_with_guidance_before_any_network(
-            self) -> None:
-        import io
-        import contextlib
 
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(schedule_deploy, "fetch_release") as fetch,
-            mock.patch.object(
-                schedule_deploy.fleet, "boto_session"
-            ) as boto,
-            contextlib.redirect_stderr(stderr),
-        ):
-            result = schedule_deploy.main(
-                ["--tag", TAG, "--experiment",
-                 "665b6b18-3cfe-4d0a-85c7-3e84fa2f7834"]
+def programming_fixture(routing_compiled: bool = True):
+    from flash_gui.openjii_client import (MacroCondition, WorkbookMacro,
+                                          WorkbookProgramming)
+
+    return WorkbookProgramming(
+        yaml_text=PROGRAMMING_YAML,
+        workbook_id="wb-1",
+        workbook_version_id=WORKBOOK_VERSION,
+        workbook_version_number=7,
+        macros=(
+            WorkbookMacro(
+                id="47b03f78-a0d4-4b1d-bcd6-6e0b7d470040",
+                name="ambyte-trace",
+                filename="macro_8feac276a118",
+                when=(MacroCondition("schema", "eq", "ambit.trace/3"),),
+            ),
+        ),
+        routing_compiled=routing_compiled,
+    )
+
+
+class FakeClient:
+    """OpenJIIClient stand-in: the three calls experiment mode makes."""
+
+    def __init__(self, programming, devices, user=None):
+        self.programming = programming
+        self.devices = devices
+        self.user = user or {"email": "operator@example.test"}
+        self.resolve_calls = []
+
+    def validate_key(self):
+        return self.user
+
+    def resolve_programming(self, experiment_id, fw_version="", log=None):
+        self.resolve_calls.append((experiment_id, fw_version))
+        return self.programming
+
+    def list_experiment_devices(self, experiment_id):
+        return [{"thingName": name, "deviceType": "ambyte"} for name in self.devices]
+
+
+class WorkbookDeliveryTest(unittest.TestCase):
+    """--experiment resolves and stamps the pinned workbook exactly like the
+    flash GUI, restricts the cohort to the experiment's Ambytes, and publishes
+    one INLINE script_update per firmware class (no artifact host needed)."""
+
+    def setUp(self) -> None:
+        from tools.fleet_deploy import workbook_schedule
+        from flash_gui import schedule_stamp
+
+        self.workbook = workbook_schedule
+        self.stamp = schedule_stamp
+
+    def test_firmware_classes_follow_the_flash_gui_gates(self) -> None:
+        cases = {
+            None: "silent",
+            "dev-build": "unparseable",
+            "1": "pre-yaml",  # legacy NVS junk parses as 1.0.0: still excluded
+            "1.10.0": "pre-yaml",
+            "2.0.3": "id-only",
+            "2.1.0": "macros",
+            "2.2.1": "when",
+        }
+        for fw, expected in cases.items():
+            with self.subTest(fw=fw):
+                self.assertEqual(
+                    self.workbook.firmware_class(fw, self.stamp), expected
+                )
+
+    def test_plans_one_inline_variant_per_firmware_class(self) -> None:
+        cohort = [DEVICE_A, DEVICE_B, "ambyte_12:34:56:78:9A:BC",
+                  "ambyte_00:00:00:00:00:01", "ambyte_00:00:00:00:00:02"]
+        firmware = {DEVICE_A: "2.2.1", DEVICE_B: "2.1.0",
+                    "ambyte_12:34:56:78:9A:BC": "2.0.3",
+                    "ambyte_00:00:00:00:00:01": "1.10.0"}
+        variants, excluded = self.workbook.plan_variants(
+            programming_fixture(), cohort, firmware, self.stamp,
+            reboot=False, checker=lambda text: None, log=lambda _line: None,
+        )
+
+        self.assertEqual([v.key for v in variants], ["when", "macros", "id-only"])
+        self.assertEqual(
+            excluded,
+            {"ambyte_00:00:00:00:00:01": "pre-yaml",
+             "ambyte_00:00:00:00:00:02": "silent"},
+        )
+        by_key = {v.key: v for v in variants}
+        self.assertIn("when:", by_key["when"].text)
+        self.assertIn("macros:", by_key["macros"].text)
+        self.assertNotIn("when:", by_key["macros"].text)
+        self.assertNotIn("macros:", by_key["id-only"].text)
+        for variant in variants:
+            command = variant.command
+            self.assertEqual(command["type"], "script_update")
+            self.assertEqual(command["script"], variant.text)
+            self.assertEqual(
+                command["checksum"],
+                hashlib.sha256(variant.text.encode()).hexdigest(),
+            )
+            self.assertNotIn("url", command)
+            self.assertIs(command["reboot"], False)
+            self.assertEqual(command["script_version"], "wb-v7")
+            self.assertIn(WORKBOOK_VERSION, variant.text)
+            self.assertLess(len(command["id"]), 64)
+        self.assertEqual(len({v.command["id"] for v in variants}), 3)
+
+    def test_refuses_routing_class_without_compiled_routing_and_oversize(self) -> None:
+        with self.assertRaises(self.workbook.WorkbookDeliveryError):
+            self.workbook.stamped_variant(
+                programming_fixture(routing_compiled=False), "when", self.stamp,
+                reboot=True, checker=lambda text: None, log=lambda _l: None,
+            )
+        from dataclasses import replace
+
+        huge = replace(
+            programming_fixture(),
+            yaml_text=PROGRAMMING_YAML + "# " + "x" * (16 * 1024) + "\n",
+        )
+        with self.assertRaises(self.workbook.WorkbookDeliveryError):
+            self.workbook.stamped_variant(
+                huge, "when", self.stamp, reboot=True,
+                checker=lambda text: None, log=lambda _l: None,
             )
 
+    def test_explicit_devices_must_belong_to_the_experiment(self) -> None:
+        restricted = self.workbook.restrict_to_experiment(
+            ["AMBYTE_00:11:22:33:44:55"], ["ambyte_00:11:22:33:44:55"]
+        )
+        self.assertEqual(restricted, ["ambyte_00:11:22:33:44:55"])
+        with self.assertRaises(self.workbook.WorkbookDeliveryError):
+            self.workbook.restrict_to_experiment([DEVICE_B], [DEVICE_A])
+
+    def test_requires_api_key_before_any_network(self) -> None:
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch.object(schedule_deploy.fleet, "boto_session") as boto,
+            mock.patch.object(schedule_deploy, "write_results"),
+            mock.patch.object(schedule_deploy, "write_summary"),
+        ):
+            result = schedule_deploy.main(
+                ["--experiment", EXPERIMENT, "--openjii-env", "prod", "--dry-run"]
+            )
         self.assertEqual(result, 2)
-        self.assertIn("flash GUI", stderr.getvalue())
-        self.assertIn("artifact host", stderr.getvalue())
-        fetch.assert_not_called()
         boto.assert_not_called()
+
+    def _run(self, argv, client, ping, update=None):
+        with (
+            mock.patch.dict("os.environ", {"OPENJII_API_KEY": "jii_fixture"}),
+            mock.patch.object(self.workbook, "make_client", return_value=client),
+            mock.patch.object(schedule_deploy.fleet, "boto_session", return_value=object()),
+            mock.patch.object(schedule_deploy.fleet, "fleet_ping", return_value=ping),
+            mock.patch.object(
+                schedule_deploy, "fleet_script_update",
+                side_effect=update or (lambda *a, **k: ({}, None)),
+            ) as publish,
+            mock.patch.object(self.stamp, "_check_with_sched_host", return_value=None),
+            mock.patch.object(schedule_deploy, "write_results") as results,
+            mock.patch.object(schedule_deploy, "write_summary"),
+        ):
+            code = schedule_deploy.main(argv)
+        return code, publish, results.call_args[0][1]
+
+    def test_dry_run_targets_experiment_devices_only_and_publishes_nothing(self) -> None:
+        client = FakeClient(programming_fixture(), [DEVICE_A, DEVICE_B])
+        code, publish, plan = self._run(
+            ["--experiment", EXPERIMENT, "--openjii-env", "prod", "--dry-run"],
+            client, {DEVICE_A: "2.2.1", DEVICE_B: "1.10.0"},
+        )
+        self.assertEqual(code, 0)
+        publish.assert_not_called()
+        self.assertEqual(client.resolve_calls, [(EXPERIMENT, self.stamp.MACRO_WHEN_MIN_FW)])
+        self.assertEqual(plan["universe"], 2)
+        self.assertEqual(plan["excluded"], {DEVICE_B: "pre-yaml"})
+        self.assertEqual([v["devices"] for v in plan["variants"]], [[DEVICE_A]])
+
+    def test_live_run_publishes_one_campaign_per_class_and_needs_applied_sha(self) -> None:
+        client = FakeClient(programming_fixture(), [DEVICE_A, DEVICE_B])
+        published = []
+
+        def update(session, devices, command, *rest):
+            published.append((tuple(devices), command))
+            sha = hashlib.sha256(command["script"].encode()).hexdigest()
+            return ({d: {"accepted": True, "state": "applied", "script_sha256": sha}
+                     for d in devices}, None)
+
+        code, publish, plan = self._run(
+            ["--experiment", EXPERIMENT, "--openjii-env", "prod"],
+            client, {DEVICE_A: "2.2.1", DEVICE_B: "2.1.0"}, update,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual({d for devs, _ in published for d in devs}, {DEVICE_A, DEVICE_B})
+        self.assertEqual(len({c["id"] for _, c in published}), 2)
+
+        code, _, _ = self._run(
+            ["--experiment", EXPERIMENT, "--openjii-env", "prod"],
+            client, {DEVICE_A: "2.2.1"},
+            lambda s, devices, command, *rest: (
+                {d: {"accepted": True, "state": "applied", "script_sha256": "0" * 64}
+                 for d in devices}, None),
+        )
+        self.assertEqual(code, 1)
+
+    def test_explicit_device_outside_the_experiment_fails_closed(self) -> None:
+        client = FakeClient(programming_fixture(), [DEVICE_A])
+        code, publish, plan = self._run(
+            ["--experiment", EXPERIMENT, "--openjii-env", "prod",
+             "--devices", DEVICE_B, "--dry-run"],
+            client, {},
+        )
+        self.assertEqual(code, 2)
+        publish.assert_not_called()
+        self.assertIn(DEVICE_B, plan["error"])
 
 
 class TargetingTest(unittest.TestCase):
