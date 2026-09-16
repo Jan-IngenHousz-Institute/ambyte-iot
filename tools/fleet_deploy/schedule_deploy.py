@@ -2,12 +2,22 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Targeted deployment of an immutable Schedule release to the Ambyte fleet.
+"""Targeted deployment of a Schedule to the Ambyte fleet.
 
-The selected release manifest and Schedule asset are downloaded and verified before
-the tool opens an MQTT connection. Device discovery, normalization, firmware
-ping/version handling, deterministic cohort ordering, and AWS IoT WebSocket
-setup deliberately reuse :mod:`fleet_deploy`.
+Two sources:
+
+* a published catalog release (``--tag schedule-vX.Y.Z --script-name ...``):
+  manifest and asset are downloaded and verified, then the manifest's
+  ``script_update`` (URL mode) is published to the cohort;
+* an experiment's pinned workbook (``--experiment <uuid> --openjii-env ...``):
+  the schedule cell is resolved and stamped exactly as the flash GUI does, the
+  cohort is restricted to that experiment's Ambytes, and one inline
+  ``script_update`` per firmware class is published (see
+  :mod:`workbook_schedule`).
+
+Device discovery, normalization, firmware ping/version handling, deterministic
+cohort ordering, and AWS IoT WebSocket setup deliberately reuse
+:mod:`fleet_deploy`.
 """
 
 from __future__ import annotations
@@ -27,9 +37,11 @@ from typing import Any, Callable
 
 try:  # Package import in tests; sibling import when invoked as a script.
     from . import fleet_deploy as fleet
+    from . import workbook_schedule as workbook
     from .release_selection import SCHEDULE_TAG_RE
 except ImportError:  # pragma: no cover - exercised by CLI invocation
     import fleet_deploy as fleet
+    import workbook_schedule as workbook
     from release_selection import SCHEDULE_TAG_RE
 
 
@@ -451,7 +463,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repo", default="Jan-IngenHousz-Institute/ambyte-iot"
     )
-    parser.add_argument("--tag", required=True, help="published schedule-vX.Y.Z tag")
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="published schedule-vX.Y.Z tag (catalog mode; ignored with --experiment)",
+    )
     parser.add_argument(
         "--script-name",
         default="default",
@@ -460,10 +476,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--experiment",
         default=None,
-        help="NOT SUPPORTED — accepted only to fail with guidance. A "
-        "workbook-stamped schedule has no immutable release URL for devices "
-        "to download, so fleet delivery needs an artifact host (tracked). "
-        "Install workbook programming with the flash GUI over serial today.",
+        metavar="UUID",
+        help="deliver this openJII experiment's pinned workbook schedule "
+        "(stamped per firmware class, sent inline) to the experiment's own "
+        f"Ambytes only; reads the API key from ${workbook.API_KEY_ENV}",
+    )
+    parser.add_argument(
+        "--openjii-env",
+        choices=["dev", "prod"],
+        default=None,
+        help="openJII environment the experiment lives in (required with "
+        "--experiment; must match the AWS account you deploy to)",
     )
     parser.add_argument(
         "--version-op",
@@ -495,26 +518,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.experiment:
-        # Fleet delivery publishes a script_update carrying an immutable
-        # release-asset URL the device downloads; a per-experiment
-        # workbook-stamped YAML has no URL, so this cannot reuse the resolve +
-        # stamp path (flash_gui.schedule_stamp) until an artifact host exists.
-        # Rejected as a flag so device and fleet semantics cannot drift apart
-        # silently.
-        print(
-            "--experiment is not supported: workbook-stamped schedules are "
-            "installed by the flash GUI over serial today; fleet delivery "
-            "needs an artifact host — tracked.",
-            file=sys.stderr,
-        )
-        return 2
     if not 1 <= args.percentage <= 100:
         parser.error("--percentage must be 1-100")
     if args.version_op != "any" and fleet.parse_version(args.version or "") is None:
         parser.error(
             f"--version-op {args.version_op} needs a parseable --version"
         )
+    if args.experiment:
+        if not args.openjii_env:
+            parser.error("--experiment requires --openjii-env dev|prod")
+        return run_experiment_mode(args, parser)
+    if not args.tag:
+        parser.error("--tag is required unless --experiment is given")
 
     # This must finish before fleet_ping or the deployment connection can publish.
     print(f"Resolving and verifying {args.tag} ...")
@@ -719,6 +734,243 @@ def main(argv: list[str] | None = None) -> int:
         for record in plan["results"].values()
     ):
         print("\nNo target confirmed the expected Schedule SHA-256 as applied.")
+        return 1
+    print("\nDone.")
+    return 0
+
+
+def _fail_experiment(args, message: str, extra: dict[str, Any] | None = None) -> int:
+    error = _redact_text(message)
+    plan = {
+        "experiment": args.experiment,
+        "openjii_env": args.openjii_env,
+        "dry_run": args.dry_run,
+        "results": {},
+        "error": error,
+    }
+    plan.update(extra or {})
+    write_results(args.results_json, plan)
+    write_summary(
+        os.environ.get("GITHUB_STEP_SUMMARY"),
+        [f"## Fleet deploy (Schedule): workbook of {args.experiment} failed", "",
+         f"**{error}**"],
+    )
+    print(f"Workbook delivery failed: {error}", file=sys.stderr)
+    return 2
+
+
+def run_experiment_mode(args, parser) -> int:
+    """Resolve, stamp and deliver an experiment's workbook schedule inline."""
+    try:
+        client = workbook.make_client(
+            args.openjii_env, os.environ.get(workbook.API_KEY_ENV, "")
+        )
+    except workbook.WorkbookDeliveryError as exc:
+        return _fail_experiment(args, str(exc))
+    openjii_client, stamp, _environments = workbook.gui_modules()
+    if args.tag:
+        print(f"Note: --tag {args.tag} is ignored; the schedule comes from the workbook.")
+
+    print(f"Resolving the pinned workbook of experiment {args.experiment} ({args.openjii_env}) ...")
+    try:
+        user = client.validate_key()
+        # Routing is compiled against the newest firmware class; older classes
+        # get the same macros with routing stripped (plan_variants).
+        programming = client.resolve_programming(
+            args.experiment, fw_version=stamp.MACRO_WHEN_MIN_FW, log=print
+        )
+        experiment_devices, unaddressable = workbook.experiment_thing_names(
+            client, args.experiment
+        )
+    except openjii_client.OpenJIIError as exc:
+        return _fail_experiment(args, str(exc))
+    print(f"  signed in as {user.get('email') or user.get('name') or user.get('id')}")
+    if programming is None:
+        return _fail_experiment(
+            args,
+            "the experiment has no pinned workbook version with an Ambyte "
+            "schedule command cell (schema: jii.ambyte-schedule/...)",
+        )
+    print(
+        f"  workbook {programming.workbook_id} version "
+        f"{programming.workbook_version_id} "
+        f"({len(programming.macros)} macro(s), routing compiled="
+        f"{programming.routing_compiled})"
+    )
+    print(f"  {len(experiment_devices)} Ambyte(s) bound to the experiment")
+    if unaddressable:
+        print(f"  {len(unaddressable)} bound device(s) are not fleet client IDs: "
+              + ", ".join(unaddressable))
+
+    if args.devices:
+        try:
+            requested = parse_devices(args.devices)
+            universe = workbook.restrict_to_experiment(requested, experiment_devices)
+        except (ValueError, workbook.WorkbookDeliveryError) as exc:
+            return _fail_experiment(args, str(exc))
+        print(f"Explicit device list: {len(universe)} device(s)")
+    else:
+        universe = experiment_devices
+
+    base_plan: dict[str, Any] = {
+        "experiment": args.experiment,
+        "openjii_env": args.openjii_env,
+        "workbook_id": programming.workbook_id,
+        "workbook_version_id": programming.workbook_version_id,
+        "workbook_version_number": programming.workbook_version_number,
+        "reboot": args.reboot,
+        "version_op": args.version_op,
+        "version": args.version,
+        "percentage": args.percentage,
+        "dry_run": args.dry_run,
+        "unaddressable_devices": unaddressable,
+    }
+    if not universe:
+        print("No devices to target.")
+        write_results(args.results_json, {**base_plan, "universe": 0, "cohort": [],
+                                          "variants": [], "results": {}, "error": None})
+        write_summary(
+            os.environ.get("GITHUB_STEP_SUMMARY"),
+            [f"## Fleet deploy (Schedule): workbook of {args.experiment}", "",
+             "No devices to target."],
+        )
+        return 0
+
+    session = fleet.boto_session(args.profile, args.region)
+    print(f"Pinging {len(universe)} device(s) (up to {args.ping_wait}s) ...")
+    firmware_by_device = fleet.fleet_ping(session, universe, args.ping_wait)
+    selected = select_cohort(
+        universe, firmware_by_device, args.version_op, args.version, args.percentage
+    )
+    silent = sorted(d for d in universe if d not in firmware_by_device)
+    try:
+        variants, excluded = workbook.plan_variants(
+            programming, selected["cohort"], firmware_by_device, stamp,
+            reboot=args.reboot, log=print,
+        )
+    except (workbook.WorkbookDeliveryError, stamp.ScheduleStampError, ValueError) as exc:
+        return _fail_experiment(
+            args, str(exc),
+            {"universe": len(universe), "cohort": selected["cohort"],
+             "firmware_by_device": firmware_by_device, "silent_on_ping": silent},
+        )
+    targeted = [d for v in variants for d in v.devices]
+
+    print(
+        f"\nPlan: workbook {programming.workbook_version_id}\n"
+        f"  universe {len(universe)} | matching {len(selected['matching'])} | "
+        f"cohort {args.percentage}% -> {len(selected['cohort'])} | "
+        f"deliverable {len(targeted)} | excluded {len(excluded)}"
+    )
+    for variant in variants:
+        print(f"  [{variant.key}] {variant.description}: sha256={variant.sha256} "
+              f"campaign {variant.command['id']!r}")
+        for device in variant.devices:
+            print(f"    {device}  fw={firmware_by_device.get(device)}")
+    for device, reason in sorted(excluded.items()):
+        print(f"  excluded {device}  fw={firmware_by_device.get(device) or 'silent'} "
+              f"({reason})")
+
+    plan: dict[str, Any] = {
+        **base_plan,
+        "universe": len(universe),
+        "matching": len(selected["matching"]),
+        "cohort": selected["cohort"],
+        "unproven_firmware": selected["unproven"],
+        "silent_on_ping": silent,
+        "excluded": excluded,
+        "firmware_by_device": firmware_by_device,
+        "variants": [
+            {"class": v.key, "description": v.description, "sha256": v.sha256,
+             "size_bytes": len(v.text.encode("utf-8")),
+             "campaign_id": v.command["id"], "devices": v.devices}
+            for v in variants
+        ],
+        "results": {},
+        "error": None,
+    }
+    sha_by_device = {d: v.sha256 for v in variants for d in v.devices}
+
+    if args.dry_run:
+        print(
+            "\nDRY RUN: correlated ping commands were published for liveness/"
+            "firmware targeting; no script_update commands were published."
+        )
+    elif not targeted:
+        print("\nNo device can take the workbook schedule; nothing to deploy.")
+    else:
+        for variant in variants:
+            print(f"\nDeploying [{variant.key}] to {len(variant.devices)} device(s) ...")
+            results, error = fleet_script_update(
+                session, variant.devices, variant.command,
+                args.ack_seconds, args.final_seconds, args.batch, args.stagger,
+            )
+            plan["results"].update(results)
+            if error:
+                plan["error"] = error
+                break
+
+    write_results(args.results_json, plan)
+    summary_lines = [
+        f"## Fleet deploy (Schedule): workbook of {args.experiment} "
+        f"({'dry run' if args.dry_run else 'live'})",
+        "",
+        f"- Workbook version: `{programming.workbook_version_id}`"
+        + (f" (v{programming.workbook_version_number})"
+           if isinstance(programming.workbook_version_number, int) else ""),
+        f"- Macros: {len(programming.macros)}, routing compiled: {programming.routing_compiled}",
+        f"- Targeting: `{args.version_op}"
+        + (f" {args.version}" if args.version_op != "any" else "")
+        + f"` at **{args.percentage}%**, experiment devices only",
+        f"- Universe {len(universe)} -> matching {len(selected['matching'])} -> "
+        f"cohort {len(selected['cohort'])} -> deliverable {len(targeted)} "
+        f"(excluded {len(excluded)}: silent, legacy or pre-YAML firmware)",
+        "",
+        "| device | fw before | class | outcome | script SHA-256 | detail |",
+        "|---|---|---|---|---|---|",
+    ]
+    if args.dry_run:
+        summary_lines[6:6] = [
+            "- Dry run published correlated ping commands only; it published no "
+            "`script_update` command and made no device-state change.",
+        ]
+    class_by_device = {d: v.key for v in variants for d in v.devices}
+    for device in sorted(targeted):
+        if args.dry_run:
+            outcome, detail, reported_sha = "would deploy", "", sha_by_device[device]
+        else:
+            record = plan["results"].get(device, {})
+            outcome = classify(record, sha_by_device[device])
+            detail = record.get("detail") or ""
+            reported_sha = record.get("script_sha256") or ""
+        summary_lines.append(
+            f"| {device} | {firmware_by_device.get(device)} | {class_by_device[device]} | "
+            f"{outcome} | {reported_sha} | {detail} |"
+        )
+    for device, reason in sorted(excluded.items()):
+        summary_lines.append(
+            f"| {device} | {firmware_by_device.get(device) or 'silent'} | - | "
+            f"excluded | | {reason} |"
+        )
+    if plan["error"]:
+        summary_lines.extend(["", f"**Campaign error (tracking incomplete): {plan['error']}**"])
+    write_summary(os.environ.get("GITHUB_STEP_SUMMARY"), summary_lines)
+
+    if plan["error"]:
+        return 1
+    failed = [
+        device for device, record in plan["results"].items()
+        if classify(record, sha_by_device.get(device)) in {"failed", "applied (sha mismatch)"}
+    ]
+    if failed:
+        print(f"\n{len(failed)} device(s) failed identity/application checks: "
+              f"{', '.join(failed)}")
+        return 1
+    if not args.dry_run and targeted and not any(
+        classify(record, sha_by_device.get(device)) == "applied"
+        for device, record in plan["results"].items()
+    ):
+        print("\nNo target confirmed its stamped schedule SHA-256 as applied.")
         return 1
     print("\nDone.")
     return 0

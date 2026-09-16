@@ -320,6 +320,31 @@ class OpenJIIClient:
             topic_prefix=topic_prefix.strip().strip("/"),
         )
 
+    def list_experiment_devices(self, experiment_id: str) -> list[dict]:
+        """Devices bound to an experiment, flattened to the device objects.
+
+        GET /experiments/{id}/devices answers ``[{device: {...}, addedBy,
+        addedAt}]``; only collaborators see it, and it is gated by the same
+        `iot-devices` flag as the registry.
+        """
+        status, payload = self._request(
+            "GET", f"/api/v1/experiments/{experiment_id}/devices")
+        if status == 403:
+            raise OpenJIIError(
+                f"openJII refused the device list of {experiment_id} (403): "
+                "you need collaborator access and the `iot-devices` flag: "
+                f"{self._error_text(payload)}")
+        if status != 200 or not isinstance(payload, list):
+            raise OpenJIIError(
+                f"listing devices of experiment {experiment_id} failed "
+                f"({status}): {self._error_text(payload)}")
+        devices = []
+        for entry in payload:
+            device = entry.get("device") if isinstance(entry, dict) else None
+            if isinstance(device, dict):
+                devices.append(device)
+        return devices
+
     # ── workbook programming (schedule install source) ───────────────────
     def get_experiment(self, experiment_id: str) -> dict:
         """The experiment detail; carries the pinned workbookId/versionId."""

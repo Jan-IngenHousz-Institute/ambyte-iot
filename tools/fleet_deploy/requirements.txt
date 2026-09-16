@@ -3,3 +3,6 @@
 # lookup + SigV4 credentials.
 boto3>=1.34
 awsiotsdk>=1.21
+# --experiment mode reuses the flash GUI's openJII client, whose TLS helper
+# validates api.openjii.org against certifi's bundle.
+certifi>=2024.7.4

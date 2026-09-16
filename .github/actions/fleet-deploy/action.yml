@@ -15,6 +15,18 @@ inputs:
     description: Schedule only; released asset name without the .yaml suffix
     required: false
     default: default
+  experiment-id:
+    description: Schedule only; deliver this openJII experiment's pinned workbook schedule to its own Ambytes instead of a catalog release
+    required: false
+    default: ""
+  openjii-environment:
+    description: Schedule only; openJII environment (dev|prod) the experiment lives in, must match the AWS environment
+    required: false
+    default: ""
+  openjii-api-key:
+    description: Schedule only; personal openJII API key used to read the experiment (required with experiment-id)
+    required: false
+    default: ""
   version-op:
     description: Firmware-version predicate
     required: true
@@ -187,6 +199,9 @@ runs:
         AMBIT_FINAL_SECONDS: ${{ inputs.ambit-final-seconds }}
         REBOOT: ${{ inputs.reboot }}
         SCRIPT_NAME: ${{ inputs.script-name }}
+        EXPERIMENT_ID: ${{ inputs.experiment-id }}
+        OPENJII_ENV: ${{ inputs.openjii-environment }}
+        OPENJII_API_KEY: ${{ inputs.openjii-api-key }}
       shell: bash
       run: |
         set -euo pipefail
@@ -213,7 +228,13 @@ runs:
             ;;
           schedule)
             [[ "${REBOOT}" == "true" ]] && ARGS+=(--reboot) || ARGS+=(--no-reboot)
-            ARGS+=(--script-name "${SCRIPT_NAME}")
+            if [[ -n "${EXPERIMENT_ID}" ]]; then
+              [[ "${EXPERIMENT_ID}" =~ ^[0-9a-fA-F-]{36}$ ]] \
+                || { echo "::error::experiment-id must be a UUID"; exit 2; }
+              ARGS+=(--experiment "${EXPERIMENT_ID}" --openjii-env "${OPENJII_ENV}")
+            else
+              ARGS+=(--script-name "${SCRIPT_NAME}")
+            fi
             python tools/fleet_deploy/schedule_deploy.py "${ARGS[@]}"
             ;;
           ambit)

@@ -17,10 +17,14 @@ on:
         type: string
         default: "latest"
       script:
-        description: "Released Schedule script to install as schedule.yaml"
+        description: "Released Schedule script to install as schedule.yaml (ignored when experiment_id is set)"
         type: choice
         options: [default, legacy_1hz_spec]
         default: default
+      experiment_id:
+        description: "Optional openJII experiment id: deliver its pinned workbook schedule (stamped, inline) to that experiment's Ambytes only"
+        type: string
+        default: ""
       version_op:
         description: "Firmware-version filter reported by each device"
         type: choice
@@ -63,7 +67,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.script }} from ${{ inputs.release_tag }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    name: Deploy ${{ inputs.experiment_id && format('workbook of {0}', inputs.experiment_id) || format('{0} from {1}', inputs.script, inputs.release_tag) }} to ${{ inputs.environment }} (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
     runs-on: ubuntu-latest
     environment: fleet-deploy-${{ inputs.environment }}
     timeout-minutes: 60
@@ -80,6 +84,9 @@ jobs:
           repository: ${{ github.repository }}
           release-tag: ${{ inputs.release_tag }}
           script-name: ${{ inputs.script }}
+          experiment-id: ${{ inputs.experiment_id }}
+          openjii-environment: ${{ inputs.environment }}
+          openjii-api-key: ${{ secrets.OPENJII_API_KEY }}
           version-op: ${{ inputs.version_op }}
           version: ${{ inputs.version }}
           percentage: ${{ inputs.percentage }}
