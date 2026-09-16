@@ -4,6 +4,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -59,20 +60,46 @@ static esp_err_t publish_heartbeat(int64_t uptime_ms)
 static void heartbeat_task(void *arg)
 {
     (void)arg;
-    int64_t next_due_ms = 0; /* first report as soon as Wi-Fi + MQTT are ready */
+    uint32_t slot = 0;
+    if (fleet_jitter_slot_for_sta_mac(900, &slot) != ESP_OK) {
+        ESP_LOGW("heartbeat", "MAC jitter unavailable; using slot 0");
+    }
+    const int64_t phase_ms = (int64_t)slot * 1000;
+    int64_t next_due_ms = 0;
+    bool was_connected = false;
     for (;;) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms >= next_due_ms && s_cfg.wifi_connected() && s_cfg.mqtt_connected()) {
-            if (publish_heartbeat(now_ms) == ESP_OK) {
-                next_due_ms = now_ms + HEARTBEAT_INTERVAL_MS;
-            } else {
-                ESP_LOGW("heartbeat", "status submission failed; retry in 30 s");
+        const bool connected = s_cfg.wifi_connected() && s_cfg.mqtt_connected();
+        uint32_t sleep_ms = HEARTBEAT_POLL_MS;
+        if (connected) {
+            if (!was_connected && now_ms >= next_due_ms) {
+                /* Stagger boot AND recovery: all gateways otherwise become due
+                 * together after a site outage. One fresh report within the
+                 * first 15 minutes, then the normal 15-minute interval. */
+                next_due_ms = now_ms + phase_ms;
+            }
+            if (now_ms >= next_due_ms) {
+                if (s_cfg.publish_allowed != NULL && !s_cfg.publish_allowed()) {
+                    /* Keep the raw-sensor hold (including the legacy full-cycle
+                     * rollback), but poll finely: 30 s sampling can phase-lock
+                     * with a repeated measurement and starve every report. */
+                    sleep_ms = 1000;
+                } else if (publish_heartbeat(now_ms) == ESP_OK) {
+                    next_due_ms = now_ms + HEARTBEAT_INTERVAL_MS;
+                } else {
+                    ESP_LOGW("heartbeat", "status submission failed; retry in 30 s");
+                }
+            }
+            const int64_t remaining_ms = next_due_ms - esp_timer_get_time() / 1000;
+            if (remaining_ms > 0 && remaining_ms < sleep_ms) {
+                sleep_ms = (uint32_t)remaining_ms;
             }
         }
+        was_connected = connected;
         /* A failed submission or an offline interval never consumes the due
          * report. Reconnection sends ONE fresh snapshot, not a night's backlog.
          * Monotonic uptime keeps this alive with an unset/jumping wall clock. */
-        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(sleep_ms) > 0 ? pdMS_TO_TICKS(sleep_ms) : 1);
     }
 }
 

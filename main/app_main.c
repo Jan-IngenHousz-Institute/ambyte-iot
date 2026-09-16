@@ -189,6 +189,17 @@ static esp_err_t app_start_wifi(void)
     return ESP_OK;
 }
 
+/* Heartbeats bypass the external-power gate, but preserve the sensor hold and
+ * the legacy whole-measurement rollback switch used by the bulk publisher. */
+static bool app_heartbeat_publish_allowed(void)
+{
+#if AMBYTE_PUBLISH_GATE_LEGACY
+    return !device_commands_measurement_active();
+#else
+    return !device_commands_publish_hold_active();
+#endif
+}
+
 /* bool(void) adapter over wifi_manager_is_provisioned(bool*) for the
  * status-LED blinker probe table. */
 static bool app_wifi_provisioned(void)
@@ -1443,6 +1454,7 @@ void app_main(void)
         .publish          = mqtt_client_get_publish_fn(),
         .mqtt_connected   = mqtt_client_get_is_connected_fn(),
         .wifi_connected   = wifi_manager_is_connected,
+        .publish_allowed  = app_heartbeat_publish_allowed,
         .read_power       = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
         .sd_ready         = sdcard_is_mounted,
         .status_topic     = status_topic,

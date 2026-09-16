@@ -283,7 +283,11 @@ A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (de
 Stored telemetry follows the measurement FIFO and can wait for external power.
 For live reachability, an independent `status_heartbeat` task publishes a compact
 `type: heartbeat` message directly to the configured MQTT **status topic** (the
-same topic as command replies), first when connected and then every 15 minutes.
+same topic as command replies). The first report after connection or an overdue
+reconnect is MAC-staggered over 0–899 seconds, then repeats every 15 minutes.
+Brief sensor transactions defer due reports, checked every second; the legacy
+whole-measurement hold remains supported. Short reconnects do not restart a
+pending future deadline.
 It includes device identity, running firmware, uptime, battery/input voltage,
 charging state and SD mount status. A failed/absent charger read reports
 `power: null`; it never suppresses the heartbeat. Battery voltage, external
@@ -292,7 +296,7 @@ gate this operational message. `heartbeat_s=0` disables stored telemetry only.
 
 Wi-Fi **and MQTT** must be connected and the device must remain powered. A due
 report is retried every 30 seconds after a failed submission or an outage; only
-one fresh snapshot is sent on recovery. Transport QoS 1 provides delivery retry,
+one fresh snapshot is scheduled on recovery, staggered by the same MAC slot. Transport QoS 1 provides delivery retry,
 but an accepted submission is not proof of broker receipt. There is no offline
 heartbeat backlog. This status-topic message is separate from the warehouse
 measurement envelope and does not by itself add a dashboard display. The bulk

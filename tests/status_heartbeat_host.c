@@ -15,6 +15,12 @@ static void (*task_fn)(void *);
 static jmp_buf done;
 static bool is(const char *s) { return strcmp(scenario, s) == 0; }
 int64_t esp_timer_get_time(void) { return now_ms * 1000; }
+esp_err_t fleet_jitter_slot_for_sta_mac(uint32_t slots, uint32_t *out)
+{
+    assert(slots == 900);
+    *out = (is("jitter") || is("reconnect_jitter") || is("brief_reconnect")) ? 137 : 0;
+    return ESP_OK;
+}
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
                        void *arg, unsigned priority, TaskHandle_t *handle)
 {
@@ -30,8 +36,10 @@ void vTaskDelay(TickType_t ticks)
 static bool wifi(void) { return !is("wifi_down"); }
 static bool mqtt(void)
 {
-    return !is("mqtt_down") && (!is("reconnect") || now_ms >= 1200000);
+    if (is("brief_reconnect") && now_ms >= 90000 && now_ms < 110000) return false;
+    return !is("mqtt_down") && (!(is("reconnect") || is("reconnect_jitter")) || now_ms >= 1200000);
 }
+static bool allowed(void) { return !is("sensor_hold") || now_ms >= 5000; }
 static bool sd(void) { return false; } /* parked/absent for the entire test */
 static esp_err_t power(power_reading_t *p)
 {
@@ -47,6 +55,7 @@ static void *alloc(size_t size)
 static esp_err_t publish(const char *topic, const char *payload, size_t len, int *id)
 {
     assert(wifi() && mqtt());
+    assert(allowed());
     assert(strcmp(topic, "test/device/status") == 0);
     assert(len == strlen(payload));
     attempts++;
@@ -56,7 +65,8 @@ static esp_err_t publish(const char *topic, const char *payload, size_t len, int
     assert(strcmp(cJSON_GetObjectItem(j,"device_id")->valuestring,"AMBYTE_\"test") == 0);
     assert(strcmp(cJSON_GetObjectItem(j,"fw")->valuestring,"2.2.1") == 0);
     assert(cJSON_GetObjectItem(j,"uptime_ms")->valuedouble == (double)now_ms);
-    assert(cJSON_IsFalse(cJSON_GetObjectItem(j,"sd_ready")));
+    if (is("no_sd_probe")) assert(cJSON_IsNull(cJSON_GetObjectItem(j,"sd_ready")));
+    else assert(cJSON_IsFalse(cJSON_GetObjectItem(j,"sd_ready")));
     cJSON *p = cJSON_GetObjectItem(j,"power");
     if (is("power_error")) assert(cJSON_IsNull(p));
     else {
@@ -76,7 +86,8 @@ int main(int argc, char **argv)
     cJSON_Hooks hooks = {.malloc_fn=alloc,.free_fn=free}; cJSON_InitHooks(&hooks);
     status_heartbeat_config_t cfg = {
         .publish=publish,.mqtt_connected=mqtt,.wifi_connected=wifi,.read_power=power,
-        .sd_ready=sd,.status_topic="test/device/status",.device_id="AMBYTE_\"test",.firmware_version="2.2.1",
+        .sd_ready=is("no_sd_probe") ? NULL : sd,.publish_allowed=allowed,
+        .status_topic="test/device/status",.device_id="AMBYTE_\"test",.firmware_version="2.2.1",
     };
     assert(status_heartbeat_start(NULL) == ESP_ERR_INVALID_ARG);
     assert(status_heartbeat_start(&cfg) == ESP_OK);
@@ -84,6 +95,9 @@ int main(int argc, char **argv)
     if (setjmp(done) == 0) task_fn(NULL);
     if (is("wifi_down") || is("mqtt_down")) assert(attempts == 0);
     else if (is("reconnect")) { assert(successes == 1); assert(sent_at[0] == 1200000); }
+    else if (is("reconnect_jitter")) { assert(successes == 1); assert(sent_at[0] == 1337000); }
+    else if (is("jitter") || is("brief_reconnect")) { assert(successes == 2); assert(sent_at[0] == 137000); assert(sent_at[1] == 1037000); }
+    else if (is("sensor_hold")) { assert(successes == 2); assert(sent_at[0] == 5000); assert(sent_at[1] == 905000); }
     else if (is("publish_failure") || is("allocation_failure")) {
         assert(successes == 2); assert(sent_at[0] == 30000); assert(sent_at[1] == 930000);
     } else {

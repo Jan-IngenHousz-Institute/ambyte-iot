@@ -7,6 +7,7 @@ typedef struct {
     message_publish_fn publish;
     message_is_connected_fn mqtt_connected;
     bool (*wifi_connected)(void);
+    bool (*publish_allowed)(void); /* optional transient sensor hold; never a power gate */
     power_read_fn read_power; /* optional; failed/absent read reports power:null */
     bool (*sd_ready)(void);   /* optional; no SD access, cached mount state only */
     const char *status_topic;
@@ -16,7 +17,9 @@ typedef struct {
 
 /* Start once after MQTT and power-driver initialization. Copies the config;
  * string storage must outlive the task. One small QoS-1 status-topic message
- * immediately when connected, then every 15 minutes of uptime. Retries failed
+ * at a MAC-staggered point within 15 minutes of connection, then every 15
+ * minutes of uptime. Brief sensor holds defer a due report (checked every 1 s).
+ * Retries failed
  * submissions / overdue offline reports every 30 s, without offline buffering.
  *
  * Deliberately independent of external power, SD/internal storage, RTC, schedule

@@ -26,7 +26,8 @@ class StatusHeartbeatTest(unittest.TestCase):
                 str(cjson), "-lm", "-o", str(binary),
             ], check=True)
             for scenario in ("battery", "critical", "charging", "power_error", "mqtt_down",
-                             "wifi_down", "reconnect", "publish_failure", "allocation_failure"):
+                             "wifi_down", "reconnect", "publish_failure", "allocation_failure",
+                             "sensor_hold", "jitter", "reconnect_jitter", "brief_reconnect", "no_sd_probe"):
                 with self.subTest(scenario=scenario):
                     subprocess.run([str(binary), scenario], check=True)
 
