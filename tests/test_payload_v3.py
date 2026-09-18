@@ -318,6 +318,15 @@ class PayloadV3Test(unittest.TestCase):
         heartbeat = source.split("static cmd_result_t emit_status_event", 1)[1].split(
             "/* Last battery voltage", 1
         )[0]
+        direct = heartbeat.split("if (direct) {", 1)[1].split("} else {", 1)[0]
+        self.assertIn(".topic = s_cfg.topic_root", direct)
+        self.assertIn(".device_id = s_mac_str", direct)
+        self.assertIn(".provenance = s_cfg.schedule_provenance", direct)
+        self.assertNotIn("status_topic", direct)
+        self.assertNotIn("store_event", direct)
+        app = (ROOT / "main/app_main.c").read_text()
+        self.assertIn("return cmd_publish_status_event().status;", app)
+        self.assertIn(".publish_snapshot = app_publish_telemetry", app)
         self.assertIn("cmd_ambit_device_info_cached", heartbeat)
         self.assertNotIn("ambit_info_fetch", heartbeat)
         self.assertIn("input.attached_count = 0", heartbeat)

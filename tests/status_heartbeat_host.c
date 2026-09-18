@@ -46,8 +46,8 @@ static esp_err_t publish(void)
 {
     assert(wifi() && mqtt() && allowed());
     attempts++;
-    if ((is("publish_failure") || is("allocation_failure")) && attempts == 1)
-        return ESP_FAIL;
+    if (is("allocation_failure") && attempts == 1) return ESP_ERR_NO_MEM;
+    if (is("publish_failure") && attempts == 1) return ESP_FAIL;
     assert(successes < 16);
     sent_at[successes++] = now_ms;
     return ESP_OK;

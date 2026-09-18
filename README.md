@@ -287,7 +287,10 @@ canonical `ambyte.telemetry/1` sample in the normal `sample` envelope directly t
 provenance and the macros whose `when` conditions match telemetry. The former
 `type: heartbeat` command-status message is no longer emitted; command replies
 continue on the status topic. This uses the existing ingestion pipeline and
-requires no new database or backend. Warehouse visibility still depends on that
+requires no new database or backend. If optional workbook snapshot/rendering
+allocation fails, the health envelope still publishes without provenance keys;
+workbook-driven processing of that degraded row is consequently not guaranteed.
+Warehouse visibility still depends on that
 pipeline's health, permissions and processing latency.
 
 Reports use a MAC-staggered 0–899-second phase on a fixed 15-minute uptime grid.
@@ -295,8 +298,10 @@ An overdue report sends on the first connected poll, then returns to that grid;
 a reconnect never postpones it. Brief sensor transactions defer due reports,
 checked every second; the legacy whole-measurement hold remains supported.
 Battery voltage, external power, missing SD/internal storage, clock trust and
-schedule state do not gate the report. Failed sensor reads omit the unavailable
-health section. `heartbeat_s=0` disables stored telemetry only.
+schedule state do not gate the report. An unset wall clock is reported as-is
+(including an epoch timestamp) with clock-health flags; the firmware does not
+fabricate a current observation time. Failed sensor reads leave the corresponding
+health section empty. `heartbeat_s=0` disables stored telemetry only.
 
 The direct path uses the shared NVS-backed measure-ID allocator, initialized
 independently of the event-store mount. It never claims or acknowledges a stored

@@ -34,7 +34,8 @@ Databricks `open_jii_dev.centrum.clean_data`.
   PUBACKs safe.
 - **Task boundaries**: the esp-mqtt task touches only the portMUX latch table + completion
   queue — never event_log's `s_mtx` (blocking socket servicing *causes* disconnects). All
-  event_log mutations happen on sync_runner.
+  event-log ACK/cursor mutations happen on sync_runner. Producers and the direct
+  heartbeat allocate unique IDs under event_log's mutex; they never advance the cursor.
 - **Cap chain (compile-verified)**: `AMBIT_RUN_PAYLOAD_CAP` (64,000) < `EVLOG_RECORD_CAP_NORMAL`
   (65,552) < `AMBYTE_PUBLISH_MAX_BYTES` (record+4 KiB). PSRAM-absent boots fall back to the
   12 KB record cap at runtime.

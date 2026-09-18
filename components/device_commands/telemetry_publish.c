@@ -1,7 +1,6 @@
 #include "telemetry_publish.h"
 #include "envelope_provenance.h"
 
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "cJSON.h"
@@ -51,30 +50,39 @@ esp_err_t telemetry_publish(const telemetry_publish_config_t *cfg,
     if (battery_mv && !cJSON_AddNumberToObject(envelope, "device_battery", (double)battery_mv / 1000.0)) goto cleanup;
 
     if (cfg->provenance) {
-        provenance = calloc(1, sizeof *provenance);
-        if (provenance == NULL) goto cleanup;
+        provenance = cJSON_malloc(sizeof *provenance);
+        if (provenance == NULL) goto publish;
+        memset(provenance, 0, sizeof *provenance);
         if (cfg->provenance(provenance) == ESP_OK) {
-            /* Same 1440-byte bound and per-sample macro filtering as the drain.
-             * Turn its trailing-comma splice into an object for safe merging. */
-            part = malloc(1442);
-            if (part == NULL) goto cleanup;
+            /* Optional decoration must not silence liveness. Prepare both keys
+             * off-envelope so allocation/parse failure cannot leave a partial
+             * workbook/macro pair. Same bounded splice as the normal drain. */
+            part = cJSON_malloc(1442);
+            if (part == NULL) goto publish;
             part[0] = '{';
             int length = envelope_provenance_part(provenance, sample_json, part + 1, 1440);
             if (length > 0) {
                 part[length] = '}';
                 part[length + 1] = '\0';
                 provenance_json = cJSON_Parse(part);
-                if (provenance_json == NULL) goto cleanup;
-                while (provenance_json->child) {
-                    cJSON *field = cJSON_DetachItemViaPointer(provenance_json, provenance_json->child);
-                    if (!cJSON_AddItemToObject(envelope, field->string, field)) {
-                        cJSON_Delete(field);
-                        goto cleanup;
-                    }
-                }
+                if (provenance_json == NULL) goto publish;
+                /* Literal keys avoid a final key-copy allocation: after the
+                 * complete parse succeeds these ownership transfers cannot OOM. */
+                cJSON *workbook = cJSON_DetachItemFromObjectCaseSensitive(provenance_json, "workbook_version_id");
+                cJSON *macros = cJSON_DetachItemFromObjectCaseSensitive(provenance_json, "macros");
+                if (workbook) (void)cJSON_AddItemToObjectCS(envelope, "workbook_version_id", workbook);
+                if (macros) (void)cJSON_AddItemToObjectCS(envelope, "macros", macros);
             }
         }
     }
+publish:
+    /* Release optional scratch before allocating the final wire buffer. */
+    cJSON_Delete(provenance_json);
+    cJSON_free(part);
+    cJSON_free(provenance);
+    provenance_json = NULL;
+    part = NULL;
+    provenance = NULL;
     wire = cJSON_PrintUnformatted(envelope);
     if (wire == NULL) goto cleanup;
     result = cfg->publish(cfg->topic, wire, strlen(wire), NULL);
@@ -82,7 +90,7 @@ cleanup:
     cJSON_free(wire);
     cJSON_Delete(provenance_json);
     cJSON_Delete(envelope);
-    free(part);
-    free(provenance);
+    cJSON_free(part);
+    cJSON_free(provenance);
     return result;
 }

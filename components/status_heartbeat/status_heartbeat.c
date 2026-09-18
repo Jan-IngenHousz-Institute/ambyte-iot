@@ -8,7 +8,9 @@
 
 #define HEARTBEAT_INTERVAL_MS (15LL * 60 * 1000)
 #define HEARTBEAT_POLL_MS 30000U
-#define HEARTBEAT_STACK 10240
+/* Canonical snapshot plus nested schedule-provenance copy; keep headroom over
+ * the stored-telemetry watchdog and report the actual minimum after first send. */
+#define HEARTBEAT_STACK 12288
 
 static status_heartbeat_config_t s_cfg;
 static TaskHandle_t s_task;
@@ -29,6 +31,7 @@ static void heartbeat_task(void *arg)
     }
     const int64_t phase_ms = (int64_t)slot * 1000;
     int64_t next_due_ms = phase_ms;
+    bool stack_reported = false;
     for (;;) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const bool connected = s_cfg.wifi_connected() && s_cfg.mqtt_connected();
@@ -47,6 +50,11 @@ static void heartbeat_task(void *arg)
                      * suppress reports forever. A recovery snapshot can be
                      * followed by the next grid report in less than 15 min. */
                     next_due_ms = next_phase_after(now_ms, phase_ms);
+                    if (!stack_reported) {
+                        ESP_LOGI("heartbeat", "stack free minimum: %u bytes",
+                                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                        stack_reported = true;
+                    }
                 } else {
                     ESP_LOGW("heartbeat", "status submission failed; retry in 30 s");
                 }

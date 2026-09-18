@@ -6,7 +6,7 @@
 #include "payload_v3.h"
 #include "telemetry_publish.h"
 
-static int published;
+static int published, degraded;
 static int fail_after = -1, allocations;
 static bool transport_failure;
 static const char *scenario;
@@ -38,6 +38,12 @@ static esp_err_t publish(const char *topic, const char *payload, size_t len, int
     assert(len == strlen(payload));
     assert(id == NULL); /* Direct heartbeat never enrolls in the stored-event window. */
     ++published;
+    if (is("allocations")) {
+        bool has_workbook = strstr(payload, "workbook_version_id") != NULL;
+        bool has_macros = strstr(payload, "telemetry-id") != NULL;
+        assert(has_workbook == has_macros); /* Never attach half the routing pair. */
+        if (!has_workbook) ++degraded;
+    }
     if (!is("allocations")) puts(payload);
     /* The sample's int64 ID must not round through cJSON's double. */
     assert(strstr(payload, "9007199254740993"));
@@ -79,10 +85,15 @@ int main(int argc, char **argv)
         for (index = 0; index < 300; ++index) {
             fail_after = index; allocations = 0; published = 0;
             esp_err_t result = telemetry_publish(&cfg, sample, now, 3800);
-            if (result == ESP_OK) { assert(published == 1); break; }
-            assert(result == ESP_ERR_NO_MEM && published == 0);
+            if (result == ESP_OK) {
+                assert(published == 1);
+                if (allocations <= fail_after) break; /* Covered every allocation. */
+            } else {
+                assert(result == ESP_ERR_NO_MEM && published == 0);
+            }
         }
         assert(index > 20 && index < 300);
+        assert(degraded > 2); /* Snapshot, splice and parse failpoints publish without provenance. */
     } else {
         esp_err_t result = telemetry_publish(&cfg, sample, now,
             is("power_error") ? 0 : is("critical") ? 3100 : 3800);

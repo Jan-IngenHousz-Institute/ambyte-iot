@@ -785,6 +785,9 @@ static int64_t now_ms(void)
 }
 
 /* ── Publish power gate (Phase 1) ─────────────────────────────────────────
+ * Snapshot callers (watchdog, direct heartbeat, CLI) also evaluate this cached
+ * diagnostic state; the direct heartbeat reports it but never uses it to gate
+ * delivery. The debounce/cache is advisory across those tasks.
  * Only drain the MQTT backlog while on external power. Keyed on VIN-present
  * (input voltage / charger VIN status) rather than input current: Iin has a
  * ~13 mA ADC step and reads near-zero when the battery is full even in full

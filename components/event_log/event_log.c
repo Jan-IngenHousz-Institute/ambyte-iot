@@ -6,7 +6,8 @@
  * docs/append-log-persistence-plan.md for the design rationale; the Step-0 spike
  * proved this write pattern is corruption-free on the field card.
  *
- * Concurrency: every public op runs under s_mtx, serialising the schedule runner
+ * Concurrency: every public op runs under s_mtx, serialising the status-heartbeat
+ * snapshot/ID allocator, the schedule runner
  * (store), the sync-runner drain (claim plus deferred ack/error marks), the
  * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), and the CLI
  * (stats). MQTT/Wi-Fi event tasks never enter this component: device_commands
