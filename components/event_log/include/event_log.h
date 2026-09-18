@@ -63,6 +63,9 @@ extern "C" {
  * archive copies (a dead SD + slow uplink must never make the store refuse new
  * measurements while old synced data holds the space).
  */
+/* Boot-only ID allocator initialization; independent of filesystem/SD. Call
+ * before producers start. event_log_init also invokes this idempotently. */
+esp_err_t event_log_init_ids(void);
 esp_err_t event_log_init(void);
 
 /* Register the composition-root hook that clears the MQTT correlation window

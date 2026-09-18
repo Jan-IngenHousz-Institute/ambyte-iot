@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "cJSON.h"
 #include "status_heartbeat.h"
 #include "freertos/task.h"
 
@@ -43,42 +42,12 @@ static bool mqtt(void)
     return !is("mqtt_down") && (!(is("reconnect") || is("reconnect_jitter")) || now_ms >= 1200000);
 }
 static bool allowed(void) { return !is("sensor_hold") || now_ms >= 5000; }
-static bool sd(void) { return false; } /* parked/absent for the entire test */
-static esp_err_t power(power_reading_t *p)
+static esp_err_t publish(void)
 {
-    *p = (power_reading_t){.battery_mv = is("critical") ? 3100 : 3800,
-                         .input_present = is("charging"), .charge_status = is("charging") ? 2 : 0};
-    return is("power_error") ? ESP_FAIL : ESP_OK;
-}
-static void *alloc(size_t size)
-{
-    if (is("allocation_failure") && now_ms < 30000) return NULL;
-    return malloc(size);
-}
-static esp_err_t publish(const char *topic, const char *payload, size_t len, int *id)
-{
-    assert(wifi() && mqtt());
-    assert(allowed());
-    assert(strcmp(topic, "test/device/status") == 0);
-    assert(len == strlen(payload));
+    assert(wifi() && mqtt() && allowed());
     attempts++;
-    cJSON *j = cJSON_Parse(payload);
-    assert(j);
-    assert(strcmp(cJSON_GetObjectItem(j,"type")->valuestring,"heartbeat") == 0);
-    assert(strcmp(cJSON_GetObjectItem(j,"device_id")->valuestring,"AMBYTE_\"test") == 0);
-    assert(strcmp(cJSON_GetObjectItem(j,"fw")->valuestring,"2.2.1") == 0);
-    assert(cJSON_GetObjectItem(j,"uptime_ms")->valuedouble == (double)now_ms);
-    if (is("no_sd_probe")) assert(cJSON_IsNull(cJSON_GetObjectItem(j,"sd_ready")));
-    else assert(cJSON_IsFalse(cJSON_GetObjectItem(j,"sd_ready")));
-    cJSON *p = cJSON_GetObjectItem(j,"power");
-    if (is("power_error")) assert(cJSON_IsNull(p));
-    else {
-        assert(cJSON_GetObjectItem(p,"battery_mv")->valueint == (is("critical") ? 3100 : 3800));
-        assert(cJSON_IsTrue(cJSON_GetObjectItem(p,"input_present")) == is("charging"));
-    }
-    cJSON_Delete(j);
-    if (is("publish_failure") && attempts == 1) return ESP_FAIL;
-    *id = attempts;
+    if ((is("publish_failure") || is("allocation_failure")) && attempts == 1)
+        return ESP_FAIL;
     assert(successes < 16);
     sent_at[successes++] = now_ms;
     return ESP_OK;
@@ -86,11 +55,9 @@ static esp_err_t publish(const char *topic, const char *payload, size_t len, int
 int main(int argc, char **argv)
 {
     assert(argc == 2); scenario = argv[1];
-    cJSON_Hooks hooks = {.malloc_fn=alloc,.free_fn=free}; cJSON_InitHooks(&hooks);
     status_heartbeat_config_t cfg = {
-        .publish=publish,.mqtt_connected=mqtt,.wifi_connected=wifi,.read_power=power,
-        .sd_ready=is("no_sd_probe") ? NULL : sd,.publish_allowed=allowed,
-        .status_topic="test/device/status",.device_id="AMBYTE_\"test",.firmware_version="2.2.1",
+        .publish_snapshot=publish,.mqtt_connected=mqtt,.wifi_connected=wifi,
+        .publish_allowed=allowed,
     };
     assert(status_heartbeat_start(NULL) == ESP_ERR_INVALID_ARG);
     assert(status_heartbeat_start(&cfg) == ESP_OK);

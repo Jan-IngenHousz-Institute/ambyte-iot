@@ -315,7 +315,7 @@ class PayloadV3Test(unittest.TestCase):
             ack_processing.index("ambit_announcement_ack"),
         )
 
-        heartbeat = source.split("cmd_result_t cmd_store_status_event", 1)[1].split(
+        heartbeat = source.split("static cmd_result_t emit_status_event", 1)[1].split(
             "/* Last battery voltage", 1
         )[0]
         self.assertIn("cmd_ambit_device_info_cached", heartbeat)

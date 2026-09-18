@@ -189,6 +189,11 @@ static esp_err_t app_start_wifi(void)
     return ESP_OK;
 }
 
+static esp_err_t app_publish_telemetry(void)
+{
+    return cmd_publish_status_event().status;
+}
+
 /* Heartbeats bypass the external-power gate, but preserve the sensor hold and
  * the legacy whole-measurement rollback switch used by the bulk publisher. */
 static bool app_heartbeat_publish_allowed(void)
@@ -1326,6 +1331,7 @@ void app_main(void)
      * No SD/littlefs gating: the store partition is soldered down. If the mount
      * or the open fails, that is a real fault worth failing loudly, not a
      * missing-card condition to degrade around. */
+    const bool telemetry_ids_available = event_log_init_ids() == ESP_OK;
     bool persistence_available = false;
     err = app_init_evstore();
     if (err == ESP_OK) {
@@ -1401,7 +1407,7 @@ void app_main(void)
         .sd_ready               = sdcard_is_mounted,
         .read_script_identity   = script_update_get_identity,
         .announcement_store    = ambit_announcement_nvs_port(),
-        .next_id            = persistence_available ? event_log_get_next_id_fn()            : NULL,
+        .next_id            = telemetry_ids_available ? event_log_get_next_id_fn()            : NULL,
         .store_event        = persistence_available ? event_log_get_store_event_fn()        : NULL,
         .claim_next_event   = persistence_available ? event_log_get_claim_next_event_fn()   : NULL,
         .mark_event_synced  = persistence_available ? event_log_get_mark_event_synced_fn()  : NULL,
@@ -1447,19 +1453,14 @@ void app_main(void)
      * started yet. */
     app_start_cli();
 
-    /* Operational liveness must survive the external-power publishing gate
-     * and failed storage initialization. Keep this outside persistence_available:
-     * the durable TELEMETRY records below still queue normally on battery. */
+    /* Canonical telemetry goes straight to the ingest topic, independently of
+     * the FIFO's power gate and store availability. It shares only the NVS ID
+     * allocator; durable telemetry below still queues normally on battery. */
     const status_heartbeat_config_t heartbeat_cfg = {
-        .publish          = mqtt_client_get_publish_fn(),
-        .mqtt_connected   = mqtt_client_get_is_connected_fn(),
-        .wifi_connected   = wifi_manager_is_connected,
-        .publish_allowed  = app_heartbeat_publish_allowed,
-        .read_power       = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
-        .sd_ready         = sdcard_is_mounted,
-        .status_topic     = status_topic,
-        .device_id        = device_id,
-        .firmware_version = running_app != NULL ? running_app->version : "",
+        .publish_snapshot = app_publish_telemetry,
+        .mqtt_connected = mqtt_client_get_is_connected_fn(),
+        .wifi_connected = wifi_manager_is_connected,
+        .publish_allowed = app_heartbeat_publish_allowed,
     };
     esp_err_t heartbeat_err = status_heartbeat_start(&heartbeat_cfg);
     if (heartbeat_err != ESP_OK) {

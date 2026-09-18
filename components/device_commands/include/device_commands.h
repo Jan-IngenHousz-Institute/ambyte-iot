@@ -213,6 +213,9 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out);
  * reporting is firmware-owned so a bad installed schedule cannot silence it.
  * Does not wake the sync runner (the caller is the sync runner). */
 cmd_result_t cmd_store_status_event(void);
+/* Fresh canonical telemetry on topic_root, bypassing only the backlog/power
+ * gate. Uses the shared ID allocator but never claims or ACKs a stored event. */
+cmd_result_t cmd_publish_status_event(void);
 
 /* Last battery voltage (mV) latched from any successful charger read;
  * 0 = never read. Cheap probe (no I2C) for the status-LED blinker. */
