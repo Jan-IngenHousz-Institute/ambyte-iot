@@ -6,7 +6,8 @@
  * docs/append-log-persistence-plan.md for the design rationale; the Step-0 spike
  * proved this write pattern is corruption-free on the field card.
  *
- * Concurrency: every public op runs under s_mtx, serialising the schedule runner
+ * Concurrency: every public op runs under s_mtx, serialising the status-heartbeat
+ * snapshot/ID allocator, the schedule runner
  * (store), the sync-runner drain (claim plus deferred ack/error marks), the
  * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), and the CLI
  * (stats). MQTT/Wi-Fi event tasks never enter this component: device_commands
@@ -798,11 +799,12 @@ static esp_err_t evlog_open_locked(void)
 
 /* ── public API ──────────────────────────────────────────────────────── */
 
-esp_err_t event_log_init(void)
+/* Boot-only and idempotent: liveness can allocate IDs even if the event-store
+ * mount or large line-buffer allocation fails. Start producer tasks only after
+ * event_log_init has had its normal opportunity to reconcile the disk frontier. */
+esp_err_t event_log_init_ids(void)
 {
-    esp_err_t line_err = evlog_allocate_line_buffer();
-    if (line_err != ESP_OK) return line_err;
-
+    if (s_mtx != NULL) return ESP_OK;
     s_mtx = xSemaphoreCreateMutexStatic(&s_mtx_storage);
     if (s_mtx == NULL) return ESP_ERR_NO_MEM;
 
@@ -818,6 +820,16 @@ esp_err_t event_log_init(void)
     if (hwm < 1) hwm = 1;
     s_next_id  = (int64_t)hwm;
     s_id_limit = (int64_t)hwm;
+
+    return ESP_OK;
+}
+
+esp_err_t event_log_init(void)
+{
+    esp_err_t id_err = event_log_init_ids();
+    if (id_err != ESP_OK) return id_err;
+    esp_err_t line_err = evlog_allocate_line_buffer();
+    if (line_err != ESP_OK) return line_err;
 
     /* The internal partition is mounted by app_main before this runs and cannot
      * disappear afterwards — open unconditionally. (The old SD-store variant had

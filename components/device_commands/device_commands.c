@@ -14,6 +14,7 @@
 #include "ambit_announcement.h"
 #include "clock_trust.h"
 #include "envelope_provenance.h"
+#include "telemetry_publish.h"
 #include "payload_gzip.h"
 #include "payload_v3.h"
 #include "timezone.h"
@@ -784,6 +785,9 @@ static int64_t now_ms(void)
 }
 
 /* ── Publish power gate (Phase 1) ─────────────────────────────────────────
+ * Snapshot callers (watchdog, direct heartbeat, CLI) also evaluate this cached
+ * diagnostic state; the direct heartbeat reports it but never uses it to gate
+ * delivery. The debounce/cache is advisory across those tasks.
  * Only drain the MQTT backlog while on external power. Keyed on VIN-present
  * (input voltage / charger VIN status) rather than input current: Iin has a
  * ~13 mA ADC step and reads near-zero when the battery is full even in full
@@ -1655,9 +1659,9 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
  * silence it. cmd_status_report performs the BME280 read exactly once; this
  * function groups that observation beside health in ONE stored row. It never
  * stores the old companion environment event and never wakes a UART channel. */
-cmd_result_t cmd_store_status_event(void)
+static cmd_result_t emit_status_event(bool direct)
 {
-    if (!s_initialized || s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
+    if (!s_initialized || (!direct && s_cfg.store_event == NULL) || s_cfg.next_id == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
     }
 
@@ -1812,14 +1816,35 @@ cmd_result_t cmd_store_status_event(void)
         .end_ms        = now,
         .payload_json  = payload,
     };
-    err = s_cfg.store_event(&d);
+    if (direct) {
+        telemetry_publish_config_t config = {
+            .publish = s_cfg.publish, .topic = s_cfg.topic_root,
+            .device_id = s_mac_str, .device_name = s_cfg.device_name,
+            .device_version = s_cfg.device_version, .device_firmware = s_cfg.device_firmware,
+            .timezone = s_cfg.timezone, .provenance = s_cfg.schedule_provenance,
+        };
+        err = telemetry_publish(&config, payload, now,
+                                s.power_valid ? s.power.battery_mv : 0);
+    } else {
+        err = s_cfg.store_event(&d);
+    }
     free(payload);
     if (err != ESP_OK) {
-        return make_result(err, "telemetry store failed: %s", esp_err_to_name(err));
+        return make_result(err, "telemetry delivery failed: %s", esp_err_to_name(err));
     }
     return make_result(ESP_OK, "TELEMETRY id=%lld gate=%s Vbat=%umV",
                        (long long)mid, s.publish_gate_open ? "OPEN" : "CLOSED",
                        (unsigned)(s.power_valid ? s.power.battery_mv : 0));
+}
+
+cmd_result_t cmd_store_status_event(void)
+{
+    return emit_status_event(false);
+}
+
+cmd_result_t cmd_publish_status_event(void)
+{
+    return emit_status_event(true);
 }
 
 /* Last battery voltage latched from any successful charger read (power gate /

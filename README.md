@@ -86,7 +86,7 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 ### Tasks (each created inside its own component)
 
 - **sync_runner** — the only measurement-queue publisher; also stores the `ambyte.telemetry/1` heartbeat and runs a connectivity watchdog.
-- **status_heartbeat** — a small direct MQTT status report every 15 minutes while connected, including on battery or with storage unavailable. Does not drain the measurement queue.
+- **status_heartbeat** — a direct canonical telemetry upload every 15 minutes while connected, including on battery or with storage unavailable. Does not drain the measurement queue.
 - **sched_runner** — compiles the installed schedule or embedded default, arms wall-clock triggers against monotonic deadlines, and executes fused actions. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement is not preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
 - **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
@@ -281,27 +281,37 @@ For live wire inspection without the firmware in the loop, use [docs/mqtt_tls_te
 A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) independently of the measurement schedule. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Schedule release metadata is included only when its persisted digest still matches the installed schedule.
 
 Stored telemetry follows the measurement FIFO and can wait for external power.
-For live reachability, an independent `status_heartbeat` task publishes a compact
-`type: heartbeat` message directly to the configured MQTT **status topic** (the
-same topic as command replies). Reports use a MAC-staggered 0–899-second phase on a fixed 15-minute uptime
-grid. An overdue report sends on the first connected poll, then returns to
-that grid; a reconnect never postpones it.
-Brief sensor transactions defer due reports, checked every second; the legacy
-whole-measurement hold remains supported. Repeated link drops cannot keep
-restarting a pending deadline.
-It includes device identity, running firmware, uptime, battery/input voltage,
-charging state and SD mount status. A failed/absent charger read reports
-`power: null`; it never suppresses the heartbeat. Battery voltage, external
-power, missing SD/internal storage, invalid clock and schedule state do not
-gate this operational message. `heartbeat_s=0` disables stored telemetry only.
+For live reachability, an independent `status_heartbeat` task sends the same
+canonical `ambyte.telemetry/1` sample in the normal `sample` envelope directly to
+**`mqtt_topic_root`**, the measurement ingest topic. It includes workbook
+provenance and the macros whose `when` conditions match telemetry. The former
+`type: heartbeat` command-status message is no longer emitted; command replies
+continue on the status topic. This uses the existing ingestion pipeline and
+requires no new database or backend. If optional workbook snapshot/rendering
+allocation fails, the health envelope still publishes without provenance keys;
+workbook-driven processing of that degraded row is consequently not guaranteed.
+Warehouse visibility still depends on that
+pipeline's health, permissions and processing latency.
 
-Wi-Fi **and MQTT** must be connected and the device must remain powered. A due
-report is retried every 30 seconds after a failed submission or an outage; only
-one fresh snapshot is sent on recovery, then normal per-device phasing resumes. Transport QoS 1 provides delivery retry,
-but an accepted submission is not proof of broker receipt. There is no offline
-heartbeat backlog. This status-topic message is separate from the warehouse
-measurement envelope and does not by itself add a dashboard display. The bulk
-upload power gate and low-battery SD protection remain in force.
+Reports use a MAC-staggered 0–899-second phase on a fixed 15-minute uptime grid.
+An overdue report sends on the first connected poll, then returns to that grid;
+a reconnect never postpones it. Brief sensor transactions defer due reports,
+checked every second; the legacy whole-measurement hold remains supported.
+Battery voltage, external power, missing SD/internal storage, clock trust and
+schedule state do not gate the report. An unset wall clock is reported as-is
+(including an epoch timestamp) with clock-health flags; the firmware does not
+fabricate a current observation time. Failed sensor reads leave the corresponding
+health section empty. `heartbeat_s=0` disables stored telemetry only.
+
+The direct path uses the shared NVS-backed measure-ID allocator, initialized
+independently of the event-store mount. It never claims or acknowledges a stored
+measurement and never advances the FIFO cursor. Allocation, snapshot-build and
+publish failures retry after 30 seconds. Wi-Fi **and MQTT** must be connected and
+the device must remain powered. Only one fresh snapshot is sent on recovery;
+there is no offline direct-heartbeat backlog. Transport QoS 1 provides delivery
+retry, but an accepted submission is not proof of broker receipt or warehouse
+processing. The bulk upload power gate and low-battery SD protection remain in
+force.
 
 ### Payload schema
 
@@ -398,7 +408,7 @@ components/
   command_router/    # inbound MQTT JSON dispatch (ping/OTA/schedule/location)
   event_log/         # append-only SD event store (REPLACES SQLite)
   sync_runner/       # measurement FIFO publisher; power/clock gate; stored telemetry; watchdog
-  status_heartbeat/  # direct status-topic liveness every 15 min, including on battery
+  status_heartbeat/  # direct ingest telemetry every 15 min, including on battery
   mqtt_client/       # esp-mqtt wrapper (mutual TLS to AWS IoT)
   uart_sensors/      # AMBIT UART bus (4 channels) + ROM-flash reset/boot control lines
   ambit_ota/         # AMBIT app-OTA over UART (Strategy B)
@@ -451,7 +461,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 | Device boots and logs `Device not provisioned` | NVS image wasn't flashed — confirm `extra_scripts = pre:tools/extra_script.py` in `platformio.ini` and that `.env` resolves to non-empty values |
 | MQTT connects then immediately disconnects | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 | Telemetry stops but no data loss / device on external power | In-flight slot may have stalled — check the `inflight` CLI command; the 60 s reaper + MQTT-disconnect clear should recover it, else the 1 h watchdog reboots |
-| Events pile up in `event_log`, measurements do not publish | Expected on battery (power gate) or before the clock is valid (< 2024). The independent 15-minute status-topic heartbeat still reports while Wi-Fi/MQTT are connected. |
+| Events pile up in `event_log`, measurements do not publish | Expected on battery (power gate) or before the clock is valid (< 2024). The independent 15-minute ingest telemetry heartbeat still reports while Wi-Fi/MQTT are connected. |
 | Installed schedule is rejected | Run `schedule status` for the compile error; the embedded default remains active |
 | Schedule update does not take effect | Check `schedule release`, then use `schedule reload` or reboot after a successful install |
 | sdmmc `0x107` errors after pulling the SD card | Hot-plug recovery should latch the loss and remount on reinsert; if it floods, this path needs the HW pull/reinsert verification still pending (see Status) |
