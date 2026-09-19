@@ -1889,6 +1889,55 @@ esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
     return ESP_OK;
 }
 
+/* Collect every measure_id in [from_id, to_id] (to_id 0 = unbounded) present in
+ * ANY file still on flash: pending records and synced records not yet archived
+ * or evicted. This is the replay resume set: a record appended before a reset
+ * may already have been published and acknowledged, so a pending-only scan
+ * would miss it and a resume would append it twice. Synced files stay on flash
+ * until the next archive burst (every EVLOG_ARCHIVE_EVERY_N stores) or an
+ * eviction, so a resume that runs soon after boot sees them. Unsorted, ids are
+ * appended in file order; *out_capped = true when `cap` or the time bound was
+ * hit (the set is then incomplete). */
+esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t *ids,
+                                         size_t cap, size_t *out_n, bool *out_capped)
+{
+    if (ids == NULL || out_n == NULL) return ESP_ERR_INVALID_ARG;
+    *out_n = 0;
+    if (out_capped) *out_capped = false;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_INVALID_STATE; }
+    (void)evlog_flush_writer_locked();
+    uint32_t min_seq = 0, max_seq = 0;
+    bool capped = false;
+    const TickType_t t0 = xTaskGetTickCount();
+    if (evlog_scan_range_locked(&min_seq, &max_seq)) {
+        for (uint32_t seq = min_seq; seq <= max_seq && !capped; seq++) {
+            char path[64];
+            evlog_file_path(path, sizeof path, seq);
+            FILE *f = fopen(path, "rb");
+            if (f == NULL) continue;
+            while (fgets(s_line, s_line_cap, f) != NULL) {
+                size_t len = strlen(s_line);
+                if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
+                int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+                if (id >= from_id && (to_id == 0 || id <= to_id)) {
+                    if (*out_n >= cap) { capped = true; break; }
+                    ids[(*out_n)++] = id;
+                }
+                if ((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(4 * EVLOG_SCAN_MAX_MS)) {
+                    capped = true;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    xSemaphoreGive(s_mtx);
+    if (out_capped) *out_capped = capped;
+    return ESP_OK;
+}
+
 /* One-shot fleet migration: re-append the pre-internal-store /sdcard/events
  * backlog through the normal internal writer, preserving each record verbatim
  * (measure_id included — openJII dedups on it, so a power cut between "appended

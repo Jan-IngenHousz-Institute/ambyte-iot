@@ -36,6 +36,7 @@
 #define REPLAY_BOOT_DELAY_MS  30000
 #define REPLAY_PROGRESS_EVERY 1000
 #define REPLAY_CMD_ID_MAX     64
+#define REPLAY_RESUME_SET_CAP 4096   /* ids already on flash beyond the persisted progress */
 
 typedef struct {
     evlog_replay_req_t   req;
@@ -301,6 +302,23 @@ static void finish(replay_job_t *j, evlog_replay_state_t st, const char *cmd_id,
              (unsigned)j->appended, (long long)j->next_id);
 }
 
+static int cmp_id(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static bool in_set(const int64_t *set, size_t n, int64_t id)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (set[mid] == id) return true;
+        if (set[mid] < id) lo = mid + 1; else hi = mid;
+    }
+    return false;
+}
+
 static void do_run(const replay_task_arg_t *a)
 {
     replay_job_t j;
@@ -308,42 +326,65 @@ static void do_run(const replay_task_arg_t *a)
     j = s_job;
     portEXIT_CRITICAL(&s_mux);
     uint32_t chunk = j.req.chunk ? j.req.chunk : EVLOG_REPLAY_DEFAULT_CHUNK;
-    uint32_t skipped_window = 0, skipped_unparsed = 0;
+    uint32_t skipped_window = 0, skipped_unparsed = 0, skipped_present = 0;
     bool resume_exact = true;
-
-    /* Exact resume: whatever a previous attempt appended is still PENDING in
-     * the store (it was fsync'd before its progress was committed, or it was
-     * lost with the tail, either way never skipped). Continue after the
-     * highest such id so a reset between append and progress commit cannot
-     * duplicate a chunk. */
-    if (j.next_id > j.req.from_id || j.appended > 0) {
-        int64_t mx = 0;
-        bool capped = false;
-        if (event_log_max_pending_id_in_range(j.req.from_id, j.req.to_id, &mx, &capped) == ESP_OK) {
-            if (mx + 1 > j.next_id) j.next_id = mx + 1;
-            resume_exact = !capped;
-        } else {
-            resume_exact = false;
-        }
-    }
+    int64_t *present = NULL;
+    size_t   npresent = 0;
     if (j.next_id < j.req.from_id) j.next_id = j.req.from_id;
+
+    /* Resume after a reset. Progress (next_id) is persisted only after a chunk
+     * is fsync'd, so the records of an interrupted chunk may already be on
+     * flash — and some of them may already have been published and
+     * acknowledged, i.e. are no longer PENDING. Neither "resume at next_id"
+     * (duplicates the chunk) nor "resume after the highest pending id" (misses
+     * drained records, and skips lower ids that sort late in a file) is exact.
+     * Instead: collect every id in [next_id, to_id] still present on flash
+     * (pending or synced-not-yet-archived) and skip exactly those while
+     * processing everything else from next_id. Residual window: a record
+     * drained AND archived/evicted between the reset and this resume (the
+     * archive burst needs EVLOG_ARCHIVE_EVERY_N new stores, hours at the field
+     * cadence; boot resume runs 30 s after boot). */
+    if (j.next_id > j.req.from_id || j.appended > 0) {
+        present = calloc(REPLAY_RESUME_SET_CAP, sizeof *present);
+        bool capped = true;
+        if (present != NULL &&
+            event_log_collect_ids_in_range(j.next_id, j.req.to_id, present, REPLAY_RESUME_SET_CAP,
+                                           &npresent, &capped) == ESP_OK && !capped) {
+            qsort(present, npresent, sizeof *present, cmp_id);
+        } else {
+            /* Incomplete set: fall back to the conservative rule (highest
+             * pending id + 1) and say so; a bounded number of duplicates or a
+             * skipped late-sorted id becomes possible. */
+            free(present);
+            present = NULL;
+            npresent = 0;
+            resume_exact = false;
+            int64_t mx = 0;
+            if (event_log_max_pending_id_in_range(j.req.from_id, j.req.to_id, &mx, NULL) == ESP_OK &&
+                mx + 1 > j.next_id) {
+                j.next_id = mx + 1;
+            }
+        }
+        ESP_LOGW(TAG, "resume %s: next_id=%lld, %u id(s) already on flash, exact=%s", j.req.token,
+                 (long long)j.next_id, (unsigned)npresent, resume_exact ? "yes" : "no");
+    }
 
     char *line = malloc(REPLAY_LINE_CAP);
     arc_name_t *names = calloc(REPLAY_MAX_FILES, sizeof *names);
     if (line == NULL || names == NULL) {
-        free(line); free(names);
+        free(line); free(names); free(present);
         finish(&j, EVLOG_REPLAY_FAILED, a->cmd_id, "no_mem", 0, 0, resume_exact);
         return;
     }
     if (!sdcard_is_mounted()) {
-        free(line); free(names);
+        free(line); free(names); free(present);
         finish(&j, EVLOG_REPLAY_FAILED, a->cmd_id, "sd_not_mounted", 0, 0, resume_exact);
         return;
     }
     uint32_t nfiles = 0;
     bool truncated = false;
     if (!list_archive(names, REPLAY_MAX_FILES, &nfiles, &truncated)) {
-        free(line); free(names);
+        free(line); free(names); free(present);
         finish(&j, EVLOG_REPLAY_FAILED, a->cmd_id, "sd_lost", 0, 0, resume_exact);
         return;
     }
@@ -381,7 +422,8 @@ static void do_run(const replay_task_arg_t *a)
                 int64_t id = 0, start_ms = 0;
                 size_t head = len < 1024 ? len : 1024;
                 if (!evlog_inventory_parse_head(line, head, &id, &start_ms)) { skipped_unparsed++; continue; }
-                if (id < j.next_id) continue;                 /* already appended (resume) */
+                if (id < j.next_id) continue;                 /* below persisted progress */
+                if (present != NULL && in_set(present, npresent, id)) { skipped_present++; continue; }
                 if (!in_window(&j.req, id, start_ms)) { skipped_window++; continue; }
 
                 esp_err_t err = event_log_append_verbatim(line, len, NULL);
@@ -398,7 +440,10 @@ static void do_run(const replay_task_arg_t *a)
                 if (err != ESP_OK) { failed = true; fail_detail = esp_err_to_name(err); break; }
 
                 j.appended++;
-                j.next_id = id + 1;
+                /* Progress is a low-water mark, not "highest appended": ids in
+                 * a file can be slightly out of order (two producer tasks), so
+                 * never let a late-sorted lower id fall below next_id. */
+                if (id + 1 > j.next_id) j.next_id = id + 1;
                 if (++in_chunk >= chunk) {
                     (void)event_log_flush();
                     progress_save(j.next_id, j.appended);
@@ -434,6 +479,10 @@ static void do_run(const replay_task_arg_t *a)
 
     free(line);
     free(names);
+    free(present);
+    if (skipped_present) {
+        ESP_LOGW(TAG, "resume skipped %u record(s) already on flash", (unsigned)skipped_present);
+    }
     if (failed) {
         progress_save(j.next_id, j.appended);
         finish(&j, EVLOG_REPLAY_FAILED, a->cmd_id, fail_detail, skipped_window, skipped_unparsed, resume_exact);

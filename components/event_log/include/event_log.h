@@ -99,6 +99,11 @@ esp_err_t event_log_append_verbatim(const char *line, size_t len, int64_t *out_i
 esp_err_t event_log_flush(void);
 esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
                                             int64_t *out_max, bool *out_capped);
+/* collect_ids_in_range: every id in [from_id, to_id] present in any file still
+ * on flash (pending, or synced but not yet archived/evicted), unsorted, at most
+ * `cap`; *out_capped when the set is incomplete. The replay resume set. */
+esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t *ids,
+                                         size_t cap, size_t *out_n, bool *out_capped);
 
 /* Pre-reboot power-safety drain (register once via esp_register_shutdown_handler).
  * Flushes + fsyncs the periodically-buffered tail, persists the read cursor, and
