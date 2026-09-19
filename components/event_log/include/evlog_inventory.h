@@ -80,6 +80,16 @@ typedef struct {
     void (*yield)(void);         /* called between files; NULL = none */
 } evlog_inventory_hooks_t;
 
+/* Shared parsers (also used by evlog_replay). parse_name accepts
+ * "<prefix><id>.log" and the collision-avoiding "<prefix><id>-<seq>.log"
+ * (*out_suffix = 0 when absent). parse_head reads measure_id and start_ms from
+ * the first bytes of a record line; false when the head does not contain the
+ * sixth field. */
+bool evlog_inventory_parse_name(const char *name, const char *prefix, int64_t *out_id,
+                                uint32_t *out_suffix);
+bool evlog_inventory_parse_head(const char *head, size_t head_len, int64_t *out_id,
+                                int64_t *out_start_ms);
+
 /* Scan `archive_dir` (and count `legacy_dir`, which may be NULL). `win` may be
  * NULL for no window. `out` is fully overwritten. Returns ESP_OK even when the
  * directory is absent (archive_dir_present=false); ESP_ERR_INVALID_ARG on NULL

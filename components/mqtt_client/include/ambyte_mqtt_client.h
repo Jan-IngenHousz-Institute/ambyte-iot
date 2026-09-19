@@ -33,6 +33,7 @@ message_publish_fn                  mqtt_client_get_publish_fn(void);
 message_is_connected_fn             mqtt_client_get_is_connected_fn(void);
 message_error_disconnect_count_fn   mqtt_client_get_error_disconnect_count_fn(void);
 message_connection_stats_fn         mqtt_client_get_connection_stats_fn(void);
+message_publish_refusal_stats_fn    mqtt_client_get_publish_refusal_stats_fn(void);  /* refused PUBACKs (MQTT 5 reason >= 0x80) */
 message_set_connect_handler_fn      mqtt_client_get_set_connect_handler_fn(void);
 message_set_publish_ack_handler_fn  mqtt_client_get_set_ack_handler_fn(void);
 message_set_received_handler_fn     mqtt_client_get_set_received_handler_fn(void);

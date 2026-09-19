@@ -363,7 +363,31 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 \
 
 - Optional window: `from_id`/`to_id` on `measure_id`, `from_ms`/`to_ms` on the record's capture time (epoch ms). Omitted or `0` means unbounded. `list` (default true) adds up to 48 per-file rows; the summary is sent alone if the list would not fit the reply.
 - Reply: `archive.{present,files,records,torn,unparsed,in_window,pre_2024,bytes,min_id,max_id,min_start_ms,max_start_ms}`, `legacy_events_files`, `store.{free_bytes,pending,last_acked_id,next_id}`, `scan_ms`, `sd_mounted`, plus `files_list[]`. `pre_2024` counts records stamped before time sync. `ok:false` with `detail` = `busy` (a scan is running), `no_mem`, `no_task` or `reply_too_large`.
-- Why it exists: on 16–18 Sep 2026 the broker acknowledged publishes it had refused for a missing topic permission, so devices marked those records synced and archived them; this command is how the fleet's recoverable set is measured before any replay is designed. Do not send it as a retained message.
+- Why it exists: on 16–18 Sep 2026 the broker acknowledged publishes it had refused for a missing topic permission, so devices marked those records synced and archived them; this command is how the fleet's recoverable set is measured before any replay is run. Do not send it as a retained message.
+
+### Broker refusals are not deliveries
+
+The client speaks MQTT 5, and AWS IoT Core answers an unauthorized publish with a PUBACK carrying reason `0x87 Not authorized` while dropping the message. Since this firmware a PUBACK with reason `>= 0x80` is reported to the publisher as `ESP_ERR_NOT_ALLOWED`: the record stays **PENDING** (never synced, never quarantined), the drain is held for a growing backoff (1 min → 30 min, reset by the next accepted PUBACK), and the no-PUBACK reboot watchdog treats the refusal as a live link so the device does not reboot-loop through a policy outage. Telemetry adds `connectivity.publish_refused` (count since boot), `last_puback_reason` and `refusal_hold_s`. Limit: the 9.375 MiB store holds roughly 17 h of records at the default cadence; a refusal outage longer than that starts refusing **new** captures (`sd_dropped`), which is the visible signal that an operator must fix the policy.
+
+### Remote replay from the SD archive (`evlog_replay`)
+
+`{type:evlog_replay, mode, token, from_id, to_id, from_ms, to_ms, chunk}` re-sends records that were acknowledged earlier (and therefore archived to `/sdcard/archive`) by re-appending the selection to the live FIFO with their original `measure_id` and capture times; the normal publisher then delivers them behind current data. The read cursor and the in-flight window are never touched.
+
+```sh
+# 1. dry run: how many archived records match?
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 \
+  --message '{"type":"evlog_replay","id":"rp-1","mode":"count","from_id":5571,"to_id":26331}'
+# 2. run it (resumable by token), 3. watch, 4. stop if needed
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 \
+  --message '{"type":"evlog_replay","id":"rp-2","mode":"run","token":"sep16-fc80","from_id":5571,"to_id":26331,"chunk":64}'
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --message '{"type":"evlog_replay","id":"rp-3","mode":"status"}'
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --message '{"type":"evlog_replay","id":"rp-4","mode":"cancel","token":"sep16-fc80"}'
+```
+
+- Selection: `from_id`/`to_id` on `measure_id` (exact; the platform knows which ids it lacks), `from_ms`/`to_ms` on capture time as a guard. An unbounded `run` is refused. `token` (`[A-Za-z0-9._:-]`, ≤32) names the job; re-running a finished token is a no-op, re-running a cancelled or failed one resumes it.
+- Safety: appends go in chunks (default 64) with fsync and NVS progress after each; a reset resumes, and the device first asks the store for the highest still-pending id in the range so the interrupted chunk is not duplicated (`resume_exact:false` in the reply if that scan hit its bound). The job pauses while the store has under 2 MiB free or over 3,000 pending records, so live captures are never refused because of a replay. Replayed records publish **without** workbook provenance (they were captured under an earlier schedule and the record stores none). A replayed range archived again is written as `arc-<id>-<seq>.log`, never over an existing archive file.
+- Replies: `evlog_replay_result` with `mode`, `ok`, `state` (`idle|running|done|cancelled|failed`), `token`, the window, `next_id`, `appended`, `detail`, plus `matched`/`files`/`unparsed`/`torn`/`pre_2024` for `count` and `skipped_window`/`skipped_unparsed`/`resume_exact` at the end of a `run`; a progress reply every 1,000 records.
+- The platform has no dedup on `(device_id, measure_id)`; replay exactly the missing id set and reconcile afterwards. Never send these commands as retained messages.
 
 ### Remote schedule delivery
 

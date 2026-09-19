@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "event_log.h"
 #include "evlog_inventory.h"
+#include "evlog_replay.h"
 #include "sd_card.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
@@ -189,6 +190,50 @@ static void handle_evlog_inventory(const cJSON *root, const char *id)
              (long long)req->win.from_ms, (long long)req->win.to_ms);
 }
 
+/* ── evlog_replay: re-send a range of archived records ────────────────────────
+ * {"type":"evlog_replay","id":"<cmd id>","mode":"count|run|cancel|status",
+ *  "token":"<job id>","from_id":N,"to_id":M,"from_ms":T0,"to_ms":T1,"chunk":64}
+ * count = dry run (matches only), run = re-append the selection to the live
+ * FIFO with original ids/timestamps (resumable, chunked, store-guarded),
+ * cancel = stop the named job, status = report the persisted job. Replies are
+ * evlog_replay_result messages on the status topic, sent by evlog_replay. See
+ * components/evlog_replay/include/evlog_replay.h. Never send as retained. */
+static void handle_evlog_replay(const cJSON *root, const char *id)
+{
+    const cJSON *jmode = cJSON_GetObjectItemCaseSensitive(root, "mode");
+    const cJSON *jtok  = cJSON_GetObjectItemCaseSensitive(root, "token");
+    const char *mode  = cJSON_IsString(jmode) ? jmode->valuestring : "count";
+    const char *token = cJSON_IsString(jtok) ? jtok->valuestring : "";
+    evlog_replay_req_t req;
+    memset(&req, 0, sizeof req);
+    strncpy(req.token, token, sizeof req.token - 1);
+    req.from_id = json_i64(root, "from_id");
+    req.to_id   = json_i64(root, "to_id");
+    req.from_ms = json_i64(root, "from_ms");
+    req.to_ms   = json_i64(root, "to_ms");
+    int64_t chunk = json_i64(root, "chunk");
+    req.chunk = chunk > 0 && chunk <= EVLOG_REPLAY_MAX_CHUNK ? (uint32_t)chunk : 0;
+
+    esp_err_t err;
+    if (strcmp(mode, "count") == 0)       err = evlog_replay_count(&req, id);
+    else if (strcmp(mode, "run") == 0)    err = evlog_replay_run(&req, id);
+    else if (strcmp(mode, "cancel") == 0) err = evlog_replay_cancel(token, id);
+    else if (strcmp(mode, "status") == 0) err = evlog_replay_status(id);
+    else                                  err = ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGW(TAG, "evlog_replay id=%s mode=%s token=%s ids %lld..%lld ms %lld..%lld -> %s",
+             id ? id : "", mode, token, (long long)req.from_id, (long long)req.to_id,
+             (long long)req.from_ms, (long long)req.to_ms, esp_err_to_name(err));
+    if (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_NOT_SUPPORTED) {
+        char reply[256];
+        snprintf(reply, sizeof(reply),
+                 "{\"type\":\"evlog_replay_result\",\"id\":\"%.64s\",\"device_id\":\"%s\",\"mode\":\"%.16s\","
+                 "\"ok\":false,\"detail\":\"%s\"}",
+                 id ? id : "", s_cfg.device_id ? s_cfg.device_id : "", mode,
+                 err == ESP_ERR_INVALID_ARG ? "invalid_request" : "unknown_mode");
+        publish_reply(reply);
+    }
+}
+
 /* message_received_fn — runs in the mqtt task. Keep light; hand long work (OTA) to
  * a separate task in Stage 3. */
 static void on_message(const char *topic, const char *payload, size_t len, void *ctx)
@@ -219,6 +264,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         handle_ping(id);
     } else if (strcmp(type, "evlog_inventory") == 0) {
         handle_evlog_inventory(root, id);
+    } else if (strcmp(type, "evlog_replay") == 0) {
+        handle_evlog_replay(root, id);
     } else if (strcmp(type, "ota_update") == 0) {
         const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
         const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;

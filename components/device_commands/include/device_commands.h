@@ -59,6 +59,13 @@ typedef struct {
     message_connection_stats_fn         connection_stats;
     message_set_publish_ack_handler_fn  set_publish_ack_handler;
     message_set_disconnect_handler_fn   set_disconnect_handler;  /* reverts the in-flight window on MQTT drop; NULL = only Wi-Fi drop does so */
+    message_publish_refusal_stats_fn    publish_refusal_stats;   /* refused-PUBACK telemetry; NULL = not reported */
+
+    /* Archive replay: true when `measure_id` belongs to a range re-appended from
+     * the SD archive by evlog_replay. Replayed records were captured under an
+     * earlier schedule, so the envelope omits workbook provenance for them
+     * instead of stamping the currently installed schedule. NULL = never. */
+    bool                              (*provenance_suppressed)(int64_t measure_id);
 
     /* Topic config (Phase 6A) */
     const char                         *topic_root;
@@ -207,6 +214,12 @@ typedef struct {
 } device_status_snapshot_t;
 
 cmd_result_t cmd_status_report(device_status_snapshot_t *out);
+
+/* Broker-refusal state of the publisher: refusals (PUBACK reason >= 0x80) since
+ * the last accepted PUBACK, remaining drain hold in ms, and the last refused
+ * measure_id. Any out-pointer may be NULL. */
+void device_commands_refusal_status(uint32_t *refusals_since_ok, int64_t *hold_remaining_ms,
+                                    int64_t *last_refused_id);
 
 /* Store one ambyte.telemetry/1 heartbeat event (tag TELEMETRY, onboard provenance)
  * built from cmd_status_report. Called by sync_runner on its heartbeat period — status

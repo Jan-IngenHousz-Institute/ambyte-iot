@@ -46,6 +46,7 @@
 #include "sd_card.h"
 #include "sd_logger.h"
 #include "event_log.h"
+#include "evlog_replay.h"
 #include "sync_runner.h"
 #include "status_heartbeat.h"
 #include "uart_sensors.h"
@@ -1437,6 +1438,10 @@ void app_main(void)
         .watchdog_armed         = sync_runner_watchdog_armed,
         .publish_gzip_enabled   = device_config_publish_gzip_enabled,
         .schedule_provenance    = sched_runner_provenance_port,
+        .publish_refusal_stats  = mqtt_client_get_publish_refusal_stats_fn(),
+        /* Replayed archive records were captured under an earlier schedule:
+         * the envelope omits workbook provenance for them. */
+        .provenance_suppressed  = evlog_replay_covers,
     };
     device_commands_init(&cmd_cfg);
     if (persistence_available) {
@@ -1444,6 +1449,19 @@ void app_main(void)
          * MQTT latch/queue through a registered callback rather than coupling
          * the infrastructure component directly to device_commands. */
         event_log_set_reset_notifier(device_commands_on_persistence_reset);
+
+        /* Operator-driven re-send from the SD archive (MQTT evlog_replay). Resumes
+         * a job interrupted by a reset; inert otherwise. */
+        evlog_replay_config_t rp_cfg = {
+            .publish          = mqtt_client_get_publish_fn(),
+            .status_topic     = status_topic,
+            .device_id        = device_id,
+            .firmware_version = running_app != NULL ? running_app->version : "",
+            .notify_publisher = sync_runner_notify,
+        };
+        if (evlog_replay_init(&rp_cfg) != ESP_OK) {
+            ESP_LOGW(APP_TAG, "evlog_replay init failed — archive replay unavailable this session");
+        }
     }
 
     /* ── CLI ──────────────────────────────────────────────────────────

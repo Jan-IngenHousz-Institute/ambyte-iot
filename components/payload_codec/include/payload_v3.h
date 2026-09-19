@@ -93,6 +93,11 @@ typedef struct {
     const char *last_disc_reason;
     int64_t conn_age_s;
     int64_t pending;
+    /* Broker refusals: PUBACKs with an MQTT 5 reason >= 0x80 since boot, the last
+     * reason code (0 = none), and how long the drain is still held off. */
+    uint32_t publish_refused;
+    int last_puback_reason;
+    int64_t refusal_hold_s;
 
     bool power_valid;
     double battery_v;

@@ -690,8 +690,11 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   input->wifi ? "true" : "false", input->provisioned ? "true" : "false",
                   input->publish_gate ? "true" : "false", input->mqtt_reconnects);
         jw_string(&w, input->last_disc_reason);
-        jw_append(&w, ",\"conn_age_s\":%lld,\"pending\":%lld",
-                  (long long)input->conn_age_s, (long long)input->pending);
+        jw_append(&w, ",\"conn_age_s\":%lld,\"pending\":%lld,\"publish_refused\":%u,"
+                      "\"last_puback_reason\":%d,\"refusal_hold_s\":%lld",
+                  (long long)input->conn_age_s, (long long)input->pending,
+                  input->publish_refused, input->last_puback_reason,
+                  (long long)input->refusal_hold_s);
     }
     jw_append(&w, "},\"power\":{");
     if (input->power_valid) {

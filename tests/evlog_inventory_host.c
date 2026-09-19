@@ -65,6 +65,22 @@ int main(int argc, char **argv)
     snprintf(path, sizeof path, "%s/arc-200.log", arch);
     write_file(path, buf);
 
+    /* arc-300-7.log: collision-avoiding suffixed name written when a replayed
+     * range is archived a second time; must be scanned like any archive file. */
+    buf[0] = '\0';
+    record(line, sizeof line, 300, "arrun", 1758200000000LL); strcat(buf, line);
+    record(line, sizeof line, 301, "arrun", 1758200060000LL); strcat(buf, line);
+    snprintf(path, sizeof path, "%s/arc-300-7.log", arch);
+    write_file(path, buf);
+    {
+        int64_t nid = 0; uint32_t suf = 0;
+        assert(evlog_inventory_parse_name("arc-300-7.log", "arc-", &nid, &suf) && nid == 300 && suf == 7);
+        assert(evlog_inventory_parse_name("arc-300.log", "arc-", &nid, &suf) && nid == 300 && suf == 0);
+        assert(!evlog_inventory_parse_name("arc-300-.log", "arc-", &nid, &suf));
+        assert(!evlog_inventory_parse_name("arc-300-7.tmp", "arc-", &nid, &suf));
+        assert(!evlog_inventory_parse_name("arc-.log", "arc-", &nid, &suf));
+    }
+
     /* Distractors: a non-matching name and a hidden file. */
     snprintf(path, sizeof path, "%s/notes.txt", arch);
     write_file(path, "hello\n");

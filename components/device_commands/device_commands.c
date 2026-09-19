@@ -155,7 +155,23 @@ typedef struct {
     int           msg_id;
     esp_err_t     status;
     dc_ack_kind_t kind;
+    bool          refused;   /* broker ACKed with an MQTT 5 reason >= 0x80: dropped server-side */
 } dc_ack_completion_t;
+
+/* Broker refusals (PUBACK reason >= 0x80, e.g. 0x87 Not authorized while a topic
+ * policy is missing). The record is reverted to PENDING, exactly like a transport
+ * failure, so it republishes once the broker accepts again — but re-trying every
+ * drain pass would hammer a broker that is refusing everything. The drain is
+ * therefore held for a growing backoff after each refusal and released by the
+ * next accepted PUBACK. The store keeps filling meanwhile: at the default cadence
+ * the 9.375 MiB store holds roughly 17 h of records before NEW captures are
+ * refused (sd_dropped), so a long refusal outage still needs an operator. */
+#define DC_REFUSAL_HOLD_MIN_MS   (60LL * 1000)
+#define DC_REFUSAL_HOLD_MAX_MS   (30LL * 60 * 1000)
+static int64_t  s_refusal_hold_until_ms = 0;   /* guarded by s_inflight_mtx */
+static int64_t  s_refusal_hold_ms       = 0;
+static uint32_t s_refusals_since_ok     = 0;
+static int64_t  s_last_refused_id       = 0;
 
 static QueueHandle_t s_ack_queue = NULL;
 static StaticQueue_t s_ack_queue_control;
@@ -302,6 +318,7 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
         .msg_id     = msg_id,
         .status     = status,
         .kind       = status == ESP_OK ? DC_ACK_PUBACK : DC_ACK_PUBLISH_ERROR,
+        .refused    = status == ESP_ERR_NOT_ALLOWED,
     };
 
     bool matched = false;
@@ -309,14 +326,18 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
     bool park_overflow = false;
     int matched_idx = -1;
     dc_inflight_slot_t detached = {0};
-    int64_t acked_at_ms = status == ESP_OK ? mono_ms() : 0;
+    /* A refused PUBACK still proves the broker link is alive, so it counts for the
+     * no-PUBACK reboot watchdog (rebooting cannot fix a missing topic policy and
+     * would loop every 2 h for the whole outage). It does NOT mark the record
+     * synced — see cmd_process_pending_acks. */
+    int64_t acked_at_ms = (status == ESP_OK || status == ESP_ERR_NOT_ALLOWED) ? mono_ms() : 0;
     portENTER_CRITICAL(&s_inflight_mtx);
     matched_idx = inflight_find_msg_locked(msg_id);
     if (matched_idx >= 0) {
         detached = s_inflight[matched_idx];
         completion.measure_id = detached.measure_id;
         inflight_clear_locked((size_t)matched_idx);
-        if (status == ESP_OK) s_last_publish_ok_ms = acked_at_ms;
+        if (acked_at_ms != 0) s_last_publish_ok_ms = acked_at_ms;
         matched = true;
     } else {
         /* esp_mqtt_client_publish unlocks its API mutex just before returning.
@@ -488,8 +509,34 @@ esp_err_t cmd_process_pending_acks(void)
             err = s_cfg.mark_event_synced != NULL
                 ? s_cfg.mark_event_synced(completion.measure_id)
                 : ESP_ERR_NOT_SUPPORTED;
+            if (err == ESP_OK) {
+                /* An accepted PUBACK ends any refusal hold: the broker takes our
+                 * records again, drain at full speed. */
+                portENTER_CRITICAL(&s_inflight_mtx);
+                s_refusal_hold_until_ms = 0;
+                s_refusal_hold_ms = 0;
+                s_refusals_since_ok = 0;
+                portEXIT_CRITICAL(&s_inflight_mtx);
+            }
         } else if (s_cfg.mark_event_pending != NULL) {
             err = s_cfg.mark_event_pending(completion.measure_id);
+            if (err == ESP_OK && completion.refused) {
+                /* Record stays PENDING (never synced, never quarantined: this is a
+                 * broker policy problem, not a poison record). Back the drain off
+                 * so the FIFO is not spun against a refusing broker. */
+                int64_t hold;
+                portENTER_CRITICAL(&s_inflight_mtx);
+                s_refusal_hold_ms = s_refusal_hold_ms == 0 ? DC_REFUSAL_HOLD_MIN_MS
+                                  : (s_refusal_hold_ms * 2 > DC_REFUSAL_HOLD_MAX_MS
+                                         ? DC_REFUSAL_HOLD_MAX_MS : s_refusal_hold_ms * 2);
+                hold = s_refusal_hold_ms;
+                s_refusal_hold_until_ms = mono_ms() + hold;
+                s_refusals_since_ok++;
+                s_last_refused_id = completion.measure_id;
+                portEXIT_CRITICAL(&s_inflight_mtx);
+                ESP_LOGW(TAG, "broker REFUSED id=%lld (msg_id=%d) — kept pending, publishing held %lld s",
+                         (long long)completion.measure_id, completion.msg_id, (long long)(hold / 1000));
+            }
         } else {
             err = ESP_ERR_NOT_SUPPORTED;
         }
@@ -1158,6 +1205,18 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
+    /* Refusal hold: the broker acknowledged-but-refused a record recently. Keep
+     * everything PENDING and let the fallback wake retry after the backoff. */
+    {
+        int64_t until, now = mono_ms();
+        portENTER_CRITICAL(&s_inflight_mtx);
+        until = s_refusal_hold_until_ms;
+        portEXIT_CRITICAL(&s_inflight_mtx);
+        if (until > now) {
+            return make_result(ESP_ERR_NOT_SUPPORTED, "broker refused publishes — holding %lld s",
+                               (long long)((until - now) / 1000));
+        }
+    }
     /* Power gate lives solely in sync_runner_is_allowed() now — sync_runner is
      * the only caller of this function, so one check there is sufficient and
      * unbypassable. Count admission is checked before touching FATFS; byte
@@ -1267,7 +1326,14 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
      * envelope then stays byte-identical to an unstamped schedule). Built once
      * per publish, filtered against THIS event's payload so the six sizing
      * sites below still see the exact part that goes on the wire. */
-    dc_build_provenance_part(e.payload_json);
+    if (s_cfg.provenance_suppressed != NULL && s_cfg.provenance_suppressed(e.measure_id)) {
+        /* Replayed from the SD archive: captured under an earlier schedule, and
+         * the record stores no provenance of its own. Omit the workbook part
+         * rather than attribute today's schedule to an old measurement. */
+        s_wbpart[0] = '\0';
+    } else {
+        dc_build_provenance_part(e.payload_json);
+    }
 
     const char *meta = e.metadata_json;          /* already a JSON object, or NULL */
     const char *fw   = s_cfg.device_firmware  ? s_cfg.device_firmware  : "";
@@ -1584,8 +1650,11 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                 early_completion.status = s_early_acks[i].status;
                 early_completion.kind = s_early_acks[i].status == ESP_OK
                     ? DC_ACK_PUBACK : DC_ACK_PUBLISH_ERROR;
+                early_completion.refused = s_early_acks[i].status == ESP_ERR_NOT_ALLOWED;
                 inflight_clear_locked((size_t)slot_idx);
-                if (early_completion.status == ESP_OK) s_last_publish_ok_ms = finalized_at_ms;
+                if (early_completion.status == ESP_OK || early_completion.refused) {
+                    s_last_publish_ok_ms = finalized_at_ms;   /* link proven, see on_publish_ack */
+                }
                 early_matched = true;
                 break;
             }
@@ -1685,6 +1754,13 @@ static cmd_result_t emit_status_event(bool direct)
         s_cfg.connection_stats(&mqtt_connects, &conn_age_s,
                                last_disc_reason, sizeof last_disc_reason);
     }
+    uint32_t publish_refused = 0;
+    int last_puback_reason = 0;
+    if (s_cfg.publish_refusal_stats != NULL) {
+        s_cfg.publish_refusal_stats(&publish_refused, &last_puback_reason, NULL);
+    }
+    int64_t refusal_hold_ms = 0;
+    device_commands_refusal_status(NULL, &refusal_hold_ms, NULL);
 
     const esp_app_desc_t *app = esp_app_get_description();
     bool wd_armed = s_cfg.watchdog_armed != NULL && s_cfg.watchdog_armed();
@@ -1713,6 +1789,9 @@ static cmd_result_t emit_status_event(bool direct)
         .mqtt_reconnects = mqtt_connects,
         .last_disc_reason = last_disc_reason,
         .conn_age_s = conn_age_s,
+        .publish_refused = publish_refused,
+        .last_puback_reason = last_puback_reason,
+        .refusal_hold_s = refusal_hold_ms / 1000,
         .pending = s.pending,
         .power_valid = s.power_valid,
         .battery_v = (double)s.power.battery_mv / 1000.0,
@@ -2003,6 +2082,17 @@ bool device_commands_reap_stale_inflight(int64_t max_age_ms)
         }
     }
     return stale;
+}
+
+void device_commands_refusal_status(uint32_t *refusals_since_ok, int64_t *hold_remaining_ms,
+                                    int64_t *last_refused_id)
+{
+    int64_t now = mono_ms();
+    portENTER_CRITICAL(&s_inflight_mtx);
+    if (refusals_since_ok)  *refusals_since_ok = s_refusals_since_ok;
+    if (hold_remaining_ms)  *hold_remaining_ms = s_refusal_hold_until_ms > now ? s_refusal_hold_until_ms - now : 0;
+    if (last_refused_id)    *last_refused_id = s_last_refused_id;
+    portEXIT_CRITICAL(&s_inflight_mtx);
 }
 
 int64_t device_commands_ms_since_publish_ok(void)

@@ -87,6 +87,19 @@ esp_err_t event_log_archive_to_sd(size_t *out_archived);
 size_t    event_log_import_sd_backlog(size_t max_files);
 esp_err_t event_log_free_bytes(uint64_t *out_free);
 
+/* ── Archive replay support (evlog_replay) ──
+ * append_verbatim: re-append one already-framed v2 record line (e.g. read back
+ * from /sdcard/archive) to the tail as PENDING, keeping its measure_id and
+ * capture times; next_id stays above it. ESP_ERR_INVALID_ARG = malformed line
+ * (skip), ESP_ERR_NO_MEM = store full (nothing written, retry later), ESP_FAIL =
+ * media write failure. flush: fsync the tail (call after a chunk of appends,
+ * before persisting replay progress). max_pending_id_in_range: highest pending
+ * id inside [from_id, to_id] (to_id 0 = unbounded), for exact resume. */
+esp_err_t event_log_append_verbatim(const char *line, size_t len, int64_t *out_id);
+esp_err_t event_log_flush(void);
+esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
+                                            int64_t *out_max, bool *out_capped);
+
 /* Pre-reboot power-safety drain (register once via esp_register_shutdown_handler).
  * Flushes + fsyncs the periodically-buffered tail, persists the read cursor, and
  * closes the tail file so a following sdcard_unmount() can finalize FATFS cleanly

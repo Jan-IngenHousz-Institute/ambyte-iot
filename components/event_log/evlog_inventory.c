@@ -9,8 +9,8 @@
 /* Room for "<archive_dir>/arc-<int64>.log"; host tests pass long temp paths. */
 #define EVLOG_INVENTORY_PATH_MAX 260
 
-/* Accept exactly "<prefix><digits>.log"; returns the digits as an id. */
-static bool parse_named_log(const char *name, const char *prefix, int64_t *out_id)
+bool evlog_inventory_parse_name(const char *name, const char *prefix, int64_t *out_id,
+                                uint32_t *out_suffix)
 {
     size_t plen = strlen(prefix);
     if (strncmp(name, prefix, plen) != 0) return false;
@@ -18,15 +18,33 @@ static bool parse_named_log(const char *name, const char *prefix, int64_t *out_i
     if (*p < '0' || *p > '9') return false;
     char *end = NULL;
     long long v = strtoll(p, &end, 10);
-    if (end == p || v <= 0 || strcmp(end, ".log") != 0) return false;
+    if (end == p || v <= 0) return false;
+    uint32_t suffix = 0;
+    if (*end == '-') {                       /* arc-<id>-<seq>.log: collision-avoiding name */
+        const char *q = end + 1;
+        if (*q < '0' || *q > '9') return false;
+        long long s = strtoll(q, &end, 10);
+        if (end == q || s < 0) return false;
+        suffix = (uint32_t)s;
+    }
+    if (strcmp(end, ".log") != 0) return false;
     if (out_id) *out_id = (int64_t)v;
+    if (out_suffix) *out_suffix = suffix;
     return true;
 }
 
-static int cmp_i64(const void *a, const void *b)
+static bool parse_named_log(const char *name, const char *prefix, int64_t *out_id)
 {
-    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
-    return (x < y) ? -1 : (x > y) ? 1 : 0;
+    return evlog_inventory_parse_name(name, prefix, out_id, NULL);
+}
+
+typedef struct { int64_t id; uint32_t suffix; } arc_entry_t;
+
+static int cmp_arc(const void *a, const void *b)
+{
+    const arc_entry_t *x = a, *y = b;
+    if (x->id != y->id) return x->id < y->id ? -1 : 1;
+    return x->suffix < y->suffix ? -1 : (x->suffix > y->suffix ? 1 : 0);
 }
 
 static bool io_begin(const evlog_inventory_hooks_t *h)
@@ -43,7 +61,14 @@ static void io_end(const evlog_inventory_hooks_t *h)
  * head of a line. cmd_raw is bounded at 543 B by the producer, so the sixth
  * field starts well inside EVLOG_INVENTORY_HEAD_BYTES for every record the
  * firmware writes; anything else counts as unparsed. */
+bool evlog_inventory_parse_head(const char *head, size_t head_len, int64_t *out_id, int64_t *out_start_ms);
+
 static bool parse_head(const char *head, size_t head_len, int64_t *out_id, int64_t *out_start_ms)
+{
+    return evlog_inventory_parse_head(head, head_len, out_id, out_start_ms);
+}
+
+bool evlog_inventory_parse_head(const char *head, size_t head_len, int64_t *out_id, int64_t *out_start_ms)
 {
     if (head_len == 0 || head[0] < '0' || head[0] > '9') return false;
     char *end = NULL;
@@ -154,7 +179,7 @@ esp_err_t evlog_inventory_scan(const char *archive_dir, const char *legacy_dir,
     if (archive_dir == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
 
-    int64_t *ids = calloc(EVLOG_INVENTORY_MAX_FILES, sizeof *ids);
+    arc_entry_t *ids = calloc(EVLOG_INVENTORY_MAX_FILES, sizeof *ids);
     char *buf = malloc(EVLOG_INVENTORY_HEAD_BYTES);
     if (ids == NULL || buf == NULL) { free(ids); free(buf); return ESP_ERR_NO_MEM; }
 
@@ -166,21 +191,25 @@ esp_err_t evlog_inventory_scan(const char *archive_dir, const char *legacy_dir,
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (ent->d_name[0] == '.') continue;
-            int64_t id = 0;
-            if (!parse_named_log(ent->d_name, "arc-", &id)) { out->other_entries++; continue; }
+            arc_entry_t e;
+            if (!evlog_inventory_parse_name(ent->d_name, "arc-", &e.id, &e.suffix)) { out->other_entries++; continue; }
             out->files++;
-            if (nids < EVLOG_INVENTORY_MAX_FILES) ids[nids++] = id;
+            if (nids < EVLOG_INVENTORY_MAX_FILES) ids[nids++] = e;
             else out->files_truncated = true;
         }
         closedir(d);
     }
     io_end(hooks);
 
-    qsort(ids, nids, sizeof *ids, cmp_i64);
+    qsort(ids, nids, sizeof *ids, cmp_arc);
     char path[EVLOG_INVENTORY_PATH_MAX];
     for (uint32_t i = 0; i < nids && !out->sd_lost; i++) {
-        snprintf(path, sizeof path, "%s/arc-%lld.log", archive_dir, (long long)ids[i]);
-        scan_file(path, ids[i], win, hooks, buf, out);
+        if (ids[i].suffix) {
+            snprintf(path, sizeof path, "%s/arc-%lld-%u.log", archive_dir, (long long)ids[i].id, (unsigned)ids[i].suffix);
+        } else {
+            snprintf(path, sizeof path, "%s/arc-%lld.log", archive_dir, (long long)ids[i].id);
+        }
+        scan_file(path, ids[i].id, win, hooks, buf, out);
         if (hooks != NULL && hooks->yield != NULL) hooks->yield();
     }
 

@@ -28,6 +28,16 @@ Databricks `open_jii_dev.centrum.clean_data`.
   advances past the *contiguous ACKED prefix only*, and only on the sync_runner task.
   Duplicates are acceptable (platform dedups on `(device_id, measure_id)` — flagged, verify);
   skips never are.
+- **A refused PUBACK is not delivery**: the client runs MQTT 5; a PUBACK reason `>= 0x80`
+  (AWS `0x87 Not authorized` on a missing topic policy) is reported as `ESP_ERR_NOT_ALLOWED`,
+  the record stays PENDING, the drain backs off (1–30 min) and the no-PUBACK watchdog counts
+  it as liveness. Never map a reason-coded PUBACK back to `ESP_OK` (16–18 Sep 2026 lost
+  ~0.8M records that way). Store capacity (~17 h at default cadence) is the outage budget.
+- **Archive is append-only and named by first id**: `event_log_archive_to_sd` must never
+  overwrite an existing `arc-*.log` (replayed ranges re-archive under `arc-<id>-<seq>.log`).
+  `evlog_replay` re-appends archive records through `event_log_append_verbatim` behind the
+  live queue and never moves the cursor; replayed ids publish without workbook provenance
+  (`provenance_suppressed` port).
 - **Windowed publisher (1.0.6)**: ≤16 slots / ≤64 KiB outstanding QoS1 envelopes; synchronous
   `esp_mqtt_client_publish` (NOT `enqueue` — esp-mqtt drains its outbox one message per task
   loop, enqueue serializes the wire); pre-publish reservation + early-ack parking makes sub-ms

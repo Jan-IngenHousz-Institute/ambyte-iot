@@ -432,7 +432,12 @@ class PayloadV3Test(unittest.TestCase):
                     "DC_V3_GZ_EVENT_ENVELOPE_FMT"):
             body = env_header.split(f"#define {fmt}", 1)[1].split("\n\n", 1)[0]
             self.assertIn('%s%s%s', body, fmt)
-        self.assertEqual(publisher.count("s_wbpart"), 6)  # 3 pre-size + 3 real snprintf
+        # 3 pre-size + 3 real snprintf + 1 clear for archive-replayed rows
+        # (provenance_suppressed → s_wbpart[0] = '\0', so a record captured under
+        # an earlier schedule is not stamped with today's workbook/macros).
+        self.assertEqual(publisher.count("s_wbpart"), 7)
+        self.assertIn("s_wbpart[0] = '\\0';", publisher)
+        self.assertIn("s_cfg.provenance_suppressed(e.measure_id)", publisher)
         # Built ONCE per publish, before the sizing sites, and fed this row's
         # payload so the six s_wbpart splices above all see the same
         # per-row-filtered part (the exact-pre-sizing invariant).
