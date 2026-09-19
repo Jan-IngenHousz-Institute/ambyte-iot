@@ -352,6 +352,19 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 - `url` must be a **direct** `.bin`: a GitHub Release asset (`…/releases/download/<tag>/firmware.bin`) or `raw.githubusercontent.com/...`. `github.com/.../tree/` or `/blob/` web URLs serve HTML and are rejected.
 - Requires the **dual-OTA partition layout** (`ota_0`/`ota_1` + `otadata`, `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`) — a one-time USB reflash migrates legacy single-app units (see Factory reset caution above).
 
+### Remote SD archive inventory (read-only)
+
+`{type:evlog_inventory}` on the command topic makes the device survey what its SD card still holds and answer once on the status topic. It reads `/sdcard/archive/arc-*.log` (verbatim copies of already-acknowledged event-log files) and counts `/sdcard/events`; it never touches the event store, the read cursor, NVS or the card contents, and it runs on a one-shot low-priority task so measurement and publishing continue.
+
+```sh
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 \
+  --message '{"type":"evlog_inventory","id":"inv-1","from_id":5571,"to_id":26331,"list":true}'
+```
+
+- Optional window: `from_id`/`to_id` on `measure_id`, `from_ms`/`to_ms` on the record's capture time (epoch ms). Omitted or `0` means unbounded. `list` (default true) adds up to 48 per-file rows; the summary is sent alone if the list would not fit the reply.
+- Reply: `archive.{present,files,records,torn,unparsed,in_window,pre_2024,bytes,min_id,max_id,min_start_ms,max_start_ms}`, `legacy_events_files`, `store.{free_bytes,pending,last_acked_id,next_id}`, `scan_ms`, `sd_mounted`, plus `files_list[]`. `pre_2024` counts records stamped before time sync. `ok:false` with `detail` = `busy` (a scan is running), `no_mem`, `no_task` or `reply_too_large`.
+- Why it exists: on 16–18 Sep 2026 the broker acknowledged publishes it had refused for a missing topic permission, so devices marked those records synced and archived them; this command is how the fleet's recoverable set is measured before any replay is designed. Do not send it as a retained message.
+
 ### Remote schedule delivery
 
 [components/script_update](components/script_update), dispatched by `command_router`:
