@@ -134,9 +134,11 @@ def main(argv=None):
 
     by_identity = fleet_deploy.device_index(devices)
     q = queue.Queue()
+    # The environment roles may only connect as client/fleet-deploy-*; the
+    # helper appends pid and time for uniqueness.
     conn = fleet_deploy.mqtt_connection(session, fleet_deploy.STATUS_TOPIC,
                                         lambda topic, payload, **kw: q.put((time.time(), topic, payload)),
-                                        client_id=f"fleet-command-{int(time.time())}")
+                                        client_id="fleet-deploy-command")
     replies = {}
     try:
         for dev in devices:
