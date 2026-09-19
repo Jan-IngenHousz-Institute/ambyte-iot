@@ -32,9 +32,13 @@ extern "C" {
  * duplicate-chunk window it first asks event_log for the highest still-pending
  * id inside the range and resumes after it (exact unless that scan hit its
  * bound — the reply reports `resume_exact`). Re-running a finished token is a
- * no-op. Store protection: the job pauses while the store has less than
- * EVLOG_REPLAY_MIN_FREE_BYTES free or more than EVLOG_REPLAY_PENDING_CAP records
- * pending, so live captures are never refused because of a replay.
+ * no-op. Store protection: the job pauses while more than
+ * EVLOG_REPLAY_PENDING_CAP records are pending or the store refuses the append
+ * (full of unsynced data), so live captures are never refused because of a
+ * replay. The free-space floor below is deliberately under event_log's own
+ * eviction watermark (256 KiB, evicting synced files up to 512 KiB): in steady
+ * state free space hovers inside that band, so a higher floor would never be
+ * reached again once the store has filled and the job would pause forever.
  *
  * Provenance: the stored record carries no workbook provenance; the publisher
  * normally stamps the currently installed schedule. evlog_replay_covers() lets it
@@ -44,7 +48,7 @@ extern "C" {
 #define EVLOG_REPLAY_TOKEN_MAX       32
 #define EVLOG_REPLAY_DEFAULT_CHUNK   64
 #define EVLOG_REPLAY_MAX_CHUNK       1000
-#define EVLOG_REPLAY_MIN_FREE_BYTES  (2u * 1024u * 1024u)
+#define EVLOG_REPLAY_MIN_FREE_BYTES  (128u * 1024u)   /* must stay below event_log's EVLOG_MIN_FREE_BYTES */
 #define EVLOG_REPLAY_PENDING_CAP     3000
 #define EVLOG_REPLAY_HISTORY         4        /* completed ranges remembered for covers() */
 

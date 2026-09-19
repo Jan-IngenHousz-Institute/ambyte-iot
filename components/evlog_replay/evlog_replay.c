@@ -116,6 +116,10 @@ static esp_err_t job_save(const replay_job_t *j)
 
 static void progress_save(int64_t next_id, uint32_t appended)
 {
+    portENTER_CRITICAL(&s_mux);
+    s_job.next_id = next_id;
+    s_job.appended = appended;
+    portEXIT_CRITICAL(&s_mux);
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     (void)nvs_set_i64(h, KEY_NEXT, next_id);
@@ -240,9 +244,13 @@ static bool in_window(const evlog_replay_req_t *r, int64_t id, int64_t start_ms)
     return true;
 }
 
-/* Wait until the store can take more records or the job is cancelled. */
-static bool wait_for_room(void)
+/* Wait until the store can take more records or the job is cancelled.
+ * `delay_first` is set after an ESP_ERR_NO_MEM append: the store told us it is
+ * full of unsynced data, which the free-space probe below cannot see, so back
+ * off once before probing instead of spinning on the same refusal. */
+static bool wait_for_room(bool delay_first)
 {
+    if (delay_first) vTaskDelay(pdMS_TO_TICKS(REPLAY_PAUSE_MS));
     for (;;) {
         if (s_cancel) return false;
         uint64_t freeb = 0;
@@ -408,7 +416,7 @@ static void do_run(const replay_task_arg_t *a)
             if (!sdcard_io_begin()) { failed = true; fail_detail = "sd_lost"; break; }
             FILE *f = fopen(path, "rb");
             if (f == NULL) { sdcard_io_end(); file_done = true; break; }   /* archived away meanwhile */
-            bool paused = false;
+            bool paused = false, store_full = false;
             while (fgets(line, (int)REPLAY_LINE_CAP, f) != NULL) {
                 size_t len = strlen(line);
                 if (len == 0 || line[len - 1] != '\n') {
@@ -434,6 +442,7 @@ static void do_run(const replay_task_arg_t *a)
                     (void)event_log_flush();
                     progress_save(j.next_id, j.appended);
                     paused = true;
+                    store_full = true;
                     break;
                 }
                 if (err == ESP_ERR_INVALID_ARG) { skipped_unparsed++; continue; }
@@ -469,7 +478,7 @@ static void do_run(const replay_task_arg_t *a)
             fclose(f);
             sdcard_io_end();
             if (paused) {
-                if (!wait_for_room()) break;          /* cancelled while waiting */
+                if (!wait_for_room(store_full)) break;   /* cancelled while waiting */
                 continue;                             /* reopen this file */
             }
             file_done = true;
