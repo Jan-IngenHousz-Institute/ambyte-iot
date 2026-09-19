@@ -177,6 +177,34 @@ commanded gateway still lacking exact target-version proof after the fresh
 post-OTA ping. Partial results are always written to `results.json` and the
 summary.
 
+## Device commands around a rollout (`fleet_command.py`)
+
+`fleet_command.py` sends one device command over the same transport and
+returns the replies, so the checks around an OTA do not need a laptop with an
+AWS session. Three commands:
+
+- `ping` — firmware check. With `--expect-fw 2.3.1` the run fails unless every
+  targeted device answers with that version, which makes it the post-OTA gate.
+- `inventory` — `evlog_inventory`: what `/sdcard/archive` holds, optionally
+  inside an id window. Read-only.
+- `replay` — `evlog_replay` with `--mode status|count|run|cancel` and `--token`.
+  `count` and `status` are read-only; `run` (needs a bounded window and a
+  `--chunk`) and `cancel` change device state.
+
+```bash
+python tools/fleet_deploy/fleet_command.py ping --profile jii-infra-494 \
+  --devices "ambyte_28:37:2F:FF:FC:80 ambyte_E8:F6:0A:B1:ED:B8" --expect-fw 2.3.1
+python tools/fleet_deploy/fleet_command.py replay --mode status --token sep16-fffc80 \
+  --devices ambyte_28:37:2F:FF:FC:80
+```
+
+The **Fleet command** workflow (`.github/workflows/fleet-command.yml`) exposes
+the same inputs under the `fleet-deploy-<env>` environment gate, prints the
+summary into the run and uploads `results.json` (one entry per device, plus
+`no_reply` and `not_expected_fw`). Device ids keep their exact spelling:
+`ambyte_<MAC>` and `AMBYTE_<MAC>` are different MQTT routes, and a bare MAC
+gets the historical uppercase prefix, so name production things explicitly.
+
 ## Deploying AMBIT firmware through Ambytes
 
 Use **Actions -> Fleet deploy (AMBIT via Ambyte) -> Run workflow**. The release
