@@ -129,6 +129,33 @@ static uint32_t mqtt_error_disconnect_count_impl(uint32_t window_s)
     return count;
 }
 
+/* Refused-PUBACK accounting (MQTT 5 reason >= 0x80). Guarded by s_error_disc_mux
+ * like the other boot-scoped connection telemetry. */
+static uint32_t s_publish_refused_total = 0;
+static int      s_last_puback_reason    = 0;
+static int64_t  s_last_refusal_us       = -1;
+
+static void mqtt_publish_refusal_stats_impl(uint32_t *refused_total, int *last_reason_code,
+                                            int64_t *ms_since_last)
+{
+    uint32_t total;
+    int reason;
+    int64_t last_us;
+    portENTER_CRITICAL(&s_error_disc_mux);
+    total   = s_publish_refused_total;
+    reason  = s_last_puback_reason;
+    last_us = s_last_refusal_us;
+    portEXIT_CRITICAL(&s_error_disc_mux);
+    if (refused_total)    *refused_total = total;
+    if (last_reason_code) *last_reason_code = reason;
+    if (ms_since_last)    *ms_since_last = last_us < 0 ? -1 : (esp_timer_get_time() - last_us) / 1000LL;
+}
+
+message_publish_refusal_stats_fn mqtt_client_get_publish_refusal_stats_fn(void)
+{
+    return mqtt_publish_refusal_stats_impl;
+}
+
 static void mqtt_connection_stats_impl(uint32_t *successful_connects,
                                        int64_t *connection_age_s,
                                        char *last_disconnect_reason,
@@ -314,12 +341,36 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         }
         break;
 
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGD(TAG, "MQTT publish ack msg_id=%d", event->msg_id);
+    case MQTT_EVENT_PUBLISHED: {
+        /* esp-mqtt raises PUBLISHED for every PUBACK, refused or not. Under MQTT 5
+         * esp_mqtt5_parse_puback points event->data at the reason-code byte when
+         * the PUBACK carries one (absent = success). AWS IoT Core answers an
+         * unauthorized publish with 0x87 Not authorized and DROPS the message: on
+         * 16–18 Sep 2026 the fleet marked ~0.8M records synced on exactly those
+         * ACKs. A reason >= 0x80 is therefore reported as ESP_ERR_NOT_ALLOWED so the
+         * publisher keeps the record PENDING and retries later. */
+        int reason = 0;
+        if (event->protocol_ver == MQTT_PROTOCOL_V_5 && event->data != NULL && event->data_len >= 1) {
+            reason = (int)(uint8_t)event->data[0];
+        }
+        esp_err_t status = ESP_OK;
+        if (reason >= 0x80) {
+            status = ESP_ERR_NOT_ALLOWED;
+            portENTER_CRITICAL(&s_error_disc_mux);
+            s_publish_refused_total++;
+            s_last_puback_reason = reason;
+            s_last_refusal_us = esp_timer_get_time();
+            portEXIT_CRITICAL(&s_error_disc_mux);
+            ESP_LOGW(TAG, "MQTT publish REFUSED by broker msg_id=%d reason=0x%02x — record stays pending",
+                     event->msg_id, (unsigned)reason);
+        } else {
+            ESP_LOGD(TAG, "MQTT publish ack msg_id=%d", event->msg_id);
+        }
         if (s_ack_handler != NULL) {
-            s_ack_handler(event->msg_id, ESP_OK, s_ack_ctx);
+            s_ack_handler(event->msg_id, status, s_ack_ctx);
         }
         break;
+    }
 
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT error type=%d", event->error_handle->error_type);

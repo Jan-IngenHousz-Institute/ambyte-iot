@@ -1735,9 +1735,17 @@ esp_err_t event_log_archive_to_sd(size_t *out_archived)
         bool ok = false;
         if (sdcard_io_begin()) {
             mkdir(EVLOG_ARCHIVE_DIR, 0777);          /* ignore EEXIST */
-            char dst[64];
+            char dst[80];
             snprintf(dst, sizeof dst, "%s/arc-%lld.log", EVLOG_ARCHIVE_DIR,
                      (long long)first_id);
+            /* Names collide when a replayed (re-appended) range is archived a
+             * second time: its first id already names an archive file. Never
+             * overwrite an archive — suffix the internal seq instead. */
+            struct stat st;
+            if (stat(dst, &st) == 0) {
+                snprintf(dst, sizeof dst, "%s/arc-%lld-%u.log", EVLOG_ARCHIVE_DIR,
+                         (long long)first_id, (unsigned)min_seq);
+            }
             FILE *wf = fopen(dst, "wb");
             if (wf != NULL) {
                 ok = true;
@@ -1767,6 +1775,166 @@ esp_err_t event_log_archive_to_sd(size_t *out_archived)
         ESP_LOGI(TAG, "archived %u synced file(s) to " EVLOG_ARCHIVE_DIR, (unsigned)archived);
     }
     if (out_archived) *out_archived = archived;
+    return ESP_OK;
+}
+
+/* Append one already-framed v2 record line to the tail exactly as stored on
+ * another medium (legacy SD import, archive replay). Caller holds s_mtx and
+ * `line` may alias s_line. Gate: newline framed, <= s_max_record, >= 8 tabs,
+ * id > 0 → ESP_ERR_INVALID_ARG otherwise (skip it, the old reader would have
+ * too). ESP_ERR_NO_MEM = store full after evicting synced files (nothing was
+ * written; the caller may retry later). ESP_FAIL = media write failure (the
+ * torn partial is truncated away). On success *out_id is the record's id, the
+ * record is PENDING, and next_id is kept above it. */
+static esp_err_t evlog_append_verbatim_locked(const char *line, size_t len, int64_t *out_id)
+{
+    if (len == 0 || line[len - 1] != '\n' || len > s_max_record) return ESP_ERR_INVALID_ARG;
+    int tabs = 0;
+    for (size_t i = 0; i < len; i++) tabs += (line[i] == '\t');
+    int64_t id = (int64_t)strtoll(line, NULL, 10);
+    if (tabs < 8 || id <= 0) return ESP_ERR_INVALID_ARG;
+    if (s_wf == NULL) return ESP_ERR_INVALID_STATE;
+
+    uint64_t freeb = 0;
+    if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+        (void)evlog_evict_synced_locked();
+        if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_tail_size > 0 && s_tail_size + (long)len > EVLOG_ROTATE_BYTES) {
+        if (evlog_flush_writer_locked() != ESP_OK) return ESP_FAIL;
+        fclose(s_wf);
+        s_wf = NULL;
+        s_tail_seq++;
+        if (evlog_reopen_tail_locked() != ESP_OK) return ESP_FAIL;
+    }
+    if (fwrite(line, 1, len, s_wf) != len) {
+        fflush(s_wf);
+        (void)ftruncate(fileno(s_wf), s_tail_size);
+        return ESP_FAIL;
+    }
+    s_tail_size += (long)len;
+    s_pending++;
+    if (id + 1 > s_next_id) {
+        s_next_id = id + 1;
+        if (s_next_id >= s_id_limit) {
+            s_id_limit = s_next_id + EVLOG_ID_BLOCK;
+            evlog_persist_nid_locked();
+        }
+    }
+    if (out_id) *out_id = id;
+    return ESP_OK;
+}
+
+esp_err_t event_log_append_verbatim(const char *line, size_t len, int64_t *out_id)
+{
+    if (line == NULL) return ESP_ERR_INVALID_ARG;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t err = !s_available ? ESP_ERR_INVALID_STATE
+                                 : evlog_append_verbatim_locked(line, len, out_id);
+    xSemaphoreGive(s_mtx);
+    return err;
+}
+
+esp_err_t event_log_flush(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t err = evlog_flush_writer_locked();
+    xSemaphoreGive(s_mtx);
+    return err;
+}
+
+/* Highest measure_id in [from_id, to_id] among PENDING records (cursor → tail).
+ * Lets a replay resume exactly after a reset: everything it appended before the
+ * reset is still pending, so the next id to append is *out_max + 1. Bounded like
+ * the boot pending count; *out_capped = true means the scan stopped early and
+ * *out_max is a floor. *out_max = 0 when nothing in range was found. */
+esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
+                                            int64_t *out_max, bool *out_capped)
+{
+    if (out_max == NULL) return ESP_ERR_INVALID_ARG;
+    *out_max = 0;
+    if (out_capped) *out_capped = false;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_INVALID_STATE; }
+    (void)evlog_flush_writer_locked();
+    int64_t lines = 0;
+    bool capped = false;
+    const TickType_t t0 = xTaskGetTickCount();
+    for (uint32_t seq = s_rd_seq; seq <= s_tail_seq && !capped; seq++) {
+        char path[64];
+        evlog_file_path(path, sizeof path, seq);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) continue;
+        if (seq == s_rd_seq && s_rd_off > 0 && fseek(f, s_rd_off, SEEK_SET) != 0) { fclose(f); continue; }
+        while (fgets(s_line, s_line_cap, f) != NULL) {
+            size_t len = strlen(s_line);
+            if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
+            int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+            if (id >= from_id && (to_id == 0 || id <= to_id) && id > *out_max) *out_max = id;
+            if (++lines >= 3 * EVLOG_SCAN_MAX_LINES ||
+                (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(4 * EVLOG_SCAN_MAX_MS)) {
+                capped = true;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    xSemaphoreGive(s_mtx);
+    if (out_capped) *out_capped = capped;
+    return ESP_OK;
+}
+
+/* Collect every measure_id in [from_id, to_id] (to_id 0 = unbounded) present in
+ * ANY file still on flash: pending records and synced records not yet archived
+ * or evicted. This is the replay resume set: a record appended before a reset
+ * may already have been published and acknowledged, so a pending-only scan
+ * would miss it and a resume would append it twice. Synced files stay on flash
+ * until the next archive burst (every EVLOG_ARCHIVE_EVERY_N stores) or an
+ * eviction, so a resume that runs soon after boot sees them. Unsorted, ids are
+ * appended in file order; *out_capped = true when `cap` or the time bound was
+ * hit (the set is then incomplete). */
+esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t *ids,
+                                         size_t cap, size_t *out_n, bool *out_capped)
+{
+    if (ids == NULL || out_n == NULL) return ESP_ERR_INVALID_ARG;
+    *out_n = 0;
+    if (out_capped) *out_capped = false;
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_INVALID_STATE; }
+    (void)evlog_flush_writer_locked();
+    uint32_t min_seq = 0, max_seq = 0;
+    bool capped = false;
+    const TickType_t t0 = xTaskGetTickCount();
+    if (evlog_scan_range_locked(&min_seq, &max_seq)) {
+        for (uint32_t seq = min_seq; seq <= max_seq && !capped; seq++) {
+            char path[64];
+            evlog_file_path(path, sizeof path, seq);
+            FILE *f = fopen(path, "rb");
+            if (f == NULL) continue;
+            while (fgets(s_line, s_line_cap, f) != NULL) {
+                size_t len = strlen(s_line);
+                if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
+                int64_t id = (int64_t)strtoll(s_line, NULL, 10);
+                if (id >= from_id && (to_id == 0 || id <= to_id)) {
+                    if (*out_n >= cap) { capped = true; break; }
+                    ids[(*out_n)++] = id;
+                }
+                if ((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(4 * EVLOG_SCAN_MAX_MS)) {
+                    capped = true;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    xSemaphoreGive(s_mtx);
+    if (out_capped) *out_capped = capped;
     return ESP_OK;
 }
 
@@ -1820,38 +1988,11 @@ size_t event_log_import_sd_backlog(size_t max_files)
             } else {
                 while (fgets(s_line, s_line_cap, rf) != NULL) {
                     size_t len = strlen(s_line);
-                    /* Verbatim-append gate: framed, sized, and 9-field shaped.
-                     * Anything else (torn tail, over-long, v1 relics) is skipped —
-                     * the old firmware's reader would have skipped it too. */
-                    if (len == 0 || s_line[len - 1] != '\n' || len > s_max_record) { skipped++; continue; }
-                    int tabs = 0;
-                    for (size_t i = 0; i < len; i++) tabs += (s_line[i] == '\t');
-                    int64_t id = (int64_t)strtoll(s_line, NULL, 10);
-                    if (tabs < 8 || id <= 0) { skipped++; continue; }
-
-                    uint64_t freeb = 0;
-                    if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
-                        (void)evlog_evict_synced_locked();
-                        if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
-                            store_full = true;
-                            break;                   /* remainder stays on SD */
-                        }
-                    }
-                    if (s_tail_size > 0 && s_tail_size + (long)len > EVLOG_ROTATE_BYTES) {
-                        if (evlog_flush_writer_locked() != ESP_OK) { file_ok = false; break; }
-                        fclose(s_wf);
-                        s_wf = NULL;
-                        s_tail_seq++;
-                        if (evlog_reopen_tail_locked() != ESP_OK) { file_ok = false; break; }
-                    }
-                    if (fwrite(s_line, 1, len, s_wf) != len) {
-                        fflush(s_wf);
-                        (void)ftruncate(fileno(s_wf), s_tail_size);
-                        file_ok = false;
-                        break;
-                    }
-                    s_tail_size += (long)len;
-                    s_pending++;
+                    int64_t id = 0;
+                    esp_err_t aerr = evlog_append_verbatim_locked(s_line, len, &id);
+                    if (aerr == ESP_ERR_INVALID_ARG) { skipped++; continue; }
+                    if (aerr == ESP_ERR_NO_MEM) { store_full = true; break; }   /* remainder stays on SD */
+                    if (aerr != ESP_OK) { file_ok = false; break; }
                     imported++;
                     if (id > max_seen_id) max_seen_id = id;
                 }

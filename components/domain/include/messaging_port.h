@@ -33,8 +33,21 @@ typedef void      (*message_connect_fn)(void *ctx);
 typedef esp_err_t (*message_set_connect_handler_fn)(message_connect_fn handler,
                                                      void *ctx);
 
-/* Callback delivered when a QoS-1 publish is acknowledged (or fails) */
+/* Callback delivered when a QoS-1 publish is acknowledged (or fails).
+ * status: ESP_OK = the broker ACCEPTED the message (MQTT 5 PUBACK reason < 0x80,
+ * or a reason-less PUBACK). ESP_ERR_NOT_ALLOWED = the broker ACKNOWLEDGED but
+ * REFUSED it (PUBACK reason >= 0x80, e.g. 0x87 Not authorized): the message was
+ * dropped server-side and must be treated as NOT delivered. Any other error =
+ * transport failure. Under MQTT 3.1.1 a refusal is indistinguishable from
+ * success; the transport must run MQTT 5 for this signal to exist. */
 typedef void      (*message_publish_ack_fn)(int msg_id, esp_err_t status, void *ctx);
+
+/* Boot-scoped count of refused PUBACKs (see above), the last reason code
+ * (0 = none yet) and milliseconds since the last refusal (-1 = never). Any
+ * out-param may be NULL. */
+typedef void      (*message_publish_refusal_stats_fn)(uint32_t *refused_total,
+                                                      int *last_reason_code,
+                                                      int64_t *ms_since_last);
 typedef esp_err_t (*message_set_publish_ack_handler_fn)(message_publish_ack_fn handler,
                                                          void *ctx);
 

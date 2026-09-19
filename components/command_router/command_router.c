@@ -1,12 +1,20 @@
 #include "command_router.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "event_log.h"
+#include "evlog_inventory.h"
+#include "evlog_replay.h"
+#include "sd_card.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "script_update.h"
@@ -46,6 +54,186 @@ static void handle_ping(const char *id)
     publish_reply(reply);
 }
 
+/* ── evlog_inventory: read-only survey of the SD archive ──────────────────────
+ * {"type":"evlog_inventory","id":"<unique>","from_id":N,"to_id":M,
+ *  "from_ms":T0,"to_ms":T1,"list":true}   (every field but type optional)
+ * Scans /sdcard/archive/arc-*.log (verbatim copies of already-acknowledged
+ * records) and replies once on the status topic with counts, id/capture-time
+ * bounds, how many records fall inside the window, and the store's health
+ * snapshot. Writes nothing: no cursor, store, NVS or SD mutation. Runs on a
+ * one-shot low-priority task because a card can hold tens of MB; the MQTT task
+ * only parses and dispatches. One scan at a time; a second request while one
+ * runs gets {"ok":false,"detail":"busy"}. */
+#define EVLOG_INVENTORY_REPLY_CAP   8192
+#define EVLOG_INVENTORY_TASK_STACK  6144
+#define EVLOG_INVENTORY_ID_MAX      65
+
+typedef struct {
+    char id[EVLOG_INVENTORY_ID_MAX];
+    evlog_inventory_window_t win;
+    bool list;
+} inventory_req_t;
+
+static atomic_bool s_inventory_busy;
+
+static void publish_inventory_error(const char *id, const char *detail)
+{
+    char reply[256];
+    snprintf(reply, sizeof(reply),
+             "{\"type\":\"evlog_inventory\",\"id\":\"%.64s\",\"device_id\":\"%s\",\"ok\":false,"
+             "\"detail\":\"%.64s\"}",
+             id ? id : "", s_cfg.device_id ? s_cfg.device_id : "", detail);
+    publish_reply(reply);
+}
+
+static void inventory_yield(void) { vTaskDelay(1); }
+
+static void inventory_task(void *arg)
+{
+    inventory_req_t *req = arg;
+    const int64_t t0 = esp_timer_get_time();
+    evlog_inventory_t *inv = calloc(1, sizeof *inv);
+    char *reply = malloc(EVLOG_INVENTORY_REPLY_CAP);
+    if (inv == NULL || reply == NULL) {
+        publish_inventory_error(req->id, "no_mem");
+        goto out;
+    }
+    const bool mounted = sdcard_is_mounted();
+    const evlog_inventory_hooks_t hooks = {
+        .io_begin = sdcard_io_begin, .io_end = sdcard_io_end, .yield = inventory_yield,
+    };
+    esp_err_t err = mounted
+        ? evlog_inventory_scan(EVLOG_INVENTORY_ARCHIVE_DIR, EVLOG_INVENTORY_LEGACY_DIR,
+                               &req->win, &hooks, inv)
+        : ESP_OK;                       /* unmounted card: report empty + sd_mounted=false */
+    if (err != ESP_OK) {
+        publish_inventory_error(req->id, esp_err_to_name(err));
+        goto out;
+    }
+    evlog_health_t h;
+    memset(&h, 0, sizeof h);
+    (void)event_log_health(&h);
+    uint64_t free_bytes = 0;
+    (void)event_log_free_bytes(&free_bytes);
+    const uint32_t scan_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    int n = evlog_inventory_render_json(inv, &req->win, req->id,
+                                        s_cfg.device_id ? s_cfg.device_id : "",
+                                        s_cfg.firmware_version ? s_cfg.firmware_version : "",
+                                        mounted, free_bytes, h.pending, h.last_acked_id, h.next_id,
+                                        scan_ms, req->list, reply, EVLOG_INVENTORY_REPLY_CAP);
+    if (n < 0 && req->list) {
+        /* The per-file list did not fit; send the summary alone. */
+        n = evlog_inventory_render_json(inv, &req->win, req->id,
+                                        s_cfg.device_id ? s_cfg.device_id : "",
+                                        s_cfg.firmware_version ? s_cfg.firmware_version : "",
+                                        mounted, free_bytes, h.pending, h.last_acked_id, h.next_id,
+                                        scan_ms, false, reply, EVLOG_INVENTORY_REPLY_CAP);
+    }
+    if (n < 0) {
+        publish_inventory_error(req->id, "reply_too_large");
+    } else {
+        ESP_LOGI(TAG, "evlog_inventory id=%s: %u files, %u records, %u in window, %u ms",
+                 req->id, (unsigned)inv->files, (unsigned)inv->records,
+                 (unsigned)inv->in_window, (unsigned)scan_ms);
+        publish_reply(reply);
+    }
+out:
+    free(inv);
+    free(reply);
+    free(req);
+    atomic_store(&s_inventory_busy, false);
+    vTaskDelete(NULL);
+}
+
+static int64_t json_i64(const cJSON *root, const char *key)
+{
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(j) || !isfinite(j->valuedouble) || j->valuedouble < 0) return 0;
+    return (int64_t)j->valuedouble;   /* valuedouble: ids and epoch-ms exceed int */
+}
+
+static void handle_evlog_inventory(const cJSON *root, const char *id)
+{
+    if (id != NULL && strlen(id) >= EVLOG_INVENTORY_ID_MAX) {
+        ESP_LOGW(TAG, "evlog_inventory: id too long — ignoring");
+        return;
+    }
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_inventory_busy, &expected, true)) {
+        ESP_LOGW(TAG, "evlog_inventory id=%s: scan already running", id ? id : "");
+        publish_inventory_error(id, "busy");
+        return;
+    }
+    inventory_req_t *req = calloc(1, sizeof *req);
+    if (req == NULL) {
+        atomic_store(&s_inventory_busy, false);
+        publish_inventory_error(id, "no_mem");
+        return;
+    }
+    if (id != NULL) strncpy(req->id, id, sizeof req->id - 1);
+    req->win.from_id = json_i64(root, "from_id");
+    req->win.to_id   = json_i64(root, "to_id");
+    req->win.from_ms = json_i64(root, "from_ms");
+    req->win.to_ms   = json_i64(root, "to_ms");
+    const cJSON *jlist = cJSON_GetObjectItemCaseSensitive(root, "list");
+    req->list = cJSON_IsBool(jlist) ? cJSON_IsTrue(jlist) : true;
+    if (xTaskCreate(inventory_task, "evlog_inv", EVLOG_INVENTORY_TASK_STACK, req,
+                    tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "evlog_inventory id=%s: task create failed", req->id);
+        publish_inventory_error(req->id, "no_task");
+        free(req);
+        atomic_store(&s_inventory_busy, false);
+        return;
+    }
+    ESP_LOGW(TAG, "evlog_inventory id=%s dispatched (ids %lld..%lld, ms %lld..%lld)", req->id,
+             (long long)req->win.from_id, (long long)req->win.to_id,
+             (long long)req->win.from_ms, (long long)req->win.to_ms);
+}
+
+/* ── evlog_replay: re-send a range of archived records ────────────────────────
+ * {"type":"evlog_replay","id":"<cmd id>","mode":"count|run|cancel|status",
+ *  "token":"<job id>","from_id":N,"to_id":M,"from_ms":T0,"to_ms":T1,"chunk":64}
+ * count = dry run (matches only), run = re-append the selection to the live
+ * FIFO with original ids/timestamps (resumable, chunked, store-guarded),
+ * cancel = stop the named job, status = report the persisted job. Replies are
+ * evlog_replay_result messages on the status topic, sent by evlog_replay. See
+ * components/evlog_replay/include/evlog_replay.h. Never send as retained. */
+static void handle_evlog_replay(const cJSON *root, const char *id)
+{
+    const cJSON *jmode = cJSON_GetObjectItemCaseSensitive(root, "mode");
+    const cJSON *jtok  = cJSON_GetObjectItemCaseSensitive(root, "token");
+    const char *mode  = cJSON_IsString(jmode) ? jmode->valuestring : "count";
+    const char *token = cJSON_IsString(jtok) ? jtok->valuestring : "";
+    evlog_replay_req_t req;
+    memset(&req, 0, sizeof req);
+    strncpy(req.token, token, sizeof req.token - 1);
+    req.from_id = json_i64(root, "from_id");
+    req.to_id   = json_i64(root, "to_id");
+    req.from_ms = json_i64(root, "from_ms");
+    req.to_ms   = json_i64(root, "to_ms");
+    int64_t chunk = json_i64(root, "chunk");
+    req.chunk = chunk > 0 && chunk <= EVLOG_REPLAY_MAX_CHUNK ? (uint32_t)chunk : 0;
+
+    esp_err_t err;
+    if (strcmp(mode, "count") == 0)       err = evlog_replay_count(&req, id);
+    else if (strcmp(mode, "run") == 0)    err = evlog_replay_run(&req, id);
+    else if (strcmp(mode, "cancel") == 0) err = evlog_replay_cancel(token, id);
+    else if (strcmp(mode, "status") == 0) err = evlog_replay_status(id);
+    else                                  err = ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGW(TAG, "evlog_replay id=%s mode=%s token=%s ids %lld..%lld ms %lld..%lld -> %s",
+             id ? id : "", mode, token, (long long)req.from_id, (long long)req.to_id,
+             (long long)req.from_ms, (long long)req.to_ms, esp_err_to_name(err));
+    if (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_NOT_SUPPORTED) {
+        char reply[256];
+        snprintf(reply, sizeof(reply),
+                 "{\"type\":\"evlog_replay_result\",\"id\":\"%.64s\",\"device_id\":\"%s\",\"mode\":\"%.16s\","
+                 "\"ok\":false,\"detail\":\"%s\"}",
+                 id ? id : "", s_cfg.device_id ? s_cfg.device_id : "", mode,
+                 err == ESP_ERR_INVALID_ARG ? "invalid_request" : "unknown_mode");
+        publish_reply(reply);
+    }
+}
+
 /* message_received_fn — runs in the mqtt task. Keep light; hand long work (OTA) to
  * a separate task in Stage 3. */
 static void on_message(const char *topic, const char *payload, size_t len, void *ctx)
@@ -74,6 +262,10 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
 
     if (strcmp(type, "ping") == 0) {
         handle_ping(id);
+    } else if (strcmp(type, "evlog_inventory") == 0) {
+        handle_evlog_inventory(root, id);
+    } else if (strcmp(type, "evlog_replay") == 0) {
+        handle_evlog_replay(root, id);
     } else if (strcmp(type, "ota_update") == 0) {
         const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
         const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;

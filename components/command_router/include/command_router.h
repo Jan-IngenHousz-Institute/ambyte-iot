@@ -19,6 +19,10 @@ extern "C" {
  *   { "type": "ping" | "ota_update" | "script_update", "id": "<unique>", ... }
  * script_update release messages may add `script_version` and `built_against_fw`;
  * older command payloads remain valid.
+ * Read-only diagnostics: `ping` → `pong`; `evlog_inventory` → one
+ * `evlog_inventory` report describing the SD archive (arc-*.log) with optional
+ * `from_id`/`to_id`/`from_ms`/`to_ms` window and `list` (per-file rows, default
+ * true). It never touches the event store, the cursor or the card contents.
  * State-changing commands carry a unique `id`; the router persists the last applied
  * id in NVS and no-ops a repeat (idempotency — safe with a retained trigger).
  */
