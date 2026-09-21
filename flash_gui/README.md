@@ -195,6 +195,7 @@ the operator whether the LED lit, and logs.
 python -m flash_gui.factory_test [--fw latest|BUILD_DIR] [--no-flash]
                                  [--port COM7] [--logdir factory_logs]
                                  [--operator NAME] [--station ID] [--no-led]
+                                 [--no-rtc-set]
 ```
 
 With one board plugged in, no arguments are needed: the newest published
@@ -208,8 +209,21 @@ network). `--fw .pio/build/esp32-s3-devkitm-1` flashes a local build instead
 (any directory with a `flasher_args.json`); `--no-flash` skips straight to
 testing whatever is on the board.
 
+Before the selftest runs, the station writes its own UTC clock to the board's
+RTC. This is required, not cosmetic: a factory-fresh PCF2131 powers up with
+its oscillator-stop flag set, and the driver refuses to return a time while
+that flag is set, so that a never-set clock cannot be mistaken for a real one.
+The selftest's tick test reads through that same path, so without a prior set
+a perfectly good board reports `rtc FAIL ready=1 osf=1 tick=fail epoch=0`.
+Writing the clock clears the flag and is what makes the oscillator observable.
+It does not weaken the test: a dead 32 kHz crystal still fails, because the
+time will not advance between the selftest's two reads even after a set. The
+board also leaves the station with a correct clock. `--no-rtc-set` skips the
+write when you want to see a board's as-found RTC state.
+
 Each run writes one JSON file (parsed tests, raw measured values, flashed
-release tag, the verbatim serial transcript) plus one appended row in
+release tag, what the station wrote to the RTC, the verbatim serial
+transcript) plus one appended row in
 `results.csv`; nothing is ever overwritten — a retest is a new row. The LED
 is driven red by the firmware, confirmed by the operator (recorded as
 attested, skippable with `--no-led` for unattended runs), then switched off.

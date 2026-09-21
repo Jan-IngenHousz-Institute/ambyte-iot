@@ -58,6 +58,9 @@ _VERDICT_RE = re.compile(
     r"^SELFTEST (PASS|FAIL) passed=(\d+) failed=(\d+) fw=(\S+) mac=(\S+)",
     re.MULTILINE)
 _BEGIN_RE = re.compile(r"^SELFTEST BEGIN fw=(\S+) mac=(\S+)", re.MULTILINE)
+# `rtc set <epoch>` answers "RTC set; RTC: <YYYY-MM-DD HH:MM:SS> (<epoch>)".
+_RTC_SET_OK_RE = re.compile(r"^RTC set;\s*RTC:\s*\S+ \S+\s*\((\d+)\)",
+                            re.MULTILINE)
 _KV_RE = re.compile(r"(\w+)=(\S+)")
 
 # The RTC tick test alone holds the console ~1.1 s and the I2C sweep probes
@@ -147,6 +150,56 @@ def _schedule_stop_best_effort(con: AmbyteConsole, log) -> None:
         pass
 
 
+def set_rtc_from_host(con: AmbyteConsole, log) -> dict:
+    """Set the board's clock from the station clock BEFORE running the selftest.
+
+    Why this has to happen first: a factory-fresh PCF2131 powers up with its
+    oscillator-stop flag (OSF) set, and the driver deliberately REFUSES to
+    return a time while that flag is set (PCF2131_base::rtc_time returns
+    ESP_ERR_INVALID_STATE) so that a never-set clock can never be mistaken for
+    a real one. The selftest's tick test is built on that same read path, so on
+    an out-of-factory board both of its reads fail, the two timestamps keep
+    their zero initialiser, and a perfectly good board reports
+    `rtc FAIL ready=1 osf=1 tick=fail epoch=0`. Writing the time clears OSF,
+    which is the only thing that makes the oscillator observable at all.
+
+    Setting from the station clock rather than a synthetic stamp is deliberate:
+    the board then leaves the station with a correct time, which is what it
+    needs in the field anyway, and no bogus epoch can ever reach the event log.
+
+    This does NOT weaken the test. A dead 32 kHz crystal still fails, because
+    the time will not advance between the selftest's two reads even after a
+    successful set — which is exactly the fault the tick test exists to catch.
+
+    Best-effort by design: a station-side failure here is logged and recorded
+    but never fatal. The firmware's own rtc verdict stays the gate.
+    """
+    stamp = datetime.now(timezone.utc).replace(microsecond=0)
+    epoch = int(stamp.timestamp())
+    record = {
+        "requested_epoch": epoch,
+        "requested_utc": stamp.isoformat(),
+        "ok": False,
+        "reply": "",
+    }
+    try:
+        reply = con.command(f"rtc set {epoch}", timeout=10.0)
+    except ConsoleError as exc:
+        record["reply"] = str(exc)
+        log(f"WARNING: could not set the RTC ({exc}); a factory-fresh board "
+            "will fail the rtc test for lack of a set clock.")
+        return record
+
+    record["reply"] = reply.strip()
+    record["ok"] = _RTC_SET_OK_RE.search(reply) is not None
+    if record["ok"]:
+        log(f"RTC set from the station clock: {stamp.isoformat()}.")
+    else:
+        log("WARNING: the board did not confirm the RTC set; a factory-fresh "
+            "board will fail the rtc test for lack of a set clock.")
+    return record
+
+
 def _led_off_best_effort(con: AmbyteConsole) -> None:
     try:
         con.command("red 0", timeout=5.0)
@@ -176,7 +229,8 @@ def ask_operator_led() -> bool:
 def write_logs(logdir: Path, result: SelftestResult, *, port: str,
                operator: str, station: str, led_operator: bool | None,
                overall: bool, duration_s: float,
-               flashed: str | None = None) -> Path:
+               flashed: str | None = None,
+               rtc_set: dict | None = None) -> Path:
     """One JSON per run + one CSV row per run. The JSON is the archive; the
     CSV is the batch overview. Neither is ever overwritten."""
     logdir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +259,9 @@ def write_logs(logdir: Path, result: SelftestResult, *, port: str,
         "failed": result.failed,
         "failed_tests": result.failed_names,
         "led_operator_pass": led_operator,     # None = prompt skipped
+        # What the station wrote to the RTC before testing; None = --no-rtc-set.
+        # Archived because the rtc verdict is only interpretable alongside it.
+        "rtc_set": rtc_set,
         "overall": "PASS" if overall else "FAIL",
         "tests": [
             {"name": t.name, "verdict": "PASS" if t.passed else "FAIL",
@@ -447,6 +504,11 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--connect-timeout", type=float, default=200.0,
                         help="seconds to wait for the console (the CLI comes "
                         "up ~20-35 s after boot; default 200)")
+    parser.add_argument("--no-rtc-set", action="store_true",
+                        help="do not set the RTC from the station clock before "
+                             "testing. A factory-fresh board will then fail the "
+                             "rtc step: its oscillator-stop flag blocks the "
+                             "read until the clock is written once")
     parser.add_argument("--no-led", action="store_true",
                         help="skip the operator LED prompt (unattended runs); "
                         "the verdict is then the firmware's alone")
@@ -473,8 +535,13 @@ def run(argv: list[str] | None = None) -> int:
         return 2
 
     led_operator: bool | None = None
+    rtc_set: dict | None = None
     try:
         _schedule_stop_best_effort(con, log)
+        # Must precede the selftest: the rtc step cannot read a clock that has
+        # never been set (see set_rtc_from_host).
+        if not args.no_rtc_set:
+            rtc_set = set_rtc_from_host(con, log)
         log("Running selftest...")
         try:
             reply = con.command("selftest", timeout=SELFTEST_TIMEOUT_S)
@@ -498,6 +565,7 @@ def run(argv: list[str] | None = None) -> int:
     json_path = write_logs(
         args.logdir, result, port=con.port, operator=args.operator,
         station=args.station, led_operator=led_operator, overall=overall,
+        rtc_set=rtc_set,
         duration_s=time.time() - started, flashed=flashed_tag)
 
     verdict = "PASS" if overall else "FAIL"

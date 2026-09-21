@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "timestamp_utc": "2026-09-21T08:28:51.041299+00:00",
+  "mac": "20:6E:F1:F5:E4:F8",
+  "fw": "2.3.1",
+  "port": "COM6",
+  "operator": "",
+  "station": "",
+  "flashed": "v2.3.1",
+  "duration_s": 67.48,
+  "firmware_verdict": "FAIL",
+  "passed": 9,
+  "failed": 1,
+  "failed_tests": [
+    "rtc"
+  ],
+  "led_operator_pass": true,
+  "overall": "FAIL",
+  "tests": [
+    {
+      "name": "identity",
+      "verdict": "PASS",
+      "values": {
+        "mac": "20:6E:F1:F5:E4:F8",
+        "chip_rev": "2",
+        "cores": "2",
+        "flash_mb": "16",
+        "t": "0ms"
+      },
+      "raw": "TEST identity PASS mac=20:6E:F1:F5:E4:F8 chip_rev=2 cores=2 flash_mb=16 t=0ms"
+    },
+    {
+      "name": "psram",
+      "verdict": "PASS",
+      "values": {
+        "size": "2097152",
+        "rw": "ok",
+        "t": "70ms"
+      },
+      "raw": "TEST psram PASS size=2097152 rw=ok t=70ms"
+    },
+    {
+      "name": "evstore",
+      "verdict": "PASS",
+      "values": {
+        "mounted": "1",
+        "total": "9830400",
+        "used": "16384",
+        "rw": "ok",
+        "t": "20ms"
+      },
+      "raw": "TEST evstore PASS mounted=1 total=9830400 used=16384 rw=ok t=20ms"
+    },
+    {
+      "name": "littlefs",
+      "verdict": "PASS",
+      "values": {
+        "mounted": "1",
+        "total": "524288",
+        "used": "8192",
+        "rw": "ok",
+        "t": "20ms"
+      },
+      "raw": "TEST littlefs PASS mounted=1 total=524288 used=8192 rw=ok t=20ms"
+    },
+    {
+      "name": "nvs",
+      "verdict": "PASS",
+      "values": {
+        "used": "78",
+        "free": "678",
+        "t": "0ms"
+      },
+      "raw": "TEST nvs PASS used=78 free=678 t=0ms"
+    },
+    {
+      "name": "i2c",
+      "verdict": "PASS",
+      "values": {
+        "bus": "ok",
+        "mp2731": "1",
+        "rtc": "1",
+        "bme280": "1",
+        "extra": "0",
+        "t": "30ms"
+      },
+      "raw": "TEST i2c PASS bus=ok mp2731=1 rtc=1 bme280=1 extra=0 t=30ms"
+    },
+    {
+      "name": "rtc",
+      "verdict": "FAIL",
+      "values": {
+        "ready": "1",
+        "osf": "1",
+        "tick": "fail",
+        "epoch": "0",
+        "t": "1110ms"
+      },
+      "raw": "TEST rtc FAIL ready=1 osf=1 tick=fail epoch=0 t=1110ms"
+    },
+    {
+      "name": "power",
+      "verdict": "PASS",
+      "values": {
+        "read": "ok",
+        "vbat_mv": "0",
+        "vin_mv": "5100",
+        "vsys_mv": "3780",
+        "vbus": "1",
+        "t": "80ms"
+      },
+      "raw": "TEST power PASS read=ok vbat_mv=0 vin_mv=5100 vsys_mv=3780 vbus=1 t=80ms"
+    },
+    {
+      "name": "bme280",
+      "verdict": "PASS",
+      "values": {
+        "read": "ok",
+        "temp_c": "26.34",
+        "hum_pct": "41.1",
+        "pres_pa": "102955",
+        "t": "100ms"
+      },
+      "raw": "TEST bme280 PASS read=ok temp_c=26.34 hum_pct=41.1 pres_pa=102955 t=100ms"
+    },
+    {
+      "name": "led",
+      "verdict": "PASS",
+      "values": {
+        "state": "on",
+        "t": "0ms"
+      },
+      "raw": "TEST led PASS state=on t=0ms"
+    }
+  ],
+  "transcript": "selftest\r\nSELFTEST BEGIN fw=2.3.1 mac=20:6E:F1:F5:E4:F8\r\r\nTEST identity PASS mac=20:6E:F1:F5:E4:F8 chip_rev=2 cores=2 flash_mb=16 t=0ms\r\r\nTEST psram PASS size=2097152 rw=ok t=70ms\r\r\nTEST evstore PASS mounted=1 total=9830400 used=16384 rw=ok t=20ms\r\r\nTEST littlefs PASS mounted=1 total=524288 used=8192 rw=ok t=20ms\r\r\nTEST nvs PASS used=78 free=678 t=0ms\r\r\nTEST i2c PASS bus=ok mp2731=1 rtc=1 bme280=1 extra=0 t=30ms\r\r\nW (14307) pcf2131tfy_rtc_api: RTC read failed: ESP_ERR_INVALID_STATE\r\nW (15417) pcf2131tfy_rtc_api: RTC read failed: ESP_ERR_INVALID_STATE\r\nTEST rtc FAIL ready=1 osf=1 tick=fail epoch=0 t=1110ms\r\r\nTEST power PASS read=ok vbat_mv=0 vin_mv=5100 vsys_mv=3780 vbus=1 t=80ms\r\r\nTEST bme280 PASS read=ok temp_c=26.34 hum_pct=41.1 pres_pa=102955 t=100ms\r\r\nTEST led PASS state=on t=0ms\r\r\nSELFTEST FAIL passed=9 failed=1 fw=2.3.1 mac=20:6E:F1:F5:E4:F8\r\r\nCommand returned non-zero error code: 0x1 (ERROR)\r\nambyte>  \r\nambyte>  "
+}
