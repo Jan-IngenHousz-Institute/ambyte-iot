@@ -242,3 +242,96 @@ def test_overall_verdict_rules():
     assert overall_verdict(True, None) is True
     assert overall_verdict(False, True) is False
     assert overall_verdict(False, None) is False
+
+
+# ── set_rtc_from_host ───────────────────────────────────────────────────────
+# A factory-fresh PCF2131 refuses every read until its clock is written once
+# (oscillator-stop flag), which made good boards fail the selftest's rtc step.
+# These cover the contract the station depends on: the clock is written from
+# the station's UTC, a refusal is reported rather than swallowed, and neither
+# outcome is ever fatal.
+
+class _FakeRtcConsole:
+    """Minimal AmbyteConsole stand-in: records commands, replays scripted
+    replies, and can raise the way a wedged console does."""
+
+    def __init__(self, reply="", raises=None):
+        self.reply = reply
+        self.raises = raises
+        self.commands = []
+
+    def command(self, cmd, timeout=None):
+        self.commands.append(cmd)
+        if self.raises is not None:
+            raise self.raises
+        return self.reply
+
+
+def test_set_rtc_from_host_sends_station_utc_and_confirms():
+    from datetime import datetime, timezone
+    from flash_gui.factory_test import set_rtc_from_host
+
+    con = _FakeRtcConsole("rtc set 1789982100\r\n"
+                       "RTC set; RTC: 2026-09-21 09:15:00 (1789982100)\r\n"
+                       "ambyte> ")
+    lines = []
+    before = int(datetime.now(timezone.utc).timestamp())
+    record = set_rtc_from_host(con, lines.append)
+    after = int(datetime.now(timezone.utc).timestamp())
+
+    assert len(con.commands) == 1
+    sent = con.commands[0]
+    assert sent.startswith("rtc set ")
+    # The epoch must be the station's real UTC, not a synthetic stamp.
+    assert before <= int(sent.split()[-1]) <= after
+    assert record["ok"] is True
+    assert before <= record["requested_epoch"] <= after
+    assert "WARNING" not in "".join(lines)
+
+
+def test_set_rtc_from_host_reports_a_refusal_without_raising():
+    from flash_gui.factory_test import set_rtc_from_host
+
+    con = _FakeRtcConsole("rtc set 1789982100\r\n"
+                       "rtc set failed: ESP_ERR_INVALID_STATE\r\n"
+                       "ambyte> ")
+    lines = []
+    record = set_rtc_from_host(con, lines.append)
+
+    assert record["ok"] is False
+    assert "ESP_ERR_INVALID_STATE" in record["reply"]
+    assert any("WARNING" in line for line in lines)
+
+
+def test_set_rtc_from_host_survives_a_console_error():
+    from flash_gui.ambyte_serial import ConsoleError
+    from flash_gui.factory_test import set_rtc_from_host
+
+    con = _FakeRtcConsole(raises=ConsoleError("port went away"))
+    lines = []
+    record = set_rtc_from_host(con, lines.append)
+
+    assert record["ok"] is False
+    assert "port went away" in record["reply"]
+    assert any("WARNING" in line for line in lines)
+
+
+def test_write_logs_archives_the_rtc_set_record(tmp_path):
+    result = parse_selftest(PASS_REPLY)
+    rtc_set = {"requested_epoch": 1789982100,
+               "requested_utc": "2026-09-21T09:15:00+00:00",
+               "ok": True, "reply": "RTC set; RTC: 2026-09-21 09:15:00"}
+    path = write_logs(tmp_path, result, port="COM6", operator="op",
+                      station="bench-1", led_operator=True, overall=True,
+                      duration_s=41.0, rtc_set=rtc_set)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["rtc_set"] == rtc_set
+
+
+def test_write_logs_records_a_skipped_rtc_set_as_none(tmp_path):
+    result = parse_selftest(PASS_REPLY)
+    path = write_logs(tmp_path, result, port="COM6", operator="op",
+                      station="bench-1", led_operator=True, overall=True,
+                      duration_s=41.0)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["rtc_set"] is None
