@@ -67,6 +67,25 @@ _KV_RE = re.compile(r"(\w+)=(\S+)")
 # 112 addresses; 30 s is an order of magnitude of headroom, not a guess at
 # the happy path.
 SELFTEST_TIMEOUT_S = 30.0
+# Settle window between the post-flash reset and the FIRST console open.
+#
+# Measured on Windows usbser (2026-09-21, bench unit 20:6E:F1:F5:E4:F8): a
+# handle opened in the enumeration window right after esptool resets the S3
+# takes exactly 30 s to CloseHandle. Not our code and not pyserial's — the
+# blocking call is CloseHandle on the port itself, with every pyserial step
+# before it clocking 0.00 s. Every LATER handle closes instantly, but the port
+# is exclusive while the bad one retires, so it cannot be dodged by reopening,
+# and skipping close() only moves the same 30 s to process exit. The operator
+# saw it as "the log file takes 30 s to write" — the wait sits between the LED
+# answer and the banner.
+#
+# Letting the device finish enumerating first avoids it entirely: 2 s still
+# pays the full penalty, 5 s reproducibly does not. This costs nothing in wall
+# time because the board needs ~13 s to reach its console regardless — the
+# settle simply eats into the boot wait that connect_console would spend
+# polling anyway (measured 13.30 s to console with the settle, 13.28 s
+# without). A reboot alone does NOT trigger this; only a flash does.
+POST_FLASH_SETTLE_S = 6.0
 
 # Park detection. A booting board streams boot/app logs from the first
 # seconds; a chip parked in the S3's ROM download mode is bit-for-bit silent.
@@ -529,6 +548,8 @@ def run(argv: list[str] | None = None) -> int:
             port = await_port(port, args.connect_timeout, log)
             flash_board(port, images, log)
             flashed_tag = images.tag
+            # Do NOT open the port yet — see POST_FLASH_SETTLE_S.
+            time.sleep(POST_FLASH_SETTLE_S)
         con = connect_console(port, args.connect_timeout, log)
     except (FactoryTestError, ConsoleError, EsptoolError, ReleaseError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
