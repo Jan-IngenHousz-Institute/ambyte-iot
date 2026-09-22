@@ -110,6 +110,56 @@ static void print_trace_fixtures(void)
     printf("TRACE_SUBSAMPLE=%s\n", output);
 }
 
+static void print_recorded_trace_fixtures(void)
+{
+    /* Warm-up/setup gaps, a slower far-red segment, and a disabled optional
+     * channel: none can be represented by the historical tick_factor/freq. */
+    uint32_t edges[] = {300000,400000,500000,600000,700000,800000,900000,1000000,
+                        1500000,1610000,1720000,1830000,1940000,2050000,2160000,2270000,
+                        2900000,3000000};
+    uint32_t counts[18]; fill_values(counts, 18, 20);
+    uint32_t timing[] = {100, 3100100}, env[] = {2500,2510}, env_t[] = {0,2100};
+    payload_v3_array_t arrays[] = {
+        {0,2,env}, {1,18,counts}, {2,18,counts}, {3,2,counts}, {4,2,counts},
+        {5,1,counts}, {6,1,counts}, {7,2,timing}, {8,2,env_t}, {9,18,edges},
+    };
+    payload_v3_segment_t segments[] = {{2,8,10,0,2}, {1,8,10,0,2}, {2,2,10,0,0}};
+    payload_v3_trace_input_t input = {
+        .channel="uart_0", .device="AD89", .sensor_id="3C:DC:75:0E:02:B8",
+        .protocol_cmd="arrun recorded", .calibration_present=true, .tick_factor=0.854,
+        .segments=segments, .segment_count=3, .arrays=arrays, .array_count=10,
+    };
+    char out[8192], metadata[2048], error[128];
+    assert(payload_v3_build_trace(out, sizeof out, &input, error, sizeof error));
+    printf("TRACE_RECORDED=%s\n", out);
+
+    /* Interrupted during the second eight-pulse window: only the completed
+     * ambient window has a value, and reflection has no complete window yet. */
+    arrays[1].length = arrays[2].length = arrays[9].length = 11;
+    arrays[3].length = arrays[4].length = 1;
+    arrays[5].length = arrays[6].length = 0;
+    assert(payload_v3_build_trace(out, sizeof out, &input, error, sizeof error));
+    printf("TRACE_RECORDED_PARTIAL=%s\n", out);
+
+    arrays[1].length = arrays[2].length = arrays[9].length = 8;
+    for (size_t i=0; i<8; ++i) edges[i] = 3000000000U + (uint32_t)i * 100000;
+    assert(payload_v3_build_trace(out, sizeof out, &input, error, sizeof error));
+    printf("TRACE_RECORDED_WIDE=%s\n", out);
+
+    /* Bad metadata must keep the raw arrays through the lossless v2 route,
+     * never silently apply a free-run axis to a triggered trace. */
+    arrays[9].length = 7;
+    assert(payload_v3_build_trace_lossless(out, sizeof out, metadata, sizeof metadata,
+              &input, error, sizeof error) == PAYLOAD_TRACE_ROUTE_V2);
+    assert(strstr(out, "\"arr9\":[3000000000") != NULL);
+    arrays[9].length = 8;
+    edges[1] = edges[0];
+    assert(!payload_v3_build_trace(out, sizeof out, &input, error, sizeof error));
+    edges[1] += 100000;
+    arrays[3].length = 2;
+    assert(!payload_v3_build_trace(out, sizeof out, &input, error, sizeof error));
+}
+
 static void test_lossless_trace_routes(void)
 {
     uint32_t temp[] = {2500, 2510};
@@ -176,11 +226,11 @@ static void test_lossless_trace_routes(void)
     assert(strstr(out, "\"s_630\":[10,11,12,13]") != NULL);
     segment.pulses = 4;
 
-    arrays[1].index = 9; /* forward-compatible unknown series on main clock */
+    arrays[1].index = 10; /* forward-compatible unknown series on main clock */
     assert(payload_v3_build_trace_lossless(out, sizeof out, metadata, sizeof metadata,
                                             &input, error, sizeof error) ==
            PAYLOAD_TRACE_ROUTE_V3);
-    assert(strstr(out, "\"arr9\":{\"u\":\"count\"") != NULL);
+    assert(strstr(out, "\"arr10\":{\"u\":\"count\"") != NULL);
     arrays[1].index = 1;
 
     input.array_count = 2; /* missing calibration timing is a permanent v2 fallback */
@@ -472,6 +522,7 @@ static void print_spectrum_fixture(void)
 int main(void)
 {
     print_trace_fixtures();
+    print_recorded_trace_fixtures();
     test_lossless_trace_routes();
     print_tagged_trace_fixture();
     print_spectrum_fixture();
