@@ -2922,7 +2922,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
      * with CMD_END and no arrays; transport success alone is not a measurement.
      * Keep the wire protocol intact while making this visible to every caller. */
     if (response->array_count == 0U) {
-        return make_result(ESP_FAIL, "AMBIT%u run aborted: no result arrays", ch + 1);
+        return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u run returned no result arrays", ch + 1);
     }
     return make_result(ESP_OK, "AMBIT%u run: %u arrays",
                        ch + 1, response->array_count);
@@ -3028,7 +3028,7 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
         return make_result(err, "AMBIT%u fetch failed: %s", ch + 1, esp_err_to_name(err));
     }
     if (response->array_count == 0U) {
-        return make_result(ESP_FAIL, "AMBIT%u fetch: no retained result", ch + 1);
+        return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u fetch: no retained result", ch + 1);
     }
     return make_result(ESP_OK, "AMBIT%u fetch: %u arrays", ch + 1, response->array_count);
 }
