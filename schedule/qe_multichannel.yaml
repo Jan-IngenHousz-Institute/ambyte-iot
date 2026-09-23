@@ -1,0 +1,370 @@
+schema: jii.ambyte-schedule/v1-draft
+id: urn:jii:schedule:qe-multichannel
+version: 0.2.0-draft
+name: qe-multichannel
+description: default-multichannel plus a PAR read before every MPF and a twice-daily qE (NPQ induction/relaxation) sequence at 10:00 and 16:00 local.
+
+# Site facts such as location, timezone, deployment, and MAC live in NVS.
+# This schedule is identical across sites.
+#
+# Differences from default-multichannel:
+#   1. Every MPF is preceded by a PAR read (ambit/spectrum). Today that action
+#      sends AMBIT cmd 31 (get_spec: 10 bins + calibrated PAR). The raw
+#      three-tier PAR command (cmd 35, get_spec_raw, AMBIT fw >= 1.2.0) has no
+#      ambyte action yet — see the firmware follow-up in the PR description.
+#   2. A `qe` job runs PAR → MPF → light phase (500 µmol actinic: 10 s, MPF,
+#      20 s, MPF, 30 s, MPF) → dark phase (10 s, MPF, 20 s, MPF, 30 s, MPF).
+#
+# The runner is a single task, so while `qe` runs (~4.5 min) nothing else
+# fires: steady_state slots more than one period late are counted as skipped
+# and dropped; the 5/10-min grids catch up within their late grace. `qe` is
+# the FIRST job in this file on purpose: jobs due in the same poll run in
+# document order, and at 10:00 steady_state, spectra and saturating_flash are
+# all due too. Listed first, qE starts on time and dark-adapted-as-it-gets;
+# listed last it would start ~1 min late, seconds after a saturating flash.
+
+protocols:
+  SS:
+    # 45 pulses since #47; 59 seconds left no slack on a one-minute grid.
+    - pulses: 45
+      freq: 1
+      actinic: 0
+
+  MPF:
+    # Dark baseline.
+    - pulses: 40
+      freq: 10
+      actinic: 0
+
+    # Saturating phases. Actinic values are raw DAC values.
+    - pulses: 70
+      freq: 100
+      actinic: -250
+    - pulses: 10
+      freq: 100
+      actinic: -200
+    - pulses: 10
+      freq: 100
+      actinic: -160
+    - pulses: 10
+      freq: 100
+      actinic: -250
+
+    # Relaxation.
+    - pulses: 40
+      freq: 10
+      actinic: 0
+
+  # ── qE light phase ──────────────────────────────────────────────────────
+  # The AMBIT sets the actinic LED per segment and, without `persist`, turns
+  # it OFF at the end of every segment and at the end of the run. "Keep the
+  # light on" therefore means: every segment of the light phase carries
+  # actinic 500, including the MPF baseline/relaxation segments (which are
+  # 0 in the dark MPF above). Positive actinic values are PAR in µmol m⁻² s⁻¹,
+  # converted on the ambyte with the AMBIT's calibrated actinic_coef
+  # (DAC = coef × PAR, clamped 4..255; 0.1 → DAC 50). Note the factory sweep
+  # calibrates nominal 50..250 µmol, so 500 is an extrapolation.
+  #
+  # The "wait" segments are 1 Hz measuring pulses (pulses N at freq 1 = N s):
+  # a type-0 line is skipped by the AMBIT without consuming time, so a wait
+  # has to be a real (weak, non-actinic) pulse train. The 1 Hz Fs trace during
+  # the wait is the induction kinetic and comes for free.
+  #
+  # `persist: true` on every qE protocol (AMBIT PAM.cpp run_arr_type1):
+  #   - Without it the AMBIT calls AS_LED_OFF() at the end of EVERY segment
+  #     and re-enables the LED after reconfiguring the ADPD for the next one
+  #     (several I2C writes + 2 ms): a few-ms dark blip at each boundary,
+  #     including between the saturating-flash phases (250→off→200→off→160).
+  #     With persist the LED driver (AS7341, I2C, holds its own state) just
+  #     steps to the new current; the actinic-0 segments still switch it off
+  #     because the segment start always applies the line's level.
+  #   - An AMBIT run array holds at most 16 lines, so the light phase is split
+  #     16 + 8. persist keeps the LED at 500 through the fetch/re-trigger gap
+  #     (1–3 s per channel, up to ~8 s on channel 3 with four AMBITs); the
+  #     AMBIT's idle light sleep does not touch the LED, so the light really
+  #     is continuous from the first light segment to the first dark one.
+  #   - persist on qE_light_b keeps the light on until qE_dark_a's first
+  #     segment (actinic 0) switches it off, so the 10 s dark wait is timed
+  #     from the real light-off and is in the data, instead of an unrecorded
+  #     1–8 s of dark before the dark protocol even starts.
+  # HAZARD: if the runner is stopped (OTA, `schedule stop`, reboot) while a
+  # light protocol is in flight, the AMBIT finishes its run with the LED ON
+  # and nothing turns it off until the next actinic-0 segment on that channel
+  # (the qe job's final ambit/actinic step, or steady_state once the runner
+  # is back). ~2 min of exposure twice a day; accepted.
+  qE_light_a:
+    persist: true
+    segments:
+      # 10 s at 500 µmol.
+      - pulses: 10
+        freq: 1
+        actinic: 500
+      # MPF under actinic.
+      - pulses: 40
+        freq: 10
+        actinic: 500
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 500
+      # 20 s at 500 µmol.
+      - pulses: 20
+        freq: 1
+        actinic: 500
+      # MPF under actinic.
+      - pulses: 40
+        freq: 10
+        actinic: 500
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 500
+
+  qE_light_b:
+    persist: true
+    segments:
+      # 30 s at 500 µmol.
+      - pulses: 30
+        freq: 1
+        actinic: 500
+      # MPF under actinic. The run ends with the LED still at 500 (persist);
+      # qE_dark_a's first segment is the "switch off".
+      - pulses: 40
+        freq: 10
+        actinic: 500
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 500
+
+  # ── qE dark phase ───────────────────────────────────────────────────────
+  # Same shape with the light off: 1 Hz dark waits followed by the standard
+  # MPF (whose own 4 s dark baseline adds to the wait). The first segment's
+  # actinic 0 is what switches the persisted LED off on that channel. persist
+  # here only removes the blips between the flash phases; the last segment is
+  # actinic 0, so the run ends dark either way.
+  qE_dark_a:
+    persist: true
+    segments:
+      # 10 s dark.
+      - pulses: 10
+        freq: 1
+        actinic: 0
+      # MPF.
+      - pulses: 40
+        freq: 10
+        actinic: 0
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 0
+      # 20 s dark.
+      - pulses: 20
+        freq: 1
+        actinic: 0
+      # MPF.
+      - pulses: 40
+        freq: 10
+        actinic: 0
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 0
+
+  qE_dark_b:
+    persist: true
+    segments:
+      # 30 s dark.
+      - pulses: 30
+        freq: 1
+        actinic: 0
+      # MPF.
+      - pulses: 40
+        freq: 10
+        actinic: 0
+      - pulses: 70
+        freq: 100
+        actinic: -250
+      - pulses: 10
+        freq: 100
+        actinic: -200
+      - pulses: 10
+        freq: 100
+        actinic: -160
+      - pulses: 10
+        freq: 100
+        actinic: -250
+      - pulses: 40
+        freq: 10
+        actinic: 0
+
+jobs:
+  qe:
+    # Twice a day, local time (cron runs in the NVS timezone). No day window:
+    # 16:00 is before sunset everywhere this fleet is deployed; add
+    # `when: window: day` if that stops being true.
+    schedule:
+      cron: "0 10,16 * * *"
+    # Roughly 4.5 min end to end (PAR + 7 MPF ≈ 80 s of pulses + 120 s of
+    # waits + per-channel fetch gaps). The job cap is 8 steps, which is why
+    # the waits live inside the protocols rather than as device/sleep steps.
+    #
+    # continue-on-error on every step but the last: a failed PAR read or a
+    # failed channel must not stop the sequence, and the final actinic-off
+    # step must always be reached so a persisted LED (see qE_light_a) is
+    # never left on by a step failure. The job still counts as failed.
+    steps:
+      - uses: ambit/spectrum
+        continue-on-error: true
+      - uses: ambit/trace
+        continue-on-error: true
+        with:
+          protocol: MPF
+          hold_window: true
+          tag: qe
+      - uses: ambit/trace
+        continue-on-error: true
+        with:
+          protocol: qE_light_a
+          hold_window: true
+          tag: qe
+      - uses: ambit/trace
+        continue-on-error: true
+        with:
+          protocol: qE_light_b
+          hold_window: true
+          tag: qe
+      - uses: ambit/trace
+        continue-on-error: true
+        with:
+          protocol: qE_dark_a
+          hold_window: true
+          tag: qe
+      - uses: ambit/trace
+        continue-on-error: true
+        with:
+          protocol: qE_dark_b
+          hold_window: true
+          tag: qe
+      # Belt and braces: a zero-current actinic pulse on every present
+      # channel (AMBIT cmd 4 type 5 with current 0 = LED off).
+      - uses: ambit/actinic
+        with:
+          level: 0
+          duration: 1s
+
+  steady_state:
+    # Conventional five-field cron is the normal scheduling syntax.
+    schedule:
+      cron: "* * * * *"
+    steps:
+      - uses: ambit/trace
+        with:
+          protocol: SS
+          hold_window: false
+
+  spectra:
+    schedule:
+      cron: "*/5 * * * *"
+    when:
+      window: day
+    steps:
+      # With no channels list, every AMBIT that answers a ping is measured.
+      - uses: ambit/spectrum
+
+  saturating_flash:
+    schedule:
+      cron: "*/10 * * * *"
+    when:
+      window: day
+    steps:
+      # PAR before the MPF. continue-on-error: a failed PAR read must not
+      # cancel the flash. On :00/:10/… this doubles the `spectra` read of the
+      # same minute; the second read is seconds later and costs ~0.4 s.
+      - uses: ambit/spectrum
+        continue-on-error: true
+      - uses: ambit/trace
+        with:
+          protocol: MPF
+          hold_window: true
+
+  dark_edge:
+    # Solar entries are the explicit extension for times cron cannot know.
+    schedule:
+      - solar: sunset
+        offset: +30m
+      - solar: sunrise
+        offset: -30m
+    steps:
+      - uses: ambit/spectrum
+        continue-on-error: true
+      - uses: ambit/trace
+        with:
+          protocol: MPF
+          hold_window: true
+          tag: edge
+
+  health:
+    schedule:
+      - boot
+      - solar: sunrise
+        offset: -15m
+      - solar: sunset
+        offset: +15m
+    steps:
+      - uses: device/status-report
