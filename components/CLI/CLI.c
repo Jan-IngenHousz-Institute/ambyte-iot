@@ -1812,18 +1812,18 @@ static int cli_cmd_schedule(int argc, char **argv)
         return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
-            printf("still busy in a UART transaction — it will exit when that returns\r\n");
+            printf("stop still in progress (UART or AMBIT cleanup) — it will exit when cleanup completes\r\n");
         } else {
             printf("%s\r\n", sched_runner_is_running() ? "stop signaled" : "stopped");
         }
         return 0;
     }
     if (strcmp(argv[1], "reload") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
-            printf("stop timed out (UART busy) — retry when the transaction returns\r\n");
+            printf("stop timed out (UART or AMBIT cleanup) — retry when cleanup completes\r\n");
             return 1;
         }
         err = sched_runner_start();

@@ -48,6 +48,7 @@
 #include "sched_runner_priv.h"
 #include "time_sync.h"
 #include "timezone.h"
+#include "uart_sensors.h"
 
 #define TAG "sched_act"
 
@@ -57,6 +58,28 @@
 #define TRACE_TRIGGER_TIMEOUT_MS 3000   /* covers wake + ack only */
 #define TRACE_FETCH_TIMEOUT_MS  30000   /* must cover the array stream */
 #define TRACE_POLL_TIMEOUT_MS   400     /* a measuring AMBIT fails fast */
+
+/* Runner-task owned, sticky for this generation. Set BEFORE a persistent
+ * trigger: a lost acknowledgement does not mean the AMBIT stayed idle. Fetch,
+ * later dark segments and ping failures cannot prove a previous run is off. */
+static bool s_persist_attempted;
+
+void sched_runner_cleanup_lights(void)
+{
+    if (!s_persist_attempted) return;
+    /* A measuring AMBIT cannot service off commands. Reset aborts even an
+     * autonomous run, then its application startup disables the AS7341 LED.
+     * CHIP_EN is shared: unfinished/buffered runs on ALL channels are lost.
+     * Do this before publishing STOPPED, including stops between actions or
+     * while idle. No ping gate: its negative cache may describe a busy AMBIT.
+     * If another UART owner holds a lock, remain STOPPING and retry; callers
+     * can time out, but must never observe a falsely successful stop. */
+    while (uart_sensors_reset_all(1000) != ESP_OK) {
+        ESP_LOGW(TAG, "waiting to reset AMBITs after persistent trace");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    s_persist_attempted = false;
+}
 
 /* ── step input access ────────────────────────────────────────────────── */
 
@@ -192,7 +215,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         .persist         = proto->persist,
         .allow_interrupt = proto->allow_interrupt != 0,
         .timeout_ms      = TRACE_TRIGGER_TIMEOUT_MS,
-        .protocol_ref    = { { 0 } },
     };
     snprintf(opts.protocol_ref.protocol, sizeof(opts.protocol_ref.protocol),
              "%s", pname);
@@ -207,6 +229,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
         if (sched_runner_should_stop()) break; /* between ping and trigger */
+        if (opts.persist) s_persist_attempted = true;
         cmd_result_t r = ambit_trace_trigger(ch, segs, (size_t)nseg, &opts, &s_pend[ch]);
         if (r.status == ESP_OK) {
             t0[ch] = esp_timer_get_time() / 1000;
@@ -218,7 +241,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
 
     int fetched = 0, chan_failed = 0;
     while (pending_count > 0) {
-        if (!act_sleep_ms(POLL_INTERVAL_MS)) break; /* stop: leave runs buffered */
+        if (!act_sleep_ms(POLL_INTERVAL_MS)) break; /* exit cleanup resets persisted runs */
         int64_t now = esp_timer_get_time() / 1000;
         for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
             if (t0[ch] == 0) continue;
@@ -469,9 +492,8 @@ static esp_err_t act_ambit_actinic(void *vctx, const sched_step_t *step,
         remaining -= chunk;
     }
 
-    /* Cleanup runs even on stop: a job must never leave the light on. The
-     * pulse self-terminates, so "off" is a zero-current 100 ms pulse on every
-     * channel we lit — best-effort, the AMBIT has no explicit off verb. */
+    /* Cleanup runs even on stop. The pulse self-terminates; the additional
+     * zero-current request maps to cmd 4 type 0 (off only), never a 4 mA pulse. */
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (!lit[ch]) continue;
         (void)cmd_ambit_actinic(ch, 5, 0, 1);
