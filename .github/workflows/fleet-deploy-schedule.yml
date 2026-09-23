@@ -19,7 +19,7 @@ on:
       script:
         description: "Released Schedule script to install as schedule.yaml (ignored when experiment_id is set)"
         type: choice
-        options: [default, legacy_1hz_spec]
+        options: [default, legacy_1hz_spec, qe_multichannel]
         default: default
       experiment_id:
         description: "Optional openJII experiment id: deliver its pinned workbook schedule (stamped, inline) to that experiment's Ambytes only"
