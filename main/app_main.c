@@ -238,7 +238,8 @@ static void app_workload_suspend(void)
 }
 
 /* The runner's worst-case unwind after a stop request: one 30 s trace fetch
- * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval and cleanup. Resume must
+ * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval, reset-lock wait and 5 s
+ * AMBIT boot grace. Resume must
  * out-retry that, or a stop that timed out leaves measurement permanently
  * dead (T3 review blocker 3). */
 #define WORKLOAD_RESUME_RETRIES 90 /* 90 × 500 ms = 45 s > 30 s fetch + margin */
