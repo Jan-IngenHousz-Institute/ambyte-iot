@@ -12,6 +12,7 @@ The initial catalog contains:
 | --- | --- |
 | `default.yaml` | Multi-channel steady-state, spectra, saturating-flash, edge, and health jobs |
 | `legacy_1hz_spec.yaml` | Channel-0 spectra at 1 Hz around daylight and 10-minute fallback outside it |
+| `qe_multichannel.yaml` | `default.yaml` plus a PAR read before every MPF and a twice-daily qE induction/relaxation sequence (10:00 and 16:00 local) |
 | `actions.schema.json` | JSON Schema generated from the firmware action table |
 
 Devices install every selected asset as `/littlefs/schedule.yaml`. Installation
