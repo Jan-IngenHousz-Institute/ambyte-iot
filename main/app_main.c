@@ -230,7 +230,8 @@ static void app_workload_suspend(void)
     taskENTER_CRITICAL(&s_workload_mux);
     bool first = (s_workload_susp_n++ == 0);
     taskEXIT_CRITICAL(&s_workload_mux);
-    if (first && sched_runner_stop(5000) != ESP_OK) {
+    /* Includes the 5 s AMBIT boot grace after persisted-trace stop cleanup. */
+    if (first && sched_runner_stop(10000) != ESP_OK) {
         ESP_LOGW(APP_TAG, "schedule runner did not stop before the maintenance op — "
                           "UART may be busy / heap may fragment");
     }

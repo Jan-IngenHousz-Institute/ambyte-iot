@@ -87,11 +87,10 @@ protocols:
   #     segment (actinic 0) switches it off, so the 10 s dark wait is timed
   #     from the real light-off and is in the data, instead of an unrecorded
   #     1–8 s of dark before the dark protocol even starts.
-  # HAZARD: if the runner is stopped (OTA, `schedule stop`, reboot) while a
-  # light protocol is in flight, the AMBIT finishes its run with the LED ON
-  # and nothing turns it off until the next actinic-0 segment on that channel
-  # (the qe job's final ambit/actinic step, or steady_state once the runner
-  # is back). ~2 min of exposure twice a day; accepted.
+  # Requires firmware with persisted-trace stop cleanup: stopping the runner
+  # resets the shared AMBIT bank, aborts all unfinished/buffered traces and
+  # waits for boot-time LED off before completing. Older firmware can leave
+  # light on indefinitely after an in-place stop; use a reboot there.
   qE_light_a:
     persist: true
     segments:
@@ -301,8 +300,8 @@ jobs:
           protocol: qE_dark_b
           hold_window: true
           tag: qe
-      # Belt and braces: a zero-current actinic pulse on every present
-      # channel (AMBIT cmd 4 type 5 with current 0 = LED off).
+      # Off only on every present channel. Updated ambyte firmware maps
+      # level 0 to cmd 4 type 0; older firmware emits an unintended 4 mA pulse.
       - uses: ambit/actinic
         with:
           level: 0

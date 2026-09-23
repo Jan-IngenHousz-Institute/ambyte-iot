@@ -30,6 +30,6 @@ idf_component_register(
     SRCS "sched_runner.c" "sched_runner_actions.c" "sched_runner_json.c"
     INCLUDE_DIRS "include"
     REQUIRES sched_spec ambit_trace device_commands event_log time_sync timezone device_config
-    PRIV_REQUIRES esp_timer mbedtls
+    PRIV_REQUIRES esp_timer mbedtls uart_sensors
 )
 target_include_directories(${COMPONENT_LIB} PRIVATE "${SCHED_EMBED_DIR}")

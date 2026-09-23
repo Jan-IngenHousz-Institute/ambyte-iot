@@ -342,6 +342,30 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     return ESP_OK;
 }
 
+esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    const int64_t deadline = now_us() + (int64_t)wait_ms * 1000;
+    uint8_t held = 0;
+    for (; held < UART_SENSOR_NUM_CHANNELS; held++) {
+        uint32_t ticks = uart_stream_capped_deadline_ticks(
+            now_us(), deadline, wait_ms, portTICK_PERIOD_MS);
+        if (ticks == 0 || xSemaphoreTake(s_ch_mtx[held], ticks) != pdTRUE) break;
+    }
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    if (held == UART_SENSOR_NUM_CHANNELS) {
+        /* Every UART owner takes a channel lock first (also flash sessions),
+         * so owning all four excludes transactions on UART0/1/2 without a
+         * second shared-bus lock. Never reset while another channel is busy. */
+        err = uart_sensors_run_app(0);
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(AMBIT_APP_BOOT_GRACE_US / 1000));
+        }
+    }
+    while (held > 0) xSemaphoreGive(s_ch_mtx[--held]);
+    return err;
+}
+
 /* ── Ambit wake sequence ───────────────────────────────────────────── */
 
 static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)

@@ -1812,7 +1812,7 @@ static int cli_cmd_schedule(int argc, char **argv)
         return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
             printf("still busy in a UART transaction — it will exit when that returns\r\n");
         } else {
@@ -1821,7 +1821,7 @@ static int cli_cmd_schedule(int argc, char **argv)
         return 0;
     }
     if (strcmp(argv[1], "reload") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
             printf("stop timed out (UART busy) — retry when the transaction returns\r\n");
             return 1;
