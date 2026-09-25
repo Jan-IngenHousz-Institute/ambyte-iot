@@ -3564,9 +3564,10 @@ esp_err_t event_log_sd_keeper_start(void)
 {
     if (s_keeper_task != NULL) return ESP_OK;
     if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
-    /* File copy loops + VFS, no mount fan-out. Priority 2 with the other
-     * background housekeeping. */
-    if (xTaskCreate(evq_keeper_task, "sd_keeper", 6144, NULL, 2, &s_keeper_task) != pdPASS) {
+    /* File copy/verify loops + VFS/FATFS call depth, plus the epoch repair's
+     * name tables (~2.7 KB on stack): 8 KB, up from the old keeper's 6 KB.
+     * No mount fan-out. Priority 2 with the other background housekeeping. */
+    if (xTaskCreate(evq_keeper_task, "sd_keeper", 8192, NULL, 2, &s_keeper_task) != pdPASS) {
         s_keeper_task = NULL;
         return ESP_ERR_NO_MEM;
     }
