@@ -108,6 +108,10 @@ jobs:
           aws-region: eu-central-1
           role-session-name: fleet-command-${{ github.run_id }}
 
+      - name: Inspect delivery logs (read only)
+        shell: bash
+        run: python tools/fleet_deploy/delivery_diagnostic.py
+
       - name: Run command
         id: run
         shell: bash
@@ -158,4 +162,5 @@ jobs:
           path: |
             results.json
             command.log
+            delivery-diagnostic.json
           if-no-files-found: ignore
