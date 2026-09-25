@@ -62,8 +62,12 @@ def _matrix_one(args) -> dict:
 
 
 def _prebuild() -> None:
+    """Build every driver variant once, before workers fork."""
     S.exe("head")
     S.exe("head", S.MATRIX_TUNING)
+    S.exe("head", {"EVQ_INDEX_COMPACT_BYTES": 1024})                            # B4
+    S.exe("head", {"EVQ_INDEX_CAP": 6})                                        # C7
+    S.exe("head", {"EVLOG_ROTATE_BYTES": 262144, "EVQ_SD_RESERVE_BYTES": 64 * S.MiB})  # A3
     S.exe("b3f9b8a")
     S.exe("v2.2.3")
 

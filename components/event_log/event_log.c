@@ -2692,8 +2692,17 @@ static bool evq_spool_one(uint32_t seq)
         } else if (!evq_sd_has_room(need)) {
             full = true;
         } else {
-            ok = (pr == 1 || evq_copy_commit(flash_path, EVLOG_LEGACY_SD_DIR, pbase, &s, "spool")) &&
-                 (mr == 1 || evq_copy_commit(flash_path, EVQ_MIRROR_DIR, mbase, &s, "mirror"));
+            bool p_ok = pr == 1 || evq_copy_commit(flash_path, EVLOG_LEGACY_SD_DIR, pbase, &s, "spool");
+            ok = p_ok && (mr == 1 || evq_copy_commit(flash_path, EVQ_MIRROR_DIR, mbase, &s, "mirror"));
+            if (p_ok && !ok) {
+                /* Our own verified primary without a mirror is not a SPOOLED copy;
+                 * left in /sdcard/events it would later look like foreign legacy
+                 * backlog and be re-imported (duplicates). The flash copy still
+                 * holds everything, so remove it; the next pass starts over. */
+                char pp[EVQ_PATH_MAX];
+                snprintf(pp, sizeof pp, "%s/%s.log", EVLOG_LEGACY_SD_DIR, pbase);
+                remove(pp);
+            }
             if (!evq_name_join(pname, sizeof pname, pbase, ".log") ||
                 !evq_name_join(mname, sizeof mname, mbase, ".log")) ok = false;
         }
@@ -2843,6 +2852,23 @@ static bool evq_archive_one(uint32_t seq)
                 }
             }
         } else if (s.flash_present && evlog_flash_exists(seq, NULL)) {
+            /* A never-spooled file may still have copies from an interrupted
+             * spool (crash between commit and the SPOOLED line). Once this entry
+             * retires they would read as foreign legacy backlog: drop any that
+             * are ours (verify against the index, or a byte prefix of flash). */
+            char cand[EVQ_PATH_MAX];
+            const char *cdirs[2] = { EVLOG_LEGACY_SD_DIR, EVQ_MIRROR_DIR };
+            for (int ci = 0; ci < 2; ci++) {
+                if (ci == 0) snprintf(cand, sizeof cand, "%s/ev-%06lld.log", cdirs[ci], (long long)s.first_id);
+                else snprintf(cand, sizeof cand, "%s/m-%06u.log", cdirs[ci], (unsigned)seq);
+                if (!evq_sd_path_exists(cand)) continue;
+                evq_scan_t cs;
+                if ((evq_scan_file(cand, s_kbuf, s_line_cap, &cs) && evq_scan_matches(&cs, &s)) ||
+                    evq_is_prefix_of(cand, flash_path, s_kbuf, s_line_cap)) {
+                    s_pass_wrote_sd = true;
+                    remove(cand);
+                }
+            }
             if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
                 s_sd_full = true;
                 ok = false;

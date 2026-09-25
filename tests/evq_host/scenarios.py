@@ -43,12 +43,18 @@ def exe(kind: str = "head", tuning: dict | None = None) -> Path:
         if key not in _builds:
             name = "d_" + kind.replace(".", "_") + "_" + "_".join(f"{k}{v}" for k, v in sorted((tuning or {}).items()))
             name = re.sub(r"[^A-Za-z0-9_]", "", name)[:120]
-            if kind == "head":
-                _builds[key] = build.build_head(build_root(), tuning, name=name)
-            else:
-                path, info = build.build_baseline(kind, build_root(), name=name)
-                _builds[key] = path
-                (build_root() / (name + ".rewrite.json")).write_text(json.dumps(info, indent=1))
+            final = build_root() / name
+            if not final.exists():
+                # parallel workers may build the same variant: each builds under a
+                # private name, then renames it into place atomically
+                tmp = f"{name}_p{os.getpid()}"
+                if kind == "head":
+                    built = build.build_head(build_root(), tuning, name=tmp)
+                else:
+                    built, info = build.build_baseline(kind, build_root(), name=tmp)
+                    (build_root() / (name + ".rewrite.json")).write_text(json.dumps(info, indent=1))
+                os.replace(built, final)
+            _builds[key] = final
     return _builds[key]
 
 
@@ -58,7 +64,7 @@ def baseline_rewrite_info(rev: str) -> dict:
         d = json.loads(p.read_text())
         if d["rev"] == rev:
             return d
-    return {}
+    return build.baseline_sources(rev, build_root() / f"rewrite_{rev}")
 
 
 def device(scn: str, seed: int, kind: str = "head", tuning: dict | None = None, flash: int = 2 * MiB,
@@ -1406,9 +1412,13 @@ def matrix_run(point: str, mode: str, nth: int, seed: int, env_extra: dict | Non
     dups_phase1 = len(ids) - len(set(ids))
     seg_count_max = max([x.count for x in index_segs(dev)[0].values()] + [1])
     crashes_phase1 = dev.crashes
-    bound = crashes_phase1 * (16 + max(seg_count_max, 80))
+    # an injected I/O error is one fault event too (e.g. EIO on the SD remove
+    # after a legacy import re-imports that file: at-least-once, bounded)
+    fired_now = (dev.state / ".shim" / "fault_fired").exists()
+    events = crashes_phase1 + (1 if (mode != "crash" and fired_now and not phase2) else 0)
+    bound = events * (16 + max(seg_count_max, 80))
     if dups_phase1 > bound:
-        raise OracleFailure(f"D: {dups_phase1} duplicates after {crashes_phase1} crash(es) exceed the bound {bound}")
+        raise OracleFailure(f"D: {dups_phase1} duplicates after {events} fault event(s) exceed the bound {bound}")
     # Phase 2 for every run: another firmware advanced the legacy cursor past
     # SD-only segments (rollback) → re-import; reimport.* points are armed here.
     matrix_foreign_cursor(dev)
