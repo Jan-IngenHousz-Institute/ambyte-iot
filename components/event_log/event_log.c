@@ -284,6 +284,7 @@ static int64_t   s_unidx_floor   = 0;
  * scanned in this session → pending is a floor. */
 static int64_t   s_legacy_pending = 0;
 static bool      s_legacy_known   = false;
+static uint32_t  s_legacy_counted_epoch = 0;   /* one full scan per card mount, then decrements */
 
 /* Bookkeeping. */
 static uint32_t   s_acks_since_persist = 0;
@@ -3185,6 +3186,8 @@ static size_t event_log_import_sd_backlog(size_t max_files)
                 files_done++;
                 s_quarantined_malformed += (int64_t)quarantined;
                 s_skipped += (int64_t)quarantined;
+                int64_t done_lines = (int64_t)(imported + quarantined);
+                s_legacy_pending = s_legacy_pending > done_lines ? s_legacy_pending - done_lines : 0;
             } else {
                 file_ok = false;
             }
@@ -3527,7 +3530,13 @@ esp_err_t event_log_sd_service(void)
         if (import_room) (void)event_log_import_sd_backlog(4);
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         if (evq_sd_usable_locked() && !s_sd_mismatch_park) {
-            evq_count_legacy_locked();
+            /* Full scan once per mount (and until the repair pass has visited
+             * every orphan); imports then decrement it, so a large legacy
+             * backlog is not re-read every keeper period. */
+            if (s_legacy_counted_epoch != s_sd_epoch || !s_legacy_known) {
+                evq_count_legacy_locked();
+                s_legacy_counted_epoch = s_sd_epoch;
+            }
             if (s_sd_repaired_epoch != s_sd_epoch) s_legacy_known = false;
         }
         xSemaphoreGive(s_mtx);

@@ -1400,6 +1400,15 @@ def matrix_run(point: str, mode: str, nth: int, seed: int, env_extra: dict | Non
         assert dev.crashes == 1, "adopt precondition (interrupted spool) did not happen"
         dev.armed = None
     dev.run(matrix_workload(), fault=None if phase2 else f"{point}:{nth}:{mode}")
+    # D duplicate bound for the fault phase: <= 16 + one segment's records per crash
+    # (the rollback phase below only reports, as the contract allows)
+    ids = [d["id"] for d in read_jsonl(dev.state / "out" / "delivered.jsonl")]
+    dups_phase1 = len(ids) - len(set(ids))
+    seg_count_max = max([x.count for x in index_segs(dev)[0].values()] + [1])
+    crashes_phase1 = dev.crashes
+    bound = crashes_phase1 * (16 + max(seg_count_max, 80))
+    if dups_phase1 > bound:
+        raise OracleFailure(f"D: {dups_phase1} duplicates after {crashes_phase1} crash(es) exceed the bound {bound}")
     # Phase 2 for every run: another firmware advanced the legacy cursor past
     # SD-only segments (rollback) → re-import; reimport.* points are armed here.
     matrix_foreign_cursor(dev)
@@ -1416,7 +1425,8 @@ def matrix_run(point: str, mode: str, nth: int, seed: int, env_extra: dict | Non
     reached = (dev.state / ".shim" / "faults_reached").read_text().split() if (dev.state / ".shim" / "faults_reached").exists() else []
     out = {"point": point, "mode": mode, "nth": nth, "seed": seed, "fired": fired, "crashes": dev.crashes,
            "dups": rec["duplicate_count"], "reached": sorted(set(reached)), "counts": counts,
-           "accepted": rec["accepted"], "refused": rec["refused"], "indeterminate": rec["indeterminate"]}
+           "accepted": rec["accepted"], "refused": rec["refused"], "indeterminate": rec["indeterminate"],
+           "dups_fault_phase": dups_phase1, "dup_bound": bound, "crashes_fault_phase": crashes_phase1}
     finish(dev)
     return out
 
