@@ -1007,6 +1007,15 @@ cmd_result_t cmd_mqtt_status(void)
     return make_result(ESP_OK, "MQTT: %s", connected ? "connected" : "disconnected");
 }
 
+int64_t device_commands_deliverable_pending(void)
+{
+    evlog_health_t h;
+    if (event_log_health(&h) == ESP_OK) return h.deliverable_pending;
+    int64_t pending = 0;
+    (void)cmd_db_status(NULL, NULL, &pending, NULL);
+    return pending;
+}
+
 cmd_result_t cmd_db_status(bool *available, int64_t *total,
                            int64_t *pending, int64_t *next_id)
 {
@@ -1838,6 +1847,37 @@ static cmd_result_t emit_status_event(bool direct)
             input.sd_io_lost = io_lost;
         }
     }
+    {
+        evlog_health_t eh;
+        if (event_log_health(&eh) == ESP_OK) {
+            input.evq_valid = true;
+            input.evq_pending_exact = eh.pending_exact;
+            input.evq_storage_blocked = eh.storage_blocked;
+            input.evq_pending = eh.pending;
+            input.evq_deliverable_pending = eh.deliverable_pending;
+            input.evq_flash_pending = eh.flash_pending;
+            input.evq_sd_pending = eh.sd_pending;
+            input.evq_reimport_pending = eh.reimport_pending;
+            input.evq_sd_state = event_log_sd_state_name(eh.sd_state);
+            input.evq_head_block = event_log_block_name(eh.head_block);
+            input.evq_blocked_reason = event_log_blocked_reason_name(eh.blocked_reason);
+            input.evq_corrupt_medium = event_log_medium_name(eh.corrupt_medium);
+            input.evq_refused_full = eh.refused_full;
+            input.evq_refused_media = eh.refused_media;
+            input.evq_refused_too_large = eh.refused_too_large;
+            input.evq_refused_unavailable = eh.refused_unavailable;
+            input.evq_quarantined_poison = eh.quarantined_poison;
+            input.evq_quarantined_malformed = eh.quarantined_malformed;
+            input.evq_skipped_unindexed_gap = eh.skipped_unindexed_gap;
+            input.evq_corrupt_detected = eh.corrupt_detected;
+            input.evq_spool_files = eh.spool_files;
+            input.evq_spool_errors = eh.spool_errors;
+            input.evq_mirror_used = eh.mirror_used;
+            input.evq_reclaimed_files = eh.reclaimed_files;
+            input.evq_archived_files = eh.archived_files;
+            input.evq_reimported_files = eh.reimported_files;
+        }
+    }
 
     char channels[PAYLOAD_V3_MAX_ATTACHED][12];
     /* One info record PER SLOT, not one reused local. payload_v3_attached_sensor_t
@@ -1867,10 +1907,10 @@ static cmd_result_t emit_status_event(bool direct)
         };
     }
 
-    char *payload = malloc(4096U);
+    char *payload = malloc(PAYLOAD_V3_TELEMETRY_CAP);
     if (payload == NULL) return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
     char build_error[96];
-    bool built = payload_v3_build_telemetry(payload, 4096U, &input,
+    bool built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                             build_error, sizeof build_error);
     if (!built && input.attached_count > 0) {
         /* A malformed/stale peripheral cache must not silence the gateway's
@@ -1879,7 +1919,7 @@ static cmd_result_t emit_status_event(bool direct)
          * validation failure and a later healthy heartbeat restores the list. */
         ESP_LOGW(TAG, "telemetry build retry without attached sensors: %s", build_error);
         input.attached_count = 0;
-        built = payload_v3_build_telemetry(payload, 4096U, &input,
+        built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                            build_error, sizeof build_error);
     }
     if (!built) {

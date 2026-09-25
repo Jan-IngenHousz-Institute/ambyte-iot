@@ -175,6 +175,9 @@ __attribute__((weak)) bool sync_runner_is_allowed(void)
     return sensor_gate_open && device_commands_publish_power_ok();
 }
 
+/* One warning per head-wait episode (ESP_ERR_NOT_FINISHED), not per wake. */
+static bool s_head_wait_logged = false;
+
 /* Publish pending events back-to-back until the queue drains or the gate closes.
  * One measure_id remains one MQTT message, but up to the independent slot/byte
  * ceilings may await PUBACK concurrently. */
@@ -219,6 +222,7 @@ static void sync_runner_drain(void)
 
         cmd_result_t res = cmd_mqtt_publish_next_event();
         if (res.status == ESP_OK) {
+            s_head_wait_logged = false;
             ESP_LOGI(TAG, "%s", res.message);
             taskYIELD();
         } else if (res.status == ESP_ERR_INVALID_STATE) {
@@ -233,7 +237,19 @@ static void sync_runner_drain(void)
             }
             vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_WINDOW_WAIT_MS));
         } else if (res.status == ESP_ERR_NOT_FOUND) {
+            s_head_wait_logged = false;
             return; /* nothing left to publish */
+        } else if (res.status == ESP_ERR_NOT_FINISHED) {
+            /* The delivery head is an SD-resident segment that cannot be read
+             * right now (card absent/parked/swapped, or its copies missing or
+             * corrupt). NOT "queue empty": the cursor waits in place and the
+             * backlog stays pending. Return and let the next notifier/fallback
+             * wake retry — logged once per episode, never a spin. */
+            if (!s_head_wait_logged) {
+                ESP_LOGW(TAG, "delivery waiting on unreadable SD backlog: %s", res.message);
+                s_head_wait_logged = true;
+            }
+            return;
         } else {
             /* NOT_SUPPORTED (no MQTT/persistence) or a publish error. */
             if (res.status != ESP_ERR_NOT_SUPPORTED) {
@@ -598,8 +614,11 @@ static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
 
     bool    a = device_commands_publish_power_ok();
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
-    int64_t pending = 0;
-    (void)cmd_db_status(NULL, NULL, &pending, NULL);
+    /* DELIVERABLE backlog only: records waiting behind an unreadable SD copy
+     * (card absent/parked/swapped) cannot produce a PUBACK however long the
+     * link is up, and rebooting would not bring the card back — counting them
+     * would turn a missing card into a nightly reboot loop. */
+    int64_t pending = device_commands_deliverable_pending();
     int64_t since = device_commands_ms_since_publish_ok();
 
     int64_t now_ms = esp_timer_get_time() / 1000;

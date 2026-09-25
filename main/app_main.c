@@ -597,8 +597,11 @@ static esp_err_t app_init_sdcard(void)
 static void app_on_sd_state_change(bool mounted)
 {
     if (!mounted) {
-        ESP_LOGW(APP_TAG, "SD out — archive/logs paused; measurement + publishing unaffected");
+        ESP_LOGW(APP_TAG, "SD out — overflow/archive/logs paused; measurement continues on the internal store");
     }
+    /* A card appearing (or leaving) changes what the keeper may do and whether
+     * an SD-only backlog is readable: wake it rather than waiting a period. */
+    event_log_sd_notify();
 }
 
 /* Pre-reboot power-safety hook (Item B). Every esp_restart() in the tree (OTA,
@@ -688,6 +691,7 @@ static void app_power_guard_task(void *arg)
              * teardown can race the flush + unmount below (same order as
              * app_prepare_reboot). */
             sdcard_monitor_suspend();
+            event_log_set_sd_parked(true);   /* keeper + claim: zero SD operations while parked */
             sd_logger_pause();               /* drain ring, fsync + close (resumable) */
             esp_err_t err = ESP_OK;
             for (int i = 0; i < 5; i++) {    /* TIMEOUT = in-flight FATFS op draining */
@@ -720,6 +724,7 @@ static void app_power_guard_task(void *arg)
                 ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
             }
             sdcard_monitor_resume();
+            event_log_set_sd_parked(false);  /* wakes the keeper: resume overflow/delivery from SD */
             s_pwrguard_parked = false;
             low_n = 0;
         }
@@ -773,8 +778,10 @@ static esp_err_t app_sd_health(bool *io_lost, uint64_t *free_bytes,
                                int64_t *skipped, int64_t *dropped, int64_t *last_acked_id)
 {
     if (io_lost)    *io_lost = sdcard_io_lost();     /* SD (archive) subsystem state */
-    /* free_bytes now reports the INTERNAL store headroom — that is the number the
-     * storage-full watermark + eviction act on; SD fullness only delays archiving. */
+    /* free_bytes reports the INTERNAL store headroom — the number the pressure
+     * watermark, reclaim and the storage-full refusal act on. The full SD-overflow
+     * state (sd_state, blocked_reason, exact/floor pending split, refusals by
+     * reason) is carried separately via event_log_health in the STATUS metadata. */
     if (free_bytes) { *free_bytes = 0; (void)event_log_free_bytes(free_bytes); }
     evlog_health_t h;
     if (event_log_health(&h) != ESP_OK) return ESP_FAIL;
@@ -829,40 +836,14 @@ static esp_err_t app_init_evstore(void)
     return ESP_OK;
 }
 
-/* ── SD keeper task ─────────────────────────────────────────────────────────
- * The one place the event pipeline still touches the SD, on a slow cadence and
- * always in bulk: (1) legacy migration — drain the pre-internal-store
- * /sdcard/events backlog into the internal store (oldest-first, a few files per
- * pass so this task never hogs the store mutex); (2) bulk archive — once
- * EVLOG_ARCHIVE_EVERY_N stores accumulate, copy every fully-synced retained file
- * to /sdcard/archive in one burst. Both are keeper-paced, so a dead/absent/
- * parked SD costs nothing but a skipped pass — measurement and publishing never
- * notice. Priority 2 (with the other background housekeeping). */
-#define SD_KEEPER_PERIOD_MS       60000
-#define SD_KEEPER_MIGRATE_FILES   4       /* per pass: bounds mutex hold + task burst */
-#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no mount fan-out */
-
-static void app_sd_keeper_task(void *arg)
-{
-    (void)arg;
-    bool migration_done_logged = false;
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SD_KEEPER_PERIOD_MS));
-        if (!sdcard_is_mounted()) continue;
-
-        size_t migrated = event_log_import_sd_backlog(SD_KEEPER_MIGRATE_FILES);
-        if (migrated > 0) {
-            migration_done_logged = false;
-        } else if (!migration_done_logged) {
-            migration_done_logged = true;   /* quiet once the legacy dir is empty */
-        }
-
-        if (event_log_archive_pending()) {
-            size_t archived = 0;
-            (void)event_log_archive_to_sd(&archived);
-        }
-    }
-}
+/* ── SD keeper ──────────────────────────────────────────────────────────────
+ * The keeper task now lives in event_log (event_log_sd_keeper_start): SD
+ * overflow of UNSENT files (primary + mirror, verified before any flash copy is
+ * reclaimed), bulk archive of delivered files, re-import after a rollback, and
+ * the legacy /sdcard/events migration. It runs every 60 s and immediately when
+ * the store crosses the pressure watermark or the 1000-store batch count, when
+ * a card mounts, or when the power guard un-parks. A dead/absent/parked card
+ * costs only skipped passes — measurement and publishing never wait on it. */
 
 static void app_start_sched_runner(void)
 {
@@ -1366,10 +1347,9 @@ void app_main(void)
      * out of the internal store. Missing-task fallback: nothing breaks, the
      * store just retains synced files until eviction bounds them. */
     if (persistence_available) {
-        if (xTaskCreate(app_sd_keeper_task, "sd_keeper", SD_KEEPER_TASK_STACK,
-                        NULL, 2, NULL) != pdPASS) {
+        if (event_log_sd_keeper_start() != ESP_OK) {
             ESP_LOGW(APP_TAG, "SD keeper not started (task alloc failed) — "
-                              "no SD archive/migration this session");
+                              "no SD overflow/archive/migration this session");
         }
     }
 

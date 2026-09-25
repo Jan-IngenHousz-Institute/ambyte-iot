@@ -432,6 +432,11 @@ void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *
  * Any out-pointer may be NULL. */
 void device_commands_window_status(size_t *slots, size_t *bytes);
 
+/* Records the drain can reach right now (event_log health's deliverable_pending:
+ * 0 while the delivery head waits on an unreadable SD copy). Liveness
+ * watchdogs use this instead of the raw pending count. */
+int64_t device_commands_deliverable_pending(void);
+
 /* Test hook: inject a fake, already-stale in-flight slot (no real measure_id) so
  * the reaper path can be exercised on hardware without engineering a lost PUBACK.
  * The next sync_runner drain (kick it with sync_runner_notify) reaps it. */

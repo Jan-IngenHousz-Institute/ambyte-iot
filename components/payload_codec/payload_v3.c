@@ -719,6 +719,36 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   (long long)input->sd_skipped, (long long)input->sd_dropped,
                   (long long)input->last_acked_id,
                   input->sd_io_lost ? "true" : "false");
+        storage_comma = true;
+    }
+    if (input->evq_valid) {
+        jw_append(&w, "%s\"evq\":{\"pending\":%lld,\"pending_exact\":%s,"
+                      "\"deliverable_pending\":%lld,\"flash_pending\":%lld,"
+                      "\"sd_pending\":%lld,\"reimport_pending\":%lld,\"sd_state\":",
+                  storage_comma ? "," : "",
+                  (long long)input->evq_pending, input->evq_pending_exact ? "true" : "false",
+                  (long long)input->evq_deliverable_pending, (long long)input->evq_flash_pending,
+                  (long long)input->evq_sd_pending, (long long)input->evq_reimport_pending);
+        jw_string(&w, input->evq_sd_state);
+        jw_append(&w, ",\"head_block\":");
+        jw_string(&w, input->evq_head_block);
+        jw_append(&w, ",\"storage_blocked\":%s,\"blocked_reason\":",
+                  input->evq_storage_blocked ? "true" : "false");
+        jw_string(&w, input->evq_blocked_reason);
+        jw_append(&w, ",\"refused_full\":%lld,\"refused_media\":%lld,"
+                      "\"refused_too_large\":%lld,\"refused_unavailable\":%lld,"
+                      "\"quarantined_poison\":%lld,\"quarantined_malformed\":%lld,"
+                      "\"skipped_unindexed_gap\":%lld,\"corrupt_detected\":%lld,"
+                      "\"corrupt_medium\":",
+                  (long long)input->evq_refused_full, (long long)input->evq_refused_media,
+                  (long long)input->evq_refused_too_large, (long long)input->evq_refused_unavailable,
+                  (long long)input->evq_quarantined_poison, (long long)input->evq_quarantined_malformed,
+                  (long long)input->evq_skipped_unindexed_gap, (long long)input->evq_corrupt_detected);
+        jw_string(&w, input->evq_corrupt_medium);
+        jw_append(&w, ",\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,"
+                      "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u}",
+                  input->evq_spool_files, input->evq_spool_errors, input->evq_mirror_used,
+                  input->evq_reclaimed_files, input->evq_archived_files, input->evq_reimported_files);
     }
     jw_append(&w, "},\"runtime\":{");
     if (input->runtime_valid) {
