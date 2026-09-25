@@ -320,6 +320,8 @@ static volatile bool s_sd_parked = false;       /* low-battery guard (app_main) 
 static bool      s_sd_last_mounted = false;
 static uint32_t  s_sd_last_cid = 0;
 static uint32_t  s_sd_epoch = 1;
+static volatile uint32_t s_sd_notify_epoch = 0;   /* bumped lock-free by event_log_sd_notify */
+static uint32_t  s_sd_notify_seen = 0;
 static uint32_t  s_sd_repaired_epoch = 0;       /* epoch whose SD-side repair ran */
 static uint8_t   s_sd_state = EVQ_SD_ABSENT;
 static bool      s_sd_mismatch_park = false;
@@ -567,7 +569,9 @@ static void evq_sd_observe_locked(void)
 {
     bool mounted = sdcard_is_mounted();
     uint32_t cid = mounted ? sdcard_card_serial() : 0;
-    if (mounted != s_sd_last_mounted || cid != s_sd_last_cid) {
+    uint32_t ne = s_sd_notify_epoch;
+    if (mounted != s_sd_last_mounted || cid != s_sd_last_cid || ne != s_sd_notify_seen) {
+        s_sd_notify_seen = ne;
         s_sd_epoch++;
         s_sd_last_mounted = mounted;
         s_sd_last_cid = cid;
@@ -973,15 +977,29 @@ static void evlog_normalize_cursor_locked(void)
  * a spooled file the SD copies remain and are archived later. Returns true if at
  * least one file was evicted. Caller holds s_mtx. */
 static int64_t s_evicted_files = 0;   /* lifetime counter (boot-relative), logged */
-static bool evlog_evict_synced_locked(void)
+static bool evlog_evict_to_locked(uint64_t target)
 {
     bool evicted = false;
     uint64_t freeb = 0;
-    while (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_EVICT_TARGET) {
+    uint32_t scan_from = 0;
+    while (evstore_free_bytes(&freeb) == ESP_OK && freeb < target) {
+        /* Oldest flash file strictly behind the cursor that is NOT still owed:
+         * a REIMPORT entry's flash copy may be its only copy (the cursor moved
+         * without our ACK), so it is never an eviction candidate. */
         uint32_t min_seq = 0, max_seq = 0;
         if (!evlog_scan_range_locked(&min_seq, &max_seq)) break;
-        if (min_seq >= s_rd_seq) break;              /* nothing fully-synced left */
-        if (min_seq == s_keeper_pin_seq) break;      /* keeper is copying it right now */
+        uint32_t cand = 0;
+        for (uint32_t q = (min_seq > scan_from ? min_seq : scan_from); q < s_rd_seq && q <= max_seq; q++) {
+            if (!evlog_flash_exists(q, NULL)) continue;
+            const evq_seg_t *e = evq_index_find(&s_ix, q);
+            if (e != NULL && e->state == EVQ_SEG_REIMPORT) continue;
+            if (q == s_keeper_pin_seq) continue;      /* keeper is copying it right now */
+            cand = q;
+            break;
+        }
+        if (cand == 0) break;                        /* nothing evictable left */
+        min_seq = cand;
+        scan_from = cand + 1;
         char path[EVQ_PATH_MAX];
         evlog_file_path(path, sizeof path, min_seq);
         if (remove(path) != 0) break;                /* stuck file: don't spin */
@@ -997,6 +1015,11 @@ static bool evlog_evict_synced_locked(void)
                  path, (unsigned long long)freeb, (long long)s_evicted_files);
     }
     return evicted;
+}
+
+static bool evlog_evict_synced_locked(void)
+{
+    return evlog_evict_to_locked(EVLOG_EVICT_TARGET);
 }
 
 /* Full-store recovery, shared by EVERY ENOSPC-class failure path: evict the
@@ -1484,6 +1507,10 @@ static esp_err_t evlog_open_locked(void)
     s_head_block = EVQ_BLOCK_NONE;
     evq_validate_cursor_locked();
 
+    /* First keeper pass as soon as it starts (index pre-upgrade files, repair
+     * the card, resume transfers) instead of one period after boot. */
+    s_keeper_wake_pending = true;
+
     ESP_LOGI(TAG, "ready: flash files %u..%u, %u indexed segment(s), cursor seq=%u off=%ld, next_id=%lld",
              (unsigned)min_seq, (unsigned)s_tail_seq, (unsigned)s_ix.n, (unsigned)s_rd_seq, s_rd_off,
              (long long)s_next_id);
@@ -1529,7 +1556,6 @@ esp_err_t event_log_init(void)
      * job: measurement and publishing never wait on the card. */
     s_available = (evlog_open_locked() == ESP_OK);
     if (!s_available) ESP_LOGW(TAG, "event log unavailable");
-    evq_keeper_notify();
     return ESP_OK;
 }
 
@@ -2471,6 +2497,11 @@ static void evq_keeper_notify(void)
 
 void event_log_sd_notify(void)
 {
+    /* Called by the SD monitor on EVERY mount-state transition: whatever card
+     * is there now must be re-verified before its copies are trusted, even if
+     * event_log itself never observed it unmounted (same CID, removed,
+     * modified elsewhere, reinserted between two observations). */
+    s_sd_notify_epoch++;
     evq_keeper_notify();
 }
 
@@ -2927,10 +2958,18 @@ static bool evq_reimport_one(uint32_t seq)
 {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     evq_seg_t *sp = evq_index_find(&s_ix, seq);
-    uint64_t freeb = 0, total = 0;
-    (void)evstore_space(&freeb, &total);
-    bool room = sp != NULL && total > 0 && freeb * 100U >= total * EVQ_RECLAIM_PCT &&
-                freeb > (uint64_t)sp->bytes + EVLOG_MIN_FREE_BYTES;
+    /* Room for THIS file above the refusal watermark is enough: requiring the
+     * 40 % reclaim target here could never pass while the REIMPORT sources
+     * themselves fill flash (their copies are exempt from eviction). Delivered
+     * flash copies are given up first to make that room. */
+    uint64_t need = sp != NULL ? (uint64_t)sp->bytes + EVLOG_MIN_FREE_BYTES + 4096U : 0;
+    uint64_t freeb = 0;
+    (void)evstore_free_bytes(&freeb);
+    if (sp != NULL && freeb <= need) {
+        (void)evlog_evict_to_locked(need + 1);
+        (void)evstore_free_bytes(&freeb);
+    }
+    bool room = sp != NULL && freeb > need;
     bool flash_src = sp != NULL && evlog_flash_exists(seq, NULL);
     if (sp == NULL || sp->state != EVQ_SEG_REIMPORT || !room ||
         (!flash_src && (!evq_sd_usable_locked() || s_sd_mismatch_park || sp->cid != s_sd_last_cid))) {

@@ -244,6 +244,12 @@ esp_err_t evq_index_append(evq_index_t *ix, const char *path, const char *fmt, .
     if (bn < 0 || (size_t)bn >= sizeof body) return ESP_ERR_INVALID_SIZE;
     int n = evq_index_format_line(line, sizeof line, body);
     if (n < 0) return ESP_ERR_INVALID_SIZE;
+    /* A new segment that the RAM table cannot hold must not reach the disk
+     * either, or a later replay (with free slots) would diverge from RAM. */
+    if (body[0] == 'S') {
+        unsigned long seq = strtoul(body + 2, NULL, 10);
+        if (evq_index_find(ix, (uint32_t)seq) == NULL && ix->n >= ix->cap) return ESP_ERR_NO_MEM;
+    }
 
     EVQ_FAULT_POINT("index.append_torn");
     FILE *f = fopen(path, "ab");

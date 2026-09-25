@@ -318,10 +318,20 @@ def B3(seed: int) -> dict:
     dev = device("B3", seed)
     # manual keeper: observe the state just before and just after the
     # pressure-triggered pass (auto mode runs it inside the store loop)
-    dev.run(["keeper manual", "store 240", "health pre", "checkpoint pre", "service", "health post", "checkpoint post",
+    dev.run(["keeper manual"])
+    crossed = None
+    for i in range(80):                      # store until the pressure watermark is crossed
+        dev.run(["keeper manual", "store 10", f"health fill{i}"])
+        if last_health(dev, f"fill{i}")["pressure_notifies"] >= 1:
+            crossed = last_health(dev, f"fill{i}")
+            break
+    assert crossed is not None, "pressure never reached"
+    dev.run(["keeper manual", "health pre", "checkpoint pre", "service", "health post", "checkpoint post",
              "keeper auto"] + cps(300, 50) + ["health end"])
     pre, post, h = last_health(dev, "pre"), last_health(dev, "post"), last_health(dev, "end")
-    assert pre["pressure_notifies"] >= 1 and pre["flash_free"] * 100 < 2 * MiB * 25, "pressure not reached before store #1000"
+    stores = len(read_jsonl(dev.state / "out" / "attempts.jsonl"))
+    assert crossed["pressure_notifies"] >= 1 and pre["flash_free"] * 100 < 2 * MiB * 25 and stores < 1000, \
+        "pressure not reached before store #1000"
     assert post["spool_files"] > 0 and post["reclaimed"] >= 1, "no early transfer/reclaim under pressure"
     assert post["flash_free"] * 100 >= 2 * MiB * 40, f"free {post['flash_free']} below the 40% reclaim target"
     removed = []

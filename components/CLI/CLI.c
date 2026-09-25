@@ -1274,7 +1274,7 @@ static int cli_cmd_evlog(int argc, char **argv)
      * payload_v3.c) the host tests exercise — never a hand-rolled subset here.
      * The renderer refuses rather than truncates; say so instead of printing a
      * clipped status. */
-    static char text[1024];
+    static char text[1536];                     /* worst case (every counter INT64_MIN) ≈ 1.1 KiB */
     if (evq_render_health_text(&h, text, sizeof text) < 0) {
         printf("evlog: status rendering exceeded %u B — refusing to print a truncated status\r\n",
                (unsigned)sizeof text);
