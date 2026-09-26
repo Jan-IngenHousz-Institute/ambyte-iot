@@ -1,0 +1,13 @@
+menu "Ambyte SD overflow on-device verification"
+
+config AMBYTE_EVQ_HIL
+    bool "Enable the evq_hil hardware-in-the-loop verification controls"
+    default n
+    help
+        Test-only build (PlatformIO env evq-hil): synthetic record fill through
+        the production store path, read-only flash/SD/index inventories, an
+        RTC-retained SD boot hold and publish-gate hold, named fault injection
+        and an I/O trace in event_log. See docs/evq-sd-overflow-hil-contract.md.
+        Never enabled in a release image.
+
+endmenu

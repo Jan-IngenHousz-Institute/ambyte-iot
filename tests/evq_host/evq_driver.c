@@ -22,6 +22,9 @@
 #include "event_log.h"
 #include "evq_host.h"
 #include "sha256.h"
+#ifdef EVQ_HIL_HOST
+#include "event_log_hil.h"   /* HOLD-1: the verification build's SD boot hold */
+#endif
 
 static FILE *s_acc, *s_ref, *s_att, *s_del, *s_hl, *s_clm;
 static char  s_scenario[64] = "unnamed";
@@ -420,6 +423,12 @@ int main(int argc, char **argv)
     s_del = open_out("delivered.jsonl"); s_hl = open_out("health.jsonl"); s_clm = open_out("claims.jsonl");
     load_gen();
 
+#ifdef EVQ_HIL_HOST
+    /* Same order as app_main in the evq-hil build: the hold precedes init.
+     * EVQ_HIL_RELEASED=1 models a boot after `evq_hil sd_release` (RTC kept). */
+    event_log_hil_boot_init();
+    if (getenv("EVQ_HIL_RELEASED") != NULL) event_log_hil_release();
+#endif
     if (event_log_init() != ESP_OK) { fprintf(stderr, "event_log_init failed\n"); return 3; }
     shim_mark("boot");
 
@@ -540,6 +549,10 @@ int main(int argc, char **argv)
             FILE *p2 = fopen("out/pc", "w"); if (p2) { fprintf(p2, "%ld\n", ln); fclose(p2); }
             return 85;
         }
+#ifdef EVQ_HIL_HOST
+        else if (strcmp(cmd, "hil_release") == 0) event_log_hil_release();
+        else if (strcmp(cmd, "hil_state") == 0) (void)event_log_hil_state_dump();
+#endif
         else if (strcmp(cmd, "crash") == 0) { evq_host_flush_manifests(); shim_mark("crash-cmd"); _exit(86); }
         else { fprintf(stderr, "unknown command %s\n", cmd); return 2; }
     }

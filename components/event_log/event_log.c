@@ -58,6 +58,21 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
+/* On-device verification build only (CONFIG_AMBYTE_EVQ_HIL): route this
+ * file's I/O through the counting/tracing/fault wrapper. Included after every
+ * system header so only event_log's own calls are affected; the host harness
+ * uses its fsshim instead (EVQ_HOST_FAULTS). */
+#if !defined(EVQ_HOST_FAULTS) && CONFIG_AMBYTE_EVQ_HIL
+#include "evq_hil_io.h"
+#include "evq_hil_io_impl.h"
+#endif
+#if CONFIG_AMBYTE_EVQ_HIL || defined(EVQ_HIL_HOST)
+#define EVQ_HIL_ON 1
+#include "event_log_hil.h"
+#else
+#define EVQ_HIL_ON 0
+#endif
+
 #define TAG "event_log"
 
 /* ── internal-store seams ──────────────────────────────────────────────────
@@ -326,6 +341,17 @@ static uint8_t   s_head_block = EVQ_BLOCK_NONE;
 /* SD observation (updated under s_mtx by claim + keeper). The epoch bumps on
  * every mount/CID transition and invalidates cached verifications. */
 static volatile bool s_sd_parked = false;       /* low-battery guard (app_main) */
+#if EVQ_HIL_ON
+/* HIL state (docs/evq-sd-overflow-hil-contract.md). The hold and the gate
+ * override live in RTC_NOINIT memory so the injected CPU/ROM resets keep
+ * them; the rest is RAM (cleared by any reset). */
+static bool     evq_hil_hold_active(void);
+static volatile bool s_hil_keeper_paused = false;
+static uint64_t s_hil_reserve = 0;
+static uint32_t s_hil_cid = 0;
+static uint64_t s_hil_claims[4];              /* OK, NOT_FOUND, NOT_FINISHED, other */
+static void     evq_hil_note_line(int64_t id, const char *const parts[], const size_t lens[], size_t n);
+#endif
 static bool      s_sd_last_mounted = false;
 static uint32_t  s_sd_last_cid = 0;
 static uint32_t  s_sd_epoch = 1;
@@ -578,6 +604,9 @@ static void evq_sd_observe_locked(void)
 {
     bool mounted = sdcard_is_mounted();
     uint32_t cid = mounted ? sdcard_card_serial() : 0;
+#if EVQ_HIL_ON
+    if (mounted && s_hil_cid != 0) cid = s_hil_cid;     /* injected card swap (M-4) */
+#endif
     uint32_t ne = s_sd_notify_epoch;
     if (mounted != s_sd_last_mounted || cid != s_sd_last_cid || ne != s_sd_notify_seen) {
         s_sd_notify_seen = ne;
@@ -606,7 +635,13 @@ static void evq_sd_observe_locked(void)
     }
     s_sd_mismatch_park = park;
 
+#if EVQ_HIL_ON
+    /* The HIL boot hold is a SEPARATE flag: the power guard's un-park
+     * (event_log_set_sd_parked(false)) can never release it. */
+    if (s_sd_parked || evq_hil_hold_active()) s_sd_state = EVQ_SD_PARKED;
+#else
     if (s_sd_parked)            s_sd_state = EVQ_SD_PARKED;
+#endif
     else if (!mounted)          s_sd_state = sdcard_io_lost() ? EVQ_SD_LOST : EVQ_SD_ABSENT;
     else if (sdcard_io_lost())  s_sd_state = EVQ_SD_LOST;
     else if (park)              s_sd_state = EVQ_SD_MISMATCH;
@@ -1587,6 +1622,9 @@ esp_err_t event_log_init(void)
     if (id_err != ESP_OK) return id_err;
     esp_err_t line_err = evlog_allocate_line_buffer();
     if (line_err != ESP_OK) return line_err;
+#if !defined(EVQ_HOST_FAULTS) && CONFIG_AMBYTE_EVQ_HIL
+    evq_hil_io_init();
+#endif
 
     /* The internal partition is mounted by app_main before this runs and cannot
      * disappear afterwards — open unconditionally. SD-side repair is the keeper's
@@ -1855,6 +1893,9 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         return ESP_FAIL;
     }
     evstore_report_io_ok();
+#if EVQ_HIL_ON
+    evq_hil_note_line(measure_id, parts, lens, 7);
+#endif
     evlog_tail_account(parts, lens, 7, measure_id);
     free(cmd);
     s_tail_size += (long)total;
@@ -2485,6 +2526,10 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
     if (!evstore_io_begin()) { memset(out, 0, sizeof *out); return ESP_ERR_NOT_SUPPORTED; }
     esp_err_t rc = event_log_claim_impl(out);
     evstore_io_end();
+#if EVQ_HIL_ON
+    /* The real drain's claim results (M-1): the only caller is sync_runner. */
+    s_hil_claims[rc == ESP_OK ? 0 : rc == ESP_ERR_NOT_FOUND ? 1 : rc == ESP_ERR_NOT_FINISHED ? 2 : 3]++;
+#endif
     return rc;
 }
 
@@ -2690,7 +2735,11 @@ static bool evq_sd_has_room(uint64_t need)
 {
     uint64_t freeb = 0;
     if (sdcard_free_bytes(&freeb) != ESP_OK) return false;
-    return freeb > EVQ_SD_RESERVE_BYTES && freeb - EVQ_SD_RESERVE_BYTES >= need;
+    uint64_t reserve = EVQ_SD_RESERVE_BYTES;
+#if EVQ_HIL_ON
+    if (s_hil_reserve != 0) reserve = s_hil_reserve;     /* injected "card full" (M-2) */
+#endif
+    return freeb > reserve && freeb - reserve >= need;
 }
 
 /* Spool one unsent FLASH segment: primary + mirror, both verified, then the
@@ -3554,6 +3603,9 @@ static void evq_unindexed_floor_refresh(void)
 esp_err_t event_log_sd_service(void)
 {
     if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
+#if EVQ_HIL_ON
+    if (s_hil_keeper_paused) return ESP_OK;   /* quiescent inventory in progress */
+#endif
     s_keeper_wake_pending = false;
     s_pass_wrote_sd = false;
     s_pass_error = false;
@@ -3827,3 +3879,422 @@ esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t
     if (out_capped) *out_capped = capped;
     return ESP_OK;
 }
+
+/* ══ On-device verification hooks (CONFIG_AMBYTE_EVQ_HIL only) ════════════
+ * docs/evq-sd-overflow-hil-contract.md. Nothing below exists in a release
+ * build (ISO-1 checks the ELF). Every dump is read-only; the controls are
+ * RAM/RTC overrides that a power-on reset clears. */
+#if EVQ_HIL_ON
+
+#ifdef EVQ_HIL_HOST
+#include "sha256.h"
+#include <time.h>
+#define HIL_RTC
+static int64_t hil_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+#else
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "evq_hil_trace.h"
+#include "mbedtls/sha256.h"
+#define HIL_RTC RTC_NOINIT_ATTR
+static int64_t hil_now_us(void) { return esp_timer_get_time(); }
+#endif
+
+/* ── sha256 over pieces (target: mbedtls; host: concatenate) ── */
+typedef struct {
+#ifdef EVQ_HIL_HOST
+    char  *buf;
+    size_t len, cap;
+#else
+    mbedtls_sha256_context c;
+#endif
+} hil_sha_t;
+
+static void hil_sha_start(hil_sha_t *h)
+{
+#ifdef EVQ_HIL_HOST
+    h->buf = NULL; h->len = h->cap = 0;
+#else
+    mbedtls_sha256_init(&h->c);
+    mbedtls_sha256_starts(&h->c, 0);
+#endif
+}
+
+static void hil_sha_update(hil_sha_t *h, const void *p, size_t n)
+{
+#ifdef EVQ_HIL_HOST
+    if (h->len + n > h->cap) {
+        size_t nc = (h->len + n) * 2 + 64;
+        char *nb = realloc(h->buf, nc);
+        if (nb == NULL) return;
+        h->buf = nb; h->cap = nc;
+    }
+    memcpy(h->buf + h->len, p, n);
+    h->len += n;
+#else
+    mbedtls_sha256_update(&h->c, p, n);
+#endif
+}
+
+static void hil_sha_finish(hil_sha_t *h, char hex[65])
+{
+    uint8_t d[32];
+#ifdef EVQ_HIL_HOST
+    sha256_hex(h->buf ? h->buf : "", h->len, hex);
+    free(h->buf);
+    (void)d;
+#else
+    mbedtls_sha256_finish(&h->c, d);
+    mbedtls_sha256_free(&h->c);
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
+#endif
+    hex[64] = '\0';
+}
+
+/* ── RTC-retained state ── */
+typedef struct {
+    uint32_t magic, released, gate, boots, check;
+} hil_rtc_t;
+HIL_RTC static hil_rtc_t s_hil_rtc;
+#define HIL_RTC_MAGIC 0x45564851u   /* "EVHQ" */
+
+static bool hil_rtc_valid(void)
+{
+    return s_hil_rtc.magic == HIL_RTC_MAGIC &&
+           s_hil_rtc.check == (s_hil_rtc.released ^ (s_hil_rtc.gate << 8) ^ s_hil_rtc.boots ^ 0xA5A5A5A5u);
+}
+
+static void hil_rtc_seal(void)
+{
+    s_hil_rtc.magic = HIL_RTC_MAGIC;
+    s_hil_rtc.check = s_hil_rtc.released ^ (s_hil_rtc.gate << 8) ^ s_hil_rtc.boots ^ 0xA5A5A5A5u;
+}
+
+void evq_hil_trace(const char *step)
+{
+    printf("HIL_TRACE %s %lld\n", step, (long long)hil_now_us());
+    fflush(stdout);
+}
+
+void event_log_hil_boot_init(void)
+{
+    bool valid = hil_rtc_valid();
+    if (!valid) {
+        /* Power-on or foreign RTC contents: the safe default for a
+         * verification run — SD HELD, publishing on HOLD. */
+        s_hil_rtc.released = 0;
+        s_hil_rtc.gate = EVQ_HIL_GATE_HOLD;
+        s_hil_rtc.boots = 0;
+    }
+    s_hil_rtc.boots++;
+    hil_rtc_seal();
+    printf("HIL_BOOT rtc_valid=%d hold=%d gate=%u boots=%u\n", valid ? 1 : 0,
+           s_hil_rtc.released ? 0 : 1, (unsigned)s_hil_rtc.gate, (unsigned)s_hil_rtc.boots);
+    evq_hil_trace("hold_set");
+}
+
+static bool evq_hil_hold_active(void)
+{
+    /* Before boot_init (or with RTC RAM lost) the answer is HELD. */
+    return !hil_rtc_valid() || s_hil_rtc.released == 0;
+}
+
+bool event_log_hil_held(void) { return evq_hil_hold_active(); }
+
+void event_log_hil_release(void)
+{
+    if (!hil_rtc_valid()) { s_hil_rtc.gate = EVQ_HIL_GATE_HOLD; s_hil_rtc.boots = 1; }
+    s_hil_rtc.released = 1;
+    hil_rtc_seal();
+    printf("HIL_RELEASE us=%lld\n", (long long)hil_now_us());
+    evq_keeper_notify();
+}
+
+evq_hil_gate_t event_log_hil_gate(void)
+{
+    return hil_rtc_valid() ? (evq_hil_gate_t)s_hil_rtc.gate : EVQ_HIL_GATE_HOLD;
+}
+
+void event_log_hil_set_gate(evq_hil_gate_t g)
+{
+    if (!hil_rtc_valid()) { s_hil_rtc.released = 0; s_hil_rtc.boots = 1; }
+    s_hil_rtc.gate = (uint32_t)g;
+    hil_rtc_seal();
+}
+
+void event_log_hil_keeper_pause(bool pause)
+{
+    s_hil_keeper_paused = pause;
+    if (!pause) evq_keeper_notify();
+}
+bool event_log_hil_keeper_paused(void) { return s_hil_keeper_paused; }
+void event_log_hil_set_reserve(uint64_t bytes) { s_hil_reserve = bytes; evq_keeper_notify(); }
+uint64_t event_log_hil_reserve(void) { return s_hil_reserve ? s_hil_reserve : EVQ_SD_RESERVE_BYTES; }
+void event_log_hil_set_cid(uint32_t cid) { s_hil_cid = cid; evq_keeper_notify(); }
+uint32_t event_log_hil_cid(void) { return s_hil_cid; }
+
+/* ── exact stored-line hash of recent stores (EVQ_ACC) ── */
+typedef struct { int64_t id; uint32_t bytes; char hex[65]; } hil_line_t;
+static hil_line_t s_hil_lines[8];
+static unsigned s_hil_line_next;
+
+static void evq_hil_note_line(int64_t id, const char *const parts[], const size_t lens[], size_t n)
+{
+    hil_sha_t h;
+    hil_sha_start(&h);
+    uint32_t total = 0;
+    for (size_t i = 0; i < n; i++) { hil_sha_update(&h, parts[i], lens[i]); total += (uint32_t)lens[i]; }
+    hil_line_t *e = &s_hil_lines[s_hil_line_next++ % 8];
+    hil_sha_finish(&h, e->hex);
+    e->bytes = total;
+    e->id = id;
+}
+
+bool event_log_hil_line_sha(int64_t id, uint8_t out[32], uint32_t *out_bytes)
+{
+    bool ok = false;
+    if (s_mtx != NULL) xSemaphoreTake(s_mtx, portMAX_DELAY);
+    for (int i = 0; i < 8; i++) {
+        if (s_hil_lines[i].id == id && s_hil_lines[i].hex[0] != '\0') {
+            for (int k = 0; k < 32; k++) {
+                unsigned v = 0;
+                sscanf(s_hil_lines[i].hex + 2 * k, "%2x", &v);
+                out[k] = (uint8_t)v;
+            }
+            if (out_bytes) *out_bytes = s_hil_lines[i].bytes;
+            ok = true;
+            break;
+        }
+    }
+    if (s_mtx != NULL) xSemaphoreGive(s_mtx);
+    return ok;
+}
+
+/* ── flash inventory (P0-1 of contract v3) ──
+ * Snapshot under s_mtx: every ev-*.log name, its byte length, cutoff_id =
+ * next_id and the tail seq. Then hash ONLY those prefixes (append-only files;
+ * rotated files immutable; keeper paused so nothing is removed mid-walk). */
+typedef struct { uint32_t seq; long len; } hil_snap_t;
+
+static int hil_snap_cmp(const void *a, const void *b)
+{
+    uint32_t x = ((const hil_snap_t *)a)->seq, y = ((const hil_snap_t *)b)->seq;
+    return x < y ? -1 : x > y;
+}
+
+esp_err_t event_log_hil_flash_inv(void)
+{
+    if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
+    if (!s_hil_keeper_paused && !evq_hil_hold_active()) {
+        printf("EVQ_FERR keeper_running (evq_hil keeper pause first)\n");
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t cap = 512, n = 0;
+    hil_snap_t *snap = malloc(cap * sizeof *snap);
+    char *line = malloc(s_line_cap + 2);
+    char *buf = malloc(4096);
+    if (snap == NULL || line == NULL || buf == NULL) { free(snap); free(line); free(buf); return ESP_ERR_NO_MEM; }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    int64_t cutoff = s_next_id;
+    uint32_t tail = s_tail_seq;
+    DIR *d = opendir(EVLOG_DIR);
+    if (d != NULL) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n < cap) {
+            unsigned q = 0;
+            char tail_c = 0;
+            if (sscanf(ent->d_name, "ev-%u.lo%c", &q, &tail_c) == 2 && tail_c == 'g') {
+                char path[EVQ_PATH_MAX];
+                evlog_file_path(path, sizeof path, q);
+                struct stat st;
+                if (stat(path, &st) == 0) { snap[n].seq = q; snap[n].len = (long)st.st_size; n++; }
+            }
+        }
+        closedir(d);
+    }
+    xSemaphoreGive(s_mtx);
+    qsort(snap, n, sizeof *snap, hil_snap_cmp);
+    printf("EVQ_FSNAP %lld %u %u\n", (long long)cutoff, (unsigned)tail, (unsigned)n);
+
+    unsigned missing = 0, hashed = 0;
+    for (size_t i = 0; i < n; i++) {
+        char path[EVQ_PATH_MAX];
+        evlog_file_path(path, sizeof path, snap[i].seq);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) { missing++; printf("EVQ_FMISS %s\n", path); continue; }
+        hil_sha_t fh;
+        hil_sha_start(&fh);
+        uint32_t crc = 0;
+        long left = snap[i].len;
+        size_t ll = 0;
+        unsigned lno = 0;
+        while (left > 0) {
+            size_t want = left < 4096 ? (size_t)left : 4096;
+            size_t r = fread(buf, 1, want, f);
+            if (r == 0) break;
+            left -= (long)r;
+            hil_sha_update(&fh, buf, r);
+            crc = evq_crc32(crc, buf, r);
+            for (size_t k = 0; k < r; k++) {
+                if (ll < s_line_cap + 1) line[ll] = buf[k];
+                ll++;
+                if (buf[k] == '\n') {
+                    char hex[65];
+                    hil_sha_t lh;
+                    hil_sha_start(&lh);
+                    hil_sha_update(&lh, line, ll <= s_line_cap + 1 ? ll : s_line_cap + 1);
+                    hil_sha_finish(&lh, hex);
+                    lno++;
+                    printf("EVQ_FL %s %u %lld %s %u\n", path, lno, strtoll(line, NULL, 10), hex, (unsigned)ll);
+                    ll = 0;
+                }
+            }
+        }
+        bool short_read = left > 0;
+        fclose(f);
+        char fhex[65];
+        hil_sha_finish(&fh, fhex);
+        if (ll > 0) printf("EVQ_FT %s %u %u\n", path, lno + 1, (unsigned)ll);
+        if (short_read) { missing++; printf("EVQ_FSHORT %s %ld\n", path, left); continue; }
+        printf("EVQ_FF %s %ld %s %08" PRIx32 "\n", path, snap[i].len, fhex, crc);
+        hashed++;
+    }
+    printf("EVQ_FEND %u %u\n", hashed, missing);
+    free(snap); free(line); free(buf);
+    return missing == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t event_log_hil_index_dump(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    printf("EVQ_IXHDR n=%u rd_seq=%u rd_off=%ld tail=%u cid=%08" PRIx32 " epoch=%u\n", (unsigned)s_ix.n,
+           (unsigned)s_rd_seq, s_rd_off, (unsigned)s_tail_seq, s_sd_last_cid, (unsigned)s_sd_epoch);
+    for (size_t i = 0; i < s_ix.n; i++) {
+        const evq_seg_t *g = &s_ix.segs[i];
+        printf("EVQ_IX %u %s %lld %lld %u %u %08" PRIx32 " %08" PRIx32 " %s %s %d\n", (unsigned)g->seq,
+               evq_seg_state_name(g->state), (long long)g->first_id, (long long)g->last_id,
+               (unsigned)g->count, (unsigned)g->bytes, g->crc, g->cid,
+               g->primary[0] ? g->primary : "-", g->mirror[0] ? g->mirror : "-", g->flash_present ? 1 : 0);
+    }
+    xSemaphoreGive(s_mtx);
+    printf("EVQ_IXEND\n");
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_cursor_dump(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    uint32_t rs = s_rd_seq;
+    long ro = s_rd_off;
+    xSemaphoreGive(s_mtx);
+    evlog_cursor_blob_t b = { 0 };
+    size_t blen = sizeof b;
+    uint32_t lseq = 0, loff = 0;
+    int have_b = 0, have_s = 0, have_o = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        have_b = nvs_get_blob(h, NVS_KEY_CUR, &b, &blen) == ESP_OK;
+        have_s = nvs_get_u32(h, NVS_KEY_RD_SEQ, &lseq) == ESP_OK;
+        have_o = nvs_get_u32(h, NVS_KEY_RD_OFF, &loff) == ESP_OK;
+        nvs_close(h);
+    }
+    hil_sha_t sh;
+    char hex[65];
+    hil_sha_start(&sh);
+    hil_sha_update(&sh, &b, sizeof b);
+    hil_sha_update(&sh, &lseq, sizeof lseq);
+    hil_sha_update(&sh, &loff, sizeof loff);
+    hil_sha_finish(&sh, hex);
+    printf("EVQ_CUR ram=%u:%ld blob=%d:%u:%u:%08" PRIx32 " rd_seq=%d:%u rd_off=%d:%u nvs_sha=%s\n",
+           (unsigned)rs, ro, have_b, (unsigned)b.seq, (unsigned)b.off, b.crc, have_s, (unsigned)lseq,
+           have_o, (unsigned)loff, hex);
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_claims_dump(void)
+{
+    printf("EVQ_CLAIMS ok=%llu not_found=%llu not_finished=%llu other=%llu us=%lld\n",
+           (unsigned long long)s_hil_claims[0], (unsigned long long)s_hil_claims[1],
+           (unsigned long long)s_hil_claims[2], (unsigned long long)s_hil_claims[3], (long long)hil_now_us());
+    return ESP_OK;
+}
+
+#ifndef EVQ_HIL_HOST
+static const char *hil_op_name(uint8_t op)
+{
+    static const char *const names[] = { "?", "open_r", "open_w", "close_r", "close_w", "fsync",
+                                         "rename", "remove", "mkdir", "idx_write", "fault" };
+    return op < sizeof names / sizeof names[0] ? names[op] : "?";
+}
+
+static void hil_emit_tr(const evq_tr_entry_t *e, void *ctx)
+{
+    (void)ctx;
+    printf("EVQ_TR %llu %lld %s %d %u %s %s\n", (unsigned long long)e->seq, (long long)e->us,
+           hil_op_name(e->op), (int)e->result, (unsigned)e->bytes, e->a[0] ? e->a : "-", e->b[0] ? e->b : "-");
+}
+#endif
+
+esp_err_t event_log_hil_io_dump(bool drain_trace)
+{
+#ifdef EVQ_HIL_HOST
+    (void)drain_trace;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    evq_io_counters_t *c = evq_io_counters();
+    printf("EVQ_IO sd_mut=%llu sd_read=%llu sd_write_open=%llu flash_mut=%llu appends=%llu fsyncs=%llu trace_total=%llu\n",
+           (unsigned long long)c->sd_mut, (unsigned long long)c->sd_read_open,
+           (unsigned long long)c->sd_write_open, (unsigned long long)c->flash_mut,
+           (unsigned long long)c->store_appends, (unsigned long long)c->store_fsyncs,
+           (unsigned long long)evq_tr_total());
+    if (drain_trace) {
+        uint64_t lost = 0, first = 0, last = 0;
+        size_t n = evq_tr_drain(hil_emit_tr, NULL, &lost, &first, &last);
+        printf("EVQ_TR_HDR %llu %llu %llu %llu %u\n", (unsigned long long)evq_tr_total(),
+               (unsigned long long)lost, (unsigned long long)first, (unsigned long long)last, (unsigned)n);
+    }
+    return ESP_OK;
+#endif
+}
+
+esp_err_t event_log_hil_state_dump(void)
+{
+    char arm[160] = "-";
+#ifndef EVQ_HIL_HOST
+    (void)evq_arm_describe(arm, sizeof arm);
+#endif
+    printf("EVQ_STATE hold=%d gate=%u keeper_paused=%d reserve=%llu cid_override=%08" PRIx32
+           " rtc_valid=%d boots=%u parked=%d arm=[%s]\n",
+           evq_hil_hold_active() ? 1 : 0, (unsigned)event_log_hil_gate(), s_hil_keeper_paused ? 1 : 0,
+           (unsigned long long)s_hil_reserve, s_hil_cid, hil_rtc_valid() ? 1 : 0,
+           (unsigned)s_hil_rtc.boots, s_sd_parked ? 1 : 0, arm);
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_arm(const char *point, const char *mode, unsigned nth)
+{
+#ifdef EVQ_HIL_HOST
+    (void)point; (void)mode; (void)nth;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    evq_arm_mode_t m;
+    if (strcmp(mode, "reset") == 0) m = EVQ_ARM_RESET;
+    else if (strcmp(mode, "reset_inside") == 0) m = EVQ_ARM_RESET_INSIDE;
+    else if (strcmp(mode, "eio") == 0) m = EVQ_ARM_EIO;
+    else if (strcmp(mode, "enospc") == 0) m = EVQ_ARM_ENOSPC;
+    else if (strcmp(mode, "off") == 0) { evq_arm_clear(); return ESP_OK; }
+    else return ESP_ERR_INVALID_ARG;
+    evq_arm_set(point, m, nth);
+    return ESP_OK;
+#endif
+}
+
+#endif /* EVQ_HIL_ON */

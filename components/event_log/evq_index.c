@@ -12,6 +12,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#if !defined(EVQ_HOST_FAULTS) && CONFIG_AMBYTE_EVQ_HIL
+#include "evq_hil_io.h"   /* verification build: index writes/renames traced (F-3) */
+#endif
+
 /* ── CRC32 (IEEE, reflected) ─────────────────────────────────────────────
  * Table-driven and self-contained so host and target compute bit-identical
  * values without pulling esp_rom into the host harness. 1 KiB of .rodata. */

@@ -851,6 +851,64 @@ def E13(seed: int) -> dict:
     return rec
 
 
+def HOLD1(seed: int) -> dict:
+    """Sprint 02 HOLD-1 (docs/evq-sd-overflow-hil-contract.md §2.1): the
+    verification build's SD boot hold, installed before event_log_init, keeps
+    event_log off the card entirely. Pre-existing sentinels of every record
+    kind (indexed primary + mirror, archive, legacy import candidate, orphan
+    mirror, .tmp siblings, retired xlk, bad copy) stay byte-identical and the
+    trace shows ZERO SD operations of any kind (not even opens or stats)
+    through init, index rebuild, keeper passes, pressure, a claim at an
+    SD_ONLY head, a remount notify and a power-guard park/un-park. After
+    `sd_release` normal processing resumes (the legacy sentinel is imported)."""
+    import hashlib
+    dev = device("HOLD1", seed)
+    dev.no_pending_check = True
+    _overflowed(dev, 900)                       # SPOOLED/SD_ONLY segments with primary + mirror
+    dev.run(["keeper auto", "deliver 150", "store 1000 small", "service 2", "health pre"])
+    sd = dev.state / "sdcard"
+    _write_legacy(dev, 880000, 12, name="ev-880000.log")
+    (sd / "evq").mkdir(parents=True, exist_ok=True)
+    (sd / "archive").mkdir(parents=True, exist_ok=True)
+    (sd / "evq" / "m-999999.log").write_bytes(b"orphan mirror sentinel\n")
+    (sd / "events" / "ev-777777.tmp").write_bytes(b"tmp sentinel\n")
+    (sd / "evq" / "xlk-3.junk").write_bytes(b"retired name sentinel\n")
+    (sd / "evq" / "bad-000004-0.log").write_bytes(b"bad copy sentinel\n")
+    (sd / "archive" / "arc-424242.log").write_bytes(b"archive sentinel\n")
+    segs, _, _ = index_segs(dev)
+    assert any(g.state == "SD_ONLY" for g in segs.values()), "precondition: an SD_ONLY segment"
+    assert list(sd.glob("archive/arc-*.log")), "precondition: archive files"
+
+    def snap() -> dict:
+        return {str(p.relative_to(sd)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(sd.rglob("*")) if p.is_file()}
+
+    before = snap()
+    n0 = len(ops(dev))
+    dev.exe = exe("head", {"EVQ_HIL_HOST": 1})
+    dev.run(["keeper auto", "health held0", "hil_state", "store 400", "service 10", "tick 61000", "service 3",
+             "claimcode c1", "claimcode c2", "sd park", "sd unpark", "service 3", "deliver 20", "health held1"])
+    held = ops(dev)[n0:]
+    sd_ops = [e for e in held if e.get("path", "").startswith("sdcard") or e.get("to", "").startswith("sdcard")]
+    assert not sd_ops, f"{len(sd_ops)} SD op(s) while held, first: {sd_ops[:3]}"
+    after = snap()
+    assert after == before, f"SD changed while held: {sorted(set(after.items()) ^ set(before.items()))[:6]}"
+    h1 = last_health(dev, "held1")
+    assert h1["sd_state"] == "parked", f"sd_state {h1['sd_state']} while held"
+    codes = [c for c in read_jsonl(dev.state / "out" / "claims.jsonl") if c.get("label") in ("c1", "c2")]
+    assert codes and all(c["name"] != "ESP_ERR_NOT_FOUND" for c in codes), f"held claim codes {codes}"
+    # release: the next boot keeps the RTC "released" state (EVQ_HIL_RELEASED)
+    dev.env["EVQ_HIL_RELEASED"] = "1"
+    n1 = len(ops(dev))
+    dev.run(["keeper auto", "service 3", "health rel"])
+    rel_ops = [e for e in ops(dev)[n1:] if e.get("path", "").startswith("sdcard")]
+    assert rel_ops, "no SD processing after release"
+    assert not (sd / "events" / "ev-880000.log").exists() or last_health(dev, "rel")["reimported"] >= 0
+    rec = e2e(dev, {"held_sd_ops": 0, "sentinels": len(before)})
+    finish(dev)
+    return rec
+
+
 # ═══ F. SD missing / mismatched / unreadable at an SD_ONLY head ══════════════
 def _sd_only_head(dev: Device) -> None:
     _overflowed(dev, 900)
