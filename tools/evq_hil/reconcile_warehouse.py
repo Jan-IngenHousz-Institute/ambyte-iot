@@ -85,6 +85,15 @@ def _iso(ms: int) -> str:
     return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _same_instant(a: str | None, ms: int) -> bool:
+    """Envelope `timestamp` is second-resolution ISO; the pipeline may render it
+    as ...:41.000Z. Compare instants, not strings."""
+    if not a:
+        return False
+    t = dt.datetime.fromisoformat(a.replace("Z", "+00:00"))
+    return int(t.timestamp()) == ms // 1000
+
+
 def check_synthetic(row: dict, exp: dict, pad: int, workbook: str | None, cfg: dict) -> list[str]:
     s, e, bad = row["sample"], row["env"], []
     pl = hilpay.payload(exp["run"], exp["k"], pad)
@@ -99,7 +108,7 @@ def check_synthetic(row: dict, exp: dict, pad: int, workbook: str | None, cfg: d
         bad.append("data hash")
     if row["experiment_id"] != EXPERIMENT:
         bad.append(f"experiment {row['experiment_id']}")
-    if e.get("timestamp") != _iso(exp["start_ms"]):
+    if not _same_instant(e.get("timestamp"), exp["start_ms"]):
         bad.append(f"timestamp {e.get('timestamp')}")
     if e.get("device_id") != MAC:
         bad.append(f"device_id {e.get('device_id')}")
@@ -126,7 +135,7 @@ def check_real(row: dict, stored_line: bytes) -> list[str]:
             bad.append("v3 sample != stored payload")
     elif s.get("data") != payload:
         bad.append("v2 data != stored payload")
-    if row["env"].get("timestamp") != _iso(start_ms):
+    if not _same_instant(row["env"].get("timestamp"), start_ms):
         bad.append(f"timestamp {row['env'].get('timestamp')} != {_iso(start_ms)}")
     return bad
 

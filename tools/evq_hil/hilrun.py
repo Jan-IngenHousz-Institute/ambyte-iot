@@ -23,11 +23,17 @@ def off() -> int:
 
 
 def send(*cmds: str, gap: float = 0.4) -> None:
-    with open(CTL, "w") as f:
-        for c in cmds:
-            f.write(c + "\n")
-            f.flush()
-            time.sleep(gap)
+    # One FIFO open per command: the daemon reopens its read end after each
+    # writer closes, so a held-open writer can hit EPIPE in between.
+    for c in cmds:
+        for attempt in range(20):
+            try:
+                with open(CTL, "w") as f:
+                    f.write(c + "\n")
+                break
+            except BrokenPipeError:
+                time.sleep(0.2)
+        time.sleep(gap)
 
 
 def wait(regex: str, start: int, timeout: float = 600, count: int = 1) -> int:
