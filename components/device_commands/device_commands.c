@@ -3064,6 +3064,16 @@ cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch)
  * Set AMBIT actinic output. */
 cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2)
 {
+    /* AMBIT cmd 4 always starts with AS_LED_OFF(). Type 0 then goes straight
+     * to CMD_END, without changing calibration or enabling the LED. Type 5
+     * with current 0 is NOT off: the driver clamps it to 4 mA and the pulse
+     * handler calls AS_LED_ON() unconditionally. Normalize every zero-current
+     * pulse here so CLI callers and runner cleanup share the true off path.
+     * This works with the existing AMBIT firmware; no new wire verb is needed. */
+    if (type == 5 && var == 0) {
+        type = 0;
+        var2 = 0;
+    }
     uint8_t cmd[8] = { AMBIT_CMD_ACTINIC, type, var, var2, 0, 0, 0, 0 };
     return ambit_action(ch, cmd, NULL, 0, 15000);
 }

@@ -12,6 +12,7 @@ The initial catalog contains:
 | --- | --- |
 | `default.yaml` | Multi-channel steady-state, spectra, saturating-flash, edge, and health jobs |
 | `legacy_1hz_spec.yaml` | Channel-0 spectra at 1 Hz around daylight and 10-minute fallback outside it |
+| `qe_multichannel.yaml` | `default.yaml` plus a PAR read before every MPF and a twice-daily qE induction/relaxation sequence (10:00 and 16:00 local) |
 | `actions.schema.json` | JSON Schema generated from the firmware action table |
 
 Devices install every selected asset as `/littlefs/schedule.yaml`. Installation
@@ -191,6 +192,20 @@ lists in site-independent schedules.
 Protocols used by `ambit/trace` are declared at top level as named arrays of
 segments. Each segment requires `pulses`, `freq`, and `actinic`; `type`,
 `far_red`, and `subsampling` are optional.
+
+Protocols may set `persist: true` to keep the actinic LED state between runs.
+After attempting any persistent trace, stopping this firmware's runner resets
+the shared AMBIT bank and waits five seconds for application startup, which
+disables the LEDs. This discards unfinished and buffered traces on all channels,
+including on an in-place schedule replacement. Cleanup also covers a lost
+trigger acknowledgement and a stop between actions. A stop that times out
+remains in progress; a replacement runner cannot start until cleanup finishes.
+
+`ambit/actinic` with `level: 0` uses an off-only command; it does not pulse the
+LED. Both fixes require an **ambyte firmware update**. Updating only the YAML
+does not fix older firmware's 4 mA zero-current pulse or its persisted-light
+hazard on an in-place stop. Existing AMBIT firmware already supports the wire
+command and boot-time LED shutdown used here.
 
 `db/store-event` scalar values may use device placeholders: `$deployment`,
 `$lat`, `$lon`, `$tz`, `$boot_epoch`, `$uptime_ms`, `$sd_ready`, and the current

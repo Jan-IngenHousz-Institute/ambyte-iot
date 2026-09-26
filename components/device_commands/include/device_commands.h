@@ -366,6 +366,8 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
 /* Actions (wait for CMD_END, no response data) */
 cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity);
 cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch);
+/* A type-5 zero-current request is off-only (cmd 4 type 0), with no pulse or
+ * duration. Other types and nonzero-current pulses retain their wire form. */
 cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2);
 
 /* Write commands (extra data buffered, wait for CMD_END) */

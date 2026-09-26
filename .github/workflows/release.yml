@@ -122,7 +122,7 @@ jobs:
             test -f "release-assets/ambyte-iot-v${FIRMWARE_VERSION}.zip"
           fi
           if [[ "${SCHEDULE_WILL_RELEASE}" == true ]]; then
-            SCHEDULES=(default legacy_1hz_spec)
+            SCHEDULES=(default legacy_1hz_spec qe_multichannel)
             test -f release-assets/actions.schema.json
             for SCRIPT in "${SCHEDULES[@]}"; do
               test -f "release-assets/${SCRIPT}.yaml"
