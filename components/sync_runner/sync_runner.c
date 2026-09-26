@@ -1,4 +1,13 @@
 #include "sync_runner.h"
+#if !defined(EVQ_HIL_HOST) && __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#if CONFIG_AMBYTE_EVQ_HIL || defined(EVQ_HIL_HOST)
+#define SYNC_HIL 1
+#include "event_log_hil.h"   /* verification build: RTC-retained gate override */
+#else
+#define SYNC_HIL 0
+#endif
 
 #include <stdio.h>
 #include <stdint.h>
@@ -167,13 +176,27 @@ void sync_runner_notify(void)
  * power_monitor can override. */
 __attribute__((weak)) bool sync_runner_is_allowed(void)
 {
+#if SYNC_HIL
+    /* Verification build only (docs/evq-sd-overflow-hil-contract.md): HOLD
+     * keeps every record PENDING (delivery closed during the fill), FORCE
+     * opens the power gate only (the sensor hold still applies), AUTO is
+     * exactly the production rule below. */
+    evq_hil_gate_t hil_gate = event_log_hil_gate();
+    if (hil_gate == EVQ_HIL_GATE_HOLD) return false;
+#endif
 #if AMBYTE_PUBLISH_GATE_LEGACY
     bool sensor_gate_open = !device_commands_measurement_active();
 #else
     bool sensor_gate_open = !device_commands_publish_hold_active();
 #endif
+#if SYNC_HIL
+    if (hil_gate == EVQ_HIL_GATE_FORCE) return sensor_gate_open;
+#endif
     return sensor_gate_open && device_commands_publish_power_ok();
 }
+
+/* One warning per head-wait episode (ESP_ERR_NOT_FINISHED), not per wake. */
+static bool s_head_wait_logged = false;
 
 /* Publish pending events back-to-back until the queue drains or the gate closes.
  * One measure_id remains one MQTT message, but up to the independent slot/byte
@@ -219,6 +242,7 @@ static void sync_runner_drain(void)
 
         cmd_result_t res = cmd_mqtt_publish_next_event();
         if (res.status == ESP_OK) {
+            s_head_wait_logged = false;
             ESP_LOGI(TAG, "%s", res.message);
             taskYIELD();
         } else if (res.status == ESP_ERR_INVALID_STATE) {
@@ -233,7 +257,19 @@ static void sync_runner_drain(void)
             }
             vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_WINDOW_WAIT_MS));
         } else if (res.status == ESP_ERR_NOT_FOUND) {
+            s_head_wait_logged = false;
             return; /* nothing left to publish */
+        } else if (res.status == ESP_ERR_NOT_FINISHED) {
+            /* The delivery head is an SD-resident segment that cannot be read
+             * right now (card absent/parked/swapped, or its copies missing or
+             * corrupt). NOT "queue empty": the cursor waits in place and the
+             * backlog stays pending. Return and let the next notifier/fallback
+             * wake retry — logged once per episode, never a spin. */
+            if (!s_head_wait_logged) {
+                ESP_LOGW(TAG, "delivery waiting on unreadable SD backlog: %s", res.message);
+                s_head_wait_logged = true;
+            }
+            return;
         } else {
             /* NOT_SUPPORTED (no MQTT/persistence) or a publish error. */
             if (res.status != ESP_ERR_NOT_SUPPORTED) {
@@ -597,9 +633,20 @@ static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
     static int64_t s_gate_blocked_ms;
 
     bool    a = device_commands_publish_power_ok();
+#if SYNC_HIL
+    /* Verification build: a HIL gate HOLD is a deliberately closed delivery
+     * path, exactly like a closed power gate here. Without this an hour of
+     * held backlog reads as a wedged pipeline and the watchdog reboots the
+     * bench mid-run (observed on hardware, 2026-09-26). FORCE counts as open. */
+    if (event_log_hil_gate() == EVQ_HIL_GATE_HOLD) a = false;
+    else if (event_log_hil_gate() == EVQ_HIL_GATE_FORCE) a = true;
+#endif
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
-    int64_t pending = 0;
-    (void)cmd_db_status(NULL, NULL, &pending, NULL);
+    /* DELIVERABLE backlog only: records waiting behind an unreadable SD copy
+     * (card absent/parked/swapped) cannot produce a PUBACK however long the
+     * link is up, and rebooting would not bring the card back — counting them
+     * would turn a missing card into a nightly reboot loop. */
+    int64_t pending = device_commands_deliverable_pending();
     int64_t since = device_commands_ms_since_publish_ok();
 
     int64_t now_ms = esp_timer_get_time() / 1000;

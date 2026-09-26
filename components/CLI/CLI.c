@@ -1223,8 +1223,8 @@ static int cli_cmd_netwd(int argc, char **argv)
 }
 
 /* evlog              → print the event-log cursor + pending backlog
- * evlog rewind       → rewind the cursor to the OLDEST file still on the card
- *                      (re-publish everything) and kick a drain
+ * evlog rewind       → rewind the cursor to the OLDEST file the queue can still
+ *                      read (flash or a spooled SD copy) and kick a drain
  * evlog rewind <seq> → rewind to ev-<seq>.log so that record and all newer ones
  *                      revert to PENDING and re-publish. There is no per-record
  *                      state in the .log files — a record is PENDING iff it sits
@@ -1263,15 +1263,25 @@ static int cli_cmd_evlog(int argc, char **argv)
         return 1;
     }
 
-    bool     available = false;
-    int64_t  pending = 0, next_id = 0;
     uint32_t rd_seq = 0, rd_off = 0, tail_seq = 0;
-    event_log_db_stats(&available, NULL, &pending, &next_id);
     event_log_cursor_info(&rd_seq, &rd_off, &tail_seq);
-    printf("event log: %s\r\n", available ? "available" : "OFFLINE (SD not mounted?)");
-    printf(" - cursor: ev-%06u.log @ off %u  (tail ev-%06u.log)\r\n",
-           (unsigned)rd_seq, (unsigned)rd_off, (unsigned)tail_seq);
-    printf(" - pending: %lld   next_id: %lld\r\n", (long long)pending, (long long)next_id);
+    evlog_health_t h;
+    if (event_log_health(&h) != ESP_OK) {
+        printf("evlog: health unavailable (store not initialised or lock busy)\r\n");
+        return 1;
+    }
+    /* Both surfaces render through the production helpers (evq_render.c /
+     * payload_v3.c) the host tests exercise — never a hand-rolled subset here.
+     * The renderer refuses rather than truncates; say so instead of printing a
+     * clipped status. */
+    static char text[1536];                     /* worst case (every counter INT64_MIN) ≈ 1.1 KiB */
+    if (evq_render_health_text(&h, text, sizeof text) < 0) {
+        printf("evlog: status rendering exceeded %u B — refusing to print a truncated status\r\n",
+               (unsigned)sizeof text);
+        return 1;
+    }
+    printf("%s", text);
+    printf("  cursor_off=%u\r\n", (unsigned)rd_off);
     return 0;
 }
 

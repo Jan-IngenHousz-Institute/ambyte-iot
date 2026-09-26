@@ -3,25 +3,46 @@
  *
  * Replaces SQLite (which corrupted FATFS/SD via in-place page + header rewrites)
  * with an append-only store-and-forward FIFO. See event_log.h and
- * docs/append-log-persistence-plan.md for the design rationale; the Step-0 spike
- * proved this write pattern is corruption-free on the field card.
+ * docs/evq-sd-overflow.md for the design rationale.
  *
  * Concurrency: every public op runs under s_mtx, serialising the status-heartbeat
  * snapshot/ID allocator, the schedule runner
  * (store), the sync-runner drain (claim plus deferred ack/error marks), the
- * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), and the CLI
- * (stats). MQTT/Wi-Fi event tasks never enter this component: device_commands
- * queues their completions for the drain so FATFS latency cannot stall socket
- * servicing. The RAM claim window is bounded by the same 16-slot/64-KiB
- * contract as the publisher; only its contiguous ACKed prefix is durable.
+ * sync-runner watchdog task (cmd_store_status_event/cmd_db_status), the SD
+ * keeper task, and the CLI (stats). MQTT/Wi-Fi event tasks never enter this
+ * component: device_commands queues their completions for the drain so FATFS
+ * latency cannot stall socket servicing. The RAM claim window is bounded by the
+ * same 16-slot/64-KiB contract as the publisher; only its contiguous ACKed
+ * prefix is durable.
+ *
+ * TWO MEDIA, ONE QUEUE (2026-09 SD-overflow repair). Until v2.4.2 only fully
+ * delivered files ever reached the SD card, so a broker outage longer than the
+ * ~17 h internal store filled flash and every later measurement was refused
+ * while a 244 GB card sat idle (the nine full gateways of Sep 2026). Now a
+ * rotated ev-<seq>.log may live on flash, on SD, or both: unsent files are
+ * copied byte-for-byte to SD (a rollback-importable primary plus a mirror),
+ * and only once both copies are durable and verified may the flash copy be
+ * reclaimed under pressure. The cursor keeps its meaning — offsets are
+ * identical on either medium — and claim reads whichever verified copy exists.
+ * The segment index (evq_index.c, internal littlefs) is what lets the cursor
+ * tell "on an absent card" from "gone": an indexed file is never skipped.
+ *
+ * Lock order: s_mtx → sdcard_io_begin ref. No blocking lock is ever taken
+ * while an SD ref is held (sd_card.h contract). The keeper copies and verifies
+ * files WITHOUT s_mtx (rotated files are immutable; a pinned seq is exempt from
+ * eviction), so a slow or hung card delays only the keeper, never a store.
  */
 
 #include "event_log.h"
+#include "evq_fault.h"
+#include "evq_index.h"
 #include "sd_card.h"
 
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +57,21 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+
+/* On-device verification build only (CONFIG_AMBYTE_EVQ_HIL): route this
+ * file's I/O through the counting/tracing/fault wrapper. Included after every
+ * system header so only event_log's own calls are affected; the host harness
+ * uses its fsshim instead (EVQ_HOST_FAULTS). */
+#if !defined(EVQ_HOST_FAULTS) && CONFIG_AMBYTE_EVQ_HIL
+#include "evq_hil_io.h"
+#include "evq_hil_io_impl.h"
+#endif
+#if CONFIG_AMBYTE_EVQ_HIL || defined(EVQ_HIL_HOST)
+#define EVQ_HIL_ON 1
+#include "event_log_hil.h"
+#else
+#define EVQ_HIL_ON 0
+#endif
 
 #define TAG "event_log"
 
@@ -62,31 +98,52 @@ static void evstore_report_io_error(void)
 }
 static inline void evstore_report_io_ok(void) {}
 
-/* Free bytes on the internal store partition (littlefs bookkeeping, no media
- * walk — cheap enough for per-store admission checks). */
-static esp_err_t evstore_free_bytes(uint64_t *out_free)
+/* Free/total bytes on the internal store partition (littlefs bookkeeping, no
+ * media walk — cheap enough for per-store admission checks). */
+static esp_err_t evstore_space(uint64_t *out_free, uint64_t *out_total)
 {
-    if (out_free == NULL) return ESP_ERR_INVALID_ARG;
     size_t total = 0, used = 0;
     esp_err_t err = esp_littlefs_info(EVSTORE_PARTITION, &total, &used);
     if (err != ESP_OK) return err;
-    *out_free = (total > used) ? (uint64_t)(total - used) : 0;
+    if (out_free)  *out_free  = (total > used) ? (uint64_t)(total - used) : 0;
+    if (out_total) *out_total = (uint64_t)total;
     return ESP_OK;
 }
 
-/* The store lives on INTERNAL flash (littlefs on the previously-unused 9.4 MiB
- * "storage" partition, mounted at EVSTORE_MOUNT by app_main). littlefs is
- * copy-on-write and power-loss-safe: a reset/brownout mid-append rolls the file
- * back to the last fsync — record framing can never tear, and the filesystem
- * structure can never be lost the way FAT metadata could on the SD card. The SD
- * card is demoted to two explicitly-bracketed interchange roles at the bottom of
- * this file: bulk ARCHIVE of already-synced records (one burst per
- * EVLOG_ARCHIVE_EVERY_N stores, not a continuous trickle) and one-shot IMPORT of
- * a legacy /sdcard/events backlog after the OTA that moves the store internal. */
+static esp_err_t evstore_free_bytes(uint64_t *out_free)
+{
+    if (out_free == NULL) return ESP_ERR_INVALID_ARG;
+    return evstore_space(out_free, NULL);
+}
+
+/* ── layout ────────────────────────────────────────────────────────────────
+ * Internal store (littlefs, power-loss-safe):
+ *   EVSTORE_MOUNT/events/ev-<seq>.log   the queue's flash segments (tail = max seq)
+ *   EVSTORE_MOUNT/events/quarantine.log intact copies of records passed WITHOUT
+ *                                       an ACK (publish-impossible poison, malformed
+ *                                       pre-upgrade lines, detected corruption)
+ *   EVSTORE_MOUNT/evq.idx               segment index (evq_index.h)
+ * SD card (FAT, corruption-prone, removable):
+ *   EVQ_SD_ROOT/events/ev-<first_id>.log  unsent PRIMARY copy. Deliberately the
+ *        directory every firmware since v1.10.0 imports verbatim on its keeper
+ *        pass: a rollback re-ingests SD-only records instead of stranding them.
+ *   EVQ_SD_ROOT/evq/m-<seq>.log           MIRROR copy (old firmware never reads it)
+ *   EVQ_SD_ROOT/archive/arc-<first_id>[-<n>].log  delivered records (bulk archive)
+ * The partition label and the /events + /archive names are load-bearing across
+ * the fleet; the root prefixes are #ifndef-guarded only so the host harness can
+ * point them at a temp directory (check_constants.py pins production values). */
+#ifndef EVQ_SD_ROOT
+#define EVQ_SD_ROOT          SD_MOUNT_POINT
+#endif
 #define EVLOG_DIR            EVSTORE_MOUNT "/events"
-#define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"   /* poison events archived here */
-#define EVLOG_LEGACY_SD_DIR  "/sdcard/events"              /* pre-internal-store firmware backlog */
-#define EVLOG_ARCHIVE_DIR    "/sdcard/archive"             /* bulk archive of synced records */
+#define EVLOG_QUARANTINE     EVLOG_DIR "/quarantine.log"
+#define EVQ_INDEX_PATH       EVSTORE_MOUNT "/evq.idx"
+#define EVQ_INDEX_TMP        EVSTORE_MOUNT "/evq.idx.tmp"
+#define EVLOG_LEGACY_SD_DIR  EVQ_SD_ROOT "/events"     /* legacy import dir == spool primary dir */
+#define EVQ_MIRROR_DIR       EVQ_SD_ROOT "/evq"
+#define EVLOG_ARCHIVE_DIR    EVQ_SD_ROOT "/archive"
+#define EVQ_PATH_MAX         112
+
 /* ambit_trace's binding case is the permanent new-firmware v2 fallback:
  * 62,999 payload + 1,535 metadata + 543 arrun command + 113 fixed header +
  * 2 framing = 65,192 B, strictly below EVLOG_RECORD_CAP_NORMAL (65,552) with
@@ -94,51 +151,85 @@ static esp_err_t evstore_free_bytes(uint64_t *out_free)
  * producer names every term and proves the positive margin with static asserts
  * against this component's public cap (a reverse include here would create an
  * event_log <-> ambit_trace component dependency cycle). */
+#ifndef EVLOG_ROTATE_BYTES
 #define EVLOG_ROTATE_BYTES   (256 * 1024)     /* roll the tail file past this size */
-#define EVLOG_FLUSH_PERIOD_MS 1500            /* periodic flush backstop (NOT the primary durability lever) */
-#define EVLOG_FLUSH_EVERY_N  8                /* fsync every N records. Was 1 (per-record) to shrink the
-                                               * brownout-loss window to one record (audit G3/B2) — but each
-                                               * fsync rewrites the FAT sector + dir entry IN PLACE, so at the
-                                               * field cadence that was thousands of in-place metadata writes
-                                               * per day, each one a corruption window if power dies mid-write
-                                               * (FATFS has no journal; consumer-card FTLs can tear a whole
-                                               * erase block on power loss). Batching trades ≤8 records /
-                                               * ≤1.5 s of loss — which at-least-once delivery already
-                                               * tolerates — for ~8× less FAT exposure; a corrupted FAT loses
-                                               * the ENTIRE backlog. The low-battery persistence
-                                               * park (app_main) closes the predictable-brownout case. Claims
-                                               * of tail records still flush first, so publishing never sees a
-                                               * stale tail. */
+#endif
+/* DURABLE ACCEPTANCE: store_event returns ESP_OK only after the record's bytes
+ * are fsync'd. Until v2.4.2 the tail was flushed every 8 records / 1.5 s, so up
+ * to 8 records reported "saved" could vanish in a brownout. That batching was
+ * sized for FAT, where every fsync rewrote the FAT sector + dir entry in place;
+ * on copy-on-write littlefs a sync commits a new metadata pair and cannot tear
+ * the volume, so per-record durability costs only flash writes (at field
+ * cadence, decades of wear budget on this partition). */
+#ifndef EVLOG_ARCHIVE_EVERY_N
+#define EVLOG_ARCHIVE_EVERY_N 1000            /* SD transfer burst once per N stores */
+#endif
 #define EVLOG_CURSOR_BATCH   16               /* persist read cursor every N acks */
 #define EVLOG_ID_BLOCK       64               /* reserve next_id in blocks → 1 NVS write / 64 ids */
-#define EVLOG_SCAN_MAX_LINES 20000            /* bound the boot pending-count (stat only) */
-#define EVLOG_SCAN_MAX_MS    3000             /* …and its wall-clock, so a huge/slow backlog can't churn on */
+#define EVLOG_SCAN_MAX_LINES 20000            /* bound an UNINDEXED-file pending count (stat only) */
+#define EVLOG_SCAN_MAX_MS    3000             /* …and its wall-clock */
+#ifndef EVLOG_MIN_FREE_BYTES
 #define EVLOG_MIN_FREE_BYTES (256 * 1024)     /* storage-full watermark: refuse writes below this (audit C1/C2) */
+#endif
+#ifndef EVLOG_EVICT_TARGET
 #define EVLOG_EVICT_TARGET   (512 * 1024)     /* eviction hysteresis: clean synced files until this much is free */
-#define EVLOG_ARCHIVE_EVERY_N 1000            /* bulk-archive synced files to SD once per N stores */
+#endif
 #define EVLOG_OOM_STUCK_MAX  30               /* NO_MEM retries on one head record → quarantine it (audit D2) */
+/* Pressure: below this share of the partition free, the store wakes the keeper
+ * at once (not at the next 1000-store burst); the keeper spools and reclaims
+ * verified copies oldest-first until EVQ_RECLAIM_PCT is free again. */
+#ifndef EVQ_PRESSURE_PCT
+#define EVQ_PRESSURE_PCT     25
+#endif
+#ifndef EVQ_RECLAIM_PCT
+#define EVQ_RECLAIM_PCT      40
+#endif
+/* Never fill the card: sd_logger and AMBIT firmware images share it. */
+#ifndef EVQ_SD_RESERVE_BYTES
+#define EVQ_SD_RESERVE_BYTES (64ULL * 1024 * 1024)
+#endif
+#ifndef EVQ_INDEX_CAP
+#define EVQ_INDEX_CAP        4096             /* segments (~1 GiB at 256 KiB) — PSRAM table */
+#endif
+#define EVQ_INDEX_CAP_FALLBACK 512            /* PSRAM-absent boot */
+#ifndef EVQ_INDEX_COMPACT_BYTES
+#define EVQ_INDEX_COMPACT_BYTES (48 * 1024)
+#endif
+#ifndef EVQ_KEEPER_PERIOD_MS
+#define EVQ_KEEPER_PERIOD_MS 60000
+#endif
+#ifndef EVQ_SD_BACKOFF_MIN_MS
+#define EVQ_SD_BACKOFF_MIN_MS 60000
+#endif
+#ifndef EVQ_SD_BACKOFF_MAX_MS
+#define EVQ_SD_BACKOFF_MAX_MS (30 * 60000)
+#endif
+#define EVQ_FALLBACK_NAME_BASE 3000000000U    /* primary collision fallback: above any measure_id */
 
 _Static_assert(PUBLISH_WINDOW_SLOTS > 0 && PUBLISH_WINDOW_SLOTS <= 16,
                "publish window must fit the firmware's 16-slot ACK table");
 _Static_assert(PUBLISH_WINDOW_BYTES > 0, "publish window byte budget must be non-zero");
+_Static_assert(EVQ_RECLAIM_PCT > EVQ_PRESSURE_PCT, "reclaim target must exceed the pressure watermark");
 
 #define NVS_NS               "evlog"
-#define NVS_KEY_RD_SEQ       "rd_seq"
+#define NVS_KEY_RD_SEQ       "rd_seq"   /* legacy cursor keys — still written for rollback */
 #define NVS_KEY_RD_OFF       "rd_off"
+#define NVS_KEY_CUR          "cur"      /* atomic cursor blob {seq, off, crc}; only this firmware writes it */
 #define NVS_KEY_NID          "nid"
-/* (The former "card_id" CID-binding key is gone: the store and its NVS cursor now
- * live on the same soldered-down device, so a cursor can never meet a foreign log —
- * the audit I2/I3 card-swap failure class is structurally impossible internally.) */
+
+typedef struct {
+    uint32_t seq;
+    uint32_t off;
+    uint32_t crc;
+} evlog_cursor_blob_t;
 
 static SemaphoreHandle_t s_mtx = NULL;
 static StaticSemaphore_t s_mtx_storage;
-/* volatile: event_log_on_sd_lost flips this false WITHOUT s_mtx (it may not be
- * able to take the lock in time when a writer is stuck in a failing transfer),
- * so the flag must be observed promptly by the next store. */
+/* volatile: read lock-free by the racy keeper trigger checks. */
 static volatile bool s_available = false;
-/* Composition-root callback: an SD reopen rebuilds this component's volatile
- * claim window from the durable cursor, so the MQTT peer must discard its RAM
- * correlation table/queue at the same boundary. Stored once during boot. */
+/* Composition-root callback: invariant recovery rebuilds this component's
+ * volatile claim window from the durable cursor, so the MQTT peer must discard
+ * its RAM correlation table/queue at the same boundary. Stored once during boot. */
 static void (*s_reset_notifier)(void) = NULL;
 /* Set only under s_mtx when an invariant-recovery path discards the event window.
  * The mutating caller consumes it before releasing s_mtx, then invokes the peer
@@ -146,21 +237,30 @@ static void (*s_reset_notifier)(void) = NULL;
  * dependency boundary without leaving the two RAM windows divergent for 60 s. */
 static bool s_reset_pending = false;
 
-/* Tail (write) file. */
+/* Tail (write) file + its running segment statistics (become the index S line
+ * at rotation, so a rotated file's CRC is known without re-reading it). */
 static FILE     *s_wf        = NULL;
 static uint32_t  s_tail_seq  = 1;
 static long      s_tail_size = 0;
+static uint32_t  s_tail_count = 0;
+static uint32_t  s_tail_crc   = 0;
+static int64_t   s_tail_first_id = 0;
+static int64_t   s_tail_last_id  = 0;
 
 /* Read cursor (the next record to publish). */
 static uint32_t  s_rd_seq = 1;
 static long      s_rd_off = 0;
+/* Records (complete lines) before s_rd_off in the cursor file — the exact
+ * pending count subtracts it. Unknown until the boot offset is validated. */
+static uint32_t  s_cur_consumed = 0;
+static bool      s_cur_validated = false;
 
 /* RAM-only claim window over the durable read cursor.  Slots are ordered by
  * (seq,off) and remain in this array until they leave the contiguous ACKed
  * prefix.  `claimed=false && !acked` is a reverted record and is always returned
  * before a new offset is admitted; this is what makes a mid-window timeout or
  * disconnect replay FIFO rather than leaking past the gap.  The cursor, rotated
- * file deletion, pending count, and NVS persistence NEVER follow the claim tail.
+ * file retirement, pending count, and NVS persistence NEVER follow the claim tail.
  * They move only when slot zero is ACKed (or explicitly frontier-quarantined).
  *
  * Per-slot token invariant, paired with device_commands' msg-id table: an
@@ -183,31 +283,93 @@ static size_t              s_window_bytes = 0;
 static int64_t   s_next_id  = 1;
 static int64_t   s_id_limit = 1;
 
-/* Counters (re-derived on boot). Every present record is unsynced ⇒ total==pending.
- * s_pending is counted off the boot path by evlog_count_task (see below). */
-static int64_t     s_pending    = 0;
-static TaskHandle_t s_count_task = NULL;   /* one-shot boot backlog counter */
+/* Segment index (RAM fold of EVQ_INDEX_PATH). */
+static evq_index_t s_ix;
+static bool        s_ix_ready = false;
 
-/* Flush / cursor-persist bookkeeping. */
-static uint32_t   s_writes_since_flush = 0;
-static TickType_t s_last_flush_tick    = 0;
+/* Unindexed rotated flash files at/after the cursor (pre-upgrade files, or a
+ * crash between rotation and its S line). Pending is only a FLOOR while any
+ * exist; the keeper indexes them. s_unidx_floor is their bounded line count. */
+static bool      s_unidx_present = false;
+static int64_t   s_unidx_floor   = 0;
+/* Records in UNOWNED /sdcard/events files (pre-internal-store backlog, an
+ * index-lost spool, a rollback leftover) that the keeper will import. They are
+ * owed, so they count as pending (inside reimport_pending): a card holding
+ * them is never reported as an empty backlog. Unknown until the card was
+ * scanned in this session → pending is a floor. */
+static int64_t   s_legacy_pending = 0;
+static bool      s_legacy_known   = false;
+static uint32_t  s_legacy_counted_epoch = 0;   /* one full scan per card mount, then decrements */
+
+/* Bookkeeping. */
 static uint32_t   s_acks_since_persist = 0;
-static uint32_t   s_stores_since_archive = 0;   /* bulk-SD-archive trigger counter */
+static uint32_t   s_stores_since_archive = 0;   /* SD transfer burst trigger */
 
-/* Health / loss accounting (surfaced via event_log_health for the STATUS heartbeat,
- * so silent-skip and drop sites become observable in the field). */
-static int64_t   s_skipped       = 0;   /* records/files skipped at the cursor without publishing */
-static int64_t   s_dropped       = 0;   /* records refused/dropped at store (too-large, full, short-write) */
+/* Health / loss accounting (event_log_health → STATUS metadata + `evlog`). */
+static int64_t   s_skipped       = 0;   /* legacy aggregate: records passed without publish */
+static int64_t   s_dropped       = 0;   /* legacy aggregate: records refused at store */
 static int64_t   s_last_acked_id = 0;   /* highest measure_id confirmed synced (PUBACK) */
-/* Storage-full is distinct from card-loss: a full card is HEALTHY, so we pause
- * writes WITHOUT reporting an I/O error (which would unmount it + restart measurement).
- * The drain keeps running, frees space, and store admission re-enables writes. */
+static int64_t   s_refused_full = 0, s_refused_media = 0, s_refused_too_large = 0, s_refused_unavailable = 0;
+static int64_t   s_quarantined_poison = 0, s_quarantined_malformed = 0, s_corrupt_detected = 0;
+static int64_t   s_skipped_unindexed_gap = 0;
+static uint8_t   s_corrupt_medium = EVQ_MEDIUM_NONE;
+static uint32_t  s_pressure_notifies = 0, s_sd_bursts = 0;
+static uint32_t  s_spool_files = 0, s_spool_errors = 0, s_mirror_used = 0;
+static uint32_t  s_reclaimed_files = 0, s_archived_files = 0, s_reimported_files = 0;
+static uint32_t  s_sd_bad_copies = 0;          /* damaged SD copies moved aside (kept, never delivered) */
+static uint32_t  s_sd_retired_names = 0;       /* .tmp names retired (renamed aside, never unlinked) — on the card now */
+/* Archive retry bound (eval R2-F1): consecutive failed archive passes of the
+ * same segment. After EVQ_ARCHIVE_TRIES an unreadable SD copy is treated as
+ * damaged (moved aside) instead of being retried forever. Keeper-only. */
+#define EVQ_ARCHIVE_TRIES 3
+static uint32_t  s_arch_fail_seq = 0;
+static uint8_t   s_arch_fail_n = 0;
+/* Storage-full is distinct from card-loss: a full store is HEALTHY, so we pause
+ * writes WITHOUT reporting an I/O error. The drain + keeper free space and
+ * store admission re-enables writes. */
 static volatile bool s_write_full = false;
 /* Head-of-line OOM tracking: a record too big to strdup on the fragmented heap is
  * retried; after EVLOG_OOM_STUCK_MAX strikes on the SAME head it is quarantined so
  * the drain advances instead of reboot-looping. */
 static int64_t   s_oom_head_id = 0;
 static uint32_t  s_oom_strikes = 0;
+
+/* Head block: why the cursor currently waits (EVQ_BLOCK_*). Set when claim at
+ * the frontier returns ESP_ERR_NOT_FINISHED; cleared when the frontier moves. */
+static uint8_t   s_head_block = EVQ_BLOCK_NONE;
+
+/* SD observation (updated under s_mtx by claim + keeper). The epoch bumps on
+ * every mount/CID transition and invalidates cached verifications. */
+static volatile bool s_sd_parked = false;       /* low-battery guard (app_main) */
+#if EVQ_HIL_ON
+/* HIL state (docs/evq-sd-overflow-hil-contract.md). The hold and the gate
+ * override live in RTC_NOINIT memory so the injected CPU/ROM resets keep
+ * them; the rest is RAM (cleared by any reset). */
+static bool     evq_hil_hold_active(void);
+static volatile bool s_hil_keeper_paused = false;
+static uint64_t s_hil_reserve = 0;
+static uint32_t s_hil_cid = 0;
+static uint64_t s_hil_claims[4];              /* OK, NOT_FOUND, NOT_FINISHED, other */
+static void     evq_hil_note_line(int64_t id, const char *const parts[], const size_t lens[], size_t n);
+#endif
+static bool      s_sd_last_mounted = false;
+static uint32_t  s_sd_last_cid = 0;
+static uint32_t  s_sd_epoch = 1;
+static volatile uint32_t s_sd_notify_epoch = 0;   /* bumped lock-free by event_log_sd_notify */
+static uint32_t  s_sd_notify_seen = 0;
+static uint32_t  s_sd_repaired_epoch = 0;       /* epoch whose SD-side repair ran */
+static uint8_t   s_sd_state = EVQ_SD_ABSENT;
+static bool      s_sd_mismatch_park = false;
+static bool      s_sd_full = false;
+static TickType_t s_sd_backoff_until = 0;
+static uint32_t  s_sd_backoff_ms = 0;
+static bool      s_sd_backoff_active = false;
+
+/* Keeper. */
+static TaskHandle_t      s_keeper_task = NULL;
+static volatile bool     s_keeper_wake_pending = false;
+static volatile uint32_t s_keeper_pin_seq = 0;   /* file being copied: exempt from eviction */
+static char   *s_kbuf = NULL;                    /* keeper-private I/O buffer (s_line_cap) */
 
 /* One reusable read/claim buffer, allocated once before the log opens. On the
  * normal board malloc(65568) is routed to PSRAM by
@@ -220,6 +382,9 @@ static uint32_t  s_oom_strikes = 0;
 static char   *s_line       = NULL;
 static size_t  s_line_cap   = 0;
 static size_t  s_max_record = 0;
+
+static void evq_keeper_notify(void);
+static void evlog_persist_cursor_locked(void);
 
 /* ── small helpers ───────────────────────────────────────────────────── */
 
@@ -244,6 +409,10 @@ static esp_err_t evlog_allocate_line_buffer(void)
 
     s_line_cap = cap;
     s_max_record = cap - EVLOG_RECORD_GUARD_BYTES;
+    /* The keeper streams SD copies/imports on its own task without s_mtx, so it
+     * gets its own buffer of the same size (a reimported line can be a full
+     * record). Absent → the keeper simply does no SD work this session. */
+    s_kbuf = malloc(cap);
     if (cap == EVLOG_LINE_CAP_NORMAL) {
         ESP_LOGI(TAG, "event-line buffer: %u B (PSRAM policy), max record %u B",
                  (unsigned)s_line_cap, (unsigned)s_max_record);
@@ -261,10 +430,20 @@ static void evlog_file_path(char *buf, size_t cap, uint32_t seq)
 
 static long evlog_file_size(uint32_t seq)
 {
-    char path[64];
+    char path[EVQ_PATH_MAX];
     evlog_file_path(path, sizeof path, seq);
     struct stat st;
     return (stat(path, &st) == 0) ? (long)st.st_size : 0;
+}
+
+static bool evlog_flash_exists(uint32_t seq, long *size)
+{
+    char path[EVQ_PATH_MAX];
+    evlog_file_path(path, sizeof path, seq);
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    if (size) *size = (long)st.st_size;
+    return true;
 }
 
 static void evlog_window_clear_locked(void)
@@ -300,10 +479,14 @@ static bool parse_ev_name(const char *name, uint32_t *seq)
     if (strncmp(name, "ev-", 3) != 0) return false;
     const char *p = name + 3;
     if (!isdigit((unsigned char)*p)) return false;
-    uint32_t v = 0;
-    while (isdigit((unsigned char)*p)) { v = v * 10u + (uint32_t)(*p - '0'); p++; }
+    uint64_t v = 0;
+    while (isdigit((unsigned char)*p)) {
+        v = v * 10u + (uint64_t)(*p - '0');
+        if (v > UINT32_MAX) return false;
+        p++;
+    }
     if (strcmp(p, ".log") != 0) return false;
-    *seq = v;
+    *seq = (uint32_t)v;
     return true;
 }
 
@@ -344,9 +527,9 @@ static void sanitize_field(char *dst, size_t cap, const char *src)
     dst[j] = '\0';
 }
 
-/* Flush + fsync the tail. Returns ESP_FAIL if the underlying media write failed
- * (a full/dying card), so callers can surface it instead of counting torn data as
- * durable. Returns ESP_OK when there is nothing open to flush. */
+/* Flush + fsync the tail. Returns ESP_FAIL if the underlying media write failed,
+ * so callers can surface it instead of counting torn data as durable. Returns
+ * ESP_OK when there is nothing open to flush. */
 static esp_err_t evlog_flush_writer_locked(void)
 {
     if (s_wf == NULL) return ESP_OK;
@@ -362,7 +545,7 @@ static esp_err_t evlog_flush_writer_locked(void)
 static esp_err_t evlog_reopen_tail_locked(void)
 {
     if (s_wf != NULL) return ESP_OK;
-    char path[64];
+    char path[EVQ_PATH_MAX];
     evlog_file_path(path, sizeof path, s_tail_seq);
     s_wf = fopen(path, "a");
     if (s_wf == NULL) return ESP_FAIL;
@@ -370,120 +553,552 @@ static esp_err_t evlog_reopen_tail_locked(void)
     return ESP_OK;
 }
 
-/* Copy rec_len raw bytes at the current cursor to quarantine.log (archive-before-skip).
- * Used only by the OOM head-of-line escape, where parse_record has already mangled
- * s_line, so we re-read the raw record from disk. Clobbers s_line. Caller holds s_mtx.
- *
- * Window-safety contract: expected_measure_id MUST still identify the record at
- * the persisted cursor frontier. The claim window can parse a later slot, but
- * this head-only escape may never archive/advance that later slot's length at
- * s_rd_off. Re-reading and comparing the frontier id makes mismatch fail closed. */
-static bool evlog_archive_head_locked(long rec_len, int64_t expected_measure_id)
+/* ── segment index glue ────────────────────────────────────────────────── */
+
+static bool evq_pos_before_watermark(uint32_t seq, long off)
 {
-    if (rec_len <= 0 || rec_len >= (long)s_line_cap) return false;
-    char path[64];
-    evlog_file_path(path, sizeof path, s_rd_seq);
-    FILE *rf = fopen(path, "rb");
-    if (rf == NULL) return false;
-    bool ok = false;
-    if (fseek(rf, s_rd_off, SEEK_SET) == 0 &&
-        fread(s_line, 1, (size_t)rec_len, rf) == (size_t)rec_len) {
-        s_line[rec_len] = '\0';
-        int64_t frontier_id = (int64_t)strtoll(s_line, NULL, 10);
-        if (s_line[rec_len - 1] != '\n' || frontier_id != expected_measure_id) {
-            ESP_LOGW(TAG, "OOM archive refused: cursor seq=%u off=%ld holds id=%lld, expected id=%lld",
-                     (unsigned)s_rd_seq, s_rd_off, (long long)frontier_id,
-                     (long long)expected_measure_id);
-        } else {
-            FILE *qf = fopen(EVLOG_QUARANTINE, "a");
-            if (qf != NULL) {
-                size_t w = fwrite(s_line, 1, (size_t)rec_len, qf);
-                fflush(qf);
-                fsync(fileno(qf));
-                fclose(qf);
-                ok = (w == (size_t)rec_len);
+    if (!s_ix.have_watermark) return true;
+    if (seq != s_ix.wm_seq) return seq < s_ix.wm_seq;
+    return (uint32_t)off < s_ix.wm_off;
+}
+
+/* Durable index append (caller holds s_mtx). Failures are logged; every caller
+ * treats a failed append as "state did not change" — the RAM fold only moves on
+ * success (evq_index_append), so RAM never runs ahead of disk. */
+#define EVQ_IX_APPEND(...) evq_index_append(&s_ix, EVQ_INDEX_PATH, __VA_ARGS__)
+
+static void evq_index_maybe_compact_locked(void)
+{
+    if (!s_ix_ready || s_ix.file_bytes < EVQ_INDEX_COMPACT_BYTES) return;
+    if (evq_index_compact(&s_ix, EVQ_INDEX_PATH, EVQ_INDEX_TMP) == ESP_OK) {
+        ESP_LOGI(TAG, "segment index compacted: %u line(s), %u B",
+                 (unsigned)s_ix.lines, (unsigned)s_ix.file_bytes);
+    }
+}
+
+/* Register a just-rotated (closed) file with its running statistics. */
+static void evq_register_rotated_locked(uint32_t seq, int64_t first, int64_t last,
+                                        uint32_t count, uint32_t bytes, uint32_t crc)
+{
+    if (!s_ix_ready || count == 0) return;
+    esp_err_t err = EVQ_IX_APPEND("S %" PRIu32 " %lld %lld %" PRIu32 " %" PRIu32 " %08" PRIx32,
+                                  seq, (long long)first, (long long)last, count, bytes, crc);
+    if (err == ESP_OK) {
+        evq_seg_t *s = evq_index_find(&s_ix, seq);
+        if (s) s->flash_present = true;
+    } else {
+        /* Stays unindexed: flash-only, never spooled or reclaimed until the
+         * keeper indexes it by scanning. */
+        s_unidx_present = true;
+        ESP_LOGW(TAG, "index S line for ev-%06u.log failed (%s) — keeper will index it",
+                 (unsigned)seq, esp_err_to_name(err));
+    }
+}
+
+/* ── SD observation ─────────────────────────────────────────────────────── */
+
+/* Refresh the SD view (no FS operation: mount flag, CID, loss latch, park flag
+ * only — a mismatched card must receive ZERO operations, and deciding that must
+ * not itself touch the card). Caller holds s_mtx. */
+static void evq_sd_observe_locked(void)
+{
+    bool mounted = sdcard_is_mounted();
+    uint32_t cid = mounted ? sdcard_card_serial() : 0;
+#if EVQ_HIL_ON
+    if (mounted && s_hil_cid != 0) cid = s_hil_cid;     /* injected card swap (M-4) */
+#endif
+    uint32_t ne = s_sd_notify_epoch;
+    if (mounted != s_sd_last_mounted || cid != s_sd_last_cid || ne != s_sd_notify_seen) {
+        s_sd_notify_seen = ne;
+        s_sd_epoch++;
+        s_sd_last_mounted = mounted;
+        s_sd_last_cid = cid;
+        s_sd_full = false;
+        s_sd_backoff_active = false;
+        s_sd_backoff_ms = 0;
+        if (mounted) evq_keeper_notify();
+    }
+
+    /* A card is parked (zero operations) when any obligation that only an SD
+     * copy can satisfy — SD_ONLY or REIMPORT — lives on another CID. */
+    bool park = false;
+    if (mounted) {
+        for (size_t i = 0; i < s_ix.n; i++) {
+            const evq_seg_t *s = &s_ix.segs[i];
+            if ((s->state == EVQ_SEG_SD_ONLY || s->state == EVQ_SEG_REIMPORT ||
+                 (s->state == EVQ_SEG_DELIVERED && !s->flash_present && s->seq >= s_rd_seq)) &&
+                s->cid != 0 && s->cid != cid) {
+                park = true;
+                break;
             }
         }
     }
-    fclose(rf);
+    s_sd_mismatch_park = park;
+
+#if EVQ_HIL_ON
+    /* The HIL boot hold is a SEPARATE flag: the power guard's un-park
+     * (event_log_set_sd_parked(false)) can never release it. */
+    if (s_sd_parked || evq_hil_hold_active()) s_sd_state = EVQ_SD_PARKED;
+#else
+    if (s_sd_parked)            s_sd_state = EVQ_SD_PARKED;
+#endif
+    else if (!mounted)          s_sd_state = sdcard_io_lost() ? EVQ_SD_LOST : EVQ_SD_ABSENT;
+    else if (sdcard_io_lost())  s_sd_state = EVQ_SD_LOST;
+    else if (park)              s_sd_state = EVQ_SD_MISMATCH;
+    else if (s_sd_full)         s_sd_state = EVQ_SD_FULL;
+    else                        s_sd_state = EVQ_SD_OK;
+}
+
+static bool evq_sd_usable_locked(void)
+{
+    evq_sd_observe_locked();
+    return s_sd_state == EVQ_SD_OK || s_sd_state == EVQ_SD_FULL;
+}
+
+/* ── SD file helpers (keeper + claim) ──────────────────────────────────── */
+
+typedef struct {
+    uint32_t crc;
+    uint32_t bytes;
+    uint32_t count;
+    int64_t  first_id;
+    int64_t  last_id;
+    bool     framed;     /* every line newline-terminated (last byte '\n') */
+    bool     io_error;
+} evq_scan_t;
+
+/* Stream a file computing size, CRC and line structure. `buf` is scratch of
+ * `cap` bytes. Needs no line buffer: ids are parsed from the first digits after
+ * each newline (records begin with their measure_id). */
+static bool evq_scan_file(const char *path, char *buf, size_t cap, evq_scan_t *out)
+{
+    memset(out, 0, sizeof *out);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return false;
+    uint32_t crc = 0;
+    bool at_line_start = true, parsing_id = false;
+    int64_t cur_id = 0;
+    char last = '\n';
+    size_t n;
+    while ((n = fread(buf, 1, cap, f)) > 0) {
+        crc = evq_crc32(crc, buf, n);
+        out->bytes += (uint32_t)n;
+        for (size_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (at_line_start) {
+                at_line_start = false;
+                parsing_id = true;
+                cur_id = 0;
+            }
+            if (parsing_id) {
+                if (c >= '0' && c <= '9') cur_id = cur_id * 10 + (c - '0');
+                else parsing_id = false;
+            }
+            if (c == '\n') {
+                out->count++;
+                if (out->count == 1) out->first_id = cur_id;
+                out->last_id = cur_id;
+                at_line_start = true;
+                parsing_id = false;
+            }
+        }
+        last = buf[n - 1];
+    }
+    out->io_error = ferror(f) != 0;
+    fclose(f);
+    out->crc = crc;
+    out->framed = (out->bytes == 0) || last == '\n';
+    return !out->io_error;
+}
+
+static bool evq_scan_matches(const evq_scan_t *sc, const evq_seg_t *s)
+{
+    return sc->framed && !sc->io_error && sc->bytes == s->bytes && sc->crc == s->crc &&
+           sc->count == s->count && sc->first_id == s->first_id && sc->last_id == s->last_id;
+}
+
+static void evq_sd_primary_path(char *buf, size_t cap, const char *name)
+{
+    snprintf(buf, cap, "%s/%s", EVLOG_LEGACY_SD_DIR, name);
+}
+static void evq_sd_mirror_path(char *buf, size_t cap, const char *name)
+{
+    snprintf(buf, cap, "%s/%s", EVQ_MIRROR_DIR, name);
+}
+
+static void evq_sd_backoff_locked(void)
+{
+    s_spool_errors++;
+    s_sd_backoff_ms = s_sd_backoff_ms == 0 ? EVQ_SD_BACKOFF_MIN_MS
+                    : (s_sd_backoff_ms * 2 > EVQ_SD_BACKOFF_MAX_MS ? EVQ_SD_BACKOFF_MAX_MS : s_sd_backoff_ms * 2);
+    s_sd_backoff_until = xTaskGetTickCount() + pdMS_TO_TICKS(s_sd_backoff_ms);
+    s_sd_backoff_active = true;
+    ESP_LOGW(TAG, "SD transfer error — backing off %u ms", (unsigned)s_sd_backoff_ms);
+}
+
+static bool evq_sd_backoff_elapsed(void)
+{
+    if (!s_sd_backoff_active) return true;
+    return (int32_t)(xTaskGetTickCount() - s_sd_backoff_until) >= 0;
+}
+
+/* ── read-source abstraction (claim / quarantine / OOM archive) ─────────── */
+
+typedef struct {
+    FILE   *f;
+    bool    sd_ref;
+    uint8_t medium;
+} evq_rd_t;
+
+static void evq_rd_close(evq_rd_t *rd)
+{
+    if (rd->f != NULL) fclose(rd->f);
+    if (rd->sd_ref) sdcard_io_end();
+    rd->f = NULL;
+    rd->sd_ref = false;
+}
+
+/* Move a damaged SD copy of segment `seq` aside to /sdcard/evq/bad-<seq>-<k>.log
+ * (contract amendment A1): the bytes are kept for inspection, never deleted,
+ * but leave /sdcard/events (a rolled-back firmware would import them verbatim)
+ * and the m-* mirror names (orphan-mirror import). Caller holds an SD ref.
+ * A rename touches only directory entries, so it works on a copy whose data
+ * clusters no longer read back. */
+static bool evq_sd_move_aside(const char *path, uint32_t seq)
+{
+    char bad[EVQ_PATH_MAX];
+    struct stat bst;
+    unsigned k = 0;
+    for (; k < 100; k++) {
+        snprintf(bad, sizeof bad, "%s/bad-%06u-%u.log", EVQ_MIRROR_DIR, (unsigned)seq, k);
+        if (stat(bad, &bst) != 0) break;
+    }
+    if (k == 100 || rename(path, bad) != 0) return false;
+    s_sd_bad_copies++;
+    ESP_LOGW(TAG, "damaged copy %s moved aside to %s", path, bad);
+    return true;
+}
+
+/* Verify one SD copy of `s` in place (caller holds s_mtx AND an SD ref). */
+static bool evq_sd_verify_copy_locked(const evq_seg_t *s, bool mirror)
+{
+    char path[EVQ_PATH_MAX];
+    if (mirror) evq_sd_mirror_path(path, sizeof path, s->mirror);
+    else        evq_sd_primary_path(path, sizeof path, s->primary);
+    evq_scan_t sc;
+    if (!evq_scan_file(path, s_line, s_line_cap, &sc)) return false;
+    return evq_scan_matches(&sc, s);
+}
+
+/* Open a verified SD copy of `s` for reading. Holds an SD ref on success.
+ * On failure sets *block to the reason and returns ESP_ERR_NOT_FINISHED. */
+static esp_err_t evq_sd_open_verified_locked(evq_seg_t *s, evq_rd_t *rd, uint8_t *block)
+{
+    if (!evq_sd_usable_locked()) {
+        *block = (s_sd_state == EVQ_SD_PARKED)   ? EVQ_BLOCK_SD_PARKED
+               : (s_sd_state == EVQ_SD_MISMATCH) ? EVQ_BLOCK_SD_MISMATCH
+               : (s_sd_state == EVQ_SD_LOST)     ? EVQ_BLOCK_SD_LOST : EVQ_BLOCK_SD_ABSENT;
+        return ESP_ERR_NOT_FINISHED;
+    }
+    if (s->cid != s_sd_last_cid) { *block = EVQ_BLOCK_SD_MISMATCH; return ESP_ERR_NOT_FINISHED; }
+    if (!sdcard_io_begin()) { *block = EVQ_BLOCK_SD_LOST; return ESP_ERR_NOT_FINISHED; }
+
+    if (s->sd_verified_epoch != s_sd_epoch) {
+        EVQ_FAULT_POINT("claim.sd_read_error");
+        uint8_t which = 0;
+        if (s->primary[0] != '\0' && evq_sd_verify_copy_locked(s, false)) {
+            which = 1;
+        } else if (s->mirror[0] != '\0' && evq_sd_verify_copy_locked(s, true)) {
+            which = 2;
+            s_mirror_used++;
+            ESP_LOGW(TAG, "ev-%06u.log: SD primary failed verification — using mirror", (unsigned)s->seq);
+            /* The damaged primary is kept for inspection (bytes untouched) but
+             * moved out of /sdcard/events, where a rolled-back firmware would
+             * import it verbatim. */
+            char pp[EVQ_PATH_MAX];
+            evq_sd_primary_path(pp, sizeof pp, s->primary);
+            struct stat bst;
+            if (stat(pp, &bst) == 0) (void)evq_sd_move_aside(pp, s->seq);
+        }
+        if (which == 0) {
+            char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
+            evq_sd_primary_path(pp, sizeof pp, s->primary);
+            evq_sd_mirror_path(mp, sizeof mp, s->mirror);
+            struct stat st;
+            bool any = stat(pp, &st) == 0 || stat(mp, &st) == 0;
+            sdcard_io_end();
+            *block = any ? EVQ_BLOCK_BACKLOG_CORRUPT : EVQ_BLOCK_BACKLOG_MISSING;
+            if (any) s_corrupt_medium = EVQ_MEDIUM_SD;
+            return ESP_ERR_NOT_FINISHED;
+        }
+        s->sd_verified_epoch = s_sd_epoch;
+        s->sd_verified_which = which;
+    }
+
+    char path[EVQ_PATH_MAX];
+    if (s->sd_verified_which == 2) evq_sd_mirror_path(path, sizeof path, s->mirror);
+    else                           evq_sd_primary_path(path, sizeof path, s->primary);
+    EVQ_FAULT_POINT("claim.sd_short_read");
+    rd->f = fopen(path, "rb");
+    if (rd->f == NULL) {
+        sdcard_io_end();
+        s->sd_verified_epoch = 0;             /* re-verify next time */
+        *block = EVQ_BLOCK_SD_LOST;
+        sdcard_report_io_error();
+        return ESP_ERR_NOT_FINISHED;
+    }
+    rd->sd_ref = true;
+    rd->medium = EVQ_MEDIUM_SD;
+    return ESP_OK;
+}
+
+/* Verify a rotated flash file's CRC once per boot (G8: post-commit flash
+ * corruption must be detected, not delivered). Caller holds s_mtx. */
+static bool evq_flash_crc_ok_locked(evq_seg_t *s)
+{
+    if (s->flash_crc_checked == 0) {
+        char path[EVQ_PATH_MAX];
+        evlog_file_path(path, sizeof path, s->seq);
+        evq_scan_t sc;
+        bool ok = evq_scan_file(path, s_line, s_line_cap, &sc) && evq_scan_matches(&sc, s);
+        s->flash_crc_checked = ok ? 1 : 2;
+        if (!ok) {
+            s_corrupt_detected += s->count;
+            ESP_LOGE(TAG, "ev-%06u.log: flash copy fails its index CRC — never delivered from flash",
+                     (unsigned)s->seq);
+        }
+    }
+    return s->flash_crc_checked == 1;
+}
+
+/* Open queue file `seq` for reading from whichever verified copy exists.
+ *   ESP_OK               rd open (flash or verified SD)
+ *   ESP_ERR_NOT_FINISHED an indexed obligation that cannot be read now (*block)
+ *   ESP_ERR_NOT_FOUND    no copy anywhere and not indexed (pre-upgrade gap)
+ *   ESP_FAIL             flash I/O error
+ * Caller holds s_mtx. */
+static esp_err_t evq_open_read_locked(uint32_t seq, evq_rd_t *rd, uint8_t *block)
+{
+    memset(rd, 0, sizeof *rd);
+    *block = EVQ_BLOCK_NONE;
+    char path[EVQ_PATH_MAX];
+    evlog_file_path(path, sizeof path, seq);
+    evq_seg_t *s = (seq < s_tail_seq) ? evq_index_find(&s_ix, seq) : NULL;
+
+    errno = 0;
+    FILE *f = fopen(path, "rb");
+    if (f != NULL) {
+        if (s != NULL && !evq_flash_crc_ok_locked(s)) {
+            fclose(f);
+            if (s->primary[0] != '\0') {
+                esp_err_t e = evq_sd_open_verified_locked(s, rd, block);
+                if (e == ESP_OK) return ESP_OK;
+                if (*block == EVQ_BLOCK_BACKLOG_CORRUPT || *block == EVQ_BLOCK_BACKLOG_MISSING) {
+                    s_corrupt_medium = EVQ_MEDIUM_FLASH;
+                    *block = EVQ_BLOCK_BACKLOG_CORRUPT;
+                }
+                return e;
+            }
+            s_corrupt_medium = EVQ_MEDIUM_FLASH;
+            *block = EVQ_BLOCK_BACKLOG_CORRUPT;
+            return ESP_ERR_NOT_FINISHED;
+        }
+        rd->f = f;
+        rd->medium = EVQ_MEDIUM_FLASH;
+        return ESP_OK;
+    }
+    if (errno != ENOENT) return ESP_FAIL;
+    if (seq >= s_tail_seq) return ESP_ERR_NOT_FOUND;
+    if (s == NULL) return ESP_ERR_NOT_FOUND;
+    if (s->flash_present) s->flash_present = false;
+    if (s->primary[0] == '\0' || s->state == EVQ_SEG_FLASH || s->state == EVQ_SEG_REIMPORT) {
+        *block = EVQ_BLOCK_BACKLOG_MISSING;         /* indexed, no SD copy: wait, never skip */
+        return ESP_ERR_NOT_FINISHED;
+    }
+    return evq_sd_open_verified_locked(s, rd, block);
+}
+
+/* Size of queue file `seq` from whichever copy defines it (flash stat, else
+ * the index). false = unknown (cursor must not advance past it). */
+static bool evq_file_size_locked(uint32_t seq, long *size)
+{
+    if (evlog_flash_exists(seq, size)) return true;
+    evq_seg_t *s = evq_index_find(&s_ix, seq);
+    if (s != NULL && s->primary[0] != '\0' &&
+        (s->state == EVQ_SEG_SPOOLED || s->state == EVQ_SEG_SD_ONLY || s->state == EVQ_SEG_DELIVERED)) {
+        *size = (long)s->bytes;
+        return true;
+    }
+    return false;
+}
+
+/* ── quarantine (intact copy BEFORE the cursor moves) ──────────────────── */
+
+typedef enum { EVQ_Q_POISON, EVQ_Q_MALFORMED } evq_qclass_t;
+
+/* Copy `len` raw bytes at `off` of queue file `seq` to quarantine.log and fsync.
+ * true only once the copy is durable; the caller moves the cursor only then.
+ * Uses s_line as a chunk buffer. Caller holds s_mtx. */
+static bool evq_quarantine_range_locked(uint32_t seq, long off, long len)
+{
+    if (len <= 0) return false;
+    evq_rd_t rd;
+    uint8_t block;
+    if (evq_open_read_locked(seq, &rd, &block) != ESP_OK) return false;
+    EVQ_FAULT_POINT("quarantine.before_copy");
+    bool ok = fseek(rd.f, off, SEEK_SET) == 0;
+    FILE *qf = ok ? fopen(EVLOG_QUARANTINE, "a") : NULL;
+    ok = ok && qf != NULL;
+    long left = len;
+    while (ok && left > 0) {
+        size_t want = (size_t)left < s_line_cap ? (size_t)left : s_line_cap;
+        size_t got = fread(s_line, 1, want, rd.f);
+        if (got == 0) { ok = false; break; }
+        if (fwrite(s_line, 1, got, qf) != got) { ok = false; break; }
+        left -= (long)got;
+    }
+    if (qf != NULL) {
+        if (ok && (fflush(qf) != 0 || fsync(fileno(qf)) != 0)) ok = false;
+        if (fclose(qf) != 0) ok = false;
+    }
+    evq_rd_close(&rd);
+    EVQ_FAULT_POINT("quarantine.after_copy_before_cursor");
     return ok;
 }
 
+/* Account one record passed at the cursor WITHOUT an ACK, after its intact copy
+ * is durable in quarantine. Classification: bytes this firmware wrote (at/after
+ * the upgrade watermark) can only be malformed through post-commit corruption. */
+static void evq_account_quarantined_locked(evq_qclass_t cls, uint32_t seq, long off)
+{
+    s_skipped++;
+    if (cls == EVQ_Q_POISON) s_quarantined_poison++;
+    else if (evq_pos_before_watermark(seq, off)) s_quarantined_malformed++;
+    else { s_corrupt_detected++; s_corrupt_medium = EVQ_MEDIUM_FLASH; }
+}
+
+/* ── cursor persistence ─────────────────────────────────────────────────── */
+
+static uint32_t evq_blob_crc(uint32_t seq, uint32_t off)
+{
+    uint32_t v[2] = { seq, off };
+    return evq_crc32(0x5EC0, v, sizeof v);
+}
+
+/* Persist the cursor: the atomic blob FIRST (only this firmware writes it), then
+ * the legacy keys that older firmware reads. A tear between the two leaves the
+ * legacy value BEHIND the blob, which boot treats as "use the earlier value"
+ * (duplicates, never a skip); legacy AHEAD of the blob means another firmware
+ * moved the cursor (a rollback) — see evq_reconcile_cursor_locked. */
 static void evlog_persist_cursor_locked(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    evlog_cursor_blob_t b = { .seq = s_rd_seq, .off = (uint32_t)s_rd_off };
+    b.crc = evq_blob_crc(b.seq, b.off);
+    nvs_set_blob(h, NVS_KEY_CUR, &b, sizeof b);
+    nvs_commit(h);
+    EVQ_FAULT_POINT("cursor.after_blob_before_legacy");
     nvs_set_u32(h, NVS_KEY_RD_SEQ, s_rd_seq);
     nvs_set_u32(h, NVS_KEY_RD_OFF, (uint32_t)s_rd_off);
     nvs_commit(h);
     nvs_close(h);
 }
 
+/* The cursor just passed EOF of `seq` by this firmware's own ACK prefix (or a
+ * frontier quarantine). Persist, then mark the file DELIVERED in the index. */
+static void evq_cursor_leave_file_locked(void)
+{
+    uint32_t done = s_rd_seq;
+    s_rd_seq++;
+    s_rd_off = 0;
+    s_cur_consumed = 0;
+    s_cur_validated = true;
+    evlog_persist_cursor_locked();
+    EVQ_FAULT_POINT("cursor.after_nvs_before_index_delivered");
+    evq_seg_t *s = evq_index_find(&s_ix, done);
+    if (s != NULL && s->state != EVQ_SEG_DELIVERED && s->state != EVQ_SEG_REIMPORT) {
+        if (EVQ_IX_APPEND("D %" PRIu32, done) != ESP_OK) {
+            /* Boot repair re-derives DELIVERED from the blob. */
+        }
+    }
+}
+
 /* Step over a rotated file only when the durable cursor itself has reached its
  * EOF.  The claim tail may already be in a later file, but it is deliberately
  * irrelevant here: a reboot must still find every un-ACKed byte at or after the
- * cursor.  File-boundary persistence matches the old frequency (once per drained
- * file) and is safe even between 16-ACK cursor batches.
- *
- * RETENTION CHANGE (internal store): a fully-drained file is NO LONGER deleted
- * here. Files with seq < s_rd_seq are 100% synced and linger for the bulk SD
- * archive (event_log_archive_to_sd) — and they are the eviction pool when the
- * store runs short of space (evlog_evict_synced_locked): unsynced data always
- * outranks synced archive copies. */
+ * cursor. Drained files are NOT deleted here — the keeper archives them to SD
+ * (or eviction reclaims their flash copy); unsynced data always outranks synced
+ * copies. The file size comes from flash, else from the index (SD-only). */
 static void evlog_normalize_cursor_locked(void)
 {
     while (s_rd_seq < s_tail_seq) {
-        char path[64];
-        evlog_file_path(path, sizeof path, s_rd_seq);
-        struct stat st;
-        /* A transient stat failure is not proof of EOF.  Leave the cursor in
-         * place so the normal claim path can distinguish a genuinely missing
-         * file from an I/O failure; treating the old helper's synthetic zero as
-         * EOF here could silently skip a whole rotated file. */
-        if (stat(path, &st) != 0 || s_rd_off < (long)st.st_size) break;
-
-        s_rd_seq++;
-        s_rd_off = 0;
-        evlog_persist_cursor_locked();
+        long size = 0;
+        /* An unknown size is not proof of EOF. Leave the cursor so the claim
+         * path can distinguish a genuinely missing file from an I/O failure. */
+        if (!evq_file_size_locked(s_rd_seq, &size) || s_rd_off < size) break;
+        evq_cursor_leave_file_locked();
     }
 }
 
 /* ── synced-first eviction (audit C1 successor) ────────────────────────────
- * When the internal store runs short (dead SD → nothing archives, and/or a slow
- * uplink → the cursor crawls), free space by deleting the OLDEST fully-synced
- * retained files (seq < s_rd_seq strictly — the cursor file may hold unsynced
- * bytes and is never touched, nor is anything after it). What is lost is only
- * the not-yet-archived SD copy of data the platform has already ACKed; unsynced
- * records are sacred and are what this space is being freed FOR. Returns true
- * if at least one file was evicted. Caller holds s_mtx. */
+ * When the internal store runs short, free space by deleting the OLDEST fully
+ * DELIVERED flash copies (seq < s_rd_seq strictly — the cursor file may hold
+ * unsynced bytes and is never touched, nor is anything after it). What is lost
+ * is only the not-yet-archived SD copy of data the platform already ACKed; for
+ * a spooled file the SD copies remain and are archived later. Returns true if at
+ * least one file was evicted. Caller holds s_mtx. */
 static int64_t s_evicted_files = 0;   /* lifetime counter (boot-relative), logged */
-static bool evlog_evict_synced_locked(void)
+static bool evlog_evict_to_locked(uint64_t target)
 {
     bool evicted = false;
     uint64_t freeb = 0;
-    while (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_EVICT_TARGET) {
+    uint32_t scan_from = 0;
+    while (evstore_free_bytes(&freeb) == ESP_OK && freeb < target) {
+        /* Oldest flash file strictly behind the cursor that is NOT still owed:
+         * a REIMPORT entry's flash copy may be its only copy (the cursor moved
+         * without our ACK), so it is never an eviction candidate. */
         uint32_t min_seq = 0, max_seq = 0;
         if (!evlog_scan_range_locked(&min_seq, &max_seq)) break;
-        if (min_seq >= s_rd_seq) break;              /* nothing fully-synced left */
-        char path[64];
+        uint32_t cand = 0;
+        for (uint32_t q = (min_seq > scan_from ? min_seq : scan_from); q < s_rd_seq && q <= max_seq; q++) {
+            if (!evlog_flash_exists(q, NULL)) continue;
+            const evq_seg_t *e = evq_index_find(&s_ix, q);
+            if (e != NULL && e->state == EVQ_SEG_REIMPORT) continue;
+            if (q == s_keeper_pin_seq) continue;      /* keeper is copying it right now */
+            cand = q;
+            break;
+        }
+        if (cand == 0) break;                        /* nothing evictable left */
+        min_seq = cand;
+        scan_from = cand + 1;
+        char path[EVQ_PATH_MAX];
         evlog_file_path(path, sizeof path, min_seq);
         if (remove(path) != 0) break;                /* stuck file: don't spin */
         evicted = true;
         s_evicted_files++;
-        ESP_LOGW(TAG, "evicted synced %s (unarchived) to protect unsynced capacity "
+        evq_seg_t *s = evq_index_find(&s_ix, min_seq);
+        if (s != NULL) {
+            s->flash_present = false;
+            if (s->primary[0] == '\0') (void)EVQ_IX_APPEND("A %" PRIu32, min_seq);   /* delivered, no SD copy left to archive */
+        }
+        ESP_LOGW(TAG, "evicted delivered %s to protect unsent capacity "
                       "(%llu B free, %lld evicted so far)",
                  path, (unsigned long long)freeb, (long long)s_evicted_files);
     }
     return evicted;
 }
 
-/* Full-store recovery, shared by EVERY ENOSPC-class failure path (short write,
- * flush/fsync failure, rotate-open failure, tail-reopen failure): evict the
- * oldest fully-synced retained files before anything is dropped or reported as
- * a media fault. Returns true when the store has headroom again (or never lost
- * it). On false, s_write_full is latched so later stores fail fast at the
- * admission check instead of paying a full littlefs free-block scan per attempt.
- * Caller holds s_mtx. */
+static bool evlog_evict_synced_locked(void)
+{
+    return evlog_evict_to_locked(EVLOG_EVICT_TARGET);
+}
+
+/* Full-store recovery, shared by EVERY ENOSPC-class failure path: evict the
+ * oldest delivered flash copies, and wake the keeper to spool + reclaim, before
+ * anything is dropped or reported as a media fault. Returns true when the store
+ * has headroom again. On false, s_write_full is latched so later stores fail
+ * fast at the admission check. Caller holds s_mtx. */
 static bool evlog_full_recovery_locked(void)
 {
     uint64_t freeb = 0;
@@ -494,11 +1109,11 @@ static bool evlog_full_recovery_locked(void)
         return true;
     }
     if (!s_write_full) {
-        ESP_LOGW(TAG, "store full (%llu B free, nothing synced left to evict) — "
-                      "writes paused until the drain frees space",
+        ESP_LOGW(TAG, "store full (%llu B free) — writes paused until spool/reclaim or the drain frees space",
                  (unsigned long long)freeb);
     }
     s_write_full = true;
+    evq_keeper_notify();
     return false;
 }
 
@@ -516,10 +1131,7 @@ static void evlog_advance_acked_prefix_locked(void)
                      (long long)front.measure_id);
             /* The cursor is durable truth. Holding this impossible RAM shape
              * forever turns one invariant violation into a permanent publisher
-             * outage; abandoning claims costs only bounded duplicates. Stale
-             * MQTT completions/latches must be discarded at the same recovery
-             * boundary; the caller fires the registered reset after s_mtx is
-             * released, then this cursor is claimed again. */
+             * outage; abandoning claims costs only bounded duplicates. */
             evlog_window_clear_locked();
             s_reset_pending = true;
             return;
@@ -527,11 +1139,12 @@ static void evlog_advance_acked_prefix_locked(void)
 
         s_rd_seq = front.seq;
         s_rd_off = front.off + front.len;
+        s_cur_consumed++;
         s_last_acked_id = front.measure_id;
-        if (s_pending > 0) s_pending--;
         evlog_window_pop_front_locked();
 
         if (++s_acks_since_persist >= EVLOG_CURSOR_BATCH) {
+            EVQ_FAULT_POINT("ack.after_ram_prefix_before_nvs");
             evlog_persist_cursor_locked();
             s_acks_since_persist = 0;
         }
@@ -548,99 +1161,59 @@ static void evlog_persist_nid_locked(void)
     nvs_close(h);
 }
 
-/* The highest measure_id on the card is the newest record. Records are appended in
- * strictly-ascending id order, so it lives in the last non-empty file (the tail, or
- * the file just below it if the tail was freshly rotated and is still empty). Scan
- * only that one (≤EVLOG_ROTATE_BYTES) file, so next_id can be reseeded on boot
- * WITHOUT walking the whole backlog. Uses s_line — caller holds s_mtx / is init. */
-static int64_t evlog_tail_max_id_locked(void)
+static void evlog_bump_next_id_locked(int64_t seen_id)
 {
-    uint32_t seq = s_tail_seq;
-    while (seq >= 1) {
-        char path[64];
-        evlog_file_path(path, sizeof path, seq);
-        FILE *f = fopen(path, "rb");
-        if (f != NULL) {
-            int64_t max_id = 0;
-            while (fgets(s_line, s_line_cap, f) != NULL) {
-                size_t len = strlen(s_line);
-                if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
-                int64_t id = (int64_t)strtoll(s_line, NULL, 10);
-                if (id > max_id) max_id = id;
-            }
-            fclose(f);
-            if (max_id > 0) return max_id;
+    if (seen_id + 1 > s_next_id) {
+        s_next_id = seen_id + 1;
+        if (s_next_id >= s_id_limit) {
+            s_id_limit = s_next_id + EVLOG_ID_BLOCK;
+            evlog_persist_nid_locked();
         }
-        if (seq == 1) break;
-        seq--;
     }
-    return 0;
 }
 
-/* One-shot task: count the pending backlog (cursor → tail) OFF the boot path, so a
- * large offline accumulation (Wi-Fi down → nothing drains) can't stall app_main
- * before the console starts. BOUNDED by line count and wall-clock — beyond that the
- * count is a floor (true value ≥ reported), which is fine: it is a stat only, and
- * claim/publish walk the cursor regardless. Runs under s_mtx (serialised with
- * store/claim/drain — no concurrent FATFS handles) but only briefly (≤EVLOG_SCAN_MAX_MS).
- * next_id was already seeded synchronously in evlog_open_locked, so a partial count
- * never risks id collisions. */
-/* Count PENDING records from the cursor (s_rd_seq/off) to the tail, BOUNDED by
- * line count and wall-clock so a huge backlog can't churn on. *capped_out (may be
- * NULL) is set true if a bound was hit — then the return is a floor (true ≥ it).
- * Caller holds s_mtx; uses the shared s_line buffer. */
-static int64_t evlog_scan_pending_locked(bool *capped_out)
+/* ── exact pending accounting ───────────────────────────────────────────── */
+
+typedef struct {
+    int64_t pending, flash, sd, reimport;
+    bool    exact;
+} evq_counts_t;
+
+/* Pending = records at/after the cursor on either medium + records owed by
+ * REIMPORT entries. Exact from the index counts, the cursor file's consumed
+ * count and the tail counter; a FLOOR while unindexed files, an unvalidated
+ * cursor offset, or an unknown reimport remainder exist. Caller holds s_mtx. */
+static void evq_counts_locked(evq_counts_t *c)
 {
-    int64_t pending = 0;
-    bool    capped  = false;
-    const TickType_t t0 = xTaskGetTickCount();
-    for (uint32_t seq = s_rd_seq; seq <= s_tail_seq && !capped; seq++) {
-        char path[64];
-        evlog_file_path(path, sizeof path, seq);
-        FILE *f = fopen(path, "rb");
-        if (f == NULL) continue;
-        if (seq == s_rd_seq && s_rd_off > 0) {
-            if (fseek(f, s_rd_off, SEEK_SET) != 0) { fclose(f); continue; }
+    memset(c, 0, sizeof *c);
+    c->exact = s_ix_ready && !s_unidx_present && s_cur_validated;
+    for (size_t i = 0; i < s_ix.n; i++) {
+        const evq_seg_t *s = &s_ix.segs[i];
+        if (s->state == EVQ_SEG_REIMPORT) {
+            if (s->reimport_remaining < 0) { c->exact = false; c->reimport += s->count; }
+            else c->reimport += s->reimport_remaining;
+            continue;
         }
-        while (fgets(s_line, s_line_cap, f) != NULL) {
-            size_t len = strlen(s_line);
-            if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
-            pending++;
-            if (pending >= EVLOG_SCAN_MAX_LINES ||
-                (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(EVLOG_SCAN_MAX_MS)) {
-                capped = true;
-                break;
-            }
-        }
-        fclose(f);
+        if (s->seq < s_rd_seq || s->seq >= s_tail_seq) continue;
+        int64_t n = s->count;
+        if (s->seq == s_rd_seq) n = (int64_t)s->count > (int64_t)s_cur_consumed ? (int64_t)s->count - s_cur_consumed : 0;
+        bool on_sd_only = !s->flash_present && s->primary[0] != '\0';
+        if (on_sd_only) c->sd += n; else c->flash += n;
     }
-    if (capped_out) *capped_out = capped;
-    return pending;
-}
-
-static void evlog_count_task(void *arg)
-{
-    (void)arg;
-    bool capped = false;
-
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    s_pending    = evlog_scan_pending_locked(&capped);
-    int64_t pending = s_pending;
-    s_count_task = NULL;
-    xSemaphoreGive(s_mtx);
-
-    if (capped) {
-        ESP_LOGW(TAG, "pending backlog >= %lld (count capped) — drain via Wi-Fi/MQTT "
-                      "or clear " EVLOG_DIR, (long long)pending);
-    } else {
-        ESP_LOGI(TAG, "pending backlog counted: %lld", (long long)pending);
+    if (s_tail_seq >= s_rd_seq) {
+        int64_t n = s_tail_count;
+        if (s_tail_seq == s_rd_seq) n = (int64_t)s_tail_count > (int64_t)s_cur_consumed ? (int64_t)s_tail_count - s_cur_consumed : 0;
+        c->flash += n;
     }
-    vTaskDelete(NULL);
+    if (s_unidx_present) c->flash += s_unidx_floor;
+    c->reimport += s_legacy_pending;
+    if (!s_legacy_known) c->exact = false;
+    c->pending = c->flash + c->sd + c->reimport;
 }
 
 /* Parse one (newline-included) record line in place. Returns:
  *   ESP_OK                  — out filled (heap metadata/payload; free with measurement_event_free)
- *   ESP_ERR_INVALID_RESPONSE — malformed; caller skips it
+ *   ESP_ERR_INVALID_RESPONSE — malformed; caller quarantines it at the frontier
  *   ESP_ERR_NO_MEM          — alloc failed; caller must NOT consume the record */
 static esp_err_t parse_record(char *line, size_t len, measurement_event_t *out)
 {
@@ -684,53 +1257,36 @@ static esp_err_t parse_record(char *line, size_t len, measurement_event_t *out)
     return ESP_OK;
 }
 
-/* Discover files, validate the NVS cursor, open the tail for append, recount
- * pending. Caller holds s_mtx (or is single-threaded at init). */
-static esp_err_t evlog_open_locked(void)
+/* Structural validity of a framed v2 line WITHOUT allocating: exactly what
+ * parse_record accepts. Imports route anything else to quarantine. */
+static bool evq_line_is_valid(const char *line, size_t len)
 {
-    /* A prior event_log_on_sd_lost() that timed out on s_mtx may have left the
-     * tail FILE* open (card gone, couldn't close). Close it now before we reopen
-     * so the descriptor can't leak across a loss→restore cycle. */
-    if (s_wf != NULL) { fclose(s_wf); s_wf = NULL; }
-
-    mkdir(EVLOG_DIR, 0777);
-
-    uint32_t min_seq = 0, max_seq = 0;
-    if (!evlog_scan_range_locked(&min_seq, &max_seq)) {
-        min_seq = max_seq = 1;               /* fresh — tail created by fopen("a") below */
+    if (len == 0 || line[len - 1] != '\n') return false;
+    int tabs = 0;
+    const char *payload = NULL;
+    for (size_t i = 0; i < len; i++) {
+        if (line[i] == '\t') { tabs++; if (tabs == 8) payload = line + i + 1; }
     }
-    s_tail_seq = max_seq;
+    if (tabs < 8 || payload == NULL) return false;
+    if (payload[0] != '{' && payload[0] != '[') return false;
+    return strtoll(line, NULL, 10) > 0;
+}
 
-    /* Read cursor; default to the oldest file. */
-    uint32_t cseq = min_seq, coff32 = 0;
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u32(h, NVS_KEY_RD_SEQ, &cseq);
-        nvs_get_u32(h, NVS_KEY_RD_OFF, &coff32);
-        nvs_close(h);
-    }
-    /* Clamp to what's actually in the store (a torn offset past EOF is pulled
-     * back). NOTE: with synced files now RETAINED for archive/eviction, min_seq
-     * being far below the cursor is the normal shape, not a stale-cursor sign.
-     * Over-clamping only re-sends a few events, which at-least-once tolerates. */
-    if (cseq < min_seq) { cseq = min_seq; coff32 = 0; }
-    if (cseq > max_seq) { cseq = max_seq; coff32 = 0; }
-    long fsz  = evlog_file_size(cseq);
-    long coff = (long)coff32;
-    if (coff > fsz) coff = fsz;
-    s_rd_seq = cseq;
-    s_rd_off = coff;
+/* ── boot ───────────────────────────────────────────────────────────────── */
 
-    char path[64];
+/* Scan the tail file: repair a brownout-torn final record, then derive the
+ * running segment statistics (count, CRC, first/last id). Caller holds s_mtx /
+ * is init. Uses s_line. */
+static void evlog_scan_tail_locked(void)
+{
+    char path[EVQ_PATH_MAX];
     evlog_file_path(path, sizeof path, s_tail_seq);
 
-    /* Repair a brownout-torn final record: an ungraceful reset (brownout/POR/panic
-     * bypasses the shutdown-handler fsync) can leave the tail ending mid-record with
-     * no '\n'. Truncate back to the last newline so the next append can't concatenate
-     * into — and corrupt the framing of — the torn record (audit B3). Only truncate
-     * when a newline is found in the trailing window; if none is (an over-long/corrupt
-     * fragment), leave it for the reader's over-long-skip to handle rather than nuke
-     * good data. */
+    /* Repair a brownout-torn final record: an ungraceful reset can leave bytes
+     * after the last fsync (the record was never acknowledged). Truncate back to
+     * the last newline so the next append can't concatenate into — and corrupt
+     * the framing of — the torn record (audit B3). Accepted records are fsync'd
+     * before ESP_OK, so this never removes one. */
     long tsz = evlog_file_size(s_tail_seq);
     if (tsz > 0) {
         FILE *tf = fopen(path, "rb+");
@@ -745,13 +1301,248 @@ static esp_err_t evlog_open_locked(void)
                 if (last_nl >= 0) {
                     long good_end = tsz - scan + last_nl + 1;
                     if (good_end < tsz && ftruncate(fileno(tf), good_end) == 0) {
+                        fsync(fileno(tf));
                         ESP_LOGW(TAG, "repaired torn tail %s: %ld -> %ld B", path, tsz, good_end);
                     }
+                } else if (tsz < (long)s_line_cap && ftruncate(fileno(tf), 0) == 0) {
+                    fsync(fileno(tf));      /* one torn fragment and nothing else */
+                    ESP_LOGW(TAG, "repaired torn tail %s: %ld -> 0 B", path, tsz);
                 }
             }
             fclose(tf);
         }
     }
+
+    evq_scan_t sc;
+    if (evq_scan_file(path, s_line, s_line_cap, &sc)) {
+        s_tail_count = sc.count;
+        s_tail_crc = sc.crc;
+        s_tail_first_id = sc.first_id;
+        s_tail_last_id = sc.last_id;
+    } else {
+        s_tail_count = 0; s_tail_crc = 0; s_tail_first_id = s_tail_last_id = 0;
+    }
+}
+
+/* Validate the cursor offset against the record framing and count the lines
+ * before it (s_cur_consumed). An offset that is not a record boundary (a torn
+ * two-key NVS write from older firmware) falls back to the file start: bounded
+ * duplicates, never a misaligned parse that "skips" a record. Needs the file
+ * readable (flash or a verified SD copy); otherwise stays unvalidated. */
+static void evq_validate_cursor_locked(void)
+{
+    if (s_cur_validated) return;
+    if (s_rd_off == 0) { s_cur_consumed = 0; s_cur_validated = true; return; }
+    evq_rd_t rd;
+    uint8_t block;
+    if (evq_open_read_locked(s_rd_seq, &rd, &block) != ESP_OK) return;
+    uint32_t lines = 0;
+    long left = s_rd_off;
+    char last = '\n';
+    bool ok = true;
+    while (left > 0) {
+        size_t want = (size_t)left < s_line_cap ? (size_t)left : s_line_cap;
+        size_t got = fread(s_line, 1, want, rd.f);
+        if (got == 0) { ok = false; break; }
+        for (size_t i = 0; i < got; i++) if (s_line[i] == '\n') lines++;
+        last = s_line[got - 1];
+        left -= (long)got;
+    }
+    evq_rd_close(&rd);
+    if (!ok) return;                           /* I/O: retry on the next claim */
+    if (last != '\n') {
+        ESP_LOGW(TAG, "cursor off=%ld in ev-%06u.log is not a record boundary — replaying file from 0",
+                 s_rd_off, (unsigned)s_rd_seq);
+        s_rd_off = 0;
+        s_cur_consumed = 0;
+        evlog_persist_cursor_locked();
+    } else {
+        s_cur_consumed = lines;
+    }
+    s_cur_validated = true;
+}
+
+/* Reconcile the atomic blob with the legacy keys (see evlog_persist_cursor_locked).
+ * Returns the cursor to use. `foreign` = another firmware advanced it. */
+static void evq_reconcile_cursor_locked(uint32_t *seq, uint32_t *off, bool *foreign,
+                                        uint32_t *blob_seq, uint32_t *blob_off)
+{
+    uint32_t lseq = 0, loff = 0;
+    bool have_legacy = false;
+    evlog_cursor_blob_t b = {0};
+    bool have_blob = false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        have_legacy = nvs_get_u32(h, NVS_KEY_RD_SEQ, &lseq) == ESP_OK;
+        if (nvs_get_u32(h, NVS_KEY_RD_OFF, &loff) != ESP_OK) loff = 0;
+        size_t len = sizeof b;
+        have_blob = nvs_get_blob(h, NVS_KEY_CUR, &b, &len) == ESP_OK && len == sizeof b &&
+                    b.crc == evq_blob_crc(b.seq, b.off);
+        nvs_close(h);
+    }
+    *foreign = false;
+    *blob_seq = b.seq; *blob_off = b.off;
+    if (!have_blob) {                          /* first boot of this firmware */
+        *seq = have_legacy ? lseq : 0;
+        *off = have_legacy ? loff : 0;
+        return;
+    }
+    if (!have_legacy) { *seq = b.seq; *off = b.off; return; }
+    bool legacy_ahead = (lseq > b.seq) || (lseq == b.seq && loff > b.off);
+    bool legacy_behind = (lseq < b.seq) || (lseq == b.seq && loff < b.off);
+    if (legacy_ahead) {
+        *foreign = true;                       /* a rollback moved it */
+        *seq = lseq; *off = loff;
+    } else if (legacy_behind) {
+        *seq = lseq; *off = loff;              /* our own torn write: earlier = duplicates only */
+    } else {
+        *seq = b.seq; *off = b.off;
+    }
+}
+
+/* Mark every SPOOLED/SD_ONLY file the cursor passed WITHOUT our ACK as REIMPORT.
+ * A cursor move by another firmware is never taken as proof of delivery. */
+static void evq_mark_foreign_range_locked(uint32_t from_seq, uint32_t from_off, uint32_t to_seq)
+{
+    /* Walk EVERY indexed segment in the range in seq order (no fixed-size
+     * batch: a segment left out here would be taken as delivered and archived).
+     * Appends may remove entries, so re-locate the next one by seq each time. */
+    uint32_t next = from_seq;
+    for (;;) {
+        evq_seg_t *s = NULL;
+        for (size_t i = 0; i < s_ix.n; i++) {
+            evq_seg_t *c = &s_ix.segs[i];
+            if (c->seq >= next && c->seq < to_seq && c->state != EVQ_SEG_REIMPORT) { s = c; break; }
+        }
+        if (s == NULL) break;
+        next = s->seq + 1;
+        s->flash_present = evlog_flash_exists(s->seq, NULL);
+        if (!s->flash_present && s->primary[0] == '\0') {
+            /* Flash-only and gone: the other firmware can only have removed
+             * it at/behind ITS cursor after reading it. Retire the entry. */
+            (void)EVQ_IX_APPEND("A %" PRIu32, s->seq);
+            continue;
+        }
+        /* Even a flash-resident file is re-imported: a cursor move by other
+         * firmware is not proof of delivery (duplicates, never a loss). */
+        uint32_t off = (s->seq == from_seq) ? from_off : 0;
+        int64_t rem = off == 0 ? (int64_t)s->count : -1;
+        if (EVQ_IX_APPEND("R %" PRIu32 " %" PRIu32 " %lld", s->seq, off, (long long)rem) == ESP_OK) {
+            ESP_LOGW(TAG, "ev-%06u.log left the queue without our ACK (rollback?) — will re-import it",
+                     (unsigned)s->seq);
+        }
+    }
+}
+
+/* Boot repair of index states against flash presence and the cursor. */
+static void evq_boot_repair_states_locked(void)
+{
+    for (size_t i = 0; i < s_ix.n; i++) {
+        evq_seg_t *s = &s_ix.segs[i];
+        s->flash_present = evlog_flash_exists(s->seq, NULL);
+    }
+    for (size_t i = 0; i < s_ix.n;) {
+        evq_seg_t *s = &s_ix.segs[i];
+        uint32_t seq = s->seq;
+        if (s->state == EVQ_SEG_DELIVERED && seq >= s_rd_seq) {
+            /* A DELIVERED line the cursor does not confirm: downgrade. */
+            if (s->primary[0] != '\0') {
+                (void)EVQ_IX_APPEND("P %" PRIu32 " %08" PRIx32 " %s %s", seq, s->cid, s->primary, s->mirror);
+                s = evq_index_find(&s_ix, seq);
+                if (s && !s->flash_present) (void)EVQ_IX_APPEND("O %" PRIu32, seq);
+            } else {
+                (void)EVQ_IX_APPEND("S %" PRIu32 " %lld %lld %" PRIu32 " %" PRIu32 " %08" PRIx32,
+                                    seq, (long long)s->first_id, (long long)s->last_id,
+                                    s->count, s->bytes, s->crc);
+            }
+        } else if (s->state == EVQ_SEG_SD_ONLY && s->flash_present) {
+            /* Crash inside reclaim: flash copy still there — treat as SPOOLED. */
+            (void)EVQ_IX_APPEND("P %" PRIu32 " %08" PRIx32 " %s %s", seq, s->cid, s->primary, s->mirror);
+        } else if (s->state == EVQ_SEG_SPOOLED && !s->flash_present) {
+            (void)EVQ_IX_APPEND("O %" PRIu32, seq);       /* reclaim removed it before its O line */
+        } else if (s->state == EVQ_SEG_FLASH && !s->flash_present && seq < s_rd_seq) {
+            (void)EVQ_IX_APPEND("A %" PRIu32, seq);       /* delivered and gone (evicted/archived) */
+            continue;                                      /* entry removed; same i */
+        } else if ((s->state == EVQ_SEG_SPOOLED || s->state == EVQ_SEG_SD_ONLY) && seq < s_rd_seq) {
+            /* Passed by our own blob-confirmed cursor (evq_reconcile) → delivered. */
+            (void)EVQ_IX_APPEND("D %" PRIu32, seq);
+        }
+        s = evq_index_find(&s_ix, seq);
+        if (s == NULL) continue;
+        i++;
+    }
+}
+
+/* Discover files, load the index, reconcile the NVS cursor, open the tail for
+ * append. Caller holds s_mtx (or is single-threaded at init). */
+static esp_err_t evlog_open_locked(void)
+{
+    if (s_wf != NULL) { fclose(s_wf); s_wf = NULL; }
+
+    mkdir(EVLOG_DIR, 0777);
+
+    /* Segment index. A missing file on a store that already has rotated
+     * files is a pre-upgrade store (or a lost index): everything written
+     * before now is pre-watermark and the keeper indexes the files. */
+    if (!s_ix_ready) {
+        bool have_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+        if (evq_index_init(&s_ix, have_psram ? EVQ_INDEX_CAP : EVQ_INDEX_CAP_FALLBACK) != ESP_OK) {
+            ESP_LOGE(TAG, "segment index allocation failed — SD overflow disabled this session");
+        } else {
+            s_ix_ready = true;
+        }
+    }
+    struct stat ist;
+    bool index_existed = stat(EVQ_INDEX_PATH, &ist) == 0;
+    if (s_ix_ready) {
+        if (evq_index_load(&s_ix, EVQ_INDEX_PATH) != ESP_OK) {
+            ESP_LOGW(TAG, "segment index read error — continuing with %u valid line(s)", (unsigned)s_ix.lines);
+        }
+        if (s_ix.bad_lines > 0) {
+            ESP_LOGW(TAG, "segment index: %u corrupt/torn line(s) ignored", (unsigned)s_ix.bad_lines);
+        }
+    }
+
+    uint32_t min_seq = 0, max_seq = 0;
+    bool any = evlog_scan_range_locked(&min_seq, &max_seq);
+    if (!any) min_seq = max_seq = 1;
+    /* The tail is never reclaimed, so it is the newest flash file; but never
+     * reuse a seq the index knows (a lost tail after a reclaim of its
+     * predecessor would otherwise re-number an SD-only segment). */
+    uint32_t ix_min = 0, ix_max = 0;
+    for (size_t i = 0; i < s_ix.n; i++) {
+        if (s_ix.segs[i].state == EVQ_SEG_REIMPORT) continue;
+        if (ix_min == 0 || s_ix.segs[i].seq < ix_min) ix_min = s_ix.segs[i].seq;
+        if (s_ix.segs[i].seq > ix_max) ix_max = s_ix.segs[i].seq;
+    }
+    if (s_ix.n > 0 && s_ix.segs[s_ix.n - 1].seq > ix_max) ix_max = s_ix.segs[s_ix.n - 1].seq;
+    s_tail_seq = max_seq;
+    if (ix_max >= s_tail_seq) s_tail_seq = ix_max + 1;
+    uint32_t q_min = min_seq;
+    if (ix_min != 0 && ix_min < q_min) q_min = ix_min;
+
+    /* Cursor: atomic blob vs legacy keys. */
+    uint32_t cseq = 0, coff32 = 0, bseq = 0, boff = 0;
+    bool foreign = false;
+    evq_reconcile_cursor_locked(&cseq, &coff32, &foreign, &bseq, &boff);
+    if (cseq == 0) { cseq = q_min; coff32 = 0; }
+    if (foreign && s_ix_ready) evq_mark_foreign_range_locked(bseq, boff, cseq);
+    /* Clamp to what exists on either medium (a torn offset past EOF is pulled
+     * back). Below every copy = a pre-upgrade gap; above = impossible. */
+    if (cseq < q_min) { cseq = q_min; coff32 = 0; }
+    if (cseq > s_tail_seq) { cseq = s_tail_seq; coff32 = 0; }
+    s_rd_seq = cseq;
+    s_rd_off = (long)coff32;
+    long fsz = 0;
+    if (evq_file_size_locked(s_rd_seq, &fsz) && s_rd_off > fsz) s_rd_off = fsz;
+    s_cur_validated = false;
+    s_cur_consumed = 0;
+
+    if (s_ix_ready) evq_boot_repair_states_locked();
+
+    char path[EVQ_PATH_MAX];
+    evlog_file_path(path, sizeof path, s_tail_seq);
+    evlog_scan_tail_locked();
 
     s_wf = fopen(path, "a");
     if (s_wf == NULL) {
@@ -760,40 +1551,41 @@ static esp_err_t evlog_open_locked(void)
     }
     s_tail_size = evlog_file_size(s_tail_seq);
 
-    /* Seed next_id from the store synchronously — cheap: only the tail file (records
-     * are appended in ascending id order, so the tail holds the max). */
-    int64_t max_id = evlog_tail_max_id_locked();
-    s_pending = 0;   /* provisional; evlog_count_task fills it in shortly */
+    /* Upgrade watermark: first boot of this firmware on this store. */
+    if (s_ix_ready && !s_ix.have_watermark) {
+        (void)EVQ_IX_APPEND("W %" PRIu32 " %ld", s_tail_seq, s_tail_size);
+        if (!index_existed) ESP_LOGI(TAG, "segment index created (watermark ev-%06u.log:%ld)",
+                                     (unsigned)s_tail_seq, s_tail_size);
+    }
 
-    /* Never hand out an id that collides with a record still on the card. NVS
-     * (where next_id's HWM lives) is wiped on every reflash and could be lost to
-     * corruption, while the SD log survives — so after a flash the HWM can read
-     * back below ids already written. Seed above the log's max to keep measure_ids
-     * unique (openJII dedups on them). */
-    if (max_id + 1 > s_next_id) {
-        s_next_id = max_id + 1;
-        if (s_next_id >= s_id_limit) {
-            s_id_limit = s_next_id + EVLOG_ID_BLOCK;
-            evlog_persist_nid_locked();
+    /* Rotated flash files without an index entry → the keeper indexes them. */
+    s_unidx_present = false;
+    s_unidx_floor = 0;
+    if (any) {
+        for (uint32_t seq = min_seq; seq < s_tail_seq; seq++) {
+            if (seq < s_rd_seq) continue;
+            if (evq_index_find(&s_ix, seq) == NULL && evlog_flash_exists(seq, NULL)) { s_unidx_present = true; break; }
         }
     }
 
-    s_writes_since_flush = 0;
-    s_last_flush_tick    = xTaskGetTickCount();
+    /* Never hand out an id that collides with a record still stored anywhere.
+     * NVS (where next_id's HWM lives) can be wiped by a reflash while the log
+     * survives, so reseed above the tail and above every indexed segment. */
+    evlog_bump_next_id_locked(s_tail_last_id);
+    for (size_t i = 0; i < s_ix.n; i++) evlog_bump_next_id_locked(s_ix.segs[i].last_id);
+
     s_acks_since_persist = 0;
     evlog_window_clear_locked();
+    s_head_block = EVQ_BLOCK_NONE;
+    evq_validate_cursor_locked();
 
-    ESP_LOGI(TAG, "ready: files %u..%u, cursor seq=%u off=%ld, max_id=%lld, next_id=%lld (pending counting in background)",
-             (unsigned)min_seq, (unsigned)max_seq, (unsigned)s_rd_seq, s_rd_off,
-             (long long)max_id, (long long)s_next_id);
+    /* First keeper pass as soon as it starts (index pre-upgrade files, repair
+     * the card, resume transfers) instead of one period after boot. */
+    s_keeper_wake_pending = true;
 
-    /* Count the backlog off the boot path (see evlog_count_task). Guard against a
-     * duplicate if a prior count is still running (e.g. rapid SD loss/restore). */
-    if (s_count_task == NULL) {
-        if (xTaskCreate(evlog_count_task, "evlog_count", 4096, NULL, 3, &s_count_task) != pdPASS) {
-            s_count_task = NULL;   /* count skipped; pending stays provisional 0 (stat only) */
-        }
-    }
+    ESP_LOGI(TAG, "ready: flash files %u..%u, %u indexed segment(s), cursor seq=%u off=%ld, next_id=%lld",
+             (unsigned)min_seq, (unsigned)s_tail_seq, (unsigned)s_ix.n, (unsigned)s_rd_seq, s_rd_off,
+             (long long)s_next_id);
     return ESP_OK;
 }
 
@@ -830,11 +1622,13 @@ esp_err_t event_log_init(void)
     if (id_err != ESP_OK) return id_err;
     esp_err_t line_err = evlog_allocate_line_buffer();
     if (line_err != ESP_OK) return line_err;
+#if !defined(EVQ_HOST_FAULTS) && CONFIG_AMBYTE_EVQ_HIL
+    evq_hil_io_init();
+#endif
 
     /* The internal partition is mounted by app_main before this runs and cannot
-     * disappear afterwards — open unconditionally. (The old SD-store variant had
-     * to gate on sdcard_is_mounted and react to hot-plug callbacks; both of those
-     * seams are gone with the store internal.) */
+     * disappear afterwards — open unconditionally. SD-side repair is the keeper's
+     * job: measurement and publishing never wait on the card. */
     s_available = (evlog_open_locked() == ESP_OK);
     if (!s_available) ESP_LOGW(TAG, "event log unavailable");
     return ESP_OK;
@@ -845,20 +1639,22 @@ void event_log_set_reset_notifier(void (*fn)(void))
     s_reset_notifier = fn;
 }
 
+void event_log_set_sd_parked(bool parked)
+{
+    s_sd_parked = parked;
+    if (!parked) evq_keeper_notify();
+}
+
 esp_err_t event_log_prepare_shutdown(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
 
-    /* Pre-reboot drain: flush + fsync the periodically-buffered tail writes (store
-     * flushes only every EVLOG_FLUSH_EVERY_N records / EVLOG_FLUSH_PERIOD_MS, so up
-     * to a few records sit unflushed), persist the read cursor, and CLOSE the tail
-     * so FATFS can finalize its directory entry cleanly when sdcard_unmount() runs
-     * next. Every esp_restart() otherwise fired with no fsync/unmount, risking a
-     * torn FAT/dir-entry metadata write. Bounded lock wait — a reboot must not hang
-     * on a stuck writer; if it times out the data already fsync'd at the last
-     * periodic flush is still safe, we just skip the final few records. */
+    /* Pre-reboot drain: fsync + close the tail and persist the read cursor.
+     * Records are already fsync'd per store; this persists the batched cursor
+     * so fewer duplicates replay. Bounded lock wait — a reboot must not hang
+     * on a stuck writer. */
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        ESP_LOGW(TAG, "pre-reboot flush skipped (lock busy) — last periodic flush stands");
+        ESP_LOGW(TAG, "pre-reboot flush skipped (lock busy) — last persisted cursor stands");
         return ESP_ERR_TIMEOUT;
     }
     if (s_wf != NULL) {
@@ -885,6 +1681,65 @@ esp_err_t event_log_next_id(int64_t *out_id)
     return ESP_OK;
 }
 
+/* Roll the tail to a fresh file: fsync + close, register the closed file in the
+ * index with its running statistics, open the next seq. On a full store the
+ * rotation is deferred (keep appending to the old tail). Returns false only if
+ * no tail could be (re)opened at all. Caller holds s_mtx. */
+static bool evlog_rotate_locked(void)
+{
+    if (evlog_flush_writer_locked() != ESP_OK) evstore_report_io_error();
+    fclose(s_wf);
+    s_wf = NULL;
+    uint32_t old = s_tail_seq;
+    uint32_t count = s_tail_count, crc = s_tail_crc, bytes = (uint32_t)s_tail_size;
+    int64_t first = s_tail_first_id, last = s_tail_last_id;
+    EVQ_FAULT_POINT("store.rotate_after_close_before_open");
+    s_tail_seq++;
+    char path[EVQ_PATH_MAX];
+    evlog_file_path(path, sizeof path, s_tail_seq);
+    s_wf = fopen(path, "a");
+    if (s_wf == NULL && evlog_full_recovery_locked()) {
+        s_wf = fopen(path, "a");   /* eviction freed space — retry once */
+    }
+    if (s_wf == NULL) {
+        /* Still no room. Roll the sequence back and keep appending to the
+         * previous tail: writer and reader must never point at a file that does
+         * not exist (a phantom tail reads as "queue drained"). */
+        s_tail_seq = old;
+        evlog_file_path(path, sizeof path, s_tail_seq);
+        s_wf = fopen(path, "a");
+        if (s_wf == NULL) return false;
+        ESP_LOGW(TAG, "rotate deferred (store full) — still appending to %s", path);
+        return true;
+    }
+    fsync(fileno(s_wf));
+    evq_register_rotated_locked(old, first, last, count, bytes, crc);
+    EVQ_FAULT_POINT("store.rotate_after_index_seg");
+    s_tail_size = 0;
+    s_tail_count = 0;
+    s_tail_crc = 0;
+    s_tail_first_id = s_tail_last_id = 0;
+    if (s_ix.n >= s_ix.cap) ESP_LOGW(TAG, "segment index full (%u) — new files stay flash-only", (unsigned)s_ix.cap);
+    return true;
+}
+
+/* Record one appended line in the tail's running statistics. */
+static void evlog_tail_account(const char *const *parts, const size_t *lens, size_t n, int64_t id)
+{
+    for (size_t i = 0; i < n; i++) s_tail_crc = evq_crc32(s_tail_crc, parts[i], lens[i]);
+    if (s_tail_count == 0) s_tail_first_id = id;
+    s_tail_last_id = id;
+    s_tail_count++;
+}
+
+static bool evq_pressure_locked(uint64_t *freeb_out)
+{
+    uint64_t freeb = 0, total = 0;
+    if (evstore_space(&freeb, &total) != ESP_OK || total == 0) return false;
+    if (freeb_out) *freeb_out = freeb;
+    return freeb * 100U < total * EVQ_PRESSURE_PCT;
+}
+
 static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
@@ -892,39 +1747,39 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        s_refused_unavailable++;      /* racy increment is fine: a counter */
+        return ESP_ERR_TIMEOUT;
+    }
     if (!s_available) {
+        s_refused_unavailable++;
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_SUPPORTED;
     }
     /* Self-heal: a prior rotate/open failure may have closed the tail without
-     * latching the log offline (see rotate path). Reopen it here rather than
-     * staying dark for the rest of the session (audit D1). On a FULL partition
-     * the reopen itself ENOSPCs (the file handle needs a metadata block), so
-     * evict synced files and retry once before declaring the store unwritable. */
+     * latching the log offline. On a FULL partition the reopen itself ENOSPCs,
+     * so evict delivered copies and retry once before declaring it unwritable. */
     if (s_wf == NULL) {
         esp_err_t ro = evlog_reopen_tail_locked();
         if (ro != ESP_OK && evlog_full_recovery_locked()) {
             ro = evlog_reopen_tail_locked();
         }
         if (ro != ESP_OK) {
-            xSemaphoreGive(s_mtx);
             if (s_write_full) {
-                s_dropped++;
+                s_dropped++; s_refused_full++;
+                xSemaphoreGive(s_mtx);
                 return ESP_ERR_NO_MEM;   /* full is not a media fault */
             }
+            s_dropped++; s_refused_media++;
+            xSemaphoreGive(s_mtx);
             evstore_report_io_error();
-            return ESP_ERR_NOT_SUPPORTED;
+            return ESP_FAIL;
         }
     }
-    /* Storage-full admission control: a full card is healthy, so refuse cleanly
-     * (no I/O-error report → no unmount/measurement-restart thrash) and let the drain free
-     * space. Re-enable once the drain has recovered headroom (audit C1/C2). */
+    /* Storage-full admission control: a full store is healthy, so refuse cleanly
+     * and let the drain + keeper free space. */
     if (s_write_full) {
         uint64_t freeb = 0;
-        /* Recovery order: the drain freeing space is passive; ACTIVE recovery is
-         * evicting the oldest fully-synced retained files — unsynced capacity
-         * always outranks unarchived synced copies (see evlog_evict_synced_locked). */
         if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
             (void)evlog_evict_synced_locked();
         }
@@ -933,7 +1788,8 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
             ESP_LOGI(TAG, "store space recovered (%llu B free) — writes resumed",
                      (unsigned long long)freeb);
         } else {
-            s_dropped++;
+            s_dropped++; s_refused_full++;
+            evq_keeper_notify();
             xSemaphoreGive(s_mtx);
             return ESP_ERR_NO_MEM;
         }
@@ -945,12 +1801,12 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     sanitize_field(dev,  sizeof dev,  desc->device);
     sanitize_field(tag,  sizeof tag,  desc->tag);
     /* cmd_raw is variable-length (a full multi-segment "arrun …" can be ~520 B),
-     * so it gets its own heap-sanitized buffer and its own write rather than
-     * sharing the fixed header buffer. */
+     * so it gets its own heap-sanitized buffer and its own write. */
     const char *cmd_src = (desc->cmd_raw != NULL) ? desc->cmd_raw : "";
     size_t cmd_cap = strlen(cmd_src) + 1;
     char *cmd = malloc(cmd_cap);
     if (cmd == NULL) {
+        s_refused_unavailable++;
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NO_MEM;
     }
@@ -959,8 +1815,6 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
                        ? desc->metadata_json : "";
     const char *payload_json = desc->payload_json;
 
-    /* Header split around cmd_raw: "<id>\t<chan>\t<dev>\t<tag>\t" then cmd, then
-     * "\t<start>\t<end>\t". */
     char hdr1[96], hdr2[48];
     int h1 = snprintf(hdr1, sizeof hdr1, "%lld\t%s\t%s\t%s\t",
                       (long long)measure_id, chan, dev, tag);
@@ -968,6 +1822,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
                       (long long)desc->start_ms, (long long)desc->end_ms);
     if (h1 < 0 || h1 >= (int)sizeof hdr1 || h2 < 0 || h2 >= (int)sizeof hdr2) {
         free(cmd);
+        s_refused_media++;
         xSemaphoreGive(s_mtx);
         return ESP_FAIL;
     }
@@ -979,128 +1834,92 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         ESP_LOGE(TAG, "record too large (%u B) for active %u-B cap (max record %u B), id %lld — dropped",
                  (unsigned)total, (unsigned)s_line_cap, (unsigned)s_max_record,
                  (long long)measure_id);
-        s_dropped++;
+        s_dropped++; s_refused_too_large++;
         free(cmd);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /* Roll to a fresh file before the tail would exceed the rotate threshold, so
-     * a fully-published file can later be deleted to reclaim space. */
+    /* Roll to a fresh file before the tail would exceed the rotate threshold. */
     if (s_tail_size > 0 && s_tail_size + (long)total > EVLOG_ROTATE_BYTES) {
-        if (evlog_flush_writer_locked() != ESP_OK) evstore_report_io_error();
-        fclose(s_wf);
-        s_wf = NULL;
-        s_tail_seq++;
-        char path[64];
-        evlog_file_path(path, sizeof path, s_tail_seq);
-        s_wf = fopen(path, "a");
-        if (s_wf == NULL && evlog_full_recovery_locked()) {
-            s_wf = fopen(path, "a");   /* eviction freed space — retry once */
-        }
-        if (s_wf == NULL) {
-            /* Still no room (nothing synced left to evict). Roll the sequence
-             * back and keep appending to the previous tail: writer and reader
-             * must never point at a file that does not exist (a phantom tail
-             * reads as "queue drained" to the claim path and deadlocks the
-             * publisher until reboot). The old tail grows past the rotate
-             * threshold until the drain frees space — harmless. */
-            s_tail_seq--;
-            evlog_file_path(path, sizeof path, s_tail_seq);
-            s_wf = fopen(path, "a");
-            if (s_wf == NULL) {
-                /* Do NOT latch the log offline: a transient open failure
-                 * (heap/DMA OOM) must not disable persistence for the rest of
-                 * the session (audit D1). */
-                ESP_LOGE(TAG, "rotate: reopen of previous tail %s failed — dropping record", path);
-                s_dropped++;
-                free(cmd);
-                xSemaphoreGive(s_mtx);
-                evstore_report_io_error();
-                return ESP_FAIL;
-            }
-            ESP_LOGW(TAG, "rotate deferred (store full) — still appending to %s", path);
-        } else {
-            s_tail_size = 0;
+        if (!evlog_rotate_locked()) {
+            ESP_LOGE(TAG, "rotate: reopen of previous tail failed — dropping record");
+            s_dropped++; s_refused_media++;
+            free(cmd);
+            xSemaphoreGive(s_mtx);
+            evstore_report_io_error();
+            return ESP_FAIL;
         }
     }
 
+    EVQ_FAULT_POINT("store.before_write");
+    const char *parts[7] = { hdr1, cmd, hdr2, meta, "\t", payload_json, "\n" };
+    const size_t lens[7] = { (size_t)h1, clen, (size_t)h2, mlen, 1, plen, 1 };
     size_t w = 0;
-    w += fwrite(hdr1, 1, (size_t)h1, s_wf);
-    w += fwrite(cmd,  1, clen, s_wf);
-    w += fwrite(hdr2, 1, (size_t)h2, s_wf);
-    w += fwrite(meta, 1, mlen, s_wf);
-    w += fwrite("\t", 1, 1, s_wf);
-    w += fwrite(payload_json, 1, plen, s_wf);
-    w += fwrite("\n", 1, 1, s_wf);
-    free(cmd);
-    if (w != total) {
-        /* A failed/short write (e.g. sdmmc couldn't get a DMA buffer under low
-         * heap) leaves a torn partial record. Roll the file back to the last good
-         * boundary so the partial can't merge with — and corrupt the framing of —
-         * the NEXT record. The event is simply dropped (not counted as pending).
-         * Best-effort: under severe OOM even the truncate may fail, but then the
-         * reader's skip-bad still discards the torn line on read. */
-        ESP_LOGE(TAG, "store_event: short write (%u/%u) for id %lld — rolling back",
+    for (size_t i = 0; i < 7; i++) w += fwrite(parts[i], 1, lens[i], s_wf);
+    EVQ_FAULT_POINT("store.after_write_before_fsync");
+    bool durable = (w == total) && evlog_flush_writer_locked() == ESP_OK;
+    if (!durable) {
+        /* A failed/short write or sync leaves a torn or non-durable record. Roll
+         * the file back to the last acknowledged boundary so it can neither
+         * merge with the next record nor surface later as a "refused" record
+         * that is delivered anyway. */
+        int saved_errno = errno;
+        ESP_LOGE(TAG, "store_event: write/sync failed (%u/%u) for id %lld — rolling back",
                  (unsigned)w, (unsigned)total, (long long)measure_id);
+        clearerr(s_wf);
         fflush(s_wf);
-        if (ftruncate(fileno(s_wf), s_tail_size) != 0) {
-            ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
+        if (ftruncate(fileno(s_wf), s_tail_size) != 0 || fsync(fileno(s_wf)) != 0) {
+            /* Cannot prove the rollback: close the writer so the next store
+             * reopens at the true file end (and re-derive stats at boot). */
+            ESP_LOGW(TAG, "store_event: rollback truncate failed — writer reset");
+            fclose(s_wf);
+            s_wf = NULL;
         }
+        free(cmd);
         s_dropped++;
-        /* Distinguish a FULL store (healthy — pause writes, keep draining) from a
-         * media fault (report I/O error → latch). A false fault report on a
-         * full-but-healthy store causes the remount/measurement-restart thrash (audit C1).
-         * Recovery (evict synced files first) is shared with every other
-         * ENOSPC-class path via evlog_full_recovery_locked(). */
         uint64_t freeb = 0;
-        bool full = (errno == ENOSPC) ||
+        bool full = (saved_errno == ENOSPC) ||
                     (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
         if (full) {
-            /* This record was already rolled back and stays dropped; the next
-             * store proceeds when eviction restored headroom. */
+            s_refused_full++;
             (void)evlog_full_recovery_locked();
             xSemaphoreGive(s_mtx);
             return ESP_ERR_NO_MEM;      /* full is not a media fault: no report_io_error */
         }
+        s_refused_media++;
         xSemaphoreGive(s_mtx);
         evstore_report_io_error();
         return ESP_FAIL;
     }
     evstore_report_io_ok();
+#if EVQ_HIL_ON
+    evq_hil_note_line(measure_id, parts, lens, 7);
+#endif
+    evlog_tail_account(parts, lens, 7, measure_id);
+    free(cmd);
     s_tail_size += (long)total;
-    s_pending++;
-    s_stores_since_archive++;        /* bulk-SD-archive trigger (event_log_archive_pending) */
+    s_stores_since_archive++;
+    EVQ_FAULT_POINT("store.after_fsync_before_return");
 
-    s_writes_since_flush++;
-    TickType_t now = xTaskGetTickCount();
-    if (s_writes_since_flush >= EVLOG_FLUSH_EVERY_N ||
-        (now - s_last_flush_tick) >= pdMS_TO_TICKS(EVLOG_FLUSH_PERIOD_MS)) {
-        if (evlog_flush_writer_locked() != ESP_OK) {
-            /* The record's bytes reached stdio but the flush failed. On a FULL
-             * littlefs this is backpressure (the COW commit has no free block
-             * pair), not a dying medium — and this is the path a full store
-             * actually takes, since stdio absorbs the fwrites and the failure
-             * only surfaces here. Evict synced files first; only with space
-             * available is a flush failure a real I/O fault. The record stays
-             * dropped/not-durable either way. */
-            uint64_t freeb = 0;
-            if (evstore_free_bytes(&freeb) == ESP_OK &&
-                freeb < EVLOG_MIN_FREE_BYTES) {
-                (void)evlog_full_recovery_locked();
-                xSemaphoreGive(s_mtx);
-                return ESP_ERR_NO_MEM;
-            }
-            xSemaphoreGive(s_mtx);
-            evstore_report_io_error();
-            return ESP_FAIL;
-        }
-        s_writes_since_flush = 0;
-        s_last_flush_tick    = now;
-    }
-
+    uint64_t freeb = 0;
+    bool pressure = evq_pressure_locked(&freeb);
+    if (pressure) s_pressure_notifies++;
+    bool wake = pressure || s_stores_since_archive == EVLOG_ARCHIVE_EVERY_N;
     xSemaphoreGive(s_mtx);
+    if (wake) evq_keeper_notify();
     return ESP_OK;
+}
+
+/* Frontier helper: set the head block and return NOT_FINISHED. */
+static esp_err_t evq_block_locked(uint8_t why)
+{
+    if (s_head_block != why) {
+        ESP_LOGW(TAG, "delivery waits at ev-%06u.log:%ld — %s (cursor held; nothing skipped)",
+                 (unsigned)s_rd_seq, s_rd_off, event_log_block_name(why));
+    }
+    s_head_block = why;
+    return ESP_ERR_NOT_FINISHED;
 }
 
 static esp_err_t event_log_claim_impl(measurement_event_t *out)
@@ -1123,25 +1942,24 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
         evlog_window_slot_t *slot = &s_window[i];
         if (slot->acked || slot->claimed) continue;
 
-        bool is_tail = slot->seq >= s_tail_seq;
-        if (is_tail && evlog_flush_writer_locked() != ESP_OK) {  /* push appends to media first */
-            evstore_report_io_error();
+        evq_rd_t rd;
+        uint8_t block = EVQ_BLOCK_NONE;
+        esp_err_t oe = evq_open_read_locked(slot->seq, &rd, &block);
+        if (oe != ESP_OK) {
+            esp_err_t r = (oe == ESP_ERR_NOT_FINISHED) ? evq_block_locked(block) : ESP_FAIL;
+            ESP_LOGE(TAG, "re-claim of id=%lld at %u:%ld unavailable — holding window",
+                     (long long)slot->measure_id, (unsigned)slot->seq, slot->off);
             xSemaphoreGive(s_mtx);
-            return ESP_FAIL;
+            return r;
         }
-
-        char path[64];
-        evlog_file_path(path, sizeof path, slot->seq);
-        FILE *rf = fopen(path, "rb");
-        if (rf == NULL || fseek(rf, slot->off, SEEK_SET) != 0 ||
-            fgets(s_line, s_line_cap, rf) == NULL) {
-            if (rf != NULL) fclose(rf);
+        if (fseek(rd.f, slot->off, SEEK_SET) != 0 || fgets(s_line, s_line_cap, rd.f) == NULL) {
+            evq_rd_close(&rd);
             ESP_LOGE(TAG, "re-claim failed for id=%lld at %u:%ld — holding window",
                      (long long)slot->measure_id, (unsigned)slot->seq, slot->off);
             xSemaphoreGive(s_mtx);
             return ESP_FAIL;
         }
-        fclose(rf);
+        evq_rd_close(&rd);
 
         size_t len = strlen(s_line);
         int64_t disk_id = (int64_t)strtoll(s_line, NULL, 10);
@@ -1170,9 +1988,9 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
     }
 
     /* The scan position follows the claim tail, never the cursor unless the
-     * window is empty.  EOF traversal may move this local position across files,
-     * but only cursor normalization below is permitted to delete one. */
+     * window is empty. */
     evlog_normalize_cursor_locked();
+    if (s_window_count == 0) evq_validate_cursor_locked();
     uint32_t scan_seq = s_rd_seq;
     long scan_off = s_rd_off;
     if (s_window_count > 0) {
@@ -1191,73 +2009,79 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             break;
         }
 
-        char path[64];
-        evlog_file_path(path, sizeof path, scan_seq);
-        errno = 0;
-        FILE *rf = fopen(path, "rb");
-        if (rf == NULL) {
-            if (is_tail && errno == ENOENT && s_wf == NULL) {
+        evq_rd_t rd;
+        uint8_t block = EVQ_BLOCK_NONE;
+        esp_err_t oe = evq_open_read_locked(scan_seq, &rd, &block);
+        if (oe == ESP_ERR_NOT_FINISHED) {
+            /* An indexed obligation that cannot be read right now (card absent,
+             * parked, swapped, file missing or both copies corrupt): WAIT. The
+             * cursor never passes it; with claims already outstanding, report
+             * window-bound so the drain keeps consuming their ACKs. */
+            result = at_cursor ? evq_block_locked(block) : ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (oe == ESP_ERR_NOT_FOUND) {
+            if (is_tail && s_wf == NULL) {
                 /* Writer-down state: a rotate onto a full store advanced
-                 * s_tail_seq past a file that was never created, and the
-                 * store-side reopen keeps failing. A phantom tail must not read
-                 * as "queue drained" (that idles the publisher until reboot):
-                 * evict to make room, roll the tail back to the newest real
-                 * file, reopen it, and retry the claim once. */
+                 * s_tail_seq past a file that was never created. A phantom tail
+                 * must not read as "queue drained": evict, roll the tail back
+                 * to the newest real file, reopen it, and retry once. */
                 (void)evlog_full_recovery_locked();
                 uint32_t min_seq = 0, max_seq = 0;
                 if (evlog_scan_range_locked(&min_seq, &max_seq) &&
-                    max_seq < s_tail_seq) {
-                    ESP_LOGW(TAG, "tail ev-%06u.log missing with writer down — "
-                                  "rolling back to ev-%06u.log",
+                    max_seq < s_tail_seq && evq_index_find(&s_ix, max_seq) == NULL) {
+                    ESP_LOGW(TAG, "tail ev-%06u.log missing with writer down — rolling back to ev-%06u.log",
                              (unsigned)s_tail_seq, (unsigned)max_seq);
                     s_tail_seq = max_seq;
+                    evlog_scan_tail_locked();
                 }
-                if (evlog_reopen_tail_locked() == ESP_OK) {
-                    continue;            /* tail healed — retry the read */
-                }
+                if (evlog_reopen_tail_locked() == ESP_OK) continue;
                 result = ESP_ERR_NOT_FOUND;
                 break;
             }
-            if (!is_tail && errno == ENOENT) {
-                if (at_cursor) {
-                    ESP_LOGW(TAG, "ev-%06u.log missing at cursor — skipping", (unsigned)scan_seq);
-                    s_skipped++;
-                    s_rd_seq++; s_rd_off = 0;
-                    evlog_persist_cursor_locked();
-                    scan_seq = s_rd_seq;
-                    scan_off = s_rd_off;
-                    continue;
-                }
-                /* Do not create a later-file slot across a missing-file gap.
-                 * Once the existing window closes, that gap becomes the cursor
-                 * and the audited frontier-only skip above owns the decision. */
-                result = ESP_ERR_INVALID_STATE;
-                break;
+            if (is_tail) { result = ESP_ERR_NOT_FOUND; break; }
+            if (at_cursor) {
+                /* Not on flash, not in the index: a pre-upgrade gap (files the
+                 * old firmware deleted). Nothing can recover it; count it. */
+                ESP_LOGW(TAG, "ev-%06u.log missing at cursor and never indexed — passing gap", (unsigned)scan_seq);
+                s_skipped++;
+                s_skipped_unindexed_gap++;
+                s_rd_seq++; s_rd_off = 0; s_cur_consumed = 0;
+                evlog_persist_cursor_locked();
+                scan_seq = s_rd_seq;
+                scan_off = s_rd_off;
+                continue;
             }
+            /* Do not create a later-file slot across a gap. */
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (oe != ESP_OK) {
             if (!is_tail) evstore_report_io_error();
             result = is_tail ? ESP_ERR_NOT_FOUND : ESP_FAIL;
             break;
         }
-        if (fseek(rf, scan_off, SEEK_SET) != 0) {
-            fclose(rf);
+        if (at_cursor) s_head_block = EVQ_BLOCK_NONE;
+        if (fseek(rd.f, scan_off, SEEK_SET) != 0) {
+            evq_rd_close(&rd);
             result = ESP_ERR_NOT_FOUND;
             break;
         }
 
-        char *got = fgets(s_line, s_line_cap, rf);
+        char *got = fgets(s_line, s_line_cap, rd.f);
         if (got == NULL) {
-            if (ferror(rf)) {
-                clearerr(rf); fclose(rf);
-                evstore_report_io_error();
+            if (ferror(rd.f)) {
+                clearerr(rd.f); evq_rd_close(&rd);
+                if (rd.medium == EVQ_MEDIUM_SD) sdcard_report_io_error(); else evstore_report_io_error();
                 result = ESP_FAIL;
                 break;
             }
-            fclose(rf);
+            evq_rd_close(&rd);
             if (!is_tail) {
                 if (at_cursor) {
-                    remove(path);
-                    s_rd_seq++; s_rd_off = 0;
-                    evlog_persist_cursor_locked();
+                    evq_cursor_leave_file_locked();   /* EOF reached by the ACK prefix */
+                    scan_seq = s_rd_seq; scan_off = s_rd_off;
+                    continue;
                 }
                 scan_seq++;
                 scan_off = 0;
@@ -1273,65 +2097,67 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             if (len == s_line_cap - 1U) {            /* over-long/corrupt: no '\n' within active cap */
                 long skipped = (long)len;
                 char *more;
-                while ((more = fgets(s_line, s_line_cap, rf)) != NULL) {
+                bool framed = false;
+                while ((more = fgets(s_line, s_line_cap, rd.f)) != NULL) {
                     size_t l2 = strlen(more);
                     skipped += (long)l2;
-                    if (l2 > 0 && more[l2 - 1] == '\n') break;
+                    if (l2 > 0 && more[l2 - 1] == '\n') { framed = true; break; }
                 }
-                if (ferror(rf)) {                    /* over-long scan hit a read error → don't skip */
-                    clearerr(rf); fclose(rf);
+                if (ferror(rd.f)) {                  /* over-long scan hit a read error → don't skip */
+                    clearerr(rd.f); evq_rd_close(&rd);
                     evstore_report_io_error();
                     result = ESP_FAIL;
                     break;
                 }
-                fclose(rf);
-                if (!at_cursor) {
-                    /* A later corrupt record cannot be skipped around the
-                     * unacked frontier.  Let the prefix close, then the normal
-                     * cursor-owned skip path handles it. */
-                    result = ESP_ERR_INVALID_STATE;
+                evq_rd_close(&rd);
+                if (!at_cursor) { result = ESP_ERR_INVALID_STATE; break; }
+                if (!framed && is_tail) { result = ESP_ERR_NOT_FOUND; break; }   /* still being written? */
+                /* Preserve the intact bytes BEFORE the cursor moves. */
+                if (!evq_quarantine_range_locked(scan_seq, scan_off, skipped)) {
+                    result = ESP_FAIL;
                     break;
                 }
-                ESP_LOGW(TAG, "skipping over-long record seq=%u off=%ld (%ld B)",
+                ESP_LOGW(TAG, "quarantined over-long record seq=%u off=%ld (%ld B)",
                          (unsigned)scan_seq, scan_off, skipped);
+                evq_account_quarantined_locked(EVQ_Q_MALFORMED, scan_seq, scan_off);
                 s_rd_off += skipped;
+                s_cur_consumed += framed ? 1 : 0;
                 scan_off = s_rd_off;
-                s_skipped++;
-                if (s_pending > 0) s_pending--;
                 evlog_persist_cursor_locked();
                 continue;
             }
-            if (ferror(rf)) {                        /* partial line due to a read error, not a torn record */
-                clearerr(rf); fclose(rf);
+            if (ferror(rd.f)) {                      /* partial line due to a read error, not a torn record */
+                clearerr(rd.f); evq_rd_close(&rd);
                 evstore_report_io_error();
                 result = ESP_FAIL;
                 break;
             }
-            fclose(rf);
-            if (!is_tail && at_cursor) {             /* torn tail of a closed file → drop it */
-                ESP_LOGW(TAG, "partial record at end of rotated %s — dropping", path);
-                remove(path);
-                s_rd_seq++; s_rd_off = 0;
-                scan_seq = s_rd_seq; scan_off = 0;
-                s_skipped++;
+            evq_rd_close(&rd);
+            if (!is_tail && at_cursor) {
+                /* Torn tail of a closed, UNINDEXED (pre-upgrade) file — indexed
+                 * files are CRC-verified before reading, so they never get here.
+                 * Keep the fragment, then leave the file. */
+                if (!evq_quarantine_range_locked(scan_seq, scan_off, (long)len)) {
+                    result = ESP_FAIL;
+                    break;
+                }
+                ESP_LOGW(TAG, "partial record at end of rotated ev-%06u.log — quarantined", (unsigned)scan_seq);
+                evq_account_quarantined_locked(EVQ_Q_MALFORMED, scan_seq, scan_off);
+                s_rd_off += (long)len;
                 evlog_persist_cursor_locked();
+                evq_cursor_leave_file_locked();
+                scan_seq = s_rd_seq; scan_off = 0;
                 continue;
             }
             result = is_tail ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_STATE;
             break;
         }
-        fclose(rf);
+        evq_rd_close(&rd);
 
         /* Raw-record bytes are a conservative, persistence-owned first gate.
          * device_commands applies the exact envelope-byte gate before publish;
          * both serialize a lone over-budget item, then enforce the byte ceiling
-         * once anything is outstanding. A reverted slot bypasses this check
-         * because its bytes are already charged above. */
-        /* An empty window admits one record even at the active cap: equality
-         * fills the 64-KiB budget, while the final 15 B allowed by the 65552-B
-         * store cap may exceed it slightly. Either way the record serializes the
-         * window; device_commands' exact envelope/publish-cap gate then publishes
-         * or archives it. Once any bytes are outstanding, the budget is strict. */
+         * once anything is outstanding. */
         if (s_window_bytes > 0 &&
             (s_window_bytes >= PUBLISH_WINDOW_BYTES ||
              len > PUBLISH_WINDOW_BYTES - s_window_bytes)) {
@@ -1361,25 +2187,21 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             /* Fragmented heap can't strdup this (oversized) record. Retrying it
              * forever head-of-line-blocks the whole backlog into an hourly reboot
              * loop (audit D2). After EVLOG_OOM_STUCK_MAX strikes on the SAME head,
-             * quarantine it by raw line so the drain advances. parse_record has
-             * mangled s_line, so archive re-reads the raw record from disk. */
+             * quarantine it (intact copy first) so the drain advances. */
             if (!at_cursor) {
-                /* A later-slot allocation failure may not feed the destructive
-                 * frontier OOM escape at all. Wait for the current prefix to
-                 * close, then retry/count it when it is exactly the cursor. */
                 result = ESP_ERR_NO_MEM;
                 break;
             }
             if (record_id == s_oom_head_id) s_oom_strikes++;
             else { s_oom_head_id = record_id; s_oom_strikes = 1; }
             if (s_oom_strikes >= EVLOG_OOM_STUCK_MAX &&
-                evlog_archive_head_locked((long)len, record_id)) {
+                evq_quarantine_range_locked(scan_seq, scan_off, (long)len)) {
                 ESP_LOGW(TAG, "OOM-stuck record id=%lld quarantined after %u strikes — drain unblocked",
                          (long long)record_id, (unsigned)s_oom_strikes);
+                evq_account_quarantined_locked(EVQ_Q_POISON, scan_seq, scan_off);
                 s_rd_off += (long)len;
+                s_cur_consumed++;
                 scan_off = s_rd_off;
-                if (s_pending > 0) s_pending--;
-                s_skipped++;
                 s_oom_head_id = 0; s_oom_strikes = 0;
                 evlog_persist_cursor_locked();
                 continue;
@@ -1387,19 +2209,23 @@ static esp_err_t event_log_claim_impl(measurement_event_t *out)
             result = ESP_ERR_NO_MEM;                 /* don't consume — retry next drain */
             break;
         }
-        /* Malformed records may be skipped only when they are at the cursor
-         * frontier.  With claim!=cursor, stop and let earlier slots close first;
-         * advancing s_rd_off here would be the ticket-04 m5 data-loss bug. */
+        /* Malformed records may be passed only at the cursor frontier, and only
+         * after their intact bytes are durable in quarantine. With claim!=cursor,
+         * stop and let earlier slots close first (the ticket-04 m5 rule). */
         if (!at_cursor) {
             result = ESP_ERR_INVALID_STATE;
             break;
         }
-        ESP_LOGW(TAG, "skipping bad record seq=%u off=%ld len=%u",
+        if (!evq_quarantine_range_locked(scan_seq, scan_off, (long)len)) {
+            result = ESP_FAIL;                       /* Q3: cursor stays */
+            break;
+        }
+        ESP_LOGW(TAG, "quarantined malformed record seq=%u off=%ld len=%u",
                  (unsigned)s_rd_seq, s_rd_off, (unsigned)len);
+        evq_account_quarantined_locked(EVQ_Q_MALFORMED, scan_seq, scan_off);
         s_rd_off += (long)len;
+        s_cur_consumed++;
         scan_off = s_rd_off;
-        s_skipped++;
-        if (s_pending > 0) s_pending--;
         evlog_persist_cursor_locked();
     }
 
@@ -1425,8 +2251,6 @@ esp_err_t event_log_mark_event_synced(int64_t measure_id)
     bool reset_pending = s_reset_pending;
     s_reset_pending = false;
     xSemaphoreGive(s_mtx);
-    /* Invariant recovery cleared event_log's volatile window. Reset the peer only
-     * after releasing s_mtx so its bounded portMUX/queue work cannot invert locks. */
     if (reset_pending && s_reset_notifier != NULL) s_reset_notifier();
     return ESP_OK;
 }
@@ -1455,9 +2279,7 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
 
     /* Window-safety contract: quarantine is deliberately a frontier-only
      * operation. Re-read s_rd_seq/s_rd_off under s_mtx and verify measure_id
-     * before any archive or cursor mutation. When ticket 05 lets claim position
-     * move ahead of the cursor, a stuck non-frontier slot MUST receive
-     * ESP_ERR_INVALID_STATE rather than archive an innocent frontier record. */
+     * before any archive or cursor mutation. */
     if (s_window_count > 0 &&
         (s_window[0].measure_id != measure_id || s_window[0].seq != s_rd_seq ||
          s_window[0].off != s_rd_off || s_window[0].claimed || s_window[0].acked)) {
@@ -1468,44 +2290,36 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_rd_seq >= s_tail_seq) evlog_flush_writer_locked();
-    char path[64];
-    evlog_file_path(path, sizeof path, s_rd_seq);
-    FILE *rf = fopen(path, "rb");
-    if (rf == NULL) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_FOUND; }
-    if (fseek(rf, s_rd_off, SEEK_SET) != 0 ||
-        fgets(s_line, s_line_cap, rf) == NULL) {
-        fclose(rf);
+    evq_rd_t rd;
+    uint8_t block;
+    if (evq_open_read_locked(s_rd_seq, &rd, &block) != ESP_OK) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_FOUND; }
+    if (fseek(rd.f, s_rd_off, SEEK_SET) != 0 || fgets(s_line, s_line_cap, rd.f) == NULL) {
+        evq_rd_close(&rd);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_FOUND;
     }
-    fclose(rf);
+    evq_rd_close(&rd);
 
     size_t len = strlen(s_line);
     if (len == 0 || s_line[len - 1] != '\n') {
-        /* Torn/over-long record: claim's own skip logic owns those cases. */
+        /* Torn/over-long record: claim's own quarantine logic owns those cases. */
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_STATE;
     }
-    /* Fail closed if the caller's id is not still exactly at the frontier. */
     if ((int64_t)strtoll(s_line, NULL, 10) != measure_id) {
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Archive FIRST — the record is only skipped once it is durably elsewhere.
-     * If the append fails, stay put and let the caller retry next cycle. */
-    FILE *qf = fopen(EVLOG_QUARANTINE, "a");
-    if (qf == NULL) { xSemaphoreGive(s_mtx); return ESP_FAIL; }
-    size_t w = fwrite(s_line, 1, len, qf);
-    fflush(qf);
-    fsync(fileno(qf));
-    fclose(qf);
-    if (w != len) { xSemaphoreGive(s_mtx); return ESP_FAIL; }
+    /* Archive FIRST — the record is only passed once it is durably elsewhere.
+     * If the copy fails, stay put and let the caller retry next cycle. */
+    if (!evq_quarantine_range_locked(s_rd_seq, s_rd_off, (long)len)) {
+        xSemaphoreGive(s_mtx);
+        return ESP_FAIL;
+    }
+    evq_account_quarantined_locked(EVQ_Q_POISON, s_rd_seq, s_rd_off);
 
-    /* Advance past exactly the cursor record without pretending it had a PUBACK.
-     * If it was already claimed as slot zero, remove only that slot; later ACKed
-     * slots may then form a real contiguous prefix and advance normally. */
+    /* Advance past exactly the cursor record without pretending it had a PUBACK. */
     if (s_window_count > 0) {
         s_rd_seq = s_window[0].seq;
         s_rd_off = s_window[0].off + s_window[0].len;
@@ -1513,7 +2327,7 @@ static esp_err_t event_log_quarantine_impl(int64_t measure_id)
     } else {
         s_rd_off += (long)len;
     }
-    if (s_pending > 0) s_pending--;
+    s_cur_consumed++;
     evlog_advance_acked_prefix_locked();
     evlog_normalize_cursor_locked();
     evlog_persist_cursor_locked();
@@ -1535,40 +2349,45 @@ static esp_err_t event_log_rewind_impl(uint32_t seq, uint32_t *out_seq, int64_t 
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     if (!s_available) { xSemaphoreGive(s_mtx); return ESP_ERR_NOT_SUPPORTED; }
 
-    /* Clamp the target to the files actually on the card. Drained files were
-     * deleted, so the oldest present file (min_seq) is as far back as we can go;
-     * seq==0 means "the oldest file" (re-publish everything still on the card). */
+    /* Clamp to files the QUEUE can still read: flash files plus SPOOLED/SD_ONLY
+     * segments (never archived ones). seq==0 means "the oldest such file". */
     uint32_t min_seq = 0, max_seq = 0;
-    if (!evlog_scan_range_locked(&min_seq, &max_seq)) {
+    bool any = evlog_scan_range_locked(&min_seq, &max_seq);
+    for (size_t i = 0; i < s_ix.n; i++) {
+        const evq_seg_t *s = &s_ix.segs[i];
+        if (s->state != EVQ_SEG_SPOOLED && s->state != EVQ_SEG_SD_ONLY) continue;
+        if (!any || s->seq < min_seq) { min_seq = s->seq; if (!any) max_seq = s->seq; any = true; }
+    }
+    if (!any) {
         xSemaphoreGive(s_mtx);
-        return ESP_ERR_NOT_FOUND;            /* no log files to rewind to */
+        return ESP_ERR_NOT_FOUND;
     }
     uint32_t target = (seq == 0) ? min_seq : seq;
     if (target < min_seq) target = min_seq;
     if (target > max_seq) target = max_seq;
-    /* Rewind only: never advance the cursor forward, which would skip still-pending
-     * records and orphan their files (they're deleted only as the reader passes
-     * them). A forward request is clamped back to the current cursor file. */
+    /* Rewind only: never advance the cursor forward. */
     if (target > s_rd_seq) target = s_rd_seq;
 
     s_rd_seq = target;
     s_rd_off = 0;
+    s_cur_consumed = 0;
+    s_cur_validated = true;
     /* Rewind abandons every RAM-only claim. device_commands_abort_inflight()
      * clears the peer msg-id table and completion queue before the CLI invokes
      * this path, so late PUBACKs cannot address the rebuilt window. */
     evlog_window_clear_locked();
     evlog_persist_cursor_locked();
+    /* DELIVERED segments the rewound cursor now precedes rejoin the queue. */
+    evq_boot_repair_states_locked();
 
-    bool capped = false;
-    s_pending = evlog_scan_pending_locked(&capped);
-    int64_t pending = s_pending;
-
+    evq_counts_t c;
+    evq_counts_locked(&c);
     if (out_seq)     *out_seq     = s_rd_seq;
-    if (out_pending) *out_pending = pending;
+    if (out_pending) *out_pending = c.pending;
     xSemaphoreGive(s_mtx);
 
     ESP_LOGW(TAG, "cursor rewound to seq=%u off=0 — %lld%s record(s) pending, will re-publish",
-             (unsigned)target, (long long)pending, capped ? "+" : "");
+             (unsigned)target, (long long)c.pending, c.exact ? "" : "+");
     return ESP_OK;
 }
 
@@ -1588,12 +2407,48 @@ esp_err_t event_log_db_stats(bool *available, int64_t *total,
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    evq_counts_t c;
+    evq_counts_locked(&c);
     if (available) *available = s_available;
-    if (total)     *total     = s_pending;
-    if (pending)   *pending   = s_pending;
+    if (total)     *total     = c.pending;
+    if (pending)   *pending   = c.pending;
     if (next_id)   *next_id   = s_next_id;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
+}
+
+/* Is the delivery head waiting on an unreadable SD-only segment? True once a
+ * claim hit it, and also derivable without one (right after boot, before the
+ * drain has tried): the cursor's segment has no flash copy and its card is not
+ * usable. No FS operation — mismatched cards get zero operations. */
+static uint8_t evq_head_waiting_locked(void)
+{
+    if (s_head_block != EVQ_BLOCK_NONE) return s_head_block;
+    if (s_rd_seq >= s_tail_seq) return EVQ_BLOCK_NONE;
+    const evq_seg_t *s = evq_index_find(&s_ix, s_rd_seq);
+    if (s == NULL || s->flash_present || s->primary[0] == '\0') return EVQ_BLOCK_NONE;
+    switch (s_sd_state) {
+    case EVQ_SD_ABSENT:   return EVQ_BLOCK_SD_ABSENT;
+    case EVQ_SD_LOST:     return EVQ_BLOCK_SD_LOST;
+    case EVQ_SD_PARKED:   return EVQ_BLOCK_SD_PARKED;
+    case EVQ_SD_MISMATCH: return EVQ_BLOCK_SD_MISMATCH;
+    default:              return s->cid != s_sd_last_cid ? EVQ_BLOCK_SD_MISMATCH : EVQ_BLOCK_NONE;
+    }
+}
+
+static uint8_t evq_blocked_reason_locked(void)
+{
+    if (!s_write_full) return EVQ_BLOCKED_NONE;
+    if (evq_head_waiting_locked() != EVQ_BLOCK_NONE) return EVQ_BLOCKED_BACKLOG_WAITING;
+    if (s_ix_ready && s_ix.n >= s_ix.cap) return EVQ_BLOCKED_INDEX_CAP;
+    switch (s_sd_state) {
+    case EVQ_SD_ABSENT: case EVQ_SD_LOST: case EVQ_SD_PARKED: return EVQ_BLOCKED_SD_UNAVAILABLE;
+    case EVQ_SD_MISMATCH: return EVQ_BLOCKED_SD_MISMATCH;
+    case EVQ_SD_FULL:     return EVQ_BLOCKED_SD_FULL;
+    default: break;
+    }
+    if (s_sd_backoff_active) return EVQ_BLOCKED_SD_ERROR;
+    return EVQ_BLOCKED_TRANSFER_PENDING;
 }
 
 esp_err_t event_log_health(evlog_health_t *out)
@@ -1601,25 +2456,60 @@ esp_err_t event_log_health(evlog_health_t *out)
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    memset(out, 0, sizeof *out);
+    evq_sd_observe_locked();
+    evq_counts_t c;
+    evq_counts_locked(&c);
     out->available     = s_available;
     out->write_full    = s_write_full;
-    out->pending       = s_pending;
+    out->pending       = c.pending;
+    out->pending_exact = c.exact;
+    out->flash_pending = c.flash;
+    out->sd_pending    = c.sd;
+    out->reimport_pending = c.reimport;
+    /* Strict original order: while the head waits on an unreadable copy the
+     * drain can reach NOTHING, so nothing is deliverable (and the no-PUBACK
+     * watchdog must not reboot-loop over a missing card). */
+    uint8_t head = evq_head_waiting_locked();
+    out->deliverable_pending = (head != EVQ_BLOCK_NONE) ? 0 : c.pending - c.reimport;
     out->next_id       = s_next_id;
     out->last_acked_id = s_last_acked_id;
     out->skipped       = s_skipped;
     out->dropped       = s_dropped;
     out->rd_seq        = s_rd_seq;
     out->tail_seq      = s_tail_seq;
+    out->sd_state      = s_head_block == EVQ_BLOCK_BACKLOG_MISSING ? EVQ_SD_BACKLOG_MISSING
+                       : s_head_block == EVQ_BLOCK_BACKLOG_CORRUPT ? EVQ_SD_BACKLOG_CORRUPT
+                       : s_sd_state;
+    out->head_block    = head;
+    out->storage_blocked = s_write_full;
+    out->blocked_reason  = evq_blocked_reason_locked();
+    out->refused_full        = s_refused_full;
+    out->refused_media       = s_refused_media;
+    out->refused_too_large   = s_refused_too_large;
+    out->refused_unavailable = s_refused_unavailable;
+    out->quarantined_poison    = s_quarantined_poison;
+    out->quarantined_malformed = s_quarantined_malformed;
+    out->skipped_unindexed_gap = s_skipped_unindexed_gap;
+    out->corrupt_detected      = s_corrupt_detected;
+    out->corrupt_medium        = s_corrupt_medium;
+    out->spool_files      = s_spool_files;
+    out->spool_errors     = s_spool_errors;
+    out->mirror_used      = s_mirror_used;
+    out->reclaimed_files  = s_reclaimed_files;
+    out->archived_files   = s_archived_files;
+    out->reimported_files = s_reimported_files;
+    out->pressure_notifies = s_pressure_notifies;
+    out->sd_bursts        = s_sd_bursts;
+    out->sd_retired_names = s_sd_retired_names;
+    out->sd_bad_copies    = s_sd_bad_copies;
+    out->index_segments   = (uint32_t)s_ix.n;
+    out->index_cap        = (uint32_t)s_ix.cap;
     xSemaphoreGive(s_mtx);
     return ESP_OK;
 }
 
-/* ── public entry points: SD RW-gate wrappers ─────────────────────────────
- * Every op that touches the FATFS volume runs between evstore_io_begin()/io_end() so
- * an unmount cannot free the volume mid-op (audit F1/R-5). The begin/end are 1:1 by
- * construction — exactly one begin, exactly one end, NO branch between — so no return
- * path inside the *_impl (which keep all their own s_mtx handling) can leak a ref.
- * The ref spans the brief s_mtx wait too, which only delays a teardown by ms. */
+/* ── public entry points: SD RW-gate wrappers ───────────────────────────── */
 esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
@@ -1636,6 +2526,10 @@ esp_err_t event_log_claim_next_event(measurement_event_t *out)
     if (!evstore_io_begin()) { memset(out, 0, sizeof *out); return ESP_ERR_NOT_SUPPORTED; }
     esp_err_t rc = event_log_claim_impl(out);
     evstore_io_end();
+#if EVQ_HIL_ON
+    /* The real drain's claim results (M-1): the only caller is sync_runner. */
+    s_hil_claims[rc == ESP_OK ? 0 : rc == ESP_ERR_NOT_FOUND ? 1 : rc == ESP_ERR_NOT_FINISHED ? 2 : 3]++;
+#endif
     return rc;
 }
 
@@ -1665,135 +2559,540 @@ measurement_mark_event_pending_fn event_log_get_mark_event_pending_fn(void) { re
 measurement_quarantine_fn         event_log_get_quarantine_fn(void)         { return event_log_quarantine_event; }
 measurement_db_stats_fn           event_log_get_db_stats_fn(void)           { return event_log_db_stats; }
 
-/* ═══ SD interchange: bulk archive + legacy-backlog import ═══════════════════
- * The ONLY two places this component touches the SD card, both driven by the
- * app-level keeper task (never the store/claim hot path) and both bracketed by
- * sdcard_io_begin/end because the SD — unlike the internal store — can vanish
- * mid-op. SD failures here report into the card-loss latch (a genuinely dead
- * card should unmount) but NEVER affect store availability: with no SD the
- * archive simply skips and eviction bounds the retained-synced pool. */
-
 esp_err_t event_log_free_bytes(uint64_t *out_free)
 {
     return evstore_free_bytes(out_free);
 }
 
-bool event_log_archive_pending(void)
+/* ═══ SD transfer: spool, reclaim, archive, re-import, legacy import ════════
+ * Driven only by the keeper task (event_log_sd_keeper_start) — never the store
+ * or claim hot path. File copies and verifications run WITHOUT s_mtx (rotated
+ * files are immutable; the copied seq is pinned against eviction), inside one
+ * sdcard_io_begin/end bracket each; s_mtx is taken only to decide and to append
+ * index lines. With no card, or a parked/mismatched one, every step is a no-op:
+ * measurement and publishing never notice. */
+
+static void evq_keeper_notify(void)
 {
-    /* Racy reads are fine: the keeper polls; a stale answer costs one period. */
-    return s_available && s_stores_since_archive >= EVLOG_ARCHIVE_EVERY_N &&
-           sdcard_is_mounted();
+    s_keeper_wake_pending = true;
+    TaskHandle_t t = s_keeper_task;
+    if (t != NULL) xTaskNotifyGive(t);
 }
 
-/* Copy every fully-synced retained file (seq < durable cursor) to
- * EVLOG_ARCHIVE_DIR, then delete the internal copy. One burst per trigger — the
- * SD sees a few large sequential writes per EVLOG_ARCHIVE_EVERY_N stores instead
- * of a continuous metadata trickle (the corruption pattern PR #27 documented).
- * Archive names are arc-<first_measure_id>.log: measure_ids are monotonic for
- * the device's lifetime (NVS HWM + reseed-above-max), so names never collide
- * across internal seq resets. s_mtx is taken PER FILE so store/claim latency is
- * bounded by one file copy, not the whole burst. */
-esp_err_t event_log_archive_to_sd(size_t *out_archived)
+void event_log_sd_notify(void)
 {
-    if (out_archived) *out_archived = 0;
-    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
-    size_t archived = 0;
+    /* Called by the SD monitor on EVERY mount-state transition: whatever card
+     * is there now must be re-verified before its copies are trusted, even if
+     * event_log itself never observed it unmounted (same CID, removed,
+     * modified elsewhere, reinserted between two observations). */
+    s_sd_notify_epoch++;
+    evq_keeper_notify();
+}
 
+bool event_log_sd_service_pending(void)
+{
+    return s_keeper_wake_pending;
+}
+
+/* Per-service bookkeeping: did this pass write to the card (a "burst")? */
+static bool s_pass_wrote_sd = false;
+static bool s_pass_error    = false;
+
+/* Bounded name copy: false (dst untouched) when src does not fit. Names we
+ * create are short; a longer directory entry is simply not ours. */
+static bool evq_name_copy(char *dst, size_t cap, const char *src)
+{
+    size_t n = strlen(src);
+    if (n >= cap) return false;
+    memcpy(dst, src, n + 1);
+    return true;
+}
+
+static bool evq_name_join(char *dst, size_t cap, const char *base, const char *ext)
+{
+    size_t a = strlen(base), b = strlen(ext);
+    if (a + b >= cap) return false;
+    memcpy(dst, base, a);
+    memcpy(dst + a, ext, b + 1);
+    return true;
+}
+
+static bool evq_sd_path_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Is the SD file a byte prefix of the flash file? (A crash-torn copy of our
+ * own, which is safe to remove because the flash copy still holds it all.) */
+static bool evq_is_prefix_of(const char *sd_path, const char *flash_path, char *buf, size_t cap)
+{
+    FILE *a = fopen(sd_path, "rb");
+    if (a == NULL) return false;
+    FILE *b = fopen(flash_path, "rb");
+    if (b == NULL) { fclose(a); return false; }
+    size_t half = cap / 2;
+    bool prefix = true;
     for (;;) {
-        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) break;
+        size_t na = fread(buf, 1, half, a);
+        if (na == 0) break;
+        size_t nb = fread(buf + half, 1, na, b);
+        if (nb != na || memcmp(buf, buf + half, na) != 0) { prefix = false; break; }
+    }
+    if (ferror(a) || ferror(b)) prefix = false;
+    fclose(a);
+    fclose(b);
+    return prefix;
+}
 
-        uint32_t min_seq = 0, max_seq = 0;
-        bool any = s_available && evlog_scan_range_locked(&min_seq, &max_seq) &&
-                   min_seq < s_rd_seq;               /* strictly-synced files only */
-        if (!any) {
-            /* Reset the trigger only when the pool is clean, so leftovers from a
-             * failed burst re-arm the next keeper pass immediately. */
-            if (archived > 0 || min_seq >= s_rd_seq) s_stores_since_archive = 0;
-            xSemaphoreGive(s_mtx);
-            break;
-        }
+/* Stream `src` to `dir/<base>.log` via `dir/<base>[-k].tmp`: exclusive create,
+ * copy, fflush+fsync+close (content-durable), rename (FatFs f_rename ends in
+ * sync_fs: directory-durable on successful return), then reopen BY THE NEW
+ * NAME and verify size/CRC/structure against `expect`. Caller holds an SD ref
+ * and no s_mtx. `fp` prefixes the fault-point names. */
+static bool evq_copy_commit(const char *src, const char *dir, const char *base,
+                            const evq_seg_t *expect, const char *fp)
+{
+    char tmp[EVQ_PATH_MAX], dst[EVQ_PATH_MAX], name[64];
+    snprintf(dst, sizeof dst, "%s/%s.log", dir, base);
+    if (evq_sd_path_exists(dst)) return false;            /* never overwrite */
+    snprintf(tmp, sizeof tmp, "%s/%s.tmp", dir, base);
+    for (unsigned k = 1; evq_sd_path_exists(tmp) && k < 16; k++) {
+        snprintf(tmp, sizeof tmp, "%s/%s-%u.tmp", dir, base, k);
+    }
+    if (evq_sd_path_exists(tmp)) return false;
 
-        char src[64];
-        evlog_file_path(src, sizeof src, min_seq);
-        FILE *rf = fopen(src, "rb");
-        if (rf == NULL) { xSemaphoreGive(s_mtx); break; }
+    FILE *rf = fopen(src, "rb");
+    if (rf == NULL) return false;
+    FILE *wf = fopen(tmp, "wx");
+    s_pass_wrote_sd = true;
+    if (wf == NULL) { fclose(rf); return false; }
+    snprintf(name, sizeof name, "%s.after_tmp_open", fp); EVQ_FAULT_POINT(name);
+    bool ok = true;
+    bool first = true;
+    size_t n;
+    while ((n = fread(s_kbuf, 1, s_line_cap, rf)) > 0) {
+        if (fwrite(s_kbuf, 1, n, wf) != n) { ok = false; break; }
+        if (first) { first = false; snprintf(name, sizeof name, "%s.mid_copy", fp); EVQ_FAULT_POINT(name); }
+    }
+    if (ferror(rf)) ok = false;
+    fclose(rf);
+    snprintf(name, sizeof name, "%s.before_tmp_fsync", fp); EVQ_FAULT_POINT(name);
+    if (ok && (fflush(wf) != 0 || fsync(fileno(wf)) != 0)) ok = false;
+    if (fclose(wf) != 0) ok = false;
+    if (!ok) { remove(tmp); return false; }
+    snprintf(name, sizeof name, "%s.after_tmp_fsync_before_rename", fp); EVQ_FAULT_POINT(name);
+    snprintf(name, sizeof name, "%s.rename.inside_call", fp); EVQ_FAULT_POINT(name);
+    if (rename(tmp, dst) != 0) { remove(tmp); return false; }
+    snprintf(name, sizeof name, "%s.rename.after_return", fp); EVQ_FAULT_POINT(name);
+    snprintf(name, sizeof name, "%s.after_rename_before_verify", fp); EVQ_FAULT_POINT(name);
+    snprintf(name, sizeof name, "%s.verify_read_error", fp); EVQ_FAULT_POINT(name);
+    evq_scan_t sc;
+    if (!evq_scan_file(dst, s_kbuf, s_line_cap, &sc) || !evq_scan_matches(&sc, expect)) {
+        ESP_LOGW(TAG, "SD copy %s failed read-back verification — removed", dst);
+        remove(dst);
+        return false;
+    }
+    return true;
+}
 
-        /* First line's id names the archive file. */
-        int64_t first_id = 0;
-        if (fgets(s_line, s_line_cap, rf) != NULL) {
-            first_id = (int64_t)strtoll(s_line, NULL, 10);
+/* Choose (and, where an identical copy already exists, adopt) an SD name for
+ * seg `s` in `dir`. `cand` is the preferred basename (without .log); fallbacks
+ * are generated by `fallback(k)`. Returns: 1 adopted existing verified copy,
+ * 0 free name chosen in `out`, -1 no name available. Caller holds an SD ref. */
+static int evq_pick_name(const char *dir, const char *flash_path, const evq_seg_t *s,
+                         const char *cand, bool mirror, char *out, size_t cap)
+{
+    char path[EVQ_PATH_MAX];
+    for (unsigned k = 0; k < 16; k++) {
+        char base[48];
+        if (k == 0) snprintf(base, sizeof base, "%s", cand);
+        else if (mirror) snprintf(base, sizeof base, "m-%06u-%u", (unsigned)s->seq, k);
+        else snprintf(base, sizeof base, "ev-%u", (unsigned)(EVQ_FALLBACK_NAME_BASE + s->seq + (k - 1U)));
+        snprintf(path, sizeof path, "%s/%s.log", dir, base);
+        if (!evq_sd_path_exists(path)) {
+            snprintf(out, cap, "%s", base);
+            return 0;
         }
-        if (first_id <= 0) {
-            /* Unreadable/empty synced file: nothing to archive, drop it. */
-            fclose(rf);
-            remove(src);
-            xSemaphoreGive(s_mtx);
-            continue;
+        /* Taken. Our own intact copy from an interrupted pass → adopt; our own
+         * crash-torn copy (a byte prefix of the flash file) → remove, reuse the
+         * name; anything else is someone else's file → never touched. */
+        evq_scan_t sc;
+        if (evq_scan_file(path, s_kbuf, s_line_cap, &sc) && evq_scan_matches(&sc, s)) {
+            snprintf(out, cap, "%s", base);
+            EVQ_FAULT_POINT("boot.adopt_mid");
+            return 1;
         }
-        rewind(rf);
+        if (evq_is_prefix_of(path, flash_path, s_kbuf, s_line_cap)) {
+            s_pass_wrote_sd = true;
+            if (remove(path) == 0) { snprintf(out, cap, "%s", base); return 0; }
+        }
+    }
+    return -1;
+}
 
-        bool ok = false;
-        if (sdcard_io_begin()) {
-            mkdir(EVLOG_ARCHIVE_DIR, 0777);          /* ignore EEXIST */
-            char dst[80];
-            snprintf(dst, sizeof dst, "%s/arc-%lld.log", EVLOG_ARCHIVE_DIR,
-                     (long long)first_id);
-            /* Names collide when a replayed (re-appended) range is archived a
-             * second time: its first id already names an archive file. Never
-             * overwrite an archive — suffix the internal seq instead. */
-            struct stat st;
-            if (stat(dst, &st) == 0) {
-                snprintf(dst, sizeof dst, "%s/arc-%lld-%u.log", EVLOG_ARCHIVE_DIR,
-                         (long long)first_id, (unsigned)min_seq);
-            }
-            FILE *wf = fopen(dst, "wb");
-            if (wf != NULL) {
-                ok = true;
-                size_t n;
-                while ((n = fread(s_line, 1, s_line_cap, rf)) > 0) {
-                    if (fwrite(s_line, 1, n, wf) != n) { ok = false; break; }
-                }
-                if (ok && (fflush(wf) != 0 || fsync(fileno(wf)) != 0)) ok = false;
-                fclose(wf);
-                if (!ok) remove(dst);                /* no partial archives */
-            }
-            if (ok) sdcard_report_io_ok(); else sdcard_report_io_error();
-            sdcard_io_end();
-        }
-        fclose(rf);
+static bool evq_sd_has_room(uint64_t need)
+{
+    uint64_t freeb = 0;
+    if (sdcard_free_bytes(&freeb) != ESP_OK) return false;
+    uint64_t reserve = EVQ_SD_RESERVE_BYTES;
+#if EVQ_HIL_ON
+    if (s_hil_reserve != 0) reserve = s_hil_reserve;     /* injected "card full" (M-2) */
+#endif
+    return freeb > reserve && freeb - reserve >= need;
+}
 
-        if (ok) {
-            remove(src);                             /* internal copy freed */
-            archived++;
-        }
+/* Spool one unsent FLASH segment: primary + mirror, both verified, then the
+ * SPOOLED index line. The flash copy is kept; reclaim is a separate step. */
+static bool evq_spool_one(uint32_t seq)
+{
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    evq_seg_t *sp = evq_index_find(&s_ix, seq);
+    if (sp == NULL || sp->state != EVQ_SEG_FLASH || !sp->flash_present || !evq_sd_usable_locked() ||
+        s_sd_mismatch_park) {
         xSemaphoreGive(s_mtx);
-        if (!ok) break;                              /* SD unhappy: retry next trigger */
-        vTaskDelay(1);                               /* yield between files */
+        return false;
+    }
+    evq_seg_t s = *sp;
+    uint32_t cid = s_sd_last_cid;
+    s_keeper_pin_seq = seq;
+    xSemaphoreGive(s_mtx);
+
+    char flash_path[EVQ_PATH_MAX];
+    evlog_file_path(flash_path, sizeof flash_path, seq);
+    bool ok = false, full = false;
+    char pname[EVQ_NAME_MAX] = "", mname[EVQ_NAME_MAX] = "";
+    if (sdcard_io_begin()) {
+        mkdir(EVLOG_LEGACY_SD_DIR, 0777);
+        mkdir(EVQ_MIRROR_DIR, 0777);
+        char pcand[48], mcand[48], pbase[48], mbase[48];
+        /* EXACTLY "ev-%06u": every released importer (v1.10.0–v2.4.2) rebuilds
+         * the path as "%s/ev-%06u.log" from the parsed number, so any other
+         * spelling of the same number is invisible to a rolled-back firmware. */
+        snprintf(pcand, sizeof pcand, "ev-%06lld", (long long)s.first_id);
+        snprintf(mcand, sizeof mcand, "m-%06u", (unsigned)seq);
+        int pr = evq_pick_name(EVLOG_LEGACY_SD_DIR, flash_path, &s, pcand, false, pbase, sizeof pbase);
+        int mr = pr >= 0 ? evq_pick_name(EVQ_MIRROR_DIR, flash_path, &s, mcand, true, mbase, sizeof mbase) : -1;
+        uint64_t need = (uint64_t)s.bytes * (uint64_t)((pr == 0) + (mr == 0)) + 64 * 1024;
+        if (pr < 0 || mr < 0) {
+            ok = false;
+        } else if (!evq_sd_has_room(need)) {
+            full = true;
+        } else {
+            bool p_ok = pr == 1 || evq_copy_commit(flash_path, EVLOG_LEGACY_SD_DIR, pbase, &s, "spool");
+            ok = p_ok && (mr == 1 || evq_copy_commit(flash_path, EVQ_MIRROR_DIR, mbase, &s, "mirror"));
+            if (p_ok && !ok) {
+                /* Our own verified primary without a mirror is not a SPOOLED copy;
+                 * left in /sdcard/events it would later look like foreign legacy
+                 * backlog and be re-imported (duplicates). The flash copy still
+                 * holds everything, so remove it; the next pass starts over. */
+                char pp[EVQ_PATH_MAX];
+                snprintf(pp, sizeof pp, "%s/%s.log", EVLOG_LEGACY_SD_DIR, pbase);
+                remove(pp);
+            }
+            if (!evq_name_join(pname, sizeof pname, pbase, ".log") ||
+                !evq_name_join(mname, sizeof mname, mbase, ".log")) ok = false;
+        }
+        if (ok) sdcard_report_io_ok(); else if (!full) sdcard_report_io_error();
+        sdcard_io_end();
     }
 
-    if (archived > 0) {
-        ESP_LOGI(TAG, "archived %u synced file(s) to " EVLOG_ARCHIVE_DIR, (unsigned)archived);
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_keeper_pin_seq = 0;
+    if (full) {
+        if (!s_sd_full) ESP_LOGW(TAG, "SD below its %llu-B reserve — spooling paused", (unsigned long long)EVQ_SD_RESERVE_BYTES);
+        s_sd_full = true;
+        xSemaphoreGive(s_mtx);
+        return false;
     }
-    if (out_archived) *out_archived = archived;
-    return ESP_OK;
+    sp = evq_index_find(&s_ix, seq);
+    if (ok && sp != NULL && sp->state == EVQ_SEG_FLASH && sp->crc == s.crc) {
+        EVQ_FAULT_POINT("spool.after_verify_before_index");
+        if (EVQ_IX_APPEND("P %" PRIu32 " %08" PRIx32 " %s %s", seq, cid, pname, mname) == ESP_OK) {
+            EVQ_FAULT_POINT("spool.after_index_before_reclaim");
+            s_spool_files++;
+            sp = evq_index_find(&s_ix, seq);
+            if (sp) { sp->sd_verified_epoch = s_sd_epoch; sp->sd_verified_which = 1; }
+            xSemaphoreGive(s_mtx);
+            return true;
+        }
+    }
+    if (!ok) { s_pass_error = true; evq_sd_backoff_locked(); }
+    xSemaphoreGive(s_mtx);
+    return false;
+}
+
+/* Reclaim one SPOOLED segment's flash copy: re-verify BOTH SD copies first
+ * (G6: a copy damaged after SPOOLED must never become the only copy), then
+ * remove the flash file, then record SD_ONLY. */
+static bool evq_reclaim_one(uint32_t seq)
+{
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    evq_seg_t *sp = evq_index_find(&s_ix, seq);
+    if (sp == NULL || sp->state != EVQ_SEG_SPOOLED || !sp->flash_present || seq >= s_tail_seq ||
+        !evq_sd_usable_locked() || s_sd_mismatch_park || sp->cid != s_sd_last_cid) {
+        xSemaphoreGive(s_mtx);
+        return false;
+    }
+    evq_seg_t s = *sp;
+    xSemaphoreGive(s_mtx);
+
+    bool ok = false;
+    if (sdcard_io_begin()) {
+        char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
+        evq_sd_primary_path(pp, sizeof pp, s.primary);
+        evq_sd_mirror_path(mp, sizeof mp, s.mirror);
+        evq_scan_t a, b;
+        ok = evq_scan_file(pp, s_kbuf, s_line_cap, &a) && evq_scan_matches(&a, &s) &&
+             evq_scan_file(mp, s_kbuf, s_line_cap, &b) && evq_scan_matches(&b, &s);
+        sdcard_io_end();
+    }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    sp = evq_index_find(&s_ix, seq);
+    if (sp == NULL || sp->state != EVQ_SEG_SPOOLED || !sp->flash_present) { xSemaphoreGive(s_mtx); return false; }
+    if (!ok) {
+        /* A spooled copy went bad: back to FLASH (flash copy is the only one) —
+         * the next burst re-spools under fresh names. */
+        ESP_LOGW(TAG, "ev-%06u.log: SD copies fail re-verification — reclaim refused, will re-spool", (unsigned)seq);
+        (void)EVQ_IX_APPEND("S %" PRIu32 " %lld %lld %" PRIu32 " %" PRIu32 " %08" PRIx32,
+                            seq, (long long)s.first_id, (long long)s.last_id, s.count, s.bytes, s.crc);
+        sp = evq_index_find(&s_ix, seq);
+        if (sp) sp->flash_present = true;
+        s_spool_errors++;
+        xSemaphoreGive(s_mtx);
+        return false;
+    }
+    char path[EVQ_PATH_MAX];
+    evlog_file_path(path, sizeof path, seq);
+    EVQ_FAULT_POINT("reclaim.remove.inside_call");
+    if (remove(path) != 0) { xSemaphoreGive(s_mtx); return false; }
+    sp->flash_present = false;
+    EVQ_FAULT_POINT("reclaim.after_remove_before_index");
+    (void)EVQ_IX_APPEND("O %" PRIu32, seq);
+    EVQ_FAULT_POINT("reclaim.after_index");
+    s_reclaimed_files++;
+    xSemaphoreGive(s_mtx);
+    return true;
+}
+
+/* Archive one DELIVERED segment (seq < cursor). A spooled one moves its primary
+ * into the archive by rename (cheap metadata; FatFs: durable on return) and
+ * drops the mirror; a never-spooled one is copied from flash. The index entry
+ * retires (A) only after the archive name verifies, and the flash copy goes last. */
+static bool evq_archive_one(uint32_t seq)
+{
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    evq_seg_t *sp = evq_index_find(&s_ix, seq);
+    if (sp == NULL || seq >= s_rd_seq || sp->state == EVQ_SEG_REIMPORT || !evq_sd_usable_locked() ||
+        s_sd_mismatch_park) {
+        xSemaphoreGive(s_mtx);
+        return false;
+    }
+    if (sp->primary[0] != '\0' && sp->cid != s_sd_last_cid) {
+        /* Delivered, but its copies are on another card: obligation met, drop
+         * the reference (the flash copy, if any, is left to eviction). */
+        (void)EVQ_IX_APPEND("A %" PRIu32, seq);
+        xSemaphoreGive(s_mtx);
+        return true;
+    }
+    if (sp->state != EVQ_SEG_DELIVERED) (void)EVQ_IX_APPEND("D %" PRIu32, seq);
+    sp = evq_index_find(&s_ix, seq);
+    if (sp == NULL) { xSemaphoreGive(s_mtx); return false; }
+    evq_seg_t s = *sp;
+    s_keeper_pin_seq = seq;
+    xSemaphoreGive(s_mtx);
+    EVQ_FAULT_POINT("delivered.after_index_before_archive_rename");
+
+    char flash_path[EVQ_PATH_MAX];
+    evlog_file_path(flash_path, sizeof flash_path, seq);
+    bool ok = false;
+    if (sdcard_io_begin()) {
+        mkdir(EVLOG_ARCHIVE_DIR, 0777);
+        char base[64], dst[EVQ_PATH_MAX];
+        /* Collision-free archive name: arc-<first_id>, then arc-<first_id>-<seq>,
+         * then arc-<first_id>-<seq + k·10^8> (evlog_inventory parses one numeric
+         * suffix). Never overwrite an archive. */
+        base[0] = '\0';
+        for (unsigned k = 0; k < 8; k++) {
+            if (k == 0) snprintf(base, sizeof base, "arc-%lld", (long long)s.first_id);
+            else snprintf(base, sizeof base, "arc-%lld-%u", (long long)s.first_id,
+                          (unsigned)(s.seq + (k - 1U) * 100000000U));
+            snprintf(dst, sizeof dst, "%s/%s.log", EVLOG_ARCHIVE_DIR, base);
+            if (!evq_sd_path_exists(dst)) break;
+            base[0] = '\0';
+        }
+        char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
+        evq_sd_primary_path(pp, sizeof pp, s.primary);
+        evq_sd_mirror_path(mp, sizeof mp, s.mirror);
+        /* Source order: the primary (renamed into place, cheap), else the
+         * mirror, else the flash copy (both copied + verified under the new
+         * name). The redundant copies (mirror, flash) are dropped ONLY after
+         * a verified archive copy exists; a failed verification keeps them and
+         * retries on a later pass (§1.8).
+         *
+         * Every SD source is verified IN PLACE first (eval R2-F1): a primary
+         * whose bytes read back but differ from the index is conclusively
+         * damaged. Renaming it into the archive and back on every pass
+         * starved its healthy mirror and, through the transfer loop, all
+         * later spooling (flash filled up to refusal with the SD mostly
+         * empty). A damaged copy is therefore never a source: the archive
+         * comes from the verified mirror/flash copy and the damaged bytes
+         * move aside to evq/bad-* (A1), never deleted. An UNREADABLE copy
+         * (I/O error, maybe transient) is retried with backoff for
+         * EVQ_ARCHIVE_TRIES passes, then treated the same way. */
+        unsigned tries = s_arch_fail_seq == seq ? s_arch_fail_n : 0;
+        bool give_up = tries >= EVQ_ARCHIVE_TRIES;
+        bool have_primary = s.primary[0] != '\0' && evq_sd_path_exists(pp);
+        bool have_mirror = s.mirror[0] != '\0' && evq_sd_path_exists(mp);
+        evq_scan_t psc, msc;
+        bool p_read = have_primary && evq_scan_file(pp, s_kbuf, s_line_cap, &psc);
+        bool p_good = p_read && evq_scan_matches(&psc, &s);
+        bool use_primary = p_good && !give_up;
+        bool p_bad = have_primary && !use_primary && (p_read || give_up);   /* conclusive, or out of retries */
+        bool m_read = false, m_good = false;
+        if (have_mirror && !use_primary) {
+            m_read = evq_scan_file(mp, s_kbuf, s_line_cap, &msc);
+            m_good = m_read && evq_scan_matches(&msc, &s);
+        }
+        bool m_bad = have_mirror && !use_primary && !m_good && (m_read || give_up);
+        bool set_aside_primary = false, set_aside_mirror = false;
+        if (base[0] == '\0') {
+            ok = false;
+        } else if (use_primary) {
+            s_pass_wrote_sd = true;
+            EVQ_FAULT_POINT("archive.rename.inside_call");
+            ok = rename(pp, dst) == 0;
+            EVQ_FAULT_POINT("archive.after_rename_before_verify");
+            if (ok) {
+                evq_scan_t sc;
+                if (!evq_scan_file(dst, s_kbuf, s_line_cap, &sc) || !evq_scan_matches(&sc, &s)) {
+                    /* Not a verified archive: put it back where the index says it
+                     * is and keep every other copy. If the move back fails too,
+                     * the next pass archives from the mirror/flash copy (the
+                     * unverified file just stays in the archive directory). */
+                    ESP_LOGW(TAG, "archive %s failed verification — kept primary/mirror, will retry", dst);
+                    (void)rename(dst, pp);
+                    ok = false;
+                }
+            }
+        } else if (have_primary && !p_bad) {
+            ok = false;          /* primary unreadable: retry (bounded) before giving up on it */
+        } else if (m_good) {
+            set_aside_primary = have_primary;
+            if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
+                s_sd_full = true;
+                ok = false;
+            } else {
+                ok = evq_copy_commit(mp, EVLOG_ARCHIVE_DIR, base, &s, "archive");
+            }
+        } else if (have_mirror && !m_bad) {
+            ok = false;          /* mirror unreadable: retry (bounded) */
+        } else if (s.flash_present && evlog_flash_exists(seq, NULL)) {
+            set_aside_primary = have_primary;
+            set_aside_mirror = have_mirror;
+            /* A never-spooled file may still have copies from an interrupted
+             * spool (crash between commit and the SPOOLED line). Once this entry
+             * retires they would read as foreign legacy backlog: drop any that
+             * are ours (verify against the index, or a byte prefix of flash). */
+            char cand[EVQ_PATH_MAX];
+            const char *cdirs[2] = { EVLOG_LEGACY_SD_DIR, EVQ_MIRROR_DIR };
+            for (int ci = 0; ci < 2 && !have_primary && !have_mirror; ci++) {
+                if (ci == 0) snprintf(cand, sizeof cand, "%s/ev-%06lld.log", cdirs[ci], (long long)s.first_id);
+                else snprintf(cand, sizeof cand, "%s/m-%06u.log", cdirs[ci], (unsigned)seq);
+                if (!evq_sd_path_exists(cand)) continue;
+                evq_scan_t cs;
+                if ((evq_scan_file(cand, s_kbuf, s_line_cap, &cs) && evq_scan_matches(&cs, &s)) ||
+                    evq_is_prefix_of(cand, flash_path, s_kbuf, s_line_cap)) {
+                    s_pass_wrote_sd = true;
+                    remove(cand);
+                }
+            }
+            if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
+                s_sd_full = true;
+                ok = false;
+            } else {
+                ok = evq_copy_commit(flash_path, EVLOG_ARCHIVE_DIR, base, &s, "archive");
+            }
+        } else if (have_primary || have_mirror) {
+            /* Delivered, and every remaining copy is damaged: nothing verified
+             * can be archived. The delivery obligation is met; keep the bytes
+             * aside and retire the entry instead of blocking the keeper. */
+            ESP_LOGE(TAG, "ev-%06u.log: delivered, no verified copy left — damaged copies kept in %s/bad-*",
+                     (unsigned)seq, EVQ_MIRROR_DIR);
+            set_aside_primary = have_primary;
+            set_aside_mirror = have_mirror;
+            ok = true;
+        } else {
+            ok = true;       /* no copy left anywhere (flash evicted, SD copies gone): nothing to archive */
+        }
+        /* Damaged copies leave the import/mirror names only once the archive
+         * (or retirement) is settled; a failed move keeps the entry for retry. */
+        if (ok && set_aside_primary) {
+            s_pass_wrote_sd = true;
+            ok = evq_sd_move_aside(pp, seq);
+        }
+        if (ok && set_aside_mirror) {
+            s_pass_wrote_sd = true;
+            ok = evq_sd_move_aside(mp, seq);
+        }
+        if (ok) {
+            EVQ_FAULT_POINT("archive.after_verify_before_mirror_remove");
+            if (s.mirror[0] != '\0' && evq_sd_path_exists(mp)) {
+                s_pass_wrote_sd = true;
+                EVQ_FAULT_POINT("archive.mirror_remove.inside_call");
+                remove(mp);
+            }
+            EVQ_FAULT_POINT("archive.after_mirror_remove_before_index");
+        }
+        if (ok) sdcard_report_io_ok();
+        sdcard_io_end();
+    }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_keeper_pin_seq = 0;
+    if (!ok) {
+        if (s_arch_fail_seq == seq) { if (s_arch_fail_n < 255) s_arch_fail_n++; }
+        else { s_arch_fail_seq = seq; s_arch_fail_n = 1; }
+        if (!s_sd_full) { s_pass_error = true; evq_sd_backoff_locked(); }
+        xSemaphoreGive(s_mtx);
+        return false;
+    }
+    if (s_arch_fail_seq == seq) { s_arch_fail_seq = 0; s_arch_fail_n = 0; }
+    (void)EVQ_IX_APPEND("A %" PRIu32, seq);
+    s_archived_files++;
+    /* The flash copy is delivered AND archived: free it now. */
+    if (seq < s_rd_seq && evlog_flash_exists(seq, NULL)) remove(flash_path);
+    xSemaphoreGive(s_mtx);
+    return true;
+}
+
+/* Quarantine raw bytes that are not a valid record (import paths). */
+static bool evq_quarantine_bytes_locked(const char *buf, size_t len)
+{
+    FILE *qf = fopen(EVLOG_QUARANTINE, "a");
+    if (qf == NULL) return false;
+    bool ok = fwrite(buf, 1, len, qf) == len;
+    if (ok && buf[len - 1] != '\n') ok = fwrite("\n", 1, 1, qf) == 1;
+    if (ok && (fflush(qf) != 0 || fsync(fileno(qf)) != 0)) ok = false;
+    if (fclose(qf) != 0) ok = false;
+    return ok;
 }
 
 /* Append one already-framed v2 record line to the tail exactly as stored on
- * another medium (legacy SD import, archive replay). Caller holds s_mtx and
- * `line` may alias s_line. Gate: newline framed, <= s_max_record, >= 8 tabs,
- * id > 0 → ESP_ERR_INVALID_ARG otherwise (skip it, the old reader would have
- * too). ESP_ERR_NO_MEM = store full after evicting synced files (nothing was
+ * another medium (legacy SD import, re-import, archive replay). Caller holds
+ * s_mtx and `line` must NOT alias s_line. Gate: exactly what parse_record
+ * accepts → ESP_ERR_INVALID_ARG otherwise (caller quarantines it).
+ * ESP_ERR_NO_MEM = store full after evicting delivered copies (nothing was
  * written; the caller may retry later). ESP_FAIL = media write failure (the
  * torn partial is truncated away). On success *out_id is the record's id, the
- * record is PENDING, and next_id is kept above it. */
+ * record is PENDING (durable after the caller's flush), and next_id is kept
+ * above it. */
 static esp_err_t evlog_append_verbatim_locked(const char *line, size_t len, int64_t *out_id)
 {
-    if (len == 0 || line[len - 1] != '\n' || len > s_max_record) return ESP_ERR_INVALID_ARG;
-    int tabs = 0;
-    for (size_t i = 0; i < len; i++) tabs += (line[i] == '\t');
+    if (len > s_max_record || !evq_line_is_valid(line, len)) return ESP_ERR_INVALID_ARG;
     int64_t id = (int64_t)strtoll(line, NULL, 10);
-    if (tabs < 8 || id <= 0) return ESP_ERR_INVALID_ARG;
-    if (s_wf == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_wf == NULL && evlog_reopen_tail_locked() != ESP_OK) return ESP_ERR_INVALID_STATE;
 
     uint64_t freeb = 0;
     if (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES) {
@@ -1803,26 +3102,18 @@ static esp_err_t evlog_append_verbatim_locked(const char *line, size_t len, int6
         }
     }
     if (s_tail_size > 0 && s_tail_size + (long)len > EVLOG_ROTATE_BYTES) {
-        if (evlog_flush_writer_locked() != ESP_OK) return ESP_FAIL;
-        fclose(s_wf);
-        s_wf = NULL;
-        s_tail_seq++;
-        if (evlog_reopen_tail_locked() != ESP_OK) return ESP_FAIL;
+        if (!evlog_rotate_locked()) return ESP_FAIL;
     }
     if (fwrite(line, 1, len, s_wf) != len) {
         fflush(s_wf);
         (void)ftruncate(fileno(s_wf), s_tail_size);
         return ESP_FAIL;
     }
+    const char *parts[1] = { line };
+    const size_t lens[1] = { len };
+    evlog_tail_account(parts, lens, 1, id);
     s_tail_size += (long)len;
-    s_pending++;
-    if (id + 1 > s_next_id) {
-        s_next_id = id + 1;
-        if (s_next_id >= s_id_limit) {
-            s_id_limit = s_next_id + EVLOG_ID_BLOCK;
-            evlog_persist_nid_locked();
-        }
-    }
+    evlog_bump_next_id_locked(id);
     if (out_id) *out_id = id;
     return ESP_OK;
 }
@@ -1847,11 +3138,664 @@ esp_err_t event_log_flush(void)
     return err;
 }
 
-/* Highest measure_id in [from_id, to_id] among PENDING records (cursor → tail).
- * Lets a replay resume exactly after a reset: everything it appended before the
- * reset is still pending, so the next id to append is *out_max + 1. Bounded like
- * the boot pending count; *out_capped = true means the scan stopped early and
- * *out_max is a floor. *out_max = 0 when nothing in range was found. */
+/* Re-append a REIMPORT segment's records (from its recorded offset) out of a
+ * verified SD copy into the flash tail, fsync, THEN remove the SD copies, THEN
+ * retire the entry. A crash anywhere before the retire replays the file from
+ * the recorded offset: bounded duplicates, never a loss. */
+static bool evq_reimport_one(uint32_t seq)
+{
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    evq_seg_t *sp = evq_index_find(&s_ix, seq);
+    /* Room for THIS file above the refusal watermark is enough: requiring the
+     * 40 % reclaim target here could never pass while the REIMPORT sources
+     * themselves fill flash (their copies are exempt from eviction). Delivered
+     * flash copies are given up first to make that room. */
+    uint64_t need = sp != NULL ? (uint64_t)sp->bytes + EVLOG_MIN_FREE_BYTES + 4096U : 0;
+    uint64_t freeb = 0;
+    (void)evstore_free_bytes(&freeb);
+    if (sp != NULL && freeb <= need) {
+        (void)evlog_evict_to_locked(need + 1);
+        (void)evstore_free_bytes(&freeb);
+    }
+    bool room = sp != NULL && freeb > need;
+    bool flash_src = sp != NULL && evlog_flash_exists(seq, NULL);
+    if (sp == NULL || sp->state != EVQ_SEG_REIMPORT || !room ||
+        (!flash_src && (!evq_sd_usable_locked() || s_sd_mismatch_park || sp->cid != s_sd_last_cid))) {
+        xSemaphoreGive(s_mtx);
+        return false;
+    }
+    evq_seg_t s = *sp;
+    if (flash_src) s_keeper_pin_seq = seq;
+    xSemaphoreGive(s_mtx);
+
+    /* Pick a verified copy: the flash file when it survived, else SD. */
+    char src[EVQ_PATH_MAX] = "", pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX], fp[EVQ_PATH_MAX];
+    evq_sd_primary_path(pp, sizeof pp, s.primary);
+    evq_sd_mirror_path(mp, sizeof mp, s.mirror);
+    evlog_file_path(fp, sizeof fp, seq);
+    int64_t remaining = 0;
+    evq_scan_t sc;
+    if (flash_src && evq_scan_file(fp, s_kbuf, s_line_cap, &sc) && evq_scan_matches(&sc, &s)) {
+        snprintf(src, sizeof src, "%s", fp);
+    } else if (s.primary[0] != '\0') {
+        if (!sdcard_io_begin()) { s_keeper_pin_seq = 0; return false; }
+        if (evq_scan_file(pp, s_kbuf, s_line_cap, &sc) && evq_scan_matches(&sc, &s)) snprintf(src, sizeof src, "%s", pp);
+        else if (s.mirror[0] && evq_scan_file(mp, s_kbuf, s_line_cap, &sc) && evq_scan_matches(&sc, &s)) snprintf(src, sizeof src, "%s", mp);
+        sdcard_io_end();
+        flash_src = false;
+    }
+    if (src[0] == '\0') {
+        s_keeper_pin_seq = 0;
+        ESP_LOGW(TAG, "ev-%06u.log owed for re-import but no verified SD copy is present — kept outstanding",
+                 (unsigned)seq);
+        return false;
+    }
+
+    long pos = (long)s.reimport_off;
+    bool ok = true, done = false;
+    while (ok && !done) {
+        /* Read a chunk of whole lines with the SD ref only… */
+        size_t used = 0, nlines = 0;
+        long next = pos;
+        if (!flash_src && !sdcard_io_begin()) { ok = false; break; }
+        FILE *f = fopen(src, "rb");
+        if (f == NULL || fseek(f, pos, SEEK_SET) != 0) { if (f) fclose(f); if (!flash_src) sdcard_io_end(); ok = false; break; }
+        for (;;) {
+            if (used + s_max_record + 1 > s_line_cap) break;
+            if (fgets(s_kbuf + used, (int)(s_line_cap - used), f) == NULL) { done = true; break; }
+            size_t l = strlen(s_kbuf + used);
+            if (l == 0) { done = true; break; }
+            used += l;
+            nlines++;
+            next += (long)l;
+        }
+        fclose(f);
+        if (!flash_src) sdcard_io_end();
+        if (nlines == 0) break;
+        /* …then append them under s_mtx (lock order: never s_mtx inside a ref). */
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        size_t off = 0;
+        while (off < used) {
+            char *line = s_kbuf + off;
+            size_t l = strlen(line);
+            esp_err_t e = evlog_append_verbatim_locked(line, l, NULL);
+            if (e == ESP_ERR_INVALID_ARG) {
+                if (!evq_quarantine_bytes_locked(line, l)) { ok = false; break; }
+                s_skipped++;
+                if (evq_pos_before_watermark(seq, pos)) s_quarantined_malformed++; else s_corrupt_detected++;
+            } else if (e != ESP_OK) { ok = false; break; }
+            off += l;
+            remaining++;
+            if (remaining == 1) EVQ_FAULT_POINT("reimport.mid_append");
+        }
+        if (ok && evlog_flush_writer_locked() != ESP_OK) ok = false;
+        xSemaphoreGive(s_mtx);
+        pos = next;
+    }
+    s_keeper_pin_seq = 0;
+    if (!ok) return false;
+    EVQ_FAULT_POINT("reimport.after_fsync_before_sd_remove");
+    if (s.primary[0] != '\0' && sdcard_io_begin()) {
+        EVQ_FAULT_POINT("reimport.remove.inside_call");
+        if (s.primary[0] && evq_sd_path_exists(pp)) remove(pp);
+        if (s.mirror[0] && evq_sd_path_exists(mp)) remove(mp);
+        s_pass_wrote_sd = true;
+        sdcard_io_end();
+    }
+    EVQ_FAULT_POINT("reimport.after_sd_remove_before_index");
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    (void)EVQ_IX_APPEND("A %" PRIu32, seq);
+    s_reimported_files++;
+    /* A surviving flash copy is off-queue now (behind the cursor, re-appended). */
+    if (seq < s_rd_seq && evlog_flash_exists(seq, NULL)) remove(fp);
+    xSemaphoreGive(s_mtx);
+    ESP_LOGI(TAG, "re-imported ev-%06u.log (%lld record(s)) into the flash queue", (unsigned)seq, (long long)remaining);
+    return true;
+}
+
+/* Is `name` referenced by the index (as a primary), or the preferred primary
+ * name of a not-yet-spooled FLASH segment (the spool step owns those)? */
+static bool evq_name_is_owned_locked(const char *name)
+{
+    for (size_t i = 0; i < s_ix.n; i++) {
+        const evq_seg_t *s = &s_ix.segs[i];
+        if (strcmp(s->primary, name) == 0) return true;
+        if (s->state == EVQ_SEG_FLASH) {
+            char cand[48];
+            snprintf(cand, sizeof cand, "ev-%06lld.log", (long long)s->first_id);
+            if (strcmp(cand, name) == 0) return true;
+        }
+    }
+    return false;
+}
+
+/* Count complete lines in every UNOWNED /sdcard/events file (the legacy /
+ * orphan import backlog). Called by the keeper with s_mtx held on a usable,
+ * non-parked card. */
+static void evq_count_legacy_locked(void)
+{
+    int64_t lines = 0;
+    if (!sdcard_io_begin()) return;
+    DIR *d = opendir(EVLOG_LEGACY_SD_DIR);
+    if (d != NULL) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            uint32_t seq;
+            if (!parse_ev_name(ent->d_name, &seq) || evq_name_is_owned_locked(ent->d_name)) continue;
+            char p[EVQ_PATH_MAX];
+            if (snprintf(p, sizeof p, "%s/%s", EVLOG_LEGACY_SD_DIR, ent->d_name) >= (int)sizeof p) continue;
+            evq_scan_t sc;
+            if (evq_scan_file(p, s_kbuf, s_line_cap, &sc)) lines += sc.count;
+        }
+        closedir(d);
+    }
+    sdcard_io_end();
+    s_legacy_pending = lines;
+    s_legacy_known = true;
+}
+
+/* Legacy / orphan import: re-append records from an UNOWNED /sdcard/events file
+ * (pre-internal-store backlog, a rollback-era leftover, or an index-lost spool)
+ * through the normal internal writer, verbatim (measure_id kept). Files import
+ * oldest-first; each SD file is deleted only after its records are appended AND
+ * fsync'd internally. Malformed lines are quarantined (intact) first. Imports at
+ * most max_files per call; returns files imported. */
+static size_t event_log_import_sd_backlog(size_t max_files)
+{
+    size_t files_done = 0;
+
+    while (files_done < max_files) {
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        if (!s_available || !evq_sd_usable_locked() || s_sd_mismatch_park) { xSemaphoreGive(s_mtx); break; }
+        if (s_wf == NULL && evlog_reopen_tail_locked() != ESP_OK) { xSemaphoreGive(s_mtx); break; }
+
+        uint32_t min_seq = 0;
+        bool found = false;
+        char chosen[64] = "";
+        if (sdcard_io_begin()) {
+            DIR *d = opendir(EVLOG_LEGACY_SD_DIR);
+            if (d != NULL) {
+                struct dirent *ent;
+                while ((ent = readdir(d)) != NULL) {
+                    uint32_t seq;
+                    if (!parse_ev_name(ent->d_name, &seq)) continue;
+                    if (evq_name_is_owned_locked(ent->d_name)) continue;
+                    if ((!found || seq < min_seq) && evq_name_copy(chosen, sizeof chosen, ent->d_name)) {
+                        min_seq = seq; found = true;
+                    }
+                }
+                closedir(d);
+            }
+            sdcard_io_end();
+        }
+        if (!found) { xSemaphoreGive(s_mtx); break; }
+
+        char src[EVQ_PATH_MAX];
+        snprintf(src, sizeof src, "%s/%s", EVLOG_LEGACY_SD_DIR, chosen);
+
+        bool file_ok = true, store_full = false;
+        size_t imported = 0, quarantined = 0;
+        if (sdcard_io_begin()) {
+            FILE *rf = fopen(src, "rb");
+            if (rf == NULL) {
+                file_ok = false;
+            } else {
+                EVQ_FAULT_POINT("import.mid_append");
+                while (fgets(s_kbuf, s_line_cap, rf) != NULL) {
+                    size_t len = strlen(s_kbuf);
+                    if (len == s_line_cap - 1 && s_kbuf[len - 1] != '\n') {
+                        /* over-long: quarantine this chunk and the rest of the line */
+                        if (!evq_quarantine_bytes_locked(s_kbuf, len)) { file_ok = false; break; }
+                        int c;
+                        while ((c = fgetc(rf)) != EOF && c != '\n') {}
+                        quarantined++;
+                        continue;
+                    }
+                    int64_t id = 0;
+                    esp_err_t aerr = evlog_append_verbatim_locked(s_kbuf, len, &id);
+                    if (aerr == ESP_ERR_INVALID_ARG) {
+                        if (!evq_quarantine_bytes_locked(s_kbuf, len)) { file_ok = false; break; }
+                        quarantined++;
+                        continue;
+                    }
+                    if (aerr == ESP_ERR_NO_MEM) { store_full = true; break; }   /* remainder stays on SD */
+                    if (aerr != ESP_OK) { file_ok = false; break; }
+                    imported++;
+                }
+                if (ferror(rf)) file_ok = false;
+                fclose(rf);
+            }
+            /* Delete the SD source only when its every record is durably internal. */
+            if (file_ok && !store_full && evlog_flush_writer_locked() == ESP_OK) {
+                EVQ_FAULT_POINT("import.after_fsync_before_sd_remove");
+                remove(src);
+                s_pass_wrote_sd = true;
+                files_done++;
+                s_quarantined_malformed += (int64_t)quarantined;
+                s_skipped += (int64_t)quarantined;
+                int64_t done_lines = (int64_t)(imported + quarantined);
+                s_legacy_pending = s_legacy_pending > done_lines ? s_legacy_pending - done_lines : 0;
+            } else {
+                file_ok = false;
+            }
+            sdcard_io_end();
+        } else {
+            file_ok = false;
+        }
+
+        if (imported > 0 || quarantined > 0) {
+            ESP_LOGI(TAG, "migrated %s: %u record(s) imported, %u quarantined%s",
+                     src, (unsigned)imported, (unsigned)quarantined,
+                     store_full ? " (store full — resuming later)" : "");
+        }
+        xSemaphoreGive(s_mtx);
+        if (!file_ok || store_full) break;
+        vTaskDelay(1);
+    }
+    return files_done;
+}
+
+/* Once per SD mount epoch (card present, not parked/mismatched): clear stale
+ * .tmp files (never the only copy — the flash copy is kept until SPOOLED), and
+ * turn orphan mirrors (no index entry, e.g. after a lost index) into import
+ * candidates. A .tmp whose .log sibling also exists may be the "both names"
+ * outcome of an interrupted f_rename — on FAT those two entries can share one
+ * cluster chain, so unlinking the .tmp would free the .log's clusters. It is
+ * RETIRED (renamed aside, never unlinked) instead. */
+static bool evq_sd_epoch_repair(void)
+{
+    bool more = false;             /* a bounded batch was full: repeat next pass */
+    if (!sdcard_io_begin()) return true;
+    mkdir(EVLOG_LEGACY_SD_DIR, 0777);
+    mkdir(EVQ_MIRROR_DIR, 0777);
+    mkdir(EVLOG_ARCHIVE_DIR, 0777);
+    const char *dirs[3] = { EVLOG_LEGACY_SD_DIR, EVQ_MIRROR_DIR, EVLOG_ARCHIVE_DIR };
+    unsigned retired = 0;
+    for (int di = 0; di < 3; di++) {
+        DIR *d = opendir(dirs[di]);
+        if (d == NULL) continue;
+        char names[32][64];
+        int nn = 0;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && nn < 32) {
+            size_t l = strlen(ent->d_name);
+            if (l > 4 && l < 60 && strcmp(ent->d_name + l - 4, ".tmp") == 0) {
+                if (evq_name_copy(names[nn], sizeof names[nn], ent->d_name)) nn++;
+            }
+        }
+        closedir(d);
+        if (nn == 32) more = true;
+        for (int i = 0; i < nn; i++) {
+            /* Siblings: "<X>.tmp" pairs with "<X>.log"; an alternate
+             * "<X>-<k>.tmp" pairs with "<X>.log" too. */
+            char tmp[EVQ_PATH_MAX], log1[EVQ_PATH_MAX], log2[EVQ_PATH_MAX], base[64];
+            snprintf(tmp, sizeof tmp, "%s/%s", dirs[di], names[i]);
+            snprintf(base, sizeof base, "%s", names[i]);
+            base[strlen(base) - 4] = '\0';
+            snprintf(log1, sizeof log1, "%s/%s.log", dirs[di], base);
+            log2[0] = '\0';
+            char *dash = strrchr(base, '-');
+            if (dash != NULL && dash[1] != '\0' && strspn(dash + 1, "0123456789") == strlen(dash + 1)) {
+                *dash = '\0';
+                snprintf(log2, sizeof log2, "%s/%s.log", dirs[di], base);
+            }
+            s_pass_wrote_sd = true;
+            if (evq_sd_path_exists(log1) || (log2[0] != '\0' && evq_sd_path_exists(log2))) {
+                char junk[EVQ_PATH_MAX];
+                for (unsigned k = 0; k < 1000; k++) {
+                    snprintf(junk, sizeof junk, "%s/xlk-%u.junk", EVQ_MIRROR_DIR, k);
+                    if (!evq_sd_path_exists(junk)) break;
+                }
+                if (rename(tmp, junk) == 0) retired++;
+            } else {
+                remove(tmp);
+            }
+        }
+    }
+    /* Observable, bounded policy (contract amendment A1): retired names stay
+     * on the card for fsck/inspection and are counted each mount; at most
+     * 1000 slots — past that a .tmp is simply left in place (a .tmp is never
+     * a committed copy and no firmware imports it). */
+    unsigned on_card = 0, bad_on_card = 0;
+    {
+        DIR *d = opendir(EVQ_MIRROR_DIR);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (strncmp(ent->d_name, "xlk-", 4) == 0) on_card++;
+                else if (strncmp(ent->d_name, "bad-", 4) == 0) bad_on_card++;
+            }
+            closedir(d);
+        }
+    }
+    s_sd_retired_names = on_card;
+    if (bad_on_card > s_sd_bad_copies) s_sd_bad_copies = bad_on_card;
+    sdcard_io_end();
+    if (retired > 0) ESP_LOGW(TAG, "retired %u possibly cross-linked .tmp name(s) (not unlinked; %u on card)", retired, on_card);
+
+    /* Orphan mirrors → import candidates (only if their primary is absent). */
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    if (sdcard_io_begin()) {
+        DIR *d = opendir(EVQ_MIRROR_DIR);
+        char orphans[16][40];
+        int no = 0;
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL && no < 16) {
+                const char *n = ent->d_name;
+                size_t l = strlen(n);
+                if (strncmp(n, "m-", 2) != 0 || l < 7 || strcmp(n + l - 4, ".log") != 0 || l >= 40) continue;
+                bool owned = false;
+                for (size_t i = 0; i < s_ix.n && !owned; i++) {
+                    if (strcmp(s_ix.segs[i].mirror, n) == 0) owned = true;
+                    if (s_ix.segs[i].state == EVQ_SEG_FLASH && (uint32_t)strtoul(n + 2, NULL, 10) == s_ix.segs[i].seq) owned = true;
+                }
+                if (!owned && evq_name_copy(orphans[no], sizeof orphans[no], n)) no++;
+            }
+            closedir(d);
+        }
+        if (no == 16) more = true;
+        for (int i = 0; i < no; i++) {
+            char mp[EVQ_PATH_MAX];
+            evq_sd_mirror_path(mp, sizeof mp, orphans[i]);
+            FILE *f = fopen(mp, "rb");
+            long long first = 0;
+            if (f != NULL) { if (fgets(s_kbuf, 64, f) != NULL) first = strtoll(s_kbuf, NULL, 10); fclose(f); }
+            if (first <= 0) continue;
+            char pp[EVQ_PATH_MAX];
+            snprintf(pp, sizeof pp, "%s/ev-%06lld.log", EVLOG_LEGACY_SD_DIR, first);
+            s_pass_wrote_sd = true;
+            if (evq_sd_path_exists(pp)) {
+                remove(mp);                            /* its primary will be imported */
+            } else {
+                for (unsigned k = 0; k < 16 && evq_sd_path_exists(pp); k++) {
+                    snprintf(pp, sizeof pp, "%s/ev-%u.log", EVLOG_LEGACY_SD_DIR, (unsigned)(EVQ_FALLBACK_NAME_BASE + 500000000U + k));
+                }
+                (void)rename(mp, pp);                  /* becomes a legacy-import candidate */
+            }
+        }
+        sdcard_io_end();
+    }
+    xSemaphoreGive(s_mtx);
+    return more;
+}
+
+/* Index rotated flash files that have no entry (pre-upgrade files, or a crash
+ * between rotation and its S line). Flash-only; bounded per pass. */
+static void evq_index_unindexed(size_t max_files)
+{
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    uint32_t min_seq = 0, max_seq = 0;
+    bool any = evlog_scan_range_locked(&min_seq, &max_seq);
+    uint32_t tail = s_tail_seq;
+    xSemaphoreGive(s_mtx);
+    if (!any || !s_ix_ready) return;
+
+    size_t done = 0;
+    bool remaining = false;
+    int64_t floor_count = 0;
+    for (uint32_t seq = min_seq; seq < tail; seq++) {
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        bool need = evq_index_find(&s_ix, seq) == NULL && evlog_flash_exists(seq, NULL);
+        bool at_after_cursor = seq >= s_rd_seq;
+        if (need) s_keeper_pin_seq = seq;
+        xSemaphoreGive(s_mtx);
+        if (!need) continue;
+        if (done >= max_files) { remaining = remaining || at_after_cursor; continue; }
+        char path[EVQ_PATH_MAX];
+        evlog_file_path(path, sizeof path, seq);
+        evq_scan_t sc;
+        bool ok = evq_scan_file(path, s_kbuf, s_line_cap, &sc);
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        s_keeper_pin_seq = 0;
+        if (ok && evq_index_find(&s_ix, seq) == NULL && sc.count > 0) {
+            if (EVQ_IX_APPEND("S %" PRIu32 " %lld %lld %" PRIu32 " %" PRIu32 " %08" PRIx32,
+                              seq, (long long)sc.first_id, (long long)sc.last_id, sc.count, sc.bytes, sc.crc) == ESP_OK) {
+                evq_seg_t *s = evq_index_find(&s_ix, seq);
+                if (s) { s->flash_present = true; s->flash_crc_checked = 1; }
+                evlog_bump_next_id_locked(sc.last_id);
+                EVQ_FAULT_POINT("boot.index_rebuild_mid");
+            } else if (at_after_cursor) {
+                remaining = true;
+                floor_count += sc.count;
+            }
+        } else if (ok && sc.count == 0 && seq < s_rd_seq) {
+            /* empty delivered file: nothing to index */
+        } else if (at_after_cursor) {
+            remaining = true;
+            if (ok) floor_count += sc.count;
+        }
+        xSemaphoreGive(s_mtx);
+        done++;
+    }
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_unidx_present = remaining;
+    s_unidx_floor = remaining ? floor_count : 0;
+    xSemaphoreGive(s_mtx);
+}
+
+/* Bounded pending floor for unindexed files still waiting (C9). */
+static void evq_unindexed_floor_refresh(void)
+{
+    if (!s_unidx_present) return;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    int64_t lines = 0;
+    const TickType_t t0 = xTaskGetTickCount();
+    bool capped = false;
+    for (uint32_t seq = s_rd_seq; seq < s_tail_seq && !capped; seq++) {
+        if (evq_index_find(&s_ix, seq) != NULL) continue;
+        char path[EVQ_PATH_MAX];
+        evlog_file_path(path, sizeof path, seq);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) continue;
+        while (fgets(s_line, s_line_cap, f) != NULL) {
+            size_t len = strlen(s_line);
+            if (len == 0 || s_line[len - 1] != '\n') break;
+            if (++lines >= EVLOG_SCAN_MAX_LINES ||
+                (xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(EVLOG_SCAN_MAX_MS)) { capped = true; break; }
+        }
+        fclose(f);
+    }
+    s_unidx_floor = lines;
+    xSemaphoreGive(s_mtx);
+}
+
+esp_err_t event_log_sd_service(void)
+{
+    if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
+#if EVQ_HIL_ON
+    if (s_hil_keeper_paused) return ESP_OK;   /* quiescent inventory in progress */
+#endif
+    s_keeper_wake_pending = false;
+    s_pass_wrote_sd = false;
+    s_pass_error = false;
+
+    /* 1. Flash-only bookkeeping: index unindexed rotated files. */
+    evq_index_unindexed(8);
+    evq_unindexed_floor_refresh();
+    if (s_kbuf == NULL) return ESP_ERR_NO_MEM;
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    bool usable = evq_sd_usable_locked() && !s_sd_mismatch_park && evq_sd_backoff_elapsed();
+    bool repair = usable && s_sd_repaired_epoch != s_sd_epoch;
+    uint32_t cid = s_sd_last_cid;
+    bool due = s_stores_since_archive >= EVLOG_ARCHIVE_EVERY_N;
+    uint64_t freeb = 0;
+    bool pressure = evq_pressure_locked(&freeb);
+    /* Adoption of a new card: every obligation elsewhere is SPOOLED (flash
+     * copy still verified) or delivered — re-spool from flash, forget the rest. */
+    if (usable) {
+        for (size_t i = 0; i < s_ix.n;) {
+            evq_seg_t *s = &s_ix.segs[i];
+            uint32_t seq = s->seq;
+            if (s->primary[0] != '\0' && s->cid != cid && s->state == EVQ_SEG_SPOOLED && s->flash_present) {
+                ESP_LOGW(TAG, "ev-%06u.log was spooled to card %08" PRIx32 " — re-spooling to %08" PRIx32,
+                         (unsigned)seq, s->cid, cid);
+                (void)EVQ_IX_APPEND("S %" PRIu32 " %lld %lld %" PRIu32 " %" PRIu32 " %08" PRIx32,
+                                    seq, (long long)s->first_id, (long long)s->last_id, s->count, s->bytes, s->crc);
+                due = true;   /* re-spool promptly */
+            } else if (s->primary[0] != '\0' && s->cid != cid && s->state == EVQ_SEG_DELIVERED) {
+                (void)EVQ_IX_APPEND("A %" PRIu32, seq);
+                continue;
+            }
+            s = evq_index_find(&s_ix, seq);
+            if (s == NULL) continue;
+            i++;
+        }
+    }
+    xSemaphoreGive(s_mtx);
+
+    if (repair) {
+        bool more = evq_sd_epoch_repair();
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        if (!more) s_sd_repaired_epoch = s_sd_epoch;
+        else s_legacy_known = false;          /* orphans not all visited yet: pending is a floor */
+        xSemaphoreGive(s_mtx);
+    }
+
+    /* 2. Recovery: re-import obligations that left the queue unACKed (from a
+     *    surviving flash copy even with no card; else from this card). */
+    {
+        uint32_t cand[32];
+        size_t nc = 0;
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        for (size_t i = 0; i < s_ix.n && nc < 32; i++) {
+            const evq_seg_t *s = &s_ix.segs[i];
+            if (s->state == EVQ_SEG_REIMPORT && (evlog_flash_exists(s->seq, NULL) || (usable && s->cid == cid))) {
+                cand[nc++] = s->seq;
+            }
+        }
+        xSemaphoreGive(s_mtx);
+        for (size_t k = 0; k < nc; k++) (void)evq_reimport_one(cand[k]);   /* each tried once per pass */
+    }
+
+    if (usable) {
+
+        /* Recovery work (re-import / legacy import) needs flash room; delivered
+         * files still held for the archive are the first space to give up. */
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        bool import_work = s_legacy_pending > 0;
+        for (size_t i = 0; i < s_ix.n && !import_work; i++) import_work = s_ix.segs[i].state == EVQ_SEG_REIMPORT;
+        uint64_t fb0 = 0, tot0 = 0;
+        (void)evstore_space(&fb0, &tot0);
+        bool short_room = tot0 > 0 && fb0 * 100U < tot0 * EVQ_RECLAIM_PCT;
+        xSemaphoreGive(s_mtx);
+
+        /* 3. Transfer burst: batch trigger, flash pressure, or recovery needing room. */
+        if (due || pressure || (import_work && short_room)) {
+            /* Unsent records first (eval R2-F1): spooling is the obligation
+             * that keeps flash from filling; archiving delivered files is
+             * housekeeping, so a stuck archive can never starve the spool. */
+            bool clean = true;
+            for (size_t guard = 0; guard < EVQ_INDEX_CAP; guard++) {
+                uint32_t seq = 0;
+                xSemaphoreTake(s_mtx, portMAX_DELAY);
+                for (size_t i = 0; i < s_ix.n; i++) {
+                    const evq_seg_t *s = &s_ix.segs[i];
+                    if (s->state == EVQ_SEG_FLASH && s->flash_present && s->seq >= s_rd_seq && s->seq < s_tail_seq) { seq = s->seq; break; }
+                }
+                xSemaphoreGive(s_mtx);
+                if (seq == 0) break;
+                if (!evq_spool_one(seq)) { clean = false; break; }
+            }
+            /* A spool that stopped on a full card still lets delivered files
+             * archive (their flash copies are the space recovery gives up
+             * first); an I/O error backs the whole card off. */
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            bool arch_go = clean || (s_sd_full && evq_sd_backoff_elapsed());
+            xSemaphoreGive(s_mtx);
+            for (size_t guard = 0; guard < EVQ_INDEX_CAP && arch_go; guard++) {
+                uint32_t seq = 0;
+                xSemaphoreTake(s_mtx, portMAX_DELAY);
+                for (size_t i = 0; i < s_ix.n; i++) {
+                    const evq_seg_t *s = &s_ix.segs[i];
+                    if (s->seq < s_rd_seq && s->state != EVQ_SEG_REIMPORT) { seq = s->seq; break; }
+                }
+                xSemaphoreGive(s_mtx);
+                if (seq == 0) break;
+                if (!evq_archive_one(seq)) { clean = false; break; }
+            }
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            if (clean) { s_stores_since_archive = 0; s_sd_full = false; }
+            xSemaphoreGive(s_mtx);
+        }
+
+        /* 4. Reclaim verified flash copies oldest-first under pressure. */
+        if (pressure) {
+            for (size_t guard = 0; guard < EVQ_INDEX_CAP; guard++) {
+                uint64_t fb = 0, tot = 0;
+                xSemaphoreTake(s_mtx, portMAX_DELAY);
+                (void)evstore_space(&fb, &tot);
+                uint32_t seq = 0;
+                if (tot > 0 && fb * 100U < tot * EVQ_RECLAIM_PCT) {
+                    for (size_t i = 0; i < s_ix.n; i++) {
+                        const evq_seg_t *s = &s_ix.segs[i];
+                        if (s->state == EVQ_SEG_SPOOLED && s->flash_present && s->seq < s_tail_seq) { seq = s->seq; break; }
+                    }
+                }
+                xSemaphoreGive(s_mtx);
+                if (seq == 0 || !evq_reclaim_one(seq)) break;
+            }
+        }
+
+        /* 5. Legacy / orphan import (pre-existing behaviour), when flash has room. */
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        uint64_t fb = 0, tot = 0;
+        (void)evstore_space(&fb, &tot);
+        bool import_room = tot > 0 && fb * 100U >= tot * EVQ_RECLAIM_PCT;
+        xSemaphoreGive(s_mtx);
+        if (import_room) (void)event_log_import_sd_backlog(4);
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        if (evq_sd_usable_locked() && !s_sd_mismatch_park) {
+            /* Full scan once per mount (and until the repair pass has visited
+             * every orphan); imports then decrement it, so a large legacy
+             * backlog is not re-read every keeper period. */
+            if (s_legacy_counted_epoch != s_sd_epoch || !s_legacy_known) {
+                evq_count_legacy_locked();
+                s_legacy_counted_epoch = s_sd_epoch;
+            }
+            if (s_sd_repaired_epoch != s_sd_epoch) s_legacy_known = false;
+        }
+        xSemaphoreGive(s_mtx);
+    }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    if (s_pass_wrote_sd) s_sd_bursts++;
+    if (!s_pass_error && usable) { s_sd_backoff_active = false; s_sd_backoff_ms = 0; }
+    /* Space may have come back: let the next store re-check admission. */
+    evq_index_maybe_compact_locked();
+    xSemaphoreGive(s_mtx);
+    return ESP_OK;
+}
+
+static void evq_keeper_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(EVQ_KEEPER_PERIOD_MS));
+        (void)event_log_sd_service();
+    }
+}
+
+esp_err_t event_log_sd_keeper_start(void)
+{
+    if (s_keeper_task != NULL) return ESP_OK;
+    if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
+    /* File copy/verify loops + VFS/FATFS call depth, plus the epoch repair's
+     * name tables (~2.7 KB on stack): 8 KB, up from the old keeper's 6 KB.
+     * No mount fan-out. Priority 2 with the other background housekeeping. */
+    if (xTaskCreate(evq_keeper_task, "sd_keeper", 8192, NULL, 2, &s_keeper_task) != pdPASS) {
+        s_keeper_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (s_keeper_wake_pending) xTaskNotifyGive(s_keeper_task);
+    return ESP_OK;
+}
+
+/* ── archive-replay support (evlog_replay) ─────────────────────────────────
+ * Both walk the QUEUE (flash or verified SD copy). An unreadable SD segment
+ * makes the answer incomplete (*out_capped), never silently smaller. */
+
 esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
                                             int64_t *out_max, bool *out_capped)
 {
@@ -1866,12 +3810,13 @@ esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
     bool capped = false;
     const TickType_t t0 = xTaskGetTickCount();
     for (uint32_t seq = s_rd_seq; seq <= s_tail_seq && !capped; seq++) {
-        char path[64];
-        evlog_file_path(path, sizeof path, seq);
-        FILE *f = fopen(path, "rb");
-        if (f == NULL) continue;
-        if (seq == s_rd_seq && s_rd_off > 0 && fseek(f, s_rd_off, SEEK_SET) != 0) { fclose(f); continue; }
-        while (fgets(s_line, s_line_cap, f) != NULL) {
+        evq_rd_t rd;
+        uint8_t block;
+        esp_err_t oe = evq_open_read_locked(seq, &rd, &block);
+        if (oe == ESP_ERR_NOT_FINISHED) { capped = true; break; }
+        if (oe != ESP_OK) continue;
+        if (seq == s_rd_seq && s_rd_off > 0 && fseek(rd.f, s_rd_off, SEEK_SET) != 0) { evq_rd_close(&rd); continue; }
+        while (fgets(s_line, s_line_cap, rd.f) != NULL) {
             size_t len = strlen(s_line);
             if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
             int64_t id = (int64_t)strtoll(s_line, NULL, 10);
@@ -1882,22 +3827,13 @@ esp_err_t event_log_max_pending_id_in_range(int64_t from_id, int64_t to_id,
                 break;
             }
         }
-        fclose(f);
+        evq_rd_close(&rd);
     }
     xSemaphoreGive(s_mtx);
     if (out_capped) *out_capped = capped;
     return ESP_OK;
 }
 
-/* Collect every measure_id in [from_id, to_id] (to_id 0 = unbounded) present in
- * ANY file still on flash: pending records and synced records not yet archived
- * or evicted. This is the replay resume set: a record appended before a reset
- * may already have been published and acknowledged, so a pending-only scan
- * would miss it and a resume would append it twice. Synced files stay on flash
- * until the next archive burst (every EVLOG_ARCHIVE_EVERY_N stores) or an
- * eviction, so a resume that runs soon after boot sees them. Unsorted, ids are
- * appended in file order; *out_capped = true when `cap` or the time bound was
- * hit (the set is then incomplete). */
 esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t *ids,
                                          size_t cap, size_t *out_n, bool *out_capped)
 {
@@ -1911,13 +3847,19 @@ esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t
     uint32_t min_seq = 0, max_seq = 0;
     bool capped = false;
     const TickType_t t0 = xTaskGetTickCount();
-    if (evlog_scan_range_locked(&min_seq, &max_seq)) {
+    bool any = evlog_scan_range_locked(&min_seq, &max_seq);
+    for (size_t i = 0; i < s_ix.n; i++) {
+        if (!any || s_ix.segs[i].seq < min_seq) { min_seq = s_ix.segs[i].seq; any = true; }
+    }
+    if (any) {
+        if (max_seq < s_tail_seq) max_seq = s_tail_seq;
         for (uint32_t seq = min_seq; seq <= max_seq && !capped; seq++) {
-            char path[64];
-            evlog_file_path(path, sizeof path, seq);
-            FILE *f = fopen(path, "rb");
-            if (f == NULL) continue;
-            while (fgets(s_line, s_line_cap, f) != NULL) {
+            evq_rd_t rd;
+            uint8_t block;
+            esp_err_t oe = evq_open_read_locked(seq, &rd, &block);
+            if (oe == ESP_ERR_NOT_FINISHED) { capped = true; break; }
+            if (oe != ESP_OK) continue;
+            while (fgets(s_line, s_line_cap, rd.f) != NULL) {
                 size_t len = strlen(s_line);
                 if (len == 0 || s_line[len - 1] != '\n') break;   /* partial tail */
                 int64_t id = (int64_t)strtoll(s_line, NULL, 10);
@@ -1930,7 +3872,7 @@ esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t
                     break;
                 }
             }
-            fclose(f);
+            evq_rd_close(&rd);
         }
     }
     xSemaphoreGive(s_mtx);
@@ -1938,95 +3880,448 @@ esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t
     return ESP_OK;
 }
 
-/* One-shot fleet migration: re-append the pre-internal-store /sdcard/events
- * backlog through the normal internal writer, preserving each record verbatim
- * (measure_id included — openJII dedups on it, so a power cut between "appended
- * internally" and "deleted from SD" costs only duplicates, never a skip). Files
- * import oldest-first so the publish order stays FIFO; each SD file is deleted
- * only after its records are appended AND fsync'd internally. Imports at most
- * max_files per call so the keeper loop stays responsive; returns the number of
- * files imported (0 = nothing left or SD absent). Storage-full stops the import
- * cleanly — the remainder stays on the SD for the next pass. */
-size_t event_log_import_sd_backlog(size_t max_files)
+/* ══ On-device verification hooks (CONFIG_AMBYTE_EVQ_HIL only) ════════════
+ * docs/evq-sd-overflow-hil-contract.md. Nothing below exists in a release
+ * build (ISO-1 checks the ELF). Every dump is read-only; the controls are
+ * RAM/RTC overrides that a power-on reset clears. */
+#if EVQ_HIL_ON
+
+#ifdef EVQ_HIL_HOST
+#include "sha256.h"
+#define HIL_RTC
+static int64_t hil_now_us(void)
 {
-    if (s_mtx == NULL || !sdcard_is_mounted()) return 0;
-    size_t files_done = 0;
-    int64_t max_seen_id = 0;
-
-    while (files_done < max_files) {
-        if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) break;
-        if (!s_available || s_wf == NULL) { xSemaphoreGive(s_mtx); break; }
-
-        /* Oldest legacy file (min seq) this pass. */
-        uint32_t min_seq = 0;
-        bool found = false;
-        if (sdcard_io_begin()) {
-            DIR *d = opendir(EVLOG_LEGACY_SD_DIR);
-            if (d != NULL) {
-                struct dirent *ent;
-                while ((ent = readdir(d)) != NULL) {
-                    uint32_t seq;
-                    if (parse_ev_name(ent->d_name, &seq)) {
-                        if (!found || seq < min_seq) { min_seq = seq; found = true; }
-                    }
-                }
-                closedir(d);
-            }
-            sdcard_io_end();
-        }
-        if (!found) { xSemaphoreGive(s_mtx); break; }
-
-        char src[64];
-        snprintf(src, sizeof src, "%s/ev-%06u.log", EVLOG_LEGACY_SD_DIR, (unsigned)min_seq);
-
-        bool file_ok = true, store_full = false;
-        size_t imported = 0, skipped = 0;
-        if (sdcard_io_begin()) {
-            FILE *rf = fopen(src, "rb");
-            if (rf == NULL) {
-                file_ok = false;
-            } else {
-                while (fgets(s_line, s_line_cap, rf) != NULL) {
-                    size_t len = strlen(s_line);
-                    int64_t id = 0;
-                    esp_err_t aerr = evlog_append_verbatim_locked(s_line, len, &id);
-                    if (aerr == ESP_ERR_INVALID_ARG) { skipped++; continue; }
-                    if (aerr == ESP_ERR_NO_MEM) { store_full = true; break; }   /* remainder stays on SD */
-                    if (aerr != ESP_OK) { file_ok = false; break; }
-                    imported++;
-                    if (id > max_seen_id) max_seen_id = id;
-                }
-                fclose(rf);
-            }
-            /* Delete the SD source only when its every record is durably internal. */
-            if (file_ok && !store_full && evlog_flush_writer_locked() == ESP_OK) {
-                remove(src);
-                files_done++;
-            } else {
-                file_ok = false;
-            }
-            sdcard_io_end();
-        } else {
-            file_ok = false;
-        }
-
-        if (imported > 0 || skipped > 0) {
-            ESP_LOGI(TAG, "migrated %s: %u record(s) imported, %u skipped%s",
-                     src, (unsigned)imported, (unsigned)skipped,
-                     store_full ? " (store full — resuming later)" : "");
-        }
-        /* Ids inside the imported backlog can exceed the NVS HWM if NVS was ever
-         * wiped; keep next_id above everything now inside the store. */
-        if (max_seen_id + 1 > s_next_id) {
-            s_next_id = max_seen_id + 1;
-            if (s_next_id >= s_id_limit) {
-                s_id_limit = s_next_id + EVLOG_ID_BLOCK;
-                evlog_persist_nid_locked();
-            }
-        }
-        xSemaphoreGive(s_mtx);
-        if (!file_ok || store_full) break;
-        vTaskDelay(1);
-    }
-    return files_done;
+    return 0;   /* host harnesses compare stdout across runs: keep it deterministic */
 }
+#else
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "evq_hil_trace.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/sha256.h"
+#define HIL_RTC RTC_NOINIT_ATTR
+static int64_t hil_now_us(void) { return esp_timer_get_time(); }
+#endif
+
+/* ── sha256 over pieces (target: mbedtls; host: concatenate) ── */
+typedef struct {
+#ifdef EVQ_HIL_HOST
+    char  *buf;
+    size_t len, cap;
+#else
+    mbedtls_sha256_context c;
+#endif
+} hil_sha_t;
+
+static void hil_sha_start(hil_sha_t *h)
+{
+#ifdef EVQ_HIL_HOST
+    h->buf = NULL; h->len = h->cap = 0;
+#else
+    mbedtls_sha256_init(&h->c);
+    mbedtls_sha256_starts(&h->c, 0);
+#endif
+}
+
+static void hil_sha_update(hil_sha_t *h, const void *p, size_t n)
+{
+#ifdef EVQ_HIL_HOST
+    if (h->len + n > h->cap) {
+        size_t nc = (h->len + n) * 2 + 64;
+        char *nb = realloc(h->buf, nc);
+        if (nb == NULL) return;
+        h->buf = nb; h->cap = nc;
+    }
+    memcpy(h->buf + h->len, p, n);
+    h->len += n;
+#else
+    mbedtls_sha256_update(&h->c, p, n);
+#endif
+}
+
+static void hil_sha_finish(hil_sha_t *h, char hex[65])
+{
+    uint8_t d[32];
+#ifdef EVQ_HIL_HOST
+    sha256_hex(h->buf ? h->buf : "", h->len, hex);
+    free(h->buf);
+    (void)d;
+#else
+    mbedtls_sha256_finish(&h->c, d);
+    mbedtls_sha256_free(&h->c);
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
+#endif
+    hex[64] = '\0';
+}
+
+/* ── RTC-retained state ── */
+typedef struct {
+    uint32_t magic, released, gate, boots, check;
+} hil_rtc_t;
+HIL_RTC static hil_rtc_t s_hil_rtc;
+#define HIL_RTC_MAGIC 0x45564851u   /* "EVHQ" */
+
+static bool hil_rtc_valid(void)
+{
+    return s_hil_rtc.magic == HIL_RTC_MAGIC &&
+           s_hil_rtc.check == (s_hil_rtc.released ^ (s_hil_rtc.gate << 8) ^ s_hil_rtc.boots ^ 0xA5A5A5A5u);
+}
+
+static void hil_rtc_seal(void)
+{
+    s_hil_rtc.magic = HIL_RTC_MAGIC;
+    s_hil_rtc.check = s_hil_rtc.released ^ (s_hil_rtc.gate << 8) ^ s_hil_rtc.boots ^ 0xA5A5A5A5u;
+}
+
+void evq_hil_trace(const char *step)
+{
+    printf("HIL_TRACE %s %lld\n", step, (long long)hil_now_us());
+    fflush(stdout);
+}
+
+void event_log_hil_boot_init(void)
+{
+    bool valid = hil_rtc_valid();
+    if (!valid) {
+        /* Power-on or foreign RTC contents: the safe default for a
+         * verification run — SD HELD, publishing on HOLD. */
+        s_hil_rtc.released = 0;
+        s_hil_rtc.gate = EVQ_HIL_GATE_HOLD;
+        s_hil_rtc.boots = 0;
+    }
+    s_hil_rtc.boots++;
+    hil_rtc_seal();
+    printf("HIL_BOOT rtc_valid=%d hold=%d gate=%u boots=%u\n", valid ? 1 : 0,
+           s_hil_rtc.released ? 0 : 1, (unsigned)s_hil_rtc.gate, (unsigned)s_hil_rtc.boots);
+    evq_hil_trace("hold_set");
+}
+
+static bool evq_hil_hold_active(void)
+{
+    /* Before boot_init (or with RTC RAM lost) the answer is HELD. */
+    return !hil_rtc_valid() || s_hil_rtc.released == 0;
+}
+
+bool event_log_hil_held(void) { return evq_hil_hold_active(); }
+
+void event_log_hil_release(void)
+{
+    if (!hil_rtc_valid()) { s_hil_rtc.gate = EVQ_HIL_GATE_HOLD; s_hil_rtc.boots = 1; }
+    s_hil_rtc.released = 1;
+    hil_rtc_seal();
+    printf("HIL_RELEASE us=%lld\n", (long long)hil_now_us());
+    evq_keeper_notify();
+}
+
+evq_hil_gate_t event_log_hil_gate(void)
+{
+    return hil_rtc_valid() ? (evq_hil_gate_t)s_hil_rtc.gate : EVQ_HIL_GATE_HOLD;
+}
+
+void event_log_hil_set_gate(evq_hil_gate_t g)
+{
+    if (!hil_rtc_valid()) { s_hil_rtc.released = 0; s_hil_rtc.boots = 1; }
+    s_hil_rtc.gate = (uint32_t)g;
+    hil_rtc_seal();
+}
+
+void event_log_hil_keeper_pause(bool pause)
+{
+    s_hil_keeper_paused = pause;
+    if (!pause) evq_keeper_notify();
+}
+bool event_log_hil_keeper_paused(void) { return s_hil_keeper_paused; }
+void event_log_hil_set_reserve(uint64_t bytes) { s_hil_reserve = bytes; evq_keeper_notify(); }
+uint64_t event_log_hil_reserve(void) { return s_hil_reserve ? s_hil_reserve : EVQ_SD_RESERVE_BYTES; }
+void event_log_hil_set_cid(uint32_t cid) { s_hil_cid = cid; evq_keeper_notify(); }
+uint32_t event_log_hil_cid(void) { return s_hil_cid; }
+
+/* ── exact stored-line hash of recent stores (EVQ_ACC) ── */
+typedef struct { int64_t id; uint32_t bytes; char hex[65]; } hil_line_t;
+static hil_line_t s_hil_lines[8];
+static unsigned s_hil_line_next;
+
+static void evq_hil_note_line(int64_t id, const char *const parts[], const size_t lens[], size_t n)
+{
+    hil_sha_t h;
+    hil_sha_start(&h);
+    uint32_t total = 0;
+    for (size_t i = 0; i < n; i++) { hil_sha_update(&h, parts[i], lens[i]); total += (uint32_t)lens[i]; }
+    hil_line_t *e = &s_hil_lines[s_hil_line_next++ % 8];
+    hil_sha_finish(&h, e->hex);
+    e->bytes = total;
+    e->id = id;
+}
+
+bool event_log_hil_line_sha(int64_t id, uint8_t out[32], uint32_t *out_bytes)
+{
+    bool ok = false;
+    if (s_mtx != NULL) xSemaphoreTake(s_mtx, portMAX_DELAY);
+    for (int i = 0; i < 8; i++) {
+        if (s_hil_lines[i].id == id && s_hil_lines[i].hex[0] != '\0') {
+            for (int k = 0; k < 32; k++) {
+                unsigned v = 0;
+                sscanf(s_hil_lines[i].hex + 2 * k, "%2x", &v);
+                out[k] = (uint8_t)v;
+            }
+            if (out_bytes) *out_bytes = s_hil_lines[i].bytes;
+            ok = true;
+            break;
+        }
+    }
+    if (s_mtx != NULL) xSemaphoreGive(s_mtx);
+    return ok;
+}
+
+/* ── flash inventory (P0-1 of contract v3) ──
+ * Snapshot under s_mtx: every ev-*.log name, its byte length, cutoff_id =
+ * next_id and the tail seq. Then hash ONLY those prefixes (append-only files;
+ * rotated files immutable; keeper paused so nothing is removed mid-walk). */
+typedef struct { uint32_t seq; long len; } hil_snap_t;
+
+static int hil_snap_cmp(const void *a, const void *b)
+{
+    uint32_t x = ((const hil_snap_t *)a)->seq, y = ((const hil_snap_t *)b)->seq;
+    return x < y ? -1 : x > y;
+}
+
+/* Full content of a NON-synthetic record line (device field != "evq_hil"),
+ * base64 on one console line, so real schedule records can be reconciled by
+ * content (contract D-2). Private evidence only. */
+static void hil_emit_full(const char *path, unsigned lno, const char *line, size_t ll)
+{
+#ifdef EVQ_HIL_HOST
+    (void)path; (void)lno; (void)line; (void)ll;
+#else
+    const char *t1 = memchr(line, '\t', ll);
+    const char *t2 = t1 ? memchr(t1 + 1, '\t', ll - (size_t)(t1 + 1 - line)) : NULL;
+    if (t2 != NULL && (size_t)(ll - (t2 + 1 - line)) > 8 && memcmp(t2 + 1, "evq_hil\t", 8) == 0) return;
+    size_t olen = 0;
+    (void)mbedtls_base64_encode(NULL, 0, &olen, (const unsigned char *)line, ll);
+    unsigned char *b = malloc(olen + 1);
+    if (b == NULL) { printf("EVQ_FLX %s %u -\n", path, lno); return; }
+    if (mbedtls_base64_encode(b, olen + 1, &olen, (const unsigned char *)line, ll) == 0) {
+        b[olen] = '\0';
+        printf("EVQ_FLX %s %u %s\n", path, lno, (const char *)b);
+    }
+    free(b);
+#endif
+}
+
+void event_log_hil_emit_full(const char *path, unsigned lno, const char *line, size_t len)
+{
+    hil_emit_full(path, lno, line, len);
+}
+
+esp_err_t event_log_hil_flash_inv(bool full)
+{
+    if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
+    if (!s_hil_keeper_paused && !evq_hil_hold_active()) {
+        printf("EVQ_FERR keeper_running (evq_hil keeper pause first)\n");
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t cap = 512, n = 0;
+    hil_snap_t *snap = malloc(cap * sizeof *snap);
+    char *line = malloc(s_line_cap + 2);
+    char *buf = malloc(4096);
+    if (snap == NULL || line == NULL || buf == NULL) { free(snap); free(line); free(buf); return ESP_ERR_NO_MEM; }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    int64_t cutoff = s_next_id;
+    uint32_t tail = s_tail_seq;
+    DIR *d = opendir(EVLOG_DIR);
+    if (d != NULL) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n < cap) {
+            unsigned q = 0;
+            char tail_c = 0;
+            if (sscanf(ent->d_name, "ev-%u.lo%c", &q, &tail_c) == 2 && tail_c == 'g') {
+                char path[EVQ_PATH_MAX];
+                evlog_file_path(path, sizeof path, q);
+                struct stat st;
+                if (stat(path, &st) == 0) { snap[n].seq = q; snap[n].len = (long)st.st_size; n++; }
+            }
+        }
+        closedir(d);
+    }
+    xSemaphoreGive(s_mtx);
+    qsort(snap, n, sizeof *snap, hil_snap_cmp);
+    printf("EVQ_FSNAP %lld %u %u\n", (long long)cutoff, (unsigned)tail, (unsigned)n);
+
+    unsigned missing = 0, hashed = 0;
+    for (size_t i = 0; i < n; i++) {
+        char path[EVQ_PATH_MAX];
+        evlog_file_path(path, sizeof path, snap[i].seq);
+        FILE *f = fopen(path, "rb");
+        if (f == NULL) { missing++; printf("EVQ_FMISS %s\n", path); continue; }
+        hil_sha_t fh;
+        hil_sha_start(&fh);
+        uint32_t crc = 0;
+        long left = snap[i].len;
+        size_t ll = 0;
+        unsigned lno = 0;
+        while (left > 0) {
+            size_t want = left < 4096 ? (size_t)left : 4096;
+            size_t r = fread(buf, 1, want, f);
+            if (r == 0) break;
+            left -= (long)r;
+            hil_sha_update(&fh, buf, r);
+            crc = evq_crc32(crc, buf, r);
+            for (size_t k = 0; k < r; k++) {
+                if (ll < s_line_cap + 1) line[ll] = buf[k];
+                ll++;
+                if (buf[k] == '\n') {
+                    char hex[65];
+                    hil_sha_t lh;
+                    hil_sha_start(&lh);
+                    hil_sha_update(&lh, line, ll <= s_line_cap + 1 ? ll : s_line_cap + 1);
+                    hil_sha_finish(&lh, hex);
+                    lno++;
+                    printf("EVQ_FL %s %u %lld %s %u\n", path, lno, strtoll(line, NULL, 10), hex, (unsigned)ll);
+                    if (full && ll <= s_line_cap + 1) hil_emit_full(path, lno, line, ll);
+                    ll = 0;
+                }
+            }
+        }
+        bool short_read = left > 0;
+        fclose(f);
+        char fhex[65];
+        hil_sha_finish(&fh, fhex);
+        if (ll > 0) printf("EVQ_FT %s %u %u\n", path, lno + 1, (unsigned)ll);
+        if (short_read) { missing++; printf("EVQ_FSHORT %s %ld\n", path, left); continue; }
+        printf("EVQ_FF %s %ld %s %08" PRIx32 "\n", path, snap[i].len, fhex, crc);
+        hashed++;
+    }
+    printf("EVQ_FEND %u %u\n", hashed, missing);
+    free(snap); free(line); free(buf);
+    return missing == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t event_log_hil_index_dump(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    printf("EVQ_IXHDR n=%u rd_seq=%u rd_off=%ld tail=%u cid=%08" PRIx32 " epoch=%u\n", (unsigned)s_ix.n,
+           (unsigned)s_rd_seq, s_rd_off, (unsigned)s_tail_seq, s_sd_last_cid, (unsigned)s_sd_epoch);
+    for (size_t i = 0; i < s_ix.n; i++) {
+        const evq_seg_t *g = &s_ix.segs[i];
+        printf("EVQ_IX %u %s %lld %lld %u %u %08" PRIx32 " %08" PRIx32 " %s %s %d\n", (unsigned)g->seq,
+               evq_seg_state_name(g->state), (long long)g->first_id, (long long)g->last_id,
+               (unsigned)g->count, (unsigned)g->bytes, g->crc, g->cid,
+               g->primary[0] ? g->primary : "-", g->mirror[0] ? g->mirror : "-", g->flash_present ? 1 : 0);
+    }
+    xSemaphoreGive(s_mtx);
+    printf("EVQ_IXEND\n");
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_cursor_dump(void)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    uint32_t rs = s_rd_seq;
+    long ro = s_rd_off;
+    xSemaphoreGive(s_mtx);
+    evlog_cursor_blob_t b = { 0 };
+    size_t blen = sizeof b;
+    uint32_t lseq = 0, loff = 0;
+    int have_b = 0, have_s = 0, have_o = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        have_b = nvs_get_blob(h, NVS_KEY_CUR, &b, &blen) == ESP_OK;
+        have_s = nvs_get_u32(h, NVS_KEY_RD_SEQ, &lseq) == ESP_OK;
+        have_o = nvs_get_u32(h, NVS_KEY_RD_OFF, &loff) == ESP_OK;
+        nvs_close(h);
+    }
+    hil_sha_t sh;
+    char hex[65];
+    hil_sha_start(&sh);
+    hil_sha_update(&sh, &b, sizeof b);
+    hil_sha_update(&sh, &lseq, sizeof lseq);
+    hil_sha_update(&sh, &loff, sizeof loff);
+    hil_sha_finish(&sh, hex);
+    printf("EVQ_CUR ram=%u:%ld blob=%d:%u:%u:%08" PRIx32 " rd_seq=%d:%u rd_off=%d:%u nvs_sha=%s\n",
+           (unsigned)rs, ro, have_b, (unsigned)b.seq, (unsigned)b.off, b.crc, have_s, (unsigned)lseq,
+           have_o, (unsigned)loff, hex);
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_claims_dump(void)
+{
+    printf("EVQ_CLAIMS ok=%llu not_found=%llu not_finished=%llu other=%llu us=%lld\n",
+           (unsigned long long)s_hil_claims[0], (unsigned long long)s_hil_claims[1],
+           (unsigned long long)s_hil_claims[2], (unsigned long long)s_hil_claims[3], (long long)hil_now_us());
+    return ESP_OK;
+}
+
+#ifndef EVQ_HIL_HOST
+static const char *hil_op_name(uint8_t op)
+{
+    static const char *const names[] = { "?", "open_r", "open_w", "close_r", "close_w", "fsync",
+                                         "rename", "remove", "mkdir", "idx_write", "fault" };
+    return op < sizeof names / sizeof names[0] ? names[op] : "?";
+}
+
+static void hil_emit_tr(const evq_tr_entry_t *e, void *ctx)
+{
+    (void)ctx;
+    printf("EVQ_TR %llu %lld %s %d %u %s %s\n", (unsigned long long)e->seq, (long long)e->us,
+           hil_op_name(e->op), (int)e->result, (unsigned)e->bytes, e->a[0] ? e->a : "-", e->b[0] ? e->b : "-");
+}
+#endif
+
+esp_err_t event_log_hil_io_dump(bool drain_trace)
+{
+#ifdef EVQ_HIL_HOST
+    (void)drain_trace;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    evq_io_counters_t *c = evq_io_counters();
+    printf("EVQ_IO sd_mut=%llu sd_read=%llu sd_write_open=%llu flash_mut=%llu appends=%llu fsyncs=%llu trace_total=%llu\n",
+           (unsigned long long)c->sd_mut, (unsigned long long)c->sd_read_open,
+           (unsigned long long)c->sd_write_open, (unsigned long long)c->flash_mut,
+           (unsigned long long)c->store_appends, (unsigned long long)c->store_fsyncs,
+           (unsigned long long)evq_tr_total());
+    if (drain_trace) {
+        uint64_t lost = 0, first = 0, last = 0;
+        size_t n = evq_tr_drain(hil_emit_tr, NULL, &lost, &first, &last);
+        printf("EVQ_TR_HDR %llu %llu %llu %llu %u\n", (unsigned long long)evq_tr_total(),
+               (unsigned long long)lost, (unsigned long long)first, (unsigned long long)last, (unsigned)n);
+    }
+    return ESP_OK;
+#endif
+}
+
+esp_err_t event_log_hil_state_dump(void)
+{
+    char arm[160] = "-";
+#ifndef EVQ_HIL_HOST
+    (void)evq_arm_describe(arm, sizeof arm);
+#endif
+    printf("EVQ_STATE hold=%d gate=%u keeper_paused=%d reserve=%llu cid_override=%08" PRIx32
+           " rtc_valid=%d boots=%u parked=%d arm=[%s]\n",
+           evq_hil_hold_active() ? 1 : 0, (unsigned)event_log_hil_gate(), s_hil_keeper_paused ? 1 : 0,
+           (unsigned long long)s_hil_reserve, s_hil_cid, hil_rtc_valid() ? 1 : 0,
+           (unsigned)s_hil_rtc.boots, s_sd_parked ? 1 : 0, arm);
+    return ESP_OK;
+}
+
+esp_err_t event_log_hil_arm(const char *point, const char *mode, unsigned nth)
+{
+#ifdef EVQ_HIL_HOST
+    (void)point; (void)mode; (void)nth;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    evq_arm_mode_t m;
+    if (strcmp(mode, "reset") == 0) m = EVQ_ARM_RESET;
+    else if (strcmp(mode, "reset_inside") == 0) m = EVQ_ARM_RESET_INSIDE;
+    else if (strcmp(mode, "eio") == 0) m = EVQ_ARM_EIO;
+    else if (strcmp(mode, "enospc") == 0) m = EVQ_ARM_ENOSPC;
+    else if (strcmp(mode, "off") == 0) { evq_arm_clear(); return ESP_OK; }
+    else return ESP_ERR_INVALID_ARG;
+    evq_arm_set(point, m, nth);
+    return ESP_OK;
+#endif
+}
+
+#endif /* EVQ_HIL_ON */

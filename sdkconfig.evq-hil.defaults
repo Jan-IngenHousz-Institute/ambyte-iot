@@ -1,0 +1,2 @@
+# On-device SD-overflow verification controls (test-only; never in a release).
+CONFIG_AMBYTE_EVQ_HIL=y

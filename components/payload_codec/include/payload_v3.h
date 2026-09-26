@@ -13,6 +13,10 @@ extern "C" {
 #define PAYLOAD_V3_MAX_ARRAYS   12U
 #define PAYLOAD_V3_MAX_ATTACHED  4U
 #define PAYLOAD_V3_TICK_FACTOR_MAX 100.0
+/* Heartbeat (TELEMETRY) build buffer. 4096 B until the storage.evq block
+ * (~1 KiB at worst-case values) was added; tests/evq_integ asserts the
+ * worst-case heartbeat fits with margin, and the builder fails closed. */
+#define PAYLOAD_V3_TELEMETRY_CAP 6144U
 /* AMBIT cmd 35 returns a fixed ten-bin spectrum plus a PAR scalar. */
 #define PAYLOAD_V3_SPECTRUM_BINS 10U
 /* Every producer MUST size its output buffer with this, not a hand-guessed
@@ -116,6 +120,38 @@ typedef struct {
     int64_t sd_dropped;
     int64_t last_acked_id;
     bool sd_io_lost;
+    /* Two-media event queue health (event_log_health). Rendered as
+     * storage.evq so a full / blocked / SD-waiting store is explicit and a
+     * floor count is never presented as exact. Names are the stable
+     * event_log_*_name strings. */
+    bool evq_valid;
+    bool evq_pending_exact;
+    bool evq_storage_blocked;
+    int64_t evq_pending;
+    int64_t evq_deliverable_pending;
+    int64_t evq_flash_pending;
+    int64_t evq_sd_pending;
+    int64_t evq_reimport_pending;
+    const char *evq_sd_state;
+    const char *evq_head_block;
+    const char *evq_blocked_reason;
+    const char *evq_corrupt_medium;
+    int64_t evq_refused_full;
+    int64_t evq_refused_media;
+    int64_t evq_refused_too_large;
+    int64_t evq_refused_unavailable;
+    int64_t evq_quarantined_poison;
+    int64_t evq_quarantined_malformed;
+    int64_t evq_skipped_unindexed_gap;
+    int64_t evq_corrupt_detected;
+    uint32_t evq_spool_files;
+    uint32_t evq_spool_errors;
+    uint32_t evq_mirror_used;
+    uint32_t evq_reclaimed_files;
+    uint32_t evq_archived_files;
+    uint32_t evq_reimported_files;
+    uint32_t evq_sd_retired_names;
+    uint32_t evq_sd_bad_copies;
 
     bool runtime_valid;
     int64_t uptime_s;
