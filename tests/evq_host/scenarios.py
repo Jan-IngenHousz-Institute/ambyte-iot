@@ -379,10 +379,26 @@ def B4(seed: int) -> dict:
             workload = ["keeper auto"] + cps(300, 60) + ["deliver 200", "store 1000 small", "checkpoint post",
                                                          "store 200", "checkpoint post2"]
             dev.run(workload, fault=f"{site}:1:crash")
+            both = False
             for e in ops(dev):
                 if e["op"] == "rename_inside":
                     outcomes.setdefault(site, set()).add(e["outcome"])
+                    both = both or e["outcome"] == "both"
             rec = e2e(dev)
+            # Amendment A1: a "both" outcome on an SD rename retires the .tmp
+            # name (never unlinks it) and the count on the card is reported.
+            evq_dir = dev.state / "sdcard" / "evq"
+            xlk = sorted(evq_dir.glob("xlk-*.junk")) if evq_dir.exists() else []
+            if both and site.startswith(("spool.", "mirror.")):
+                assert xlk, f"{site}: 'both' outcome left no retired xlk name on the card"
+            if both and site.startswith("archive."):
+                # The archive rename moves the primary itself (no .tmp): both
+                # names are archive-grade, the retry takes the next free
+                # arc-* name and no archive name is ever unlinked.
+                gone = [e["path"] for e in ops(dev) if e["op"] == "remove" and "sdcard/archive/" in e.get("path", "")]
+                assert not gone, f"{site}: archive name(s) unlinked after a 'both' rename: {gone[:5]}"
+            assert last_health(dev, "final")["sd_retired_names"] == len(xlk), \
+                f"{site}: sd_retired_names={last_health(dev, 'final')['sd_retired_names']} but {len(xlk)} xlk on card"
             runs.append({"site": site, "variant": variant, "crashes": dev.crashes, "dups": rec["duplicate_count"]})
             finish(dev)
     for site in sites:

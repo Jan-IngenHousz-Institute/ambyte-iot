@@ -6,6 +6,17 @@ comments: none
 
 **Status: AGREED (DRAFT v3 accepted by the Evaluator in contract exchange 4 of 4, 2026-09-26).** Contents below are binding for Sprint 01 and are not relaxed during implementation.
 
+## Amendment A1 (proposed by the Generator in round 2, pending Evaluator acceptance)
+
+Raised by eval round 1 (R1-F3, R1-F4). Nothing else in the agreed contract changes.
+
+| Item | Agreed text | Amended text | Why |
+| --- | --- | --- | --- |
+| §1.8 boot repair, "rename left both names" row | Keep the `.log` if it verifies, else delete both. | Keep the `.log` if it verifies. Otherwise the `.log` is removed or replaced when the segment is re-spooled. The `.tmp` name is **retired**: renamed to `/sdcard/evq/xlk-<n>.junk` and never unlinked. There are at most 1000 slots; past that the `.tmp` is left in place, since a `.tmp` is never a committed copy and no firmware imports it. Retired names on the mounted card are counted at every repair pass and reported as `sd_retired_names` in health, STATUS `storage.evq` and `evlog`. | On real FAT, an `f_rename` interrupted between `dir_register` and `dir_remove` can leave both entries on ONE cluster chain. Unlinking the `.tmp` would free the `.log`'s data. The flash copy still exists throughout. |
+| §1.9 fields | (list) | Adds `sd_retired_names` and `sd_bad_copies`. `sd_bad_copies` counts damaged primaries moved aside to `/sdcard/evq/bad-<seq>-<k>.log`: bytes kept, out of the rollback-import directory, never delivered. | Observability of both non-deleting policies. |
+| §1.10 scope | (list) | Adds the repo `CLAUDE.md` storage invariants (R1-F4), updated to the two-media design. | Its "SD archive-only" statement is otherwise stale. |
+| Tests | B4, F6, G8(c) | B4 additionally asserts that every spool or mirror `both` outcome leaves a retired `xlk` name, and that `sd_retired_names` equals the count on the card in every run. The archive rename moves the primary itself, so it has no `.tmp`: its `both` outcome leaves two archive-grade names, the retry takes the next free `arc-*` name, and B4 asserts that no archive name is ever unlinked. F6 asserts that the damaged primary is preserved byte-for-byte outside `/sdcard/events`. G8(c) asserts that the exact corrupted bytes are in `quarantine.log`. New **E11** is the archive-verification failure case: nothing is retired, the primary and mirror are kept, and a later pass archives a verified copy. New **ARCH-INV** oracle in every R-E2E: each segment that was SPOOLED and then retired (without REIMPORT) keeps a CRC-verified SD copy, checked against the cumulative index history. | Close R1-F2. The oracle also covers delivered records, which R-DUR deliberately skips. |
+
 ## Changes from DRAFT v2 (exchange 3)
 
 | Evaluator point | v3 resolution |
@@ -227,7 +238,7 @@ Boot repair of files:
 | Found at boot | Action |
 | --- | --- |
 | `.tmp` files | Deleted. They are never the only copy. |
-| **Both** a `.tmp` and a `.log` exist (the rename left both names) | Keep the `.log` if it verifies, else delete both. |
+| **Both** a `.tmp` and a `.log` exist (the rename left both names) | Keep the `.log` if it verifies, else delete both. *(Amendment A1: the `.tmp` name is retired, not unlinked; see top.)* |
 | **Neither** exists | Re-spool; the flash copy is still present. |
 | An unindexed `ev-<first_id>.log` whose CRC matches a flash segment | Adopt it. |
 | Any other unindexed `ev-*.log` | Legacy import, as today. |
