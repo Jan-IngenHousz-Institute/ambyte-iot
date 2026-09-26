@@ -171,6 +171,7 @@ typedef struct {
     size_t line_cap;
     char  *buf;
     bool   lines;
+    bool   full;
     unsigned files, missing;
 } inv_t;
 
@@ -200,6 +201,7 @@ static void inv_file(inv_t *iv, const char *path, long size)
                 hex32(d, hx);
                 lno++;
                 printf("EVQ_FL %s %u %lld %s %u\n", path, lno, strtoll(iv->line, NULL, 10), hx, (unsigned)ll);
+                if (iv->full && ll <= iv->line_cap) event_log_hil_emit_full(path, lno, iv->line, ll);
                 ll = 0;
             }
         }
@@ -242,14 +244,14 @@ static void inv_dir(inv_t *iv, const char *dir, int depth)
     closedir(d);
 }
 
-static int do_sd_inv(const char *dir, bool lines)
+static int do_sd_inv(const char *dir, bool lines, bool full)
 {
     if (!event_log_hil_keeper_paused() && !event_log_hil_held()) {
         printf("EVQ_FERR keeper_running (evq_hil keeper pause first)\n");
         return 1;
     }
     if (!sdcard_io_begin()) { printf("EVQ_FERR sd_unavailable\n"); return 1; }
-    inv_t iv = { .line_cap = 70 * 1024, .lines = lines };
+    inv_t iv = { .line_cap = 70 * 1024, .lines = lines || full, .full = full };
     iv.line = heap_caps_malloc(iv.line_cap, MALLOC_CAP_SPIRAM);
     iv.buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
     if (iv.line == NULL || iv.buf == NULL) {
@@ -287,7 +289,7 @@ static void do_stacks(void)
 /* ── command ── */
 static void usage(void)
 {
-    printf("evq_hil fill <run> <k_start> <n> <bytes> <hz> [-c] | flash_inv | sd_inv <dir> [lines] | index |\n"
+    printf("evq_hil fill <run> <k_start> <n> <bytes> <hz> [-c] | flash_inv [full] | sd_inv <dir> [lines|full] | index |\n"
            "        io [drain] | claims | cursor | state | stacks | gate <hold|auto|force> | sd_release |\n"
            "        keeper <pause|run> | sd_park | sd_unpark | fault <point> <reset|reset_inside|eio|enospc|off> [nth] |\n"
            "        reserve <bytes|off> | cid <hex|off> | boot_slot <ota_0|ota_1>\n");
@@ -319,8 +321,11 @@ static int evq_hil_cmd(int argc, char **argv)
         printf("HIL_OK fill started\n");
         return 0;
     }
-    if (strcmp(sub, "flash_inv") == 0) return event_log_hil_flash_inv() == ESP_OK ? 0 : 1;
-    if (strcmp(sub, "sd_inv") == 0 && argc >= 3) return do_sd_inv(argv[2], argc >= 4 && strcmp(argv[3], "lines") == 0);
+    if (strcmp(sub, "flash_inv") == 0) return event_log_hil_flash_inv(argc >= 3 && strcmp(argv[2], "full") == 0) == ESP_OK ? 0 : 1;
+    if (strcmp(sub, "sd_inv") == 0 && argc >= 3) {
+        bool full = argc >= 4 && strcmp(argv[3], "full") == 0;
+        return do_sd_inv(argv[2], full || (argc >= 4 && strcmp(argv[3], "lines") == 0), full);
+    }
     if (strcmp(sub, "index") == 0) return event_log_hil_index_dump() == ESP_OK ? 0 : 1;
     if (strcmp(sub, "io") == 0) return event_log_hil_io_dump(argc >= 3 && strcmp(argv[2], "drain") == 0) == ESP_OK ? 0 : 1;
     if (strcmp(sub, "claims") == 0) return event_log_hil_claims_dump() == ESP_OK ? 0 : 1;

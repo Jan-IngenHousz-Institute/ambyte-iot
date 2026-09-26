@@ -49,7 +49,8 @@ bool event_log_hil_line_sha(int64_t id, uint8_t out[32], uint32_t *out_bytes);
 
 /* Read-only dumps (printf, one machine line per item). flash_inv refuses
  * unless the keeper is paused or the SD is held. */
-esp_err_t event_log_hil_flash_inv(void);
+esp_err_t event_log_hil_flash_inv(bool full);   /* full: + base64 of non-synthetic lines */
+void event_log_hil_emit_full(const char *path, unsigned lno, const char *line, size_t len);
 esp_err_t event_log_hil_index_dump(void);
 esp_err_t event_log_hil_cursor_dump(void);
 esp_err_t event_log_hil_claims_dump(void);

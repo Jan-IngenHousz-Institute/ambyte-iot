@@ -3900,6 +3900,7 @@ static int64_t hil_now_us(void)
 #include "esp_attr.h"
 #include "esp_timer.h"
 #include "evq_hil_trace.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 #define HIL_RTC RTC_NOINIT_ATTR
 static int64_t hil_now_us(void) { return esp_timer_get_time(); }
@@ -4087,7 +4088,35 @@ static int hil_snap_cmp(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-esp_err_t event_log_hil_flash_inv(void)
+/* Full content of a NON-synthetic record line (device field != "evq_hil"),
+ * base64 on one console line, so real schedule records can be reconciled by
+ * content (contract D-2). Private evidence only. */
+static void hil_emit_full(const char *path, unsigned lno, const char *line, size_t ll)
+{
+#ifdef EVQ_HIL_HOST
+    (void)path; (void)lno; (void)line; (void)ll;
+#else
+    const char *t1 = memchr(line, '\t', ll);
+    const char *t2 = t1 ? memchr(t1 + 1, '\t', ll - (size_t)(t1 + 1 - line)) : NULL;
+    if (t2 != NULL && (size_t)(ll - (t2 + 1 - line)) > 8 && memcmp(t2 + 1, "evq_hil\t", 8) == 0) return;
+    size_t olen = 0;
+    (void)mbedtls_base64_encode(NULL, 0, &olen, (const unsigned char *)line, ll);
+    unsigned char *b = malloc(olen + 1);
+    if (b == NULL) { printf("EVQ_FLX %s %u -\n", path, lno); return; }
+    if (mbedtls_base64_encode(b, olen + 1, &olen, (const unsigned char *)line, ll) == 0) {
+        b[olen] = '\0';
+        printf("EVQ_FLX %s %u %s\n", path, lno, (const char *)b);
+    }
+    free(b);
+#endif
+}
+
+void event_log_hil_emit_full(const char *path, unsigned lno, const char *line, size_t len)
+{
+    hil_emit_full(path, lno, line, len);
+}
+
+esp_err_t event_log_hil_flash_inv(bool full)
 {
     if (s_mtx == NULL || !s_available) return ESP_ERR_INVALID_STATE;
     if (!s_hil_keeper_paused && !evq_hil_hold_active()) {
@@ -4152,6 +4181,7 @@ esp_err_t event_log_hil_flash_inv(void)
                     hil_sha_finish(&lh, hex);
                     lno++;
                     printf("EVQ_FL %s %u %lld %s %u\n", path, lno, strtoll(line, NULL, 10), hex, (unsigned)ll);
+                    if (full && ll <= s_line_cap + 1) hil_emit_full(path, lno, line, ll);
                     ll = 0;
                 }
             }
