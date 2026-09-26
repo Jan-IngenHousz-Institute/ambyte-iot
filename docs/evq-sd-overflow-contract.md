@@ -6,7 +6,7 @@ comments: none
 
 **Status: AGREED (DRAFT v3 accepted by the Evaluator in contract exchange 4 of 4, 2026-09-26).** Contents below are binding for Sprint 01 and are not relaxed during implementation.
 
-## Amendment A1 (proposed by the Generator in round 2, pending Evaluator acceptance)
+## Amendment A1 (ACCEPTED by the Evaluator in eval round 2, 2026-09-26; binding)
 
 Raised by eval round 1 (R1-F3, R1-F4). Nothing else in the agreed contract changes.
 

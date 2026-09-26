@@ -364,6 +364,33 @@ size_t shim_fwrite(const void *p, size_t sz, size_t n, FILE *f)
 static int read_gate(ofile_t *o)
 {
     if (o == NULL) return 0;
+    /* Persistent bad sectors: every data read of the SD file that is at
+     * EVQ_SHIM_BADREAD (normalized path) when the run starts fails, under
+     * whatever name it has later: the damage is in its data clusters, which
+     * a rename keeps (tracked by inode). Directory ops still work. */
+    static int bad_state = 0;            /* 0 unresolved, 1 armed, -1 off */
+    static ino_t bad_ino;
+    static dev_t bad_dev;
+    if (bad_state == 0) {
+        const char *bad = getenv("EVQ_SHIM_BADREAD");
+        struct stat bst;
+        if (bad != NULL && bad[0] != '\0' && stat(bad, &bst) == 0) {
+            bad_ino = bst.st_ino;
+            bad_dev = bst.st_dev;
+            bad_state = 1;
+        } else {
+            bad_state = -1;
+        }
+    }
+    if (bad_state == 1 && o->med == MED_SD) {
+        struct stat fst;
+        if (fstat(fileno(o->f), &fst) == 0 && fst.st_ino == bad_ino && fst.st_dev == bad_dev) {
+            ops_log("{\"op\":\"read\",\"path\":\"%s\",\"fail\":\"badread\"}", o->path);
+            o->err = true;
+            errno = EIO;
+            return EIO;
+        }
+    }
     int e = gate(o->med, "read", o->path);
     if (e) { o->err = true; errno = e; }
     return e;

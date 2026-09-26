@@ -103,7 +103,7 @@ A new card is adopted only if no such obligation exists elsewhere. Adoption re-s
 
 | Trigger | Action |
 | --- | --- |
-| Every 1000 stores (`EVLOG_ARCHIVE_EVERY_N`, unchanged) | Archive delivered files, then spool unsent rotated files. |
+| Every 1000 stores (`EVLOG_ARCHIVE_EVERY_N`, unchanged) | Spool unsent rotated files, then archive delivered files. Unsent data goes first, so a stuck archive can never starve the spool. |
 | Flash free below 25 % (`EVQ_PRESSURE_PCT`) | The store wakes the keeper at once. It spools, then reclaims verified SPOOLED files oldest-first until 40 % is free (`EVQ_RECLAIM_PCT`). |
 | A card is mounted or un-parked | The keeper is woken. Any remount invalidates cached SD verifications, because `event_log_sd_notify` bumps the epoch. |
 
@@ -111,6 +111,12 @@ A new card is adopted only if no such obligation exists elsewhere. Adoption re-s
 - The lock order is `s_mtx` → `sdcard_io_begin`. The host harness aborts if `s_mtx` is taken while an SD ref is held.
 - The SD reserve is 64 MiB (`EVQ_SD_RESERVE_BYTES`). Below it, `sd_state=full` and spooling pauses.
 - Eviction under pressure removes only delivered flash copies (`seq < cursor`), never a REIMPORT source.
+- Archiving verifies every SD copy **in place** before using it as a source.
+  - A primary that reads back with the wrong bytes is conclusively damaged. It is never renamed into the archive.
+  - A copy that cannot be read is retried with backoff for `EVQ_ARCHIVE_TRIES` (3) passes, then treated the same way.
+  - The archive is made from the verified mirror, else from the flash copy. Damaged copies move aside to `/sdcard/evq/bad-<seq>-<k>.log`: the bytes are kept, never deleted, and counted in `sd_bad_copies`.
+  - If no verified copy remains, the delivered entry still retires, with its damaged bytes kept aside, so the keeper cannot stall.
+  - Tests: E12 covers a permanently damaged primary, including the capacity check; E13 covers a persistently unreadable one.
 
 ## Rollback
 

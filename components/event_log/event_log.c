@@ -303,6 +303,12 @@ static uint32_t  s_spool_files = 0, s_spool_errors = 0, s_mirror_used = 0;
 static uint32_t  s_reclaimed_files = 0, s_archived_files = 0, s_reimported_files = 0;
 static uint32_t  s_sd_bad_copies = 0;          /* damaged SD copies moved aside (kept, never delivered) */
 static uint32_t  s_sd_retired_names = 0;       /* .tmp names retired (renamed aside, never unlinked) — on the card now */
+/* Archive retry bound (eval R2-F1): consecutive failed archive passes of the
+ * same segment. After EVQ_ARCHIVE_TRIES an unreadable SD copy is treated as
+ * damaged (moved aside) instead of being retried forever. Keeper-only. */
+#define EVQ_ARCHIVE_TRIES 3
+static uint32_t  s_arch_fail_seq = 0;
+static uint8_t   s_arch_fail_n = 0;
 /* Storage-full is distinct from card-loss: a full store is HEALTHY, so we pause
  * writes WITHOUT reporting an I/O error. The drain + keeper free space and
  * store admission re-enables writes. */
@@ -717,6 +723,27 @@ static void evq_rd_close(evq_rd_t *rd)
     rd->sd_ref = false;
 }
 
+/* Move a damaged SD copy of segment `seq` aside to /sdcard/evq/bad-<seq>-<k>.log
+ * (contract amendment A1): the bytes are kept for inspection, never deleted,
+ * but leave /sdcard/events (a rolled-back firmware would import them verbatim)
+ * and the m-* mirror names (orphan-mirror import). Caller holds an SD ref.
+ * A rename touches only directory entries, so it works on a copy whose data
+ * clusters no longer read back. */
+static bool evq_sd_move_aside(const char *path, uint32_t seq)
+{
+    char bad[EVQ_PATH_MAX];
+    struct stat bst;
+    unsigned k = 0;
+    for (; k < 100; k++) {
+        snprintf(bad, sizeof bad, "%s/bad-%06u-%u.log", EVQ_MIRROR_DIR, (unsigned)seq, k);
+        if (stat(bad, &bst) != 0) break;
+    }
+    if (k == 100 || rename(path, bad) != 0) return false;
+    s_sd_bad_copies++;
+    ESP_LOGW(TAG, "damaged copy %s moved aside to %s", path, bad);
+    return true;
+}
+
 /* Verify one SD copy of `s` in place (caller holds s_mtx AND an SD ref). */
 static bool evq_sd_verify_copy_locked(const evq_seg_t *s, bool mirror)
 {
@@ -753,19 +780,10 @@ static esp_err_t evq_sd_open_verified_locked(evq_seg_t *s, evq_rd_t *rd, uint8_t
             /* The damaged primary is kept for inspection (bytes untouched) but
              * moved out of /sdcard/events, where a rolled-back firmware would
              * import it verbatim. */
-            char pp[EVQ_PATH_MAX], bad[EVQ_PATH_MAX];
+            char pp[EVQ_PATH_MAX];
             evq_sd_primary_path(pp, sizeof pp, s->primary);
             struct stat bst;
-            if (stat(pp, &bst) == 0) {
-                for (unsigned k = 0; k < 100; k++) {
-                    snprintf(bad, sizeof bad, "%s/bad-%06u-%u.log", EVQ_MIRROR_DIR, (unsigned)s->seq, k);
-                    if (stat(bad, &bst) != 0) break;
-                }
-                if (rename(pp, bad) == 0) {
-                    s_sd_bad_copies++;
-                    ESP_LOGW(TAG, "damaged primary moved aside to %s", bad);
-                }
-            }
+            if (stat(pp, &bst) == 0) (void)evq_sd_move_aside(pp, s->seq);
         }
         if (which == 0) {
             char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
@@ -2860,13 +2878,39 @@ static bool evq_archive_one(uint32_t seq)
         evq_sd_mirror_path(mp, sizeof mp, s.mirror);
         /* Source order: the primary (renamed into place, cheap), else the
          * mirror, else the flash copy (both copied + verified under the new
-         * name). The redundant copies — mirror, flash — are dropped ONLY after
+         * name). The redundant copies (mirror, flash) are dropped ONLY after
          * a verified archive copy exists; a failed verification keeps them and
-         * retries on a later pass (§1.8). */
+         * retries on a later pass (§1.8).
+         *
+         * Every SD source is verified IN PLACE first (eval R2-F1): a primary
+         * whose bytes read back but differ from the index is conclusively
+         * damaged. Renaming it into the archive and back on every pass
+         * starved its healthy mirror and, through the transfer loop, all
+         * later spooling (flash filled up to refusal with the SD mostly
+         * empty). A damaged copy is therefore never a source: the archive
+         * comes from the verified mirror/flash copy and the damaged bytes
+         * move aside to evq/bad-* (A1), never deleted. An UNREADABLE copy
+         * (I/O error, maybe transient) is retried with backoff for
+         * EVQ_ARCHIVE_TRIES passes, then treated the same way. */
+        unsigned tries = s_arch_fail_seq == seq ? s_arch_fail_n : 0;
+        bool give_up = tries >= EVQ_ARCHIVE_TRIES;
+        bool have_primary = s.primary[0] != '\0' && evq_sd_path_exists(pp);
         bool have_mirror = s.mirror[0] != '\0' && evq_sd_path_exists(mp);
+        evq_scan_t psc, msc;
+        bool p_read = have_primary && evq_scan_file(pp, s_kbuf, s_line_cap, &psc);
+        bool p_good = p_read && evq_scan_matches(&psc, &s);
+        bool use_primary = p_good && !give_up;
+        bool p_bad = have_primary && !use_primary && (p_read || give_up);   /* conclusive, or out of retries */
+        bool m_read = false, m_good = false;
+        if (have_mirror && !use_primary) {
+            m_read = evq_scan_file(mp, s_kbuf, s_line_cap, &msc);
+            m_good = m_read && evq_scan_matches(&msc, &s);
+        }
+        bool m_bad = have_mirror && !use_primary && !m_good && (m_read || give_up);
+        bool set_aside_primary = false, set_aside_mirror = false;
         if (base[0] == '\0') {
             ok = false;
-        } else if (s.primary[0] != '\0' && evq_sd_path_exists(pp)) {
+        } else if (use_primary) {
             s_pass_wrote_sd = true;
             EVQ_FAULT_POINT("archive.rename.inside_call");
             ok = rename(pp, dst) == 0;
@@ -2883,21 +2927,28 @@ static bool evq_archive_one(uint32_t seq)
                     ok = false;
                 }
             }
-        } else if (have_mirror) {
+        } else if (have_primary && !p_bad) {
+            ok = false;          /* primary unreadable: retry (bounded) before giving up on it */
+        } else if (m_good) {
+            set_aside_primary = have_primary;
             if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
                 s_sd_full = true;
                 ok = false;
             } else {
                 ok = evq_copy_commit(mp, EVLOG_ARCHIVE_DIR, base, &s, "archive");
             }
+        } else if (have_mirror && !m_bad) {
+            ok = false;          /* mirror unreadable: retry (bounded) */
         } else if (s.flash_present && evlog_flash_exists(seq, NULL)) {
+            set_aside_primary = have_primary;
+            set_aside_mirror = have_mirror;
             /* A never-spooled file may still have copies from an interrupted
              * spool (crash between commit and the SPOOLED line). Once this entry
              * retires they would read as foreign legacy backlog: drop any that
              * are ours (verify against the index, or a byte prefix of flash). */
             char cand[EVQ_PATH_MAX];
             const char *cdirs[2] = { EVLOG_LEGACY_SD_DIR, EVQ_MIRROR_DIR };
-            for (int ci = 0; ci < 2; ci++) {
+            for (int ci = 0; ci < 2 && !have_primary && !have_mirror; ci++) {
                 if (ci == 0) snprintf(cand, sizeof cand, "%s/ev-%06lld.log", cdirs[ci], (long long)s.first_id);
                 else snprintf(cand, sizeof cand, "%s/m-%06u.log", cdirs[ci], (unsigned)seq);
                 if (!evq_sd_path_exists(cand)) continue;
@@ -2914,8 +2965,27 @@ static bool evq_archive_one(uint32_t seq)
             } else {
                 ok = evq_copy_commit(flash_path, EVLOG_ARCHIVE_DIR, base, &s, "archive");
             }
+        } else if (have_primary || have_mirror) {
+            /* Delivered, and every remaining copy is damaged: nothing verified
+             * can be archived. The delivery obligation is met; keep the bytes
+             * aside and retire the entry instead of blocking the keeper. */
+            ESP_LOGE(TAG, "ev-%06u.log: delivered, no verified copy left — damaged copies kept in %s/bad-*",
+                     (unsigned)seq, EVQ_MIRROR_DIR);
+            set_aside_primary = have_primary;
+            set_aside_mirror = have_mirror;
+            ok = true;
         } else {
             ok = true;       /* no copy left anywhere (flash evicted, SD copies gone): nothing to archive */
+        }
+        /* Damaged copies leave the import/mirror names only once the archive
+         * (or retirement) is settled; a failed move keeps the entry for retry. */
+        if (ok && set_aside_primary) {
+            s_pass_wrote_sd = true;
+            ok = evq_sd_move_aside(pp, seq);
+        }
+        if (ok && set_aside_mirror) {
+            s_pass_wrote_sd = true;
+            ok = evq_sd_move_aside(mp, seq);
         }
         if (ok) {
             EVQ_FAULT_POINT("archive.after_verify_before_mirror_remove");
@@ -2933,10 +3003,13 @@ static bool evq_archive_one(uint32_t seq)
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     s_keeper_pin_seq = 0;
     if (!ok) {
+        if (s_arch_fail_seq == seq) { if (s_arch_fail_n < 255) s_arch_fail_n++; }
+        else { s_arch_fail_seq = seq; s_arch_fail_n = 1; }
         if (!s_sd_full) { s_pass_error = true; evq_sd_backoff_locked(); }
         xSemaphoreGive(s_mtx);
         return false;
     }
+    if (s_arch_fail_seq == seq) { s_arch_fail_seq = 0; s_arch_fail_n = 0; }
     (void)EVQ_IX_APPEND("A %" PRIu32, seq);
     s_archived_files++;
     /* The flash copy is delivered AND archived: free it now. */
@@ -3558,19 +3631,11 @@ esp_err_t event_log_sd_service(void)
 
         /* 3. Transfer burst: batch trigger, flash pressure, or recovery needing room. */
         if (due || pressure || (import_work && short_room)) {
+            /* Unsent records first (eval R2-F1): spooling is the obligation
+             * that keeps flash from filling; archiving delivered files is
+             * housekeeping, so a stuck archive can never starve the spool. */
             bool clean = true;
             for (size_t guard = 0; guard < EVQ_INDEX_CAP; guard++) {
-                uint32_t seq = 0;
-                xSemaphoreTake(s_mtx, portMAX_DELAY);
-                for (size_t i = 0; i < s_ix.n; i++) {
-                    const evq_seg_t *s = &s_ix.segs[i];
-                    if (s->seq < s_rd_seq && s->state != EVQ_SEG_REIMPORT) { seq = s->seq; break; }
-                }
-                xSemaphoreGive(s_mtx);
-                if (seq == 0) break;
-                if (!evq_archive_one(seq)) { clean = false; break; }
-            }
-            for (size_t guard = 0; guard < EVQ_INDEX_CAP && clean; guard++) {
                 uint32_t seq = 0;
                 xSemaphoreTake(s_mtx, portMAX_DELAY);
                 for (size_t i = 0; i < s_ix.n; i++) {
@@ -3580,6 +3645,23 @@ esp_err_t event_log_sd_service(void)
                 xSemaphoreGive(s_mtx);
                 if (seq == 0) break;
                 if (!evq_spool_one(seq)) { clean = false; break; }
+            }
+            /* A spool that stopped on a full card still lets delivered files
+             * archive (their flash copies are the space recovery gives up
+             * first); an I/O error backs the whole card off. */
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            bool arch_go = clean || (s_sd_full && evq_sd_backoff_elapsed());
+            xSemaphoreGive(s_mtx);
+            for (size_t guard = 0; guard < EVQ_INDEX_CAP && arch_go; guard++) {
+                uint32_t seq = 0;
+                xSemaphoreTake(s_mtx, portMAX_DELAY);
+                for (size_t i = 0; i < s_ix.n; i++) {
+                    const evq_seg_t *s = &s_ix.segs[i];
+                    if (s->seq < s_rd_seq && s->state != EVQ_SEG_REIMPORT) { seq = s->seq; break; }
+                }
+                xSemaphoreGive(s_mtx);
+                if (seq == 0) break;
+                if (!evq_archive_one(seq)) { clean = false; break; }
             }
             xSemaphoreTake(s_mtx, portMAX_DELAY);
             if (clean) { s_stores_since_archive = 0; s_sd_full = false; }

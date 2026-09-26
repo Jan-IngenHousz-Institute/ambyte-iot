@@ -756,6 +756,101 @@ def E11(seed: int) -> dict:
     return rec
 
 
+def E12(seed: int) -> dict:
+    """Eval R2-F1: a delivered segment whose primary is PERMANENTLY damaged
+    (readable, wrong bytes) next to a byte-exact mirror. The keeper must not
+    stall on it: the damaged bytes are kept aside (A1 bad-*), the archive is
+    made from the verified mirror, the entry retires, later segments keep
+    spooling, and flash never refuses while the card has room."""
+    dev = device("E12", seed)
+    dev.run(["keeper auto", "store 1100 small", "deliver all", "health d"])
+    segs0, _, _ = index_segs(dev)
+    spooled = sorted(q for q, s in segs0.items() if s.primary and s.mirror and s.state in ("SPOOLED", "DELIVERED"))
+    assert spooled, "nothing spooled to corrupt"
+    victim = segs0[spooled[0]]
+    primary = dev.state / "sdcard" / "events" / victim.primary
+    mirror = dev.state / "sdcard" / "evq" / victim.mirror
+    good = mirror.read_bytes()
+    assert primary.read_bytes() == good, "precondition: primary and mirror byte-identical"
+    raw = bytearray(good)
+    mid = len(raw) // 2
+    raw[mid] = ord("x") if raw[mid] != ord("x") else ord("y")   # same length, reads back fine, wrong CRC
+    damaged = bytes(raw)
+    primary.write_bytes(damaged)
+    h0 = last_health(dev, "d")
+    # six keeper periods with work due (the batch trigger reopens the transfer burst)
+    lines = ["keeper manual"]
+    for i in range(6):
+        lines += ["store 200 small", "tick 61000", "service", f"health k{i}"]
+    dev.run(lines)
+    segs1, _, _ = index_segs(dev)
+    assert victim.seq not in segs1, f"damaged-primary segment {victim.seq} never retired: {segs1.get(victim.seq)}"
+    bad = sorted((dev.state / "sdcard" / "evq").glob(f"bad-{victim.seq:06d}-*.log"))
+    assert bad and any(p.read_bytes() == damaged for p in bad), "damaged primary bytes not preserved in evq/bad-*"
+    assert not primary.exists(), "damaged primary left in the rollback-import directory"
+    assert not mirror.exists(), "mirror kept although a verified archive exists"
+    arcs = [p for p in (dev.state / "sdcard" / "archive").glob("arc-*.log") if p.read_bytes() == good]
+    assert arcs, "no archive copy byte-identical to the verified mirror"
+    hk = last_health(dev, "k5")
+    assert hk["sd_bad_copies"] >= 1, "sd_bad_copies not reported"
+    # capacity: undelivered stores well past the flash size keep overflowing to SD
+    refused0 = len(read_jsonl(dev.state / "out" / "refused.jsonl"))
+    spool0 = hk["spool_files"]
+    cap = ["keeper auto"]
+    for i in range(8):
+        cap += ["store 500", "tick 61000", "service", f"health c{i}"]
+    dev.run(cap)
+    hc = last_health(dev, "c7")
+    refused = read_jsonl(dev.state / "out" / "refused.jsonl")[refused0:]
+    assert not refused, f"{len(refused)} store(s) refused while the SD had room: {refused[:3]}"
+    assert not hc["storage_blocked"], f"storage blocked: {hc['blocked_reason']}"
+    assert hc["spool_files"] > spool0 or hc["sd_pending"] > h0["sd_pending"], "no spooling after the damaged primary"
+    assert hc["sd_pending"] > 0, "undelivered overflow never reached SD"
+    rec = e2e(dev, {"victim": victim.seq, "bad_copies": [p.name for p in bad], "archive_copies": [p.name for p in arcs]})
+    assert rec["arch_inv"]["checked"] >= 1
+    finish(dev)
+    return rec
+
+
+def E13(seed: int) -> dict:
+    """Eval R2-F1, unreadable variant: the delivered primary's data clusters
+    fail every read (persistent EIO; rename still works). Retried with
+    backoff a bounded number of passes, then treated as damaged: kept aside
+    byte-for-byte, archived from the verified mirror, retired; spooling and
+    stores continue."""
+    dev = device("E13", seed)
+    dev.run(["keeper auto", "store 1100 small", "deliver all", "health d"])
+    segs0, _, _ = index_segs(dev)
+    spooled = sorted(q for q, s in segs0.items() if s.primary and s.mirror and s.state in ("SPOOLED", "DELIVERED"))
+    assert spooled, "nothing spooled"
+    victim = segs0[spooled[0]]
+    primary = dev.state / "sdcard" / "events" / victim.primary
+    mirror = dev.state / "sdcard" / "evq" / victim.mirror
+    orig = primary.read_bytes()
+    dev.env["EVQ_SHIM_BADREAD"] = f"sdcard/events/{victim.primary}"
+    lines = ["keeper manual"]
+    for i in range(8):
+        lines += ["store 200 small", "tick 300000", "service", f"health k{i}"]
+    dev.run(lines)
+    fails = [e for e in ops(dev) if e.get("fail") == "badread"]
+    assert len(fails) >= 2, f"primary read retried {len(fails)}x: the bounded retry never ran"
+    segs1, _, _ = index_segs(dev)
+    assert victim.seq not in segs1, f"unreadable-primary segment {victim.seq} never retired: {segs1.get(victim.seq)}"
+    bad = sorted((dev.state / "sdcard" / "evq").glob(f"bad-{victim.seq:06d}-*.log"))
+    assert bad and any(p.read_bytes() == orig for p in bad), "unreadable primary not preserved in evq/bad-*"
+    assert not primary.exists() and not mirror.exists(), "primary/mirror left behind after the verified archive"
+    assert any(p.read_bytes() == orig for p in (dev.state / "sdcard" / "archive").glob("arc-*.log")), \
+        "no verified archive copy"
+    h = last_health(dev, "k7")
+    assert h["sd_bad_copies"] >= 1 and not h["storage_blocked"], f"health: {h}"
+    refused = [r for r in read_jsonl(dev.state / "out" / "refused.jsonl")]
+    assert not refused, f"{len(refused)} store(s) refused"
+    del dev.env["EVQ_SHIM_BADREAD"]
+    rec = e2e(dev, {"victim": victim.seq, "badread_fails": len(fails)})
+    finish(dev)
+    return rec
+
+
 # ═══ F. SD missing / mismatched / unreadable at an SD_ONLY head ══════════════
 def _sd_only_head(dev: Device) -> None:
     _overflowed(dev, 900)
