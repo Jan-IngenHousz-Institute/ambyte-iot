@@ -150,6 +150,8 @@ typedef struct {
     uint32_t evq_reclaimed_files;
     uint32_t evq_archived_files;
     uint32_t evq_reimported_files;
+    uint32_t evq_sd_retired_names;
+    uint32_t evq_sd_bad_copies;
 
     bool runtime_valid;
     int64_t uptime_s;

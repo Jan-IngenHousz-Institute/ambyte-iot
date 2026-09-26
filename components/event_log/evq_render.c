@@ -112,5 +112,6 @@ int evq_render_health_text(const evlog_health_t *h, char *buf, size_t cap)
           (unsigned)h->reclaimed_files, (unsigned)h->archived_files, (unsigned)h->reimported_files,
           (unsigned)h->pressure_notifies, (unsigned)h->sd_bursts,
           (unsigned)h->index_segments, (unsigned)h->index_cap);
+    w_add(&w, "  sd_retired_names=%u sd_bad_copies=%u\r\n", (unsigned)h->sd_retired_names, (unsigned)h->sd_bad_copies);
     return w.ok ? (int)w.len : -1;
 }

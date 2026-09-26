@@ -237,6 +237,8 @@ typedef struct {
     uint32_t sd_bursts;
     uint32_t index_segments;
     uint32_t index_cap;
+    uint32_t sd_retired_names;  /* .tmp names retired on this card (possible FAT cross-link; never unlinked) */
+    uint32_t sd_bad_copies;     /* damaged SD copies moved aside to /sdcard/evq/bad-* (kept, never delivered) */
 } evlog_health_t;
 
 /* Stable wire/CLI names (evq_render.c). */

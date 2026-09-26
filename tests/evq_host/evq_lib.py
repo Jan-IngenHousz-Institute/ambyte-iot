@@ -627,3 +627,59 @@ def scratch_root() -> Path:
     if base:
         Path(base).mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="evq-", dir=base))
+
+
+# ── ARCH-INV: a retired spooled segment keeps a verified copy ─────────────
+def check_arch_inv(dev: Device) -> dict:
+    """Every segment that was SPOOLED (P line) and later retired (A line)
+    without ever being re-imported (R line) must still have a byte-exact,
+    CRC-verifying copy somewhere on SD (archive, primary, mirror, any card).
+    Uses the cumulative index history the shim records, so compaction or
+    boots cannot hide a retirement. Delivered ids are NOT exempt here: this
+    is the redundancy check R-DUR deliberately does not make."""
+    st = dev.state
+    hist = st / ".shim" / "idx_history"
+    if not hist.exists():
+        return {"checked": 0}
+    last_s: dict[int, tuple[int, int]] = {}
+    spooled: set[int] = set()
+    retired: dict[int, tuple[int, int]] = {}
+    reimported: set[int] = set()
+    for raw in hist.read_bytes().split(b"\n"):
+        line = raw.decode("latin-1")
+        m = re.match(r"^(.*) \*([0-9a-f]{8})$", line)
+        if not m or (zlib.crc32(m.group(1).encode("latin-1")) & 0xFFFFFFFF) != int(m.group(2), 16):
+            continue
+        f = m.group(1).split(" ")
+        try:
+            if f[0] == "S":
+                last_s[int(f[1])] = (int(f[5]), int(f[6], 16))
+            elif f[0] == "P":
+                spooled.add(int(f[1]))
+            elif f[0] == "R":
+                reimported.add(int(f[1]))
+            elif f[0] == "A":
+                q = int(f[1])
+                if q in spooled and q in last_s:
+                    retired[q] = last_s[q]
+        except (ValueError, IndexError):
+            continue
+    want = {q: v for q, v in retired.items() if q not in reimported}
+    if not want:
+        return {"checked": 0}
+    have: set[tuple[int, int]] = set()
+    sizes = {v[0] for v in want.values()}
+    for base in ["sdcard", "cards"]:
+        d = st / base
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if not p.is_file() or p.name.startswith(("bad-", "xlk-")):
+                continue
+            sz = p.stat().st_size
+            if sz in sizes:
+                have.add((sz, zlib.crc32(p.read_bytes()) & 0xFFFFFFFF))
+    lost = sorted(q for q, v in want.items() if v not in have)
+    if lost:
+        raise OracleFailure(f"ARCH-INV: spooled segment(s) {lost[:10]} retired without any verified SD copy left")
+    return {"checked": len(want)}

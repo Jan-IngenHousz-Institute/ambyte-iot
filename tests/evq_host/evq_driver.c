@@ -202,7 +202,8 @@ static void health(const char *label)
                   "\"sd_state\":\"%s\",\"head_block\":\"%s\",\"storage_blocked\":%d,\"blocked_reason\":\"%s\","
                   "\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,\"reclaimed\":%u,\"archived\":%u,"
                   "\"reimported\":%u,\"pressure_notifies\":%u,\"sd_bursts\":%u,\"index_segments\":%u,\"index_cap\":%u,"
-                  "\"flash_free\":%llu,\"sd_ops\":%llu,\"clock\":%u,\"render_len\":%d,\"boot\":%d}\n",
+                  "\"flash_free\":%llu,\"sd_ops\":%llu,\"clock\":%u,\"render_len\":%d,\"boot\":%d,"
+                  "\"sd_retired_names\":%u,\"sd_bad_copies\":%u}\n",
             label, h.available, h.write_full, (long long)h.pending, h.pending_exact, (long long)h.deliverable_pending,
             (long long)h.flash_pending, (long long)h.sd_pending, (long long)h.reimport_pending,
             (long long)h.next_id, (long long)h.last_acked_id, (long long)h.skipped, (long long)h.dropped,
@@ -213,7 +214,7 @@ static void health(const char *label)
             h.storage_blocked, event_log_blocked_reason_name(h.blocked_reason), h.spool_files, h.spool_errors,
             h.mirror_used, h.reclaimed_files, h.archived_files, h.reimported_files, h.pressure_notifies,
             h.sd_bursts, h.index_segments, h.index_cap, (unsigned long long)freeb,
-            (unsigned long long)shim_sd_ops(), evq_clock_now(), tl, s_boot);
+            (unsigned long long)shim_sd_ops(), evq_clock_now(), tl, s_boot, h.sd_retired_names, h.sd_bad_copies);
 #endif
     fflush(s_hl);
 }

@@ -651,9 +651,10 @@ static void print_health_json(FILE *f, const evlog_health_t *h)
     fprintf(f, ",\"corrupt_medium\":"); json_str(f, event_log_medium_name(h->corrupt_medium));
     fprintf(f, ",\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,\"reclaimed_files\":%u,"
                "\"archived_files\":%u,\"reimported_files\":%u,\"pressure_notifies\":%u,\"sd_bursts\":%u,"
-               "\"index_segments\":%u,\"index_cap\":%u}",
+               "\"index_segments\":%u,\"index_cap\":%u,\"sd_retired_names\":%u,\"sd_bad_copies\":%u}",
             h->spool_files, h->spool_errors, h->mirror_used, h->reclaimed_files, h->archived_files,
-            h->reimported_files, h->pressure_notifies, h->sd_bursts, h->index_segments, h->index_cap);
+            h->reimported_files, h->pressure_notifies, h->sd_bursts, h->index_segments, h->index_cap,
+            h->sd_retired_names, h->sd_bad_copies);
 }
 
 static void ev_health(const char *prefix, const evlog_health_t *h)
@@ -1155,7 +1156,8 @@ static void snapshot(const char *name)
            "\"refused_full\":%lld,\"refused_media\":%lld,\"refused_too_large\":%lld,\"refused_unavailable\":%lld,"
            "\"quarantined_poison\":%lld,\"quarantined_malformed\":%lld,\"skipped_unindexed_gap\":%lld,"
            "\"corrupt_detected\":%lld,\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,"
-           "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u,\"sd_state\":",
+           "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u,"
+           "\"sd_retired_names\":%u,\"sd_bad_copies\":%u,\"sd_state\":",
            g_cap.evq_valid ? "true" : "false", (long long)g_cap.evq_pending, g_cap.evq_pending_exact ? "true" : "false",
            g_cap.evq_storage_blocked ? "true" : "false", (long long)g_cap.evq_deliverable_pending,
            (long long)g_cap.evq_flash_pending, (long long)g_cap.evq_sd_pending, (long long)g_cap.evq_reimport_pending,
@@ -1163,7 +1165,8 @@ static void snapshot(const char *name)
            (long long)g_cap.evq_refused_unavailable, (long long)g_cap.evq_quarantined_poison,
            (long long)g_cap.evq_quarantined_malformed, (long long)g_cap.evq_skipped_unindexed_gap,
            (long long)g_cap.evq_corrupt_detected, g_cap.evq_spool_files, g_cap.evq_spool_errors, g_cap.evq_mirror_used,
-           g_cap.evq_reclaimed_files, g_cap.evq_archived_files, g_cap.evq_reimported_files);
+           g_cap.evq_reclaimed_files, g_cap.evq_archived_files, g_cap.evq_reimported_files,
+           g_cap.evq_sd_retired_names, g_cap.evq_sd_bad_copies);
     json_str(stdout, g_cap.evq_sd_state);
     printf(",\"head_block\":"); json_str(stdout, g_cap.evq_head_block);
     printf(",\"blocked_reason\":"); json_str(stdout, g_cap.evq_blocked_reason);
@@ -1535,6 +1538,7 @@ static void worst_health(evlog_health_t *w, int64_t v64)
     w->corrupt_medium = longest_value(event_log_medium_name);
     w->spool_files = w->spool_errors = w->mirror_used = w->reclaimed_files = w->archived_files = UINT32_MAX;
     w->reimported_files = w->pressure_notifies = w->sd_bursts = w->index_segments = w->index_cap = UINT32_MAX;
+    w->sd_retired_names = w->sd_bad_copies = UINT32_MAX;
 }
 
 static void fill_str(char *dst, size_t n, char c) { memset(dst, c, n); dst[n] = '\0'; }
@@ -1604,6 +1608,8 @@ static void sc_worst(void)
         w.evq_reclaimed_files = eh.reclaimed_files;
         w.evq_archived_files = eh.archived_files;
         w.evq_reimported_files = eh.reimported_files;
+        w.evq_sd_retired_names = eh.sd_retired_names;
+        w.evq_sd_bad_copies = eh.sd_bad_copies;
         /* Every other field at the widest value its producer can hand over. */
         static char dev[18], disc[24], wd[16], fw[32], src[16], sha[65], ver[32], bld[32], ins[32];
         static char chn[4][12], sid[4][18], afw[4][16], anm[4][20];

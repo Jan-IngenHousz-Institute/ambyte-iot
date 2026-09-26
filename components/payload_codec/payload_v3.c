@@ -746,9 +746,11 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   (long long)input->evq_skipped_unindexed_gap, (long long)input->evq_corrupt_detected);
         jw_string(&w, input->evq_corrupt_medium);
         jw_append(&w, ",\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,"
-                      "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u}",
+                      "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u,"
+                      "\"sd_retired_names\":%u,\"sd_bad_copies\":%u}",
                   input->evq_spool_files, input->evq_spool_errors, input->evq_mirror_used,
-                  input->evq_reclaimed_files, input->evq_archived_files, input->evq_reimported_files);
+                  input->evq_reclaimed_files, input->evq_archived_files, input->evq_reimported_files,
+                  input->evq_sd_retired_names, input->evq_sd_bad_copies);
     }
     jw_append(&w, "},\"runtime\":{");
     if (input->runtime_valid) {

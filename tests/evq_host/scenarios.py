@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 
 import build
-from evq_lib import (Device, HarnessError, OracleFailure, assert_e2e, check_durability, cursor_from_nvs,
+from evq_lib import (Device, HarnessError, OracleFailure, assert_e2e, check_arch_inv, check_durability, cursor_from_nvs,
                      iter_records, line_sha, load_manifests, media_hashes, nvs_read, nvs_write, parse_index,
                      quarantined_ids, read_jsonl, reconcile, record_id, registered_fault_points, scratch_root,
                      sha256_file, write_evidence)
@@ -138,10 +138,16 @@ def run_ok(dev: Device, lines: list[str], fault: str | None = None, exe_path=Non
 
 
 def e2e(dev: Device, extra: dict | None = None, media_before=None, allow_missing=None, dup_bound=None) -> dict:
-    dev.run(["drain_all", "health final", "checkpoint final"])
+    dev.run(["drain_all", "service 2", "health final", "checkpoint final"])
     rec = reconcile(dev)
     if extra:
         rec.update(extra)
+    try:
+        rec["arch_inv"] = check_arch_inv(dev)
+    except OracleFailure as e:
+        rec["arch_inv"] = {"error": str(e)}
+        write_evidence(dev, rec, media_before=media_before)
+        raise
     write_evidence(dev, rec, media_before=media_before)
     assert_e2e(rec, allow_missing)
     if dup_bound is not None and rec["duplicate_count"] > dup_bound:
@@ -702,6 +708,38 @@ def E10(seed: int) -> dict:
     return rec
 
 
+def E11(seed: int) -> dict:
+    """Archive of a delivered spooled segment whose renamed copy fails
+    verification (EIO on the read-back): nothing is retired, the mirror and
+    the primary survive, a later pass archives a VERIFIED copy."""
+    dev = device("E11", seed, flash=16 * MiB)
+    dev.run(["keeper auto", "store 1100 small", "deliver all", "health d"])
+    segs0, _, _ = index_segs(dev)
+    spooled = sorted(q for q, s in segs0.items() if s.primary and s.state in ("SPOOLED", "DELIVERED"))
+    assert spooled, "nothing spooled to archive"
+    victim = segs0[spooled[0]]
+    mirror = dev.state / "sdcard" / "evq" / victim.mirror
+    primary = dev.state / "sdcard" / "events" / victim.primary
+    assert mirror.exists() and primary.exists()
+    # arm: the first archive rename's read-back fails
+    dev.run(["keeper manual", "store 1000 small", "service", "health a1"], fault="archive.after_rename_before_verify:1:eio")
+    assert dev.fault_fired(), "fault never fired"
+    segs1, _, _ = index_segs(dev)
+    first = next(q for q in spooled if True)
+    still = segs1.get(first)
+    assert still is not None, "segment retired although its archive failed verification"
+    assert (dev.state / "sdcard" / "evq" / still.mirror).exists(), "mirror removed although archive unverified"
+    assert (dev.state / "sdcard" / "events" / still.primary).exists(), "primary not restored after failed verification"
+    dev.armed = None
+    dev.run(["keeper manual", "tick 61000", "service", "store 1000 small", "service", "health a2"])
+    segs2, _, _ = index_segs(dev)
+    assert first not in segs2, "segment never archived after the failure cleared"
+    rec = e2e(dev)
+    assert rec["arch_inv"]["checked"] >= 1
+    finish(dev)
+    return rec
+
+
 # ═══ F. SD missing / mismatched / unreadable at an SD_ONLY head ══════════════
 def _sd_only_head(dev: Device) -> None:
     _overflowed(dev, 900)
@@ -829,9 +867,16 @@ def F6(seed: int) -> dict:
         h = last_health(dev, "final")
         assert h["mirror_used"] >= 1, "mirror not used"
         assert rec["first_delivery_in_id_order"]
+        kept = [p for p in (dev.state / "sdcard" / "evq").glob("bad-*.log")]
         if dmg_hash:
-            assert (not prim.exists()) or sha256_file(prim) == dmg_hash or True
-        out[how] = {"mirror_used": h["mirror_used"]}
+            # the damaged primary is preserved byte-for-byte for inspection, out of
+            # the import directory, and never delivered (R-E2E hashes above)
+            assert any(sha256_file(p) == dmg_hash for p in kept), f"damaged primary not preserved: {kept}"
+            assert all(sha256_file(p) != dmg_hash for p in (dev.state / "sdcard" / "events").glob("*")), \
+                "damaged primary left in the rollback-import directory"
+        else:
+            assert not kept
+        out[how] = {"mirror_used": h["mirror_used"], "kept_damaged": [p.name for p in kept]}
         finish(dev)
     return {"scenario": "F6", "seed": seed, "runs": out}
 
@@ -1050,15 +1095,19 @@ def G8(seed: int) -> dict:
     data[tab + 1: tab + 1] = b""
     fields_end = off + len(line)
     seg = bytes(data[off:fields_end]).replace(b"\t", b"#")
-    data[off:fields_end] = seg[:-1] + b"\n"
+    corrupted = seg[:-1] + b"\n"                # no tab: no parseable id, no fields
+    data[off:fields_end] = corrupted
     tail.write_bytes(bytes(data))
     dev.allow_lost = {victim}
     rec = e2e(dev, allow_missing={victim})
     hc = [r for r in health_rows(dev) if r.get("corrupt_detected")]
     assert rec["missing_ids"] == [victim], rec["missing_ids"]
     assert hc and hc[-1]["corrupt_detected"] == 1, hc[-1:] if hc else "never reported"
-    assert victim in quarantined_ids(dev.state) or True
-    out["c"] = {"missing": rec["missing_ids"], "corrupt_detected": hc[-1]["corrupt_detected"]}
+    qbytes = (dev.state / "evstore" / "events" / "quarantine.log").read_bytes()
+    assert corrupted in qbytes, "the corrupted bytes were not preserved exactly in quarantine.log"
+    assert record_id(corrupted) is None
+    out["c"] = {"missing": rec["missing_ids"], "corrupt_detected": hc[-1]["corrupt_detected"],
+                "quarantined_bytes": len(corrupted)}
     finish(dev)
     return {"scenario": "G8", "seed": seed, "runs": {"a": {"dups": out["a"]["duplicate_count"]}, "b": out["b"], "c": out["c"]}}
 

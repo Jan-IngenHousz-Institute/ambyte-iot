@@ -351,6 +351,11 @@ size_t shim_fwrite(const void *p, size_t sz, size_t n, FILE *f)
     }
     size_t w = fwrite(p, sz, n, f);
     fflush(f);                          /* write-through: capacity is exact */
+    if (o->med == MED_FLASH && (strstr(o->path, "evq.idx") != NULL) && w > 0) {
+        /* cumulative index history for the ARCH-INV oracle (survives compaction) */
+        int hf = open(".shim/idx_history", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (hf >= 0) { (void)!write(hf, p, sz * w); close(hf); }
+    }
     fstat(fileno(f), &st);
     tab_set(o->med, o->path, (long long)st.st_size);
     return w;

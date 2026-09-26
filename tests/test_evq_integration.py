@@ -93,7 +93,7 @@ EVQ_INPUT_FIELDS = [
     "reimport_pending", "sd_state", "head_block", "blocked_reason", "refused_full", "refused_media",
     "refused_too_large", "refused_unavailable", "quarantined_poison", "quarantined_malformed",
     "skipped_unindexed_gap", "corrupt_detected", "corrupt_medium", "spool_files", "spool_errors",
-    "mirror_used", "reclaimed_files", "archived_files", "reimported_files",
+    "mirror_used", "reclaimed_files", "archived_files", "reimported_files", "sd_retired_names", "sd_bad_copies",
 ]
 BOOL_FIELDS = {"available", "write_full", "pending_exact", "storage_blocked"}
 
@@ -518,7 +518,7 @@ class EvqIntegration(unittest.TestCase):
         "corrupt_medium": "corrupt_medium", "skipped": "skipped", "spool_files": "spool_files",
         "spool_errors": "spool_errors", "mirror_used": "mirror_used", "reclaimed_files": "reclaimed",
         "archived_files": "archived", "reimported_files": "reimported", "pressure_notifies": "pressure_notifies",
-        "sd_bursts": "sd_bursts",
+        "sd_bursts": "sd_bursts", "sd_retired_names": "sd_retired_names", "sd_bad_copies": "sd_bad_copies",
     }
 
     def check_cli(self, text, h, label):

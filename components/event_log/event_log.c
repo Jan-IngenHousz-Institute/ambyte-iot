@@ -301,6 +301,8 @@ static uint8_t   s_corrupt_medium = EVQ_MEDIUM_NONE;
 static uint32_t  s_pressure_notifies = 0, s_sd_bursts = 0;
 static uint32_t  s_spool_files = 0, s_spool_errors = 0, s_mirror_used = 0;
 static uint32_t  s_reclaimed_files = 0, s_archived_files = 0, s_reimported_files = 0;
+static uint32_t  s_sd_bad_copies = 0;          /* damaged SD copies moved aside (kept, never delivered) */
+static uint32_t  s_sd_retired_names = 0;       /* .tmp names retired (renamed aside, never unlinked) — on the card now */
 /* Storage-full is distinct from card-loss: a full store is HEALTHY, so we pause
  * writes WITHOUT reporting an I/O error. The drain + keeper free space and
  * store admission re-enables writes. */
@@ -748,6 +750,22 @@ static esp_err_t evq_sd_open_verified_locked(evq_seg_t *s, evq_rd_t *rd, uint8_t
             which = 2;
             s_mirror_used++;
             ESP_LOGW(TAG, "ev-%06u.log: SD primary failed verification — using mirror", (unsigned)s->seq);
+            /* The damaged primary is kept for inspection (bytes untouched) but
+             * moved out of /sdcard/events, where a rolled-back firmware would
+             * import it verbatim. */
+            char pp[EVQ_PATH_MAX], bad[EVQ_PATH_MAX];
+            evq_sd_primary_path(pp, sizeof pp, s->primary);
+            struct stat bst;
+            if (stat(pp, &bst) == 0) {
+                for (unsigned k = 0; k < 100; k++) {
+                    snprintf(bad, sizeof bad, "%s/bad-%06u-%u.log", EVQ_MIRROR_DIR, (unsigned)s->seq, k);
+                    if (stat(bad, &bst) != 0) break;
+                }
+                if (rename(pp, bad) == 0) {
+                    s_sd_bad_copies++;
+                    ESP_LOGW(TAG, "damaged primary moved aside to %s", bad);
+                }
+            }
         }
         if (which == 0) {
             char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
@@ -2424,6 +2442,8 @@ esp_err_t event_log_health(evlog_health_t *out)
     out->reimported_files = s_reimported_files;
     out->pressure_notifies = s_pressure_notifies;
     out->sd_bursts        = s_sd_bursts;
+    out->sd_retired_names = s_sd_retired_names;
+    out->sd_bad_copies    = s_sd_bad_copies;
     out->index_segments   = (uint32_t)s_ix.n;
     out->index_cap        = (uint32_t)s_ix.cap;
     xSemaphoreGive(s_mtx);
@@ -2838,6 +2858,12 @@ static bool evq_archive_one(uint32_t seq)
         char pp[EVQ_PATH_MAX], mp[EVQ_PATH_MAX];
         evq_sd_primary_path(pp, sizeof pp, s.primary);
         evq_sd_mirror_path(mp, sizeof mp, s.mirror);
+        /* Source order: the primary (renamed into place, cheap), else the
+         * mirror, else the flash copy (both copied + verified under the new
+         * name). The redundant copies — mirror, flash — are dropped ONLY after
+         * a verified archive copy exists; a failed verification keeps them and
+         * retries on a later pass (§1.8). */
+        bool have_mirror = s.mirror[0] != '\0' && evq_sd_path_exists(mp);
         if (base[0] == '\0') {
             ok = false;
         } else if (s.primary[0] != '\0' && evq_sd_path_exists(pp)) {
@@ -2848,8 +2874,21 @@ static bool evq_archive_one(uint32_t seq)
             if (ok) {
                 evq_scan_t sc;
                 if (!evq_scan_file(dst, s_kbuf, s_line_cap, &sc) || !evq_scan_matches(&sc, &s)) {
-                    ESP_LOGW(TAG, "archive %s does not verify (delivered data; kept as-is)", dst);
+                    /* Not a verified archive: put it back where the index says it
+                     * is and keep every other copy. If the move back fails too,
+                     * the next pass archives from the mirror/flash copy (the
+                     * unverified file just stays in the archive directory). */
+                    ESP_LOGW(TAG, "archive %s failed verification — kept primary/mirror, will retry", dst);
+                    (void)rename(dst, pp);
+                    ok = false;
                 }
+            }
+        } else if (have_mirror) {
+            if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
+                s_sd_full = true;
+                ok = false;
+            } else {
+                ok = evq_copy_commit(mp, EVLOG_ARCHIVE_DIR, base, &s, "archive");
             }
         } else if (s.flash_present && evlog_flash_exists(seq, NULL)) {
             /* A never-spooled file may still have copies from an interrupted
@@ -2876,7 +2915,7 @@ static bool evq_archive_one(uint32_t seq)
                 ok = evq_copy_commit(flash_path, EVLOG_ARCHIVE_DIR, base, &s, "archive");
             }
         } else {
-            ok = true;       /* no copy left to archive (evicted, or an earlier pass renamed it) */
+            ok = true;       /* no copy left anywhere (flash evicted, SD copies gone): nothing to archive */
         }
         if (ok) {
             EVQ_FAULT_POINT("archive.after_verify_before_mirror_remove");
@@ -3291,8 +3330,26 @@ static bool evq_sd_epoch_repair(void)
             }
         }
     }
+    /* Observable, bounded policy (contract amendment A1): retired names stay
+     * on the card for fsck/inspection and are counted each mount; at most
+     * 1000 slots — past that a .tmp is simply left in place (a .tmp is never
+     * a committed copy and no firmware imports it). */
+    unsigned on_card = 0, bad_on_card = 0;
+    {
+        DIR *d = opendir(EVQ_MIRROR_DIR);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (strncmp(ent->d_name, "xlk-", 4) == 0) on_card++;
+                else if (strncmp(ent->d_name, "bad-", 4) == 0) bad_on_card++;
+            }
+            closedir(d);
+        }
+    }
+    s_sd_retired_names = on_card;
+    if (bad_on_card > s_sd_bad_copies) s_sd_bad_copies = bad_on_card;
     sdcard_io_end();
-    if (retired > 0) ESP_LOGW(TAG, "retired %u possibly cross-linked .tmp name(s) (not unlinked)", retired);
+    if (retired > 0) ESP_LOGW(TAG, "retired %u possibly cross-linked .tmp name(s) (not unlinked; %u on card)", retired, on_card);
 
     /* Orphan mirrors → import candidates (only if their primary is absent). */
     xSemaphoreTake(s_mtx, portMAX_DELAY);

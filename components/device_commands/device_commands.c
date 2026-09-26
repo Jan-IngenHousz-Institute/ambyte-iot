@@ -1876,6 +1876,8 @@ static cmd_result_t emit_status_event(bool direct)
             input.evq_reclaimed_files = eh.reclaimed_files;
             input.evq_archived_files = eh.archived_files;
             input.evq_reimported_files = eh.reimported_files;
+            input.evq_sd_retired_names = eh.sd_retired_names;
+            input.evq_sd_bad_copies = eh.sd_bad_copies;
         }
     }
 
