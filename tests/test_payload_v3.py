@@ -96,6 +96,26 @@ class PayloadV3Test(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.tmp.cleanup()
 
+    def test_recorded_trigger_times(self) -> None:
+        trace = self.records["TRACE_RECORDED"]
+        series = trace["series"]
+        edges = [.3,.4,.5,.6,.7,.8,.9,1,1.5,1.61,1.72,1.83,1.94,2.05,2.16,2.27,2.9,3]
+        for name in ("fluo_630_signal", "fluo_630_ref"):
+            self.assertEqual(series[name]["t"], edges)
+            self.assertNotIn("dt", series[name])
+        for name in ("ambient_sun_vis", "ambient_leaf_ir"):
+            self.assertEqual(series[name]["t"], [.65,1.885])
+        for name in ("refl_730_signal", "refl_730_ref"):
+            self.assertEqual(series[name]["t"], [1.885])
+        self.assertEqual(series["leaf_temp"]["t"], [0,2.1])
+        self.assertEqual(trace["protocol"]["tick_factor"], .854)
+        self.assertNotIn("arr9", series)
+        partial = self.records["TRACE_RECORDED_PARTIAL"]["series"]
+        self.assertEqual(partial["fluo_630_signal"]["t"], edges[:11])
+        self.assertEqual(partial["ambient_sun_vis"]["t"], [.65])
+        self.assertNotIn("refl_730_signal", partial)
+        self.assertEqual(self.records["TRACE_RECORDED_WIDE"]["series"]["ambient_sun_vis"]["t"], [3000.35])
+
     def test_reference_trace_exact_shape_idx8_and_size(self) -> None:
         trace = self.records["TRACE_IDX8"]
         self.assertEqual(
