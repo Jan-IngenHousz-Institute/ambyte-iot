@@ -57,13 +57,40 @@ def backup_lines(img: bytes, pre: dict, ids: set[int]) -> dict[int, bytes]:
     return want
 
 
+def select_sample(text: str, n: int, min_id: int) -> dict:
+    """Seeded 200 archived ids >= min_id from the last complete /sdcard inventory,
+    and the distinct archive files that hold them (to dump one by one)."""
+    inv = [x for x in hillog.sd_inventories(text) if x["dir"] == "/sdcard" and x["complete"]][-1]
+    by_id = {}
+    for ln in inv["lines"]:
+        if ln["path"].startswith("/sdcard/archive") and ln["id"] >= min_id:
+            by_id.setdefault(ln["id"], ln["path"])
+    rng = random.Random(20260926)
+    ids = sorted(rng.sample(sorted(by_id), min(n, len(by_id))))
+    return {"seed": 20260926, "min_id": min_id, "pool": len(by_id), "ids": ids,
+            "files": sorted({by_id[i] for i in ids})}
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "select":
+        ap = argparse.ArgumentParser()
+        ap.add_argument("mode")
+        ap.add_argument("--capture", required=True)
+        ap.add_argument("--n", type=int, default=200)
+        ap.add_argument("--min-id", type=int, default=66903)
+        ap.add_argument("--out", required=True)
+        a = ap.parse_args()
+        sel = select_sample(Path(a.capture).read_text(errors="replace"), a.n, a.min_id)
+        Path(a.out).write_text(json.dumps(sel, indent=1))
+        print(json.dumps({k: (v if k not in ("ids", "files") else len(v)) for k, v in sel.items()}))
+        return 0
     ap = argparse.ArgumentParser()
     ap.add_argument("--capture", required=True)
     ap.add_argument("--pre", required=True)
     ap.add_argument("--image", required=True)
     ap.add_argument("--warehouse-sample", type=int, default=200)
     ap.add_argument("--min-id", type=int, default=66903, help="first bench id in the dev experiment (2026-09-06 22:10 UTC)")
+    ap.add_argument("--sample-file", help="json from select_sample (ids + files)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     text = Path(a.capture).read_text(errors="replace")
@@ -109,9 +136,9 @@ def main() -> int:
         # >= the first dev-experiment id, compared by content (the archive's own
         # bytes from `sd_inv /sdcard/archive full`) JSON-semantically.
         full = {}
-        for inv in hillog.sd_inventories(text):
-            if inv["dir"] == "/sdcard/archive" and inv["complete"] and inv["full"]:
-                full = inv["full"]
+        for inv in hillog.sd_inventories(text):    # single-file `sd_inv <arc> full` dumps (after S2)
+            if inv["complete"] and inv["full"] and inv["us"] > s2["us"]:
+                full.update(inv["full"])
         arch_ids = {}
         for (path, line), (i, h, _) in c1["lines"].items():
             if path.startswith("/sdcard/archive") and i >= a.min_id and (path, line) in full:
@@ -119,6 +146,12 @@ def main() -> int:
                     arch_ids[i] = full[(path, line)]
         rng = random.Random(20260926)
         pool = sorted(arch_ids)
+        if a.sample_file:                          # the pre-drawn sample (select_sample)
+            want = json.loads(Path(a.sample_file).read_text())["ids"]
+            missing_content = [i for i in want if i not in arch_ids]
+            if missing_content:
+                res["errors"].append(f"continuity: {len(missing_content)} sampled id(s) without dumped content")
+            pool = [i for i in want if i in arch_ids]
         sample = sorted(rng.sample(pool, min(a.warehouse_sample, len(pool))))
         res["continuity"]["warehouse_sample"] = len(sample)
         res["continuity"]["sample_pool"] = len(pool)

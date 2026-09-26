@@ -42,6 +42,9 @@ def flash_inventories(text: str) -> list[dict]:
         if cur is None:
             continue
         if (t := _tok(raw, "EVQ_FL")) is not None:
+            if len(t) != 5 or len(t[3]) != 64:
+                cur["malformed"] = cur.get("malformed", 0) + 1   # a garbled line voids the inventory
+                continue
             cur["lines"].append({"path": t[0], "line": int(t[1]), "id": int(t[2]), "sha256": t[3], "bytes": int(t[4])})
         elif (t := _tok(raw, "EVQ_FLX")) is not None:
             cur["full"][(t[0], int(t[1]))] = base64.b64decode(t[2]) if t[2] != "-" else None
@@ -53,7 +56,7 @@ def flash_inventories(text: str) -> list[dict]:
             cur["missing"].append(t[0])
         elif (t := _tok(raw, "EVQ_FEND")) is not None:
             cur["hashed"], cur["n_missing"] = int(t[0]), int(t[1])
-            cur["complete"] = cur["n_missing"] == 0 and cur["hashed"] == cur["nfiles"]
+            cur["complete"] = cur["n_missing"] == 0 and cur["hashed"] == cur["nfiles"] and not cur.get("malformed")
             out.append(cur)
             cur = None
     return out
@@ -72,6 +75,9 @@ def sd_inventories(text: str) -> list[dict]:
         if cur is None:
             continue
         if (t := _tok(raw, "EVQ_FL")) is not None:
+            if len(t) != 5 or len(t[3]) != 64:
+                cur["malformed"] = cur.get("malformed", 0) + 1   # a garbled line voids the inventory
+                continue
             cur["lines"].append({"path": t[0], "line": int(t[1]), "id": int(t[2]), "sha256": t[3], "bytes": int(t[4])})
         elif (t := _tok(raw, "EVQ_FLX")) is not None:
             cur["full"][(t[0], int(t[1]))] = base64.b64decode(t[2]) if t[2] != "-" else None
@@ -87,7 +93,7 @@ def sd_inventories(text: str) -> list[dict]:
             cur["missing"].append(t[0])
         elif (t := _tok(raw, "EVQ_SDEND")) is not None:
             cur["n_files"], cur["n_missing"] = int(t[0]), int(t[1])
-            cur["complete"] = cur["n_missing"] == 0
+            cur["complete"] = cur["n_missing"] == 0 and not cur.get("malformed")
             out.append(cur)
             cur = None
     return out
