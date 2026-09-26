@@ -62,7 +62,10 @@ def parse_rows(rows: list[dict]) -> dict[int, list[dict]]:
     for r in rows:
         pd = json.loads(r["pd"])
         sample = pd.get("sample")
+        sample_text = None
         if isinstance(sample, str):
+            # the envelope's sample array as sent: '[' + canonical object + ']'
+            sample_text = sample[1:-1] if sample.startswith("[") and sample.endswith("]") else None
             sample = json.loads(sample)
         if not isinstance(sample, list) or not sample:
             continue
@@ -70,7 +73,7 @@ def parse_rows(rows: list[dict]) -> dict[int, list[dict]]:
         mid = obj.get("measure_id")
         if mid is None:
             continue
-        by_id.setdefault(int(mid), []).append({"sample": obj, "env": {k: v for k, v in pd.items() if k != "sample"},
+        by_id.setdefault(int(mid), []).append({"sample": obj, "sample_text": sample_text, "env": {k: v for k, v in pd.items() if k != "sample"},
                                                "experiment_id": r["experiment_id"],
                                                "workbook_version_id": r.get("workbook_version_id"),
                                                "arrival": r["kinesis_arrival_time"],
@@ -199,3 +202,35 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def fetch_ids(ids: list[int], since_date: str = "2026-09-06", chunk: int = 150) -> list[dict]:
+    """Rows of the bench client whose sample measure_id is in `ids`."""
+    rows = []
+    for i in range(0, len(ids), chunk):
+        part = ",".join(str(x) for x in ids[i:i + chunk])
+        sql = ("SELECT experiment_id, workbook_version_id, CAST(ingestion_timestamp AS STRING) ingestion_timestamp, "
+               "CAST(kinesis_arrival_time AS STRING) kinesis_arrival_time, to_json(parsed_data) pd "
+               "FROM open_jii_dev.centrum.raw_data "
+               f"WHERE lower(client_id)='{CLIENT}' AND ingest_date >= DATE'{since_date}' "
+               "AND try_cast(regexp_extract(to_json(parsed_data), 'measure_id[^0-9]+([0-9]+)', 1) AS BIGINT) "
+               f"IN ({part})")
+        rows.extend(_query(sql))
+    return rows
+
+
+def rebuild_line(row: dict) -> bytes | None:
+    """The exact event_log line of a firmware v3 record, from its warehouse
+    sample (the canonical v3 object is spliced verbatim into the envelope):
+    id, channel, device, tag, cmd, start, end, metadata(""), payload."""
+    s = row["sample"]
+    raw = row.get("sample_text")
+    if raw is None or "schema" not in s:
+        return None
+    t = s.get("time", {})
+    start = t.get("start_utc", t.get("observed_utc"))
+    end = t.get("end_utc", start)
+    cmd = (s.get("protocol") or {}).get("cmd", "")
+    fields = [str(s["measure_id"]), s.get("channel") or "", s.get("device") or "", s.get("tag") or "",
+              cmd, str(start), str(end), "", raw]
+    return ("\t".join(fields) + "\n").encode()

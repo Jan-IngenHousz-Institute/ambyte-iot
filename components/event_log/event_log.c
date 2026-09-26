@@ -3888,13 +3888,10 @@ esp_err_t event_log_collect_ids_in_range(int64_t from_id, int64_t to_id, int64_t
 
 #ifdef EVQ_HIL_HOST
 #include "sha256.h"
-#include <time.h>
 #define HIL_RTC
 static int64_t hil_now_us(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return 0;   /* host harnesses compare stdout across runs: keep it deterministic */
 }
 #else
 #include "esp_attr.h"

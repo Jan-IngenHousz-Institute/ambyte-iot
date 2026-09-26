@@ -1,4 +1,13 @@
 #include "sync_runner.h"
+#if !defined(EVQ_HIL_HOST) && __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#if CONFIG_AMBYTE_EVQ_HIL || defined(EVQ_HIL_HOST)
+#define SYNC_HIL 1
+#include "event_log_hil.h"   /* verification build: RTC-retained gate override */
+#else
+#define SYNC_HIL 0
+#endif
 
 #include <stdio.h>
 #include <stdint.h>
@@ -167,10 +176,21 @@ void sync_runner_notify(void)
  * power_monitor can override. */
 __attribute__((weak)) bool sync_runner_is_allowed(void)
 {
+#if SYNC_HIL
+    /* Verification build only (docs/evq-sd-overflow-hil-contract.md): HOLD
+     * keeps every record PENDING (delivery closed during the fill), FORCE
+     * opens the power gate only (the sensor hold still applies), AUTO is
+     * exactly the production rule below. */
+    evq_hil_gate_t hil_gate = event_log_hil_gate();
+    if (hil_gate == EVQ_HIL_GATE_HOLD) return false;
+#endif
 #if AMBYTE_PUBLISH_GATE_LEGACY
     bool sensor_gate_open = !device_commands_measurement_active();
 #else
     bool sensor_gate_open = !device_commands_publish_hold_active();
+#endif
+#if SYNC_HIL
+    if (hil_gate == EVQ_HIL_GATE_FORCE) return sensor_gate_open;
 #endif
     return sensor_gate_open && device_commands_publish_power_ok();
 }
@@ -613,6 +633,14 @@ static bool sync_runner_wd_should_reboot(int64_t timeout_ms, bool *allowed,
     static int64_t s_gate_blocked_ms;
 
     bool    a = device_commands_publish_power_ok();
+#if SYNC_HIL
+    /* Verification build: a HIL gate HOLD is a deliberately closed delivery
+     * path, exactly like a closed power gate here. Without this an hour of
+     * held backlog reads as a wedged pipeline and the watchdog reboots the
+     * bench mid-run (observed on hardware, 2026-09-26). FORCE counts as open. */
+    if (event_log_hil_gate() == EVQ_HIL_GATE_HOLD) a = false;
+    else if (event_log_hil_gate() == EVQ_HIL_GATE_FORCE) a = true;
+#endif
     bool    c = time(NULL) >= (time_t)SYNC_CLOCK_FLOOR_S;
     /* DELIVERABLE backlog only: records waiting behind an unreadable SD copy
      * (card absent/parked/swapped) cannot produce a PUBACK however long the

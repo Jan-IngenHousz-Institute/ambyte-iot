@@ -11,9 +11,13 @@ import base64
 import re
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# serial_daemon notes ("\n[host <ms>] <msg>\n") may land mid-way through a
+# device line; removing the whole insertion rejoins the device's bytes.
+HOST_NOTE = re.compile(r"\n\[host \d+\] [^\n]*\n")
 
 
 def lines_of(text: str):
+    text = HOST_NOTE.sub("", text)
     for raw in text.splitlines():
         yield ANSI.sub("", raw).strip("\r")
 

@@ -3,7 +3,8 @@
 Opening the ESP32-S3 USB-Serial-JTAG port can reset the CPU (modem-control
 lines), so one daemon holds the port for a whole phase: every received byte is
 appended to LOG (with a host-time index LOG.idx: "<unix_ms> <byte_offset>"
-per chunk), commands are read from the FIFO CTL and written with CRLF.
+per chunk, and host notes - opens, sends, resets - in LOG.notes), commands
+are read from the FIFO CTL and written with CRLF.
 After an injected reset the USB device may re-enumerate: the daemon reopens
 with the same line states and keeps logging. `esptool` needs the port: stop
 the daemon first (send "__quit__").
@@ -35,10 +36,13 @@ def run(log: Path, ctl: Path, dtr: bool, rts: bool) -> int:
     state = {"conn": None, "opens": 0}
     lf = open(log, "ab", buffering=0)
     idx = open(str(log) + ".idx", "a", buffering=1)
+    notes = open(str(log) + ".notes", "a", buffering=1)
 
     def note(msg: str) -> None:
+        # Kept OUT of the device byte stream (a note spliced mid-line would
+        # corrupt an inventory line): "<unix_ms> <log byte offset> <msg>".
         with lock:
-            lf.write(f"\n[host {int(time.time() * 1000)}] {msg}\n".encode())
+            notes.write(f"{int(time.time() * 1000)} {lf.tell()} {msg}\n")
 
     def opener():
         while not stop.is_set():
@@ -133,6 +137,7 @@ def run(log: Path, ctl: Path, dtr: bool, rts: bool) -> int:
         note("daemon exit")
         lf.close()
         idx.close()
+        notes.close()
     return 0
 
 

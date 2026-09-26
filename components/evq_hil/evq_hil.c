@@ -35,24 +35,6 @@
 
 static const char *TAG = "evq_hil";
 
-/* ── publish gate override ───────────────────────────────────────────────
- * Strong definition of sync_runner's weak sync_runner_is_allowed(): HOLD
- * keeps every record PENDING (delivery closed during the fill), FORCE opens
- * the power gate only (the sensor hold still applies), AUTO is exactly the
- * production rule. The override is RTC-retained (event_log_hil). */
-bool sync_runner_is_allowed(void)
-{
-    evq_hil_gate_t g = event_log_hil_gate();
-    if (g == EVQ_HIL_GATE_HOLD) return false;
-#if AMBYTE_PUBLISH_GATE_LEGACY
-    bool sensor_gate_open = !device_commands_measurement_active();
-#else
-    bool sensor_gate_open = !device_commands_publish_hold_active();
-#endif
-    if (g == EVQ_HIL_GATE_FORCE) return sensor_gate_open;
-    return sensor_gate_open && device_commands_publish_power_ok();
-}
-
 /* ── park hooks (production routines in app_main) ── */
 static void (*s_park)(void);
 static void (*s_unpark)(void);
@@ -264,7 +246,12 @@ static int do_sd_inv(const char *dir, bool lines, bool full)
     (void)esp_vfs_fat_info(SD_MOUNT_POINT, &total, &freeb);
     printf("EVQ_SDSNAP %s cid=%08" PRIx32 " total=%llu free=%llu us=%lld\n", dir, sdcard_card_serial(),
            (unsigned long long)total, (unsigned long long)freeb, (long long)esp_timer_get_time());
-    inv_dir(&iv, dir, 0);
+    struct stat st0;
+    if (stat(dir, &st0) == 0 && S_ISREG(st0.st_mode)) {
+        inv_file(&iv, dir, (long)st0.st_size);        /* one file (continuity sample) */
+    } else {
+        inv_dir(&iv, dir, 0);
+    }
     printf("EVQ_SDEND %u %u\n", iv.files, iv.missing);
     free(iv.line); free(iv.buf);
     sdcard_io_end();

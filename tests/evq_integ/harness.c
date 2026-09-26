@@ -1026,6 +1026,46 @@ static void sc_I3(void)
     ev_common();
 }
 
+/* I10 (Sprint 02, hil variant) — the verification build's RTC gate HOLD keeps
+ * every record PENDING and the production no-PUBACK watchdog treats it as a
+ * closed power gate: > 1 h of held, deliverable backlog with power, clock and
+ * broker all up must neither publish nor reboot; AUTO then delivers all.
+ * Regression for the hardware watchdog reboot of 2026-09-26. */
+static void sc_I10(void)
+{
+#ifdef EVQ_HIL_HOST
+    event_log_hil_release();                      /* SD not held: only the gate is under test */
+    event_log_hil_set_gate(EVQ_HIL_GATE_HOLD);
+    boot(&(boot_t){ .card = true, .keeper = true, .sync_runner = true });
+    broker_connect();
+    wait_ms(1000);
+    size_t pub0 = g_npub;
+    int stores = 0;
+    while (h_vt_us() < 75ULL * 60 * 1000000) {    /* past the 1-h watchdog timeout */
+        if (produce() == ESP_OK) stores++;
+        wait_ms(60000);
+    }
+    bool a = true, c = false;
+    int64_t wp = 0, since = 0;
+    bool reboot = sync_runner_wd_should_reboot(SYNC_WD_TIMEOUT_MS, &a, &c, &wp, &since);
+    EV("I10_HOLD", "{\"stores\":%d,\"published\":%zu,\"should_reboot\":%s,\"power_ok_seen\":%s,"
+                   "\"deliverable_pending\":%lld,\"since_ms\":%lld,\"allowed\":%s}",
+       stores, g_npub - pub0, reboot ? "true" : "false", a ? "true" : "false", (long long)wp,
+       (long long)since, sync_runner_is_allowed() ? "true" : "false");
+    CHECK(stores > 60, "stores during the hold: %d", stores);
+    CHECK(g_npub == pub0, "published while the HIL gate held");
+    CHECK(!sync_runner_is_allowed(), "drain allowed while held");
+    CHECK(!reboot && !a && wp > 0, "watchdog must read HOLD as a closed gate");
+    event_log_hil_set_gate(EVQ_HIL_GATE_AUTO);
+    sync_runner_notify();
+    CHECK(wait_until_delivered(6 * 3600), "I10 did not deliver after the gate opened");
+    e2e_t r = verify_e2e("I10");
+    (void)r;
+#else
+    CHECK(false, "I10 needs the hil variant (EVQ_HIL_HOST)");
+#endif
+}
+
 /* I4 — the head waits on an unreadable SD copy: NOT_FINISHED, no spin, no watchdog. */
 static void sc_I4(void)
 {
@@ -2261,6 +2301,7 @@ int main(int argc, char **argv)
     else if (!strcmp(s, "I2")) sc_I2();
     else if (!strcmp(s, "I3")) sc_I3();
     else if (!strcmp(s, "I4")) sc_I4();
+    else if (!strcmp(s, "I10")) sc_I10();
     else if (!strcmp(s, "I6_task")) sc_I6(true);
     else if (!strcmp(s, "I6_direct")) sc_I6(false);
     else if (!strcmp(s, "I7")) sc_I7();

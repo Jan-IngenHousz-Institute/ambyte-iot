@@ -49,6 +49,7 @@ VARIANTS = {
     "main": {},
     "idxcap": {"EVQ_INDEX_CAP": "12"},                 # flash_full_index_cap state
     "q1": {"AMBYTE_PUBLISH_MAX_BYTES": "16384"},       # documented conservative field build
+    "hil": {"EVQ_HIL_HOST": "1"},                      # Sprint 02 verification-build hooks
 }
 # Production TUs build with -Werror too; nothing is suppressed for them. Only
 # the third-party ESP-IDF cJSON.c is built with -w.
@@ -67,7 +68,7 @@ PRODUCTION_SOURCES = [
     "components/ambit_announcement/ambit_announcement.c",
 ]
 HARNESS_SOURCES = ["tests/evq_integ/harness.c"]
-IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c"]
+IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "tests/evq_host/sha256.c"]
 INCLUDES = [
     "tests/evq_integ/stubs", "tests/evq_integ",
     "components/event_log/include", "components/event_log",
@@ -76,6 +77,7 @@ INCLUDES = [
     "components/sd_card", "components/clock_trust/include", "components/fleet_jitter/include",
     "components/timezone/include", "components/ota_update/include",
     "components/wifi_manager/include", "components/ambit_announcement/include",
+    "tests/evq_host",
 ]
 
 STATE_SCENARIOS = [
@@ -385,6 +387,17 @@ class EvqIntegration(unittest.TestCase):
         self.assertEqual(red["redelivered_ok"], red["unacked_at_disconnect"])
         self.assertTrue(red["reverted_first_fifo"])
         self.assert_oracle(res, "I3")
+
+    def test_I10_hil_gate_hold_vs_watchdog(self):
+        """Sprint 02: HIL gate HOLD = closed delivery for the drain AND the
+        no-PUBACK watchdog (hardware reboot of 2026-09-26)."""
+        res = self.run_row("I10", "I10", variant="hil")
+        self.assert_clean_and_repeatable(res, "I10")
+        h = self.j(res, "I10_HOLD")
+        self.assertEqual(h["published"], 0)
+        self.assertFalse(h["should_reboot"])
+        self.assertFalse(h["power_ok_seen"])
+        self.assertGreater(h["deliverable_pending"], 0)
 
     def test_I4_head_waits_on_unreadable_sd(self):
         res = self.run_row("I4", "I4")
