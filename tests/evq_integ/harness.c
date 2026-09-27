@@ -491,6 +491,11 @@ bool h_capture_build_telemetry(char *out, size_t cap, const payload_v3_telemetry
     g_cap.script_version = cap_dup(in->script_version);
     g_cap.script_built_against_fw = cap_dup(in->script_built_against_fw);
     g_cap.script_installed_on_fw = cap_dup(in->script_installed_on_fw);
+    /* The retained-diag JSON objects live in a transient heap block that
+     * device_commands frees right after the build: keep our own copies. */
+    static char s_cap_diag[768], s_cap_sdlog[384];
+    if (in->sd_diag_json) { snprintf(s_cap_diag, sizeof s_cap_diag, "%s", in->sd_diag_json); g_cap.sd_diag_json = s_cap_diag; }
+    if (in->sdlog_json) { snprintf(s_cap_sdlog, sizeof s_cap_sdlog, "%s", in->sdlog_json); g_cap.sdlog_json = s_cap_sdlog; }
     for (size_t i = 0; i < in->attached_count && i < PAYLOAD_V3_MAX_ATTACHED; i++) {
         g_cap.attached[i].channel = cap_dup(in->attached[i].channel);
         g_cap.attached[i].sensor_id = cap_dup(in->attached[i].sensor_id);

@@ -152,6 +152,13 @@ typedef struct {
     uint32_t evq_reimported_files;
     uint32_t evq_sd_retired_names;
     uint32_t evq_sd_bad_copies;
+    uint32_t evq_sd_rename_ambiguous;
+    uint32_t evq_sd_verify_fail;
+    /* Pre-rendered JSON objects inserted verbatim as storage.sd_diag /
+     * storage.sdlog when non-NULL (sd_diag_render_json / sd_logger_acct). The
+     * caller guarantees they are complete, valid JSON objects. */
+    const char *sd_diag_json;
+    const char *sdlog_json;
 
     bool runtime_valid;
     int64_t uptime_s;

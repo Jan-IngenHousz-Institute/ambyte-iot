@@ -68,7 +68,8 @@ PRODUCTION_SOURCES = [
     "components/ambit_announcement/ambit_announcement.c",
 ]
 HARNESS_SOURCES = ["tests/evq_integ/harness.c"]
-IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "tests/evq_host/sha256.c"]
+IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "tests/evq_host/sha256.c",
+                "components/sd_card/sd_diag_core.c"]
 INCLUDES = [
     "tests/evq_integ/stubs", "tests/evq_integ",
     "components/event_log/include", "components/event_log",

@@ -9,10 +9,31 @@
  * to /sdcard/logs/ambyte.log, rotating across SD_LOGGER_MAX_FILES files. SD I/O
  * happens only in that task, so logging itself is decoupled from the (slow,
  * occasionally-absent) card.
+ *
+ * Write integrity (2026-09 write-corruption audit). Historically the writer
+ * ignored every sync and rotation result: a failed fsync was treated as
+ * durable, a torn half-line was extended by later appends, and a rotation
+ * whose oldest file could not be removed re-ran remove + 5 renames on EVERY
+ * write — a FAT metadata storm on a card that was already failing. The rules
+ * now are:
+ *   - framing is fixed at the PRODUCER: every ring record is one log call,
+ *     1..SD_LOGGER_LINE_MAX bytes, ending in exactly one '\n' (F-L0);
+ *   - the writer only ever writes whole records, and s_committed is the file
+ *     offset after the last successful sync — always a record boundary;
+ *   - any failed write/flush/sync rolls the file back to s_committed; if the
+ *     rollback itself cannot be proven, the file is QUARANTINED (never appended
+ *     to again — the next append waits for a rotation), so a torn tail can only
+ *     ever sit at the EOF of a retired file;
+ *   - a failed rotation backs off; the current file may grow to twice its cap,
+ *     then logging to SD suspends (counted) instead of storming the FAT;
+ *   - every byte that does not reach the card intact is attributed to exactly
+ *     one accounting bucket (sd_logger_acct), and every fault is recorded in
+ *     sd_diag (RTC/NVS — never the SD).
  */
 
 #include "sd_logger.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -26,18 +47,33 @@
 #include "esp_log.h"
 
 #include "sd_card.h"
+#include "sd_diag.h"
+
+/* Verification build only: route this file's SD operations through the
+ * writer-tagged fault wrappers (evq_hil fault io sdlog …). Must stay the LAST
+ * include; in a release build the header defines nothing. */
+#define EVQ_HIL_WRITER SD_DIAG_W_SDLOG
+#include "evq_hil_io_w.h"
 
 /* ── tunables ─────────────────────────────────────────────────────────── */
 #define SD_LOGGER_DIR        SD_MOUNT_POINT "/logs"
 #define SD_LOGGER_BASENAME   "ambyte"
+#ifndef SD_LOGGER_FILE_BYTES
 #define SD_LOGGER_FILE_BYTES (1 * 1024 * 1024)   /* per-file cap */
+#endif
+#define SD_LOGGER_HARD_BYTES (2 * SD_LOGGER_FILE_BYTES)  /* growth ceiling while rotation is blocked */
 #define SD_LOGGER_MAX_FILES  6                    /* current + 5 rotated ≈ 6 MB */
 #define SD_LOGGER_RING_BYTES (8 * 1024)           /* in-RAM buffer (heap is tight) */
-#define SD_LOGGER_LINE_MAX   256                  /* max formatted line */
+#define SD_LOGGER_LINE_MAX   256                  /* max record, including its '\n' */
+#define SD_LOGGER_CHUNK      512                  /* writer pop size (≥ 2 records) */
 #define SD_LOGGER_TASK_STACK 4096
 #define SD_LOGGER_TASK_PRIO  2                     /* low: below comms/measurement */
 #define SD_LOGGER_POLL_MS    250                   /* drain cadence when idle */
 #define SD_LOGGER_FSYNC_MS   2000                  /* flush-to-card cadence */
+#define SD_LOGGER_ROT_BACKOFF_MS 60000             /* after a failed rotation */
+#define SD_LOGGER_FAILLOG_MS 60000                 /* console failure-log rate limit, per class */
+
+_Static_assert(SD_LOGGER_CHUNK >= 2 * SD_LOGGER_LINE_MAX, "a pop must always hold a whole record");
 
 #define TAG "sd_logger"
 
@@ -50,9 +86,13 @@ static portMUX_TYPE    s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static vprintf_like_t  s_prev_vprintf;   /* console sink (tee target) */
 static volatile bool   s_file_open;      /* stats: file currently open */
-static volatile size_t s_file_bytes;     /* stats: current file size */
+static volatile size_t s_file_bytes;     /* current file size as written */
+static size_t          s_committed;      /* file offset after the last good sync (record boundary) */
+static bool            s_quarantined;    /* current file must not be appended to: rotate first */
 static FILE           *s_fp;
 static bool            s_started;
+static TaskHandle_t    s_writer;         /* recursion guard: its own logs stay console-only */
+static sd_logger_acct_t s_acct;          /* written by the writer task (and ring_push under s_mux) */
 
 /* Pre-reboot handshake: prepare_shutdown() sets s_stop_req; the writer task (the
  * sole owner of s_fp) drains the ring, flushes, closes, and sets s_stopped, then
@@ -70,13 +110,17 @@ static volatile bool   s_stopped;
 static volatile bool   s_pause_req;
 static volatile bool   s_paused;
 
+/* Rotation backoff: while now < s_rot_retry_at, no rotation is attempted. */
+static bool            s_rot_backoff;
+static TickType_t      s_rot_retry_at;
+
 static inline size_t ring_used(void)
 {
     return (s_head + SD_LOGGER_RING_BYTES - s_tail) % SD_LOGGER_RING_BYTES;
 }
 
-/* Push n bytes atomically; drop the whole chunk if it doesn't fit so lines are
- * never split. Safe from any task (and ISR) — only a brief memcpy under lock. */
+/* Push one whole record atomically; drop it whole if it doesn't fit, so a record
+ * is never split. Safe from any task — only a brief memcpy under lock. */
 static void ring_push(const uint8_t *p, size_t n)
 {
     if (n == 0 || n >= SD_LOGGER_RING_BYTES) return;
@@ -91,16 +135,23 @@ static void ring_push(const uint8_t *p, size_t n)
         s_head = (s_head + n) % SD_LOGGER_RING_BYTES;
     } else {
         s_dropped += n;
+        s_acct.dropped_ring_bytes += n;
+        s_acct.dropped_records++;
     }
     portEXIT_CRITICAL_SAFE(&s_mux);
 }
 
-/* Pop up to cap bytes into out; returns the count copied. */
+/* Pop the longest run of WHOLE records (ending in '\n') that fits `cap`.
+ * Producer framing guarantees a non-empty ring always yields ≥ 1 record. */
 static size_t ring_pop(uint8_t *out, size_t cap)
 {
     portENTER_CRITICAL_SAFE(&s_mux);
-    size_t used  = (s_head + SD_LOGGER_RING_BYTES - s_tail) % SD_LOGGER_RING_BYTES;
-    size_t n     = used < cap ? used : cap;
+    size_t used = (s_head + SD_LOGGER_RING_BYTES - s_tail) % SD_LOGGER_RING_BYTES;
+    size_t lim  = used < cap ? used : cap;
+    size_t n = 0;
+    for (size_t i = 0; i < lim; i++) {
+        if (s_ring[(s_tail + i) % SD_LOGGER_RING_BYTES] == '\n') n = i + 1;
+    }
     size_t first = SD_LOGGER_RING_BYTES - s_tail;
     if (first > n) first = n;
     memcpy(out, &s_ring[s_tail], first);
@@ -141,10 +192,15 @@ static int sd_log_vprintf(const char *fmt, va_list ap)
     /* 1b) SD file is WARN/ERROR-only; the console (above) still sees everything. */
     if (!sd_log_level_kept(fmt)) return ret;
 
+    /* 1c) No recursion: the writer's own failure reports describe the card it
+     * cannot write — teeing them back onto that card re-arms the failing I/O.
+     * They stay on the console (and in sd_diag). */
+    if (s_writer != NULL && xTaskGetCurrentTaskHandle() == s_writer) return ret;
+
     /* 2) Build "<RTC wall-clock>  <message>" in one buffer. System time was set
      * from the PCF2131 at boot, so time() is cheap (no I2C); before the RTC
      * syncs it reads ~1970, which is acceptable. */
-    char out[SD_LOGGER_LINE_MAX];
+    char out[SD_LOGGER_LINE_MAX + 1];
     time_t now = time(NULL);
     struct tm tmv;
     localtime_r(&now, &tmv);
@@ -152,7 +208,8 @@ static int sd_log_vprintf(const char *fmt, va_list ap)
 
     int m = vsnprintf(out + off, sizeof out - off, fmt, ap);
     if (m < 0) return ret;
-    size_t end = off + ((size_t)m < sizeof out - off ? (size_t)m : sizeof out - off - 1);
+    bool trunc = (size_t)m >= sizeof out - off;
+    size_t end = off + (trunc ? sizeof out - off - 1 : (size_t)m);
 
     /* Strip ANSI colour escapes (ESC '[' … final @-~) in place; IDF embeds them
      * in the log format string when CONFIG_LOG_COLORS is on. */
@@ -169,8 +226,43 @@ static int sd_log_vprintf(const char *fmt, va_list ap)
         }
         out[w++] = c;
     }
+
+    /* 3) F-L0 framing: one log call = one record = exactly one terminal '\n'.
+     * A missing newline (or a cut) would otherwise merge this record with the
+     * next one in the file, and a bare '\n' mid-message would split it. */
+    while (w > off && (out[w - 1] == '\n' || out[w - 1] == '\r')) w--;
+    for (size_t i = off; i < w; i++) {
+        if (out[i] == '\n' || out[i] == '\r') out[i] = ' ';
+    }
+    if (w > SD_LOGGER_LINE_MAX - 1) { w = SD_LOGGER_LINE_MAX - 1; trunc = true; }
+    if (trunc) {
+        if (w > SD_LOGGER_LINE_MAX - 3) w = SD_LOGGER_LINE_MAX - 3;
+        out[w++] = '~';
+        out[w++] = 'T';                 /* visible "this record was cut" marker */
+        portENTER_CRITICAL_SAFE(&s_mux);
+        s_acct.truncated_records++;
+        portEXIT_CRITICAL_SAFE(&s_mux);
+    }
+    out[w++] = '\n';
     ring_push((const uint8_t *)out, w);
     return ret;
+}
+
+/* ── failure reporting (console-only, rate-limited; sd_diag always) ───── */
+
+typedef enum { FL_WRITE, FL_SYNC, FL_ROLLBACK, FL_ROTATE, FL_OPEN, FL_CLOSE, FL_N } faillog_class_t;
+static TickType_t s_faillog_at[FL_N];
+static bool       s_faillog_any[FL_N];
+
+static void note_fault(faillog_class_t cls, sd_diag_op_t op, int err)
+{
+    sd_diag_fault(SD_DIAG_W_SDLOG, op, err);
+    TickType_t now = xTaskGetTickCount();
+    if (!s_faillog_any[cls] || (now - s_faillog_at[cls]) >= pdMS_TO_TICKS(SD_LOGGER_FAILLOG_MS)) {
+        s_faillog_any[cls] = true;
+        s_faillog_at[cls] = now;
+        ESP_LOGW(TAG, "%s failed errno=%d", sd_diag_op_name(op), err);
+    }
 }
 
 /* ── file handling + rotation ─────────────────────────────────────────── */
@@ -181,61 +273,241 @@ static void log_path(char *buf, size_t cap, int idx)
     else          snprintf(buf, cap, "%s/%s.%d.log", SD_LOGGER_DIR, SD_LOGGER_BASENAME, idx);
 }
 
-/* ambyte.log → ambyte.1.log → … → ambyte.(MAX-1).log; the oldest is deleted. */
-static void rotate_files(void)
+/* ambyte.log → ambyte.1.log → … → ambyte.(MAX-1).log; the oldest is deleted.
+ * FAT rename never replaces an existing target (EEXIST), so a step that fails
+ * leaves every file intact; ENOENT (a not-yet-created file) is harmless.
+ * Returns false on the first real failure — the caller backs off instead of
+ * retrying on every write. */
+static bool rotate_files(void)
 {
     char a[SD_CARD_PATH_MAX], b[SD_CARD_PATH_MAX];
+    struct stat st;
     log_path(a, sizeof a, SD_LOGGER_MAX_FILES - 1);
-    remove(a);
+    long evicted = stat(a, &st) == 0 ? (long)st.st_size : -1;
+    if (remove(a) != 0 && errno != ENOENT) {
+        note_fault(FL_ROTATE, SD_DIAG_OP_REMOVE, errno);
+        s_acct.rotate_err++;
+        return false;
+    }
+    if (evicted > 0) s_acct.retention_evicted_bytes += (uint64_t)evicted;   /* intentional, not loss */
     for (int i = SD_LOGGER_MAX_FILES - 2; i >= 0; i--) {
         log_path(a, sizeof a, i);
         log_path(b, sizeof b, i + 1);
-        rename(a, b);   /* ENOENT on a not-yet-created file is harmless */
+        if (rename(a, b) != 0 && errno != ENOENT) {
+            note_fault(FL_ROTATE, SD_DIAG_OP_RENAME, errno);
+            s_acct.rotate_err++;
+            return false;
+        }
     }
+    return true;
 }
 
 static bool open_log(void)
 {
-    mkdir(SD_LOGGER_DIR, 0777);   /* ignore EEXIST */
+    mkdir(SD_LOGGER_DIR, 0777);   /* EEXIST is the normal case; a real failure surfaces at fopen */
     char path[SD_CARD_PATH_MAX];
     log_path(path, sizeof path, 0);
-    s_fp = fopen(path, "a");
-    if (s_fp == NULL) return false;
-    fseek(s_fp, 0, SEEK_END);
-    long sz = ftell(s_fp);
-    s_file_bytes = sz > 0 ? (size_t)sz : 0;
+    /* "a+": appends always land at EOF (vfs_fat honours O_APPEND per write), and
+     * the last byte can be read back to check the tail. Unbuffered: a failed
+     * write must not linger in a stdio buffer that a later flush/close would
+     * write back past a rollback point. */
+    FILE *f = fopen(path, "a+");
+    if (f == NULL) {
+        note_fault(FL_OPEN, SD_DIAG_OP_OPEN, errno);
+        s_acct.open_err++;
+        return false;
+    }
+    setvbuf(f, NULL, _IONBF, 0);
+    long sz = -1;
+    if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    if (sz < 0) {
+        /* Never assume 0: appending at a guessed offset breaks the size cap
+         * and the committed-offset bookkeeping. */
+        note_fault(FL_OPEN, SD_DIAG_OP_OPEN, errno ? errno : EIO);
+        s_acct.open_err++;
+        fclose(f);
+        return false;
+    }
+    bool torn = false;
+    if (sz > 0) {
+        /* A tail without '\n' is a record torn by a power cut or a lost card
+         * (earlier boot or earlier mount): appending would merge the next
+         * record into it. Retire the file by rotation instead. */
+        int c = EOF;
+        if (fseek(f, -1, SEEK_END) == 0) c = fgetc(f);
+        if (c != '\n') torn = true;
+    }
+    s_fp = f;
+    s_file_bytes = (size_t)sz;
+    s_committed = (size_t)sz;
     s_file_open = true;
+    if (torn) {
+        s_quarantined = true;
+        s_acct.torn_tail_files++;
+    }
     return true;
 }
 
+/* Close after a successful commit. Unbuffered + committed ⇒ nothing is lost if
+ * fclose reports an error, but the error is still attributed. */
 static void close_log(void)
 {
-    if (s_fp) { fclose(s_fp); s_fp = NULL; }
+    if (s_fp) {
+        if (fclose(s_fp) != 0) {
+            note_fault(FL_CLOSE, SD_DIAG_OP_CLOSE, errno);
+            s_acct.close_err++;
+            if (s_file_bytes > s_committed) s_acct.indeterminate_bytes += s_file_bytes - s_committed;
+        }
+        s_fp = NULL;
+    }
     s_file_open = false;
+}
+
+/* Abandon without touching FATFS (card lost / gate refused): fclose on a volume
+ * the monitor may free is a UAF (audit R-8). Whatever was written since the last
+ * sync may or may not be on the card. */
+static void abandon_log(void)
+{
+    if (s_fp != NULL && s_file_bytes > s_committed) s_acct.indeterminate_bytes += s_file_bytes - s_committed;
+    s_fp = NULL;
+    s_file_open = false;
+}
+
+/* Roll the open file back to s_committed after a failed write/flush/sync
+ * (F-L2). `extra` = bytes of a partially written chunk (already on the card
+ * beyond s_file_bytes). On proven rollback the handle stays usable; otherwise
+ * the file is quarantined and closed. */
+static void rollback(size_t extra)
+{
+    size_t since = s_file_bytes - s_committed + extra;
+    int fd = fileno(s_fp);
+    if (ftruncate(fd, (off_t)s_committed) != 0) {
+        note_fault(FL_ROLLBACK, SD_DIAG_OP_TRUNCATE, errno);
+        s_acct.truncate_err++;
+    } else if (fsync(fd) != 0) {
+        note_fault(FL_ROLLBACK, SD_DIAG_OP_FSYNC, errno);
+        s_acct.fsync_err++;
+    } else {
+        s_acct.rolled_back_bytes += since;
+        s_file_bytes = s_committed;
+        return;
+    }
+    /* Rollback not proven: the bytes since commit may or may not be at EOF. The
+     * file is never appended to again; any tail stays at ITS end. */
+    s_acct.indeterminate_bytes += since;
+    s_file_bytes = s_committed;          /* nothing more is attributed to this handle */
+    s_quarantined = true;
+    if (fclose(s_fp) != 0) s_acct.close_err++;
+    s_fp = NULL;
+    s_file_open = false;
+}
+
+/* Commit everything written so far (fflush + fsync). False → rolled back. */
+static bool commit(void)
+{
+    if (s_fp == NULL || s_file_bytes == s_committed) return true;
+    if (fflush(s_fp) != 0) {
+        note_fault(FL_SYNC, SD_DIAG_OP_FLUSH, errno);
+        s_acct.flush_err++;
+    } else if (fsync(fileno(s_fp)) != 0) {
+        note_fault(FL_SYNC, SD_DIAG_OP_FSYNC, errno);
+        s_acct.fsync_err++;
+    } else {
+        s_committed = s_file_bytes;
+        return true;
+    }
+    sdcard_report_io_error();
+    rollback(0);
+    return false;
+}
+
+/* Write one chunk of whole records. False → rolled back / quarantined. */
+static bool write_chunk(const uint8_t *buf, size_t n)
+{
+    errno = 0;
+    size_t w = fwrite(buf, 1, n, s_fp);
+    if (w == n) {
+        s_file_bytes += n;
+        return true;
+    }
+    note_fault(FL_WRITE, SD_DIAG_OP_WRITE, errno ? errno : EIO);
+    s_acct.write_err++;
+    s_acct.lost_unwritten_bytes += n - w;
+    sdcard_report_io_error();
+    rollback(w);
+    return false;
+}
+
+typedef enum { ROOM_OK, ROOM_ROTATE_BLOCKED, ROOM_NO_FILE } room_t;
+
+/* A popped chunk that cannot be written is attributed, never silently lost. */
+static void drop_chunk(room_t why, size_t n)
+{
+    if (why == ROOM_ROTATE_BLOCKED) s_acct.dropped_rotate_blocked_bytes += n;
+    else s_acct.dropped_unavailable_bytes += n;
+}
+
+/* Make the open file appendable for `n` more bytes, rotating when due. Caller
+ * holds an io ref. */
+static room_t ensure_room(size_t n)
+{
+    if (s_fp == NULL && !open_log()) return ROOM_NO_FILE;
+    bool due = s_quarantined || s_file_bytes + n > SD_LOGGER_FILE_BYTES;
+    if (!due) return ROOM_OK;
+    TickType_t now = xTaskGetTickCount();
+    if (s_rot_backoff && (int32_t)(now - s_rot_retry_at) < 0) {
+        /* Backing off: a healthy (non-quarantined) file may keep growing to the
+         * hard ceiling; past it, or if quarantined, drop instead of retrying. */
+        return (!s_quarantined && s_file_bytes + n <= SD_LOGGER_HARD_BYTES) ? ROOM_OK : ROOM_ROTATE_BLOCKED;
+    }
+    (void)commit();                       /* nothing uncommitted crosses a rotation (failure → rolled back) */
+    if (s_fp != NULL) close_log();
+    bool ok = rotate_files();
+    if (ok) {
+        s_rot_backoff = false;
+        s_quarantined = false;
+    } else {
+        s_rot_backoff = true;
+        s_rot_retry_at = now + pdMS_TO_TICKS(SD_LOGGER_ROT_BACKOFF_MS);
+    }
+    if (!open_log()) return ROOM_NO_FILE;
+    if (s_quarantined) return ROOM_ROTATE_BLOCKED;   /* rotation failed, or the new file is torn */
+    if (s_file_bytes + n <= (ok ? SD_LOGGER_FILE_BYTES : SD_LOGGER_HARD_BYTES)) return ROOM_OK;
+    return ROOM_ROTATE_BLOCKED;
+}
+
+/* Drain the ring to the file (pause/stop): whole records only, same failure
+ * rules as normal service. Caller holds an io ref. */
+static void drain_and_close(uint8_t *buf, size_t cap)
+{
+    size_t n;
+    while ((n = ring_pop(buf, cap)) > 0) {
+        room_t r = ensure_room(n);
+        if (r != ROOM_OK) { drop_chunk(r, n); continue; }
+        (void)write_chunk(buf, n);
+    }
+    (void)commit();
+    close_log();
 }
 
 static void writer_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[512];
+    uint8_t buf[SD_LOGGER_CHUNK];
     TickType_t last_fsync = xTaskGetTickCount();
-    bool dirty = false;                                    /* unflushed bytes pending */
 
     for (;;) {
         /* Pre-reboot drain (Item B): flush whatever is buffered to the current
          * file, fsync + close it so sdcard_unmount() can finalize FATFS cleanly,
          * then park until the reboot. Only the writer task ever touches s_fp, so
-         * this is race-free. Skipped if the card is already gone (s_fp == NULL). */
+         * this is race-free. Skipped if the card is already gone. */
         if (s_stop_req) {
-            if (s_fp != NULL && !sdcard_io_lost() && sdcard_is_mounted()) {
-                size_t n;
-                while ((n = ring_pop(buf, sizeof buf)) > 0) {
-                    if (fwrite(buf, 1, n, s_fp) != n) break;
-                }
-                fflush(s_fp);
-                fsync(fileno(s_fp));
+            if (!sdcard_io_lost() && sdcard_is_mounted() && sdcard_io_begin()) {
+                drain_and_close(buf, sizeof buf);
+                sdcard_io_end();
+            } else {
+                abandon_log();
             }
-            close_log();
             s_stopped = true;
             vTaskDelay(portMAX_DELAY);   /* parked — the reboot follows shortly */
         }
@@ -247,21 +519,12 @@ static void writer_task(void *arg)
          * exactly like the loss branch below — fclose on a freed volume is a UAF. */
         if (s_pause_req) {
             if (!s_paused) {
-                if (s_fp != NULL) {
-                    if (!sdcard_io_lost() && sdcard_is_mounted() && sdcard_io_begin()) {
-                        size_t n;
-                        while ((n = ring_pop(buf, sizeof buf)) > 0) {
-                            if (fwrite(buf, 1, n, s_fp) != n) break;
-                        }
-                        fflush(s_fp);
-                        fsync(fileno(s_fp));
-                        close_log();
-                        sdcard_io_end();
-                    } else {
-                        s_fp = NULL; s_file_open = false;   /* abandon, as on loss */
-                    }
+                if (!sdcard_io_lost() && sdcard_is_mounted() && sdcard_io_begin()) {
+                    drain_and_close(buf, sizeof buf);
+                    sdcard_io_end();
+                } else {
+                    abandon_log();
                 }
-                dirty = false;
                 s_paused = true;
             }
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
@@ -271,13 +534,10 @@ static void writer_task(void *arg)
 
         /* Check the lock-free loss latch BEFORE sdcard_is_mounted(): when a card is
          * pulled this is the fast loop that re-arms the failing I/O, so it must stop
-         * the instant loss is latched. Do NOT close_log() here — fclose would touch a
-         * volume the monitor's teardown may free at any moment (UAF, audit R-8).
-         * Abandon the handle instead; the leaked stdio buffer is one-per-loss and
-         * bounded, and the ring keeps buffering in RAM. */
+         * the instant loss is latched. Do NOT close here — abandon (see abandon_log);
+         * the leaked handle is one-per-loss and bounded, and the ring keeps buffering. */
         if (sdcard_io_lost() || !sdcard_is_mounted()) {
-            s_fp = NULL; s_file_open = false;
-            dirty = false;
+            abandon_log();
             vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS * 2));
             continue;
         }
@@ -290,42 +550,33 @@ static void writer_task(void *arg)
         }
         if (s_fp == NULL && !open_log()) {
             sdcard_report_io_error();                      /* open on a gone card → loss */
+            sdcard_io_end();
             vTaskDelay(pdMS_TO_TICKS(1000));
-            goto iter_end;
+            continue;
         }
         {
             size_t n = ring_pop(buf, sizeof buf);
+            bool idle = n == 0;
             if (n > 0) {
-                if (s_file_bytes + n > SD_LOGGER_FILE_BYTES) {
-                    close_log();
-                    rotate_files();
-                    if (!open_log()) { sdcard_report_io_error(); vTaskDelay(pdMS_TO_TICKS(1000)); goto iter_end; }
+                room_t r = ensure_room(n);
+                if (r != ROOM_OK) {
+                    drop_chunk(r, n);
+                } else if (write_chunk(buf, n)) {
+                    sdcard_report_io_ok();                 /* good write → reset streak */
                 }
-                if (fwrite(buf, 1, n, s_fp) != n) {        /* card pulled / full */
-                    close_log();
-                    sdcard_report_io_error();
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    goto iter_end;
-                }
-                sdcard_report_io_ok();                     /* good write → reset streak */
-                s_file_bytes += n;
-                dirty = true;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));  /* idle */
             }
 
-            /* Flush only when there's something to flush — with WARN/ERROR-only
-             * capture the ring is usually empty, so the card sees no periodic writes
-             * (an idle fsync still touches the FAT). */
-            if (s_fp && dirty && (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
-                fflush(s_fp);
-                fsync(fileno(s_fp));
+            /* Sync only when there's something uncommitted — with WARN/ERROR-only
+             * capture the ring is usually empty, so the card sees no periodic
+             * writes (an idle fsync still touches the FAT). */
+            if (s_fp && s_file_bytes > s_committed &&
+                (xTaskGetTickCount() - last_fsync) >= pdMS_TO_TICKS(SD_LOGGER_FSYNC_MS)) {
+                (void)commit();
                 last_fsync = xTaskGetTickCount();
-                dirty = false;
             }
+            sdcard_io_end();
+            if (idle) vTaskDelay(pdMS_TO_TICKS(SD_LOGGER_POLL_MS));   /* never delay holding a ref */
         }
-    iter_end:
-        sdcard_io_end();
     }
 }
 
@@ -340,9 +591,10 @@ esp_err_t sd_logger_init(void)
 
     s_prev_vprintf = esp_log_set_vprintf(sd_log_vprintf);
     if (xTaskCreate(writer_task, "sd_logger", SD_LOGGER_TASK_STACK,
-                    NULL, SD_LOGGER_TASK_PRIO, NULL) != pdPASS) {
+                    NULL, SD_LOGGER_TASK_PRIO, &s_writer) != pdPASS) {
         esp_log_set_vprintf(s_prev_vprintf);   /* roll back the hook */
         s_prev_vprintf = NULL;
+        s_writer = NULL;
         return ESP_ERR_NO_MEM;
     }
     s_started = true;
@@ -389,4 +641,38 @@ void sd_logger_stats(bool *active, size_t *buffered, size_t *dropped, size_t *fi
     if (buffered)   *buffered   = ring_used();   /* lock-free read: approximate */
     if (dropped)    *dropped    = s_dropped;
     if (file_bytes) *file_bytes = s_file_bytes;
+}
+
+void sd_logger_acct(sd_logger_acct_t *out)
+{
+    if (out == NULL) return;
+    portENTER_CRITICAL_SAFE(&s_mux);
+    *out = s_acct;
+    out->buffered_bytes = ring_used();
+    out->quarantined = s_quarantined;
+    out->rotate_backoff = s_rot_backoff;
+    portEXIT_CRITICAL_SAFE(&s_mux);
+}
+
+int sd_logger_render_json(char *buf, size_t cap)
+{
+    /* Compact keys (heartbeat budget): quar=quarantined, backoff=rotation
+     * backoff, rb=rolled_back, indet=indeterminate, unwr=lost_unwritten,
+     * ring/rot/unav=dropped (ring full / rotation blocked / no file),
+     * evict=retention_evicted, trunc=truncated_records, torn=torn_tail_files;
+     * byte counts except trunc/torn/err. */
+    sd_logger_acct_t a;
+    sd_logger_acct(&a);
+    int n = snprintf(buf, cap,
+                     "{\"quar\":%d,\"backoff\":%d,\"rb\":%llu,\"indet\":%llu,\"unwr\":%llu,\"ring\":%llu,"
+                     "\"rot\":%llu,\"unav\":%llu,\"evict\":%llu,\"trunc\":%u,\"torn\":%u,\"err\":%u}",
+                     a.quarantined, a.rotate_backoff,
+                     (unsigned long long)a.rolled_back_bytes, (unsigned long long)a.indeterminate_bytes,
+                     (unsigned long long)a.lost_unwritten_bytes, (unsigned long long)a.dropped_ring_bytes,
+                     (unsigned long long)a.dropped_rotate_blocked_bytes, (unsigned long long)a.dropped_unavailable_bytes,
+                     (unsigned long long)a.retention_evicted_bytes, (unsigned)a.truncated_records,
+                     (unsigned)a.torn_tail_files,
+                     (unsigned)(a.write_err + a.flush_err + a.fsync_err + a.close_err + a.truncate_err +
+                                a.rotate_err + a.open_err));
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }

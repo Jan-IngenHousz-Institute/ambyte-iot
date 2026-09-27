@@ -24,6 +24,7 @@
 
 #include "esp_loader.h"
 #include "uart_sensors.h"
+#include "ambit_flash_preflight.h"
 #include "sd_card.h"
 #include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
 #include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
@@ -114,20 +115,6 @@ esp_err_t ambit_flash_probe(uint8_t channel, ambit_flash_probe_result_t *out)
 
 /* ── full multi-region ROM flash ─────────────────────────────────────────── */
 
-/* Open dir/fname, return its size (>0) or 0 on error. */
-static long region_file_size(const char *dir, const char *fname)
-{
-    char path[192];
-    snprintf(path, sizeof path, "%s/%s", dir, fname);
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        return 0;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fclose(f);
-    return (sz > 0) ? sz : 0;
-}
 
 /* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5). */
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
@@ -232,28 +219,24 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Recovery folders were historically installed by the factory SD image.
-     * Some field cards predate that layout, which made remote recovery
-     * impossible even when operators could stage the four exact files. Create
-     * only the canonical root/version directories here, before touching the
-     * target. Missing files still fail closed in the preflight below. */
-    if (mkdir(AMBIT_FW_ROOT, 0777) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "cannot create %s", AMBIT_FW_ROOT);
-        return ESP_FAIL;
-    }
-    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "cannot create recovery directory %s", dir);
-        return ESP_FAIL;
-    }
-
-    /* Fail fast: all four region files must be present + non-empty BEFORE we touch
-     * the chip, so we never half-flash because one file was missing. */
-    for (size_t i = 0; i < NUM_REGIONS; i++) {
-        if (region_file_size(dir, s_regions[i].fname) == 0) {
-            ESP_LOGE(TAG, "missing/empty %s/%s — need all 4 region files",
-                     dir, s_regions[i].fname);
-            return ESP_ERR_NOT_FOUND;
+    /* mkdir root/version + all-regions preflight, inside one SD io bracket that
+     * is released before the UART bus is taken (ambit_flash_preflight.h). */
+    {
+        const char *fnames[NUM_REGIONS];
+        for (size_t i = 0; i < NUM_REGIONS; i++) fnames[i] = s_regions[i].fname;
+        esp_err_t pe = ambit_flash_preflight(AMBIT_FW_ROOT, dir, fnames, NUM_REGIONS);
+        if (pe != ESP_OK) {
+            return pe;
         }
+        /* A teardown raised while the preflight held its ref is waiting for us
+         * now: do not reset the AMBIT into its ROM bootloader for a card that is
+         * leaving. (A teardown after this point is caught by each region's own
+         * gate, before any block is written.) */
+        if (!sdcard_io_begin()) {
+            ESP_LOGE(TAG, "SD unavailable: target untouched");
+            return ESP_ERR_INVALID_STATE;
+        }
+        sdcard_io_end();
     }
 
     esp_err_t e = uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);
@@ -359,10 +342,11 @@ static bool fw_is_newer_than_target(const ambit_fw_info_t *fw,
                   tgt->major, tgt->minor, tgt->batch);
 }
 
+/* Caller holds an SD io ref. */
 static bool dir_has_all_regions(const char *dir)
 {
     for (size_t i = 0; i < NUM_REGIONS; i++) {
-        if (region_file_size(dir, s_regions[i].fname) == 0) {
+        if (ambit_flash_region_size(dir, s_regions[i].fname) == 0) {
             return false;
         }
     }
@@ -378,8 +362,14 @@ esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* The directory scan + region probes read the FAT volume: bracket them so
+     * a concurrent monitor teardown cannot free it mid-scan (audit R-6 class). */
+    if (!sdcard_io_begin()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     DIR *d = opendir(AMBIT_FW_ROOT);
     if (d == NULL) {
+        sdcard_io_end();
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -407,6 +397,7 @@ esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)
         }
     }
     closedir(d);
+    sdcard_io_end();
 
     if (!found) {
         return ESP_ERR_NOT_FOUND;

@@ -37,6 +37,7 @@
 #include "evq_fault.h"
 #include "evq_index.h"
 #include "sd_card.h"
+#include "sd_diag.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -171,6 +172,7 @@ static esp_err_t evstore_free_bytes(uint64_t *out_free)
 #ifndef EVLOG_MIN_FREE_BYTES
 #define EVLOG_MIN_FREE_BYTES (256 * 1024)     /* storage-full watermark: refuse writes below this (audit C1/C2) */
 #endif
+#define EVLOG_RETRY_SLACK    (64 * 1024)      /* ENOSPC retry: headroom beyond the record for littlefs blocks/metadata */
 #ifndef EVLOG_EVICT_TARGET
 #define EVLOG_EVICT_TARGET   (512 * 1024)     /* eviction hysteresis: clean synced files until this much is free */
 #endif
@@ -318,6 +320,8 @@ static uint32_t  s_spool_files = 0, s_spool_errors = 0, s_mirror_used = 0;
 static uint32_t  s_reclaimed_files = 0, s_archived_files = 0, s_reimported_files = 0;
 static uint32_t  s_sd_bad_copies = 0;          /* damaged SD copies moved aside (kept, never delivered) */
 static uint32_t  s_sd_retired_names = 0;       /* .tmp names retired (renamed aside, never unlinked) — on the card now */
+static uint32_t  s_sd_rename_ambiguous = 0;    /* commit renames that failed with the target present (possible both-names) */
+static uint32_t  s_sd_verify_fail = 0;         /* fresh SD copies that failed read-back after commit (moved aside) */
 /* Archive retry bound (eval R2-F1): consecutive failed archive passes of the
  * same segment. After EVQ_ARCHIVE_TRIES an unreadable SD copy is treated as
  * damaged (moved aside) instead of being retried forever. Keeper-only. */
@@ -773,7 +777,8 @@ static bool evq_sd_move_aside(const char *path, uint32_t seq)
         snprintf(bad, sizeof bad, "%s/bad-%06u-%u.log", EVQ_MIRROR_DIR, (unsigned)seq, k);
         if (stat(bad, &bst) != 0) break;
     }
-    if (k == 100 || rename(path, bad) != 0) return false;
+    if (k == 100) return false;
+    if (rename(path, bad) != 0) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno); return false; }
     s_sd_bad_copies++;
     ESP_LOGW(TAG, "damaged copy %s moved aside to %s", path, bad);
     return true;
@@ -1740,6 +1745,25 @@ static bool evq_pressure_locked(uint64_t *freeb_out)
     return freeb * 100U < total * EVQ_PRESSURE_PCT;
 }
 
+static uint8_t evq_blocked_reason_locked(void);
+
+/* Every store refusal goes through here: the per-boot RAM counters feed the
+ * evlog health view, and sd_diag keeps the retained record (reason, refused id
+ * range, errno, wall time, blocked_reason/sd_state at refusal) that survives a
+ * reboot and never depends on the SD. `locked` = caller holds s_mtx (the
+ * blocked reason is only computed under it). Metadata only: a refused
+ * payload is not recoverable from this. */
+__attribute__((cold)) static void evq_refused(sd_diag_refusal_t r, int64_t id, int err, bool locked)
+{
+    switch (r) {
+    case SD_DIAG_REF_FULL:      s_refused_full++; break;
+    case SD_DIAG_REF_MEDIA:     s_refused_media++; break;
+    case SD_DIAG_REF_TOO_LARGE: s_refused_too_large++; break;
+    default:                    s_refused_unavailable++; break;
+    }
+    sd_diag_refusal(r, id, err, locked ? evq_blocked_reason_locked() : (uint8_t)EVQ_BLOCKED_NONE, s_sd_state);
+}
+
 static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
@@ -1748,11 +1772,11 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     }
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        s_refused_unavailable++;      /* racy increment is fine: a counter */
+        evq_refused(SD_DIAG_REF_UNAVAILABLE, desc->measure_id, ETIMEDOUT, false);   /* racy: a counter */
         return ESP_ERR_TIMEOUT;
     }
     if (!s_available) {
-        s_refused_unavailable++;
+        evq_refused(SD_DIAG_REF_UNAVAILABLE, desc->measure_id, ENODEV, true);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -1766,11 +1790,11 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         }
         if (ro != ESP_OK) {
             if (s_write_full) {
-                s_dropped++; s_refused_full++;
+                s_dropped++; evq_refused(SD_DIAG_REF_FULL, desc->measure_id, ENOSPC, true);
                 xSemaphoreGive(s_mtx);
                 return ESP_ERR_NO_MEM;   /* full is not a media fault */
             }
-            s_dropped++; s_refused_media++;
+            s_dropped++; evq_refused(SD_DIAG_REF_MEDIA, desc->measure_id, errno, true);
             xSemaphoreGive(s_mtx);
             evstore_report_io_error();
             return ESP_FAIL;
@@ -1788,7 +1812,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
             ESP_LOGI(TAG, "store space recovered (%llu B free) — writes resumed",
                      (unsigned long long)freeb);
         } else {
-            s_dropped++; s_refused_full++;
+            s_dropped++; evq_refused(SD_DIAG_REF_FULL, desc->measure_id, ENOSPC, true);
             evq_keeper_notify();
             xSemaphoreGive(s_mtx);
             return ESP_ERR_NO_MEM;
@@ -1806,7 +1830,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     size_t cmd_cap = strlen(cmd_src) + 1;
     char *cmd = malloc(cmd_cap);
     if (cmd == NULL) {
-        s_refused_unavailable++;
+        evq_refused(SD_DIAG_REF_UNAVAILABLE, desc->measure_id, ENOMEM, true);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_NO_MEM;
     }
@@ -1822,7 +1846,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
                       (long long)desc->start_ms, (long long)desc->end_ms);
     if (h1 < 0 || h1 >= (int)sizeof hdr1 || h2 < 0 || h2 >= (int)sizeof hdr2) {
         free(cmd);
-        s_refused_media++;
+        evq_refused(SD_DIAG_REF_MEDIA, desc->measure_id, EINVAL, true);
         xSemaphoreGive(s_mtx);
         return ESP_FAIL;
     }
@@ -1834,7 +1858,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         ESP_LOGE(TAG, "record too large (%u B) for active %u-B cap (max record %u B), id %lld — dropped",
                  (unsigned)total, (unsigned)s_line_cap, (unsigned)s_max_record,
                  (long long)measure_id);
-        s_dropped++; s_refused_too_large++;
+        s_dropped++; evq_refused(SD_DIAG_REF_TOO_LARGE, desc->measure_id, EFBIG, true);
         free(cmd);
         xSemaphoreGive(s_mtx);
         return ESP_ERR_INVALID_SIZE;
@@ -1844,7 +1868,7 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
     if (s_tail_size > 0 && s_tail_size + (long)total > EVLOG_ROTATE_BYTES) {
         if (!evlog_rotate_locked()) {
             ESP_LOGE(TAG, "rotate: reopen of previous tail failed — dropping record");
-            s_dropped++; s_refused_media++;
+            s_dropped++; evq_refused(SD_DIAG_REF_MEDIA, desc->measure_id, errno, true);
             free(cmd);
             xSemaphoreGive(s_mtx);
             evstore_report_io_error();
@@ -1852,9 +1876,11 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
         }
     }
 
-    EVQ_FAULT_POINT("store.before_write");
     const char *parts[7] = { hdr1, cmd, hdr2, meta, "\t", payload_json, "\n" };
     const size_t lens[7] = { (size_t)h1, clen, (size_t)h2, mlen, 1, plen, 1 };
+    bool retried = false;
+store_write:
+    EVQ_FAULT_POINT("store.before_write");
     size_t w = 0;
     for (size_t i = 0; i < 7; i++) w += fwrite(parts[i], 1, lens[i], s_wf);
     EVQ_FAULT_POINT("store.after_write_before_fsync");
@@ -1876,18 +1902,35 @@ static esp_err_t event_log_store_impl(const measurement_event_desc_t *desc)
             fclose(s_wf);
             s_wf = NULL;
         }
-        free(cmd);
-        s_dropped++;
         uint64_t freeb = 0;
         bool full = (saved_errno == ENOSPC) ||
                     (evstore_free_bytes(&freeb) == ESP_OK && freeb < EVLOG_MIN_FREE_BYTES);
+        /* Full, but delivered flash copies behind the cursor may be evictable:
+         * the admission check only evicts once the store is already latched
+         * full, so the first ENOSPC used to refuse a measurement the store had
+         * room for (field AMBYTE194, 2026-09-27; contract C-51). Evict, then
+         * retry the write exactly once before refusing. */
+        if (full && !retried) {
+            uint64_t f0 = 0;
+            (void)evstore_free_bytes(&f0);
+            /* Evict for THIS record (+ littlefs block/metadata slack), not just
+             * down to the watermark: the write can hit ENOSPC with free space
+             * still above EVLOG_MIN_FREE_BYTES. */
+            bool freed = evlog_evict_to_locked(f0 + (uint64_t)total + EVLOG_RETRY_SLACK);
+            if (freed && (s_wf != NULL || evlog_reopen_tail_locked() == ESP_OK)) {
+                retried = true;
+                goto store_write;
+            }
+        }
+        free(cmd);
+        s_dropped++;
         if (full) {
-            s_refused_full++;
+            evq_refused(SD_DIAG_REF_FULL, measure_id, saved_errno ? saved_errno : ENOSPC, true);
             (void)evlog_full_recovery_locked();
             xSemaphoreGive(s_mtx);
             return ESP_ERR_NO_MEM;      /* full is not a media fault: no report_io_error */
         }
-        s_refused_media++;
+        evq_refused(SD_DIAG_REF_MEDIA, measure_id, saved_errno, true);
         xSemaphoreGive(s_mtx);
         evstore_report_io_error();
         return ESP_FAIL;
@@ -2503,6 +2546,8 @@ esp_err_t event_log_health(evlog_health_t *out)
     out->sd_bursts        = s_sd_bursts;
     out->sd_retired_names = s_sd_retired_names;
     out->sd_bad_copies    = s_sd_bad_copies;
+    out->sd_rename_ambiguous = s_sd_rename_ambiguous;
+    out->sd_verify_fail   = s_sd_verify_fail;
     out->index_segments   = (uint32_t)s_ix.n;
     out->index_cap        = (uint32_t)s_ix.cap;
     xSemaphoreGive(s_mtx);
@@ -2514,7 +2559,10 @@ esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
 {
     if (desc == NULL || desc->payload_json == NULL ||
         desc->tag == NULL || desc->tag[0] == '\0') return ESP_ERR_INVALID_ARG;
-    if (!evstore_io_begin()) return ESP_ERR_NOT_SUPPORTED;
+    if (!evstore_io_begin()) {
+        evq_refused(SD_DIAG_REF_UNAVAILABLE, desc->measure_id, ENODEV, false);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     esp_err_t rc = event_log_store_impl(desc);
     evstore_io_end();
     return rc;
@@ -2623,6 +2671,16 @@ static bool evq_sd_path_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
+/* Remove one SD name we own, attributing a real failure (not ENOENT) to
+ * sd_diag. Returns true when the name is gone. Caller holds an SD ref. */
+__attribute__((cold)) static bool evq_sd_rm(const char *path)
+{
+    if (remove(path) == 0) return true;
+    if (errno == ENOENT) return true;
+    sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_REMOVE, errno);
+    return false;
+}
+
 /* Is the SD file a byte prefix of the flash file? (A crash-torn copy of our
  * own, which is safe to remove because the flash copy still holds it all.) */
 static bool evq_is_prefix_of(const char *sd_path, const char *flash_path, char *buf, size_t cap)
@@ -2645,13 +2703,94 @@ static bool evq_is_prefix_of(const char *sd_path, const char *flash_path, char *
     return prefix;
 }
 
+/* Retirement of names that may share a FAT cluster chain. An interrupted or
+ * failed FatFs f_rename can leave BOTH directory entries (<base>.tmp and
+ * <base>.log) on one chain, and FAT frees the chain when EITHER name is
+ * unlinked. So such names are only ever RENAMED aside to evq/xlk-<n>.junk
+ * (1000 slots, never unlinked, counted each mount) — and while a .log still
+ * has a .tmp twin, no path may import, adopt, archive-clean or orphan-convert
+ * it (evq_sd_has_tmp_twin). Caller holds an SD ref for all of these. */
+
+/* The k-th free junk slot at or after `from` (k counted from 0), or -1. */
+static int evq_xlk_free(unsigned from, char *out, size_t cap)
+{
+    for (unsigned k = from; k < 1000; k++) {
+        snprintf(out, cap, "%s/xlk-%u.junk", EVQ_MIRROR_DIR, k);
+        if (!evq_sd_path_exists(out)) return (int)k;
+    }
+    return -1;
+}
+
+/* Retire ONE name (a lone .tmp, or the .tmp of an indexed .log). */
+__attribute__((cold)) static bool evq_sd_retire_tmp(const char *tmp)
+{
+    char junk[EVQ_PATH_MAX];
+    if (evq_xlk_free(0, junk, sizeof junk) < 0) return false;   /* full: leave it in place */
+    if (rename(tmp, junk) != 0) {
+        if (errno != ENOENT) sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno);
+        return false;
+    }
+    s_sd_retired_names++;          /* the next epoch repair recounts from the card */
+    return true;
+}
+
+/* Retire an ambiguous pair as a UNIT: both names or neither. Two free slots
+ * are reserved before anything moves. The .log goes first (it is the name
+ * other paths could act on); if the .tmp then cannot follow, the .log is put
+ * back so the pair stays recognisable (and guarded). If even that restore
+ * fails, the .log is junk and the .tmp is left alone — lone .tmp names are
+ * never unlinked either, so no chain is freed on any failure path. A missing
+ * .tmp (the rename was in fact applied) restores the .log as a normal,
+ * single-named copy. */
+__attribute__((cold)) static bool evq_sd_retire_pair(const char *tmp, const char *log)
+{
+    char a[EVQ_PATH_MAX], b[EVQ_PATH_MAX];
+    int ka = evq_xlk_free(0, a, sizeof a);
+    if (ka < 0 || evq_xlk_free((unsigned)ka + 1, b, sizeof b) < 0) return false;   /* keep the pair */
+    EVQ_FAULT_POINT("retire.pair.log");
+    if (rename(log, a) != 0) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno); return false; }
+    EVQ_FAULT_POINT("retire.pair.tmp");
+    if (rename(tmp, b) != 0) {
+        if (errno != ENOENT) sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno);
+        if (rename(a, log) == 0) return false;                 /* pair (or single log) restored */
+        sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno);
+        s_sd_retired_names++;
+        return false;
+    }
+    s_sd_retired_names += 2;
+    return true;
+}
+
+/* Does `<dir>/<base>.log` still have a .tmp twin (`<base>.tmp` or the
+ * `<base>-<k>.tmp` alternates evq_copy_commit uses)? Such a .log may share
+ * its chain with that name: it is never imported, adopted, removed or
+ * converted until the pair is retired. */
+__attribute__((cold)) static bool evq_sd_has_tmp_twin(const char *logpath)
+{
+    char t[EVQ_PATH_MAX];
+    size_t l = strlen(logpath);
+    if (l < 5 || l + 4 >= sizeof t || strcmp(logpath + l - 4, ".log") != 0) return false;
+    memcpy(t, logpath, l - 4);
+    for (unsigned k = 0; k < 16; k++) {
+        char *p = t + l - 4;
+        if (k != 0) {                   /* "-<k>" alternates, k = 1..15 */
+            *p++ = '-';
+            if (k >= 10) *p++ = '1';
+            *p++ = (char)('0' + k % 10);
+        }
+        memcpy(p, ".tmp", 5);
+        if (evq_sd_path_exists(t)) return true;
+    }
+    return false;
+}
+
 /* Stream `src` to `dir/<base>.log` via `dir/<base>[-k].tmp`: exclusive create,
  * copy, fflush+fsync+close (content-durable), rename (FatFs f_rename ends in
  * sync_fs: directory-durable on successful return), then reopen BY THE NEW
  * NAME and verify size/CRC/structure against `expect`. Caller holds an SD ref
  * and no s_mtx. `fp` prefixes the fault-point names. */
-static bool evq_copy_commit(const char *src, const char *dir, const char *base,
-                            const evq_seg_t *expect, const char *fp)
+__attribute__((cold)) static bool evq_copy_commit(const char *src, const char *dir, const char *base,
+                                                  const evq_seg_t *expect, const char *fp)
 {
     char tmp[EVQ_PATH_MAX], dst[EVQ_PATH_MAX], name[64];
     snprintf(dst, sizeof dst, "%s/%s.log", dir, base);
@@ -2666,31 +2805,61 @@ static bool evq_copy_commit(const char *src, const char *dir, const char *base,
     if (rf == NULL) return false;
     FILE *wf = fopen(tmp, "wx");
     s_pass_wrote_sd = true;
-    if (wf == NULL) { fclose(rf); return false; }
+    if (wf == NULL) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_OPEN, errno); fclose(rf); return false; }
     snprintf(name, sizeof name, "%s.after_tmp_open", fp); EVQ_FAULT_POINT(name);
     bool ok = true;
     bool first = true;
     size_t n;
     while ((n = fread(s_kbuf, 1, s_line_cap, rf)) > 0) {
-        if (fwrite(s_kbuf, 1, n, wf) != n) { ok = false; break; }
+        if (fwrite(s_kbuf, 1, n, wf) != n) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_WRITE, errno); ok = false; break; }
         if (first) { first = false; snprintf(name, sizeof name, "%s.mid_copy", fp); EVQ_FAULT_POINT(name); }
     }
     if (ferror(rf)) ok = false;
     fclose(rf);
     snprintf(name, sizeof name, "%s.before_tmp_fsync", fp); EVQ_FAULT_POINT(name);
-    if (ok && (fflush(wf) != 0 || fsync(fileno(wf)) != 0)) ok = false;
-    if (fclose(wf) != 0) ok = false;
-    if (!ok) { remove(tmp); return false; }
+    if (ok && fflush(wf) != 0) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_FLUSH, errno); ok = false; }
+    if (ok && fsync(fileno(wf)) != 0) { sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_FSYNC, errno); ok = false; }
+    if (fclose(wf) != 0) { if (ok) sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_CLOSE, errno); ok = false; }
+    if (!ok) { remove(tmp); return false; }      /* tmp never renamed: single-named, ours alone */
     snprintf(name, sizeof name, "%s.after_tmp_fsync_before_rename", fp); EVQ_FAULT_POINT(name);
     snprintf(name, sizeof name, "%s.rename.inside_call", fp); EVQ_FAULT_POINT(name);
-    if (rename(tmp, dst) != 0) { remove(tmp); return false; }
+    if (rename(tmp, dst) != 0) {
+        int e = errno;
+        sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, e);
+        if (evq_sd_path_exists(dst)) {
+            /* The rename reported failure yet the committed name exists: it may
+             * have been applied (then tmp is simply gone), or FatFs may have
+             * registered dst and failed before removing tmp — both entries on
+             * ONE chain. Unlinking EITHER name would free clusters the other
+             * still references, and any later retirement of dst (archive, mirror
+             * drop, orphan cleanup) would be exactly such an unlink. So neither
+             * name stays in service: both are retired by rename to evq/xlk-*
+             * (never unlinked) — as a unit (evq_sd_retire_pair); if that is not
+             * possible now, the pair stays in place and every other path
+             * leaves a .log with a .tmp twin alone. The source copy (flash or
+             * mirror) is untouched; the next pass copies afresh. */
+            s_sd_rename_ambiguous++;
+            ESP_LOGW(TAG, "commit rename %s failed (%d), target present: both names retired", dst, e);
+            (void)evq_sd_retire_pair(tmp, dst);   /* fails → pair stays, guarded */
+        } else {
+            remove(tmp);                             /* only one name exists: ours to drop */
+        }
+        return false;
+    }
     snprintf(name, sizeof name, "%s.rename.after_return", fp); EVQ_FAULT_POINT(name);
     snprintf(name, sizeof name, "%s.after_rename_before_verify", fp); EVQ_FAULT_POINT(name);
     snprintf(name, sizeof name, "%s.verify_read_error", fp); EVQ_FAULT_POINT(name);
     evq_scan_t sc;
     if (!evq_scan_file(dst, s_kbuf, s_line_cap, &sc) || !evq_scan_matches(&sc, expect)) {
-        ESP_LOGW(TAG, "SD copy %s failed read-back verification — removed", dst);
-        remove(dst);
+        /* A copy that was written, synced and committed but does not read back
+         * is the prime evidence of write corruption — and its chain has just
+         * proven inconsistent, so freeing it could free clusters another file
+         * still owns. Keep the bytes (rename aside, never unlink); the flash
+         * copy remains the source of truth. */
+        s_sd_verify_fail++;
+        sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_VERIFY, EIO);
+        bool aside = evq_sd_move_aside(dst, expect->seq);
+        ESP_LOGW(TAG, "%s failed read-back: %s, source kept", dst, aside ? "moved aside" : "left in place");
         return false;
     }
     return true;
@@ -2716,7 +2885,9 @@ static int evq_pick_name(const char *dir, const char *flash_path, const evq_seg_
         }
         /* Taken. Our own intact copy from an interrupted pass → adopt; our own
          * crash-torn copy (a byte prefix of the flash file) → remove, reuse the
-         * name; anything else is someone else's file → never touched. */
+         * name; anything else is someone else's file → never touched. A name
+         * with a .tmp twin (ambiguous rename) is neither adopted nor removed. */
+        if (evq_sd_has_tmp_twin(path)) continue;
         evq_scan_t sc;
         if (evq_scan_file(path, s_kbuf, s_line_cap, &sc) && evq_scan_matches(&sc, s)) {
             snprintf(out, cap, "%s", base);
@@ -2725,7 +2896,7 @@ static int evq_pick_name(const char *dir, const char *flash_path, const evq_seg_
         }
         if (evq_is_prefix_of(path, flash_path, s_kbuf, s_line_cap)) {
             s_pass_wrote_sd = true;
-            if (remove(path) == 0) { snprintf(out, cap, "%s", base); return 0; }
+            if (evq_sd_rm(path)) { snprintf(out, cap, "%s", base); return 0; }
         }
     }
     return -1;
@@ -2788,7 +2959,7 @@ static bool evq_spool_one(uint32_t seq)
                  * holds everything, so remove it; the next pass starts over. */
                 char pp[EVQ_PATH_MAX];
                 snprintf(pp, sizeof pp, "%s/%s.log", EVLOG_LEGACY_SD_DIR, pbase);
-                remove(pp);
+                (void)evq_sd_rm(pp);
             }
             if (!evq_name_join(pname, sizeof pname, pbase, ".log") ||
                 !evq_name_join(mname, sizeof mname, mbase, ".log")) ok = false;
@@ -2963,6 +3134,7 @@ static bool evq_archive_one(uint32_t seq)
             s_pass_wrote_sd = true;
             EVQ_FAULT_POINT("archive.rename.inside_call");
             ok = rename(pp, dst) == 0;
+            if (!ok) sd_diag_fault(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, errno);
             EVQ_FAULT_POINT("archive.after_rename_before_verify");
             if (ok) {
                 evq_scan_t sc;
@@ -3000,12 +3172,12 @@ static bool evq_archive_one(uint32_t seq)
             for (int ci = 0; ci < 2 && !have_primary && !have_mirror; ci++) {
                 if (ci == 0) snprintf(cand, sizeof cand, "%s/ev-%06lld.log", cdirs[ci], (long long)s.first_id);
                 else snprintf(cand, sizeof cand, "%s/m-%06u.log", cdirs[ci], (unsigned)seq);
-                if (!evq_sd_path_exists(cand)) continue;
+                if (!evq_sd_path_exists(cand) || evq_sd_has_tmp_twin(cand)) continue;
                 evq_scan_t cs;
                 if ((evq_scan_file(cand, s_kbuf, s_line_cap, &cs) && evq_scan_matches(&cs, &s)) ||
                     evq_is_prefix_of(cand, flash_path, s_kbuf, s_line_cap)) {
                     s_pass_wrote_sd = true;
-                    remove(cand);
+                    (void)evq_sd_rm(cand);
                 }
             }
             if (!evq_sd_has_room((uint64_t)s.bytes + 64 * 1024)) {
@@ -3041,7 +3213,7 @@ static bool evq_archive_one(uint32_t seq)
             if (s.mirror[0] != '\0' && evq_sd_path_exists(mp)) {
                 s_pass_wrote_sd = true;
                 EVQ_FAULT_POINT("archive.mirror_remove.inside_call");
-                remove(mp);
+                (void)evq_sd_rm(mp);
             }
             EVQ_FAULT_POINT("archive.after_mirror_remove_before_index");
         }
@@ -3070,6 +3242,7 @@ static bool evq_archive_one(uint32_t seq)
 /* Quarantine raw bytes that are not a valid record (import paths). */
 static bool evq_quarantine_bytes_locked(const char *buf, size_t len)
 {
+    if (len == 0) return true;               /* nothing to keep (never read buf[-1]) */
     FILE *qf = fopen(EVLOG_QUARANTINE, "a");
     if (qf == NULL) return false;
     bool ok = fwrite(buf, 1, len, qf) == len;
@@ -3237,8 +3410,8 @@ static bool evq_reimport_one(uint32_t seq)
     EVQ_FAULT_POINT("reimport.after_fsync_before_sd_remove");
     if (s.primary[0] != '\0' && sdcard_io_begin()) {
         EVQ_FAULT_POINT("reimport.remove.inside_call");
-        if (s.primary[0] && evq_sd_path_exists(pp)) remove(pp);
-        if (s.mirror[0] && evq_sd_path_exists(mp)) remove(mp);
+        if (s.primary[0] && evq_sd_path_exists(pp)) (void)evq_sd_rm(pp);
+        if (s.mirror[0] && evq_sd_path_exists(mp)) (void)evq_sd_rm(mp);
         s_pass_wrote_sd = true;
         sdcard_io_end();
     }
@@ -3320,7 +3493,12 @@ static size_t event_log_import_sd_backlog(size_t max_files)
                     uint32_t seq;
                     if (!parse_ev_name(ent->d_name, &seq)) continue;
                     if (evq_name_is_owned_locked(ent->d_name)) continue;
-                    if ((!found || seq < min_seq) && evq_name_copy(chosen, sizeof chosen, ent->d_name)) {
+                    if (found && seq >= min_seq) continue;
+                    char cp[EVQ_PATH_MAX];
+                    if (strlen(ent->d_name) >= 64) continue;        /* never one of ours */
+                    snprintf(cp, sizeof cp, "%s/%.63s", EVLOG_LEGACY_SD_DIR, ent->d_name);
+                    if (evq_sd_has_tmp_twin(cp)) continue;   /* ambiguous rename: never imported/removed */
+                    if (evq_name_copy(chosen, sizeof chosen, ent->d_name)) {
                         min_seq = seq; found = true;
                     }
                 }
@@ -3341,14 +3519,30 @@ static size_t event_log_import_sd_backlog(size_t max_files)
                 file_ok = false;
             } else {
                 EVQ_FAULT_POINT("import.mid_append");
+                long pos0 = ftell(rf);
                 while (fgets(s_kbuf, s_line_cap, rf) != NULL) {
                     size_t len = strlen(s_kbuf);
+                    long pos1 = ftell(rf);
+                    if (pos0 >= 0 && pos1 > pos0 && (size_t)(pos1 - pos0) != len) {
+                        /* An embedded NUL (e.g. zero-filled clusters of a damaged
+                         * legacy file): strlen stops early, so neither parse nor
+                         * quarantine would see the whole line. Keep all of it in
+                         * quarantine; it is never a valid record. */
+                        size_t real = (size_t)(pos1 - pos0);
+                        if (!evq_quarantine_bytes_locked(s_kbuf, real)) { file_ok = false; break; }
+                        if (s_kbuf[real - 1] != '\n') { int c; while ((c = fgetc(rf)) != EOF && c != '\n') {} }
+                        quarantined++;
+                        pos0 = ftell(rf);
+                        continue;
+                    }
+                    pos0 = pos1;
                     if (len == s_line_cap - 1 && s_kbuf[len - 1] != '\n') {
                         /* over-long: quarantine this chunk and the rest of the line */
                         if (!evq_quarantine_bytes_locked(s_kbuf, len)) { file_ok = false; break; }
                         int c;
                         while ((c = fgetc(rf)) != EOF && c != '\n') {}
                         quarantined++;
+                        pos0 = ftell(rf);
                         continue;
                     }
                     int64_t id = 0;
@@ -3368,7 +3562,7 @@ static size_t event_log_import_sd_backlog(size_t max_files)
             /* Delete the SD source only when its every record is durably internal. */
             if (file_ok && !store_full && evlog_flush_writer_locked() == ESP_OK) {
                 EVQ_FAULT_POINT("import.after_fsync_before_sd_remove");
-                remove(src);
+                (void)evq_sd_rm(src);
                 s_pass_wrote_sd = true;
                 files_done++;
                 s_quarantined_malformed += (int64_t)quarantined;
@@ -3402,56 +3596,77 @@ static size_t event_log_import_sd_backlog(size_t max_files)
  * outcome of an interrupted f_rename — on FAT those two entries can share one
  * cluster chain, so unlinking the .tmp would free the .log's clusters. It is
  * RETIRED (renamed aside, never unlinked) instead. */
-static bool evq_sd_epoch_repair(void)
+__attribute__((cold)) static bool evq_sd_epoch_repair(void)
 {
     bool more = false;             /* a bounded batch was full: repeat next pass */
     if (!sdcard_io_begin()) return true;
     mkdir(EVLOG_LEGACY_SD_DIR, 0777);
     mkdir(EVQ_MIRROR_DIR, 0777);
     mkdir(EVLOG_ARCHIVE_DIR, 0777);
+    sdcard_io_end();
     const char *dirs[3] = { EVLOG_LEGACY_SD_DIR, EVQ_MIRROR_DIR, EVLOG_ARCHIVE_DIR };
     unsigned retired = 0;
     for (int di = 0; di < 3; di++) {
-        DIR *d = opendir(dirs[di]);
-        if (d == NULL) continue;
-        char names[32][64];
+        /* Phase 1 (SD ref): list .tmp names and their .log siblings. */
+        /* 16 per pass keeps this keeper-stack frame the size the single
+         * 32-name list used to be; a full batch repeats next pass. */
+        char names[16][64], sib[16][64];
+        bool pair[16];
         int nn = 0;
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL && nn < 32) {
-            size_t l = strlen(ent->d_name);
-            if (l > 4 && l < 60 && strcmp(ent->d_name + l - 4, ".tmp") == 0) {
-                if (evq_name_copy(names[nn], sizeof names[nn], ent->d_name)) nn++;
+        if (!sdcard_io_begin()) return true;
+        DIR *d = opendir(dirs[di]);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL && nn < 16) {
+                size_t l = strlen(ent->d_name);
+                if (l > 4 && l < 60 && strcmp(ent->d_name + l - 4, ".tmp") == 0) {
+                    if (evq_name_copy(names[nn], sizeof names[nn], ent->d_name)) nn++;
+                }
             }
+            closedir(d);
         }
-        closedir(d);
-        if (nn == 32) more = true;
+        if (nn == 16) more = true;
         for (int i = 0; i < nn; i++) {
             /* Siblings: "<X>.tmp" pairs with "<X>.log"; an alternate
              * "<X>-<k>.tmp" pairs with "<X>.log" too. */
-            char tmp[EVQ_PATH_MAX], log1[EVQ_PATH_MAX], log2[EVQ_PATH_MAX], base[64];
-            snprintf(tmp, sizeof tmp, "%s/%s", dirs[di], names[i]);
+            char base[64], cand[EVQ_PATH_MAX];
             snprintf(base, sizeof base, "%s", names[i]);
             base[strlen(base) - 4] = '\0';
-            snprintf(log1, sizeof log1, "%s/%s.log", dirs[di], base);
-            log2[0] = '\0';
-            char *dash = strrchr(base, '-');
-            if (dash != NULL && dash[1] != '\0' && strspn(dash + 1, "0123456789") == strlen(dash + 1)) {
-                *dash = '\0';
-                snprintf(log2, sizeof log2, "%s/%s.log", dirs[di], base);
-            }
-            s_pass_wrote_sd = true;
-            if (evq_sd_path_exists(log1) || (log2[0] != '\0' && evq_sd_path_exists(log2))) {
-                char junk[EVQ_PATH_MAX];
-                for (unsigned k = 0; k < 1000; k++) {
-                    snprintf(junk, sizeof junk, "%s/xlk-%u.junk", EVQ_MIRROR_DIR, k);
-                    if (!evq_sd_path_exists(junk)) break;
-                }
-                if (rename(tmp, junk) == 0) retired++;
+            pair[i] = false;
+            snprintf(cand, sizeof cand, "%s/%s.log", dirs[di], base);
+            if (evq_sd_path_exists(cand)) {
+                pair[i] = evq_name_join(sib[i], sizeof sib[i], base, ".log");
             } else {
-                remove(tmp);
+                char *dash = strrchr(base, '-');
+                if (dash != NULL && dash[1] != '\0' && strspn(dash + 1, "0123456789") == strlen(dash + 1)) {
+                    *dash = '\0';
+                    snprintf(cand, sizeof cand, "%s/%s.log", dirs[di], base);
+                    if (evq_sd_path_exists(cand)) pair[i] = evq_name_join(sib[i], sizeof sib[i], base, ".log");
+                }
             }
         }
+        /* Phase 2: retire. A .log that shares a chain with a .tmp was left by a
+         * failed or interrupted commit rename, which by construction precedes
+         * its index line, and evq_pick_name never adopts a paired name — so
+         * the .log is unreferenced and redundant (the source copy is still
+         * held). Both names are renamed aside to evq/xlk-* as a unit, never
+         * unlinked (FAT frees the shared chain when EITHER name goes). A lone
+         * .tmp may be the survivor of a pair whose .log was retired earlier,
+         * so it is retired too; with no slot left every name stays in place. */
+        for (int i = 0; i < nn; i++) {
+            char tmp[EVQ_PATH_MAX], lp[EVQ_PATH_MAX];
+            snprintf(tmp, sizeof tmp, "%s/%s", dirs[di], names[i]);
+            s_pass_wrote_sd = true;
+            if (pair[i]) {
+                snprintf(lp, sizeof lp, "%s/%s", dirs[di], sib[i]);
+                if (evq_sd_retire_pair(tmp, lp)) retired += 2;
+            } else if (evq_sd_retire_tmp(tmp)) {
+                retired++;
+            }
+        }
+        sdcard_io_end();
     }
+    if (!sdcard_io_begin()) return true;
     /* Observable, bounded policy (contract amendment A1): retired names stay
      * on the card for fsck/inspection and are counted each mount; at most
      * 1000 slots — past that a .tmp is simply left in place (a .tmp is never
@@ -3471,7 +3686,7 @@ static bool evq_sd_epoch_repair(void)
     s_sd_retired_names = on_card;
     if (bad_on_card > s_sd_bad_copies) s_sd_bad_copies = bad_on_card;
     sdcard_io_end();
-    if (retired > 0) ESP_LOGW(TAG, "retired %u possibly cross-linked .tmp name(s) (not unlinked; %u on card)", retired, on_card);
+    if (retired > 0) ESP_LOGW(TAG, "retired %u possibly cross-linked name(s) (not unlinked; %u on card)", retired, on_card);
 
     /* Orphan mirrors → import candidates (only if their primary is absent). */
     xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -3498,6 +3713,7 @@ static bool evq_sd_epoch_repair(void)
         for (int i = 0; i < no; i++) {
             char mp[EVQ_PATH_MAX];
             evq_sd_mirror_path(mp, sizeof mp, orphans[i]);
+            if (evq_sd_has_tmp_twin(mp)) continue;       /* ambiguous rename: leave the pair */
             FILE *f = fopen(mp, "rb");
             long long first = 0;
             if (f != NULL) { if (fgets(s_kbuf, 64, f) != NULL) first = strtoll(s_kbuf, NULL, 10); fclose(f); }
@@ -3506,6 +3722,7 @@ static bool evq_sd_epoch_repair(void)
             snprintf(pp, sizeof pp, "%s/ev-%06lld.log", EVLOG_LEGACY_SD_DIR, first);
             s_pass_wrote_sd = true;
             if (evq_sd_path_exists(pp)) {
+                if (evq_sd_has_tmp_twin(pp)) continue;     /* primary is not importable yet: keep the mirror */
                 remove(mp);                            /* its primary will be imported */
             } else {
                 for (unsigned k = 0; k < 16 && evq_sd_path_exists(pp); k++) {
@@ -4294,9 +4511,12 @@ esp_err_t event_log_hil_io_dump(bool drain_trace)
 
 esp_err_t event_log_hil_state_dump(void)
 {
-    char arm[160] = "-";
+    char arm[320] = "-";
 #ifndef EVQ_HIL_HOST
-    (void)evq_arm_describe(arm, sizeof arm);
+    (void)evq_arm_describe(arm, 160);
+    size_t al = strlen(arm);
+    arm[al++] = ' ';
+    (void)evq_arm_io_describe(arm + al, sizeof arm - al);
 #endif
     printf("EVQ_STATE hold=%d gate=%u keeper_paused=%d reserve=%llu cid_override=%08" PRIx32
            " rtc_valid=%d boots=%u parked=%d arm=[%s]\n",
@@ -4304,6 +4524,37 @@ esp_err_t event_log_hil_state_dump(void)
            (unsigned long long)s_hil_reserve, s_hil_cid, hil_rtc_valid() ? 1 : 0,
            (unsigned)s_hil_rtc.boots, s_sd_parked ? 1 : 0, arm);
     return ESP_OK;
+}
+
+#ifndef EVQ_HIL_HOST
+const char *event_log_hil_iom_kind(uint8_t mode) { return evq_iom_kind((evq_iom_t)mode); }
+const char *event_log_hil_iom_name(uint8_t mode) { return evq_iom_name((evq_iom_t)mode); }
+bool event_log_hil_iom_is_reset(uint8_t mode)
+{
+    return mode == EVQ_IOM_RESET_BEFORE || mode == EVQ_IOM_RESET_AFTER || mode == EVQ_IOM_RESET_MID_WRITE;
+}
+#endif
+
+esp_err_t event_log_hil_arm_io(const char *writer, const char *op, const char *mode, unsigned nth,
+                               unsigned count, const char **why)
+{
+#ifdef EVQ_HIL_HOST
+    (void)writer; (void)op; (void)mode; (void)nth; (void)count;
+    if (why) *why = "host";
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    uint8_t w = 0, o = 0;
+    evq_iom_t m = EVQ_IOM_NONE;
+    int r = evq_arm_io_parse(writer, op, mode, &w, &o, &m);
+    if (r != 0) {
+        if (why) *why = r == -1 ? "unknown_writer" : r == -2 ? "unknown_op" : r == -3 ? "unknown_mode" : "invalid_op_for_mode";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (m == EVQ_IOM_NONE) evq_arm_io_clear();
+    else evq_arm_io_set(w, o, m, nth, count);
+    if (why) *why = "ok";
+    return ESP_OK;
+#endif
 }
 
 esp_err_t event_log_hil_arm(const char *point, const char *mode, unsigned nth)

@@ -88,6 +88,9 @@ typedef struct {
     /* Optional SD/persistence telemetry for the TELEMETRY heartbeat, so silent-loss
      * sites become visible in the field. Fills any non-NULL out-param; returns
      * ESP_OK if the event-log health snapshot was read. NULL = omit the SD fields. */
+    /* sd_logger byte accounting rendered as one JSON object (storage.sdlog);
+     * returns the length, or <= 0 to omit it. Optional. */
+    int                               (*sdlog_render)(char *buf, size_t cap);
     esp_err_t                         (*sd_health)(bool *io_lost, uint64_t *free_bytes,
                                                    int64_t *skipped, int64_t *dropped,
                                                    int64_t *last_acked_id);

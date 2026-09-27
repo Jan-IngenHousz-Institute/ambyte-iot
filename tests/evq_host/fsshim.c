@@ -50,7 +50,24 @@ static uint64_t s_ops_count[3];
 
 /* fault arming (set by fault.c) */
 static int  s_arm_errno = 0;             /* EIO / ENOSPC for the next operation */
+static int  s_arm_errno_left = 0;        /* further consecutive ops that fail with s_arm_errno (eio2) */
+static int  s_arm_crash_outcome = -1;    /* forced crash-inside rename outcome, -1 = seeded */
 static bool s_arm_crash_inside = false;  /* crash midway through the next dir/write op */
+/* Non-crash special modes (Sprint 1, contract §5.3), armed at a fault point
+ * and consumed by the next op they apply to:
+ *   both_eio     next rename: on SD the destination is created as a HARD LINK
+ *                of the source, the source stays, -1/EIO is returned (FatFs
+ *                f_rename failing after dir_register: both entries on one
+ *                chain). On flash (littlefs, atomic) it is a plain
+ *                not-applied EIO.
+ *   applied_eio  next rename/remove/fsync: the op is performed for real, then
+ *                -1/EIO is returned.
+ *   flip         next SD open for reading: one byte in the middle of the file
+ *                is flipped ON DISK first (a committed copy whose data
+ *                clusters were written wrong), so the read-back mismatches. */
+enum { SP_NONE = 0, SP_BOTH_EIO, SP_APPLIED_EIO, SP_FLIP };
+static int  s_arm_special = SP_NONE;
+static bool s_idx_loaded = false;        /* first read-open of the index this process */
 static uint64_t s_rng = 0x9E3779B97F4A7C15ULL;
 
 static uint64_t rng_next(void)
@@ -62,6 +79,16 @@ static uint64_t rng_next(void)
 void shim_seed(uint64_t seed) { s_rng = seed ? seed * 0x9E3779B97F4A7C15ULL : 1; }
 void shim_arm_errno(int e) { s_arm_errno = e; }
 void shim_arm_crash_inside(void) { s_arm_crash_inside = true; }
+void shim_arm_crash_inside_outcome(int outcome) { s_arm_crash_inside = true; s_arm_crash_outcome = outcome; }
+void shim_arm_errno_n(int e, int n) { s_arm_errno = e; s_arm_errno_left = n > 1 ? n - 1 : 0; }
+int shim_arm_special(const char *mode)
+{
+    if (strcmp(mode, "both_eio") == 0) s_arm_special = SP_BOTH_EIO;
+    else if (strcmp(mode, "applied_eio") == 0) s_arm_special = SP_APPLIED_EIO;
+    else if (strcmp(mode, "flip") == 0) s_arm_special = SP_FLIP;
+    else return -1;
+    return 0;
+}
 uint64_t shim_sd_ops(void) { return s_ops_count[MED_SD]; }
 uint64_t shim_flash_ops(void) { return s_ops_count[MED_FLASH]; }
 
@@ -97,7 +124,7 @@ static void ops_log(const char *fmt, ...)
         s_ops_fd = open(".shim/ops.jsonl", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (s_ops_fd < 0) return;
     }
-    char buf[600];
+    char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof buf - 2, fmt, ap);
@@ -106,6 +133,25 @@ static void ops_log(const char *fmt, ...)
     if (n > (int)sizeof buf - 3) n = (int)sizeof buf - 3;
     buf[n++] = '\n';
     (void)!write(s_ops_fd, buf, (size_t)n);
+}
+
+/* JSON string body for arbitrary bytes (index lines may be torn/zeroed). */
+static void json_esc(char *out, size_t cap, const char *in, size_t len)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 7 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c < 0x20 || c >= 0x7f) o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+}
+
+/* A raw JSON object line from the stubs/driver (NVS cursor commits etc.). */
+void shim_note(const char *json_obj)
+{
+    ops_log("%s", json_obj);
 }
 
 void shim_mark(const char *what)
@@ -226,7 +272,8 @@ static int gate(medium_t m, const char *opname, const char *path)
     }
     if (m != MED_OTHER && s_arm_errno != 0) {
         int e = s_arm_errno;
-        s_arm_errno = 0;
+        if (s_arm_errno_left > 0) s_arm_errno_left--;
+        else s_arm_errno = 0;
         ops_log("{\"op\":\"%s\",\"path\":\"%s\",\"fail\":\"injected-%d\"}", opname, path ? norm(path) : "", e);
         return e;
     }
@@ -252,6 +299,114 @@ static ofile_t *of_find_fd(int fd)
     return NULL;
 }
 
+/* ── FAT cross-link model (contract §5.3) ─────────────────────────────── */
+
+static void find_twins(const char *dir, ino_t ino, dev_t dv, const char *self, char *out, size_t cap, int *n)
+{
+    DIR *d = opendir(dir);
+    if (d == NULL) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char p[400];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { find_twins(p, ino, dv, self, out, cap, n); continue; }
+        if (st.st_ino != ino || st.st_dev != dv || strcmp(norm(p), self) == 0) continue;
+        size_t l = strlen(out);
+        if (l + strlen(p) + 4 < cap) snprintf(out + l, cap - l, "%s\"%s\"", *n ? "," : "", norm(p));
+        (*n)++;
+    }
+    closedir(d);
+}
+
+/* Removing an SD name whose inode has other names: on real FAT the two
+ * directory entries share ONE cluster chain, and f_unlink frees it — the
+ * surviving name now points at free clusters that the next allocation reuses.
+ * Modelled by zero-filling the shared inode (through the surviving link)
+ * before the unlink. Logged as xlink_unlink for the C-19 oracle. */
+static void xlink_before_unlink(medium_t m, const char *p, const char *why)
+{
+    if (m != MED_SD) return;
+    struct stat st;
+    if (lstat(p, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink <= 1) return;
+    char twins[1200] = "";
+    int nt = 0;
+    find_twins("sdcard", st.st_ino, st.st_dev, norm(p), twins, sizeof twins, &nt);
+    int fd = open(p, O_WRONLY);
+    long long left = (long long)st.st_size;
+    if (fd >= 0) {
+        static const char zero[4096];
+        while (left > 0) {
+            size_t k = left > (long long)sizeof zero ? sizeof zero : (size_t)left;
+            ssize_t w = write(fd, zero, k);
+            if (w <= 0) break;
+            left -= w;
+        }
+        (void)fsync(fd);
+        close(fd);
+    }
+    ops_log("{\"op\":\"xlink_unlink\",\"path\":\"%s\",\"nlink\":%u,\"size\":%lld,\"zeroed\":%lld,\"why\":\"%s\",\"twins\":[%s]}",
+            norm(p), (unsigned)st.st_nlink, (long long)st.st_size, (long long)st.st_size - left, why, twins);
+}
+
+/* Index lines as written (flash, any evq.idx* path), one ops event per line,
+ * so the C-19 oracle can replay index state in trace order. */
+static void idx_log_lines(const char *path, const char *p, size_t len, int load)
+{
+    size_t i = 0;
+    while (i < len) {
+        const char *nl = memchr(p + i, '\n', len - i);
+        size_t l = nl ? (size_t)(nl - (p + i)) : len - i;
+        char esc[1400];
+        json_esc(esc, sizeof esc, p + i, l > 200 ? 200 : l);
+        ops_log("{\"op\":\"idx\",\"path\":\"%s\",\"line\":\"%s\"%s%s}", path, esc,
+                nl ? "" : ",\"partial\":1", load ? ",\"load\":1" : "");
+        i += l + (nl ? 1 : 0);
+    }
+}
+
+/* First read-open of the index in this process (boot): log what is on flash
+ * now, so python-side tampering and power-loss reverts are visible. */
+static void idx_load_log(const char *path)
+{
+    if (s_idx_loaded || strcmp(norm(path), "evstore/evq.idx") != 0) return;
+    s_idx_loaded = true;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) { ops_log("{\"op\":\"idx_load\",\"path\":\"%s\",\"bytes\":-1}", norm(path)); return; }
+    size_t cap = 1 << 16, n = 0;
+    char *buf = malloc(cap);
+    size_t r;
+    while (buf != NULL && (r = fread(buf + n, 1, cap - n, f)) > 0) {
+        n += r;
+        if (n == cap) { cap *= 2; char *nb = realloc(buf, cap); if (nb == NULL) { free(buf); buf = NULL; break; } buf = nb; }
+    }
+    fclose(f);
+    ops_log("{\"op\":\"idx_load\",\"path\":\"%s\",\"bytes\":%lld}", norm(path), (long long)n);
+    if (buf != NULL) { idx_log_lines(norm(path), buf, n, 1); free(buf); }
+}
+
+static void flip_on_disk(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return;
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return;
+    off_t off = st.st_size / 2;
+    unsigned char c = 0;
+    for (; off < st.st_size; off++) {
+        if (pread(fd, &c, 1, off) != 1) { close(fd); return; }
+        if (c != '\n') break;
+    }
+    if (off >= st.st_size) { close(fd); return; }
+    unsigned char nc = (unsigned char)(c ^ 0x01);
+    if (pwrite(fd, &nc, 1, off) == 1) (void)fsync(fd);
+    close(fd);
+    ops_log("{\"op\":\"flip\",\"path\":\"%s\",\"offset\":%lld,\"from\":%u,\"to\":%u}", norm(path),
+            (long long)off, (unsigned)c, (unsigned)nc);
+}
+
 /* ── ops ──────────────────────────────────────────────────────────────── */
 
 FILE *shim_fopen(const char *path, const char *mode)
@@ -261,6 +416,11 @@ FILE *shim_fopen(const char *path, const char *mode)
     bool w = strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+');
     int e = gate(m, w ? "open_w" : "open_r", path);
     if (e) { errno = e; return NULL; }
+    if (!w && m == MED_SD && s_arm_special == SP_FLIP) {
+        s_arm_special = SP_NONE;
+        flip_on_disk(path);
+    }
+    if (!w && m == MED_FLASH) idx_load_log(path);
     struct stat st;
     bool existed = stat(path, &st) == 0;
     if (m != MED_OTHER && w && !existed && s_tab[m].used + SHIM_BLOCK > capacity(m)) {
@@ -355,6 +515,7 @@ size_t shim_fwrite(const void *p, size_t sz, size_t n, FILE *f)
         /* cumulative index history for the ARCH-INV oracle (survives compaction) */
         int hf = open(".shim/idx_history", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (hf >= 0) { (void)!write(hf, p, sz * w); close(hf); }
+        idx_log_lines(o->path, (const char *)p, sz * w, 0);
     }
     fstat(fileno(f), &st);
     tab_set(o->med, o->path, (long long)st.st_size);
@@ -456,6 +617,12 @@ int shim_fsync(int fd)
     if (e) { o->err = true; errno = e; return -1; }
     fflush(o->f);
     record_durable(o);
+    if (s_arm_special == SP_APPLIED_EIO) {
+        s_arm_special = SP_NONE;
+        ops_log("{\"op\":\"fsync\",\"path\":\"%s\",\"applied_eio\":1}", o->path);
+        errno = EIO;
+        return -1;     /* the data IS durable; the caller is told it failed */
+    }
     return 0;          /* host page cache is the "medium"; durability is the journal */
 }
 
@@ -490,6 +657,11 @@ int shim_rename(const char *a, const char *b)
          * dir_register and dir_remove can leave BOTH names (a cross-link on
          * real FAT; a hard link here). */
         unsigned outcome = (unsigned)(rng_next() % (m == MED_SD ? 3 : 2));
+        if (s_arm_crash_outcome >= 0) {
+            outcome = (unsigned)s_arm_crash_outcome;      /* forced (crash_both) */
+            if (outcome == 2 && m != MED_SD) outcome = 1;  /* littlefs rename is atomic */
+            s_arm_crash_outcome = -1;
+        }
         const char *what = outcome == 0 ? "not_applied" : outcome == 1 ? "applied" : "both";
         if (outcome == 1) { if (rename(a, b) == 0) { journal("R %d %s %s", (int)m, norm(a), norm(b)); } }
         else if (outcome == 2) { if (link(a, b) == 0) journal("L %d %s %s", (int)m, norm(a), norm(b)); }
@@ -498,6 +670,26 @@ int shim_rename(const char *a, const char *b)
     }
     /* never replace an existing target on SD (FatFs f_rename → FR_EXIST) */
     if (m == MED_SD && stat(b, &st) == 0) { errno = EEXIST; return -1; }
+    if (m != MED_OTHER && (s_arm_special == SP_BOTH_EIO || s_arm_special == SP_APPLIED_EIO)) {
+        int sp = s_arm_special;
+        s_arm_special = SP_NONE;
+        if (sp == SP_BOTH_EIO && m == MED_SD) {
+            if (link(a, b) == 0) {
+                tab_set(m, norm(b), sz);
+                journal("L %d %s %s", (int)m, norm(a), norm(b));
+            }
+            ops_log("{\"op\":\"rename_both_eio\",\"from\":\"%s\",\"to\":\"%s\"}", norm(a), norm(b));
+        } else if (sp == SP_BOTH_EIO) {
+            ops_log("{\"op\":\"rename\",\"path\":\"%s\",\"fail\":\"injected-both_eio-atomic\"}", norm(a));
+        } else if (rename(a, b) == 0) {
+            tab_del(m, norm(a));
+            tab_set(m, norm(b), sz);
+            journal("R %d %s %s", (int)m, norm(a), norm(b));
+            ops_log("{\"op\":\"rename\",\"from\":\"%s\",\"to\":\"%s\",\"applied_eio\":1}", norm(a), norm(b));
+        }
+        errno = EIO;
+        return -1;
+    }
     int rc = rename(a, b);
     if (rc == 0) {
         tab_del(m, norm(a));
@@ -517,16 +709,21 @@ int shim_remove(const char *p)
     if (s_arm_crash_inside) {
         s_arm_crash_inside = false;
         unsigned outcome = (unsigned)(rng_next() % 2);
+        if (outcome == 1) xlink_before_unlink(m, p, "remove_inside");
         if (outcome == 1 && remove(p) == 0) journal("X %d %s", (int)m, norm(p));
         ops_log("{\"op\":\"remove_inside\",\"path\":\"%s\",\"outcome\":\"%s\"}", norm(p), outcome ? "applied" : "not_applied");
         crash_now("remove");
     }
+    bool applied_eio = m != MED_OTHER && s_arm_special == SP_APPLIED_EIO;
+    if (applied_eio) s_arm_special = SP_NONE;
+    xlink_before_unlink(m, p, "remove");
     int rc = remove(p);
     if (rc == 0) {
         tab_del(m, norm(p));
         journal("X %d %s", (int)m, norm(p));
-        ops_log("{\"op\":\"remove\",\"path\":\"%s\"}", norm(p));
+        ops_log("{\"op\":\"remove\",\"path\":\"%s\"%s}", norm(p), applied_eio ? ",\"applied_eio\":1" : "");
     }
+    if (applied_eio) { errno = EIO; return -1; }
     return rc;
 }
 

@@ -45,6 +45,7 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
+#include "sd_diag.h"
 #include "event_log.h"
 #include "evlog_replay.h"
 #include "sync_runner.h"
@@ -625,6 +626,7 @@ static void app_prepare_reboot(void)
      * unmount below (audit R-9) — the drains then run monitor-free, and sdcard_unmount
      * sees no writer refs so it completes immediately. */
     sdcard_monitor_suspend();
+    sd_diag_persist(true);          /* orderly reboot: snapshot unpersisted fault/refusal counts (NVS, not SD) */
     event_log_prepare_shutdown();   /* flush + fsync + close the events tail */
     sd_logger_prepare_shutdown();   /* drain the log ring + close the log file */
     (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
@@ -966,6 +968,10 @@ void app_main(void)
     HIL_TRACE("app_main_entry");
     event_log_hil_boot_init();
 #endif
+    /* SD-fault / refusal attribution must be live before the first SD writer
+     * (sd_logger) can fail: validate/continue the RTC block now, merge the NVS
+     * floor once NVS is up (sd_diag.h). */
+    sd_diag_boot_early();
     /* Capture WARN/ERROR logs to the SD card (INFO/DEBUG go to the console only).
      * Verbose continuous logging concurrent with the events DB corrupted the FAT
      * on a consumer card, so the file is now low-volume + idle-quiet by design. */
@@ -985,6 +991,7 @@ void app_main(void)
         return;
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
+    sd_diag_boot_nvs();
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── Power management (Phase 2, DFS-only) ─────────────────────────
@@ -1428,6 +1435,7 @@ void app_main(void)
         .quarantine_event   = persistence_available ? event_log_get_quarantine_fn()         : NULL,
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .sd_health          = persistence_available ? app_sd_health                         : NULL,
+        .sdlog_render       = sd_logger_render_json,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .error_disconnect_count = mqtt_client_get_error_disconnect_count_fn(),

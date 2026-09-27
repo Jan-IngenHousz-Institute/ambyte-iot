@@ -1225,7 +1225,7 @@ class MqttOperationTest(unittest.TestCase):
         jitter = body.index("wait_for_fleet_slot()")
         quiesce = body.index("ambit_quiesce_for_idle();")
         comms = body.index("s_cfg.comms_suspend()")
-        download = body.index("http_get_to_file(")
+        download = body.index("http_get_to_stage(")   # verified staging (ambit_stage.h)
         ping = body.index("cmd_uart_ping(c, &connected)")
         self.assertLess(jitter, quiesce)
         self.assertLess(quiesce, comms)

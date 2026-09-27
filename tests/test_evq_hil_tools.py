@@ -180,8 +180,9 @@ class Io1(unittest.TestCase):
 
     def test_trace_and_arming(self):
         with tempfile.TemporaryDirectory() as d:
-            exe = _build(["components/event_log/evq_hil_trace.c", "tests/evq_hil_host/trace_main.c"],
-                         ["components/event_log"], ["-DEVQ_HIL_TRACE_HOST"], Path(d) / "trace")
+            exe = _build(["components/event_log/evq_hil_trace.c", "components/sd_card/sd_diag_core.c",
+                          "tests/evq_hil_host/trace_main.c"],
+                         ["components/event_log", "components/sd_card"], ["-DEVQ_HIL_TRACE_HOST"], Path(d) / "trace")
             out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
             rows = [json.loads(x) for x in out.splitlines()]
             self.assertEqual(rows[0]["cls"], [1, 1, 1, 0, 1, 1, 0])
