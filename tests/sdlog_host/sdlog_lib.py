@@ -46,10 +46,14 @@ def _run(cmd: list[str]) -> None:
         raise RuntimeError(f"compile failed: {' '.join(cmd)}\n{r.stdout}\n{r.stderr}")
 
 
-def build(out_dir: Path, rev: str | None) -> Path:
-    """rev None = working tree (head); else git show <rev>: sources (base)."""
+def build(out_dir: Path, rev: str | None, hil: bool = False) -> Path:
+    """rev None = working tree (head); else git show <rev>: sources (base).
+    hil=True (head only): the verification-build variant — sd_logger.c with its
+    CONFIG_AMBYTE_EVQ_HIL trace hooks plus components/event_log/evq_hil_sdl.c
+    (Sprint 2 H2/H8b), so the replay model is proven on byte-exact files."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = "sdlog_head" if rev is None else f"sdlog_base_{rev}"
+    assert not (hil and rev is not None)
+    name = ("sdlog_hil" if hil else "sdlog_head") if rev is None else f"sdlog_base_{rev}"
     src_dir = out_dir / (name + ".src")
     src_dir.mkdir(exist_ok=True)
     if rev is None:
@@ -64,7 +68,8 @@ def build(out_dir: Path, rev: str | None) -> Path:
         inc_logger = src_dir
     incs = [f"-I{SHIM / 'stubs'}", f"-I{SHIM}", f"-I{inc_logger}", f"-I{ROOT / 'components/sd_card'}",
             f"-I{ROOT / 'components/event_log/include'}"]
-    defs = ['-DSD_MOUNT_POINT="./sdcard"'] + (["-DSDLOG_BASE"] if rev is not None else [])
+    defs = ['-DSD_MOUNT_POINT="./sdcard"'] + (["-DSDLOG_BASE"] if rev is not None else []) + \
+        (["-DCONFIG_AMBYTE_EVQ_HIL=1", "-DEVQ_HIL_HOST"] if hil else [])
     warn = ["-Wall", "-Wextra"] + (["-Werror"] if rev is None else [])
     base = [cc(), "-std=gnu11", "-g", "-O1", *SAN, *warn, *incs, *defs]
     objdir = out_dir / (name + ".o")
@@ -73,8 +78,9 @@ def build(out_dir: Path, rev: str | None) -> Path:
     o = objdir / "sd_logger.o"
     _run([*base, "-include", str(SHIM / "sd_shim.h"), "-c", str(logger_c), "-o", str(o)])
     objs.append(o)
+    extra_srcs = [ROOT / "components/event_log/evq_hil_sdl.c"] if hil else []
     for s in [SHIM / "sd_shim.c", SHIM / "host_rtos.c", SHIM / "sd_host_stubs.c",
-              ROOT / "components/sd_card/sd_diag_core.c", HOST / "sdlog_driver.c"]:
+              ROOT / "components/sd_card/sd_diag_core.c", HOST / "sdlog_driver.c", *extra_srcs]:
         o = objdir / (s.stem + ".o")
         extra = ["-Wno-error"] if s.name == "sdlog_driver.c" else []
         _run([*base, *extra, "-c", str(s), "-o", str(o)])
@@ -152,22 +158,35 @@ class Dev:
     calls: list = field(default_factory=list)       # (fmt, text)
     out: list = field(default_factory=list)
     prefill: int = 0
+    trace: list = field(default_factory=list)       # non-JSON lines (SLT_*): hil variant only
 
     def start(self) -> None:
         env = dict(os.environ, TZ="UTC", ASAN_OPTIONS="detect_leaks=0")
         self.proc = subprocess.Popen([str(self.exe), str(self.state)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      text=True, env=env)
 
+    def _json(self) -> dict:
+        """Next JSON reply; SLT_* trace lines (which the hil variant may print at
+        any time, e.g. the watermark) are stashed in self.trace, never parsed."""
+        assert self.proc and self.proc.stdout
+        while True:
+            ln = self.proc.stdout.readline()
+            if not ln:
+                raise RuntimeError("driver exited")
+            if ln.startswith("{"):
+                return json.loads(ln)
+            self.trace.append(ln.rstrip("\n"))
+
     def cmd(self, line: str, expect: bool = False) -> dict | None:
         assert self.proc and self.proc.stdin and self.proc.stdout
         self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
         if line.startswith(("log ", "logf ")):
-            o = json.loads(self.proc.stdout.readline())
+            o = self._json()
             self.calls.append((bytes.fromhex(o["fmt_hex"]), bytes.fromhex(o["text_hex"])))
             return o
         if expect:
-            o = json.loads(self.proc.stdout.readline())
+            o = self._json()
             if "error" in o:
                 raise RuntimeError(o["error"])
             self.out.append(o)

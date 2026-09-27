@@ -49,6 +49,19 @@
 #include "sd_card.h"
 #include "sd_diag.h"
 
+/* Verification build only (Sprint 2 H2/H7/H8): the byte-exact logger trace
+ * (docs/sdlog-hil-trace.md). SDL_HIL(stmt) compiles to nothing in a release
+ * build — the release image carries no trace hook (check_release_no_hil.py). */
+#if !defined(EVQ_HOST_FAULTS) && __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+#include "evq_hil_sdl.h"
+#define SDL_HIL(stmt) do { stmt; } while (0)
+#else
+#define SDL_HIL(stmt) do { } while (0)
+#endif
+
 /* Verification build only: route this file's SD operations through the
  * writer-tagged fault wrappers (evq_hil fault io sdlog …). Must stay the LAST
  * include; in a release build the header defines nothing. */
@@ -133,12 +146,15 @@ static void ring_push(const uint8_t *p, size_t n)
         memcpy(&s_ring[s_head], p, first);
         if (n > first) memcpy(&s_ring[0], p + first, n - first);
         s_head = (s_head + n) % SD_LOGGER_RING_BYTES;
+        SDL_HIL(hil_sdl_push(p, n, true));       /* inside the ring lock: trace order == ring order */
     } else {
         s_dropped += n;
         s_acct.dropped_ring_bytes += n;
         s_acct.dropped_records++;
+        SDL_HIL(hil_sdl_push(p, n, false));
     }
     portEXIT_CRITICAL_SAFE(&s_mux);
+    SDL_HIL(hil_sdl_after_push());
 }
 
 /* Pop the longest run of WHOLE records (ending in '\n') that fits `cap`.
@@ -157,6 +173,7 @@ static size_t ring_pop(uint8_t *out, size_t cap)
     memcpy(out, &s_ring[s_tail], first);
     if (n > first) memcpy(out + first, &s_ring[0], n - first);
     s_tail = (s_tail + n) % SD_LOGGER_RING_BYTES;
+    SDL_HIL(hil_sdl_pop(n));
     portEXIT_CRITICAL_SAFE(&s_mux);
     return n;
 }
@@ -285,6 +302,7 @@ static bool rotate_files(void)
     log_path(a, sizeof a, SD_LOGGER_MAX_FILES - 1);
     long evicted = stat(a, &st) == 0 ? (long)st.st_size : -1;
     if (remove(a) != 0 && errno != ENOENT) {
+        SDL_HIL(hil_sdl_ev(HIL_SDL_ROT, HIL_SDL_ROT_FAIL_REMOVE, (uint32_t)errno, 0, NULL));
         note_fault(FL_ROTATE, SD_DIAG_OP_REMOVE, errno);
         s_acct.rotate_err++;
         return false;
@@ -294,11 +312,13 @@ static bool rotate_files(void)
         log_path(a, sizeof a, i);
         log_path(b, sizeof b, i + 1);
         if (rename(a, b) != 0 && errno != ENOENT) {
+            SDL_HIL(hil_sdl_ev(HIL_SDL_ROT, HIL_SDL_ROT_FAIL_RENAME, (uint32_t)errno, (uint32_t)i, NULL));
             note_fault(FL_ROTATE, SD_DIAG_OP_RENAME, errno);
             s_acct.rotate_err++;
             return false;
         }
     }
+    SDL_HIL(hil_sdl_ev(HIL_SDL_ROT, HIL_SDL_ROT_OK, 0, 0, NULL));
     return true;
 }
 
@@ -345,6 +365,7 @@ static bool open_log(void)
         s_quarantined = true;
         s_acct.torn_tail_files++;
     }
+    SDL_HIL(hil_sdl_ev(HIL_SDL_OPEN, (uint32_t)sz, torn ? 1u : 0u, 0, SD_LOGGER_BASENAME ".log"));
     return true;
 }
 
@@ -354,9 +375,12 @@ static void close_log(void)
 {
     if (s_fp) {
         if (fclose(s_fp) != 0) {
+            SDL_HIL(hil_sdl_ev(HIL_SDL_CLOSE, HIL_SDL_CLOSE_ERR, 0, 0, NULL));
             note_fault(FL_CLOSE, SD_DIAG_OP_CLOSE, errno);
             s_acct.close_err++;
             if (s_file_bytes > s_committed) s_acct.indeterminate_bytes += s_file_bytes - s_committed;
+        } else {
+            SDL_HIL(hil_sdl_ev(HIL_SDL_CLOSE, HIL_SDL_CLOSE_OK, 0, 0, NULL));
         }
         s_fp = NULL;
     }
@@ -368,6 +392,7 @@ static void close_log(void)
  * sync may or may not be on the card. */
 static void abandon_log(void)
 {
+    if (s_fp != NULL) SDL_HIL(hil_sdl_ev(HIL_SDL_CLOSE, HIL_SDL_CLOSE_ABANDON, 0, 0, NULL));
     if (s_fp != NULL && s_file_bytes > s_committed) s_acct.indeterminate_bytes += s_file_bytes - s_committed;
     s_fp = NULL;
     s_file_open = false;
@@ -382,12 +407,15 @@ static void rollback(size_t extra)
     size_t since = s_file_bytes - s_committed + extra;
     int fd = fileno(s_fp);
     if (ftruncate(fd, (off_t)s_committed) != 0) {
+        SDL_HIL(hil_sdl_ev(HIL_SDL_RB, (uint32_t)s_committed, (uint32_t)since, HIL_SDL_RB_QUAR_TRUNC, NULL));
         note_fault(FL_ROLLBACK, SD_DIAG_OP_TRUNCATE, errno);
         s_acct.truncate_err++;
     } else if (fsync(fd) != 0) {
+        SDL_HIL(hil_sdl_ev(HIL_SDL_RB, (uint32_t)s_committed, (uint32_t)since, HIL_SDL_RB_QUAR_FSYNC, NULL));
         note_fault(FL_ROLLBACK, SD_DIAG_OP_FSYNC, errno);
         s_acct.fsync_err++;
     } else {
+        SDL_HIL(hil_sdl_ev(HIL_SDL_RB, (uint32_t)s_committed, (uint32_t)since, HIL_SDL_RB_OK, NULL));
         s_acct.rolled_back_bytes += since;
         s_file_bytes = s_committed;
         return;
@@ -414,6 +442,7 @@ static bool commit(void)
         s_acct.fsync_err++;
     } else {
         s_committed = s_file_bytes;
+        SDL_HIL(hil_sdl_ev(HIL_SDL_COMMIT, (uint32_t)s_committed, 0, 0, NULL));
         return true;
     }
     sdcard_report_io_error();
@@ -426,6 +455,7 @@ static bool write_chunk(const uint8_t *buf, size_t n)
 {
     errno = 0;
     size_t w = fwrite(buf, 1, n, s_fp);
+    SDL_HIL(hil_sdl_ev(HIL_SDL_WR, (uint32_t)n, (uint32_t)w, (uint32_t)s_file_bytes, NULL));
     if (w == n) {
         s_file_bytes += n;
         return true;
@@ -443,6 +473,8 @@ typedef enum { ROOM_OK, ROOM_ROTATE_BLOCKED, ROOM_NO_FILE } room_t;
 /* A popped chunk that cannot be written is attributed, never silently lost. */
 static void drop_chunk(room_t why, size_t n)
 {
+    SDL_HIL(hil_sdl_ev(HIL_SDL_DROP, why == ROOM_ROTATE_BLOCKED ? HIL_SDL_DROP_ROTATE_BLOCKED : HIL_SDL_DROP_UNAVAILABLE,
+                       (uint32_t)n, 0, NULL));
     if (why == ROOM_ROTATE_BLOCKED) s_acct.dropped_rotate_blocked_bytes += n;
     else s_acct.dropped_unavailable_bytes += n;
 }
@@ -585,6 +617,7 @@ static void writer_task(void *arg)
 esp_err_t sd_logger_init(void)
 {
     if (s_started) return ESP_OK;
+    SDL_HIL(hil_sdl_boot_hook());           /* auto-armed trace starts before the writer's first OPEN */
 
     s_head = s_tail = 0;
     s_dropped = 0;
@@ -676,3 +709,27 @@ int sd_logger_render_json(char *buf, size_t cap)
                                 a.rotate_err + a.open_err));
     return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }
+
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+/* H7 quiesce support (verification build only): the pause handshake is
+ * complete only when the writer itself reports it is holding. */
+bool sd_logger_hil_paused(void) { return s_paused; }
+
+void sd_logger_hil_state(uint32_t *file_bytes, uint32_t *committed, bool *quar, uint32_t *backoff_ms_left, bool *open)
+{
+    portENTER_CRITICAL_SAFE(&s_mux);
+    *file_bytes = (uint32_t)s_file_bytes;
+    *committed = (uint32_t)s_committed;
+    *quar = s_quarantined;
+    *open = s_file_open;
+    TickType_t now = xTaskGetTickCount();
+#ifdef portTICK_PERIOD_MS
+    const uint32_t ms_per_tick = portTICK_PERIOD_MS;
+#else
+    const uint32_t ms_per_tick = 1;                 /* host stand-in: pdMS_TO_TICKS(ms) == ms */
+#endif
+    *backoff_ms_left = (s_rot_backoff && (int32_t)(s_rot_retry_at - now) > 0)
+                           ? (uint32_t)(s_rot_retry_at - now) * ms_per_tick : 0;
+    portEXIT_CRITICAL_SAFE(&s_mux);
+}
+#endif

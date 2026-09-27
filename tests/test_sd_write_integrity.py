@@ -22,6 +22,7 @@ if os.path.basename(CC) == "cc":
     CC = shutil.which("clang") or "clang"
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 BASE_REV = "e1ca6ee"
+BASE_REV_S1 = "4ec9cef"   # Sprint 1 settled commit: the pre-Sprint-2 HIL semantics
 
 
 def _build(srcs, incs, defs, out: Path) -> Path:
@@ -89,6 +90,7 @@ class FaultCommand(unittest.TestCase):
     def test_parser_nth_count_short_applied_reset(self):
         with tempfile.TemporaryDirectory() as d:
             exe = _build(["components/event_log/evq_hil_trace.c", "components/event_log/evq_hil_io.c",
+                          "components/event_log/evq_hil_sdl.c",
                           "components/sd_card/sd_diag_core.c", "tests/sdwi_host/fault_io_host.c"],
                          ["tests/sdwi_host/stubs", "components/event_log", "components/event_log/include",
                           "components/sd_card"], ["-DEVQ_HIL_TRACE_HOST", "-DEVQ_HIL_HOST"], Path(d) / "fio")
@@ -96,15 +98,74 @@ class FaultCommand(unittest.TestCase):
             st.mkdir()
             r = subprocess.run([str(exe), str(st)], capture_output=True, text=True)
             checks = _checks(r.stdout)
-            self.assertGreaterEqual(len(checks), 9)
+            self.assertGreaterEqual(len(checks), 20)
             self.assertEqual([c["check"] for c in checks if not c["ok"]], [], r.stdout)
+            self.assertTrue(any(c["check"].startswith("FIO-2") for c in checks))
+            armed_b = [ln for ln in r.stdout.splitlines() if ln.startswith("HIL_FAULT fired") and "slot=B" in ln]
+            self.assertEqual(len(armed_b), 1, r.stdout)          # the L-4b truncate fired from slot B
+            self._check_wit1(r.stdout)
             fired = [ln for ln in r.stdout.splitlines() if ln.startswith("HIL_FAULT fired")]
             reset = [ln for ln in fired if "kind=cpu_reset" in ln]
-            self.assertEqual(len(reset), 1, fired)
-            self.assertIn("sd_power=not_interrupted mechanism=esp_rom_software_reset_system", reset[0])
+            self.assertEqual(len(reset), 2, fired)                # C-35 reset_before + WIT-1 reset_mid_write
+            for ln in reset:
+                self.assertIn("sd_power=not_interrupted mechanism=esp_rom_software_reset_system", ln)
             for ln in fired:
                 if "kind=cpu_reset" not in ln:
                     self.assertNotIn("sd_power", ln)       # only CPU resets carry the disclaimer
+
+    def _check_wit1(self, out: str):
+        """WIT-1: witness line carries the exact chunk and half; a complete drain
+        (contiguous seq, lost 0) follows it; both precede the reset announcement."""
+        import base64
+        import hashlib
+        lines = out.splitlines()
+        wi = next(i for i, ln in enumerate(lines) if ln.startswith("SLT_RESET_WITNESS "))
+        parts = lines[wi].split()
+        path, off, n, half, sha, b64 = parts[1], int(parts[2]), int(parts[3]), int(parts[4]), parts[5], parts[6]
+        chunk = base64.b64decode(b64)
+        want_len = int(next(ln for ln in lines if ln.startswith("WIT1_CHUNK_LEN ")).split()[1])
+        self.assertTrue(path.endswith("w.log"))
+        self.assertEqual((off, n, half, len(chunk)), (7, want_len, want_len // 2, want_len))
+        self.assertEqual(hashlib.sha256(chunk).hexdigest(), sha)
+        self.assertIn(b"HILSDLOG: wit 100000", chunk)
+        di = next(i for i in range(wi, len(lines)) if lines[i].startswith("SLT_DRAIN "))
+        hi = next(i for i in range(di, len(lines)) if lines[i].startswith("SLT_HDR "))
+        ents = [ln.split() for ln in lines[di + 1:hi] if ln.startswith("SLT_E ")]
+        seqs = [int(e[2]) for e in ents]
+        self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))
+        self.assertEqual([e[1] for e in ents], ["P", "P", "POP"])
+        for e in ents[:2]:
+            raw = base64.b64decode(e[8])
+            self.assertEqual((hashlib.sha256(raw).hexdigest(), len(raw)), (e[5], int(e[4])))
+        self.assertEqual(int(lines[hi].split()[2]), 0)            # lost == 0
+        fi = next(i for i in range(hi, len(lines)) if lines[i].startswith("HIL_FAULT fired") and "reset_mid_write" in lines[i])
+        self.assertLess(hi, fi)
+
+    def test_fio2_discriminates_against_single_slot_baseline(self):
+        """FIO-2 must FAIL on the 4ec9cef single-slot injector (a second arm replaced
+        the first), or it would not prove the two-slot L-4b mechanism."""
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "base"
+            base.mkdir()
+            for rel in ("components/event_log/evq_hil_trace.c", "components/event_log/evq_hil_io.c"):
+                text = subprocess.run(["git", "show", f"{BASE_REV_S1}:{rel}"], cwd=ROOT, capture_output=True,
+                                      text=True, check=True).stdout
+                (base / Path(rel).name).write_text(text)
+            cmd = [CC, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", *SAN, "-DEVQ_HIL_TRACE_HOST", "-DEVQ_HIL_HOST",
+                   "-DFIO_BASELINE_SEMANTICS", *[f"-I{ROOT / i}" for i in ["tests/sdwi_host/stubs", "components/event_log",
+                                                                        "components/event_log/include", "components/sd_card"]],
+                   str(base / "evq_hil_trace.c"), str(base / "evq_hil_io.c"),
+                   str(ROOT / "components/event_log/evq_hil_sdl.c"),
+                   str(ROOT / "components/sd_card/sd_diag_core.c"), str(ROOT / "tests/sdwi_host/fault_io_host.c"),
+                   "-lm", "-o", str(Path(d) / "fiob")]
+            b = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(b.returncode, 0, b.stderr)
+            st = Path(d) / "state"
+            st.mkdir()
+            r = subprocess.run([str(Path(d) / "fiob"), str(st)], capture_output=True, text=True)
+            bad = {c["check"] for c in _checks(r.stdout) if not c["ok"]}
+            self.assertIn("FIO-2 slot B fired on the following truncate (both coexist)", bad, r.stdout)
+            self.assertIn("FIO-2 path filter skips a non-matching path", bad, r.stdout)
 
     def test_power_cut_never_succeeds(self):
         src = (ROOT / "components/evq_hil/evq_hil.c").read_text()

@@ -13,6 +13,7 @@
 #include "event_log_hil.h"
 #include "evq_hil_trace.h"
 #include "evq_hil_io_impl.h"
+#include "evq_hil_sdl.h"
 #include "sd_diag.h"
 
 FILE  *evq_hil_io_fopen_w(uint8_t w, const char *path, const char *mode);
@@ -20,6 +21,26 @@ int    evq_hil_io_fclose_w(uint8_t w, FILE *f);
 size_t evq_hil_io_fwrite_w(uint8_t w, const void *p, size_t sz, size_t n, FILE *f);
 int    evq_hil_io_fsync_w(uint8_t w, int fd);
 int    evq_hil_io_rename_w(uint8_t w, const char *a, const char *b);
+int    evq_hil_io_ftruncate_w(uint8_t w, int fd, off_t len);
+
+#ifdef FIO_BASELINE_SEMANTICS
+/* 4ec9cef semantics for the FIO-2 discrimination build: one targeted slot that
+ * a second arm REPLACES, no path filter. */
+static int base_set_slot(int slot, uint8_t w, uint8_t op, evq_iom_t m, unsigned nth, unsigned count, const char *path)
+{
+    (void)slot; (void)path;
+    evq_arm_io_set(w, op, m, nth, count);
+    return 0;
+}
+static evq_iom_t base_hit_p(uint8_t w, uint8_t op, const char *path, unsigned *nth, int *slot)
+{
+    (void)path;
+    if (slot) *slot = 0;
+    return evq_arm_io_hit(w, op, nth);
+}
+#define evq_arm_io_set_slot base_set_slot
+#define evq_arm_io_hit_p    base_hit_p
+#endif
 
 static jmp_buf s_reset;
 static esp_reset_reason_t s_reason = ESP_RST_POWERON;
@@ -117,6 +138,90 @@ int main(int argc, char **argv)
     s_reason = ESP_RST_POWERON;
     evq_hil_io_init();
     CHECK("C-35 retained record invalid after power-on", !evq_hil_fault_last(&lv));
+
+    /* FIO-2 (Sprint 2 H1): two coexisting slots + path filter. Built twice by
+     * tests/test_sd_write_integrity.py: against the working tree (all pass) and,
+     * with -DFIO_BASELINE_SEMANTICS, against the 4ec9cef trace/io sources whose
+     * single slot is REPLACED by a second arm — the coexistence checks must fail
+     * there, proving the regression discriminates. */
+    evq_arm_io_clear();
+    evq_iom_t hm;
+    unsigned hn = 0;
+    int hs = -1;
+    CHECK("FIO-2 add refused without slot A", evq_arm_io_set_slot(1, SD_DIAG_W_SDLOG, SD_DIAG_OP_TRUNCATE,
+                                                                   EVQ_IOM_EIO, 1, 1, NULL) != 0);
+    (void)evq_arm_io_set_slot(0, SD_DIAG_W_SDLOG, SD_DIAG_OP_FSYNC, EVQ_IOM_EIO, 1, 1, NULL);
+    int badd = evq_arm_io_set_slot(1, SD_DIAG_W_SDLOG, SD_DIAG_OP_TRUNCATE, EVQ_IOM_EIO, 1, 1, NULL);
+    CHECK("FIO-2 slot B armed beside A", badd == 0);
+    CHECK("FIO-2 add refused while B busy", evq_arm_io_set_slot(1, SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE,
+                                                                 EVQ_IOM_EIO, 1, 1, NULL) != 0);
+    /* The L-4b flow: commit fsync fails (A), then the rollback truncate fails (B). */
+    f = evq_hil_io_fopen_w(SD_DIAG_W_SDLOG, "sdcard/q.log", "w");
+    (void)evq_hil_io_fwrite_w(SD_DIAG_W_SDLOG, "abcdefgh\n", 1, 9, f);
+    fflush(f);                                             /* bytes on "disk" before the failing ops */
+    errno = 0;
+    int fs = evq_hil_io_fsync_w(SD_DIAG_W_SDLOG, fileno(f));
+    int fs_errno = errno;
+    errno = 0;
+    int tr = evq_hil_io_ftruncate_w(SD_DIAG_W_SDLOG, fileno(f), 0);
+    int tr_errno = errno;
+    CHECK("FIO-2 slot A fired on fsync", fs == -1 && fs_errno == EIO);
+    CHECK("FIO-2 slot B fired on the following truncate (both coexist)", tr == -1 && tr_errno == EIO);
+    CHECK("FIO-2 truncate not performed by injected slot B", fsize("sdcard/q.log") == 9);
+    (void)evq_hil_io_fclose_w(SD_DIAG_W_SDLOG, f);
+    /* Path filter: only renames whose path contains the substring count. */
+    (void)evq_arm_io_set_slot(0, SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, EVQ_IOM_EIO, 1, 1, "/evq/m-");
+    hm = evq_arm_io_hit_p(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, "/sdcard/events/ev-000001.tmp", &hn, &hs);
+    CHECK("FIO-2 path filter skips a non-matching path", hm == EVQ_IOM_NONE);
+    hm = evq_arm_io_hit_p(SD_DIAG_W_EVLOG, SD_DIAG_OP_RENAME, "/sdcard/evq/m-000001.tmp", &hn, &hs);
+    CHECK("FIO-2 path filter fires on the matching path as its 1st match", hm == EVQ_IOM_EIO && hn == 1 && hs == 0);
+    /* Priority and independence: A and B both match one op -> only A fires. */
+    (void)evq_arm_io_set_slot(0, SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, EVQ_IOM_EIO, 1, 1, NULL);
+    (void)evq_arm_io_set_slot(1, SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, EVQ_IOM_ENOSPC, 1, 1, NULL);
+    hm = evq_arm_io_hit_p(SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, "sdcard/logs/ambyte.log", &hn, &hs);
+    evq_iom_t hm2 = evq_arm_io_hit_p(SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, "sdcard/logs/ambyte.log", &hn, &hs);
+    CHECK("FIO-2 one slot per op, A first, then B on the next op", hm == EVQ_IOM_EIO && hm2 == EVQ_IOM_ENOSPC && hs == 1);
+    /* Clearing: `fault io any any off` = clear both. */
+    (void)evq_arm_io_set_slot(0, SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, EVQ_IOM_EIO, 1, 1, NULL);
+    (void)evq_arm_io_set_slot(1, SD_DIAG_W_SDLOG, SD_DIAG_OP_FSYNC, EVQ_IOM_EIO, 1, 1, NULL);
+    evq_arm_io_clear();
+    CHECK("FIO-2 clear disarms both slots",
+          evq_arm_io_hit_p(SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, "x", &hn, &hs) == EVQ_IOM_NONE &&
+          evq_arm_io_hit_p(SD_DIAG_W_SDLOG, SD_DIAG_OP_FSYNC, "x", &hn, &hs) == EVQ_IOM_NONE);
+    /* Named-point arm coexists with an I/O slot (independent state). */
+    evq_arm_set("store.before_write", EVQ_ARM_EIO, 1);
+    (void)evq_arm_io_set_slot(0, SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, EVQ_IOM_EIO, 1, 1, NULL);
+    char d1[160];
+    CHECK("FIO-2 named point survives an I/O arm", evq_arm_describe(d1, sizeof d1) && strstr(d1, "store.before_write"));
+    evq_arm_clear();
+    evq_arm_io_clear();
+
+    /* WIT-1 (H8a): a sdlog reset_mid_write prints the exact chunk + half and a
+     * complete synchronous trace drain BEFORE the reset (checked byte-exact by
+     * tests/test_sd_write_integrity.py from stdout). */
+    s_reason = ESP_RST_SW;
+    CHECK("WIT-1 trace on", hil_sdl_trace_on(false) == 0);
+    static const uint8_t r1[] = "2026-09-27 10:00:00  W (1) HILSDLOG: wit 100000 aaaa\n";
+    static const uint8_t r2[] = "2026-09-27 10:00:00  W (2) HILSDLOG: wit 100001 bbbb\n";
+    hil_sdl_push(r1, sizeof r1 - 1, true);
+    hil_sdl_push(r2, sizeof r2 - 1, true);
+    hil_sdl_pop(sizeof r1 - 1 + sizeof r2 - 1);
+    f = evq_hil_io_fopen_w(SD_DIAG_W_SDLOG, "sdcard/w.log", "a+");
+    (void)evq_hil_io_fwrite_w(SD_DIAG_W_SDLOG, "prefix\n", 1, 7, f);
+    fflush(f);
+    evq_arm_io_set(SD_DIAG_W_SDLOG, SD_DIAG_OP_WRITE, EVQ_IOM_RESET_MID_WRITE, 1, 1);
+    uint8_t chunk[sizeof r1 - 1 + sizeof r2 - 1];
+    memcpy(chunk, r1, sizeof r1 - 1);
+    memcpy(chunk + sizeof r1 - 1, r2, sizeof r2 - 1);
+    printf("WIT1_CHUNK_LEN %u\n", (unsigned)sizeof chunk);
+    int wreset = 0;
+    if (setjmp(s_reset) == 0) {
+        (void)evq_hil_io_fwrite_w(SD_DIAG_W_SDLOG, chunk, 1, sizeof chunk, f);
+    } else {
+        wreset = 1;
+    }
+    CHECK("WIT-1 reset happened", wreset == 1);
+    CHECK("WIT-1 torn tail = prefix + half chunk on disk", fsize("sdcard/w.log") == 7 + (long)(sizeof chunk / 2));
     printf("{\"fails\":%d}\n", fails);
     return fails != 0;
 }

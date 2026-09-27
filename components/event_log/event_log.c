@@ -4538,8 +4538,14 @@ bool event_log_hil_iom_is_reset(uint8_t mode)
 esp_err_t event_log_hil_arm_io(const char *writer, const char *op, const char *mode, unsigned nth,
                                unsigned count, const char **why)
 {
+    return evq_hil_arm_io_slot(writer, op, mode, nth, count, NULL, false, why);
+}
+
+esp_err_t evq_hil_arm_io_slot(const char *writer, const char *op, const char *mode, unsigned nth,
+                                    unsigned count, const char *path, bool add, const char **why)
+{
 #ifdef EVQ_HIL_HOST
-    (void)writer; (void)op; (void)mode; (void)nth; (void)count;
+    (void)writer; (void)op; (void)mode; (void)nth; (void)count; (void)path; (void)add;
     if (why) *why = "host";
     return ESP_ERR_NOT_SUPPORTED;
 #else
@@ -4550,8 +4556,16 @@ esp_err_t event_log_hil_arm_io(const char *writer, const char *op, const char *m
         if (why) *why = r == -1 ? "unknown_writer" : r == -2 ? "unknown_op" : r == -3 ? "unknown_mode" : "invalid_op_for_mode";
         return ESP_ERR_INVALID_ARG;
     }
-    if (m == EVQ_IOM_NONE) evq_arm_io_clear();
-    else evq_arm_io_set(w, o, m, nth, count);
+    if (add) {
+        if (m == EVQ_IOM_NONE || evq_arm_io_set_slot(1, w, o, m, nth, count, path) != 0) {
+            if (why) *why = "slot_b_needs_armed_a_and_free_b";
+            return ESP_ERR_INVALID_STATE;
+        }
+    } else if (m == EVQ_IOM_NONE) {
+        evq_arm_io_clear();
+    } else {
+        (void)evq_arm_io_set_slot(0, w, o, m, nth, count, path);
+    }
     if (why) *why = "ok";
     return ESP_OK;
 #endif

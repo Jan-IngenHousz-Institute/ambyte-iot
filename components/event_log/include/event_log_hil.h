@@ -66,6 +66,11 @@ esp_err_t event_log_hil_arm(const char *point, const char *mode, unsigned nth);
  * an invalid op/mode combination; mode "off" disarms. */
 esp_err_t event_log_hil_arm_io(const char *writer, const char *op, const char *mode, unsigned nth,
                                unsigned count, const char **why);
+/* Slot form (Sprint 2 H1): `add` false = clear both slots and arm A; true = arm
+ * B (refused unless A is armed and B free). `path` NULL/"" = any path, else a
+ * substring the op's path must contain. */
+esp_err_t evq_hil_arm_io_slot(const char *writer, const char *op, const char *mode, unsigned nth,
+                                    unsigned count, const char *path, bool add, const char **why);
 
 /* Retained record of the last fired targeted fault (survives the CPU reset it
  * caused; invalid after power-on). */

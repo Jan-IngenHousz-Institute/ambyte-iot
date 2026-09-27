@@ -28,7 +28,8 @@ CONTRACT = Path("/home/dv/.traycer/epics/630f41e0-ce32-48dc-bd3c-a2e550479725/ar
 
 sys.path.insert(0, str(TOOLS))
 import check_evidence_manifest as cem  # noqa: E402
-from check_release_no_hil import SHN_UNDEF, build_elf  # noqa: E402
+from check_release_no_hil import (FORBIDDEN_BIN_PREFIXES, FORBIDDEN_BIN_STRINGS,  # noqa: E402
+                                  FORBIDDEN_SYMBOL_PARTS, REQUIRED_HIL_STRINGS, SHN_UNDEF, build_elf)
 
 PY = sys.executable
 EMPTY = hashlib.sha256(b"").hexdigest()
@@ -627,6 +628,42 @@ class NoHil(unittest.TestCase):
             r = self.check(binf=b)
             self.assertNotEqual(r.returncode, 0, s)
 
+    # Sprint 2 (contract r4 §2.2) ------------------------------------------------
+    def test_sprint2_symbol_parts_fail(self):
+        for part in ("hil_sdl", "sdl_hil", "slt_", "sd_logger_hil"):
+            self.assertIn(part, FORBIDDEN_SYMBOL_PARTS)
+            sym = f"s_{part}state"
+            elf = self.w(f"{part}.elf", build_elf([TEXT], [("app_main", 1), (sym, 1)]))
+            r = self.check(elf=elf)
+            self.assertNotEqual(r.returncode, 0, sym)
+            self.assertIn(sym, r.stdout)
+
+    def test_sprint2_strings_fail_one_at_a_time(self):
+        want = [b"slot=", b"sdlog_emit", b"sdlog_inv", b"sdlog_dump", b"sdlog_trace", b"HILSDLOG",
+                b"SDL_BEGIN", b"SDL_END", b"SDL_FF", b"SDL_FL", b"SDL_STATE", b"SDL_MORE", b"SDL_INVALID",
+                b"SDL_TIMEOUT", b"SDL_B64", b"SDL_DUMP_END", b"SDL_Q", b"SLT_HDR", b"SLT_DRAIN", b"SLT_WM",
+                b"SLT_ERR"]
+        for s in want:
+            self.assertIn(s, FORBIDDEN_BIN_STRINGS)
+            b = self.w("p2.bin", b"\xe9 xx " + s + b"  yy\0")
+            r = self.check(binf=b)
+            self.assertNotEqual(r.returncode, 0, s)
+
+    def test_sdl_slt_prefix_banned_anywhere(self):
+        self.assertEqual(set(FORBIDDEN_BIN_PREFIXES), {b"SDL_", b"SLT_"})
+        for s in (b"SDL_NEWMARKER", b"SLT_X", b"xxSDL_", b"SLT_RESET_WITNESS"):
+            b = self.w("pre.bin", b"\xe9 " + s + b"\0")
+            r = self.check(binf=b)
+            self.assertNotEqual(r.returncode, 0, s)
+            self.assertIn("prefix", r.stdout)
+
+    def test_production_slot_context_is_exempt_only_exactly(self):
+        prod = self.w("prod.bin", b"\xe9 window frontier mismatch: cursor=%u:%ld slot=%u:%ld id=%lld\0")
+        self.assertEqual(self.check(binf=prod).returncode, 0)
+        for hil in (b"slot=%c", b"slot=A", b"slot=%u %ld"):
+            b = self.w("slot.bin", b"\xe9 slot=%u:%ld \0" + hil + b"\0")
+            self.assertNotEqual(self.check(binf=b).returncode, 0, hil)
+
     def test_sdkconfig_json_cases(self):
         cases = {
             "false": (json.dumps({"AMBYTE_EVQ_HIL": False}), True),
@@ -665,8 +702,12 @@ class NoHil(unittest.TestCase):
                    defined if base == unwrapped else wrapped)
         return self.d / root
 
+    def hil_elf(self, strings=REQUIRED_HIL_STRINGS, name: str = "hil.elf") -> Path:
+        rodata = (".flash.rodata", 1, 0x2, b"\0".join(strings) + b"\0")
+        return self.w(name, build_elf([TEXT, rodata], [("evq_hil_io_fopen_w", 1), ("app_main", 1)]))
+
     def expect_wrapped(self, objdir: Path, elf: Path | None = None) -> subprocess.CompletedProcess:
-        hil = elf or self.w("hil.elf", build_elf([TEXT], [("evq_hil_io_fopen_w", 1), ("app_main", 1)]))
+        hil = elf or self.hil_elf()
         return run(PY, NOHIL_TOOL, "--expect-wrapped", "--elf", hil, "--objdir", objdir)
 
     def test_expect_wrapped_passes(self):
@@ -691,6 +732,14 @@ class NoHil(unittest.TestCase):
 
     def test_expect_wrapped_fails_on_missing_objdir(self):
         self.assertNotEqual(self.expect_wrapped(self.d / "nope").returncode, 0)
+
+    def test_expect_wrapped_requires_each_sprint2_string(self):
+        tree = self.wrapped_tree("strs")
+        for s in REQUIRED_HIL_STRINGS:
+            elf = self.hil_elf([x for x in REQUIRED_HIL_STRINGS if x != s], name="hil-missing.elf")
+            r = self.expect_wrapped(tree, elf=elf)
+            self.assertNotEqual(r.returncode, 0, s)
+            self.assertIn(s.decode(), r.stdout)
 
 
 if __name__ == "__main__":

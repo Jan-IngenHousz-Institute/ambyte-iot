@@ -55,6 +55,7 @@
 #if CONFIG_AMBYTE_EVQ_HIL
 #include "event_log_hil.h"   /* on-device verification build only */
 #include "evq_hil.h"
+#include "evq_hil_sdl.h"
 #define HIL_TRACE(step) evq_hil_trace(step)
 #else
 #define HIL_TRACE(step) ((void)0)
@@ -672,6 +673,9 @@ static volatile bool s_pwrguard_parked;       /* guard state; also vetoes self-r
  * this path). */
 static void app_sd_park_now(void)
 {
+#if CONFIG_AMBYTE_EVQ_HIL
+    hil_sdl_guard_note(true);        /* H7 interlock: a quiesce spanning this park is void */
+#endif
     sdcard_monitor_suspend();
     event_log_set_sd_parked(true);   /* keeper + claim: zero SD operations while parked */
     sd_logger_pause();               /* drain ring, fsync + close (resumable) */
@@ -690,6 +694,9 @@ static void app_sd_park_now(void)
 
 static void app_sd_unpark_now(void)
 {
+#if CONFIG_AMBYTE_EVQ_HIL
+    hil_sdl_guard_note(false);
+#endif
     sd_logger_resume();
     /* Remount HERE (not via the monitor): the monitor was suspended while
      * it believed the card mounted, so an un-parked remount on its own

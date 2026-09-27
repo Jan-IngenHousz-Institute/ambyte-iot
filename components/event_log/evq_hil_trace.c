@@ -202,9 +202,14 @@ bool evq_arm_describe(char *buf, size_t cap)
 
 /* ── writer/op-targeted I/O faults ─────────────────────────────────────── */
 
-static uint8_t   s_io_w = EVQ_IO_ANY, s_io_op = EVQ_IO_ANY;
-static evq_iom_t s_io_mode;
-static unsigned  s_io_nth, s_io_count, s_io_hits, s_io_fired;
+typedef struct {
+    uint8_t   w, op;
+    evq_iom_t mode;
+    unsigned  nth, count, hits, fired;
+    char      path[48];          /* substring filter; "" = any path */
+} evq_arm_slot_t;
+static evq_arm_slot_t evq_arm_slots[2] = { { EVQ_IO_ANY, EVQ_IO_ANY, EVQ_IOM_NONE, 1, 1, 0, 0, "" },
+                               { EVQ_IO_ANY, EVQ_IO_ANY, EVQ_IOM_NONE, 1, 1, 0, 0, "" } };
 
 static const struct { const char *name; evq_iom_t m; } k_modes[] = {
     { "eio", EVQ_IOM_EIO }, { "enospc", EVQ_IOM_ENOSPC }, { "short", EVQ_IOM_SHORT },
@@ -259,46 +264,87 @@ int evq_arm_io_parse(const char *writer, const char *op, const char *mode,
     return 0;
 }
 
+static void evq_arm_slot_fill(evq_arm_slot_t *s, uint8_t writer, uint8_t op, evq_iom_t mode, unsigned nth, unsigned count,
+                      const char *path)
+{
+    s->w = writer;
+    s->op = op;
+    s->mode = mode;
+    s->nth = nth ? nth : 1;
+    s->count = count ? count : 1;
+    s->hits = 0;
+    s->fired = 0;
+    snprintf(s->path, sizeof s->path, "%s", path ? path : "");
+}
+
+int evq_arm_io_set_slot(int slot, uint8_t writer, uint8_t op, evq_iom_t mode, unsigned nth, unsigned count,
+                        const char *path_substr)
+{
+    int rc = 0;
+    TR_LOCK();
+    if (slot == 0) {
+        evq_arm_slot_fill(&evq_arm_slots[1], EVQ_IO_ANY, EVQ_IO_ANY, EVQ_IOM_NONE, 1, 1, NULL);
+        evq_arm_slot_fill(&evq_arm_slots[0], writer, op, mode, nth, count, path_substr);
+    } else if (slot == 1 && evq_arm_slots[0].mode != EVQ_IOM_NONE && evq_arm_slots[1].mode == EVQ_IOM_NONE && mode != EVQ_IOM_NONE) {
+        evq_arm_slot_fill(&evq_arm_slots[1], writer, op, mode, nth, count, path_substr);
+    } else {
+        rc = -1;
+    }
+    TR_UNLOCK();
+    return rc;
+}
+
 void evq_arm_io_set(uint8_t writer, uint8_t op, evq_iom_t mode, unsigned nth, unsigned count)
 {
-    TR_LOCK();
-    s_io_w = writer;
-    s_io_op = op;
-    s_io_mode = mode;
-    s_io_nth = nth ? nth : 1;
-    s_io_count = count ? count : 1;
-    s_io_hits = 0;
-    s_io_fired = 0;
-    TR_UNLOCK();
+    (void)evq_arm_io_set_slot(0, writer, op, mode, nth, count, NULL);
 }
 
 void evq_arm_io_clear(void) { evq_arm_io_set(EVQ_IO_ANY, EVQ_IO_ANY, EVQ_IOM_NONE, 1, 1); }
 
-evq_iom_t evq_arm_io_hit(uint8_t writer, uint8_t op, unsigned *out_nth)
+static bool evq_arm_slot_matches(const evq_arm_slot_t *s, uint8_t writer, uint8_t op, const char *path)
+{
+    if (s->mode == EVQ_IOM_NONE) return false;
+    if (s->w != EVQ_IO_ANY && s->w != writer) return false;
+    if (s->op != EVQ_IO_ANY && s->op != op) return false;
+    return s->path[0] == '\0' || (path != NULL && strstr(path, s->path) != NULL);
+}
+
+evq_iom_t evq_arm_io_hit_p(uint8_t writer, uint8_t op, const char *path, unsigned *out_nth, int *out_slot)
 {
     evq_iom_t act = EVQ_IOM_NONE;
     TR_LOCK();
-    if (s_io_mode != EVQ_IOM_NONE && (s_io_w == EVQ_IO_ANY || s_io_w == writer) &&
-        (s_io_op == EVQ_IO_ANY || s_io_op == op)) {
-        s_io_hits++;
-        if (s_io_hits >= s_io_nth) {
-            act = s_io_mode;
-            if (out_nth) *out_nth = s_io_hits;
-            if (++s_io_fired >= s_io_count) s_io_mode = EVQ_IOM_NONE;   /* disarm after `count` fires */
+    for (int i = 0; i < 2 && act == EVQ_IOM_NONE; i++) {
+        evq_arm_slot_t *s = &evq_arm_slots[i];
+        if (!evq_arm_slot_matches(s, writer, op, path)) continue;
+        s->hits++;
+        if (s->hits >= s->nth) {
+            act = s->mode;
+            if (out_nth) *out_nth = s->hits;
+            if (out_slot) *out_slot = i;
+            if (++s->fired >= s->count) s->mode = EVQ_IOM_NONE;   /* disarm after `count` fires */
         }
     }
     TR_UNLOCK();
     return act;
 }
 
+evq_iom_t evq_arm_io_hit(uint8_t writer, uint8_t op, unsigned *out_nth)
+{
+    return evq_arm_io_hit_p(writer, op, NULL, out_nth, NULL);
+}
+
 bool evq_arm_io_describe(char *buf, size_t cap)
 {
     TR_LOCK();
-    bool armed = s_io_mode != EVQ_IOM_NONE;
-    snprintf(buf, cap, "io_writer=%s io_op=%s io_mode=%s nth=%u count=%u hits=%u fired=%u",
-             s_io_w == EVQ_IO_ANY ? "any" : sd_diag_writer_name(s_io_w),
-             s_io_op == EVQ_IO_ANY ? "any" : sd_diag_op_name(s_io_op), evq_iom_name(s_io_mode),
-             s_io_nth, s_io_count, s_io_hits, s_io_fired);
+    bool armed = evq_arm_slots[0].mode != EVQ_IOM_NONE || evq_arm_slots[1].mode != EVQ_IOM_NONE;
+    int off = 0;
+    for (int i = 0; i < 2 && off >= 0 && (size_t)off < cap; i++) {
+        const evq_arm_slot_t *s = &evq_arm_slots[i];
+        off += snprintf(buf + off, cap - (size_t)off, "%sslot%c writer=%s op=%s mode=%s nth=%u count=%u hits=%u fired=%u path=%s",
+                        i ? " " : "", 'A' + i, s->w == EVQ_IO_ANY ? "any" : sd_diag_writer_name(s->w),
+                        s->op == EVQ_IO_ANY ? "any" : sd_diag_op_name(s->op), evq_iom_name(s->mode),
+                        s->nth, s->count, s->hits, s->fired, s->path[0] ? s->path : "-");
+    }
     TR_UNLOCK();
     return armed;
 }

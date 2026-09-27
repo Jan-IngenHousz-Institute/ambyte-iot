@@ -15,6 +15,9 @@
 #include "sd_diag.h"
 #include "sd_logger.h"
 #include "sd_shim.h"
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+#include "evq_hil_sdl.h"   /* Sprint 2 H2/H8b trace, host variant (SLT-1, ARM-1, QUI-1) */
+#endif
 
 /* sd_shim.h renames libc calls for the PRODUCTION TU; the driver wants the real ones. */
 #undef fopen
@@ -180,6 +183,30 @@ int main(int argc, char **argv)
             if (sd_diag_render_json(&db, dj, sizeof dj) > 0) printf(",\"diag\":%s", dj);
 #endif
             printf("}\n");
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+        } else if (strcmp(cmd, "trace_on") == 0) {
+            int rc = hil_sdl_trace_on(false);
+            printf("{\"trace_on\":%d}\n", rc);
+        } else if (strcmp(cmd, "trace_off") == 0) {
+            hil_sdl_trace_off();
+            printf("{\"trace_off\":1}\n");
+        } else if (strcmp(cmd, "trace_drain") == 0) {
+            hil_sdl_trace_drain();
+            printf("{\"drained\":1}\n");
+        } else if (strcmp(cmd, "autoarm") == 0) {
+            hil_sdl_autoarm_set();
+            printf("{\"autoarm\":1}\n");
+        } else if (strcmp(cmd, "power_on") == 0) {
+            int v = 0;
+            sscanf(line, "%*s %d", &v);
+            hil_sdl_host_power_on = v != 0;
+            printf("{\"power_on\":%d}\n", v);
+        } else if (strcmp(cmd, "boot_hook") == 0) {
+            hil_sdl_boot_hook();
+            printf("{\"boot_hook\":1}\n");
+        } else if (strcmp(cmd, "paused") == 0) {
+            printf("{\"paused\":%d}\n", sd_logger_hil_paused() ? 1 : 0);
+#endif
         } else if (strcmp(cmd, "quit") == 0) {
             break;
         } else if (cmd[0] != '\0') {

@@ -100,6 +100,21 @@ void evq_arm_io_set(uint8_t writer, uint8_t op, evq_iom_t mode, unsigned nth, un
 void evq_arm_io_clear(void);
 /* Called by a wrapper at every op: returns the action for THIS op. */
 evq_iom_t evq_arm_io_hit(uint8_t writer, uint8_t op, unsigned *out_nth);
+
+/* Two targeted slots (Sprint 2 H1). Why two: some recovery branches are only
+ * reachable when two DIFFERENT ops fail in one flow (sd_logger rollback after a
+ * failed sync, where the truncate must fail too, L-4b); one slot re-armed for
+ * the second op would replace the first. Why a path filter: several files share
+ * a writer/op (spool primary vs mirror renames), and `nth` alone depends on
+ * keeper ordering; the filter makes the target unambiguous and the fired line
+ * names the path, so a wrong-path firing is visible, never silently counted.
+ * Slot A = 0 (evq_arm_io_set_slot(0, ...) clears BOTH first), slot B = 1
+ * (refused, -1, unless A is armed and B is free). An op is offered to A, then B;
+ * a slot counts an op only when writer, op and (if set) the path substring all
+ * match; at most one slot fires per op (A first). */
+int  evq_arm_io_set_slot(int slot, uint8_t writer, uint8_t op, evq_iom_t mode, unsigned nth, unsigned count,
+                         const char *path_substr);
+evq_iom_t evq_arm_io_hit_p(uint8_t writer, uint8_t op, const char *path, unsigned *out_nth, int *out_slot);
 bool evq_arm_io_describe(char *buf, size_t cap);
 const char *evq_iom_name(evq_iom_t m);
 /* Stable output kind for a fired mode: injected_errno | short_write |

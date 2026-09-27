@@ -6,8 +6,13 @@ fail, short-write, or reset the CPU on demand. It must never ship: a fleet image
 still links it is one stray console line away from destroying data on a field card.
 So the RELEASE image is checked three independent ways, any one of which fails it:
 
-  * ELF .symtab has no `evq_hil` / `evq_arm` / `evq_tr_` symbol;
-  * firmware.bin has none of the fault command's literal strings;
+  * ELF .symtab has no symbol containing a HIL-only name part (`evq_hil`, `evq_arm`,
+    `evq_tr_`, plus the Sprint 2 sd_logger trace/inventory parts `hil_sdl`, `sdl_hil`,
+    `slt_`, `sd_logger_hil`);
+  * firmware.bin has none of the HIL commands' / markers' literal strings, and - the
+    Sprint 2 naming rule (contract r4 §2.2) - not even the byte PREFIXES `SDL_` / `SLT_`
+    anywhere: every sd_logger HIL marker starts with one of them, so a new marker that
+    leaks into the release image is caught without having to be listed here;
   * the build's effective generated config ($REL/config/sdkconfig.json, recorded and
     consumed by hash in the same evidence run) has AMBYTE_EVQ_HIL absent or false. The
     mutable source-worktree sdkconfig is never read: it can differ from what was built.
@@ -15,7 +20,10 @@ So the RELEASE image is checked three independent ways, any one of which fails i
 `--expect-wrapped` is the converse for the evq-hil image (C-36): the HIL build must
 actually route the new writers' SD calls through the `evq_hil_io_*` wrappers, proved
 per object by an UNDEFINED reference (the call site exists in that TU and is resolved
-to the wrapper at link time).
+to the wrapper at link time); and (Sprint 2 §2.2) the HIL ELF must carry every Sprint 2
+command and marker string - the converse proof that the strings the release scan bans
+are the ones the verification build really prints (a renamed marker would otherwise
+make the release scan vacuous).
 
 `--self-test` builds synthetic ELF/bin/json fixtures and proves the checks catch
 pollution (C-37 "`--self-test` fails on a polluted fixture").
@@ -37,8 +45,38 @@ SHT_STRTAB = 3
 SHT_NOBITS = 8
 SHN_UNDEF = 0
 
-FORBIDDEN_SYMBOL_PARTS = ("evq_hil", "evq_arm", "evq_tr_")
-FORBIDDEN_BIN_STRINGS = (b"HIL_FAULT", b"evq_hil", b"fault io", b"power_cut")
+FORBIDDEN_SYMBOL_PARTS = ("evq_hil", "evq_arm", "evq_tr_",
+                          # Sprint 2 (contract r4 §2.2): sd_logger trace / quiesce / inventory.
+                          # ISO-NAMES (tests/test_iso_names.py) makes every function or object
+                          # the Sprint 2 diff defines in HIL-only code carry one of these, so
+                          # this substring scan binds the whole HIL surface - including the
+                          # generic single-token trace labels (P, POP, WR, ...) that a string
+                          # scan cannot ban, because they are only emitted from such functions.
+                          "hil_sdl", "sdl_hil", "slt_", "sd_logger_hil")
+# Sprint 1 strings, then the Sprint 2 commands and markers (§2.2). The SDL_*/SLT_*
+# markers are also covered by the prefix ban below; they stay listed so a hit names
+# the marker instead of only the prefix.
+FORBIDDEN_BIN_STRINGS = (b"HIL_FAULT", b"evq_hil", b"fault io", b"power_cut", b"slot=",
+                         b"sdlog_emit", b"sdlog_inv", b"sdlog_dump", b"sdlog_trace", b"HILSDLOG",
+                         b"SDL_BEGIN", b"SDL_END", b"SDL_FF", b"SDL_FL", b"SDL_STATE", b"SDL_MORE",
+                         b"SDL_INVALID", b"SDL_TIMEOUT", b"SDL_B64", b"SDL_DUMP_END", b"SDL_Q",
+                         b"SLT_HDR", b"SLT_DRAIN", b"SLT_WM", b"SLT_ERR")
+# Byte prefixes banned ANYWHERE in the release image (naming rule, §2.2 ISO-NAMES).
+# A clean release build at 4ec9cef has no occurrence (checked against the Sprint 1
+# evidence run's build_rel/firmware.bin); if a future production string ever needed
+# one, the rule says rename the HIL marker, never relax this list.
+FORBIDDEN_BIN_PREFIXES = (b"SDL_", b"SLT_")
+# Exact PRODUCTION contexts of a forbidden string that predate the HIL marker and must
+# not be renamed (BLD-1 forbids touching production code for isolation). `slot=` is the
+# H1 fired-line field (` slot=<A|B>`), but event_log.c's window-frontier error already
+# prints "... slot=%u:%ld id=%lld ..." in every release image since 1.0.6. Only that
+# exact byte context is exempt; any other `slot=` (e.g. the HIL "slot=%c") still fails.
+ALLOWED_BIN_CONTEXTS = {b"slot=": (b"slot=%u:%ld",)}
+# --expect-wrapped: the HIL image must carry these (commands + markers, §2.2).
+REQUIRED_HIL_STRINGS = (b"HIL_FAULT", b"slot=", b"sdlog_emit", b"sdlog_inv", b"sdlog_dump", b"sdlog_trace",
+                        b"HILSDLOG", b"SDL_BEGIN", b"SDL_END", b"SDL_FF", b"SDL_FL", b"SDL_STATE",
+                        b"SDL_MORE", b"SDL_INVALID", b"SDL_TIMEOUT", b"SDL_B64", b"SDL_DUMP_END", b"SDL_Q",
+                        b"SLT_HDR", b"SLT_DRAIN", b"SLT_WM", b"SLT_ERR")
 HIL_CONFIG_KEYS = ("AMBYTE_EVQ_HIL", "CONFIG_AMBYTE_EVQ_HIL")
 # The three new SD writers that must be wrapped in the evq-hil image (§1 W2..W4).
 WRAPPED_OBJECTS = ("sd_logger.c", "ambit_stage.c", "ambit_flash_preflight.c")
@@ -202,19 +240,35 @@ def build_elf(sections: list[tuple], symbols: list[tuple[str, int]] | None = Non
 
 # --------------------------------------------------------------------------- checks
 
+def _count_forbidden(blob: bytes, needle: bytes) -> int:
+    """Occurrences of `needle` in `blob` minus the exempt production contexts."""
+    n = blob.count(needle)
+    for ctx in ALLOWED_BIN_CONTEXTS.get(needle, ()):
+        n -= blob.count(ctx)
+    return n
+
+
+def forbidden_bin_hits(blob: bytes) -> list[str]:
+    hits = [s.decode() for s in FORBIDDEN_BIN_STRINGS if _count_forbidden(blob, s) > 0]
+    hits += [f"prefix {p.decode()}" for p in FORBIDDEN_BIN_PREFIXES if p in blob]
+    return hits
+
+
 def check_release(elf: str, binf: str, cfg: str) -> list[tuple[bool, str]]:
     res: list[tuple[bool, str]] = []
     try:
         bad = sorted({n for n, _ in elf_symbols(elf) if any(p in n for p in FORBIDDEN_SYMBOL_PARTS)})
-        res.append((not bad, "ELF symbols: no evq_hil/evq_arm/evq_tr_"
+        res.append((not bad, "ELF symbols: no " + "/".join(FORBIDDEN_SYMBOL_PARTS)
                     + ("" if not bad else f" (found {', '.join(bad[:10])})")))
     except (OSError, ElfError) as e:
         res.append((False, f"ELF symbols: cannot read {elf}: {e}"))
     try:
         with open(binf, "rb") as f:
             blob = f.read()
-        hits = [s.decode() for s in FORBIDDEN_BIN_STRINGS if s in blob]
-        res.append((not hits, "bin strings: no HIL_FAULT/evq_hil/fault io/power_cut"
+        hits = forbidden_bin_hits(blob)
+        res.append((not hits, f"bin strings: none of {len(FORBIDDEN_BIN_STRINGS)} HIL strings "
+                    f"(HIL_FAULT/evq_hil/fault io/power_cut/slot=/sdlog_*/SDL_*/SLT_*), no "
+                    + "/".join(p.decode() for p in FORBIDDEN_BIN_PREFIXES) + " prefix"
                     + ("" if not hits else f" (found {', '.join(hits)})")))
     except OSError as e:
         res.append((False, f"bin strings: cannot read {binf}: {e}"))
@@ -248,6 +302,13 @@ def check_wrapped(elf: str, objdir: str) -> list[tuple[bool, str]]:
     try:
         hil = [n for n, _ in elf_symbols(elf) if "evq_hil" in n]
         res.append((bool(hil), f"HIL ELF links evq_hil code ({len(hil)} symbols)"))
+        # The ELF carries .rodata verbatim, so the command/marker literals are found in
+        # its raw bytes (no separate .bin needed; keeps the frozen CLI unchanged).
+        with open(elf, "rb") as f:
+            blob = f.read()
+        missing = [s.decode() for s in REQUIRED_HIL_STRINGS if s not in blob]
+        res.append((not missing, f"HIL ELF carries all {len(REQUIRED_HIL_STRINGS)} Sprint 2 command/marker strings"
+                    + ("" if not missing else f" (missing {', '.join(missing)})")))
     except (OSError, ElfError) as e:
         res.append((False, f"HIL ELF: cannot read {elf}: {e}"))
     if not os.path.isdir(objdir):
@@ -302,6 +363,20 @@ def self_test() -> list[tuple[bool, str]]:
         cfg_list = w("list.json", "[]")
         missing = os.path.join(td, "nope.json")
 
+        # One polluted fixture per forbidden pattern (contract r4 §2.2): each must fail alone.
+        for part in FORBIDDEN_SYMBOL_PARTS:
+            sym = f"x_{part}probe"
+            p_elf = w(f"sym-{part}.elf", build_elf([text], [("app_main", 1), (sym, 1)]))
+            expect(f"symbol containing {part!r}", check_release(p_elf, clean_bin, cfg_off), False)
+        for needle in FORBIDDEN_BIN_STRINGS + FORBIDDEN_BIN_PREFIXES:
+            tag = needle.decode().strip().replace(" ", "_").replace("=", "eq")
+            p_bin = w(f"str-{tag}.bin", b"\xe9" + b"release " + needle + b"probe" + b"\0" * 8)
+            expect(f"bin string {needle.decode()!r}", check_release(clean_elf, p_bin, cfg_off), False)
+        # The exempt production context passes; the HIL form of the same field fails.
+        prod_bin = w("slot-prod.bin", b"\xe9 window frontier mismatch: cursor=%u:%ld slot=%u:%ld id=%lld\0")
+        expect("production 'slot=%u:%ld' context", check_release(clean_elf, prod_bin, cfg_off), True)
+        both_bin = w("slot-both.bin", b"\xe9 slot=%u:%ld id \0 nth=%u slot=%c\0")
+        expect("HIL 'slot=%c' beside the production context", check_release(clean_elf, both_bin, cfg_off), False)
         expect("clean release", check_release(clean_elf, clean_bin, cfg_off), True)
         expect("clean release, key absent", check_release(clean_elf, clean_bin, cfg_abs), True)
         expect("evq_hil_fopen symbol", check_release(dirty_elf, clean_bin, cfg_off), False)
@@ -311,7 +386,9 @@ def self_test() -> list[tuple[bool, str]]:
         expect("sdkconfig.json malformed", check_release(clean_elf, clean_bin, cfg_bad), False)
         expect("sdkconfig.json not an object", check_release(clean_elf, clean_bin, cfg_list), False)
 
-        hil_elf = w("hil.elf", build_elf([text], [("app_main", 1), ("evq_hil_io_fopen_w", 1)]))
+        hil_rodata = (".flash.rodata", 1, 0x2, b"\0".join(REQUIRED_HIL_STRINGS) + b"\0")
+        hil_elf = w("hil.elf", build_elf([text, hil_rodata], [("app_main", 1), ("evq_hil_io_fopen_w", 1)]))
+        hil_elf_bare = w("hil-bare.elf", build_elf([text], [("app_main", 1), ("evq_hil_io_fopen_w", 1)]))
         wrapped = build_elf([text], [("writer", 1), ("evq_hil_io_fopen_w", SHN_UNDEF)], e_type=1)
         bare = build_elf([text], [("writer", 1), ("fopen", SHN_UNDEF)], e_type=1)
         good = os.path.join(td, "good")
@@ -330,6 +407,12 @@ def self_test() -> list[tuple[bool, str]]:
         expect("expect-wrapped one object unwrapped", check_wrapped(hil_elf, bad), False)
         expect("expect-wrapped one object missing", check_wrapped(hil_elf, partial), False)
         expect("expect-wrapped ELF without evq_hil", check_wrapped(clean_elf, good), False)
+        expect("expect-wrapped ELF without Sprint 2 strings", check_wrapped(hil_elf_bare, good), False)
+        for needle in REQUIRED_HIL_STRINGS:
+            rod = (".flash.rodata", 1, 0x2, b"\0".join(x for x in REQUIRED_HIL_STRINGS if x != needle) + b"\0")
+            tag = needle.decode().replace("=", "eq")
+            e_ = w(f"hil-no-{tag}.elf", build_elf([text, rod], [("app_main", 1), ("evq_hil_io_fopen_w", 1)]))
+            expect(f"expect-wrapped missing {needle.decode()!r}", check_wrapped(e_, good), False)
     return out
 
 

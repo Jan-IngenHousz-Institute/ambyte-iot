@@ -14,6 +14,7 @@
  * own internal program operation; this is NOT an electrical power cut and must
  * never be reported as one. No verified SD/board power switch exists. */
 #include "evq_hil_io_impl.h"
+#include "evq_hil_sdl.h"
 #include "event_log_hil.h"
 
 #include <dirent.h>
@@ -145,7 +146,7 @@ bool evq_hil_fault_last(evq_hil_last_view_t *out)
 
 /* Record + announce a fired targeted fault; reset kinds never return when
  * `reset_now`. */
-static void fired(evq_iom_t m, uint8_t w, uint8_t op, const char *path, int err, unsigned nth)
+static void fired(evq_iom_t m, uint8_t w, uint8_t op, const char *path, int err, unsigned nth, int slot)
 {
     memset(&s_last, 0, sizeof s_last);
     s_last.magic = HIL_LAST_MAGIC;
@@ -161,8 +162,9 @@ static void fired(evq_iom_t m, uint8_t w, uint8_t op, const char *path, int err,
     }
     s_last.crc = last_crc(&s_last);
     bool reset = m == EVQ_IOM_RESET_BEFORE || m == EVQ_IOM_RESET_AFTER || m == EVQ_IOM_RESET_MID_WRITE;
-    printf("\r\nHIL_FAULT fired kind=%s mode=%s writer=%s op=%s path=%s errno=%d nth=%u%s\r\n",
+    printf("\r\nHIL_FAULT fired kind=%s mode=%s writer=%s op=%s path=%s errno=%d nth=%u slot=%c%s\r\n",
            evq_iom_kind(m), evq_iom_name(m), sd_diag_writer_name(w), sd_diag_op_name(op), path ? path : "-", err, nth,
+           slot == 1 ? 'B' : 'A',
            reset ? " sd_power=not_interrupted mechanism=esp_rom_software_reset_system" : "");
     evq_tr_record(now_us(), EVQ_TR_FAULT, -err, nth, path, evq_iom_name(m));
 }
@@ -179,7 +181,7 @@ static void do_reset(void)
 /* Decide this op's fate. Legacy "next op" injection applies to event_log only.
  * Returns: 0 run normally; >0 inject that errno without running; or one of the
  * targeted modes via *mode (caller handles short/applied/reset). */
-static int take(uint8_t w, uint8_t op, const char *path, evq_iom_t *mode, unsigned *nth)
+static int take(uint8_t w, uint8_t op, const char *path, evq_iom_t *mode, unsigned *nth, int *slot)
 {
     *mode = EVQ_IOM_NONE;
     if (w == SD_DIAG_W_EVLOG) {
@@ -192,32 +194,33 @@ static int take(uint8_t w, uint8_t op, const char *path, evq_iom_t *mode, unsign
         }
         if (legacy > 0) return legacy;
     }
-    evq_iom_t m = evq_arm_io_hit(w, op, nth);
+    *slot = 0;
+    evq_iom_t m = evq_arm_io_hit_p(w, op, path, nth, slot);
     if (m == EVQ_IOM_EIO || m == EVQ_IOM_ENOSPC) {
         int e = m == EVQ_IOM_EIO ? EIO : ENOSPC;
-        fired(m, w, op, path, e, *nth);
+        fired(m, w, op, path, e, *nth, *slot);
         return e;
     }
     if (m == EVQ_IOM_RESET_BEFORE) {
-        fired(m, w, op, path, 0, *nth);
+        fired(m, w, op, path, 0, *nth, *slot);
         do_reset();
     }
     *mode = m;
     return 0;
 }
 
-static void after(evq_iom_t m, uint8_t w, uint8_t op, const char *path, unsigned nth)
+static void after(evq_iom_t m, uint8_t w, uint8_t op, const char *path, unsigned nth, int slot)
 {
     if (m == EVQ_IOM_RESET_AFTER) {
-        fired(m, w, op, path, 0, nth);
+        fired(m, w, op, path, 0, nth, slot);
         do_reset();
     }
 }
 
 /* Applied-then-error: the op ran; report it failed. Returns -1 with errno=EIO. */
-static int applied(uint8_t w, uint8_t op, const char *path, unsigned nth)
+static int applied(uint8_t w, uint8_t op, const char *path, unsigned nth, int slot)
 {
-    fired(EVQ_IOM_APPLIED_EIO, w, op, path, EIO, nth);
+    fired(EVQ_IOM_APPLIED_EIO, w, op, path, EIO, nth, slot);
     errno = EIO;
     return -1;
 }
@@ -228,8 +231,8 @@ FILE *evq_hil_io_fopen_w(uint8_t w, const char *path, const char *mode)
     bool wr = strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+');
     evq_io_counters_t *c = evq_io_counters();
     if (k == 1 || k == 2) { if (wr) c->sd_write_open++; else c->sd_read_open++; }
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_OPEN, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_OPEN, path, &m, &nth, &slot);
     if (inj > 0) {
         errno = inj;
         if (relevant(k)) evq_tr_record(now_us(), wr ? EVQ_TR_OPEN_W : EVQ_TR_OPEN_R, -inj, 0, path, "injected");
@@ -252,7 +255,7 @@ FILE *evq_hil_io_fopen_w(uint8_t w, const char *path, const char *mode)
             }
         }
     }
-    after(m, w, SD_DIAG_OP_OPEN, path, nth);
+    after(m, w, SD_DIAG_OP_OPEN, path, nth, slot);
     if (f == NULL) errno = e;
     return f;
 }
@@ -262,8 +265,8 @@ int evq_hil_io_fclose_w(uint8_t w, FILE *f)
     hil_of_t *o = of_find(f);
     char path[64];
     snprintf(path, sizeof path, "%s", o ? o->path : "-");
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_CLOSE, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_CLOSE, path, &m, &nth, &slot);
     if (inj > 0) {
         /* A refused close still releases the stream (C stdio: fclose always
          * disassociates it) — callers must never touch it again. */
@@ -281,8 +284,8 @@ int evq_hil_io_fclose_w(uint8_t w, FILE *f)
         if (o->writable && (o->kind == 1 || o->kind == 2)) evq_io_counters()->sd_mut++;
         o->f = NULL;
     }
-    after(m, w, SD_DIAG_OP_CLOSE, path, nth);
-    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) { (void)applied(w, SD_DIAG_OP_CLOSE, path, nth); return EOF; }
+    after(m, w, SD_DIAG_OP_CLOSE, path, nth, slot);
+    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) { (void)applied(w, SD_DIAG_OP_CLOSE, path, nth, slot); return EOF; }
     if (rc != 0) errno = e;
     return rc;
 }
@@ -291,15 +294,22 @@ size_t evq_hil_io_fwrite_w(uint8_t w, const void *p, size_t sz, size_t n, FILE *
 {
     hil_of_t *o = of_find(f);
     const char *path = o ? o->path : "-";
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_WRITE, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_WRITE, path, &m, &nth, &slot);
     if (m == EVQ_IOM_RESET_MID_WRITE) {
-        size_t half = (sz * n) / 2;
+        size_t total = sz * n, half = total / 2;
+        struct stat wst;
+        uint32_t off_before = fstat(fileno(f), &wst) == 0 ? (uint32_t)wst.st_size : 0;
         (void)fwrite(p, 1, half, f);
         fflush(f);
         fsync(fileno(f));
         if (nth == 0) evq_hil_rom_reset("fwrite_inside");      /* legacy reset_inside */
-        fired(m, w, SD_DIAG_OP_WRITE, path, 0, nth);
+        /* H8a: the exact chunk (and so the torn tail = chunk[0:half]) plus every
+         * undrained logger-trace entry, printed synchronously BEFORE the reset —
+         * PSRAM does not survive it, so this is the only pre-reset byte witness.
+         * No file I/O; the reset kind is unchanged (CPU reset, SD powered). */
+        if (w == SD_DIAG_W_SDLOG) hil_sdl_reset_witness(path, off_before, p, total, half);
+        fired(m, w, SD_DIAG_OP_WRITE, path, 0, nth, slot);
         do_reset();
     }
     if (inj > 0) {
@@ -312,7 +322,7 @@ size_t evq_hil_io_fwrite_w(uint8_t w, const void *p, size_t sz, size_t n, FILE *
         size_t got = fwrite(p, 1, half, f);
         fflush(f);
         if (o) { o->err = true; o->bytes += (uint32_t)got; }
-        fired(m, w, SD_DIAG_OP_WRITE, path, EIO, nth);
+        fired(m, w, SD_DIAG_OP_WRITE, path, EIO, nth, slot);
         errno = EIO;
         return sz ? got / sz : 0;
     }
@@ -330,7 +340,7 @@ size_t evq_hil_io_fwrite_w(uint8_t w, const void *p, size_t sz, size_t n, FILE *
             evq_tr_record(now_us(), EVQ_TR_IDX_WRITE, 0, (uint32_t)(wr * sz), o->path, pre);
         }
     }
-    after(m, w, SD_DIAG_OP_WRITE, path, nth);
+    after(m, w, SD_DIAG_OP_WRITE, path, nth, slot);
     return wr;
 }
 
@@ -338,8 +348,8 @@ size_t evq_hil_io_fread_w(uint8_t w, void *p, size_t sz, size_t n, FILE *f)
 {
     hil_of_t *o = of_find(f);
     const char *path = o ? o->path : "-";
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_READ, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_READ, path, &m, &nth, &slot);
     if (inj > 0) {
         if (o) o->err = true;
         errno = inj;
@@ -347,7 +357,7 @@ size_t evq_hil_io_fread_w(uint8_t w, void *p, size_t sz, size_t n, FILE *f)
     }
     size_t r = fread(p, sz, n, f);
     if (o != NULL) o->bytes += (uint32_t)(r * sz);
-    after(m, w, SD_DIAG_OP_READ, path, nth);
+    after(m, w, SD_DIAG_OP_READ, path, nth, slot);
     return r;
 }
 
@@ -355,20 +365,20 @@ int evq_hil_io_fflush_w(uint8_t w, FILE *f)
 {
     hil_of_t *o = of_find(f);
     const char *path = o ? o->path : "-";
-    evq_iom_t m; unsigned nth = 0;
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
     /* Legacy named points never injected on fflush (event_log's durability is
      * decided by fsync); keep that behaviour for them. */
-    int inj = (w == SD_DIAG_W_EVLOG) ? 0 : take(w, SD_DIAG_OP_FLUSH, path, &m, &nth);
+    int inj = (w == SD_DIAG_W_EVLOG) ? 0 : take(w, SD_DIAG_OP_FLUSH, path, &m, &nth, &slot);
     if (w == SD_DIAG_W_EVLOG) { m = evq_arm_io_hit(w, SD_DIAG_OP_FLUSH, &nth);
-        if (m == EVQ_IOM_EIO || m == EVQ_IOM_ENOSPC) { inj = m == EVQ_IOM_EIO ? EIO : ENOSPC; fired(m, w, SD_DIAG_OP_FLUSH, path, inj, nth); }
-        else if (m == EVQ_IOM_RESET_BEFORE) { fired(m, w, SD_DIAG_OP_FLUSH, path, 0, nth); do_reset(); } }
+        if (m == EVQ_IOM_EIO || m == EVQ_IOM_ENOSPC) { inj = m == EVQ_IOM_EIO ? EIO : ENOSPC; fired(m, w, SD_DIAG_OP_FLUSH, path, inj, nth, slot); }
+        else if (m == EVQ_IOM_RESET_BEFORE) { fired(m, w, SD_DIAG_OP_FLUSH, path, 0, nth, slot); do_reset(); } }
     if (inj > 0) {
         if (o) o->err = true;
         errno = inj;
         return EOF;
     }
     int rc = fflush(f);
-    after(m, w, SD_DIAG_OP_FLUSH, path, nth);
+    after(m, w, SD_DIAG_OP_FLUSH, path, nth, slot);
     return rc;
 }
 
@@ -376,8 +386,8 @@ int evq_hil_io_fsync_w(uint8_t w, int fd)
 {
     hil_of_t *o = of_find_fd(fd);
     const char *path = o ? o->path : "-";
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_FSYNC, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_FSYNC, path, &m, &nth, &slot);
     if (inj > 0) {
         if (o) o->err = true;
         errno = inj;
@@ -391,8 +401,8 @@ int evq_hil_io_fsync_w(uint8_t w, int fd)
         if (relevant(o->kind) && o->kind != 4) evq_tr_record(now_us(), EVQ_TR_FSYNC, -e, o->bytes, o->path, NULL);
         if (o->kind == 1 || o->kind == 2) evq_io_counters()->sd_mut++;
     }
-    after(m, w, SD_DIAG_OP_FSYNC, path, nth);
-    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_FSYNC, path, nth);
+    after(m, w, SD_DIAG_OP_FSYNC, path, nth, slot);
+    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_FSYNC, path, nth, slot);
     if (rc != 0) errno = e;
     return rc;
 }
@@ -401,13 +411,13 @@ int evq_hil_io_ftruncate_w(uint8_t w, int fd, off_t len)
 {
     hil_of_t *o = of_find_fd(fd);
     const char *path = o ? o->path : "-";
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_TRUNCATE, path, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_TRUNCATE, path, &m, &nth, &slot);
     if (inj > 0) { errno = inj; return -1; }
     int rc = ftruncate(fd, len);
     int e = rc == 0 ? 0 : errno;
-    after(m, w, SD_DIAG_OP_TRUNCATE, path, nth);
-    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_TRUNCATE, path, nth);
+    after(m, w, SD_DIAG_OP_TRUNCATE, path, nth, slot);
+    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_TRUNCATE, path, nth, slot);
     if (rc != 0) errno = e;
     return rc;
 }
@@ -415,8 +425,8 @@ int evq_hil_io_ftruncate_w(uint8_t w, int fd, off_t len)
 int evq_hil_io_rename_w(uint8_t w, const char *a, const char *b)
 {
     uint8_t k = classify(a);
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_RENAME, a, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_RENAME, a, &m, &nth, &slot);
     if (m == EVQ_IOM_RESET_BEFORE && nth == 0) evq_hil_rom_reset("rename_inside");   /* legacy reset_inside */
     if (inj > 0) { errno = inj; if (relevant(k)) evq_tr_record(now_us(), EVQ_TR_RENAME, -inj, 0, a, b); return -1; }
     int rc = rename(a, b);
@@ -424,8 +434,8 @@ int evq_hil_io_rename_w(uint8_t w, const char *a, const char *b)
     if (relevant(k) || relevant(classify(b))) evq_tr_record(now_us(), EVQ_TR_RENAME, -e, 0, a, b);
     if (k == 1 || k == 2) evq_io_counters()->sd_mut++;
     else if (k == 3 || k == 4) evq_io_counters()->flash_mut++;
-    after(m, w, SD_DIAG_OP_RENAME, a, nth);
-    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_RENAME, a, nth);
+    after(m, w, SD_DIAG_OP_RENAME, a, nth, slot);
+    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_RENAME, a, nth, slot);
     if (rc != 0) errno = e;
     return rc;
 }
@@ -433,8 +443,8 @@ int evq_hil_io_rename_w(uint8_t w, const char *a, const char *b)
 int evq_hil_io_remove_w(uint8_t w, const char *p)
 {
     uint8_t k = classify(p);
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_REMOVE, p, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_REMOVE, p, &m, &nth, &slot);
     if (m == EVQ_IOM_RESET_BEFORE && nth == 0) evq_hil_rom_reset("remove_inside");   /* legacy reset_inside */
     if (inj > 0) { errno = inj; if (relevant(k)) evq_tr_record(now_us(), EVQ_TR_REMOVE, -inj, 0, p, "injected"); return -1; }
     int rc = remove(p);
@@ -442,8 +452,8 @@ int evq_hil_io_remove_w(uint8_t w, const char *p)
     if (relevant(k)) evq_tr_record(now_us(), EVQ_TR_REMOVE, -e, 0, p, NULL);
     if (k == 1 || k == 2) evq_io_counters()->sd_mut++;
     else if (k != 0) evq_io_counters()->flash_mut++;
-    after(m, w, SD_DIAG_OP_REMOVE, p, nth);
-    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_REMOVE, p, nth);
+    after(m, w, SD_DIAG_OP_REMOVE, p, nth, slot);
+    if (rc == 0 && m == EVQ_IOM_APPLIED_EIO) return applied(w, SD_DIAG_OP_REMOVE, p, nth, slot);
     if (rc != 0) errno = e;
     return rc;
 }
@@ -451,14 +461,14 @@ int evq_hil_io_remove_w(uint8_t w, const char *p)
 int evq_hil_io_mkdir_w(uint8_t w, const char *p, mode_t md)
 {
     uint8_t k = classify(p);
-    evq_iom_t m; unsigned nth = 0;
-    int inj = take(w, SD_DIAG_OP_MKDIR, p, &m, &nth);
+    evq_iom_t m; unsigned nth = 0; int slot = 0;
+    int inj = take(w, SD_DIAG_OP_MKDIR, p, &m, &nth, &slot);
     if (inj > 0) { errno = inj; return -1; }
     int rc = mkdir(p, md);
     int e = rc == 0 ? 0 : errno;
     if (relevant(k)) evq_tr_record(now_us(), EVQ_TR_MKDIR, -e, 0, p, NULL);
     if ((k == 1 || k == 2) && rc == 0) evq_io_counters()->sd_mut++;
-    after(m, w, SD_DIAG_OP_MKDIR, p, nth);
+    after(m, w, SD_DIAG_OP_MKDIR, p, nth, slot);
     if (rc != 0) errno = e;
     return rc;
 }
@@ -468,17 +478,17 @@ int evq_hil_io_stat_w(uint8_t w, const char *p, struct stat *st)
     uint8_t k = classify(p);
     if (k == 1 || k == 2) evq_io_counters()->sd_read_open++;   /* any SD access counts */
     /* Legacy named points never failed stat; only a targeted arm can. */
-    unsigned nth = 0;
+    unsigned nth = 0; int slot = 0;
     evq_iom_t m = evq_arm_io_hit(w, SD_DIAG_OP_STAT, &nth);
     if (m == EVQ_IOM_EIO || m == EVQ_IOM_ENOSPC) {
         int e = m == EVQ_IOM_EIO ? EIO : ENOSPC;
-        fired(m, w, SD_DIAG_OP_STAT, p, e, nth);
+        fired(m, w, SD_DIAG_OP_STAT, p, e, nth, slot);
         errno = e;
         return -1;
     }
-    if (m == EVQ_IOM_RESET_BEFORE) { fired(m, w, SD_DIAG_OP_STAT, p, 0, nth); do_reset(); }
+    if (m == EVQ_IOM_RESET_BEFORE) { fired(m, w, SD_DIAG_OP_STAT, p, 0, nth, slot); do_reset(); }
     int rc = stat(p, st);
-    after(m, w, SD_DIAG_OP_STAT, p, nth);
+    after(m, w, SD_DIAG_OP_STAT, p, nth, slot);
     return rc;
 }
 
