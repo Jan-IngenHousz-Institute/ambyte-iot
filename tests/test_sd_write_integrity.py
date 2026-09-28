@@ -22,7 +22,9 @@ if os.path.basename(CC) == "cc":
     CC = shutil.which("clang") or "clang"
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 BASE_REV = "e1ca6ee"
-BASE_REV_S1 = "4ec9cef"   # Sprint 1 settled commit: the pre-Sprint-2 HIL semantics
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pinned_revs  # noqa: E402
+BASE_REV_S1 = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # Sprint 1 settled commit (4ec9cef or its re-signed twin)
 
 
 def _build(srcs, incs, defs, out: Path) -> Path:

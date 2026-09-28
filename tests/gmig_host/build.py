@@ -35,12 +35,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / "tests" / "gmig_host"
 OLD_REV = "v1.11.0"
-DEFAULT_NEW_REV = "6fcbeba"
+sys.path.insert(0, str(ROOT / "tests"))
+import pinned_revs  # noqa: E402
+DEFAULT_NEW_REV = pinned_revs.resolve(pinned_revs.C2)   # 6fcbeba (C2) or its re-signed twin
 
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
 REWRITES = [('"/evstore"', '"./evstore"'), ('"/sdcard/', '"./sdcard/')]

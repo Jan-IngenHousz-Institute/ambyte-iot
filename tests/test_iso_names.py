@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import unittest
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = "4ec9cef"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pinned_revs  # noqa: E402
+BASE = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # 4ec9cef or its re-signed twin (same tree)
 SYMBOL_PARTS = ("evq_hil", "evq_arm", "evq_tr_", "hil_sdl", "sdl_hil", "slt_", "sd_logger_hil")
 HIL_PATHS = (re.compile(r"^components/evq_hil/"), re.compile(r"^components/event_log/evq_hil_"),
              re.compile(r"^components/event_log/include/evq_hil_"))
