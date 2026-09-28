@@ -387,7 +387,8 @@ int evq_hil_sdlog_cmd(int argc, char **argv)
         if (strcmp(a, "drain") == 0) { hil_sdl_trace_drain(); return 0; }
         if (strcmp(a, "stat") == 0) { hil_sdl_trace_stat(); return 0; }
         if (strcmp(a, "autoarm") == 0) { hil_sdl_autoarm_set(); return 0; }
-        printf("SDL_ERR usage: sdlog_trace <on|off|drain|stat|autoarm>\n");
+        if (strcmp(a, "probe") == 0 && argc >= 4) return hil_sdl_trace_probe((size_t)strtoul(argv[3], NULL, 0)) == 0 ? 0 : 1;
+        printf("SDL_ERR usage: sdlog_trace <on|off|drain|stat|autoarm|probe <min_free>>\n");
         return 1;
     }
     bool inv = strcmp(sub, "sdlog_inv") == 0, dump = strcmp(sub, "sdlog_dump") == 0;

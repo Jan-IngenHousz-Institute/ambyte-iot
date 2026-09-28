@@ -36,10 +36,17 @@ enum { HIL_SDL_CLOSE_OK = 0, HIL_SDL_CLOSE_ERR = 1, HIL_SDL_CLOSE_ABANDON = 2 };
 enum { HIL_SDL_DROP_ROTATE_BLOCKED = 0, HIL_SDL_DROP_UNAVAILABLE = 1 };
 enum { HIL_SDL_QUI_PAUSED = 0, HIL_SDL_QUI_RESUMED = 1, HIL_SDL_QUI_TIMEOUT = 2, HIL_SDL_QUI_REFUSED = 3 };
 
-#define HIL_SDL_CAP_BYTES (2u * 1024u * 1024u)
+/* 512 KiB (replacement amendment A3): the E8:F6:0A bench carries 2 MiB of PSRAM,
+ * so the original 2 MiB ring cannot coexist with the event log's record buffers.
+ * Worst case ~135 KiB per 10 s drain interval vs the 256 KiB STOP line = ~1.9x. */
+#define HIL_SDL_CAP_BYTES (512u * 1024u)
+/* `on` refuses (SLT_ERR noalloc, ring freed) unless this much PSRAM stays free
+ * after the ring is allocated: tracing must not starve the store it observes. */
+#define HIL_SDL_MIN_FREE_PSRAM (256u * 1024u)
 
 /* ── control (CLI) ── */
 int  hil_sdl_trace_on(bool autoarm);     /* 0 ok, -1 noalloc (prints SLT_ON / SLT_ERR) */
+int  hil_sdl_trace_probe(size_t min_free);   /* G-TR: SLT_PROBE ... ok|noalloc, never records */
 void hil_sdl_trace_off(void);
 void hil_sdl_trace_drain(void);          /* SLT_DRAIN, SLT_E..., SLT_HDR */
 void hil_sdl_trace_stat(void);
@@ -47,6 +54,7 @@ void hil_sdl_autoarm_set(void);          /* RTC one-shot for the next boot */
 void hil_sdl_boot_hook(void);            /* start of sd_logger_init: honour a valid autoarm (not after power-on) */
 #ifdef EVQ_HIL_HOST
 extern bool hil_sdl_host_power_on;       /* host harness: simulate a power-on boot */
+extern size_t hil_sdl_host_free_psram;   /* host harness: free PSRAM after an allocation */
 #endif
 
 /* ── hooks (sd_logger.c) ── */

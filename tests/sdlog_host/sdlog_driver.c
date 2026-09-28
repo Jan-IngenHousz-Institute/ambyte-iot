@@ -187,6 +187,15 @@ int main(int argc, char **argv)
         } else if (strcmp(cmd, "trace_on") == 0) {
             int rc = hil_sdl_trace_on(false);
             printf("{\"trace_on\":%d}\n", rc);
+        } else if (strcmp(cmd, "free_psram") == 0) {
+            unsigned long v = 0;
+            sscanf(line, "%*s %lu", &v);
+            hil_sdl_host_free_psram = (size_t)v;
+            printf("{\"free_psram\":%lu}\n", v);
+        } else if (strcmp(cmd, "trace_probe") == 0) {
+            unsigned long v = 0;
+            sscanf(line, "%*s %lu", &v);
+            printf("{\"trace_probe\":%d}\n", hil_sdl_trace_probe((size_t)v));
         } else if (strcmp(cmd, "trace_off") == 0) {
             hil_sdl_trace_off();
             printf("{\"trace_off\":1}\n");

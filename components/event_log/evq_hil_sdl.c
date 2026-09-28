@@ -23,6 +23,8 @@ static int64_t slt_now_us(void)
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 static void *slt_alloc(size_t n) { return malloc(n); }
+size_t hil_sdl_host_free_psram = 4u * 1024u * 1024u;   /* host harness: simulated free PSRAM */
+static size_t slt_free_psram(void) { return hil_sdl_host_free_psram; }
 static void slt_flush_out(void) { fflush(stdout); }
 #define SLT_RTC_NOINIT
 #else
@@ -45,6 +47,7 @@ static bool slt_drain_take(int wait_ms)
 static void slt_drain_give(void) { xSemaphoreGive(slt_drain_mtx); }
 static int64_t slt_now_us(void) { return esp_timer_get_time(); }
 static void *slt_alloc(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+static size_t slt_free_psram(void) { return heap_caps_get_free_size(MALLOC_CAP_SPIRAM); }
 static void slt_flush_out(void)
 {
     /* Give the USB-serial-JTAG FIFO time to empty: evidence printed right before
@@ -271,11 +274,37 @@ void hil_sdl_ev(int kind, uint32_t a, uint32_t b, uint32_t c, const char *name)
 
 /* ── control ─────────────────────────────────────────────────────────────── */
 
+/* Allocate the ring once, fail closed (A3): a ring that would leave less than
+ * `min_free` PSRAM free is released again, so a refusal leaves the heap exactly
+ * as it was. 0 ok (ring present), -1 refused. */
+static int slt_ring_alloc(size_t min_free)
+{
+    if (slt_buf != NULL) return 0;
+    slt_buf = slt_alloc(HIL_SDL_CAP_BYTES);
+    if (slt_buf != NULL && slt_free_psram() < min_free) {
+        free(slt_buf);
+        slt_buf = NULL;
+    }
+    return slt_buf != NULL ? 0 : -1;
+}
+
+/* G-TR fail-closed check: exercise the same allocation with a caller-chosen
+ * floor, without starting to record. `probe <huge>` must refuse and leave
+ * free PSRAM unchanged; the ring, if it is kept, is the one `on` then uses. */
+int hil_sdl_trace_probe(size_t min_free)
+{
+    bool had = slt_buf != NULL;
+    size_t before = slt_free_psram();
+    int rc = slt_ring_alloc(min_free);
+    printf("SLT_PROBE need=%u before=%u after=%u ring=%s %s\n", (unsigned)min_free, (unsigned)before,
+           (unsigned)slt_free_psram(), had ? "kept" : (rc == 0 ? "new" : "none"), rc == 0 ? "ok" : "noalloc");
+    return rc;
+}
+
 int hil_sdl_trace_on(bool autoarm)
 {
-    if (slt_buf == NULL) slt_buf = slt_alloc(HIL_SDL_CAP_BYTES);
-    if (slt_buf == NULL) {
-        printf("SLT_ERR noalloc\n");
+    if (slt_ring_alloc(HIL_SDL_MIN_FREE_PSRAM) != 0) {
+        printf("SLT_ERR noalloc free=%u\n", (unsigned)slt_free_psram());
         return -1;
     }
     SLT_LOCK();

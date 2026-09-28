@@ -12,10 +12,17 @@ console; parsers must accept `\n` or `\r\n` and ignore unrelated interleaved
 console lines. Integers are decimal; `<us>` is `esp_timer_get_time()`; `<sha>`
 is lowercase hex sha256; `<b64>` is standard base64 with padding, no line breaks.
 
-## Logger trace (H2) — `evq_hil sdlog_trace <on|off|drain|autoarm|stat>`
+## Logger trace (H2) — `evq_hil sdlog_trace <on|off|drain|autoarm|stat|probe <min_free>>`
 
-- `on` allocates a 2 MiB PSRAM byte ring (once) and starts recording:
-  `SLT_ON <cap_bytes> <next_seq>`; allocation failure: `SLT_ERR noalloc`.
+- `on` allocates a 512 KiB PSRAM byte ring (once) and starts recording:
+  `SLT_ON <cap_bytes> <next_seq>`. The allocation fails closed: if less than
+  256 KiB of PSRAM would stay free, the ring is released again and `on` prints
+  `SLT_ERR noalloc free=<bytes>` (replacement amendment A3: the E8:F6:0A bench
+  has 2 MiB of PSRAM, so the original 2 MiB ring is not possible there).
+- `probe <min_free>` runs the same allocation with a caller-chosen floor, but
+  does not start recording (G-TR fail-closed check):
+  `SLT_PROBE need=<min_free> before=<free> after=<free> ring=<new|kept|none> <ok|noalloc>`.
+  `probe 1073741824` must answer `ring=none noalloc` with `after == before`.
 - `off` stops recording: `SLT_OFF <next_seq>`. Undrained entries stay drainable.
 - `drain` prints every undrained entry, then the header:
   ```

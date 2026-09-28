@@ -277,6 +277,7 @@ static void do_stacks(void)
 
 /* ── command ── */
 int evq_hil_sdlog_cmd(int argc, char **argv);
+int evq_hil_ambit_cmd(int argc, char **argv);
 
 static void usage(void)
 {
@@ -288,7 +289,9 @@ static void usage(void)
            "                 [nth] [count] [path=<substr>] | fault io add <same> (slot B) | fault last | power_cut |\n"
            "        reserve <bytes|off> | cid <hex|off> | boot_slot <ota_0|ota_1> |\n"
            "        sdlog_trace <on|off|drain|stat|autoarm> | sdlog_emit <run> <k0> <n> <hz> <pad> |\n"
-           "        sdlog_inv [<name> <from_off>] | sdlog_dump <name> [<from_off>] | diag\n"
+           "        sdlog_inv [<name> <from_off>] | sdlog_dump <name> [<from_off>] | diag |\n"
+           "        sdlog_trace probe <min_free> | ambit_sync <hold|release|status> | ambit_nvsdump <ch> <tag> |\n"
+           "        ambit_stage <ver> <region> <url> <sha> <size> | ambit_stage commit <ver> <4 x sha>\n"
            "  every reset mode is a CPU reset (esp_rom_software_reset_system): SD power is NOT interrupted\n");
 }
 
@@ -298,6 +301,10 @@ static int evq_hil_cmd(int argc, char **argv)
     const char *sub = argv[1];
     if (strncmp(sub, "sdlog_", 6) == 0) {
         int r = evq_hil_sdlog_cmd(argc, argv);     /* Sprint 2 H2-H8: evq_hil_sdlog.c */
+        if (r >= 0) return r;
+    }
+    if (strncmp(sub, "ambit_", 6) == 0) {
+        int r = evq_hil_ambit_cmd(argc, argv);     /* replacement amendment A6: evq_hil_ambit.c */
         if (r >= 0) return r;
     }
     if (strcmp(sub, "fill") == 0) {

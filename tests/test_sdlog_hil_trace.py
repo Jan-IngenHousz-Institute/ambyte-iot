@@ -220,6 +220,51 @@ def _shim_fired(dev: L.Dev) -> list[dict]:
     return out
 
 
+class Gtr1(_Base):
+    """G-TR host twin (replacement amendment A3): the 512 KiB ring allocates only
+    when >= 256 KiB PSRAM stays free (refusal leaves no ring), the 25 % watermark
+    fires once at the new cap, and a drain is seq-contiguous with lost=0."""
+
+    def test_fail_closed_allocation(self):
+        d = self.dev("gtr_alloc")
+        d.cmd("free_psram 100000", expect=True)
+        self.assertEqual(d.cmd("trace_on", expect=True)["trace_on"], -1)
+        self.assertTrue(any(ln.startswith("SLT_ERR noalloc") for ln in d.trace), d.trace)
+        self.assertEqual(d.cmd("trace_probe 1073741824", expect=True)["trace_probe"], -1)
+        self.assertTrue(any(re.match(r"^SLT_PROBE need=1073741824 .* ring=none noalloc$", ln) for ln in d.trace),
+                        d.trace)
+        self.assertFalse(any(ln.startswith("SLT_ON ") for ln in d.trace), d.trace)
+        d.cmd("free_psram 4194304", expect=True)
+        self.assertEqual(d.cmd("trace_on", expect=True)["trace_on"], 0)
+        self.assertTrue(any(re.match(rf"^SLT_ON {512 * 1024} \d+$", ln) for ln in d.trace), d.trace)
+        d.finish()
+
+    def test_watermark_and_lossless_drain_at_512k(self):
+        d = self.dev("gtr_wm")
+        d.init()
+        d.cmd("trace_on", expect=True)
+        seq = 0
+        while not any(ln.startswith("SLT_WM ") for ln in d.trace) and seq < 4000:
+            d.log(seq, textlen=200)
+            seq += 1
+            if seq % 16 == 0:
+                d.step(1)
+        wm = [int(ln.split()[1]) for ln in d.trace if ln.startswith("SLT_WM ")]
+        self.assertEqual(len(wm), 1, d.trace[-5:])
+        self.assertGreaterEqual(wm[0] * 4, 512 * 1024)
+        self.assertLess(wm[0] * 2, 512 * 1024)                  # well below the 50 % STOP line
+        d.cmd("trace_drain", expect=True)
+        seqs = [int(e[2]) for e in _entries(d.trace)]
+        self.assertTrue(seqs)
+        self.assertEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))
+        hdr = [ln.split() for ln in d.trace if ln.startswith("SLT_HDR ")]
+        self.assertTrue(hdr, d.trace[-5:])
+        total, lost, first, last = (int(x) for x in hdr[-1][1:5])
+        self.assertEqual(lost, 0)
+        self.assertEqual((first, last), (seqs[0], seqs[-1]))
+        d.finish()
+
+
 class Slt1(_Base):
     """SLT-1: for every Sprint-1 sd_logger scenario SL1..SL21, the replay model applied
     to the recorded trace reproduces every log file the harness left, byte for byte."""
