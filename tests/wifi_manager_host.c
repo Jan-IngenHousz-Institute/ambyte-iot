@@ -44,6 +44,12 @@ static struct wm_stub_netif g_netif;
 
 static uint8_t g_stored_ssid[32];
 static int g_connect_calls;
+static int g_set_config_calls;     /* every persisted esp_wifi config rewrite */
+/* Driver association state, for esp_wifi_disconnect()'s IDF 5.5 behaviour:
+ * ESP_OK either way; a STA_DISCONNECTED(ASSOC_LEAVE) event only if associated.
+ * (IDF 5.5 does not document ESP_ERR_WIFI_NOT_CONNECT for it, and the
+ * 2026-09-28 bench join on an unassociated station logged no event.) */
+static bool g_associated;
 
 /* Script for successive esp_wifi_connect() calls: each entry is the event the
  * "driver" posts in response. >0 = STA_DISCONNECTED with that reason,
@@ -202,6 +208,7 @@ esp_err_t esp_wifi_set_ps(wifi_ps_type_t t) { (void)t; return ESP_OK; }
 esp_err_t esp_wifi_set_config(wifi_interface_t i, wifi_config_t *c)
 {
     (void)i;
+    g_set_config_calls++;
     memcpy(g_stored_ssid, c->sta.ssid, sizeof(g_stored_ssid));
     return ESP_OK;
 }
@@ -221,7 +228,14 @@ esp_err_t esp_wifi_connect(void)
     }
     return ESP_OK;
 }
-esp_err_t esp_wifi_disconnect(void) { return ESP_ERR_WIFI_NOT_CONNECT; }
+esp_err_t esp_wifi_disconnect(void)
+{
+    if (g_associated) {
+        CHECK(g_pending_len < PENDING_MAX);
+        g_pending[g_pending_len++] = WIFI_REASON_ASSOC_LEAVE;
+    }
+    return ESP_OK;
+}
 esp_err_t esp_wifi_restore(void) { return ESP_OK; }
 
 /* ── Event delivery helpers ─────────────────────────────────────────────── */
@@ -231,11 +245,13 @@ static void ev_disconnect(int reason)
     wifi_event_sta_disconnected_t d;
     memset(&d, 0, sizeof(d));
     d.reason = (uint8_t)reason;
+    g_associated = false;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &d);
 }
 
 static void ev_connected_got_ip(void)
 {
+    g_associated = true;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, NULL);
     g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);
 }
@@ -335,6 +351,7 @@ static void scenario_boot_authfail_recovers(void)
     boot("BenchAP");
     CHECK(wifi_manager_connect_stored_async() == ESP_OK);
     CHECK(g_connect_calls == 1);
+    CHECK(g_set_config_calls == 0);   /* stored creds used as-is */
     CHECK(strcmp(s_wifi.current_ssid, "BenchAP") == 0);   /* was "" */
 
     ev_disconnect(WIFI_REASON_AUTH_FAIL);
@@ -349,12 +366,23 @@ static void scenario_boot_authfail_recovers(void)
 
     CHECK(fire_timer() == 2000U);
     CHECK(g_connect_calls == 2);
+    /* The retry reuses the persisted config: no esp_wifi_set_config / NVS
+     * rewrite anywhere on the auth-retry path. */
+    CHECK(g_set_config_calls == 0);
     ev_connected_got_ip();
     CHECK(wifi_manager_is_connected());
     CHECK(!failed_bit());
     CHECK(s_wifi.reconnect_count == 0);
     CHECK(s_wifi.auth_fail_count == 0);
     CHECK(!g_timer_armed);
+
+    /* GOT_IP reset is real, not just a field: the next rejection starts the
+     * ladder from the bottom again (attempt 1, first floor). */
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(s_wifi.auth_fail_count == 1);
+    CHECK(fire_timer() == 2000U);
+    CHECK(g_set_config_calls == 0);
 }
 
 /* Genuinely wrong password: bounded, spaced retries that converge on the
@@ -378,8 +406,14 @@ static void scenario_wrong_password_bounded(void)
     }
     CHECK(retries == WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS);
     CHECK(g_connect_calls == 1 + WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS);
+    CHECK(!s_wifi.connect_requested);   /* exhaustion still stops */
     CHECK(!g_timer_armed);
     CHECK(failed_bit());
+    CHECK(g_set_config_calls == 0);
+    /* A stray event after the give-up schedules nothing. */
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(!g_timer_armed);
+    CHECK(g_connect_calls == 1 + WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS);
     /* ~44 h of trying, the first 8 retries inside ~6 min. */
     CHECK(total_ms > 43ULL * 3600ULL * 1000ULL && total_ms < 45ULL * 3600ULL * 1000ULL);
     CHECK(log_count('W', "often transient") == WIFI_MANAGER_AUTH_SUSPECT_COUNT - 1);
@@ -466,6 +500,79 @@ static void scenario_join_timeout_and_success(void)
     CHECK(s_wifi.auth_fail_count == 0);
 }
 
+/* Second 2026-09-28 bench strand: wifi_join on an UNASSOCIATED station.
+ * esp_wifi_disconnect() returns ESP_OK and posts no event, so the reconfigure
+ * flag used to stay armed through the successful join and later swallow the
+ * AP's real disconnect (reason=200 BEACON_TIMEOUT) with no reconnect. */
+static void scenario_join_unassociated_then_beacon_timeout(void)
+{
+    boot("BenchAP");
+    CHECK(!g_associated);
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "right-pass") == ESP_OK);
+    CHECK(wifi_manager_is_connected());
+    CHECK(!s_wifi.reconfigure_in_progress);   /* association disarmed it */
+    CHECK(log_count(0, "disconnected for reconfigure") == 0);
+    const int calls = g_connect_calls;
+
+    ev_disconnect(WIFI_REASON_BEACON_TIMEOUT);   /* ~29 min later: AP gone */
+    CHECK(s_wifi.connect_requested);
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(g_connect_calls == calls + 1);         /* attempt 1: immediate */
+    CHECK(log_count(0, "disconnected for reconfigure") == 0);
+    ev_disconnect(WIFI_REASON_NO_AP_FOUND);      /* AP still down */
+    CHECK(fire_timer() == 500U);
+    CHECK(g_connect_calls == calls + 2);
+    ev_connected_got_ip();                       /* AP back: recovers */
+    CHECK(wifi_manager_is_connected());
+}
+
+/* Even if no association ever clears it, a flag left armed by an unassociated
+ * join yields to the first non-ASSOC_LEAVE reason instead of eating it. */
+static void scenario_join_unassociated_connect_fails(void)
+{
+    boot("BenchAP");
+    g_script[0] = WIFI_REASON_BEACON_TIMEOUT;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);
+    CHECK(!s_wifi.reconfigure_in_progress);
+    CHECK(s_wifi.connect_requested);
+    CHECK(s_wifi.reconnect_count == 1);          /* went through the retry path */
+    CHECK(log_count('W', "reconfigure disconnect never arrived; reason=200") == 1);
+    CHECK(log_count(0, "disconnected for reconfigure") == 0);
+}
+
+/* Normal join while ASSOCIATED: exactly one ASSOC_LEAVE is ours and is
+ * suppressed; the join connects; a later ASSOC_LEAVE is a real event. */
+static void scenario_join_while_connected(void)
+{
+    boot("OldAP");
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script[1] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    pump_pending();
+    CHECK(wifi_manager_is_connected() && g_associated);
+    const int calls = g_connect_calls;
+
+    g_script_len = 2;
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_OK);
+    CHECK(log_count('I', "disconnected for reconfigure") == 1);
+    CHECK(s_wifi.reconnect_count == 0);          /* not counted as an attempt */
+    CHECK(!g_timer_armed);
+    CHECK(g_connect_calls == calls + 1);         /* only the join's own connect */
+    CHECK(!s_wifi.reconfigure_in_progress);
+    CHECK(wifi_manager_is_connected());
+    CHECK(g_set_config_calls == 1);              /* the join's one rewrite */
+
+    ev_disconnect(WIFI_REASON_ASSOC_LEAVE);      /* AP-sent, well after the join */
+    CHECK(log_count('I', "disconnected for reconfigure") == 1);
+    CHECK(s_wifi.connect_requested);
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(g_connect_calls == calls + 2);
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -491,6 +598,10 @@ int main(int argc, char **argv)
         { "join_wrong_password", scenario_join_wrong_password },
         { "join_timeout_and_success", scenario_join_timeout_and_success },
         { "ssid_32_chars", scenario_ssid_32_chars },
+        { "join_unassociated_then_beacon_timeout",
+          scenario_join_unassociated_then_beacon_timeout },
+        { "join_unassociated_connect_fails", scenario_join_unassociated_connect_fails },
+        { "join_while_connected", scenario_join_while_connected },
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <scenario>\n", argv[0]);

@@ -112,6 +112,30 @@ typedef struct {
     bool initialized;
     bool started;
     bool connect_requested;
+    /* Armed by wifi_manager_connect() just before its own esp_wifi_disconnect(),
+     * to swallow the one STA_DISCONNECTED that call produces (it must not count
+     * as a reconnect attempt, nor raise FAILED under the join's wait).
+     *
+     * It must consume ONLY that event. 2026-09-28 bench (E8:F6:0A:B1:1F:34): a
+     * `wifi_join` on a station that was NOT associated (stranded by the old
+     * "fatal" AUTH_FAIL) got ESP_OK from esp_wifi_disconnect() — IDF 5.5
+     * documents only ESP_OK / NOT_INIT / NOT_STARTED / FAIL for it, never
+     * ESP_ERR_WIFI_NOT_CONNECT — and no event followed ("disconnected for
+     * reconfigure" never logged), so the flag stayed armed through a
+     * successful join. 29 min later the AP vanished (reason=200
+     * BEACON_TIMEOUT); the handler ate that REAL disconnect as the reconfigure
+     * one, scheduled nothing, and the unit stayed offline after the AP
+     * returned. Hence two bounds:
+     *  - cleared on STA_CONNECTED / GOT_IP: an association proves our
+     *    disconnect is over (or never produced an event);
+     *  - honoured only for WIFI_REASON_ASSOC_LEAVE (8), which the IDF Wi-Fi
+     *    guide's reason table names as what the ESP station reports when it is
+     *    "disconnected by esp_wifi_disconnect() and other APIs". Any other
+     *    reason while armed is a genuine link event: the flag is cleared and
+     *    the disconnect takes the normal retry path. The residual window is
+     *    "join called, first event not yet seen": an AP-sent ASSOC_LEAVE in it
+     *    is still swallowed, which is harmless because the join's own
+     *    esp_wifi_connect() is already under way. */
     bool reconfigure_in_progress;
     int reconnect_count;
     /* Auth-class disconnects since the last GOT_IP (or fresh connect request).
@@ -379,9 +403,16 @@ static void wifi_event_handler(
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
 
         if (s_wifi.reconfigure_in_progress) {
+            /* One-shot, and only for our own disconnect (see the field). */
             s_wifi.reconfigure_in_progress = false;
-            ESP_LOGI(TAG, "Wi-Fi disconnected for reconfigure");
-            return;
+            if (reason == WIFI_REASON_ASSOC_LEAVE) {
+                ESP_LOGI(TAG, "Wi-Fi disconnected for reconfigure");
+                return;
+            }
+            ESP_LOGW(TAG,
+                     "reconfigure disconnect never arrived; reason=%d is a real "
+                     "disconnect — handling it normally",
+                     (int)reason);
         }
 
         if (!s_wifi.connect_requested) {
@@ -444,6 +475,7 @@ static void wifi_event_handler(
     }
 
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_CONNECTED)) {
+        s_wifi.reconfigure_in_progress = false;   /* our disconnect is behind us */
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
         ESP_LOGI(TAG, "Associated with AP \"%s\"", s_wifi.current_ssid);
         return;
@@ -452,6 +484,7 @@ static void wifi_event_handler(
     if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
         s_wifi.reconnect_count = 0;
         s_wifi.auth_fail_count = 0;
+        s_wifi.reconfigure_in_progress = false;   /* belt-and-braces with STA_CONNECTED */
         wifi_manager_cancel_reconnect();
         xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
@@ -623,6 +656,9 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    /* Dead on IDF 5.5 (an unassociated station gets ESP_OK and no event), kept
+     * for drivers that do report it. The handler, not this branch, is what
+     * bounds the flag — see reconfigure_in_progress. */
     if (err == ESP_ERR_WIFI_NOT_CONNECT) {
         s_wifi.reconfigure_in_progress = false;
     }

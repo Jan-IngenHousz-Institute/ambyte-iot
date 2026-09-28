@@ -1,7 +1,9 @@
 """Run the production wifi_manager reconnect policy against host stubs.
 
 Regression for the 2026-09-28 DEV bench strand: one reason=202 AUTH_FAIL on a
-boot-time join from stored (correct) credentials stopped reconnection for good.
+boot-time join from stored (correct) credentials stopped reconnection for good;
+and a wifi_join on an unassociated station left the reconfigure flag armed so a
+later real disconnect (BEACON_TIMEOUT) was swallowed with no reconnect.
 """
 import os
 from pathlib import Path
@@ -22,6 +24,9 @@ SCENARIOS = (
     "join_wrong_password",
     "join_timeout_and_success",
     "ssid_32_chars",
+    "join_unassociated_then_beacon_timeout",
+    "join_unassociated_connect_fails",
+    "join_while_connected",
 )
 
 
