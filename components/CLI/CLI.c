@@ -1118,6 +1118,13 @@ static int cli_cmd_wifi_join(int argc, char **argv)
     }
     esp_err_t err = wifi_manager_connect(argv[1], argv[2]);
     printf("wifi_join \"%s\": %s\r\n", argv[1], esp_err_to_name(err));
+    if (err == WIFI_MANAGER_ERR_AUTH_REJECTED) {
+        /* The credentials are saved and still being retried in the background;
+         * a transient rejection (AP holding a stale association) heals on its
+         * own, a wrong password needs another wifi_join. */
+        printf("  AP rejected the credentials (auth/handshake failure) — likely a wrong "
+               "password; still retrying on backoff, re-run wifi_join to correct it\r\n");
+    }
     return (err == ESP_OK) ? 0 : 1;
 }
 

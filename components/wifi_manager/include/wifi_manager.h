@@ -10,6 +10,19 @@ extern "C" {
 
 esp_err_t wifi_manager_init(void);
 esp_err_t wifi_manager_start(void);
+/* Returned by wifi_manager_connect() when the AP rejected the key/identity
+ * (auth-class disconnect). Numerically ESP_ERR_WIFI_PASSWORD, so
+ * esp_err_to_name() prints that; spelled via ESP_ERR_WIFI_BASE so callers need
+ * not depend on esp_wifi.h (wifi_manager.c static-asserts the equality). */
+#define WIFI_MANAGER_ERR_AUTH_REJECTED (ESP_ERR_WIFI_BASE + 11)
+
+/* Apply + persist new credentials and wait up to 10 s for an IP. Returns
+ * ESP_OK on GOT_IP, WIFI_MANAGER_ERR_AUTH_REJECTED if the AP rejected the
+ * key/identity (often a wrong password, sometimes transient), ESP_FAIL on any
+ * other reported failure, ESP_ERR_TIMEOUT if nothing was reported in time, or
+ * the driver's error if the config/connect call itself failed. An auth
+ * rejection or timeout does not stop the manager: it keeps retrying the new
+ * credentials on its bounded backoff. */
 esp_err_t wifi_manager_connect(const char *ssid, const char *password);
 esp_err_t wifi_manager_connect_configured(void);
 esp_err_t wifi_manager_connect_stored(void);

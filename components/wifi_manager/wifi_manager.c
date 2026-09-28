@@ -18,6 +18,9 @@
 
 #include "wifi_manager.h"
 
+_Static_assert(WIFI_MANAGER_ERR_AUTH_REJECTED == ESP_ERR_WIFI_PASSWORD,
+               "wifi_manager.h spells the auth-rejected code without esp_wifi.h");
+
 #define WIFI_MANAGER_CONNECTED_BIT BIT0
 #define WIFI_MANAGER_FAILED_BIT BIT1
 #define WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS 10000
@@ -46,6 +49,60 @@
 #define WIFI_MANAGER_RECONNECT_BACKOFF_MAX_MS  1800000   /* 30 min */
 #define WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS    100
 
+/* Auth-class retry floor (see wifi_manager_disconnect_reason_is_auth_class).
+ *
+ * Until 2026-09 an auth-class disconnect was "fatal": the manager dropped
+ * connect_requested and never tried again. Field/bench evidence 2026-09-28
+ * (DEV E8:F6:0A:B1:1F:34): a unit with CORRECT stored credentials, delivering
+ * over MQTT minutes earlier, took a CPU reset (no power loss, so no deauth ever
+ * reached the AP). The very first auth after the reboot was rejected
+ * (reason=202 AUTH_FAIL, ~70 ms after "init -> auth") — the AP was most likely
+ * still holding the pre-reset association for this MAC — and the unit then sat
+ * "disconnected (provisioned: yes)" with no further attempt until an operator
+ * re-ran `wifi_join` with the SAME credentials, which associated at once. Left
+ * alone, only a watchdog reboot would have recovered it: the no-PUBACK watchdog
+ * after >= 1 h of uptime (external power only), otherwise the next 02:00-04:00
+ * nightly reboot (up to ~30 h away; battery units never trip no-PUBACK because
+ * their power gate is closed). The same six reasons also fire on an ESTABLISHED
+ * link (an AP reboot or kick sends AUTH_LEAVE; a marginal link times out the
+ * 4-way rekey), so "fatal" stranded running units too, not just boot joins.
+ *
+ * On this firmware the driver cannot tell "wrong password" from "AP still has
+ * stale state / RF lost the handshake" — both surface as the same codes. A unit
+ * in the field has no operator to fix a password, and a genuinely wrong one
+ * can only be corrected by re-provisioning, which re-arms the manager anyway.
+ * So retrying costs one auth exchange per attempt, while giving up costs a
+ * day of data. Auth-class failures therefore retry, but NEVER immediately (the
+ * stale state that caused the rejection is still there ~0 ms later) and on a
+ * floor that grows with the per-link auth-failure count: 2 s, 10 s, 30 s, then
+ * 60 s, merged by max() with the ordinary exponential schedule. Retries land at
+ * ~2, 12, 42, 102, 162, 222, 282, 342 s after the first rejection, spanning the
+ * usual AP stale-station clearance times (PMF SA-Query ~1 s, hostapd's 300 s
+ * inactivity poll) without hammering an AP that might rate-limit or lock out
+ * failing clients. From attempt 9 the exponential term (64 s ... 30 min cap,
+ * reached at attempt 14, ~38 min in) dominates, so a wrong
+ * password converges on exactly the unreachable-AP cadence: one attempt per
+ * 30 min and the same WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS give-up (~44 h),
+ * which the nightly reboot pre-empts anyway.
+ *
+ * The wrong-password SIGNAL is kept, just decoupled from giving up:
+ *  - every auth-class failure sets WIFI_MANAGER_FAILED_BIT, so an interactive
+ *    wifi_manager_connect() (CLI `wifi_join`) still returns promptly, now with
+ *    WIFI_MANAGER_ERR_AUTH_REJECTED (== ESP_ERR_WIFI_PASSWORD) instead of a
+ *    generic ESP_FAIL, while the retry
+ *    continues in the background (the typed credentials are already persisted
+ *    by esp_wifi_set_config, so stopping could not restore the old ones);
+ *  - the count of auth-class failures since the last GOT_IP is logged on
+ *    every failure, escalating to an explicit "stored password is likely wrong"
+ *    error at WIFI_MANAGER_AUTH_SUSPECT_COUNT. A transient rejection clears on
+ *    the first or second retry and never reaches it. */
+#define WIFI_MANAGER_AUTH_SUSPECT_COUNT 3
+static const uint32_t k_wifi_manager_auth_retry_floor_ms[] = {
+    2000U, 10000U, 30000U, 60000U,
+};
+#define WIFI_MANAGER_AUTH_RETRY_FLOOR_STEPS \
+    (sizeof(k_wifi_manager_auth_retry_floor_ms) / sizeof(k_wifi_manager_auth_retry_floor_ms[0]))
+
 typedef struct {
     EventGroupHandle_t event_group;
     esp_netif_t *sta_netif;
@@ -57,6 +114,11 @@ typedef struct {
     bool connect_requested;
     bool reconfigure_in_progress;
     int reconnect_count;
+    /* Auth-class disconnects since the last GOT_IP (or fresh connect request).
+     * Deliberately NOT reset by an interleaved transient reason: a wrong
+     * password on a flaky site alternates AUTH_FAIL with NO_AP_FOUND, and the
+     * wrong-password signal must still build up. */
+    int auth_fail_count;
     esp_timer_handle_t reconnect_timer;
     char current_ssid[33];
 } wifi_manager_service_t;
@@ -73,16 +135,20 @@ static wifi_manager_service_t s_wifi = {
     .connect_requested = false,
     .reconfigure_in_progress = false,
     .reconnect_count = 0,
+    .auth_fail_count = 0,
     .reconnect_timer = NULL,
     .current_ssid = {0},
 };
 
-/* "Fatal" = a credential/configuration problem that retrying cannot fix; the
- * manager gives up and reports failure. Transient reasons (AUTH_EXPIRE,
- * CONNECTION_FAIL, NO_AP_FOUND, BEACON_TIMEOUT, ...) are deliberately NOT fatal:
- * phone hotspots routinely drop the first 802.11 auth attempts, so we back off
- * and retry instead. Only the genuine key/identity failures stay fatal. */
-static bool wifi_manager_disconnect_reason_is_fatal(wifi_err_reason_t reason)
+/* "Auth-class" = the key/identity rejections that COULD mean wrong credentials
+ * (formerly "fatal"; the manager gave up on them — see the retry-floor comment
+ * above for why that stranded correct credentials and what replaced it).
+ * AUTH_EXPIRE and CONNECTION_FAIL were already demoted to ordinary transient
+ * reasons in May 2026 because phone hotspots routinely drop the first 802.11
+ * auth attempts. What remains here is no longer a stop condition, only a
+ * classification: it selects the non-immediate retry floor and feeds the
+ * wrong-password signal. */
+static bool wifi_manager_disconnect_reason_is_auth_class(wifi_err_reason_t reason)
 {
     switch (reason) {
         case WIFI_REASON_AUTH_LEAVE:
@@ -113,6 +179,44 @@ static uint32_t wifi_manager_reconnect_delay_ms(int attempt)
         delay = WIFI_MANAGER_RECONNECT_BACKOFF_MAX_MS;
     }
     return (uint32_t)delay;
+}
+
+/* Delay before reconnect attempt `attempt` when the link has seen
+ * `auth_fail_count` auth-class failures (0 = none: the plain exponential
+ * schedule, unchanged). Otherwise max(exponential, floor[count]), the floor
+ * saturating at its last step. */
+static uint32_t wifi_manager_retry_delay_ms(int attempt, int auth_fail_count)
+{
+    uint32_t delay = wifi_manager_reconnect_delay_ms(attempt);
+    if (auth_fail_count <= 0) {
+        return delay;
+    }
+    size_t step = (size_t)(auth_fail_count - 1);
+    if (step >= WIFI_MANAGER_AUTH_RETRY_FLOOR_STEPS) {
+        step = WIFI_MANAGER_AUTH_RETRY_FLOOR_STEPS - 1U;
+    }
+    const uint32_t floor_ms = k_wifi_manager_auth_retry_floor_ms[step];
+    return (delay > floor_ms) ? delay : floor_ms;
+}
+
+/* Mirror the driver's persisted STA SSID into current_ssid. The boot path
+ * (wifi_manager_connect_stored_async) connects from esp_wifi's NVS config and
+ * never passed through wifi_manager_apply_config, so every log line said ""
+ * (2026-09-28 bench: `fatal disconnect (reason=202) for ""`). sta.ssid is a
+ * 32-byte field that is NOT NUL-terminated for a 32-char SSID. */
+static void wifi_manager_refresh_current_ssid(void)
+{
+    wifi_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK) {
+        return;
+    }
+    size_t len = 0;
+    while ((len < sizeof(cfg.sta.ssid)) && (cfg.sta.ssid[len] != 0U)) {
+        ++len;
+    }
+    memset(s_wifi.current_ssid, 0, sizeof(s_wifi.current_ssid));
+    memcpy(s_wifi.current_ssid, cfg.sta.ssid, len);
 }
 
 /* Issue one reconnect. Runs either inline (immediate retries) or from the
@@ -289,12 +393,13 @@ static void wifi_event_handler(
             return;
         }
 
-        if (wifi_manager_disconnect_reason_is_fatal(reason)) {
-            s_wifi.connect_requested = false;
-            wifi_manager_cancel_reconnect();
+        /* Auth-class rejections no longer stop the manager (retry-floor comment
+         * at the top of this file). They raise FAILED so a waiting interactive
+         * connect reports promptly, then fall through to the bounded backoff. */
+        const bool auth_class = wifi_manager_disconnect_reason_is_auth_class(reason);
+        if (auth_class) {
+            ++s_wifi.auth_fail_count;
             xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
-            ESP_LOGE(TAG, "Wi-Fi fatal disconnect (reason=%d) for \"%s\"", reason, s_wifi.current_ssid);
-            return;
         }
 
         ++s_wifi.reconnect_count;
@@ -303,17 +408,37 @@ static void wifi_event_handler(
             wifi_manager_cancel_reconnect();
             xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
             ESP_LOGE(TAG,
-                     "Wi-Fi reconnect gave up after %d attempts (reason=%d) — \"%s\" unreachable",
-                     WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS, reason, s_wifi.current_ssid);
+                     "Wi-Fi reconnect gave up after %d attempts (reason=%d, %d auth rejections) — \"%s\" %s",
+                     WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS, (int)reason, s_wifi.auth_fail_count,
+                     s_wifi.current_ssid,
+                     (s_wifi.auth_fail_count > 0) ? "rejects the stored credentials" : "unreachable");
             return;
         }
-        const uint32_t delay_ms = wifi_manager_reconnect_delay_ms(s_wifi.reconnect_count);
-        ESP_LOGW(
-            TAG,
-            "Wi-Fi disconnected (reason=%d), reconnect attempt %d in %u ms",
-            reason,
-            s_wifi.reconnect_count,
-            (unsigned)delay_ms);
+        const uint32_t delay_ms =
+            wifi_manager_retry_delay_ms(s_wifi.reconnect_count,
+                                        auth_class ? s_wifi.auth_fail_count : 0);
+        if (!auth_class) {
+            ESP_LOGW(
+                TAG,
+                "Wi-Fi disconnected (reason=%d), reconnect attempt %d in %u ms",
+                (int)reason,
+                s_wifi.reconnect_count,
+                (unsigned)delay_ms);
+        } else if (s_wifi.auth_fail_count < WIFI_MANAGER_AUTH_SUSPECT_COUNT) {
+            ESP_LOGW(TAG,
+                     "Wi-Fi auth rejected (reason=%d) by \"%s\" [%d since last IP] — "
+                     "often transient (AP still holds a pre-reset association); "
+                     "reconnect attempt %d in %u ms",
+                     (int)reason, s_wifi.current_ssid, s_wifi.auth_fail_count,
+                     s_wifi.reconnect_count, (unsigned)delay_ms);
+        } else {
+            ESP_LOGE(TAG,
+                     "Wi-Fi auth rejected (reason=%d) by \"%s\" [%d since last IP] — "
+                     "stored password is likely wrong (re-provision or wifi_join); "
+                     "still retrying, attempt %d in %u ms",
+                     (int)reason, s_wifi.current_ssid, s_wifi.auth_fail_count,
+                     s_wifi.reconnect_count, (unsigned)delay_ms);
+        }
         wifi_manager_schedule_reconnect(delay_ms);
         return;
     }
@@ -326,6 +451,7 @@ static void wifi_event_handler(
 
     if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
         s_wifi.reconnect_count = 0;
+        s_wifi.auth_fail_count = 0;
         wifi_manager_cancel_reconnect();
         xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
@@ -476,6 +602,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     }
 
     s_wifi.reconnect_count = 0;
+    s_wifi.auth_fail_count = 0;
     wifi_manager_cancel_reconnect();
     xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
 
@@ -526,7 +653,9 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     }
 
     if ((bits & WIFI_MANAGER_FAILED_BIT) != 0) {
-        return ESP_FAIL;
+        /* Distinct code for the operator (CLI wifi_join): the AP rejected the
+         * key/identity. Not a give-up — the background retry keeps going. */
+        return (s_wifi.auth_fail_count > 0) ? WIFI_MANAGER_ERR_AUTH_REJECTED : ESP_FAIL;
     }
 
     return ESP_ERR_TIMEOUT;
@@ -561,8 +690,10 @@ esp_err_t wifi_manager_connect_stored_async(void)
      * NVS, then erase the seed. esp_wifi_connect() below uses the applied
      * config; on later boots the seed is gone and this is a no-op. */
     (void)wifi_manager_apply_seeded_creds();
+    wifi_manager_refresh_current_ssid();
 
     s_wifi.reconnect_count = 0;
+    s_wifi.auth_fail_count = 0;
     wifi_manager_cancel_reconnect();
     xEventGroupClearBits(s_wifi.event_group,
                          WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
