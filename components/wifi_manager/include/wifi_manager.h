@@ -23,6 +23,12 @@ esp_err_t wifi_manager_start(void);
  * pending (e.g. the retry timer could not be armed). Re-run the join, or
  * reboot. */
 #define WIFI_MANAGER_ERR_NOT_RETRYING (WIFI_MANAGER_ERR_BASE + 2)
+/* The request was ended because an earlier connect attempt (or a superseded
+ * link) is still unresolved in the Wi-Fi driver after being kicked. ESP-IDF
+ * 5.5 provides no event barrier to hand the attempt slot over safely, so the
+ * manager does not guess. Nothing is retrying; if the earlier outcome never
+ * arrives, reboot to recover. */
+#define WIFI_MANAGER_ERR_DRIVER_UNRESOLVED (WIFI_MANAGER_ERR_BASE + 3)
 
 /* esp_err_to_name() that also knows WIFI_MANAGER_ERR_* codes. */
 const char *wifi_manager_err_to_name(esp_err_t err);

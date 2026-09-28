@@ -1124,6 +1124,9 @@ static int cli_cmd_wifi_join(int argc, char **argv)
          * own, a wrong password needs another wifi_join. */
         printf("  AP rejected the credentials (auth/handshake failure) — likely a wrong "
                "password; still retrying on backoff, re-run wifi_join to correct it\r\n");
+    } else if (err == WIFI_MANAGER_ERR_DRIVER_UNRESOLVED) {
+        printf("  the Wi-Fi driver never reported an earlier attempt's outcome - not "
+               "retrying; reboot to recover\r\n");
     } else if (err == WIFI_MANAGER_ERR_NOT_RETRYING) {
         printf("  attempt failed and no retry could be scheduled - re-run wifi_join "
                "(or reboot)\r\n");

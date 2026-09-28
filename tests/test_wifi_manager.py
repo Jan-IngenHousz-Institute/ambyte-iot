@@ -49,7 +49,7 @@ SCENARIOS = (
     "old_outcome_after_drain_timeout",
     "silent_original_retry_then_join",
     "stale_got_ip_during_join",
-    "stale_connected_after_deferred_join",
+    "stale_connected_after_unresolved_join",
     "stored_reentry_does_not_overwrite",
     "kick_outcome_before_relock",
     "boot_config_error_no_retry",
@@ -57,9 +57,14 @@ SCENARIOS = (
     "stored_reentry_deferral_timer_failure",
     "join_deferral_timer_failure",
     "bench_wrongpass_join_then_correct_join",
-    "old_retry_dropped_by_driver_then_join",
-    "stale_link_kick_without_event_released",
+    "old_retry_dropped_join_ends_truthfully",
+    "stale_link_silent_kick_ends_truthfully",
     "queued_kick_outcome_not_preempted_by_probe",
+    "probe_success_cannot_resurrect_stopped_request",
+    "delayed_old_outcome_not_charged_to_probe",
+    "own_delayed_old_outcome_never_charged",
+    "own_stopped_request_never_resurrected",
+    "stale_callback_vs_active_reentry",
 )
 
 
