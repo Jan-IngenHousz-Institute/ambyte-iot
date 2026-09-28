@@ -50,6 +50,13 @@ static int g_set_config_calls;     /* every persisted esp_wifi config rewrite */
  * (IDF 5.5 does not document ESP_ERR_WIFI_NOT_CONNECT for it, and the
  * 2026-09-28 bench join on an unassociated station logged no event.) */
 static bool g_associated;
+/* Errors returned by successive esp_wifi_connect() calls (0 = ESP_OK). A
+ * failing call posts NO event and does not consume the event script — that
+ * is the driver behaviour the timer-callback strand hinged on. */
+static esp_err_t g_connect_err[256];
+static int g_connect_err_len;
+static int g_connect_err_pos;
+static bool g_connect_err_forever;   /* every call fails with g_connect_err[0] */
 
 /* Script for successive esp_wifi_connect() calls: each entry is the event the
  * "driver" posts in response. >0 = STA_DISCONNECTED with that reason,
@@ -222,6 +229,13 @@ esp_err_t esp_wifi_get_config(wifi_interface_t i, wifi_config_t *c)
 esp_err_t esp_wifi_connect(void)
 {
     g_connect_calls++;
+    esp_err_t err = ESP_OK;
+    if (g_connect_err_forever) {
+        err = g_connect_err[0];
+    } else if (g_connect_err_pos < g_connect_err_len) {
+        err = g_connect_err[g_connect_err_pos++];
+    }
+    if (err != ESP_OK) return err;
     if (g_script_pos < g_script_len) {
         CHECK(g_pending_len < PENDING_MAX);
         g_pending[g_pending_len++] = g_script[g_script_pos++];
@@ -573,6 +587,115 @@ static void scenario_join_while_connected(void)
     CHECK(g_connect_calls == calls + 2);
 }
 
+/* Evaluator repro: an esp_wifi_connect() ERROR inside the retry timer posts
+ * no event, and used to leave connect_requested=true with no timer armed —
+ * the whole bounded policy ended after one retry. Covers ESP_ERR_WIFI_STATE
+ * (driver busy) and a generic ESP_FAIL, both before any driver event. */
+static void scenario_retry_connect_error_reschedules(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* attempt 1: 2 s floor */
+    g_connect_err[0] = ESP_ERR_WIFI_STATE;
+    g_connect_err[1] = ESP_FAIL;
+    g_connect_err_len = 2;
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+
+    int calls = g_connect_calls;
+    CHECK(fire_timer() == 2000U);                    /* -> WIFI_STATE, no event */
+    CHECK(g_connect_calls == calls + 1);             /* one call, no spin */
+    CHECK(s_wifi.connect_requested);
+    CHECK(g_timer_armed);                            /* was: nothing armed */
+    CHECK(s_wifi.reconnect_count == 2);              /* counted as an attempt */
+    CHECK(log_count('E', "esp_wifi_connect (retry) failed") == 1);
+
+    calls = g_connect_calls;
+    CHECK(fire_timer() == 1000U);                    /* floor over 500 ms; -> ESP_FAIL */
+    CHECK(g_connect_calls == calls + 1);
+    CHECK(g_timer_armed);
+    CHECK(s_wifi.reconnect_count == 3);
+
+    CHECK(fire_timer() == 1000U);                    /* exp(3)=1000; now succeeds */
+    CHECK(!g_timer_armed);
+    pump_pending();                                  /* GOT_IP */
+    CHECK(wifi_manager_is_connected());
+    CHECK(s_wifi.reconnect_count == 0 && s_wifi.auth_fail_count == 0);
+    CHECK(g_set_config_calls == 0);
+}
+
+/* The inline (attempt-1, zero-delay) path must not recurse on a connect
+ * error: exactly one esp_wifi_connect() per handler call, then a timer. */
+static void scenario_inline_connect_error_no_recursion(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    g_connect_err[0] = ESP_ERR_WIFI_STATE;
+    g_connect_err_forever = true;
+    const int calls = g_connect_calls;
+    ev_disconnect(WIFI_REASON_NO_AP_FOUND);          /* attempt 1: inline retry */
+    CHECK(g_connect_calls == calls + 1);
+    CHECK(g_timer_armed);
+    CHECK(g_timer_delay_us == 1000ULL * 1000ULL);
+    CHECK(s_wifi.reconnect_count == 2);
+}
+
+/* A driver that keeps refusing esp_wifi_connect() still exhausts the ONE
+ * shared budget: exactly MAX_ATTEMPTS attempts, never faster than 1 s, then
+ * a clean stop. */
+static void scenario_connect_error_exhausts_budget(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_BEACON_TIMEOUT);       /* attempt 1 inline, OK */
+    g_connect_err[0] = ESP_FAIL;
+    g_connect_err_forever = true;
+    ev_disconnect(WIFI_REASON_BEACON_TIMEOUT);       /* attempt 2: 500 ms timer */
+    int fires = 0;
+    while (g_timer_armed) {
+        const int calls = g_connect_calls;
+        const uint32_t d = fire_timer();
+        CHECK(g_connect_calls == calls + 1);
+        CHECK(fires == 0 || d >= 1000U);
+        fires++;
+        CHECK(fires <= WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS);
+    }
+    CHECK(s_wifi.reconnect_count == WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS + 1);
+    CHECK(!s_wifi.connect_requested);
+    CHECK(failed_bit());
+    CHECK(log_count('E', "gave up after 100 attempts") == 1);
+    CHECK(log_count('E', "unreachable") == 1);
+}
+
+/* wifi_join whose own esp_wifi_connect() fails terminally (no event can
+ * follow) must not leave the reconfigure flag armed for a later disconnect. */
+static void scenario_join_connect_error_clears_flag(void)
+{
+    boot("BenchAP");                                 /* unassociated: no event */
+    g_connect_err[0] = ESP_ERR_WIFI_CONN;
+    g_connect_err_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_WIFI_CONN);
+    CHECK(!s_wifi.reconfigure_in_progress);
+    CHECK(!s_wifi.connect_requested);
+
+    /* Busy driver for all ten tries: same guarantee. */
+    g_connect_err[0] = ESP_ERR_WIFI_STATE;
+    g_connect_err_forever = true;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_WIFI_STATE);
+    CHECK(!s_wifi.reconfigure_in_progress);
+    g_connect_err_forever = false;
+    g_connect_err_len = 0;
+
+    /* Later: a good join, then a real disconnect is handled, not swallowed. */
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_OK);
+    const int calls = g_connect_calls;
+    ev_disconnect(WIFI_REASON_BEACON_TIMEOUT);
+    CHECK(g_connect_calls == calls + 1);
+    CHECK(log_count(0, "disconnected for reconfigure") == 0);
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -602,6 +725,10 @@ int main(int argc, char **argv)
           scenario_join_unassociated_then_beacon_timeout },
         { "join_unassociated_connect_fails", scenario_join_unassociated_connect_fails },
         { "join_while_connected", scenario_join_while_connected },
+        { "retry_connect_error_reschedules", scenario_retry_connect_error_reschedules },
+        { "inline_connect_error_no_recursion", scenario_inline_connect_error_no_recursion },
+        { "connect_error_exhausts_budget", scenario_connect_error_exhausts_budget },
+        { "join_connect_error_clears_flag", scenario_join_connect_error_clears_flag },
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <scenario>\n", argv[0]);

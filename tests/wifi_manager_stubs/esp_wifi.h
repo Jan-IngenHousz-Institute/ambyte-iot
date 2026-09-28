@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #define ESP_ERR_WIFI_STATE       (ESP_ERR_WIFI_BASE + 6)
+#define ESP_ERR_WIFI_CONN        (ESP_ERR_WIFI_BASE + 7)
 #define ESP_ERR_WIFI_PASSWORD    (ESP_ERR_WIFI_BASE + 11)
 #define ESP_ERR_WIFI_NOT_CONNECT (ESP_ERR_WIFI_BASE + 15)
 typedef enum {

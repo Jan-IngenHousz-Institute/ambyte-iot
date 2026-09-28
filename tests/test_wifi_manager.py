@@ -27,6 +27,10 @@ SCENARIOS = (
     "join_unassociated_then_beacon_timeout",
     "join_unassociated_connect_fails",
     "join_while_connected",
+    "retry_connect_error_reschedules",
+    "inline_connect_error_no_recursion",
+    "connect_error_exhausts_budget",
+    "join_connect_error_clears_flag",
 )
 
 
