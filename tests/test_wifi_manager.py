@@ -56,6 +56,10 @@ SCENARIOS = (
     "superseded_link_gets_no_app_services",
     "stored_reentry_deferral_timer_failure",
     "join_deferral_timer_failure",
+    "bench_wrongpass_join_then_correct_join",
+    "old_retry_dropped_by_driver_then_join",
+    "stale_link_kick_without_event_released",
+    "queued_kick_outcome_not_preempted_by_probe",
 )
 
 

@@ -63,4 +63,6 @@ esp_err_t esp_wifi_get_config(wifi_interface_t iface, wifi_config_t *conf);
 esp_err_t esp_wifi_connect(void);
 esp_err_t esp_wifi_disconnect(void);
 esp_err_t esp_wifi_restore(void);
+typedef struct { uint8_t ssid[33]; int8_t rssi; } wifi_ap_record_t;
+esp_err_t esp_wifi_sta_get_ap_info(wifi_ap_record_t *ap_info);
 #endif

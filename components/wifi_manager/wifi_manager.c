@@ -34,6 +34,11 @@ _Static_assert((WIFI_MANAGER_ERR_AUTH_REJECTED < ESP_ERR_WIFI_BASE) ||
  * own attempt. */
 #define WIFI_MANAGER_ATTEMPT_IDLE_BIT BIT2
 #define WIFI_MANAGER_ATTEMPT_DRAIN_TIMEOUT_MS 2000
+/* How long a kicked attempt/link may stay silent before the manager ASKS the
+ * driver whether it still holds it (see the kick record on the state struct).
+ * A kick's outcome normally lands within milliseconds; 2 s matches the join
+ * drain. */
+#define WIFI_MANAGER_KICK_OUTCOME_TIMEOUT_MS 2000
 #define WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS 10000
 #define WIFI_MANAGER_STA_IFKEY "WIFI_STA_DEF"
 #define WIFI_MANAGER_UNPROVISIONED_PLACEHOLDER "__UNPROVISIONED__"
@@ -214,6 +219,29 @@ typedef struct {
     uint32_t attempt_gen;
     uint32_t attempt_seq;
     uint32_t link_gen;
+    /* Kick record (hardware, DEV 28:37:2F:FF:E7:04, 2026-09-29). The
+     * single-flight rule assumed every kick is answered by the pending
+     * attempt's outcome. The real driver can accept an esp_wifi_connect() and
+     * then drop it silently: the bench logged "request 1 still in place -
+     * kicked; retry deferred" every retry for minutes, no outcome ever came,
+     * and a later correct wifi_join livelocked behind it until reset. So a
+     * kick is recorded (which attempt seq / which link, when), and once it has
+     * been silent for WIFI_MANAGER_KICK_OUTCOME_TIMEOUT_MS the manager asks
+     * the driver instead of waiting forever:
+     *  - attempt: it issues the new request's esp_wifi_connect(). The driver
+     *    runs one attempt at a time, so ESP_OK is positive proof that it holds
+     *    no other attempt: the old one is dead and the new one owns the slot.
+     *    ESP_ERR_WIFI_STATE means the driver IS still busy with the old
+     *    attempt: the slot stays with it and the retry is deferred again.
+     *  - link: esp_wifi_sta_get_ap_info() == ESP_ERR_WIFI_NOT_CONNECT is the
+     *    driver saying the superseded association is gone.
+     * Attribution is never guessed. The slot is only reassigned on the driver's
+     * own word, and every probe costs one budgeted retry. */
+    bool kick_valid;
+    bool kick_link;
+    uint32_t kick_seq;
+    uint32_t kick_link_gen;
+    int64_t kick_us;
     /* STA_CONNECTED seen and no DISCONNECTED since: an association whose DHCP
      * is still pending is progressing, not silent (join timeout path). */
     bool associated;
@@ -242,6 +270,11 @@ static wifi_manager_service_t s_wifi = {
     .attempt_gen = 0,
     .attempt_seq = 0,
     .link_gen = 0,
+    .kick_valid = false,
+    .kick_link = false,
+    .kick_seq = 0,
+    .kick_link_gen = 0,
+    .kick_us = 0,
     .associated = false,
     .current_ssid = {0},
 };
@@ -522,25 +555,93 @@ static wifi_manager_attempt_result_t wifi_manager_start_attempt(uint32_t gen,
                                                                 esp_err_t *call_err)
 {
     wifi_manager_lock();
-    if ((s_wifi.request_gen != gen) || !s_wifi.connect_requested) {
-        wifi_manager_unlock();
-        return WIFI_MANAGER_ATTEMPT_SUPERSEDED;
-    }
-    if (!s_wifi.attempt_in_flight && s_wifi.associated && (s_wifi.link_gen == gen)) {
-        wifi_manager_unlock();
-        return WIFI_MANAGER_ATTEMPT_LINKED;
-    }
-    /* Blocked: an attempt's outcome is outstanding, or the station is still
-     * associated on a superseded request's link. Never connect over either. */
-    const bool blocked_by_attempt = s_wifi.attempt_in_flight;
-    if (blocked_by_attempt || s_wifi.associated) {
+    for (;;) {
+        if ((s_wifi.request_gen != gen) || !s_wifi.connect_requested) {
+            wifi_manager_unlock();
+            return WIFI_MANAGER_ATTEMPT_SUPERSEDED;
+        }
+        if (!s_wifi.attempt_in_flight && s_wifi.associated && (s_wifi.link_gen == gen)) {
+            wifi_manager_unlock();
+            return WIFI_MANAGER_ATTEMPT_LINKED;
+        }
+        /* Blocked: an attempt's outcome is outstanding, or the station is still
+         * associated on a superseded request's link. Never connect over either. */
+        const bool blocked_by_attempt = s_wifi.attempt_in_flight;
+        if (!blocked_by_attempt && !s_wifi.associated) {
+            break;   /* free: start below */
+        }
+        const int64_t now_us = esp_timer_get_time();
+        bool same_blocker = s_wifi.kick_valid &&
+            (blocked_by_attempt
+                 ? (!s_wifi.kick_link && (s_wifi.kick_seq == s_wifi.attempt_seq))
+                 : (s_wifi.kick_link && (s_wifi.kick_link_gen == s_wifi.link_gen)));
+        const bool kick_silent_too_long = same_blocker &&
+            ((now_us - s_wifi.kick_us) >= (int64_t)WIFI_MANAGER_KICK_OUTCOME_TIMEOUT_MS * 1000);
+
+        if (kick_silent_too_long && !blocked_by_attempt) {
+            /* Ask the driver whether the superseded association still exists. */
+            const uint32_t link = s_wifi.link_gen;
+            wifi_manager_unlock();
+            wifi_ap_record_t ap;
+            const esp_err_t q = esp_wifi_sta_get_ap_info(&ap);
+            wifi_manager_lock();
+            if ((q == ESP_ERR_WIFI_NOT_CONNECT) && s_wifi.associated &&
+                (s_wifi.link_gen == link) && !s_wifi.attempt_in_flight) {
+                ESP_LOGW(TAG, "superseded Wi-Fi link (request %u) sent no DISCONNECTED after a "
+                         "kick; driver reports it gone - released", (unsigned)link);
+                s_wifi.associated = false;
+                s_wifi.kick_valid = false;
+                continue;   /* re-evaluate: the station is free now */
+            }
+            same_blocker = false;   /* still associated: kick it again */
+        } else if (kick_silent_too_long) {
+            /* Ask the driver by issuing our connect (see the kick record). */
+            const uint32_t old_seq = s_wifi.attempt_seq;
+            const uint32_t old_gen = s_wifi.attempt_gen;
+            wifi_manager_unlock();
+            const esp_err_t err = esp_wifi_connect();
+            wifi_manager_lock();
+            if (err == ESP_OK) {
+                if (s_wifi.attempt_in_flight && (s_wifi.attempt_seq == old_seq)) {
+                    ESP_LOGW(TAG, "Wi-Fi attempt of request %u gave no outcome after a kick; "
+                             "driver accepted a new connect, so it held none - released",
+                             (unsigned)old_gen);
+                }
+                s_wifi.kick_valid = false;
+                (void)wifi_manager_begin_attempt_locked(gen);   /* driver-proven sole attempt */
+                wifi_manager_unlock();
+                return WIFI_MANAGER_ATTEMPT_STARTED;
+            }
+            if (!(s_wifi.attempt_in_flight && (s_wifi.attempt_seq == old_seq))) {
+                /* The old attempt's outcome landed meanwhile: an ordinary
+                 * call failure for our (never started) attempt. */
+                wifi_manager_unlock();
+                *call_err = err;
+                return WIFI_MANAGER_ATTEMPT_CALL_FAILED;
+            }
+            ESP_LOGW(TAG, "probe connect for request %u returned %s - driver still holds "
+                     "the attempt of request %u", (unsigned)gen, esp_err_to_name(err),
+                     (unsigned)old_gen);
+            same_blocker = false;   /* driver still busy with it: kick again, defer */
+        }
+
         const uint32_t pending_seq = s_wifi.attempt_seq;
         const uint32_t pending_gen = blocked_by_attempt ? s_wifi.attempt_gen : s_wifi.link_gen;
-        wifi_manager_unlock();
-        /* Abort / tear down so the driver reports the outcome (attributed to
-         * pending_gen whenever it lands). */
-        (void)esp_wifi_disconnect();
-        wifi_manager_lock();
+        /* The driver's own answer to the kick, logged: the 2026-09-29 bench log
+         * only carried the deferral's label, not what the driver returned. */
+        esp_err_t kick_err = ESP_OK;
+        if (!same_blocker) {
+            s_wifi.kick_valid = true;
+            s_wifi.kick_link = !blocked_by_attempt;
+            s_wifi.kick_seq = pending_seq;
+            s_wifi.kick_link_gen = s_wifi.link_gen;
+            s_wifi.kick_us = now_us;
+            wifi_manager_unlock();
+            /* Abort / tear down so the driver reports the outcome (attributed to
+             * pending_gen whenever it lands). */
+            kick_err = esp_wifi_disconnect();
+            wifi_manager_lock();
+        }
         /* Arm the retry unless the kick's outcome already came AND something
          * newer owns the next step (a started attempt or an armed timer). */
         const bool still_blocked =
@@ -552,10 +653,12 @@ static wifi_manager_attempt_result_t wifi_manager_start_attempt(uint32_t gen,
         bool owned = true;
         if ((s_wifi.request_gen == gen) && s_wifi.connect_requested &&
             (still_blocked || unowned)) {
-            ESP_LOGW(TAG, "Wi-Fi %s of request %u still in place - kicked; retry deferred",
-                     blocked_by_attempt ? "attempt" : "link", (unsigned)pending_gen);
+            ESP_LOGW(TAG, "Wi-Fi %s of request %u still in place - %s (disconnect=%s); "
+                     "retry deferred",
+                     blocked_by_attempt ? "attempt" : "link", (unsigned)pending_gen,
+                     same_blocker ? "kick pending" : "kicked", esp_err_to_name(kick_err));
             owned = wifi_manager_retry_after_silent_failure_locked(
-                ESP_ERR_WIFI_STATE, "previous Wi-Fi attempt/link unresolved");
+                ESP_ERR_NOT_FINISHED, "previous Wi-Fi attempt/link unresolved");
         }
         wifi_manager_unlock();
         /* A deferral that could not arm has ENDED the request: say so, never
@@ -750,9 +853,13 @@ static void wifi_event_handler(
         if (s_wifi.reconfigure_in_progress) {
             /* One-shot, and only for our own disconnect (see the field). */
             s_wifi.reconfigure_in_progress = false;
-            if (reason == WIFI_REASON_ASSOC_LEAVE) {
+            /* ASSOC_LEAVE: our own esp_wifi_disconnect(). UNSPECIFIED:
+             * esp_wifi_set_config() on an associated station, which IDF 5.5
+             * disconnects by itself (bench 2026-09-29: "run -> init (0x100)"
+             * then reason=1, ~30 ms after wifi_join, before our disconnect). */
+            if ((reason == WIFI_REASON_ASSOC_LEAVE) || (reason == WIFI_REASON_UNSPECIFIED)) {
                 wifi_manager_unlock();
-                ESP_LOGI(TAG, "Wi-Fi disconnected for reconfigure");
+                ESP_LOGI(TAG, "Wi-Fi disconnected for reconfigure (reason=%d)", (int)reason);
                 return;
             }
             ESP_LOGW(TAG,
@@ -1018,8 +1125,19 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Arm the reconfigure latch BEFORE esp_wifi_set_config(): on an associated
+     * station IDF drops the link inside that call (reason=1). Without the
+     * latch the old request took it as a real disconnect and issued an
+     * immediate retry that raced this join (and, on the bench, was accepted by
+     * the driver and never answered). The latch window is the join itself. */
+    wifi_manager_lock();
+    s_wifi.reconfigure_in_progress = true;
+    wifi_manager_unlock();
     esp_err_t err = wifi_manager_apply_config(ssid, password);
     if (err != ESP_OK) {
+        wifi_manager_lock();
+        s_wifi.reconfigure_in_progress = false;   /* nothing was changed */
+        wifi_manager_unlock();
         return err;
     }
 
@@ -1054,6 +1172,18 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     /* Dead on IDF 5.5 (an unassociated station gets ESP_OK and no event), kept
      * for drivers that do report it. The handler, not this branch, is what
      * bounds the flag — see reconfigure_in_progress. */
+    /* That disconnect was a kick of any attempt still pending: record it, so
+     * start_attempt asks the driver once the drain below has timed out. */
+    wifi_manager_lock();
+    if (s_wifi.attempt_in_flight &&
+        !(s_wifi.kick_valid && !s_wifi.kick_link && (s_wifi.kick_seq == s_wifi.attempt_seq))) {
+        s_wifi.kick_valid = true;
+        s_wifi.kick_link = false;
+        s_wifi.kick_seq = s_wifi.attempt_seq;
+        s_wifi.kick_us = esp_timer_get_time();
+    }
+    wifi_manager_unlock();
+
     /* Our disconnect aborts any attempt still pending for the superseded
      * request; give its outcome a bounded chance to arrive so our own attempt
      * can start at once. If it has not arrived, start_attempt leaves the slot
