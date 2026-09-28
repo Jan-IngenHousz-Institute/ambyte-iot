@@ -5,8 +5,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#define ESP_ERR_WIFI_NOT_INIT    (ESP_ERR_WIFI_BASE + 1)
+#define ESP_ERR_WIFI_NOT_STARTED (ESP_ERR_WIFI_BASE + 2)
+#define ESP_ERR_WIFI_MODE        (ESP_ERR_WIFI_BASE + 5)
 #define ESP_ERR_WIFI_STATE       (ESP_ERR_WIFI_BASE + 6)
 #define ESP_ERR_WIFI_CONN        (ESP_ERR_WIFI_BASE + 7)
+#define ESP_ERR_WIFI_SSID        (ESP_ERR_WIFI_BASE + 10)
 #define ESP_ERR_WIFI_PASSWORD    (ESP_ERR_WIFI_BASE + 11)
 #define ESP_ERR_WIFI_NOT_CONNECT (ESP_ERR_WIFI_BASE + 15)
 typedef enum {

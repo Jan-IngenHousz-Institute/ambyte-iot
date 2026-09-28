@@ -31,6 +31,14 @@ SCENARIOS = (
     "inline_connect_error_no_recursion",
     "connect_error_exhausts_budget",
     "join_connect_error_clears_flag",
+    "join_silent_timeout_retries",
+    "stale_callback_vs_new_join",
+    "dispatched_callback_after_new_join",
+    "timer_create_failure_terminal",
+    "timer_lazy_create_recovers",
+    "timer_start_failure_terminal",
+    "boot_initial_connect_error_recovers",
+    "set_config_password_error_distinct",
 )
 
 

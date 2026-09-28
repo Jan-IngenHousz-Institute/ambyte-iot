@@ -12,5 +12,6 @@ typedef int esp_err_t;
 #define ESP_ERR_NVS_BASE 0x1100
 #define ESP_ERR_NVS_NOT_FOUND (ESP_ERR_NVS_BASE + 0x02)
 #define ESP_ERR_WIFI_BASE 0x3000
+#define ESP_ERR_MESH_BASE 0x4000
 const char *esp_err_to_name(esp_err_t code);
 #endif

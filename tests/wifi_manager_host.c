@@ -35,6 +35,14 @@ static struct wm_stub_timer g_timer_obj;
 static esp_timer_cb_t g_timer_cb;
 static bool g_timer_armed;
 static uint64_t g_timer_delay_us;
+static int g_timer_create_fail;      /* next N creates fail; -1 = always */
+static bool g_timer_start_fail;
+
+/* Single-threaded harness: a second take is a self-deadlock on the real
+ * (non-recursive) mutex, and driver calls must never run under the lock. */
+struct wm_stub_mutex { int unused; };
+static struct wm_stub_mutex g_mutex_obj;
+static bool g_lock_held;
 
 struct wm_stub_event_group { EventBits_t bits; };
 static struct wm_stub_event_group g_group;
@@ -44,6 +52,11 @@ static struct wm_stub_netif g_netif;
 
 static uint8_t g_stored_ssid[32];
 static int g_connect_calls;
+static esp_err_t g_set_config_err;   /* returned (and nothing saved) if set */
+/* Runs INSIDE the next esp_wifi_connect() call, which then returns
+ * g_hook_outer_err: models another task acting while that call blocks. */
+static void (*g_connect_hook)(void);
+static esp_err_t g_hook_outer_err;
 static int g_set_config_calls;     /* every persisted esp_wifi config rewrite */
 /* Driver association state, for esp_wifi_disconnect()'s IDF 5.5 behaviour:
  * ESP_OK either way; a STA_DISCONNECTED(ASSOC_LEAVE) event only if associated.
@@ -154,8 +167,29 @@ uint32_t esp_ip4addr_aton(const char *addr) { (void)addr; return 0x08080808U; }
 void esp_restart(void) { fprintf(stderr, "unexpected esp_restart\n"); exit(2); }
 void vTaskDelay(TickType_t ticks) { (void)ticks; }
 
+SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &g_mutex_obj; }
+BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t ticks)
+{
+    (void)ticks;
+    CHECK(m == &g_mutex_obj);
+    CHECK(!g_lock_held);
+    g_lock_held = true;
+    return pdTRUE;
+}
+BaseType_t xSemaphoreGive(SemaphoreHandle_t m)
+{
+    CHECK(m == &g_mutex_obj);
+    CHECK(g_lock_held);
+    g_lock_held = false;
+    return pdTRUE;
+}
+
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out)
 {
+    if (g_timer_create_fail != 0) {
+        if (g_timer_create_fail > 0) g_timer_create_fail--;
+        return ESP_ERR_NO_MEM;
+    }
     g_timer_cb = args->callback;
     *out = &g_timer_obj;
     return ESP_OK;
@@ -164,6 +198,7 @@ esp_err_t esp_timer_start_once(esp_timer_handle_t t, uint64_t timeout_us)
 {
     CHECK(t == &g_timer_obj);
     CHECK(!g_timer_armed);   /* production stops before re-arming */
+    if (g_timer_start_fail) return ESP_FAIL;
     g_timer_armed = true;
     g_timer_delay_us = timeout_us;
     return ESP_OK;
@@ -215,7 +250,9 @@ esp_err_t esp_wifi_set_ps(wifi_ps_type_t t) { (void)t; return ESP_OK; }
 esp_err_t esp_wifi_set_config(wifi_interface_t i, wifi_config_t *c)
 {
     (void)i;
+    CHECK(!g_lock_held);
     g_set_config_calls++;
+    if (g_set_config_err != ESP_OK) return g_set_config_err;
     memcpy(g_stored_ssid, c->sta.ssid, sizeof(g_stored_ssid));
     return ESP_OK;
 }
@@ -228,7 +265,14 @@ esp_err_t esp_wifi_get_config(wifi_interface_t i, wifi_config_t *c)
 }
 esp_err_t esp_wifi_connect(void)
 {
+    CHECK(!g_lock_held);
     g_connect_calls++;
+    if (g_connect_hook != NULL) {
+        void (*hook)(void) = g_connect_hook;
+        g_connect_hook = NULL;
+        hook();
+        return g_hook_outer_err;
+    }
     esp_err_t err = ESP_OK;
     if (g_connect_err_forever) {
         err = g_connect_err[0];
@@ -244,6 +288,7 @@ esp_err_t esp_wifi_connect(void)
 }
 esp_err_t esp_wifi_disconnect(void)
 {
+    CHECK(!g_lock_held);
     if (g_associated) {
         CHECK(g_pending_len < PENDING_MAX);
         g_pending[g_pending_len++] = WIFI_REASON_ASSOC_LEAVE;
@@ -302,7 +347,7 @@ static void boot(const char *stored_ssid)
     set_stored_ssid(stored_ssid, strlen(stored_ssid));
     CHECK(wifi_manager_init() == ESP_OK);
     CHECK(wifi_manager_start() == ESP_OK);
-    CHECK(g_wifi_handler != NULL && g_ip_handler != NULL && g_timer_cb != NULL);
+    CHECK(g_wifi_handler != NULL && g_ip_handler != NULL);
 }
 
 static bool failed_bit(void) { return (g_group.bits & WIFI_MANAGER_FAILED_BIT) != 0; }
@@ -495,7 +540,7 @@ static void scenario_join_wrong_password(void)
     g_script_len = 1;
     const esp_err_t err = wifi_manager_connect("LabAP", "wrong-pass");
     CHECK(err == WIFI_MANAGER_ERR_AUTH_REJECTED);
-    CHECK(err == ESP_ERR_WIFI_PASSWORD);
+    CHECK(err != ESP_ERR_WIFI_PASSWORD);   /* never a driver code */
     CHECK(strcmp(s_wifi.current_ssid, "LabAP") == 0);
     CHECK(s_wifi.connect_requested);
     CHECK(g_timer_armed && g_timer_delay_us == 2000ULL * 1000ULL);
@@ -506,7 +551,8 @@ static void scenario_join_timeout_and_success(void)
     boot("OldAP");
     g_script[0] = WIFI_REASON_NO_AP_FOUND;
     g_script_len = 1;
-    CHECK(wifi_manager_connect("GoneAP", "pw") == ESP_ERR_TIMEOUT);   /* unchanged */
+    CHECK(wifi_manager_connect("GoneAP", "pw") == ESP_ERR_TIMEOUT);
+    CHECK(s_wifi.connect_requested && g_timer_armed);   /* still owned */
 
     g_script[1] = SCRIPT_GOT_IP;
     g_script_len = 2;
@@ -552,7 +598,10 @@ static void scenario_join_unassociated_connect_fails(void)
     CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);
     CHECK(!s_wifi.reconfigure_in_progress);
     CHECK(s_wifi.connect_requested);
-    CHECK(s_wifi.reconnect_count == 1);          /* went through the retry path */
+    /* 200 went through the retry path (attempt 1, inline); that retry was then
+     * silent, so the join's timeout handed the request to the timer. */
+    CHECK(s_wifi.reconnect_count == 2);
+    CHECK(g_timer_armed && g_timer_delay_us == 1000ULL * 1000ULL);
     CHECK(log_count('W', "reconfigure disconnect never arrived; reason=200") == 1);
     CHECK(log_count(0, "disconnected for reconfigure") == 0);
 }
@@ -696,6 +745,191 @@ static void scenario_join_connect_error_clears_flag(void)
     CHECK(log_count(0, "disconnected for reconfigure") == 0);
 }
 
+/* -- 2026-09 review round: no-event and concurrent paths ----------------- */
+
+/* Fully silent join: disconnect and connect both return ESP_OK and NO event
+ * ever arrives. Used to return TIMEOUT with the reconfigure latch armed and no
+ * retry owner. */
+static void scenario_join_silent_timeout_retries(void)
+{
+    boot("BenchAP");                                 /* unassociated */
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);
+    CHECK(!s_wifi.reconfigure_in_progress);          /* latch disarmed */
+    CHECK(s_wifi.connect_requested);
+    CHECK(g_timer_armed && g_timer_delay_us == 1000ULL * 1000ULL);
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(!failed_bit());
+    CHECK(log_count('E', "no connect result within the wait") == 1);
+
+    /* The disarmed latch no longer eats a real ASSOC_LEAVE. */
+    ev_disconnect(WIFI_REASON_ASSOC_LEAVE);
+    CHECK(log_count(0, "disconnected for reconfigure") == 0);
+    CHECK(s_wifi.reconnect_count == 2);
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(fire_timer() == 500U);
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+}
+
+static esp_err_t g_hook_join_result;
+static void hook_join_labap(void)
+{
+    g_hook_join_result = wifi_manager_connect("LabAP", "right-pass");
+}
+
+/* Deterministic interleaving: an OLD retry callback is blocked inside
+ * esp_wifi_connect() while a fresh wifi_join runs to completion; the old call
+ * then returns an error. It must not touch the new request. */
+static void scenario_stale_callback_vs_new_join(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* old request: 2 s retry */
+    CHECK(g_timer_armed);
+
+    g_connect_hook = hook_join_labap;
+    g_hook_outer_err = ESP_ERR_WIFI_STATE;           /* old call fails AFTER the join */
+    g_script[0] = SCRIPT_GOT_IP;                     /* the join's own connect */
+    g_script_len = 1;
+    (void)fire_timer();
+
+    CHECK(g_hook_join_result == ESP_OK);
+    CHECK(wifi_manager_is_connected());
+    CHECK(!failed_bit());                            /* old error not reported */
+    CHECK(s_wifi.reconnect_count == 0);              /* fresh budget intact */
+    CHECK(s_wifi.auth_fail_count == 0);
+    CHECK(!g_timer_armed);                           /* no obsolete timer */
+    CHECK(s_wifi.connect_requested);
+    CHECK(log_count('W', "stale retry result") == 1);
+}
+
+/* A callback already DISPATCHED for the old request when the join's
+ * esp_timer_stop() ran (stop cannot recall it) must do nothing. */
+static void scenario_dispatched_callback_after_new_join(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(g_timer_armed);
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_OK);
+    CHECK(!g_timer_armed);
+    const int calls = g_connect_calls;
+    g_timer_cb(NULL);                                /* the late old callback */
+    CHECK(g_connect_calls == calls);                 /* no connect on a live link */
+    CHECK(wifi_manager_is_connected());
+    CHECK(!failed_bit());
+    CHECK(!g_timer_armed);
+}
+
+/* No timer can ever be created: an explicit terminal state, never
+ * connect_requested=true with nothing owning the retry, and no inline
+ * hammering in its place. */
+static void scenario_timer_create_failure_terminal(void)
+{
+    g_timer_create_fail = -1;
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* needs a 2 s timer */
+    CHECK(!s_wifi.connect_requested);
+    CHECK(failed_bit());
+    CHECK(g_connect_calls == 1);
+    CHECK(log_count('E', "reconnect timer unavailable") == 1);
+
+    /* Immediate attempts need no timer; the first delayed one ends it. */
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_NO_AP_FOUND);          /* attempt 1: inline */
+    CHECK(g_connect_calls == 3);
+    CHECK(s_wifi.connect_requested);
+    ev_disconnect(WIFI_REASON_NO_AP_FOUND);          /* attempt 2: 500 ms */
+    CHECK(!s_wifi.connect_requested);
+    CHECK(g_connect_calls == 3);
+}
+
+/* A create failure at init is retried lazily when a retry is first needed. */
+static void scenario_timer_lazy_create_recovers(void)
+{
+    g_timer_create_fail = 1;
+    boot("BenchAP");
+    CHECK(g_timer_cb == NULL);
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(g_timer_cb != NULL);
+    CHECK(g_timer_armed && g_timer_delay_us == 2000ULL * 1000ULL);
+    CHECK(s_wifi.connect_requested);
+}
+
+/* esp_timer_start_once() failing: on the event path and on the no-event
+ * (connect-error) path, the request ends explicitly. */
+static void scenario_timer_start_failure_terminal(void)
+{
+    boot("BenchAP");
+    g_timer_start_fail = true;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(!s_wifi.connect_requested && failed_bit() && !g_timer_armed);
+
+    g_connect_err[0] = ESP_ERR_WIFI_STATE;           /* boot call fails, no event */
+    g_connect_err_len = 1;
+    g_connect_err_pos = 0;
+    CHECK(wifi_manager_connect_stored_async() == ESP_ERR_WIFI_STATE);  /* nothing retries */
+    CHECK(!s_wifi.connect_requested && failed_bit() && !g_timer_armed);
+    CHECK(log_count('E', "reconnect timer unavailable") == 2);
+}
+
+/* Boot path: a transient error from the FIRST esp_wifi_connect() is handed to
+ * the bounded retry instead of stranding the boot; config errors are not. */
+static void scenario_boot_initial_connect_error_recovers(void)
+{
+    boot("BenchAP");
+    g_connect_err[0] = ESP_ERR_WIFI_STATE;
+    g_connect_err_len = 1;
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* retry owned */
+    CHECK(s_wifi.connect_requested);
+    CHECK(g_timer_armed && g_timer_delay_us == 1000ULL * 1000ULL);
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(log_count('E', "esp_wifi_connect (boot) failed") == 1);
+    CHECK(fire_timer() == 1000U);
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+    CHECK(s_wifi.reconnect_count == 0);
+
+    g_connect_err[0] = ESP_ERR_WIFI_SSID;            /* nothing stored */
+    g_connect_err_len = 1;
+    g_connect_err_pos = 0;
+    CHECK(wifi_manager_connect_stored_async() == ESP_ERR_WIFI_SSID);
+    CHECK(!s_wifi.connect_requested);
+    CHECK(!g_timer_armed);
+}
+
+/* esp_wifi_set_config() -> ESP_ERR_WIFI_PASSWORD (malformed password) is a
+ * driver validation error before anything is saved or attempted; it must not
+ * read as the manager's "AP rejected, still retrying" result. */
+static void scenario_set_config_password_error_distinct(void)
+{
+    boot("OldAP");
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+    const int calls = g_connect_calls;
+
+    g_set_config_err = ESP_ERR_WIFI_PASSWORD;
+    const esp_err_t err = wifi_manager_connect("LabAP", "short");
+    CHECK(err == ESP_ERR_WIFI_PASSWORD);
+    CHECK(err != WIFI_MANAGER_ERR_AUTH_REJECTED);
+    CHECK(g_connect_calls == calls);                 /* nothing attempted */
+    CHECK(wifi_manager_is_connected());              /* old link untouched */
+    CHECK(strcmp(s_wifi.current_ssid, "OldAP") == 0);
+    CHECK(strcmp(wifi_manager_err_to_name(WIFI_MANAGER_ERR_AUTH_REJECTED),
+                 "WIFI_MANAGER_ERR_AUTH_REJECTED") == 0);
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -729,6 +963,14 @@ int main(int argc, char **argv)
         { "inline_connect_error_no_recursion", scenario_inline_connect_error_no_recursion },
         { "connect_error_exhausts_budget", scenario_connect_error_exhausts_budget },
         { "join_connect_error_clears_flag", scenario_join_connect_error_clears_flag },
+        { "join_silent_timeout_retries", scenario_join_silent_timeout_retries },
+        { "stale_callback_vs_new_join", scenario_stale_callback_vs_new_join },
+        { "dispatched_callback_after_new_join", scenario_dispatched_callback_after_new_join },
+        { "timer_create_failure_terminal", scenario_timer_create_failure_terminal },
+        { "timer_lazy_create_recovers", scenario_timer_lazy_create_recovers },
+        { "timer_start_failure_terminal", scenario_timer_start_failure_terminal },
+        { "boot_initial_connect_error_recovers", scenario_boot_initial_connect_error_recovers },
+        { "set_config_password_error_distinct", scenario_set_config_password_error_distinct },
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <scenario>\n", argv[0]);

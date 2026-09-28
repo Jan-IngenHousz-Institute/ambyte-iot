@@ -13,13 +13,19 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
 #include "wifi_manager.h"
 
-_Static_assert(WIFI_MANAGER_ERR_AUTH_REJECTED == ESP_ERR_WIFI_PASSWORD,
-               "wifi_manager.h spells the auth-rejected code without esp_wifi.h");
+/* The manager's own result must never be mistaken for a driver code: in
+ * particular esp_wifi_set_config() can return ESP_ERR_WIFI_PASSWORD for a
+ * malformed password BEFORE anything is saved or attempted, and the CLI's
+ * "saved, AP rejected, still retrying" hint would then be false. */
+_Static_assert((WIFI_MANAGER_ERR_AUTH_REJECTED < ESP_ERR_WIFI_BASE) ||
+               (WIFI_MANAGER_ERR_AUTH_REJECTED >= ESP_ERR_MESH_BASE),
+               "WIFI_MANAGER_ERR_* must stay outside the esp_wifi error range");
 
 #define WIFI_MANAGER_CONNECTED_BIT BIT0
 #define WIFI_MANAGER_FAILED_BIT BIT1
@@ -88,8 +94,8 @@ _Static_assert(WIFI_MANAGER_ERR_AUTH_REJECTED == ESP_ERR_WIFI_PASSWORD,
  * The wrong-password SIGNAL is kept, just decoupled from giving up:
  *  - every auth-class failure sets WIFI_MANAGER_FAILED_BIT, so an interactive
  *    wifi_manager_connect() (CLI `wifi_join`) still returns promptly, now with
- *    WIFI_MANAGER_ERR_AUTH_REJECTED (== ESP_ERR_WIFI_PASSWORD) instead of a
- *    generic ESP_FAIL, while the retry
+ *    the manager-owned WIFI_MANAGER_ERR_AUTH_REJECTED instead of a generic
+ *    ESP_FAIL, while the retry
  *    continues in the background (the typed credentials are already persisted
  *    by esp_wifi_set_config, so stopping could not restore the old ones);
  *  - the count of auth-class failures since the last GOT_IP is logged on
@@ -144,6 +150,25 @@ typedef struct {
      * wrong-password signal must still build up. */
     int auth_fail_count;
     esp_timer_handle_t reconnect_timer;
+    /* ── Request ownership (2026-09 review of the retry-strand fix) ──────
+     * Three contexts touch this state: the event-loop task (driver events),
+     * the esp_timer task (delayed retries) and the caller of a fresh request
+     * (CLI wifi_join, app_main boot). esp_timer_stop() does NOT wait for a
+     * callback that is already running, so a retry that had passed its
+     * connect_requested check could sit inside esp_wifi_connect() while a new
+     * wifi_join reset the counters, then return and set the NEW request's
+     * FAILED bit, burn its fresh budget and arm an obsolete timer.
+     *
+     * `lock` serialises every state transition (never held across a driver
+     * call - esp_wifi_* may block on the Wi-Fi task, and nothing here may wait
+     * on an event while holding it). `request_gen` is bumped by each fresh
+     * request; a retry snapshots it before its driver call and discards its
+     * result if it changed. `timer_gen` records which request armed the timer,
+     * so a callback dispatched for a superseded request does nothing. */
+    SemaphoreHandle_t lock;
+    uint32_t request_gen;
+    uint32_t timer_gen;
+    bool timer_armed;
     char current_ssid[33];
 } wifi_manager_service_t;
 
@@ -161,8 +186,30 @@ static wifi_manager_service_t s_wifi = {
     .reconnect_count = 0,
     .auth_fail_count = 0,
     .reconnect_timer = NULL,
+    .lock = NULL,
+    .request_gen = 0,
+    .timer_gen = 0,
+    .timer_armed = false,
     .current_ssid = {0},
 };
+
+const char *wifi_manager_err_to_name(esp_err_t err)
+{
+    if (err == WIFI_MANAGER_ERR_AUTH_REJECTED) {
+        return "WIFI_MANAGER_ERR_AUTH_REJECTED";
+    }
+    return esp_err_to_name(err);
+}
+
+static void wifi_manager_lock(void)
+{
+    (void)xSemaphoreTake(s_wifi.lock, portMAX_DELAY);
+}
+
+static void wifi_manager_unlock(void)
+{
+    (void)xSemaphoreGive(s_wifi.lock);
+}
 
 /* "Auth-class" = the key/identity rejections that COULD mean wrong credentials
  * (formerly "fatal"; the manager gave up on them — see the retry-floor comment
@@ -243,117 +290,171 @@ static void wifi_manager_refresh_current_ssid(void)
     memcpy(s_wifi.current_ssid, cfg.sta.ssid, len);
 }
 
-static void wifi_manager_cancel_reconnect(void);
+static void wifi_manager_reconnect_timer_cb(void *arg);
 
-/* Minimum spacing when esp_wifi_connect() ITSELF fails (see the timer cb). The
- * usual cause is ESP_ERR_WIFI_STATE — the driver is still busy with a previous
- * connect/scan/disconnect — which clears within a few hundred ms, so 1 s is
- * long enough not to spin on a busy driver and short enough to cost nothing.
- * The floor also guarantees this path never takes schedule_reconnect's
- * zero-delay inline branch, i.e. never recurses. */
+/* Minimum spacing for a retry that follows a failure the driver will never
+ * report as an event: esp_wifi_connect() itself returning an error (usually
+ * ESP_ERR_WIFI_STATE - the driver is still busy with a previous
+ * connect/scan/disconnect, which clears within a few hundred ms), or a join
+ * whose connect produced nothing at all within its wait. 1 s is long enough not
+ * to spin on a busy driver and short enough to cost nothing; it also keeps
+ * every such retry on the timer, never the inline zero-delay path, so this
+ * machinery cannot recurse. */
 #define WIFI_MANAGER_CONNECT_ERROR_MIN_DELAY_MS 1000U
 
-/* Count one failed attempt against WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS. Returns
- * true — after stopping the manager and raising FAILED — once the budget is
- * spent. Shared by both failure paths (a driver disconnect event, and an
- * esp_wifi_connect() error that produces no event) so the cap is ONE budget
- * with ONE exhaustion rule, whichever way the attempts fail. */
-static bool wifi_manager_attempt_budget_spent(int reason, esp_err_t connect_err)
+/* Create the reconnect timer if it does not exist yet. Called at init and
+ * again lazily before every arm, so one transient allocation failure at boot
+ * does not disable retries for the whole uptime. */
+static esp_err_t wifi_manager_ensure_reconnect_timer(void)
+{
+    if (s_wifi.reconnect_timer != NULL) {
+        return ESP_OK;
+    }
+    const esp_timer_create_args_t timer_args = {
+        .callback = &wifi_manager_reconnect_timer_cb,
+        .name = "wifi_reconnect",
+    };
+    const esp_err_t err = esp_timer_create(&timer_args, &s_wifi.reconnect_timer);
+    if (err != ESP_OK) {
+        s_wifi.reconnect_timer = NULL;
+    }
+    return err;
+}
+
+/* Caller holds the lock. Stop any pending retry (no-op if idle/absent). */
+static void wifi_manager_cancel_reconnect_locked(void)
+{
+    if (s_wifi.reconnect_timer != NULL) {
+        esp_timer_stop(s_wifi.reconnect_timer);
+    }
+    s_wifi.timer_armed = false;
+}
+
+/* Caller holds the lock. End the current request explicitly: no retry owner
+ * remains, so say so - connect_requested=false and FAILED, never a silent
+ * connect_requested=true with nothing scheduled. The next wifi_manager_connect
+ * / connect_stored_async re-arms; the sync_runner watchdog reboot is the
+ * unattended backstop. */
+static void wifi_manager_stop_request_locked(void)
+{
+    s_wifi.connect_requested = false;
+    s_wifi.reconfigure_in_progress = false;
+    wifi_manager_cancel_reconnect_locked();
+    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+}
+
+/* Caller holds the lock. Arm the retry timer for the CURRENT request. Returns
+ * false if no timer can be armed; the caller must then end the request
+ * (wifi_manager_stop_request_locked) - there is deliberately no inline
+ * "reconnect now" fallback: it bypassed the auth floor (hammering the AP) and,
+ * from the retry path, recursed. */
+static bool wifi_manager_arm_retry_timer_locked(uint32_t delay_ms)
+{
+    esp_err_t err = wifi_manager_ensure_reconnect_timer();
+    if (err == ESP_OK) {
+        esp_timer_stop(s_wifi.reconnect_timer);  /* idle/expired: ignored */
+        err = esp_timer_start_once(s_wifi.reconnect_timer, (uint64_t)delay_ms * 1000ULL);
+    }
+    if (err != ESP_OK) {
+        s_wifi.timer_armed = false;
+        ESP_LOGE(TAG, "reconnect timer unavailable (%s) - ending the Wi-Fi request "
+                 "(re-arm with wifi_join or reboot)", esp_err_to_name(err));
+        return false;
+    }
+    s_wifi.timer_armed = true;
+    s_wifi.timer_gen = s_wifi.request_gen;
+    return true;
+}
+
+/* Caller holds the lock. Count one failed attempt against
+ * WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS. Once the budget is spent it ends the
+ * request and returns true. Shared by every failure path (a driver
+ * disconnect event, an esp_wifi_connect() error, a silent join timeout) so the
+ * cap is ONE budget with ONE exhaustion rule. */
+static bool wifi_manager_attempt_budget_spent_locked(int reason, esp_err_t connect_err)
 {
     ++s_wifi.reconnect_count;
     if (s_wifi.reconnect_count <= WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS) {
         return false;
     }
-    s_wifi.connect_requested = false;
-    wifi_manager_cancel_reconnect();
-    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+    wifi_manager_stop_request_locked();
     ESP_LOGE(TAG,
              "Wi-Fi reconnect gave up after %d attempts (last reason=%d, connect err=%s, "
-             "%d auth rejections) — \"%s\" %s",
+             "%d auth rejections) - \"%s\" %s",
              WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS, reason, esp_err_to_name(connect_err),
              s_wifi.auth_fail_count, s_wifi.current_ssid,
              (s_wifi.auth_fail_count > 0) ? "rejects the stored credentials" : "unreachable");
     return true;
 }
 
-/* Arm the one-shot reconnect timer. Timer-only: unlike
- * wifi_manager_schedule_reconnect() it never falls back to an inline retry,
- * because its caller IS the retry and an inline fallback would recurse. */
-static void wifi_manager_arm_retry_timer(uint32_t delay_ms)
+/* Caller holds the lock. The current request's attempt failed in a way the
+ * driver will NOT report as an event (connect call error, or silence), so
+ * nothing else would ever schedule the next one: count it and arm the timer on
+ * the ordinary backoff, floored at WIFI_MANAGER_CONNECT_ERROR_MIN_DELAY_MS.
+ * Returns true if a retry is now owned by the timer, false if the request was
+ * ended (budget spent or no timer). */
+static bool wifi_manager_retry_after_silent_failure_locked(esp_err_t err, const char *what)
 {
-    esp_err_t err = ESP_ERR_INVALID_STATE;
-    if (s_wifi.reconnect_timer != NULL) {
-        esp_timer_stop(s_wifi.reconnect_timer);  /* idle/expired: ignored */
-        err = esp_timer_start_once(s_wifi.reconnect_timer, (uint64_t)delay_ms * 1000ULL);
-    }
-    if (err != ESP_OK) {
-        /* Only reachable if esp_timer failed at init or now; nothing else can
-         * wake a retry. Say so loudly: the watchdog reboot is the backstop. */
-        ESP_LOGE(TAG, "reconnect timer unavailable (%s) — Wi-Fi retry stalled until the "
-                 "next connect request or reboot", esp_err_to_name(err));
-    }
-}
-
-/* Issue one reconnect. Runs either inline (immediate retries) or from the
- * reconnect timer's task.
- *
- * An esp_wifi_connect() error here produces NO driver event, so nothing else
- * would ever schedule the next attempt. Until 2026-09 this path only logged
- * and raised FAILED, leaving connect_requested=true with no timer armed — the
- * bounded 100-attempt policy could end after a single retry (Evaluator repro:
- * stored-creds boot -> AUTH_FAIL -> 2 s retry -> ESP_ERR_WIFI_STATE -> silence).
- * The failed call now counts as an attempt against the same budget and
- * re-arms the timer on the ordinary backoff, floored at
- * WIFI_MANAGER_CONNECT_ERROR_MIN_DELAY_MS. */
-static void wifi_manager_reconnect_timer_cb(void *arg)
-{
-    (void)arg;
-    if (!s_wifi.connect_requested) {
-        return;  /* a fresh connect or give-up superseded this retry */
-    }
-    const esp_err_t err = esp_wifi_connect();
-    if (err == ESP_OK) {
-        return;  /* the outcome arrives as a driver event */
-    }
-    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
-    if (wifi_manager_attempt_budget_spent(0, err)) {
-        return;
+    if (wifi_manager_attempt_budget_spent_locked(0, err)) {
+        return false;
     }
     uint32_t delay_ms = wifi_manager_retry_delay_ms(s_wifi.reconnect_count, 0);
     if (delay_ms < WIFI_MANAGER_CONNECT_ERROR_MIN_DELAY_MS) {
         delay_ms = WIFI_MANAGER_CONNECT_ERROR_MIN_DELAY_MS;
     }
-    ESP_LOGE(TAG, "esp_wifi_connect (retry) failed: %s — no driver event will follow; "
-             "reconnect attempt %d in %u ms",
-             esp_err_to_name(err), s_wifi.reconnect_count, (unsigned)delay_ms);
-    wifi_manager_arm_retry_timer(delay_ms);
+    if (!wifi_manager_arm_retry_timer_locked(delay_ms)) {
+        wifi_manager_stop_request_locked();
+        return false;
+    }
+    ESP_LOGE(TAG, "%s (%s) - no driver event will follow; reconnect attempt %d in %u ms",
+             what, esp_err_to_name(err), s_wifi.reconnect_count, (unsigned)delay_ms);
+    return true;
 }
 
-/* Schedule a reconnect after `delay_ms`; falls back to an immediate retry if
- * the timer is unavailable or the delay is zero. */
-static void wifi_manager_schedule_reconnect(uint32_t delay_ms)
+/* Issue one retry for request `gen`. Called WITHOUT the lock (the driver call
+ * may block), either inline for an immediate attempt or from the timer cb.
+ *
+ * An esp_wifi_connect() error produces NO driver event. Until 2026-09 this path
+ * only logged and raised FAILED, leaving connect_requested=true with no timer
+ * armed, so the bounded policy could end after one retry (Evaluator repro:
+ * stored-creds boot -> AUTH_FAIL -> 2 s retry -> ESP_ERR_WIFI_STATE -> silence).
+ * The error now counts as an attempt and re-arms the timer - but only if the
+ * request that issued the call is still the current one. */
+static void wifi_manager_issue_retry(uint32_t gen)
 {
-    if ((s_wifi.reconnect_timer == NULL) || (delay_ms == 0U)) {
-        wifi_manager_reconnect_timer_cb(NULL);
+    const esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK) {
+        return;  /* the outcome arrives as a driver event */
+    }
+    wifi_manager_lock();
+    if ((s_wifi.request_gen != gen) || !s_wifi.connect_requested) {
+        ESP_LOGW(TAG, "stale retry result (%s) for a superseded Wi-Fi request - dropped",
+                 esp_err_to_name(err));
+        wifi_manager_unlock();
         return;
     }
-    esp_timer_stop(s_wifi.reconnect_timer);  /* ESP_ERR_INVALID_STATE if idle — ignored */
-    const esp_err_t err =
-        esp_timer_start_once(s_wifi.reconnect_timer, (uint64_t)delay_ms * 1000ULL);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "reconnect timer start failed (%s) — reconnecting now",
-                 esp_err_to_name(err));
-        wifi_manager_reconnect_timer_cb(NULL);
-    }
+    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+    (void)wifi_manager_retry_after_silent_failure_locked(err, "esp_wifi_connect (retry) failed");
+    wifi_manager_unlock();
 }
 
-/* Cancel any pending reconnect timer (no-op if idle or not created). */
-static void wifi_manager_cancel_reconnect(void)
+static void wifi_manager_reconnect_timer_cb(void *arg)
 {
-    if (s_wifi.reconnect_timer != NULL) {
-        esp_timer_stop(s_wifi.reconnect_timer);
+    (void)arg;
+    wifi_manager_lock();
+    s_wifi.timer_armed = false;
+    if (!s_wifi.connect_requested || (s_wifi.timer_gen != s_wifi.request_gen)) {
+        /* Superseded: a fresh request (or give-up) happened after this timer
+         * was armed, and esp_timer_stop() could not recall an already
+         * dispatched callback. */
+        wifi_manager_unlock();
+        return;
     }
+    const uint32_t gen = s_wifi.request_gen;
+    wifi_manager_unlock();
+    wifi_manager_issue_retry(gen);
 }
+
 
 static esp_err_t wifi_manager_apply_seeded_creds(void);
 
@@ -473,10 +574,12 @@ static void wifi_event_handler(
 
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
 
+        wifi_manager_lock();
         if (s_wifi.reconfigure_in_progress) {
             /* One-shot, and only for our own disconnect (see the field). */
             s_wifi.reconfigure_in_progress = false;
             if (reason == WIFI_REASON_ASSOC_LEAVE) {
+                wifi_manager_unlock();
                 ESP_LOGI(TAG, "Wi-Fi disconnected for reconfigure");
                 return;
             }
@@ -492,6 +595,7 @@ static void wifi_event_handler(
                 "Wi-Fi disconnected (reason=%d)",
                 reason);
             xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+            wifi_manager_unlock();
             return;
         }
 
@@ -504,7 +608,8 @@ static void wifi_event_handler(
             xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
         }
 
-        if (wifi_manager_attempt_budget_spent((int)reason, ESP_OK)) {
+        if (wifi_manager_attempt_budget_spent_locked((int)reason, ESP_OK)) {
+            wifi_manager_unlock();
             return;
         }
         const uint32_t delay_ms =
@@ -532,22 +637,43 @@ static void wifi_event_handler(
                      (int)reason, s_wifi.current_ssid, s_wifi.auth_fail_count,
                      s_wifi.reconnect_count, (unsigned)delay_ms);
         }
-        wifi_manager_schedule_reconnect(delay_ms);
+        if (delay_ms == 0U) {
+            /* Attempt 1 of a non-auth reason: immediate, issued after dropping
+             * the lock (the driver call may block). */
+            wifi_manager_cancel_reconnect_locked();
+            const uint32_t gen = s_wifi.request_gen;
+            wifi_manager_unlock();
+            wifi_manager_issue_retry(gen);
+            return;
+        }
+        if (!wifi_manager_arm_retry_timer_locked(delay_ms)) {
+            wifi_manager_stop_request_locked();
+        }
+        wifi_manager_unlock();
         return;
     }
 
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_CONNECTED)) {
+        wifi_manager_lock();
         s_wifi.reconfigure_in_progress = false;   /* our disconnect is behind us */
+        /* An association means the pending attempt progressed; a retry timer
+         * still armed (e.g. by a join's silent-timeout path while the driver
+         * was merely slow) would call esp_wifi_connect() on an associated
+         * station and flap the link. */
+        wifi_manager_cancel_reconnect_locked();
+        wifi_manager_unlock();
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
         ESP_LOGI(TAG, "Associated with AP \"%s\"", s_wifi.current_ssid);
         return;
     }
 
     if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
+        wifi_manager_lock();
         s_wifi.reconnect_count = 0;
         s_wifi.auth_fail_count = 0;
         s_wifi.reconfigure_in_progress = false;   /* belt-and-braces with STA_CONNECTED */
-        wifi_manager_cancel_reconnect();
+        wifi_manager_cancel_reconnect_locked();
+        wifi_manager_unlock();
         xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
         ESP_LOGI(TAG, "Got IP from AP");
@@ -586,6 +712,12 @@ esp_err_t wifi_manager_init(void)
     esp_err_t err = wifi_manager_ensure_event_group();
     if (err != ESP_OK) {
         return err;
+    }
+    if (s_wifi.lock == NULL) {
+        s_wifi.lock = xSemaphoreCreateMutex();
+        if (s_wifi.lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     err = esp_netif_init();
@@ -638,17 +770,10 @@ esp_err_t wifi_manager_init(void)
         s_wifi.handlers_registered = true;
     }
 
-    if (s_wifi.reconnect_timer == NULL) {
-        const esp_timer_create_args_t timer_args = {
-            .callback = &wifi_manager_reconnect_timer_cb,
-            .name = "wifi_reconnect",
-        };
-        err = esp_timer_create(&timer_args, &s_wifi.reconnect_timer);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "reconnect timer create failed: %s — retries will be immediate",
-                     esp_err_to_name(err));
-            s_wifi.reconnect_timer = NULL;
-        }
+    err = wifi_manager_ensure_reconnect_timer();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "reconnect timer create failed: %s - retried when first needed",
+                 esp_err_to_name(err));
     }
 
     s_wifi.initialized = true;
@@ -696,13 +821,15 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
         return err;
     }
 
+    wifi_manager_lock();
+    const uint32_t gen = ++s_wifi.request_gen;   /* supersedes any in-flight retry */
     s_wifi.reconnect_count = 0;
     s_wifi.auth_fail_count = 0;
-    wifi_manager_cancel_reconnect();
+    wifi_manager_cancel_reconnect_locked();
     xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
-
     s_wifi.connect_requested = false;
     s_wifi.reconfigure_in_progress = true;
+    wifi_manager_unlock();
     /* The reconnect timer task may be inside esp_wifi_connect() right now (an
      * unreachable AP keeps the driver busy almost continuously), and the driver
      * rejects any overlapping disconnect/connect with ESP_ERR_WIFI_STATE. Retry
@@ -713,7 +840,11 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
             break;
         }
         if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
-            s_wifi.reconfigure_in_progress = false;
+            wifi_manager_lock();
+            if (s_wifi.request_gen == gen) {
+                s_wifi.reconfigure_in_progress = false;
+            }
+            wifi_manager_unlock();
             return err;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -721,11 +852,12 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     /* Dead on IDF 5.5 (an unassociated station gets ESP_OK and no event), kept
      * for drivers that do report it. The handler, not this branch, is what
      * bounds the flag — see reconfigure_in_progress. */
+    wifi_manager_lock();
     if (err == ESP_ERR_WIFI_NOT_CONNECT) {
         s_wifi.reconfigure_in_progress = false;
     }
-
     s_wifi.connect_requested = true;
+    wifi_manager_unlock();
 
     for (int attempt = 0; ; attempt++) {
         err = esp_wifi_connect();
@@ -733,11 +865,15 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
             break;
         }
         if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
-            s_wifi.connect_requested = false;
-            /* No connect was issued, so no event can come to disarm the flag
-             * (see reconfigure_in_progress): clear it here or the NEXT real
-             * disconnect after some later successful connect is at risk. */
-            s_wifi.reconfigure_in_progress = false;
+            wifi_manager_lock();
+            if (s_wifi.request_gen == gen) {
+                s_wifi.connect_requested = false;
+                /* No connect was issued, so no event can come to disarm the
+                 * flag (see reconfigure_in_progress): clear it here or the NEXT
+                 * real disconnect after a later successful connect is at risk. */
+                s_wifi.reconfigure_in_progress = false;
+            }
+            wifi_manager_unlock();
             return err;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -760,6 +896,22 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
         return (s_wifi.auth_fail_count > 0) ? WIFI_MANAGER_ERR_AUTH_REJECTED : ESP_FAIL;
     }
 
+    /* Nothing at all within the wait. Both driver calls said ESP_OK, so no
+     * event may ever come (the 2026-09 review's fully silent case): if this
+     * returned with no retry owner, the header's "keeps retrying" promise
+     * would be false and the still-armed reconfigure latch could later eat a
+     * real ASSOC_LEAVE. Disarm the latch and hand the request to the bounded
+     * retry - unless a disconnect already did (timer armed) or a newer
+     * request took over. */
+    wifi_manager_lock();
+    if (s_wifi.request_gen == gen) {
+        s_wifi.reconfigure_in_progress = false;
+        if (s_wifi.connect_requested && !s_wifi.timer_armed) {
+            (void)wifi_manager_retry_after_silent_failure_locked(
+                ESP_ERR_TIMEOUT, "wifi_join: no connect result within the wait");
+        }
+    }
+    wifi_manager_unlock();
     return ESP_ERR_TIMEOUT;
 }
 
@@ -794,19 +946,43 @@ esp_err_t wifi_manager_connect_stored_async(void)
     (void)wifi_manager_apply_seeded_creds();
     wifi_manager_refresh_current_ssid();
 
+    wifi_manager_lock();
+    const uint32_t gen = ++s_wifi.request_gen;
     s_wifi.reconnect_count = 0;
     s_wifi.auth_fail_count = 0;
-    wifi_manager_cancel_reconnect();
+    wifi_manager_cancel_reconnect_locked();
     xEventGroupClearBits(s_wifi.event_group,
                          WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
     s_wifi.connect_requested = true;
+    wifi_manager_unlock();
 
     err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        s_wifi.connect_requested = false;
-        return err;
+    if (err == ESP_OK) {
+        return ESP_OK;   /* connection proceeds in the background (events / reconnect) */
     }
-    return ESP_OK;   /* connection proceeds in the background (events / reconnect) */
+
+    /* The boot caller (app_main) only logs a failure here, so a transient
+     * driver error on the very first call used to strand the unit for the whole
+     * boot. Configuration errors cannot heal by retrying (no/invalid stored
+     * SSID = unprovisioned, which app_main already reports), so those end the
+     * request; anything else is handed to the bounded retry and reported as
+     * started. Contract: an error return <=> nothing will retry. */
+    const bool config_error = (err == ESP_ERR_WIFI_SSID) || (err == ESP_ERR_WIFI_MODE) ||
+                              (err == ESP_ERR_WIFI_NOT_INIT) ||
+                              (err == ESP_ERR_WIFI_NOT_STARTED);
+    bool retrying = false;
+    wifi_manager_lock();
+    if (s_wifi.request_gen == gen) {
+        if (config_error) {
+            s_wifi.connect_requested = false;
+        } else {
+            xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+            retrying = wifi_manager_retry_after_silent_failure_locked(
+                err, "esp_wifi_connect (boot) failed");
+        }
+    }
+    wifi_manager_unlock();
+    return retrying ? ESP_OK : err;
 }
 
 esp_err_t wifi_manager_connect_stored(void)

@@ -8,5 +8,6 @@ typedef long BaseType_t;
 #define BIT0 0x00000001U
 #define BIT1 0x00000002U
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+#define portMAX_DELAY ((TickType_t)0xffffffffUL)
 void vTaskDelay(TickType_t ticks);
 #endif
