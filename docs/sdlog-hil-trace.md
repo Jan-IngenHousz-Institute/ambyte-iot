@@ -14,11 +14,11 @@ is lowercase hex sha256; `<b64>` is standard base64 with padding, no line breaks
 
 ## Logger trace (H2) — `evq_hil sdlog_trace <on|off|drain|autoarm|stat|probe <min_free>>`
 
-- `on` allocates a 512 KiB PSRAM byte ring (once) and starts recording:
+- `on` allocates a 128 KiB PSRAM byte ring (once) and starts recording:
   `SLT_ON <cap_bytes> <next_seq>`. The allocation fails closed: if less than
-  256 KiB of PSRAM would stay free, the ring is released again and `on` prints
-  `SLT_ERR noalloc free=<bytes>` (replacement amendment A3: the E8:F6:0A bench
-  has 2 MiB of PSRAM, so the original 2 MiB ring is not possible there).
+  192 KiB of PSRAM would stay free, the ring is released again and `on` prints
+  `SLT_ERR noalloc free=<bytes>`. Sized from the E8:F6:0A bench's measured
+  runtime headroom (393,228 B free of 2 MiB); drain every 2 s.
 - `probe <min_free>` runs the same allocation with a caller-chosen floor, but
   does not start recording (G-TR fail-closed check):
   `SLT_PROBE need=<min_free> before=<free> after=<free> ring=<new|kept|none> <ok|noalloc>`.

@@ -221,13 +221,13 @@ def _shim_fired(dev: L.Dev) -> list[dict]:
 
 
 class Gtr1(_Base):
-    """G-TR host twin (replacement amendment A3): the 512 KiB ring allocates only
-    when >= 256 KiB PSRAM stays free (refusal leaves no ring), the 25 % watermark
-    fires once at the new cap, and a drain is seq-contiguous with lost=0."""
+    """G-TR host twin: the 128 KiB ring allocates only when >= 192 KiB PSRAM stays
+    free (refusal leaves no ring), the 25 % watermark fires once at the new cap,
+    and a drain is seq-contiguous with lost=0."""
 
     def test_fail_closed_allocation(self):
         d = self.dev("gtr_alloc")
-        d.cmd("free_psram 100000", expect=True)
+        d.cmd("free_psram 190000", expect=True)             # just under the 192 KiB floor
         self.assertEqual(d.cmd("trace_on", expect=True)["trace_on"], -1)
         self.assertTrue(any(ln.startswith("SLT_ERR noalloc") for ln in d.trace), d.trace)
         self.assertEqual(d.cmd("trace_probe 1073741824", expect=True)["trace_probe"], -1)
@@ -236,10 +236,10 @@ class Gtr1(_Base):
         self.assertFalse(any(ln.startswith("SLT_ON ") for ln in d.trace), d.trace)
         d.cmd("free_psram 4194304", expect=True)
         self.assertEqual(d.cmd("trace_on", expect=True)["trace_on"], 0)
-        self.assertTrue(any(re.match(rf"^SLT_ON {512 * 1024} \d+$", ln) for ln in d.trace), d.trace)
+        self.assertTrue(any(re.match(rf"^SLT_ON {128 * 1024} \d+$", ln) for ln in d.trace), d.trace)
         d.finish()
 
-    def test_watermark_and_lossless_drain_at_512k(self):
+    def test_watermark_and_lossless_drain_at_cap(self):
         d = self.dev("gtr_wm")
         d.init()
         d.cmd("trace_on", expect=True)
@@ -251,8 +251,8 @@ class Gtr1(_Base):
                 d.step(1)
         wm = [int(ln.split()[1]) for ln in d.trace if ln.startswith("SLT_WM ")]
         self.assertEqual(len(wm), 1, d.trace[-5:])
-        self.assertGreaterEqual(wm[0] * 4, 512 * 1024)
-        self.assertLess(wm[0] * 2, 512 * 1024)                  # well below the 50 % STOP line
+        self.assertGreaterEqual(wm[0] * 4, 128 * 1024)
+        self.assertLess(wm[0] * 2, 128 * 1024)                  # well below the 50 % STOP line
         d.cmd("trace_drain", expect=True)
         seqs = [int(e[2]) for e in _entries(d.trace)]
         self.assertTrue(seqs)
@@ -262,6 +262,31 @@ class Gtr1(_Base):
         total, lost, first, last = (int(x) for x in hdr[-1][1:5])
         self.assertEqual(lost, 0)
         self.assertEqual((first, last), (seqs[0], seqs[-1]))
+        d.finish()
+
+
+class Gtr2(_Base):
+    """Overflow at the 128 KiB cap is detected, never silent: entries that do not
+    fit are counted in `lost` and still consume a seq, so the drained seq span
+    equals drained + lost (a gap the checkers report as VOID/STOP)."""
+
+    def test_overflow_is_counted_and_visible_as_seq_gaps(self):
+        d = self.dev("gtr_ovf")
+        d.init()
+        d.cmd("trace_on", expect=True)
+        for seq in range(2200):                                # ~2200 x 200 B >> 128 KiB, no drain
+            d.log(seq, textlen=200)
+            if seq % 16 == 0:
+                d.step(1)
+        d.step(20)
+        d.cmd("trace_drain", expect=True)
+        hdr = [ln.split() for ln in d.trace if ln.startswith("SLT_HDR ")]
+        total, lost, first, last = (int(x) for x in hdr[-1][1:5])
+        seqs = [int(e[2]) for e in _entries(d.trace)]
+        self.assertGreater(lost, 0)
+        self.assertEqual(len(seqs), total)
+        self.assertEqual(last - first + 1, len(seqs) + lost)   # every lost entry is a visible gap
+        self.assertNotEqual(seqs, list(range(seqs[0], seqs[0] + len(seqs))))
         d.finish()
 
 

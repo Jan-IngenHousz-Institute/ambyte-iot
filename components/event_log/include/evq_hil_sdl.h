@@ -36,13 +36,18 @@ enum { HIL_SDL_CLOSE_OK = 0, HIL_SDL_CLOSE_ERR = 1, HIL_SDL_CLOSE_ABANDON = 2 };
 enum { HIL_SDL_DROP_ROTATE_BLOCKED = 0, HIL_SDL_DROP_UNAVAILABLE = 1 };
 enum { HIL_SDL_QUI_PAUSED = 0, HIL_SDL_QUI_RESUMED = 1, HIL_SDL_QUI_TIMEOUT = 2, HIL_SDL_QUI_REFUSED = 3 };
 
-/* 512 KiB (replacement amendment A3): the E8:F6:0A bench carries 2 MiB of PSRAM,
- * so the original 2 MiB ring cannot coexist with the event log's record buffers.
- * Worst case ~135 KiB per 10 s drain interval vs the 256 KiB STOP line = ~1.9x. */
-#define HIL_SDL_CAP_BYTES (512u * 1024u)
+/* 128 KiB, sized from the E8:F6:0A bench's MEASURED runtime headroom: with the
+ * event store, MQTT and Wi-Fi up it has 393,228 B of PSRAM free (2 MiB part), so
+ * the 512 KiB ring of replacement amendment A3 could never allocate - the
+ * fail-closed check refused it on hardware (SLT_ERR noalloc free=393228).
+ * 128 KiB leaves ~262 KiB free, above the 192 KiB floor (3x the publisher's
+ * 64 KiB outstanding window). Host drains every 2 s: at the ~13.5 KiB/s worst
+ * case the ring reaches ~27 KiB between drains, under the 25 % watermark
+ * (32 KiB) and ~2.4x below the 50 % STOP line (64 KiB). */
+#define HIL_SDL_CAP_BYTES (128u * 1024u)
 /* `on` refuses (SLT_ERR noalloc, ring freed) unless this much PSRAM stays free
  * after the ring is allocated: tracing must not starve the store it observes. */
-#define HIL_SDL_MIN_FREE_PSRAM (256u * 1024u)
+#define HIL_SDL_MIN_FREE_PSRAM (192u * 1024u)
 
 /* ── control (CLI) ── */
 int  hil_sdl_trace_on(bool autoarm);     /* 0 ok, -1 noalloc (prints SLT_ON / SLT_ERR) */
