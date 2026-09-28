@@ -88,6 +88,12 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - **Two release units**: firmware keeps `vX.Y.Z`; `schedule/**` releases independently as
   `schedule-vX.Y.Z`. The path filter must be applied to commit analysis *and* release notes so a
   schedule-only commit cannot bump firmware later. Schedule assets carry SHA + built-against firmware.
+- **IoT Jobs (openJII firmware rollout)**: `components/iot_jobs` treats the MQTT client id as the
+  Thing name (the platform Jobs policy resolves `${iot:Connection.Thing.ThingName}`). It must
+  publish nothing on `$aws/things/.../jobs` until both job SUBACKs are granted on the *current*
+  connection: a unit whose certificate lacks the Jobs policy (prod certs issued before
+  2026-08-28) would otherwise draw refused PUBACKs into the publisher's refusal telemetry.
+  SUCCEEDED is reported only after the new image is confirmed valid (ota_update `confirmed` hook).
 - STATUS schema (since 1.0.6): sample `data` = environment readings only; device health lives
   in sample `metadata`; `device` = MAC. Heartbeat every 5 min from the watchdog task. Script
   release metadata is trusted only while its stored SHA matches `/littlefs/schedule.yaml`.

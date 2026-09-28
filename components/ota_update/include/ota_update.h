@@ -10,10 +10,11 @@ extern "C" {
 /*
  * MQTT-triggered self-OTA for the ambyte (docs/ota-update-plan.md, Stage 3).
  *
- * Triggered today by the custom command topic (command_router dispatches an
- * `ota_update` command here); a later swap moves the trigger to AWS IoT Jobs
- * without touching this handler. The download is Stage-0-proven `esp_https_ota`
- * from a public HTTPS URL (e.g. a GitHub release asset).
+ * Two triggers: the custom command topic (command_router dispatches an
+ * `ota_update` command to ota_update_request) and openJII's AWS IoT Jobs
+ * rollout (iot_jobs calls ota_update_request_job, which adds version + sha256
+ * checks). The download is Stage-0-proven `esp_https_ota` from an HTTPS URL
+ * (a GitHub release asset, or a presigned S3 URL for a job).
  *
  * Heap: the device cannot hold two TLS sessions at once (~17 KB largest block).
  * So the worker SUSPENDS MQTT (frees its TLS) for the download, recreating the
@@ -57,7 +58,33 @@ typedef struct {
     bool                  (*persistence_healthy)(void);
     const char             *status_topic;   /* where status JSON is published */
     const char             *device_id;      /* included in status payloads */
+    /* Called on the maintenance worker right after a just-applied image is
+     * marked valid, so a job-driven update can report SUCCEEDED only once the
+     * rollback window has closed (iot_jobs_kick). NULL = skip. */
+    void                  (*confirmed)(void);
 } ota_update_config_t;
+
+/* A job-driven update (AWS IoT Jobs, iot_jobs.c). Unlike the command path it
+ * carries the release's identity, which the worker enforces before the boot
+ * partition switches:
+ *   - expected_version must equal the downloaded image's own app version
+ *     (leading 'v' ignored on both). A mismatched asset would otherwise install,
+ *     look like "not that release" after reboot, and be refetched forever.
+ *   - sha256 (64 hex) must equal the digest of the bytes actually on flash.
+ * `started` fires once the maintenance lock is held and MQTT is still up (the
+ * moment to report IN_PROGRESS). `finished` fires only when the update did NOT
+ * reboot into a new image: retryable=true means it never ran (worker busy /
+ * no memory) and the job is untouched; false is a real failure with `detail`.
+ * The reboot-into-new-image outcome is resolved after boot via `confirmed`. */
+typedef struct {
+    const char *url;               /* HTTPS; may be a long presigned S3 URL */
+    const char *id;                /* job id; latched as the applied id on success */
+    const char *sha256;            /* required, 64 hex chars */
+    const char *expected_version;  /* required */
+    void (*started)(const char *id, void *ctx);
+    void (*finished)(const char *id, bool retryable, const char *detail, void *ctx);
+    void *ctx;
+} ota_update_job_t;
 
 /* Prepare the OTA module (stores cfg). The actual worker is the shared
  * maintenance task in app_main; requests are dispatched to it via cfg.submit. */
@@ -74,6 +101,17 @@ void ota_update_run_boot_confirm(void);
  * the worker suspends comms, downloads, sets boot, reboots. ESP_ERR_INVALID_STATE
  * before init; ESP_ERR_INVALID_ARG on a bad url/id. */
 esp_err_t ota_update_request(const char *url, const char *id);
+
+/* Queue a job-driven OTA (see ota_update_job_t). No applied-id dedupe here: the
+ * caller decides from ota_update_applied_id_is() whether the job already ran.
+ * Skips the fleet jitter, since AWS paces a rollout with its own per-minute cap.
+ * On a non-ESP_OK return nothing was queued and no callback will fire. */
+esp_err_t ota_update_request_job(const ota_update_job_t *job);
+
+/* True if `id` is the id latched by the last image that was written and set to
+ * boot. After a reboot, a job whose id this matches but whose version is not
+ * the running one means the new image was rolled back. */
+bool ota_update_applied_id_is(const char *id);
 
 /* True from successful queue admission until the OTA job finishes (or reboots
  * on success), capped at 30 minutes for watchdog-veto purposes. Expiry logs one

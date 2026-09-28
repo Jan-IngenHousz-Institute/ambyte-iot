@@ -38,6 +38,7 @@ message_set_connect_handler_fn      mqtt_client_get_set_connect_handler_fn(void)
 message_set_publish_ack_handler_fn  mqtt_client_get_set_ack_handler_fn(void);
 message_set_received_handler_fn     mqtt_client_get_set_received_handler_fn(void);
 message_set_disconnect_handler_fn   mqtt_client_get_set_disconnect_handler_fn(void);
+message_add_subscription_fn         mqtt_client_get_add_subscription_fn(void);
 
 /* Feed the Wi-Fi event's reason code into the MQTT-owned last-disconnect latch.
  * Call before stopping the client so STATUS retains the more useful cause. */
