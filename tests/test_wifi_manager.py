@@ -46,6 +46,12 @@ SCENARIOS = (
     "join_associated_dhcp_slow",
     "join_auth_reject_timer_failure",
     "join_silent_timeout_timer_failure",
+    "old_outcome_after_drain_timeout",
+    "silent_original_retry_then_join",
+    "stale_got_ip_during_join",
+    "stale_connected_after_deferred_join",
+    "stored_reentry_does_not_overwrite",
+    "kick_outcome_before_relock",
 )
 
 

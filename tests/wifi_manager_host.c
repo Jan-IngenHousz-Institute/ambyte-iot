@@ -67,6 +67,19 @@ static int g_set_config_calls;     /* every persisted esp_wifi config rewrite */
  * (IDF 5.5 does not document ESP_ERR_WIFI_NOT_CONNECT for it, and the
  * 2026-09-28 bench join on an unassociated station logged no event.) */
 static bool g_associated;
+/* Driver model of ONE outstanding attempt: set when esp_wifi_connect() returns
+ * ESP_OK with no scripted outcome (a silent attempt), cleared when any outcome
+ * event is delivered. While set, esp_wifi_connect() returns ESP_ERR_WIFI_STATE
+ * (the real driver runs one attempt at a time) and esp_wifi_disconnect()
+ * aborts it and reports its outcome (IDF: "disconnect during connect"). */
+static bool g_driver_pending;
+/* The abort's outcome event is delayed: the test delivers it later (e.g. after
+ * a join's drain timed out). */
+static bool g_defer_abort_event;
+/* The event task runs the abort's outcome before esp_wifi_disconnect()
+ * returns to its caller (models it landing before the caller re-locks). */
+static bool g_disconnect_delivers_now;
+static int g_disconnect_calls;
 /* Errors returned by successive esp_wifi_connect() calls (0 = ESP_OK). A
  * failing call posts NO event and does not consume the event script — that
  * is the driver behaviour the timer-callback strand hinged on. */
@@ -283,6 +296,7 @@ esp_err_t esp_wifi_connect(void)
         hook();
         return g_hook_outer_err;
     }
+    if (g_driver_pending) return ESP_ERR_WIFI_STATE;
     esp_err_t err = ESP_OK;
     if (g_connect_err_forever) {
         err = g_connect_err[0];
@@ -293,16 +307,26 @@ esp_err_t esp_wifi_connect(void)
     if (g_script_pos < g_script_len) {
         CHECK(g_pending_len < PENDING_MAX);
         g_pending[g_pending_len++] = g_script[g_script_pos++];
+    } else {
+        g_driver_pending = true;
     }
     return ESP_OK;
 }
 esp_err_t esp_wifi_disconnect(void)
 {
     CHECK(!g_lock_held);
+    g_disconnect_calls++;
     if (g_associated) {
         CHECK(g_pending_len < PENDING_MAX);
         g_pending[g_pending_len++] = WIFI_REASON_ASSOC_LEAVE;
+    } else if (g_driver_pending) {
+        g_driver_pending = false;
+        if (!g_defer_abort_event) {
+            CHECK(g_pending_len < PENDING_MAX);
+            g_pending[g_pending_len++] = WIFI_REASON_ASSOC_LEAVE;
+        }
     }
+    if (g_disconnect_delivers_now) pump_pending();
     return ESP_OK;
 }
 esp_err_t esp_wifi_restore(void) { return ESP_OK; }
@@ -315,18 +339,21 @@ static void ev_disconnect(int reason)
     memset(&d, 0, sizeof(d));
     d.reason = (uint8_t)reason;
     g_associated = false;
+    g_driver_pending = false;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &d);
 }
 
 static void ev_connected_only(void)
 {
     g_associated = true;
+    g_driver_pending = false;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, NULL);
 }
 
 static void ev_connected_got_ip(void)
 {
     g_associated = true;
+    g_driver_pending = false;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, NULL);
     g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);
 }
@@ -806,7 +833,9 @@ static void hook_join_labap(void)
 
 /* Deterministic interleaving: an OLD retry callback is blocked inside
  * esp_wifi_connect() while a fresh wifi_join runs to completion; the old call
- * then returns an error. It must not touch the new request. */
+ * then returns an error. It must not touch the new request, and the join must
+ * not take the attempt slot while that call is unresolved (single-flight): it
+ * defers to the timer, which then starts the join's own attempt. */
 static void scenario_stale_callback_vs_new_join(void)
 {
     boot("BenchAP");
@@ -820,14 +849,18 @@ static void scenario_stale_callback_vs_new_join(void)
     g_script_len = 1;
     (void)fire_timer();
 
-    CHECK(g_hook_join_result == ESP_OK);
-    CHECK(wifi_manager_is_connected());
+    CHECK(g_hook_join_result == ESP_ERR_TIMEOUT);    /* deferred, retry owned */
     CHECK(!failed_bit());                            /* old error not reported */
-    CHECK(s_wifi.reconnect_count == 0);              /* fresh budget intact */
+    CHECK(s_wifi.reconnect_count == 1);              /* only the deferral */
     CHECK(s_wifi.auth_fail_count == 0);
-    CHECK(!g_timer_armed);                           /* no obsolete timer */
     CHECK(s_wifi.connect_requested);
+    CHECK(!s_wifi.attempt_in_flight);                /* the old call released it */
     CHECK(log_count('W', "stale retry result") == 1);
+
+    CHECK(fire_timer() == 1000U);                    /* the join's own attempt */
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+    CHECK(s_wifi.reconnect_count == 0);
 }
 
 /* A callback already DISPATCHED for the old request when the join's
@@ -1000,8 +1033,12 @@ static void scenario_old_dispatch_vs_new_arm(void)
     CHECK(g_connect_calls == calls);                 /* no early retry */
     CHECK(s_wifi.timer_armed && g_timer_armed);      /* new arm intact */
     CHECK(s_wifi.stale_dispatches == 0);
+    const int kicks = g_disconnect_calls;
     CHECK(fire_timer() == 1000U);                    /* the new arm, on time */
-    CHECK(g_connect_calls == calls + 1);
+    /* The join's own attempt is still silent: single-flight kicks it rather
+     * than starting a second one. */
+    CHECK(g_connect_calls == calls);
+    CHECK(g_disconnect_calls == kicks + 1);
 }
 
 /* GOT_IP lands after the join's wait returned an empty snapshot: the join
@@ -1071,6 +1108,150 @@ static void scenario_join_silent_timeout_timer_failure(void)
     CHECK(!s_wifi.reconfigure_in_progress);
 }
 
+/* -- review round 3: single-flight attempt ownership ---------------------- */
+
+/* The superseded attempt's outcome arrives AFTER the join's 2 s drain timed
+ * out. The join must not have taken the slot, so the late AUTH_FAIL is still
+ * attributed to its own (old) request. */
+static void scenario_old_outcome_after_drain_timeout(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    const uint32_t old_gen = s_wifi.request_gen;
+    g_defer_abort_event = true;                     /* its outcome comes late */
+    const int calls = g_connect_calls;
+
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_ERR_TIMEOUT);
+    CHECK(g_connect_calls == calls);                 /* slot not taken */
+    CHECK(s_wifi.attempt_in_flight && s_wifi.attempt_gen == old_gen);
+    CHECK(g_timer_armed && s_wifi.timer_armed);      /* deferred: timer owns it */
+    CHECK(log_count('W', "still pending after 2000 ms") == 1);
+
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* after the drain timeout */
+    CHECK(s_wifi.auth_fail_count == 0);
+    CHECK(!failed_bit());
+    CHECK(s_wifi.reconnect_count == 1);
+    CHECK(!s_wifi.attempt_in_flight);
+    CHECK(log_count('W', "late outcome (reason=202) of a superseded Wi-Fi attempt") == 1);
+
+    g_script[0] = SCRIPT_GOT_IP;                     /* the join's own attempt */
+    g_script_len = 1;
+    CHECK(fire_timer() == 1000U);
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+}
+
+/* Same invariant without the drain: a silent original attempt, then its retry
+ * (which would get ESP_ERR_WIFI_STATE from the busy driver), then a fresh
+ * join, then the original's outcome. Nothing may release or overwrite the
+ * original's slot before its outcome. */
+static void scenario_silent_original_retry_then_join(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);   /* silent */
+    const uint32_t old_gen = s_wifi.request_gen;
+    CHECK(s_wifi.attempt_in_flight && g_timer_armed);
+    g_defer_abort_event = true;
+    const int calls = g_connect_calls;
+
+    (void)fire_timer();                              /* the retry */
+    CHECK(g_connect_calls == calls);                 /* no second attempt */
+    CHECK(s_wifi.attempt_in_flight && s_wifi.attempt_gen == old_gen);
+    CHECK(g_timer_armed);                            /* deferred again */
+
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_ERR_TIMEOUT);
+    CHECK(g_connect_calls == calls);
+    CHECK(s_wifi.attempt_in_flight && s_wifi.attempt_gen == old_gen);
+
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* the original's outcome */
+    CHECK(s_wifi.auth_fail_count == 0);
+    CHECK(!failed_bit());
+    CHECK(log_count('W', "late outcome (reason=202) of a superseded Wi-Fi attempt") == 1);
+}
+
+/* A superseded attempt's SUCCESS (STA_CONNECTED + GOT_IP) queued when a join
+ * starts must not complete the join. */
+static void scenario_stale_got_ip_during_join(void)
+{
+    boot("OldAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    g_driver_pending = false;                        /* ...which succeeded: */
+    g_pending[g_pending_len++] = SCRIPT_GOT_IP;      /* outcome still queued */
+
+    const esp_err_t err = wifi_manager_connect("LabAP", "right-pass");
+    CHECK(err != ESP_OK);
+    CHECK(!wifi_manager_is_connected());
+    CHECK(log_count('W', "association from a superseded Wi-Fi attempt") == 1);
+    CHECK(log_count('W', "IP on a superseded Wi-Fi link") == 1);
+    CHECK(s_wifi.connect_requested);
+}
+
+/* A superseded attempt associates AFTER a join deferred: it must not cancel
+ * the replacement's retry or reset its state, and its GOT_IP must not mark the
+ * replacement connected. The replacement's own retry then proceeds. */
+static void scenario_stale_connected_after_deferred_join(void)
+{
+    boot("OldAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    const uint32_t old_gen = s_wifi.request_gen;
+    g_defer_abort_event = true;
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_ERR_TIMEOUT);
+    CHECK(g_timer_armed && s_wifi.reconnect_count == 1);
+
+    ev_connected_only();                             /* the old attempt associated */
+    CHECK(s_wifi.timer_armed && g_timer_armed);      /* replacement retry intact */
+    CHECK(!s_wifi.attempt_in_flight);
+    CHECK(s_wifi.link_gen == old_gen);
+    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);   /* old DHCP completes */
+    CHECK(!wifi_manager_is_connected());
+    CHECK(s_wifi.reconnect_count == 1);
+
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(fire_timer() == 1000U);                    /* replacement's own attempt */
+    pump_pending();
+    CHECK(wifi_manager_is_connected());
+    CHECK(s_wifi.link_gen == s_wifi.request_gen);
+}
+
+/* Re-entering the public stored-connect API while an attempt is unresolved
+ * supersedes the request but never overwrites that attempt's slot. */
+static void scenario_stored_reentry_does_not_overwrite(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    const uint32_t old_gen = s_wifi.request_gen;
+    g_defer_abort_event = true;
+    const int calls = g_connect_calls;
+
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* re-entry */
+    CHECK(s_wifi.request_gen != old_gen);
+    CHECK(g_connect_calls == calls);
+    CHECK(s_wifi.attempt_in_flight && s_wifi.attempt_gen == old_gen);
+    CHECK(g_timer_armed);
+
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* the first call's outcome */
+    CHECK(s_wifi.auth_fail_count == 0);
+    CHECK(!failed_bit());
+    CHECK(log_count('W', "late outcome (reason=202) of a superseded Wi-Fi attempt") == 1);
+}
+
+/* The kick's outcome lands (and is dropped as stale) before start_attempt
+ * re-takes the lock: the deferral must still leave a retry owner. */
+static void scenario_kick_outcome_before_relock(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    g_disconnect_delivers_now = true;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* re-entry kicks it */
+    CHECK(!s_wifi.attempt_in_flight);                /* stale outcome consumed */
+    CHECK(log_count('W', "late outcome (reason=8) of a superseded Wi-Fi attempt") == 1);
+    CHECK(g_timer_armed && s_wifi.connect_requested);   /* retry owned */
+    const int calls = g_connect_calls;
+    CHECK(fire_timer() == 1000U);
+    CHECK(g_connect_calls == calls + 1);             /* now a clean single attempt */
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -1120,6 +1301,12 @@ int main(int argc, char **argv)
         { "join_associated_dhcp_slow", scenario_join_associated_dhcp_slow },
         { "join_auth_reject_timer_failure", scenario_join_auth_reject_timer_failure },
         { "join_silent_timeout_timer_failure", scenario_join_silent_timeout_timer_failure },
+        { "old_outcome_after_drain_timeout", scenario_old_outcome_after_drain_timeout },
+        { "silent_original_retry_then_join", scenario_silent_original_retry_then_join },
+        { "stale_got_ip_during_join", scenario_stale_got_ip_during_join },
+        { "stale_connected_after_deferred_join", scenario_stale_connected_after_deferred_join },
+        { "stored_reentry_does_not_overwrite", scenario_stored_reentry_does_not_overwrite },
+        { "kick_outcome_before_relock", scenario_kick_outcome_before_relock },
     };
     const size_t n_scenarios = sizeof(k_scenarios) / sizeof(k_scenarios[0]);
     if (argc != 2) {

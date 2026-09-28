@@ -49,7 +49,10 @@ esp_err_t wifi_manager_connect_stored(void);
  * boot path so a missing AP can't stall the rest of init (sensors, SD, schedule).
  * A transient driver error on the first connect call is handed to the same
  * bounded retry and still returns ESP_OK; an error return means nothing will
- * retry (not started, or a configuration error such as no stored SSID). */
+ * retry (not started, or a configuration error such as no stored SSID).
+ * Re-entry is safe: it supersedes the previous request, and an attempt still
+ * unresolved is never overwritten (the new one is deferred to the retry
+ * timer until it resolves). */
 esp_err_t wifi_manager_connect_stored_async(void);
 bool wifi_manager_is_connected(void);
 esp_err_t wifi_manager_is_provisioned(bool *out_provisioned);
