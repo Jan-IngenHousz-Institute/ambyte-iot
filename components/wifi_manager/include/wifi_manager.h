@@ -19,6 +19,10 @@ esp_err_t wifi_manager_start(void);
  * key/identity (auth-class disconnect: often a wrong password, sometimes
  * transient). The manager keeps retrying in the background. */
 #define WIFI_MANAGER_ERR_AUTH_REJECTED (WIFI_MANAGER_ERR_BASE + 1)
+/* The attempt failed and the manager has ENDED the request: no retry is
+ * pending (e.g. the retry timer could not be armed). Re-run the join, or
+ * reboot. */
+#define WIFI_MANAGER_ERR_NOT_RETRYING (WIFI_MANAGER_ERR_BASE + 2)
 
 /* esp_err_to_name() that also knows WIFI_MANAGER_ERR_* codes. */
 const char *wifi_manager_err_to_name(esp_err_t err);
@@ -27,12 +31,15 @@ const char *wifi_manager_err_to_name(esp_err_t err);
  *  - ESP_OK on GOT_IP;
  *  - WIFI_MANAGER_ERR_AUTH_REJECTED if the AP rejected the key/identity;
  *  - ESP_FAIL on any other reported failure;
- *  - ESP_ERR_TIMEOUT if nothing was reported in time;
+ *  - ESP_ERR_TIMEOUT if no result arrived in time (possibly associated with
+ *    DHCP still pending);
+ *  - WIFI_MANAGER_ERR_NOT_RETRYING if the attempt failed and the request was
+ *    ended (nothing pending);
  *  - the driver's own error if a config/disconnect/connect CALL failed.
  * After AUTH_REJECTED, ESP_FAIL or ESP_ERR_TIMEOUT the manager still owns the
  * request and keeps retrying the new credentials on its bounded backoff. After
- * a driver call error nothing retries (a config error saved nothing; a
- * connect-call error ends the request) and the caller should re-run the join. */
+ * NOT_RETRYING or a driver call error nothing retries (a config error saved
+ * nothing) and the caller should re-run the join. */
 esp_err_t wifi_manager_connect(const char *ssid, const char *password);
 esp_err_t wifi_manager_connect_configured(void);
 esp_err_t wifi_manager_connect_stored(void);

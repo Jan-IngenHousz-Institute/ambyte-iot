@@ -39,6 +39,13 @@ SCENARIOS = (
     "timer_start_failure_terminal",
     "boot_initial_connect_error_recovers",
     "set_config_password_error_distinct",
+    "late_event_of_old_attempt_after_join",
+    "old_dispatch_vs_new_arm",
+    "join_wait_races_got_ip",
+    "join_wait_races_association_dhcp_pending",
+    "join_associated_dhcp_slow",
+    "join_auth_reject_timer_failure",
+    "join_silent_timeout_timer_failure",
 )
 
 
@@ -54,6 +61,10 @@ class WifiManagerReconnectPolicyTest(unittest.TestCase):
                 str(ROOT / "tests/wifi_manager_host.c"),
                 "-o", str(binary),
             ], check=True)
+            listed = subprocess.run([str(binary), "--list"], check=True,
+                                    capture_output=True, text=True).stdout.split()
+            self.assertEqual(sorted(listed), sorted(SCENARIOS),
+                             "SCENARIOS and the C registry have drifted")
             for scenario in SCENARIOS:
                 with self.subTest(scenario=scenario):
                     subprocess.run([str(binary), scenario], check=True)

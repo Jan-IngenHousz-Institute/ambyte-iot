@@ -37,6 +37,10 @@ static bool g_timer_armed;
 static uint64_t g_timer_delay_us;
 static int g_timer_create_fail;      /* next N creates fail; -1 = always */
 static bool g_timer_start_fail;
+/* The connect wait returns its bit snapshot BEFORE the pending events are
+ * delivered: models GOT_IP / STA_CONNECTED landing between the wait returning
+ * and the caller taking the lock. */
+static bool g_wait_snapshot_first;
 
 /* Single-threaded harness: a second take is a self-deadlock on the real
  * (non-recursive) mutex, and driver calls must never run under the lock. */
@@ -75,6 +79,7 @@ static bool g_connect_err_forever;   /* every call fails with g_connect_err[0] *
  * "driver" posts in response. >0 = STA_DISCONNECTED with that reason,
  * SCRIPT_GOT_IP = STA_CONNECTED + GOT_IP. Exhausted = the driver stays quiet. */
 #define SCRIPT_GOT_IP (-1)
+#define SCRIPT_CONNECTED_ONLY (-2)   /* associated; DHCP still pending */
 static int g_script[16];
 static int g_script_len;
 static int g_script_pos;
@@ -227,6 +232,11 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t g, EventBits_t bits,
                                 TickType_t ticks)
 {
     (void)clear_on_exit; (void)wait_all; (void)ticks;
+    if (g_wait_snapshot_first && (bits & WIFI_MANAGER_CONNECTED_BIT) != 0) {
+        const EventBits_t snapshot = g->bits & bits;
+        pump_pending();      /* events land after the wait returned */
+        return snapshot;
+    }
     pump_pending();          /* the event task runs during the real wait */
     return g->bits & bits;   /* nothing further within the timeout */
 }
@@ -308,6 +318,12 @@ static void ev_disconnect(int reason)
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &d);
 }
 
+static void ev_connected_only(void)
+{
+    g_associated = true;
+    g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, NULL);
+}
+
 static void ev_connected_got_ip(void)
 {
     g_associated = true;
@@ -322,8 +338,18 @@ static void pump_pending(void)
         memmove(g_pending, g_pending + 1, (size_t)(g_pending_len - 1) * sizeof(int));
         g_pending_len--;
         if (ev == SCRIPT_GOT_IP) ev_connected_got_ip();
+        else if (ev == SCRIPT_CONNECTED_ONLY) ev_connected_only();
         else ev_disconnect(ev);
     }
+}
+
+/* Expire the armed one-shot WITHOUT running its callback: IDF has set its
+ * alarm to 0 (esp_timer_stop() now returns ESP_ERR_INVALID_STATE) and the
+ * dispatch is committed; the test runs g_timer_cb later. */
+static void expire_timer(void)
+{
+    CHECK(g_timer_armed);
+    g_timer_armed = false;
 }
 
 /* Fire the armed reconnect timer (virtual time); returns its delay in ms. */
@@ -812,10 +838,12 @@ static void scenario_dispatched_callback_after_new_join(void)
     CHECK(wifi_manager_connect_stored_async() == ESP_OK);
     ev_disconnect(WIFI_REASON_AUTH_FAIL);
     CHECK(g_timer_armed);
+    expire_timer();                                  /* dispatch committed */
     g_script[0] = SCRIPT_GOT_IP;
     g_script_len = 1;
     CHECK(wifi_manager_connect("LabAP", "right-pass") == ESP_OK);
     CHECK(!g_timer_armed);
+    CHECK(s_wifi.stale_dispatches == 1);
     const int calls = g_connect_calls;
     g_timer_cb(NULL);                                /* the late old callback */
     CHECK(g_connect_calls == calls);                 /* no connect on a live link */
@@ -930,6 +958,119 @@ static void scenario_set_config_password_error_distinct(void)
                  "WIFI_MANAGER_ERR_AUTH_REJECTED") == 0);
 }
 
+/* -- review round 2: event attribution, dispatch identity, results ------- */
+
+/* The OLD request's retry attempt returned ESP_OK; its outcome (AUTH_FAIL)
+ * arrives only after a fresh join has started. It must not consume the new
+ * request's budget, auth count, FAILED bit or timer. */
+static void scenario_late_event_of_old_attempt_after_join(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* old request: 2 s retry */
+    g_script[0] = WIFI_REASON_AUTH_FAIL;             /* the old retry's late outcome */
+    g_script_len = 1;
+    CHECK(fire_timer() == 2000U);                    /* old retry: connect OK */
+    CHECK(g_pending_len == 1 && s_wifi.attempt_in_flight);
+
+    const esp_err_t err = wifi_manager_connect("LabAP", "right-pass");   /* silent */
+    CHECK(err == ESP_ERR_TIMEOUT);
+    CHECK(s_wifi.auth_fail_count == 0);
+    CHECK(s_wifi.reconnect_count == 1);              /* only the join's own timeout */
+    CHECK(!failed_bit());
+    CHECK(g_timer_armed && g_timer_delay_us == 1000ULL * 1000ULL);
+    CHECK(log_count('W', "late outcome (reason=202) of a superseded Wi-Fi attempt") == 1);
+}
+
+/* An OLD dispatch is committed (expired, callback not yet run) when a fresh
+ * request arms its OWN timer on the same esp_timer. The old callback must not
+ * pass as the new arm: no early retry, the new arm stays armed. */
+static void scenario_old_dispatch_vs_new_arm(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    expire_timer();                                  /* old dispatch committed */
+    CHECK(wifi_manager_connect("LabAP", "pw") == ESP_ERR_TIMEOUT);   /* arms 1 s */
+    CHECK(g_timer_armed && s_wifi.timer_armed);
+    CHECK(s_wifi.stale_dispatches == 1);
+
+    const int calls = g_connect_calls;
+    g_timer_cb(NULL);                                /* the old dispatch runs now */
+    CHECK(g_connect_calls == calls);                 /* no early retry */
+    CHECK(s_wifi.timer_armed && g_timer_armed);      /* new arm intact */
+    CHECK(s_wifi.stale_dispatches == 0);
+    CHECK(fire_timer() == 1000U);                    /* the new arm, on time */
+    CHECK(g_connect_calls == calls + 1);
+}
+
+/* GOT_IP lands after the join's wait returned an empty snapshot: the join
+ * reports the association and arms nothing. */
+static void scenario_join_wait_races_got_ip(void)
+{
+    boot("BenchAP");
+    g_wait_snapshot_first = true;
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_OK);
+    CHECK(wifi_manager_is_connected());
+    CHECK(!g_timer_armed && !s_wifi.timer_armed);
+    CHECK(s_wifi.reconnect_count == 0);
+}
+
+/* STA_CONNECTED (DHCP still pending) lands after the empty snapshot: the
+ * request is progressing, so no retry is armed against the live station. */
+static void scenario_join_wait_races_association_dhcp_pending(void)
+{
+    boot("BenchAP");
+    g_wait_snapshot_first = true;
+    g_script[0] = SCRIPT_CONNECTED_ONLY;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);
+    CHECK(!g_timer_armed && !s_wifi.timer_armed);
+    CHECK(s_wifi.connect_requested && s_wifi.associated);
+    CHECK(!s_wifi.reconfigure_in_progress);
+    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);   /* DHCP completes */
+    CHECK(wifi_manager_is_connected());
+}
+
+/* Associated inside the wait but DHCP slower than it: same, without a race. */
+static void scenario_join_associated_dhcp_slow(void)
+{
+    boot("BenchAP");
+    g_script[0] = SCRIPT_CONNECTED_ONLY;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect("BenchAP", "pw") == ESP_ERR_TIMEOUT);
+    CHECK(!g_timer_armed && s_wifi.connect_requested);
+}
+
+/* Interactive auth rejection when no retry timer can be armed: the request is
+ * ended, and the result says so instead of "still retrying". */
+static void scenario_join_auth_reject_timer_failure(void)
+{
+    boot("BenchAP");
+    g_timer_start_fail = true;
+    g_script[0] = WIFI_REASON_AUTH_FAIL;
+    g_script_len = 1;
+    const esp_err_t err = wifi_manager_connect("BenchAP", "pw");
+    CHECK(err == WIFI_MANAGER_ERR_NOT_RETRYING);
+    CHECK(err != WIFI_MANAGER_ERR_AUTH_REJECTED);
+    CHECK(!s_wifi.connect_requested && !g_timer_armed);
+    CHECK(strcmp(wifi_manager_err_to_name(err), "WIFI_MANAGER_ERR_NOT_RETRYING") == 0);
+}
+
+/* Fully silent join when no retry timer can be armed: not ESP_ERR_TIMEOUT
+ * (whose contract promises a retry) but the explicit terminal result. */
+static void scenario_join_silent_timeout_timer_failure(void)
+{
+    boot("BenchAP");
+    g_timer_start_fail = true;
+    const esp_err_t err = wifi_manager_connect("BenchAP", "pw");
+    CHECK(err == WIFI_MANAGER_ERR_NOT_RETRYING);
+    CHECK(!s_wifi.connect_requested && !g_timer_armed);
+    CHECK(!s_wifi.reconfigure_in_progress);
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -944,7 +1085,7 @@ static void scenario_ssid_32_chars(void)
 
 int main(int argc, char **argv)
 {
-    static const struct { const char *name; void (*fn)(void); } k[] = {
+    static const struct { const char *name; void (*fn)(void); } k_scenarios[] = {
         { "classification", scenario_classification },
         { "delay_schedule", scenario_delay_schedule },
         { "boot_authfail_recovers", scenario_boot_authfail_recovers },
@@ -971,15 +1112,30 @@ int main(int argc, char **argv)
         { "timer_start_failure_terminal", scenario_timer_start_failure_terminal },
         { "boot_initial_connect_error_recovers", scenario_boot_initial_connect_error_recovers },
         { "set_config_password_error_distinct", scenario_set_config_password_error_distinct },
+        { "late_event_of_old_attempt_after_join", scenario_late_event_of_old_attempt_after_join },
+        { "old_dispatch_vs_new_arm", scenario_old_dispatch_vs_new_arm },
+        { "join_wait_races_got_ip", scenario_join_wait_races_got_ip },
+        { "join_wait_races_association_dhcp_pending",
+          scenario_join_wait_races_association_dhcp_pending },
+        { "join_associated_dhcp_slow", scenario_join_associated_dhcp_slow },
+        { "join_auth_reject_timer_failure", scenario_join_auth_reject_timer_failure },
+        { "join_silent_timeout_timer_failure", scenario_join_silent_timeout_timer_failure },
     };
+    const size_t n_scenarios = sizeof(k_scenarios) / sizeof(k_scenarios[0]);
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <scenario>\n", argv[0]);
+        fprintf(stderr, "usage: %s <scenario|--list>\n", argv[0]);
         return 2;
     }
-    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
-        if (strcmp(argv[1], k[i].name) == 0) {
-            k[i].fn();
-            printf("PASS %s\n", k[i].name);
+    if (strcmp(argv[1], "--list") == 0) {   /* lets pytest detect registry drift */
+        for (size_t i = 0; i < n_scenarios; i++) {
+            printf("%s\n", k_scenarios[i].name);
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < n_scenarios; i++) {
+        if (strcmp(argv[1], k_scenarios[i].name) == 0) {
+            k_scenarios[i].fn();
+            printf("PASS %s\n", k_scenarios[i].name);
             return 0;
         }
     }
