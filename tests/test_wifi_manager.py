@@ -52,6 +52,10 @@ SCENARIOS = (
     "stale_connected_after_deferred_join",
     "stored_reentry_does_not_overwrite",
     "kick_outcome_before_relock",
+    "boot_config_error_no_retry",
+    "superseded_link_gets_no_app_services",
+    "stored_reentry_deferral_timer_failure",
+    "join_deferral_timer_failure",
 )
 
 
@@ -74,6 +78,20 @@ class WifiManagerReconnectPolicyTest(unittest.TestCase):
             for scenario in SCENARIOS:
                 with self.subTest(scenario=scenario):
                     subprocess.run([str(binary), scenario], check=True)
+
+
+    def test_app_main_gates_got_ip_on_current_link(self):
+        """app_main's GOT_IP handler must ask the manager before starting link
+        services: GOT_IP reaches every handler, including for a superseded
+        request's association (the harness mirrors this gate in app_on_got_ip)."""
+        source = (ROOT / "main" / "app_main.c").read_text(encoding="utf-8")
+        body = source.split("static void on_got_ip(", 1)[1].split("\n}\n", 1)[0]
+        gate = body.find("if (!wifi_manager_link_is_current())")
+        self.assertGreaterEqual(gate, 0, "on_got_ip lacks the current-link gate")
+        after_gate = body[gate:]
+        self.assertIn("return;", after_gate.split("app_start_sntp_once()", 1)[0])
+        for service in ("app_start_sntp_once()", "mqtt_client_start()"):
+            self.assertGreater(body.find(service), gate, f"{service} runs before the gate")
 
 
 if __name__ == "__main__":

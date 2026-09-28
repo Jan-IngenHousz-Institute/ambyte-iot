@@ -52,9 +52,17 @@ esp_err_t wifi_manager_connect_stored(void);
  * retry (not started, or a configuration error such as no stored SSID).
  * Re-entry is safe: it supersedes the previous request, and an attempt still
  * unresolved is never overwritten (the new one is deferred to the retry
- * timer until it resolves). */
+ * timer until it resolves); if that deferral cannot arm a retry the request
+ * ends and WIFI_MANAGER_ERR_NOT_RETRYING is returned. */
 esp_err_t wifi_manager_connect_stored_async(void);
 bool wifi_manager_is_connected(void);
+/* True while the station's association belongs to the CURRENT connect request.
+ * ESP events reach every registered handler, so an application GOT_IP handler
+ * must check this before starting link services (SNTP, MQTT): a superseded
+ * request's late association is not the current link and is about to be torn
+ * down. Ownership is fixed at STA_CONNECTED, which always precedes GOT_IP, so
+ * the answer does not depend on handler order. */
+bool wifi_manager_link_is_current(void);
 esp_err_t wifi_manager_is_provisioned(bool *out_provisioned);
 
 /**

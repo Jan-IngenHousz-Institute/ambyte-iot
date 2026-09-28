@@ -188,7 +188,13 @@ typedef struct {
      *
      * `link_gen` is the request that owns the current association (set at
      * STA_CONNECTED from the slot), so a GOT_IP or an established-link
-     * DISCONNECTED of a superseded request's link is not credited either.
+     * DISCONNECTED of a superseded request's link is not credited either. A
+     * superseded association is also never left in service: the next attempt
+     * start for the current request disconnects it first (IDF: connect on an
+     * associated station is not supported, esp_wifi.h "call
+     * esp_wifi_disconnect"), and the application gates its GOT_IP lifecycle
+     * (SNTP/MQTT) on wifi_manager_link_is_current(), since ESP events reach
+     * every registered handler.
      *
      * Timer dispatch identity: esp_timer's callback arg is fixed at creation, so
      * a dispatch cannot say which arm it belongs to. IDF 5.5 sets an expired
@@ -501,9 +507,12 @@ static bool wifi_manager_retry_after_silent_failure_locked(esp_err_t err, const 
  * request that issued the call is still the current one. */
 typedef enum {
     WIFI_MANAGER_ATTEMPT_STARTED,      /* esp_wifi_connect() issued; outcome is an event */
+    WIFI_MANAGER_ATTEMPT_LINKED,       /* already associated for this request: nothing to do */
     WIFI_MANAGER_ATTEMPT_SUPERSEDED,   /* `gen` is no longer current; nothing done */
-    WIFI_MANAGER_ATTEMPT_DEFERRED,     /* an earlier attempt is unresolved; kicked, and
-                                        * the timer owns the retry (or the request ended) */
+    WIFI_MANAGER_ATTEMPT_DEFERRED,     /* blocked by an unresolved attempt or a superseded
+                                        * link; kicked, and the timer owns the retry */
+    WIFI_MANAGER_ATTEMPT_ENDED,        /* blocked as above, but no retry could be armed:
+                                        * the request is ended (terminal) */
     WIFI_MANAGER_ATTEMPT_CALL_FAILED,  /* esp_wifi_connect() returned *call_err */
 } wifi_manager_attempt_result_t;
 
@@ -517,27 +526,41 @@ static wifi_manager_attempt_result_t wifi_manager_start_attempt(uint32_t gen,
         wifi_manager_unlock();
         return WIFI_MANAGER_ATTEMPT_SUPERSEDED;
     }
-    if (s_wifi.attempt_in_flight) {
-        const uint32_t pending_seq = s_wifi.attempt_seq;
-        const uint32_t pending_gen = s_wifi.attempt_gen;
+    if (!s_wifi.attempt_in_flight && s_wifi.associated && (s_wifi.link_gen == gen)) {
         wifi_manager_unlock();
-        /* Abort it so the driver reports its outcome (attributed to
+        return WIFI_MANAGER_ATTEMPT_LINKED;
+    }
+    /* Blocked: an attempt's outcome is outstanding, or the station is still
+     * associated on a superseded request's link. Never connect over either. */
+    const bool blocked_by_attempt = s_wifi.attempt_in_flight;
+    if (blocked_by_attempt || s_wifi.associated) {
+        const uint32_t pending_seq = s_wifi.attempt_seq;
+        const uint32_t pending_gen = blocked_by_attempt ? s_wifi.attempt_gen : s_wifi.link_gen;
+        wifi_manager_unlock();
+        /* Abort / tear down so the driver reports the outcome (attributed to
          * pending_gen whenever it lands). */
         (void)esp_wifi_disconnect();
         wifi_manager_lock();
         /* Arm the retry unless the kick's outcome already came AND something
          * newer owns the next step (a started attempt or an armed timer). */
-        const bool still_pending = s_wifi.attempt_in_flight && (s_wifi.attempt_seq == pending_seq);
+        const bool still_blocked =
+            blocked_by_attempt
+                ? (s_wifi.attempt_in_flight && (s_wifi.attempt_seq == pending_seq))
+                : (!s_wifi.attempt_in_flight && s_wifi.associated &&
+                   (s_wifi.link_gen == pending_gen));
         const bool unowned = !s_wifi.attempt_in_flight && !s_wifi.timer_armed;
+        bool owned = true;
         if ((s_wifi.request_gen == gen) && s_wifi.connect_requested &&
-            (still_pending || unowned)) {
-            ESP_LOGW(TAG, "Wi-Fi attempt of request %u still unresolved - kicked; retry deferred",
-                     (unsigned)pending_gen);
-            (void)wifi_manager_retry_after_silent_failure_locked(
-                ESP_ERR_WIFI_STATE, "previous Wi-Fi attempt unresolved");
+            (still_blocked || unowned)) {
+            ESP_LOGW(TAG, "Wi-Fi %s of request %u still in place - kicked; retry deferred",
+                     blocked_by_attempt ? "attempt" : "link", (unsigned)pending_gen);
+            owned = wifi_manager_retry_after_silent_failure_locked(
+                ESP_ERR_WIFI_STATE, "previous Wi-Fi attempt/link unresolved");
         }
         wifi_manager_unlock();
-        return WIFI_MANAGER_ATTEMPT_DEFERRED;
+        /* A deferral that could not arm has ENDED the request: say so, never
+         * report it as a pending retry (2026-09 review round 4). */
+        return owned ? WIFI_MANAGER_ATTEMPT_DEFERRED : WIFI_MANAGER_ATTEMPT_ENDED;
     }
     const uint32_t seq = wifi_manager_begin_attempt_locked(gen);
     wifi_manager_unlock();
@@ -1160,6 +1183,9 @@ esp_err_t wifi_manager_connect_stored_async(void)
      * earlier attempt is unresolved defers to the timer instead of taking the
      * slot (2026-09 review: this public API used to overwrite it). */
     const wifi_manager_attempt_result_t started = wifi_manager_start_attempt(gen, &err);
+    if (started == WIFI_MANAGER_ATTEMPT_ENDED) {
+        return WIFI_MANAGER_ERR_NOT_RETRYING;   /* contract: error <=> nothing retries */
+    }
     if (started != WIFI_MANAGER_ATTEMPT_CALL_FAILED) {
         return ESP_OK;   /* connection proceeds in the background (events / reconnect) */
     }
@@ -1211,6 +1237,17 @@ esp_err_t wifi_manager_connect_stored(void)
     }
 
     return ESP_ERR_TIMEOUT;
+}
+
+bool wifi_manager_link_is_current(void)
+{
+    if (s_wifi.lock == NULL) {
+        return false;
+    }
+    wifi_manager_lock();
+    const bool current = s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
+    wifi_manager_unlock();
+    return current;
 }
 
 bool wifi_manager_is_connected(void)

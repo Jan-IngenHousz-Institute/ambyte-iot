@@ -924,6 +924,13 @@ static void app_start_sntp_once(void)
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    /* GOT_IP reaches every handler, including for a superseded connect
+     * request's late association, which wifi_manager does not credit and is
+     * about to tear down. Link services start only on the current link. */
+    if (!wifi_manager_link_is_current()) {
+        ESP_LOGW(APP_TAG, "IP on a superseded Wi-Fi link - not starting SNTP/MQTT");
+        return;
+    }
     app_start_sntp_once();
     taskENTER_CRITICAL(&s_boot_mux);
     bool defer = !s_boot_complete;

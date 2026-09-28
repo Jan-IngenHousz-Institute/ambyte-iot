@@ -289,6 +289,9 @@ esp_err_t esp_wifi_get_config(wifi_interface_t i, wifi_config_t *c)
 esp_err_t esp_wifi_connect(void)
 {
     CHECK(!g_lock_held);
+    /* IDF 5.5 esp_wifi.h: "If station interface is connected to an AP, call
+     * esp_wifi_disconnect to disconnect" first. Doing otherwise is a bug. */
+    CHECK(!g_associated);
     g_connect_calls++;
     if (g_connect_hook != NULL) {
         void (*hook)(void) = g_connect_hook;
@@ -319,6 +322,7 @@ esp_err_t esp_wifi_disconnect(void)
     if (g_associated) {
         CHECK(g_pending_len < PENDING_MAX);
         g_pending[g_pending_len++] = WIFI_REASON_ASSOC_LEAVE;
+        g_associated = false;        /* driver state changes now; event follows */
     } else if (g_driver_pending) {
         g_driver_pending = false;
         if (!g_defer_abort_event) {
@@ -332,6 +336,27 @@ esp_err_t esp_wifi_disconnect(void)
 esp_err_t esp_wifi_restore(void) { return ESP_OK; }
 
 /* ── Event delivery helpers ─────────────────────────────────────────────── */
+
+/* Mirrors main/app_main.c on_got_ip (registered after wifi_manager_init, so it
+ * runs after the manager's handler): link services start only when the
+ * manager says the link is current. test_wifi_manager.py asserts app_main.c
+ * performs the same gate before SNTP/MQTT. */
+static int g_app_link_starts;
+static int g_app_link_refusals;
+static void app_on_got_ip(void)
+{
+    if (wifi_manager_link_is_current()) {
+        g_app_link_starts++;
+    } else {
+        g_app_link_refusals++;
+    }
+}
+
+static void ev_got_ip(void)
+{
+    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);
+    app_on_got_ip();
+}
 
 static void ev_disconnect(int reason)
 {
@@ -355,7 +380,7 @@ static void ev_connected_got_ip(void)
     g_associated = true;
     g_driver_pending = false;
     g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, NULL);
-    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);
+    ev_got_ip();
 }
 
 static void pump_pending(void)
@@ -958,10 +983,15 @@ static void scenario_boot_initial_connect_error_recovers(void)
     pump_pending();
     CHECK(wifi_manager_is_connected());
     CHECK(s_wifi.reconnect_count == 0);
+}
 
-    g_connect_err[0] = ESP_ERR_WIFI_SSID;            /* nothing stored */
+/* Boot with nothing stored: a configuration error ends the request and is
+ * returned (nothing will retry). */
+static void scenario_boot_config_error_no_retry(void)
+{
+    boot("");
+    g_connect_err[0] = ESP_ERR_WIFI_SSID;
     g_connect_err_len = 1;
-    g_connect_err_pos = 0;
     CHECK(wifi_manager_connect_stored_async() == ESP_ERR_WIFI_SSID);
     CHECK(!s_wifi.connect_requested);
     CHECK(!g_timer_armed);
@@ -1067,7 +1097,7 @@ static void scenario_join_wait_races_association_dhcp_pending(void)
     CHECK(!g_timer_armed && !s_wifi.timer_armed);
     CHECK(s_wifi.connect_requested && s_wifi.associated);
     CHECK(!s_wifi.reconfigure_in_progress);
-    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);   /* DHCP completes */
+    ev_got_ip();                                     /* DHCP completes */
     CHECK(wifi_manager_is_connected());
 }
 
@@ -1202,16 +1232,32 @@ static void scenario_stale_connected_after_deferred_join(void)
     CHECK(s_wifi.timer_armed && g_timer_armed);      /* replacement retry intact */
     CHECK(!s_wifi.attempt_in_flight);
     CHECK(s_wifi.link_gen == old_gen);
-    g_ip_handler(NULL, IP_EVENT, IP_EVENT_STA_GOT_IP, NULL);   /* old DHCP completes */
+    ev_got_ip();                                     /* old DHCP completes */
     CHECK(!wifi_manager_is_connected());
     CHECK(s_wifi.reconnect_count == 1);
+    CHECK(g_app_link_starts == 0 && g_app_link_refusals == 1);   /* no SNTP/MQTT */
+
+    /* The replacement's retry tears the superseded link down instead of
+     * connecting over it (the stub CHECKs connect-while-associated). */
+    g_defer_abort_event = false;
+    const int calls = g_connect_calls;
+    const int kicks = g_disconnect_calls;
+    CHECK(fire_timer() == 1000U);
+    CHECK(g_connect_calls == calls);
+    CHECK(g_disconnect_calls == kicks + 1);
+    CHECK(g_timer_armed);                            /* deferred, owned */
+    pump_pending();                                  /* the link's ASSOC_LEAVE */
+    CHECK(!s_wifi.associated);
+    CHECK(log_count('W', "late outcome (reason=8) of a superseded Wi-Fi attempt") == 1);
 
     g_script[0] = SCRIPT_GOT_IP;
     g_script_len = 1;
-    CHECK(fire_timer() == 1000U);                    /* replacement's own attempt */
+    (void)fire_timer();                              /* replacement's own attempt */
+    CHECK(g_connect_calls == calls + 1);
     pump_pending();
     CHECK(wifi_manager_is_connected());
     CHECK(s_wifi.link_gen == s_wifi.request_gen);
+    CHECK(g_app_link_starts == 1);                   /* services on the current link */
 }
 
 /* Re-entering the public stored-connect API while an attempt is unresolved
@@ -1250,6 +1296,54 @@ static void scenario_kick_outcome_before_relock(void)
     const int calls = g_connect_calls;
     CHECK(fire_timer() == 1000U);
     CHECK(g_connect_calls == calls + 1);             /* now a clean single attempt */
+}
+
+/* -- review round 4: stale link and deferral truthfulness ----------------- */
+
+/* A current link, then the request is superseded (stored re-entry): the old
+ * link is torn down before any new connect, and a GOT_IP on it (DHCP renew)
+ * starts no application services. */
+static void scenario_superseded_link_gets_no_app_services(void)
+{
+    boot("BenchAP");
+    g_script[0] = SCRIPT_GOT_IP;
+    g_script_len = 1;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);
+    pump_pending();
+    CHECK(wifi_manager_is_connected() && g_app_link_starts == 1);
+    CHECK(wifi_manager_link_is_current());
+
+    g_defer_abort_event = true;
+    const int calls = g_connect_calls;
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* supersedes the link */
+    CHECK(g_connect_calls == calls);                 /* never connect over it */
+    CHECK(!wifi_manager_link_is_current());
+    CHECK(g_timer_armed);
+    ev_got_ip();                                     /* late renew on the old link */
+    CHECK(g_app_link_starts == 1 && g_app_link_refusals == 1);
+}
+
+/* Stored re-entry blocked by an unresolved attempt, and the deferral cannot
+ * arm a retry: the request is ended and the call must say so. */
+static void scenario_stored_reentry_deferral_timer_failure(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    g_defer_abort_event = true;
+    g_timer_start_fail = true;
+    CHECK(wifi_manager_connect_stored_async() == WIFI_MANAGER_ERR_NOT_RETRYING);
+    CHECK(!s_wifi.connect_requested && !g_timer_armed);
+}
+
+/* Same through the interactive path. */
+static void scenario_join_deferral_timer_failure(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    g_defer_abort_event = true;
+    g_timer_start_fail = true;
+    CHECK(wifi_manager_connect("LabAP", "right-pass") == WIFI_MANAGER_ERR_NOT_RETRYING);
+    CHECK(!s_wifi.connect_requested && !g_timer_armed);
 }
 
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
@@ -1307,6 +1401,10 @@ int main(int argc, char **argv)
         { "stale_connected_after_deferred_join", scenario_stale_connected_after_deferred_join },
         { "stored_reentry_does_not_overwrite", scenario_stored_reentry_does_not_overwrite },
         { "kick_outcome_before_relock", scenario_kick_outcome_before_relock },
+        { "boot_config_error_no_retry", scenario_boot_config_error_no_retry },
+        { "superseded_link_gets_no_app_services", scenario_superseded_link_gets_no_app_services },
+        { "stored_reentry_deferral_timer_failure", scenario_stored_reentry_deferral_timer_failure },
+        { "join_deferral_timer_failure", scenario_join_deferral_timer_failure },
     };
     const size_t n_scenarios = sizeof(k_scenarios) / sizeof(k_scenarios[0]);
     if (argc != 2) {
