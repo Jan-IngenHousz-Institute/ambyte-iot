@@ -33,7 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pinned_revs  # noqa: E402
-BASE = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # 4ec9cef or its re-signed twin (same tree)
+BASE = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # 4ec9cef rebuilt from its committed fixture (a tree id)
 SYMBOL_PARTS = ("evq_hil", "evq_arm", "evq_tr_", "hil_sdl", "sdl_hil", "slt_", "sd_logger_hil")
 HIL_PATHS = (re.compile(r"^components/evq_hil/"), re.compile(r"^components/event_log/evq_hil_"),
              re.compile(r"^components/event_log/include/evq_hil_"))
@@ -88,7 +88,7 @@ def parse_diff(text: str) -> list[FileDiff]:
 
 def git_diff() -> str:
     r = subprocess.run(["git", "diff", "--no-color", "-U1000000", BASE, "--", "*.c", "*.h"], cwd=ROOT,
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True, check=True, env=pinned_revs.env())
     return r.stdout
 
 
@@ -106,7 +106,7 @@ def untracked_sources() -> list[FileDiff]:
 
 def base_tags() -> set[str]:
     r = subprocess.run(["git", "grep", "-h", "-o", "-E", r'"\s*[A-Z][A-Z0-9_]+', BASE, "--", "components", "main"],
-                       cwd=ROOT, capture_output=True, text=True)
+                       cwd=ROOT, capture_output=True, text=True, env=pinned_revs.env())
     return {m.strip('" ').strip() for m in r.stdout.split()} | {x.strip('"') for x in r.stdout.splitlines()}
 
 

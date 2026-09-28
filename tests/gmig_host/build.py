@@ -1,10 +1,11 @@
 """Build the two G-MIG executables from git-pinned sources.
 
-  old: v1.11.0 (tag, commit 8af0c76): `git show v1.11.0:` of
+  old: v1.11.0 (commit 8af0c76 on main, pinned by id): `git show 8af0c76:` of
        components/event_log/{event_log.c,include/event_log.h},
        components/domain/include/*, components/sd_card/sd_card.h
-  new: the candidate (default rev 6fcbeba = C2; GMIG_C2_REV=<rev> for another
-       commit, GMIG_C2_REV=WORKTREE for the working tree): every file under
+  new: the candidate (default C2 = 6fcbeba, rebuilt from its committed fixture by
+       tests/pinned_revs.py; GMIG_C2_REV=<rev> for another commit,
+       GMIG_C2_REV=WORKTREE for the working tree): every file under
        components/event_log/ plus components/sd_card/{sd_card.h,sd_diag.h,
        sd_diag_core.c} and components/domain/include/*.
 
@@ -40,10 +41,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = ROOT / "tests" / "gmig_host"
-OLD_REV = "v1.11.0"
 sys.path.insert(0, str(ROOT / "tests"))
 import pinned_revs  # noqa: E402
-DEFAULT_NEW_REV = pinned_revs.resolve(pinned_revs.C2)   # 6fcbeba (C2) or its re-signed twin
+OLD_REV = pinned_revs.V1_11_0      # by commit id: a tag name is a ref that can be absent or move
+DEFAULT_NEW_REV = pinned_revs.resolve(pinned_revs.C2)   # C2 rebuilt from its fixture: a tree id
 
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
 REWRITES = [('"/evstore"', '"./evstore"'), ('"/sdcard/', '"./sdcard/')]
@@ -68,11 +69,15 @@ def tmp_root() -> Path:
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True,
+                          env=pinned_revs.env()).stdout
 
 
 def _commit(rev: str) -> str:
-    return _git("rev-parse", f"{rev}^{{commit}}").strip()
+    """Commit id, or the tree id for a rebuilt fixture baseline (content-addressed either way)."""
+    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=ROOT,
+                       capture_output=True, text=True, env=pinned_revs.env())
+    return r.stdout.strip() if r.returncode == 0 else _git("rev-parse", f"{rev}^{{tree}}").strip()
 
 
 def _ls(rev: str, *paths: str) -> list[str]:
@@ -199,8 +204,11 @@ def build(force: bool = False) -> dict:
                        [oe / "include", oldsrc / "components/domain/include", oldsrc / "components/sd_card"],
                        ["-DGMIG_V1110"])
     info = {
-        "old_rev": OLD_REV, "old_commit": _commit(OLD_REV),
+        "old_rev": "v1.11.0", "old_commit": _commit(OLD_REV),
         "new_rev": rev, "new_commit": "WORKTREE" if rev == "WORKTREE" else _commit(rev),
+        "new_pin": ({"original": pinned_revs.C2.original, "resigned": pinned_revs.C2.resigned,
+                     "tree": pinned_revs.C2.tree, "fixture": pinned_revs.C2.patch,
+                     "patch_sha256": pinned_revs.C2.patch_sha256} if rev == DEFAULT_NEW_REV else None),
         "cc": cc(), "old_exe": str(old_exe), "new_exe": str(new_exe),
         "rewrite_rules": REWRITES, "old_sources": old_rec, "new_sources": new_rec,
         "tuning_overrides": {},

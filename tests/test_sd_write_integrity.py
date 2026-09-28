@@ -24,7 +24,7 @@ SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 BASE_REV = "e1ca6ee"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pinned_revs  # noqa: E402
-BASE_REV_S1 = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # Sprint 1 settled commit (4ec9cef or its re-signed twin)
+BASE_REV_S1 = pinned_revs.resolve(pinned_revs.SPRINT1_SETTLED)   # Sprint 1 settled 4ec9cef, rebuilt from its fixture
 
 
 def _build(srcs, incs, defs, out: Path) -> Path:
@@ -151,7 +151,7 @@ class FaultCommand(unittest.TestCase):
             base.mkdir()
             for rel in ("components/event_log/evq_hil_trace.c", "components/event_log/evq_hil_io.c"):
                 text = subprocess.run(["git", "show", f"{BASE_REV_S1}:{rel}"], cwd=ROOT, capture_output=True,
-                                      text=True, check=True).stdout
+                                      text=True, check=True, env=pinned_revs.env()).stdout
                 (base / Path(rel).name).write_text(text)
             cmd = [CC, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", *SAN, "-DEVQ_HIL_TRACE_HOST", "-DEVQ_HIL_HOST",
                    "-DFIO_BASELINE_SEMANTICS", *[f"-I{ROOT / i}" for i in ["tests/sdwi_host/stubs", "components/event_log",

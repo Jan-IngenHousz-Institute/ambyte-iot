@@ -9,7 +9,7 @@ CC=clang TMPDIR=<scratch> python3 -m unittest tests.test_gmig_compat -v
 CC=clang TMPDIR=<scratch> python3 tests/gmig_host/gmig.py scenarios [NAME ...]   # JSON line per scenario
 ```
 
-- `GMIG_C2_REV=<rev>` picks the candidate commit (default `6fcbeba`). `GMIG_C2_REV=WORKTREE` builds the working tree instead.
+- `GMIG_C2_REV=<rev>` picks the candidate commit (default: C2 `6fcbeba`, rebuilt from `tests/fixtures/pinned_base/` by `tests/pinned_revs.py`, so no branch or tag is needed). `GMIG_C2_REV=WORKTREE` builds the working tree instead.
 - Full results are written to `$TMPDIR/gmig_host/results/<scenario>.json`.
 - Every state directory, snapshot and probe copy is kept under `$TMPDIR/gmig_host/runs/`.
 

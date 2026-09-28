@@ -1,8 +1,11 @@
-"""pinned_revs: the Sprint 1/2 base commits resolve to content-identical trees
-(original or re-signed twin), and a subject match with a different tree is refused -
-including pr.yml's squash commit, which carries the PR title as its subject."""
+"""pinned_revs: the Sprint 1 / C2 baselines rebuild from their committed fixtures on
+top of main alone (no branch, tag, reflog or dangling object), match the recorded
+trees on every consumed path, and any changed baseline byte is refused."""
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,53 +13,70 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import pinned_revs  # noqa: E402
+import pinned_revs as P  # noqa: E402
 
 
-class PinnedRevs(unittest.TestCase):
-    def test_pins_resolve_to_recorded_trees(self):
-        for pin in (pinned_revs.SPRINT1_SETTLED, pinned_revs.C2):
-            rev = pinned_revs.resolve(pin)
-            self.assertEqual(pinned_revs._tree(rev), pin[2], pin[0])
-
-    def test_tree_mismatch_is_refused(self):
-        short, subject, _tree = pinned_revs.SPRINT1_SETTLED
-        with self.assertRaises(RuntimeError):
-            pinned_revs.resolve((short, subject, "0" * 40))
-
-    def test_unknown_subject_is_refused(self):
-        with self.assertRaises(RuntimeError):
-            pinned_revs.resolve(("0000000", "no such subject in history", "0" * 40))
+def _mutate_added_line(patch: Path) -> None:
+    """Change one byte of baseline CONTENT (an added line), keeping the patch applicable."""
+    lines = patch.read_bytes().split(b"\n")
+    i = next(i for i, ln in enumerate(lines) if ln.startswith(b"+") and not ln.startswith(b"+++") and len(ln) > 8)
+    lines[i] = lines[i][:-1] + (b"#" if lines[i][-1:] != b"#" else b"@")
+    patch.write_bytes(b"\n".join(lines))
 
 
-    def test_pr_squash_commit_with_same_subject_is_not_the_base(self):
-        """Replays pr.yml:69-76: the PR is soft-reset onto its merge base and re-committed
-        as one commit titled with the PR title (= the base's subject). The base must still
-        resolve to the real commit, reachable only from the PR branch ref."""
+class PinnedBaselines(unittest.TestCase):
+    def test_pins_rebuild_to_recorded_consumed_listing(self):
+        for pin in P.PINS:
+            tree = P.resolve(pin)
+            self.assertEqual(P.listing_digest(tree, pin.consumed), pin.digest, pin.name)
+
+    def test_rebuilt_equals_real_commit_where_consumed(self):
+        """Independent of the recorded digest: against the real tree, when this clone has it."""
+        for pin in P.PINS:
+            real = next((c for c in (pin.original, pin.resigned)
+                         if P._git("cat-file", "-t", c, check=False).strip() == "commit"), None)
+            if real is None:
+                self.skipTest(f"{pin.name}: real commit not in this clone (expected after the squash merge)")
+            self.assertEqual(P._git("rev-parse", f"{real}^{{tree}}").strip(), pin.tree)
+            self.assertEqual(P.listing_digest(P.resolve(pin), pin.consumed), P.listing_digest(real, pin.consumed))
+
+    def test_main_bases_are_on_head_history(self):
+        for rev in (P.MAIN_BASE, P.V1_11_0):
+            r = subprocess.run(["git", "merge-base", "--is-ancestor", rev, "HEAD"], cwd=P.ROOT)
+            self.assertEqual(r.returncode, 0, f"{rev[:12]} is not an ancestor of HEAD")
+
+    def test_rebuild_writes_nothing_into_the_repository(self):
+        tree = P.resolve(P.SPRINT1_SETTLED)
+        r = subprocess.run(["git", "cat-file", "-e", tree], cwd=P.ROOT, capture_output=True)
+        self.assertNotEqual(r.returncode, 0, "the rebuilt tree leaked into the repository object store")
+
+    def test_changed_patch_bytes_are_refused(self):
+        for pin in P.PINS:
+            with tempfile.TemporaryDirectory() as d:
+                fx = Path(d) / "fx"
+                shutil.copytree(P.FIXTURES, fx)
+                _mutate_added_line(fx / pin.patch)
+                with self.assertRaisesRegex(RuntimeError, "sha256"):        # the recorded patch hash
+                    P.resolve(pin, fx)
+
+    def test_changed_baseline_content_is_refused_even_with_a_matching_patch_hash(self):
+        """The digest from the real tree, not the patch hash, is the identity proof."""
+        for pin in P.PINS:
+            with tempfile.TemporaryDirectory() as d:
+                fx = Path(d) / "fx"
+                shutil.copytree(P.FIXTURES, fx)
+                _mutate_added_line(fx / pin.patch)
+                forged = dataclasses.replace(pin, patch_sha256=hashlib.sha256((fx / pin.patch).read_bytes()).hexdigest())
+                with self.assertRaisesRegex(RuntimeError, "baseline bytes changed"):
+                    P.resolve(forged, fx)
+
+    def test_c2_refuses_a_changed_sprint1_fixture(self):
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            env = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
-
-            def git(*a):
-                return subprocess.run(["git", *env, *a], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
-
-            git("init", "-q", "-b", "main")
-            (root / "f").write_text("main\n"); git("add", "f"); git("commit", "-q", "-m", "chore: main")
-            base_sha = git("rev-parse", "HEAD")
-            git("checkout", "-q", "-b", "pr")
-            (root / "f").write_text("sprint1\n"); git("commit", "-q", "-am", "fix(storage): the settled fix")
-            pinned_sha, pinned_tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
-            (root / "f").write_text("head\n"); git("commit", "-q", "-am", "test(hil): later work")
-            git("checkout", "-q", "-B", "main", git("rev-parse", "pr"))
-            git("reset", "-q", "--soft", base_sha)
-            git("commit", "-q", "--allow-empty", "-m", "fix(storage): the settled fix")      # the PR title
-            squash = git("rev-parse", "HEAD")
-            pin = ("0000000", "fix(storage): the settled fix", pinned_tree)
-            self.assertEqual(pinned_revs.resolve(pin, root), pinned_sha)
-            self.assertNotEqual(pinned_revs.resolve(pin, root), squash)
-            git("branch", "-q", "-D", "pr")         # base no longer on any ref: fail closed
+            fx = Path(d) / "fx"
+            shutil.copytree(P.FIXTURES, fx)
+            _mutate_added_line(fx / P.SPRINT1_SETTLED.patch)
             with self.assertRaises(RuntimeError):
-                pinned_revs.resolve(pin, root)
+                P.resolve(P.C2, fx)
 
 
 if __name__ == "__main__":
