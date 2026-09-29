@@ -38,6 +38,31 @@ _Static_assert((WIFI_MANAGER_ERR_AUTH_REJECTED < ESP_ERR_WIFI_BASE) ||
  * kick record on the state struct). Kept only because the Evaluator's round-6
  * regressions, applied verbatim, advance the harness clock by this amount. */
 #define WIFI_MANAGER_KICK_OUTCOME_TIMEOUT_MS 2000
+
+/* Recovery epoch (see the epoch comment on the state struct). The deadline is
+ * a bound that FAILS CLOSED (DRIVER_UNRESOLVED): it never decides ownership, it
+ * only covers a promised STA_STOP / barrier / STA_START that was dropped (a
+ * full event queue drops posts: esp_event.h:418,447 "queue full"). The resume
+ * delay only moves esp_wifi_start() off the event-loop task. */
+#define WIFI_MANAGER_EPOCH_DEADLINE_MS 5000
+#define WIFI_MANAGER_EPOCH_RESUME_US   1000
+
+/* Manager-owned barrier events on the default loop, bound to an epoch gen. */
+ESP_EVENT_DEFINE_BASE(WIFI_MANAGER_EVENT);
+#define WIFI_MANAGER_EVENT_EPOCH_BARRIER 1
+#define WIFI_MANAGER_BARRIER_STOP_FENCE  1   /* posted right after stop() returned */
+#define WIFI_MANAGER_BARRIER_STOP_DONE   2   /* posted from STA_STOP if the fence ran first */
+typedef struct {
+    uint32_t epoch_gen;
+    uint8_t kind;
+} wifi_manager_barrier_t;
+
+typedef enum {
+    WIFI_MANAGER_EPOCH_IDLE,
+    WIFI_MANAGER_EPOCH_STOPPING,   /* stop issued: awaiting STA_STOP AND our barrier */
+    WIFI_MANAGER_EPOCH_RESUMING,   /* both seen: esp_wifi_start() queued off the loop */
+    WIFI_MANAGER_EPOCH_STARTING,   /* start issued: awaiting STA_START */
+} wifi_manager_epoch_state_t;
 #define WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS 10000
 #define WIFI_MANAGER_STA_IFKEY "WIFI_STA_DEF"
 #define WIFI_MANAGER_UNPROVISIONED_PLACEHOLDER "__UNPROVISIONED__"
@@ -218,48 +243,80 @@ typedef struct {
     uint32_t attempt_gen;
     uint32_t attempt_seq;
     uint32_t link_gen;
-    /* Kick record, and why an unresolved attempt is never handed over.
+    /* Kick record and the STA stop/start recovery epoch.
      *
      * Hardware, DEV 28:37:2F:FF:E7:04, 2026-09-29: the driver accepted an
      * esp_wifi_connect() (ESP_OK) and never reported its outcome, and a kick
      * (esp_wifi_disconnect) produced no event. A single-flight slot that waits
-     * for that outcome waits forever.
+     * for that outcome waits forever, and nothing in the API ties a late
+     * outcome to the attempt that caused it: wifi_event_sta_connected_t /
+     * wifi_event_sta_disconnected_t carry no attempt id
+     * (esp_wifi_types_generic.h:1144-1162), and ESP_OK from esp_wifi_connect()
+     * only means "accepted" (esp_wifi.h:455-462). So the slot is never handed
+     * over by guess or by elapsed time.
      *
-     * Transferring the slot safely would need an ownership boundary, and ESP-IDF
-     * 5.5 documents none:
-     *  - Events carry no attempt identity. wifi_event_sta_connected_t and
-     *    wifi_event_sta_disconnected_t (esp_wifi_types_generic.h:1144-1162)
-     *    hold only ssid, bssid, channel/authmode/aid or reason, and rssi.
-     *  - esp_wifi_connect() documents no "attempt pending" result (esp_wifi.h
-     *    :455-462). ESP_OK means only that the command was accepted, not that
-     *    no earlier outcome is still to be posted.
-     *  - The Wi-Fi guide promises STA_DISCONNECTED on esp_wifi_disconnect() /
-     *    esp_wifi_stop() only "when the station is already connected", not for
-     *    a connecting or idle station. STA_STOP carries no "no further station
-     *    events" guarantee.
-     *  - The esp_event documentation states handler order per event, but no
-     *    FIFO guarantee between posted events.
-     * Any transfer is therefore a guess: a late, untagged outcome could be
-     * charged to the wrong request, or an ended request resurrected. Elapsed
-     * time proves nothing about event drain.
-     *
-     * So the manager never transfers. A blocked request kicks the blocker once
-     * (recorded here, together with the driver's actual return code). If that
-     * request is started again while the SAME blocker is still unresolved, it
-     * is ended truthfully: FAILED, not retrying, WIFI_MANAGER_ERR_DRIVER_
-     * UNRESOLVED to a caller, and an error log with the driver's return. The
-     * slot stays with the unresolved attempt. Its own outcome, if it ever
-     * comes, is attributed to it and frees the slot for a later request.
-     * Otherwise recovery is a reboot (sync_runner watchdogs, or the operator).
-     * What would remove this limit: an attempt id carried from
-     * esp_wifi_connect() to its STA_CONNECTED/STA_DISCONNECTED, or a documented
-     * guarantee that esp_wifi_disconnect() posts exactly one STA_DISCONNECTED
-     * for an in-progress attempt, delivered in posting order. */
+     * A blocked request kicks the blocker once (recorded here, with the
+     * driver's return code). If it is started again while the SAME blocker is
+     * unresolved, it opens a recovery epoch that ENDS the old ownership
+     * instead of transferring it:
+     *  1. New epoch gen; the old attempt/link is invalidated, and every
+     *     STA_DISCONNECTED / STA_CONNECTED / GOT_IP is gated (never credited)
+     *     until the epoch completes. Then esp_wifi_stop(), outside the lock and
+     *     never on the event-loop task.
+     *  2. On ESP_OK the station is stopped and its control block freed
+     *     synchronously (DOCUMENTED, esp_wifi.h:415-426 "stops station and
+     *     frees station control block"), and STA_STOP is promised (DOCUMENTED,
+     *     v5.5 Wi-Fi guide: "If esp_wifi_stop() returns ESP_OK ... this event
+     *     will arise"). Right after, a manager barrier event (payload = epoch
+     *     gen) is posted, non-blocking, to the same default loop. The loop
+     *     queues with xQueueSendToBack to one consumer task (IMPLEMENTATION,
+     *     esp_event.c:955-966, not a documented contract), so when the barrier
+     *     is handled every driver event posted before stop() returned has been
+     *     handled; the freed control block rules out later posts for the old
+     *     attempt.
+     *  3. esp_wifi_start() runs only after BOTH the matching STA_STOP and the
+     *     matching barrier were handled, in either order; if STA_STOP came
+     *     second a second barrier (STOP_DONE) is posted so that start follows
+     *     the whole STA_STOP dispatch, including the default netif handler
+     *     (wifi_default.c:84-95 esp_netif_action_stop -> esp_netif_stop, a
+     *     synchronous tcpip call, esp_netif_lwip.c:1299-1301, running
+     *     dhcp_stop/dhcp_cleanup). Start is issued from the esp_timer task,
+     *     never inside an esp_event handler: the Wi-Fi task can block posting to
+     *     a full loop queue (esp_adapter.c:350-356 uses portMAX_DELAY for
+     *     OSI_FUNCS_TIME_BLOCKING), and a stop/start call on the loop task would
+     *     then wait on the one task that could drain it.
+     *  4. On the matching STA_START the request is re-validated (still current,
+     *     still active, budget intact) and only then does it connect, under the
+     *     existing retry budget (the epoch itself counts one attempt). The
+     *     default STA_START / STA_CONNECTED handlers bring the netif back and
+     *     restart DHCP (wifi_default.c:77-82 -> esp_netif_action_start;
+     *     :97-124 -> esp_netif_action_connected -> esp_netif_up +
+     *     esp_netif_dhcpc_start, esp_netif_handlers.c:35-49), so the next
+     *     GOT_IP works.
+     *  5. GOT_IP comes from another producer (lwIP, esp_netif_lwip.c:1414-1453,
+     *     ticks 0) with no order against Wi-Fi events, so a stale GOT_IP can
+     *     land after STA_STOP and the barrier. GOT_IP is credited only for an
+     *     association the CURRENT request made after the epoch.
+     *  6. Stop error, barrier-post failure, STA_STOP or barrier missing by the
+     *     deadline, start error, STA_START missing by the deadline: each ends the
+     *     request with WIFI_MANAGER_ERR_DRIVER_UNRESOLVED and latches
+     *     reboot_needed (the driver state is no longer known). Only these are
+     *     terminal. */
     bool kick_valid;
     bool kick_link;
     uint32_t kick_seq;
     uint32_t kick_link_gen;
     esp_err_t kick_err;
+    wifi_manager_epoch_state_t epoch_state;
+    uint32_t epoch_gen;
+    bool epoch_stop_seen;
+    bool epoch_fence_seen;
+    esp_timer_handle_t epoch_timer;
+    bool epoch_timer_armed;
+    uint32_t epoch_stale_dispatches;
+    bool reboot_needed;          /* a recovery epoch failed: driver state unknown */
+    uint32_t unresolved_gen;     /* request ended by a failed epoch */
+    esp_event_handler_instance_t mgr_handler;
     /* STA_CONNECTED seen and no DISCONNECTED since: an association whose DHCP
      * is still pending is progressing, not silent (join timeout path). */
     bool associated;
@@ -293,6 +350,16 @@ static wifi_manager_service_t s_wifi = {
     .kick_seq = 0,
     .kick_link_gen = 0,
     .kick_err = ESP_OK,
+    .epoch_state = WIFI_MANAGER_EPOCH_IDLE,
+    .epoch_gen = 0,
+    .epoch_stop_seen = false,
+    .epoch_fence_seen = false,
+    .epoch_timer = NULL,
+    .epoch_timer_armed = false,
+    .epoch_stale_dispatches = 0,
+    .reboot_needed = false,
+    .unresolved_gen = 0,
+    .mgr_handler = NULL,
     .associated = false,
     .current_ssid = {0},
 };
@@ -559,6 +626,127 @@ static bool wifi_manager_retry_after_silent_failure_locked(esp_err_t err, const 
  * stored-creds boot -> AUTH_FAIL -> 2 s retry -> ESP_ERR_WIFI_STATE -> silence).
  * The error now counts as an attempt and re-arms the timer - but only if the
  * request that issued the call is still the current one. */
+static void wifi_manager_epoch_timer_cb(void *arg);
+static void wifi_manager_issue_retry(uint32_t gen);
+
+static esp_err_t wifi_manager_ensure_epoch_timer(void)
+{
+    if (s_wifi.epoch_timer != NULL) {
+        return ESP_OK;
+    }
+    const esp_timer_create_args_t args = {
+        .callback = &wifi_manager_epoch_timer_cb,
+        .name = "wifi_epoch",
+    };
+    const esp_err_t err = esp_timer_create(&args, &s_wifi.epoch_timer);
+    if (err != ESP_OK) {
+        s_wifi.epoch_timer = NULL;
+    }
+    return err;
+}
+
+/* Caller holds the lock. Same committed-dispatch accounting as the reconnect
+ * timer (see the dispatch-identity note): a dispatch already committed when
+ * this runs is recorded as stale and consumed by the callback. */
+static void wifi_manager_cancel_epoch_timer_locked(void)
+{
+    if ((s_wifi.epoch_timer != NULL) && s_wifi.epoch_timer_armed &&
+        (esp_timer_stop(s_wifi.epoch_timer) == ESP_ERR_INVALID_STATE)) {
+        ++s_wifi.epoch_stale_dispatches;
+    }
+    s_wifi.epoch_timer_armed = false;
+}
+
+static bool wifi_manager_arm_epoch_timer_locked(uint64_t delay_us)
+{
+    esp_err_t err = wifi_manager_ensure_epoch_timer();
+    if (err == ESP_OK) {
+        wifi_manager_cancel_epoch_timer_locked();
+        err = esp_timer_start_once(s_wifi.epoch_timer, delay_us);
+    }
+    s_wifi.epoch_timer_armed = (err == ESP_OK);
+    return s_wifi.epoch_timer_armed;
+}
+
+/* Caller holds the lock. A recovery epoch could not complete: the driver state
+ * is no longer known, so end the request truthfully and latch reboot_needed. */
+static void wifi_manager_fail_epoch_locked(const char *what, esp_err_t err)
+{
+    s_wifi.epoch_state = WIFI_MANAGER_EPOCH_IDLE;
+    wifi_manager_cancel_epoch_timer_locked();
+    s_wifi.reboot_needed = true;
+    s_wifi.unresolved_gen = s_wifi.request_gen;
+    wifi_manager_stop_request_locked();
+    ESP_LOGE(TAG, "Wi-Fi recovery epoch %u failed: %s (%s) - request %u ended, "
+             "reboot to recover", (unsigned)s_wifi.epoch_gen, what, esp_err_to_name(err),
+             (unsigned)s_wifi.request_gen);
+}
+
+/* Caller holds the lock. STA_STOP and the barrier have both been handled:
+ * queue esp_wifi_start() on the esp_timer task (never the event-loop task). */
+static void wifi_manager_epoch_resume_locked(void)
+{
+    s_wifi.epoch_state = WIFI_MANAGER_EPOCH_RESUMING;
+    if (!wifi_manager_arm_epoch_timer_locked(WIFI_MANAGER_EPOCH_RESUME_US)) {
+        wifi_manager_fail_epoch_locked("resume timer", ESP_ERR_NO_MEM);
+    }
+}
+
+/* Post a barrier for `epoch`, non-blocking (ticks 0): a blocking post from the
+ * event-loop task onto its own full queue would self-deadlock. Called WITHOUT
+ * the lock. A failed post ends the epoch truthfully. */
+static void wifi_manager_post_barrier(uint32_t epoch, uint8_t kind)
+{
+    const wifi_manager_barrier_t b = { .epoch_gen = epoch, .kind = kind };
+    const esp_err_t err = esp_event_post(WIFI_MANAGER_EVENT, WIFI_MANAGER_EVENT_EPOCH_BARRIER,
+                                         &b, sizeof(b), 0);
+    if (err != ESP_OK) {
+        wifi_manager_lock();
+        if ((s_wifi.epoch_gen == epoch) && (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STOPPING)) {
+            wifi_manager_fail_epoch_locked("barrier post", err);
+        }
+        wifi_manager_unlock();
+    }
+}
+
+static void wifi_manager_epoch_timer_cb(void *arg)
+{
+    (void)arg;
+    wifi_manager_lock();
+    if (s_wifi.epoch_stale_dispatches > 0U) {
+        --s_wifi.epoch_stale_dispatches;
+        wifi_manager_unlock();
+        return;
+    }
+    s_wifi.epoch_timer_armed = false;
+    if (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STOPPING) {
+        wifi_manager_fail_epoch_locked("STA_STOP or barrier not handled by the deadline",
+                                       ESP_ERR_TIMEOUT);
+    } else if (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STARTING) {
+        wifi_manager_fail_epoch_locked("STA_START not received by the deadline", ESP_ERR_TIMEOUT);
+    } else if (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_RESUMING) {
+        const uint32_t epoch = s_wifi.epoch_gen;
+        s_wifi.epoch_state = WIFI_MANAGER_EPOCH_STARTING;
+        if (!wifi_manager_arm_epoch_timer_locked(
+                (uint64_t)WIFI_MANAGER_EPOCH_DEADLINE_MS * 1000ULL)) {
+            wifi_manager_fail_epoch_locked("deadline timer", ESP_ERR_NO_MEM);
+            wifi_manager_unlock();
+            return;
+        }
+        wifi_manager_unlock();
+        const esp_err_t err = esp_wifi_start();
+        if (err == ESP_OK) {
+            (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   /* as wifi_manager_start() */
+        }
+        wifi_manager_lock();
+        if ((err != ESP_OK) && (s_wifi.epoch_gen == epoch) &&
+            (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STARTING)) {
+            wifi_manager_fail_epoch_locked("esp_wifi_start", err);
+        }
+    }
+    wifi_manager_unlock();
+}
+
 typedef enum {
     WIFI_MANAGER_ATTEMPT_STARTED,      /* esp_wifi_connect() issued; outcome is an event */
     WIFI_MANAGER_ATTEMPT_LINKED,       /* already associated for this request: nothing to do */
@@ -583,6 +771,10 @@ static wifi_manager_attempt_result_t wifi_manager_start_attempt(uint32_t gen,
             wifi_manager_unlock();
             return WIFI_MANAGER_ATTEMPT_SUPERSEDED;
         }
+        if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE) {
+            wifi_manager_unlock();
+            return WIFI_MANAGER_ATTEMPT_DEFERRED;   /* the epoch issues the next connect */
+        }
         if (!s_wifi.attempt_in_flight && s_wifi.associated && (s_wifi.link_gen == gen)) {
             wifi_manager_unlock();
             return WIFI_MANAGER_ATTEMPT_LINKED;
@@ -598,19 +790,57 @@ static wifi_manager_attempt_result_t wifi_manager_start_attempt(uint32_t gen,
                  ? (!s_wifi.kick_link && (s_wifi.kick_seq == s_wifi.attempt_seq))
                  : (s_wifi.kick_link && (s_wifi.kick_link_gen == s_wifi.link_gen)));
         if (already_kicked) {
-            /* No supported way to hand the slot over (see the kick record):
-             * end this request truthfully instead of guessing. */
+            /* Still the same kicked blocker: end its ownership with a recovery
+             * epoch (see the state struct). The epoch's connect is this
+             * request's next attempt under its existing budget. */
+            if (wifi_manager_attempt_budget_spent_locked(0, s_wifi.kick_err)) {
+                wifi_manager_unlock();
+                return WIFI_MANAGER_ATTEMPT_ENDED;
+            }
             const uint32_t owner = blocked_by_attempt ? s_wifi.attempt_gen : s_wifi.link_gen;
             const esp_err_t kick_err = s_wifi.kick_err;
-            wifi_manager_stop_request_locked();
+            const uint32_t epoch = ++s_wifi.epoch_gen;
+            s_wifi.epoch_state = WIFI_MANAGER_EPOCH_STOPPING;
+            s_wifi.epoch_stop_seen = false;
+            s_wifi.epoch_fence_seen = false;
+            if (s_wifi.attempt_in_flight) {
+                wifi_manager_end_attempt_locked();   /* invalidated: can earn no credit */
+            }
+            s_wifi.associated = false;
+            s_wifi.kick_valid = false;
+            wifi_manager_cancel_reconnect_locked();
+            if (!wifi_manager_arm_epoch_timer_locked(
+                    (uint64_t)WIFI_MANAGER_EPOCH_DEADLINE_MS * 1000ULL)) {
+                wifi_manager_fail_epoch_locked("deadline timer", ESP_ERR_NO_MEM);
+                wifi_manager_unlock();
+                return WIFI_MANAGER_ATTEMPT_UNRESOLVED;
+            }
             wifi_manager_unlock();
-            ESP_LOGE(TAG, "Wi-Fi %s of request %u still unresolved after a kick (driver "
-                     "returned %s to esp_wifi_disconnect); IDF gives no barrier to hand "
-                     "it over, so request %u is ended, not retrying - reboot to recover "
-                     "unless its outcome arrives",
+            ESP_LOGW(TAG, "Wi-Fi %s of request %u still unresolved after a kick (driver "
+                     "returned %s); recovery epoch %u: stopping the station",
                      blocked_by_attempt ? "attempt" : "link", (unsigned)owner,
-                     esp_err_to_name(kick_err), (unsigned)gen);
-            return WIFI_MANAGER_ATTEMPT_UNRESOLVED;
+                     esp_err_to_name(kick_err), (unsigned)epoch);
+
+            const esp_err_t stop_err = esp_wifi_stop();
+            if (stop_err == ESP_OK) {
+                wifi_manager_post_barrier(epoch, WIFI_MANAGER_BARRIER_STOP_FENCE);
+            }
+            wifi_manager_lock();
+            if ((stop_err != ESP_OK) && (s_wifi.epoch_gen == epoch) &&
+                (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STOPPING)) {
+                wifi_manager_fail_epoch_locked("esp_wifi_stop", stop_err);
+            }
+            /* Re-validate after the unlocked calls; the epoch itself serves
+             * whichever request is current when STA_START arrives. */
+            wifi_manager_attempt_result_t result = WIFI_MANAGER_ATTEMPT_DEFERRED;
+            if (s_wifi.request_gen != gen) {
+                result = WIFI_MANAGER_ATTEMPT_SUPERSEDED;
+            } else if (!s_wifi.connect_requested) {
+                result = (s_wifi.unresolved_gen == gen) ? WIFI_MANAGER_ATTEMPT_UNRESOLVED
+                                                        : WIFI_MANAGER_ATTEMPT_ENDED;
+            }
+            wifi_manager_unlock();
+            return result;
         }
 
         const uint32_t pending_seq = s_wifi.attempt_seq;
@@ -822,8 +1052,62 @@ static void wifi_event_handler(
 {
     (void)arg;
 
+    if ((event_base == WIFI_MANAGER_EVENT) && (event_id == WIFI_MANAGER_EVENT_EPOCH_BARRIER)) {
+        const wifi_manager_barrier_t *b = (const wifi_manager_barrier_t *)event_data;
+        wifi_manager_lock();
+        if ((b != NULL) && (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STOPPING) &&
+            (b->epoch_gen == s_wifi.epoch_gen)) {
+            if (b->kind == WIFI_MANAGER_BARRIER_STOP_FENCE) {
+                s_wifi.epoch_fence_seen = true;
+                if (s_wifi.epoch_stop_seen) {
+                    wifi_manager_epoch_resume_locked();   /* STA_STOP ran before the fence */
+                }
+            } else if ((b->kind == WIFI_MANAGER_BARRIER_STOP_DONE) && s_wifi.epoch_stop_seen &&
+                       s_wifi.epoch_fence_seen) {
+                wifi_manager_epoch_resume_locked();       /* after STA_STOP's whole dispatch */
+            }
+        }
+        wifi_manager_unlock();
+        return;
+    }
+
+    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_STOP)) {
+        wifi_manager_lock();
+        uint32_t post_done_for = 0;
+        if ((s_wifi.epoch_state == WIFI_MANAGER_EPOCH_STOPPING) && !s_wifi.epoch_stop_seen) {
+            s_wifi.epoch_stop_seen = true;
+            if (s_wifi.epoch_fence_seen) {
+                /* The fence ran first; other STA_STOP handlers (netif stop) may
+                 * still follow this one, so resume behind a second barrier. */
+                post_done_for = s_wifi.epoch_gen;
+            }
+        }
+        wifi_manager_unlock();
+        if (post_done_for != 0U) {
+            wifi_manager_post_barrier(post_done_for, WIFI_MANAGER_BARRIER_STOP_DONE);
+        }
+        return;
+    }
+
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_START)) {
-        ESP_LOGI(TAG, "Wi-Fi station started");
+        wifi_manager_lock();
+        if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_STARTING) {
+            wifi_manager_unlock();
+            ESP_LOGI(TAG, "Wi-Fi station started");
+            return;
+        }
+        s_wifi.epoch_state = WIFI_MANAGER_EPOCH_IDLE;
+        wifi_manager_cancel_epoch_timer_locked();
+        const uint32_t epoch = s_wifi.epoch_gen;
+        const uint32_t gen = s_wifi.request_gen;
+        const bool resume = s_wifi.connect_requested &&
+                            (s_wifi.reconnect_count <= WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS);
+        wifi_manager_unlock();
+        ESP_LOGW(TAG, "Wi-Fi recovery epoch %u complete: station restarted%s",
+                 (unsigned)epoch, resume ? "; connecting the current request" : "");
+        if (resume) {
+            wifi_manager_issue_retry(gen);   /* re-validates gen/request under the lock */
+        }
         return;
     }
 
@@ -836,6 +1120,15 @@ static void wifi_event_handler(
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
 
         wifi_manager_lock();
+        if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE) {
+            /* Belongs to the stopped epoch (e.g. stop while associated raises
+             * ASSOC_LEAVE before STA_STOP): no retry, no charge. */
+            s_wifi.associated = false;
+            wifi_manager_unlock();
+            ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d) during recovery epoch - "
+                     "old epoch, ignored", (int)reason);
+            return;
+        }
         /* Attribute the event before anything else: to the pending attempt if
          * there is one, else to the owner of the association it tears down
          * (see attempt_in_flight / link_gen). */
@@ -937,6 +1230,11 @@ static void wifi_event_handler(
 
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_CONNECTED)) {
         wifi_manager_lock();
+        if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE) {
+            wifi_manager_unlock();
+            ESP_LOGW(TAG, "association during recovery epoch - old epoch, not credited");
+            return;
+        }
         const uint32_t owner = s_wifi.attempt_in_flight ? s_wifi.attempt_gen : s_wifi.request_gen;
         if (s_wifi.attempt_in_flight) {
             wifi_manager_end_attempt_locked();   /* the attempt succeeded */
@@ -966,7 +1264,8 @@ static void wifi_event_handler(
 
     if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
         wifi_manager_lock();
-        const bool current_link = s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
+        const bool current_link = (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_IDLE) &&
+                                  s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
         if (current_link) {
             s_wifi.reconnect_count = 0;
             s_wifi.auth_fail_count = 0;
@@ -1073,6 +1372,16 @@ esp_err_t wifi_manager_init(void)
             return err;
         }
 
+        err = esp_event_handler_instance_register(
+            WIFI_MANAGER_EVENT,
+            ESP_EVENT_ANY_ID,
+            &wifi_event_handler,
+            NULL,
+            &s_wifi.mgr_handler);
+        if (err != ESP_OK) {
+            return err;
+        }
+
         s_wifi.handlers_registered = true;
     }
 
@@ -1116,10 +1425,24 @@ esp_err_t wifi_manager_start(void)
     return ESP_OK;
 }
 
+static bool wifi_manager_reboot_needed(void)
+{
+    if (s_wifi.lock == NULL) {
+        return false;
+    }
+    wifi_manager_lock();
+    const bool r = s_wifi.reboot_needed;
+    wifi_manager_unlock();
+    return r;
+}
+
 esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 {
     if ((ssid == NULL) || (password == NULL)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (wifi_manager_reboot_needed()) {
+        return WIFI_MANAGER_ERR_DRIVER_UNRESOLVED;   /* a recovery epoch failed earlier */
     }
 
     /* Arm the reconfigure latch BEFORE esp_wifi_set_config(): on an associated
@@ -1144,83 +1467,90 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     s_wifi.auth_fail_count = 0;
     wifi_manager_cancel_reconnect_locked();
     xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
-    s_wifi.connect_requested = false;
-    s_wifi.reconfigure_in_progress = true;
+    /* A recovery epoch in progress is stopping/starting the station: it will
+     * connect whichever request is current at its STA_START, so this join
+     * issues no disconnect/connect of its own. */
+    const bool epoch_owns = (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE);
+    s_wifi.connect_requested = epoch_owns;
+    s_wifi.reconfigure_in_progress = !epoch_owns;
     wifi_manager_unlock();
-    /* The reconnect timer task may be inside esp_wifi_connect() right now (an
-     * unreachable AP keeps the driver busy almost continuously), and the driver
-     * rejects any overlapping disconnect/connect with ESP_ERR_WIFI_STATE. Retry
-     * past the transient instead of failing the join outright. */
-    for (int attempt = 0; ; attempt++) {
-        err = esp_wifi_disconnect();
-        if ((err == ESP_OK) || (err == ESP_ERR_WIFI_NOT_CONNECT)) {
-            break;
-        }
-        if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
-            wifi_manager_lock();
-            if (s_wifi.request_gen == gen) {
-                s_wifi.reconfigure_in_progress = false;
+    if (!epoch_owns) {
+        /* The reconnect timer task may be inside esp_wifi_connect() right now (an
+         * unreachable AP keeps the driver busy almost continuously), and the driver
+         * rejects any overlapping disconnect/connect with ESP_ERR_WIFI_STATE. Retry
+         * past the transient instead of failing the join outright. */
+        for (int attempt = 0; ; attempt++) {
+            err = esp_wifi_disconnect();
+            if ((err == ESP_OK) || (err == ESP_ERR_WIFI_NOT_CONNECT)) {
+                break;
             }
-            wifi_manager_unlock();
-            return err;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    /* Dead on IDF 5.5 (an unassociated station gets ESP_OK and no event), kept
-     * for drivers that do report it. The handler, not this branch, is what
-     * bounds the flag — see reconfigure_in_progress. */
-    /* That disconnect was a kick of any attempt still pending: record it, so a
-     * blocker that the drain below does not resolve ends the join truthfully. */
-    wifi_manager_lock();
-    if (s_wifi.attempt_in_flight &&
-        !(s_wifi.kick_valid && !s_wifi.kick_link && (s_wifi.kick_seq == s_wifi.attempt_seq))) {
-        s_wifi.kick_valid = true;
-        s_wifi.kick_link = false;
-        s_wifi.kick_seq = s_wifi.attempt_seq;
-        s_wifi.kick_err = err;
-    }
-    wifi_manager_unlock();
-
-    /* Our disconnect aborts any attempt still pending for the superseded
-     * request; give its outcome a bounded chance to arrive so our own attempt
-     * can start at once. If it has not arrived, start_attempt leaves the slot
-     * to it and defers our attempt to the timer (single-flight). */
-    const EventBits_t idle = xEventGroupWaitBits(
-        s_wifi.event_group, WIFI_MANAGER_ATTEMPT_IDLE_BIT, pdFALSE, pdTRUE,
-        pdMS_TO_TICKS(WIFI_MANAGER_ATTEMPT_DRAIN_TIMEOUT_MS));
-    if ((idle & WIFI_MANAGER_ATTEMPT_IDLE_BIT) == 0) {
-        ESP_LOGW(TAG, "previous Wi-Fi attempt still pending after %d ms",
-                 WIFI_MANAGER_ATTEMPT_DRAIN_TIMEOUT_MS);
-    }
-
-    wifi_manager_lock();
-    if (err == ESP_ERR_WIFI_NOT_CONNECT) {
-        s_wifi.reconfigure_in_progress = false;
-    }
-    s_wifi.connect_requested = true;
-    wifi_manager_unlock();
-
-    for (int attempt = 0; ; attempt++) {
-        const wifi_manager_attempt_result_t started = wifi_manager_start_attempt(gen, &err);
-        if (started == WIFI_MANAGER_ATTEMPT_UNRESOLVED) {
-            return WIFI_MANAGER_ERR_DRIVER_UNRESOLVED;   /* request ended, logged */
-        }
-        if (started != WIFI_MANAGER_ATTEMPT_CALL_FAILED) {
-            break;   /* started, deferred to the timer, or superseded: result below */
-        }
-        if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
-            wifi_manager_lock();
-            if (s_wifi.request_gen == gen) {
-                s_wifi.connect_requested = false;
-                /* No connect was issued, so no event can come to disarm the
-                 * flag (see reconfigure_in_progress): clear it here or the NEXT
-                 * real disconnect after a later successful connect is at risk. */
-                s_wifi.reconfigure_in_progress = false;
+            if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
+                wifi_manager_lock();
+                if (s_wifi.request_gen == gen) {
+                    s_wifi.reconfigure_in_progress = false;
+                }
+                wifi_manager_unlock();
+                return err;
             }
-            wifi_manager_unlock();
-            return err;
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
+        /* Dead on IDF 5.5 (an unassociated station gets ESP_OK and no event), kept
+         * for drivers that do report it. The handler, not this branch, is what
+         * bounds the flag — see reconfigure_in_progress. */
+        /* That disconnect was a kick of any attempt still pending: record it, so a
+         * blocker that the drain below does not resolve ends the join truthfully. */
+        wifi_manager_lock();
+        if (s_wifi.attempt_in_flight &&
+            !(s_wifi.kick_valid && !s_wifi.kick_link && (s_wifi.kick_seq == s_wifi.attempt_seq))) {
+            s_wifi.kick_valid = true;
+            s_wifi.kick_link = false;
+            s_wifi.kick_seq = s_wifi.attempt_seq;
+            s_wifi.kick_err = err;
+        }
+        wifi_manager_unlock();
+
+        /* Our disconnect aborts any attempt still pending for the superseded
+         * request; give its outcome a bounded chance to arrive so our own attempt
+         * can start at once. If it has not arrived, start_attempt leaves the slot
+         * to it and defers our attempt to the timer (single-flight). */
+        const EventBits_t idle = xEventGroupWaitBits(
+            s_wifi.event_group, WIFI_MANAGER_ATTEMPT_IDLE_BIT, pdFALSE, pdTRUE,
+            pdMS_TO_TICKS(WIFI_MANAGER_ATTEMPT_DRAIN_TIMEOUT_MS));
+        if ((idle & WIFI_MANAGER_ATTEMPT_IDLE_BIT) == 0) {
+            ESP_LOGW(TAG, "previous Wi-Fi attempt still pending after %d ms",
+                     WIFI_MANAGER_ATTEMPT_DRAIN_TIMEOUT_MS);
+        }
+
+        wifi_manager_lock();
+        if (err == ESP_ERR_WIFI_NOT_CONNECT) {
+            s_wifi.reconfigure_in_progress = false;
+        }
+        s_wifi.connect_requested = true;
+        wifi_manager_unlock();
+
+        for (int attempt = 0; ; attempt++) {
+            const wifi_manager_attempt_result_t started = wifi_manager_start_attempt(gen, &err);
+            if (started == WIFI_MANAGER_ATTEMPT_UNRESOLVED) {
+                return WIFI_MANAGER_ERR_DRIVER_UNRESOLVED;   /* request ended, logged */
+            }
+            if (started != WIFI_MANAGER_ATTEMPT_CALL_FAILED) {
+                break;   /* started, deferred to the timer, or superseded: result below */
+            }
+            if ((err != ESP_ERR_WIFI_STATE) || (attempt >= 9)) {
+                wifi_manager_lock();
+                if (s_wifi.request_gen == gen) {
+                    s_wifi.connect_requested = false;
+                    /* No connect was issued, so no event can come to disarm the
+                     * flag (see reconfigure_in_progress): clear it here or the NEXT
+                     * real disconnect after a later successful connect is at risk. */
+                    s_wifi.reconfigure_in_progress = false;
+                }
+                wifi_manager_unlock();
+                return err;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
     }
 
     (void)xEventGroupWaitBits(
@@ -1247,12 +1577,14 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     } else {
         s_wifi.reconfigure_in_progress = false;   /* no stale latch past the join */
         if (!s_wifi.connect_requested) {
-            result = WIFI_MANAGER_ERR_NOT_RETRYING;
+            result = (s_wifi.unresolved_gen == gen) ? WIFI_MANAGER_ERR_DRIVER_UNRESOLVED
+                                                    : WIFI_MANAGER_ERR_NOT_RETRYING;
         } else if ((bits & WIFI_MANAGER_FAILED_BIT) != 0) {
             /* The AP rejected the key/identity (or an attempt failed) and the
              * background retry keeps going. */
             result = (s_wifi.auth_fail_count > 0) ? WIFI_MANAGER_ERR_AUTH_REJECTED : ESP_FAIL;
-        } else if ((s_wifi.associated && (s_wifi.link_gen == gen)) || s_wifi.timer_armed) {
+        } else if ((s_wifi.associated && (s_wifi.link_gen == gen)) || s_wifi.timer_armed ||
+                   (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE)) {
             /* Associated with DHCP pending, or a disconnect already scheduled
              * the next attempt: owned, nothing to add. */
             result = ESP_ERR_TIMEOUT;
@@ -1286,6 +1618,9 @@ esp_err_t wifi_manager_connect_stored_async(void)
 {
     if (!s_wifi.initialized || !s_wifi.started) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (wifi_manager_reboot_needed()) {
+        return WIFI_MANAGER_ERR_DRIVER_UNRESOLVED;   /* a recovery epoch failed earlier */
     }
 
     esp_err_t err = wifi_manager_ensure_event_group();
@@ -1378,7 +1713,8 @@ bool wifi_manager_link_is_current(void)
         return false;
     }
     wifi_manager_lock();
-    const bool current = s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
+    const bool current = (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_IDLE) &&
+                         s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
     wifi_manager_unlock();
     return current;
 }

@@ -51,12 +51,14 @@ typedef struct {
 } wifi_event_sta_disconnected_t;
 enum {
     WIFI_EVENT_STA_START = 2,
+    WIFI_EVENT_STA_STOP = 3,
     WIFI_EVENT_STA_CONNECTED = 4,
     WIFI_EVENT_STA_DISCONNECTED = 5,
 };
 esp_err_t esp_wifi_init(const wifi_init_config_t *cfg);
 esp_err_t esp_wifi_set_mode(wifi_mode_t mode);
 esp_err_t esp_wifi_start(void);
+esp_err_t esp_wifi_stop(void);
 esp_err_t esp_wifi_set_ps(wifi_ps_type_t type);
 esp_err_t esp_wifi_set_config(wifi_interface_t iface, wifi_config_t *conf);
 esp_err_t esp_wifi_get_config(wifi_interface_t iface, wifi_config_t *conf);
