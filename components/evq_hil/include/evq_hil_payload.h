@@ -22,6 +22,10 @@ uint64_t evq_hil_fnv1a64(const char *s);
 /* Writes the payload + NUL into out. Returns its length (without NUL), or 0
  * when cap is too small or run contains a character outside [A-Za-z0-9._-]. */
 size_t evq_hil_payload(const char *run, uint32_t k, size_t pad_len, char *out, size_t cap);
+/* The pad characters of evq_hil_payload(run, k, pad_len) alone, NUL-terminated
+ * (Sprint 2 sdlog_emit; host twin tools/evq_hil/hilpay.py pad()). Returns
+ * pad_len, or 0 on a bad run id / small buffer. */
+size_t evq_hil_pad(const char *run, uint32_t k, size_t pad_len, char *out, size_t cap);
 
 #ifdef __cplusplus
 }

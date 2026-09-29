@@ -32,6 +32,8 @@
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "sd_card.h"
+#include "sd_diag.h"
+#include "esp_system.h"
 
 static const char *TAG = "evq_hil";
 
@@ -274,18 +276,37 @@ static void do_stacks(void)
 }
 
 /* ── command ── */
+int evq_hil_sdlog_cmd(int argc, char **argv);
+int evq_hil_ambit_cmd(int argc, char **argv);
+
 static void usage(void)
 {
     printf("evq_hil fill <run> <k_start> <n> <bytes> <hz> [-c] | flash_inv [full] | sd_inv <dir> [lines|full] | index |\n"
            "        io [drain] | claims | cursor | state | stacks | gate <hold|auto|force> | sd_release |\n"
            "        keeper <pause|run> | sd_park | sd_unpark | fault <point> <reset|reset_inside|eio|enospc|off> [nth] |\n"
-           "        reserve <bytes|off> | cid <hex|off> | boot_slot <ota_0|ota_1>\n");
+           "        fault io <evlog|sdlog|ambit_ota|ambit_flash|any> <open|write|read|flush|fsync|close|truncate|rename|\n"
+           "                 remove|mkdir|stat|any> <eio|enospc|short|applied_eio|reset_before|reset_after|reset_mid_write|off>\n"
+           "                 [nth] [count] [path=<substr>] | fault io add <same> (slot B) | fault last | power_cut |\n"
+           "        reserve <bytes|off> | cid <hex|off> | boot_slot <ota_0|ota_1> |\n"
+           "        sdlog_trace <on|off|drain|stat|autoarm> | sdlog_emit <run> <k0> <n> <hz> <pad> |\n"
+           "        sdlog_inv [<name> <from_off>] | sdlog_dump <name> [<from_off>] | diag |\n"
+           "        sdlog_trace probe <min_free> | ambit_sync <hold|release|status> | ambit_nvsdump <ch> <tag> |\n"
+           "        ambit_stage <ver> <region> <url> <sha> <size> | ambit_stage commit <ver> <4 x sha>\n"
+           "  every reset mode is a CPU reset (esp_rom_software_reset_system): SD power is NOT interrupted\n");
 }
 
 static int evq_hil_cmd(int argc, char **argv)
 {
     if (argc < 2) { usage(); return 1; }
     const char *sub = argv[1];
+    if (strncmp(sub, "sdlog_", 6) == 0) {
+        int r = evq_hil_sdlog_cmd(argc, argv);     /* Sprint 2 H2-H8: evq_hil_sdlog.c */
+        if (r >= 0) return r;
+    }
+    if (strncmp(sub, "ambit_", 6) == 0) {
+        int r = evq_hil_ambit_cmd(argc, argv);     /* replacement amendment A6: evq_hil_ambit.c */
+        if (r >= 0) return r;
+    }
     if (strcmp(sub, "fill") == 0) {
         uint64_t k0, n, b, hz;
         if (argc < 7 || !parse_u64(argv[3], &k0) || !parse_u64(argv[4], &n) || !parse_u64(argv[5], &b) ||
@@ -342,6 +363,64 @@ static int evq_hil_cmd(int argc, char **argv)
             return 1;
         }
         printf("HIL_OK %s started\n", sub);
+        return 0;
+    }
+    if (strcmp(sub, "diag") == 0) {
+        /* DG-4 (Sprint 2): the live sd_diag generation, which the production
+         * JSON renderer does not print (and must not change: BLD-1). */
+        sd_diag_block_t b;
+        sd_diag_get(&b);
+        printf("SDL_DIAG gen=%u epoch=%u boot=%u exact=%u floor_pending=%u valid=%d\n", (unsigned)b.gen,
+               (unsigned)b.epoch, (unsigned)b.boot_seq, (unsigned)b.exact, (unsigned)b.floor_pending,
+               sd_diag_valid(&b) ? 1 : 0);
+        return 0;
+    }
+    if (strcmp(sub, "power_cut") == 0) {
+        /* Deliberately unsupported: no verified, remotely switchable SD/board
+         * power rail exists on this bench. A CPU reset must never stand in for
+         * an electrical interruption, so this never "succeeds". */
+        printf("HIL_ERR power_cut unsupported: no verified SD/board power switch (CPU-reset modes do not cut SD power)\n");
+        return 1;
+    }
+    if (strcmp(sub, "fault") == 0 && argc == 3 && strcmp(argv[2], "last") == 0) {
+        evq_hil_last_view_t l;
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (!evq_hil_fault_last(&l)) {
+            printf("HIL_FAULT_LAST none reset_reason=%d\n", (int)rr);
+            return 0;
+        }
+        bool reset = event_log_hil_iom_is_reset(l.mode);
+        printf("HIL_FAULT_LAST kind=%s mode=%s writer=%s op=%s path=%s errno=%d nth=%u uptime_us=%lld reset_reason=%d%s\n",
+               event_log_hil_iom_kind(l.mode), event_log_hil_iom_name(l.mode), sd_diag_writer_name(l.writer),
+               sd_diag_op_name(l.op), l.path, (int)l.err, (unsigned)l.nth, (long long)l.uptime_us, (int)rr,
+               reset ? " sd_power=not_interrupted mechanism=esp_rom_software_reset_system" : "");
+        return 0;
+    }
+    if (strcmp(sub, "fault") == 0 && argc >= 3 && strcmp(argv[2], "io") == 0) {
+        /* fault io [add] <w> <op> <mode> [nth] [count] [path=<substr>] (H1). */
+        int a = 3;
+        bool add = argc > a && strcmp(argv[a], "add") == 0;
+        if (add) a++;
+        const char *path = NULL;
+        int last = argc;
+        if (last > a && strncmp(argv[last - 1], "path=", 5) == 0) { path = argv[last - 1] + 5; last--; }
+        uint64_t nth = 1, count = 1;
+        int npos = last - a;           /* positional: w op mode [nth] [count] */
+        if (npos < 3 || npos > 5 || (npos >= 4 && !parse_u64(argv[a + 3], &nth)) ||
+            (npos == 5 && !parse_u64(argv[a + 4], &count)) || nth == 0 || count == 0 || nth > 1000000 ||
+            count > 1000000 || (path != NULL && (path[0] == '\0' || strlen(path) >= 48))) {
+            usage();
+            return 1;
+        }
+        const char *why = "-";
+        esp_err_t e = evq_hil_arm_io_slot(argv[a], argv[a + 1], argv[a + 2], (unsigned)nth, (unsigned)count,
+                                                path, add, &why);
+        if (e != ESP_OK) {
+            printf("HIL_ERR fault io%s %s %s %s: %s\n", add ? " add" : "", argv[a], argv[a + 1], argv[a + 2], why);
+            return 1;
+        }
+        printf("HIL_FAULT armed slot=%c writer=%s op=%s mode=%s nth=%u count=%u path=%s\n", add ? 'B' : 'A',
+               argv[a], argv[a + 1], argv[a + 2], (unsigned)nth, (unsigned)count, path ? path : "-");
         return 0;
     }
     if (strcmp(sub, "fault") == 0 && argc >= 4) {

@@ -520,3 +520,23 @@ esp_err_t fleet_jitter_slot_for_sta_mac(uint32_t n, uint32_t *slot) { (void)n; *
 bool ota_update_in_progress(void) { return false; }
 int32_t timezone_utc_offset_seconds(int64_t utc) { (void)utc; return 0; }
 int64_t timezone_localize(int64_t utc) { return utc; }
+
+/* ── sd_diag device API over the REAL pure core (components/sd_card/sd_diag_core.c) ── */
+#include "sd_diag.h"
+static sd_diag_block_t g_sd_diag;
+static bool g_sd_diag_init;
+static void sd_diag_host_init(void)
+{
+    if (g_sd_diag_init) return;
+    g_sd_diag_init = true;
+    sd_diag_core_boot(&g_sd_diag, false);
+    sd_diag_core_merge_floor(&g_sd_diag, NULL);
+}
+void sd_diag_fault(sd_diag_writer_t w, sd_diag_op_t op, int err) { sd_diag_host_init(); sd_diag_core_fault(&g_sd_diag, w, op, err, 1); }
+void sd_diag_refusal(sd_diag_refusal_t r, int64_t id, int err, uint8_t blocked, uint8_t sd_state)
+{
+    sd_diag_host_init();
+    sd_diag_core_refusal(&g_sd_diag, r, id, err, blocked, sd_state, 0, 1);
+}
+void sd_diag_get(sd_diag_block_t *out) { sd_diag_host_init(); *out = g_sd_diag; }
+void sd_diag_persist(bool force) { (void)force; }

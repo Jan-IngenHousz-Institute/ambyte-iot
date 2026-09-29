@@ -88,6 +88,11 @@ Every command prints one line per result, with a `HIL_` prefix.
 | `keeper <pause\|run>` | Keeper pause for inventories. |
 | `sd_park` / `sd_unpark` | Calls the production power-guard park/unpark routine in `app_main`: sd_logger pause, unmount, `event_log_set_sd_parked`. |
 | `fault <point> <reset\|eio\|enospc> [nth]` | `reset` = `esp_rom_software_reset_system()`: no shutdown handlers, no coredump. |
+| `fault io <writer> <op> <mode> [nth] [count]` | 2026-09 write-integrity addition. Targets one SD writer (`evlog`, `sdlog`, `ambit_ota`, `ambit_flash` or `any`) and one file op (`open`, `write`, `read`, `flush`, `fsync`, `close`, `truncate`, `rename`, `remove`, `mkdir`, `stat` or `any`). `nth` counts only matching ops; `count` fires on that many consecutive matches. Modes: `eio`/`enospc` (op not performed); `short` (write only: half the bytes written and returned, errno EIO); `applied_eio` (rename/remove/fsync/close/truncate: op performed, then reported as EIO); `reset_before`/`reset_after`; `reset_mid_write` (half written, flushed and synced, then reset); `off`. Invalid op/mode pairs are refused with `HIL_ERR`. Each firing prints `HIL_FAULT fired kind=<injected_errno\|short_write\|applied_then_error\|cpu_reset> ...`. |
+| `fault last` | The last fired targeted fault, kept in RTC_NOINIT across the CPU reset it caused; `none` after power-on. |
+| `power_cut` | Always `HIL_ERR power_cut unsupported`: no verified switchable SD/board power rail exists. |
+
+Every reset mode is a **CPU reset** (`esp_rom_software_reset_system`). The SD card stays powered and its controller completes (or holds) its own internal program operation, so a reset is **never** evidence about electrical power loss. Output and `fault last` say so explicitly (`sd_power=not_interrupted`).
 | `reserve <bytes\|off>`, `cid <hex\|off>` | Overrides. |
 | `stacks` | `uxTaskGetStackHighWaterMark` for evq_keeper, sync_runner, mqtt_task, cli, sched and maint. |
 | `boot_slot <ota_0\|ota_1>` | `esp_ota_set_boot_partition`. |
@@ -159,7 +164,7 @@ The running 2.3.3-rc.1 cannot list or hash SD files; its CLI set was verified at
 | `event_log` | `/sdcard/events`, `/sdcard/evq`, `/sdcard/archive` | keeper, claim | **Yes** (only writer of record directories) |
 | `sd_logger` | `/sdcard/logs/*` | from `sd_logger_init` | No. Logs are excluded by name, and their FAT writes cannot change record-file bytes, which S1 == S2 and the final diff would show. |
 | `ambit_flash` | `mkdir /sdcard/ambit_fw[/ver]` | only when a download or flash is needed; the AMBITs are above target | No. Not a record path; a flash attempt is a STOP condition. |
-| `ambit_ota` | `/sdcard/ambit_fw.bin` | only on an MQTT `ambit_ota` command; none is sent | No. Not a record path. |
+| `ambit_ota` | `/sdcard/ambit_fw.stg-<k>.bin` (since the 2026-09 write-integrity change; the legacy `/sdcard/ambit_fw.bin` is never written, renamed or removed) | only on an MQTT `ambit_ota` command; none is sent | No. Not a record path. |
 | `sd_card` mount | FAT volume | `format_if_mount_failed=false` | n/a |
 
 Read-only SD users: `evlog_inventory`, `evlog_replay` (reads the archive, only on command), `command_router` archive scan. The littlefs mount (`format_if_mount_failed=true`) is pre-existing production behaviour: a littlefs mount failure on the new image is a STOP (W-4).

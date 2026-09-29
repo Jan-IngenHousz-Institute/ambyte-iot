@@ -227,9 +227,15 @@ class Device:
 
     armed: str | None = None     # fault spec kept armed across phases until it fires
 
-    def fault_fired(self) -> bool:
+    def fault_fired(self, name: str | None = None) -> bool:
+        """Every armed spec fired (or, with `name`, that point's spec). A spec
+        list "a:1:m,b:1:m" stays armed until all of them fired."""
         p = self.state / ".shim" / "fault_fired"
-        return p.exists() and self.armed is not None and self.armed.split(":")[0] in p.read_text()
+        if not p.exists() or self.armed is None:
+            return False
+        fired = {ln.split(":")[0] for ln in p.read_text().split()}
+        want = [sp.split(":")[0] for sp in self.armed.split(",")]
+        return name in fired if name is not None else all(w in fired for w in want)
 
     def run(self, lines: list[str], fault: str | None = None, exe: Path | None = None,
             max_phases: int = 200) -> dict:
@@ -683,3 +689,415 @@ def check_arch_inv(dev: Device) -> dict:
     if lost:
         raise OracleFailure(f"ARCH-INV: spooled segment(s) {lost[:10]} retired without any verified SD copy left")
     return {"checked": len(want)}
+
+
+# ── C-19: state-aware last-good-copy and order oracle (+ C-18 cursor rule) ──
+_IDX_MAIN = "evstore/evq.idx"
+_FLASH_EV = re.compile(r"^evstore/events/ev-(\d+)\.log$")
+_ARC = re.compile(r"^sdcard/archive/arc-(\d+)(?:-\d+)?\.log$")
+
+
+def _idx_fields(line: str) -> list[str] | None:
+    m = re.match(r"^(.*) \*([0-9a-f]{8})$", line)
+    if not m or (zlib.crc32(m.group(1).encode("latin-1")) & 0xFFFFFFFF) != int(m.group(2), 16):
+        return None
+    return m.group(1).split(" ")
+
+
+def _idx_apply(segs: dict, f: list[str]) -> None:
+    """One CRC-valid index line onto a {seq: seg} map (documented format,
+    same semantics as parse_index)."""
+    k = f[0]
+    try:
+        if k == "S":
+            q = int(f[1])
+            segs[q] = {"seq": q, "first": int(f[2]), "last": int(f[3]), "state": "FLASH", "cid": None,
+                       "primary": "", "mirror": ""}
+        elif k == "P" and int(f[1]) in segs:
+            s = segs[int(f[1])]
+            s.update(state="SPOOLED", cid=f[2].lower(), primary=f[3], mirror=f[4])
+        elif k == "O" and int(f[1]) in segs:
+            segs[int(f[1])]["state"] = "SD_ONLY"
+        elif k == "D" and int(f[1]) in segs:
+            segs[int(f[1])]["state"] = "DELIVERED"
+        elif k == "R" and int(f[1]) in segs:
+            segs[int(f[1])]["state"] = "REIMPORT"
+        elif k == "A":
+            segs.pop(int(f[1]), None)
+    except (ValueError, IndexError):
+        pass
+
+
+def last_good_copy_oracle(state: Path) -> dict:
+    """C-19 over ops.jsonl + the index lines the shim logs (contract §5.3):
+
+      (a) bad-* and xlk-* names are never unlinked;
+      (b) a name that took part in a both_eio/ambiguous rename is never
+          unlinked while its twin exists (the shim logs every unlink of an SD
+          inode with other names as xlink_unlink, with the twins it found);
+      (c) until an accepted id is ACKed with a durable cursor past it (or its
+          segment is archived/retired: A line), at every trace position at
+          least one copy containing it exists and last verified good: its
+          flash segment, or an SD primary/mirror verified (P line) after its
+          last write. Evaluated at every event that loses a copy.
+      (d) a redundant committed name — a mirror after archive, a flash copy
+          after reclaim, a primary/mirror after re-import — is removed only
+          after its successor's verification op AND the durable index line
+          appear earlier in the trace.
+
+    Plus the C-18 cursor rule: a durable cursor commit never passes an
+    accepted id that was not PUBACKed. State-aware exclusions (reported):
+    ids of a segment that entered REIMPORT (the cursor moved without our ACK;
+    R-DUR covers them), and records not stored through this trace's
+    store_ok marks (fixtures, legacy imports). Positions are (seq, end
+    offset) from the store_ok marks; the cursor is the conservative
+    min(blob, legacy) of each NVS event."""
+    events = read_jsonl(state / ".shim" / "ops.jsonl")
+    viol: list[str] = []
+    cur_viol: list[str] = []
+    cnt = {"copy_loss_events": 0, "committed_removals": 0, "cursor_commits": 0, "xlink_unlink": 0,
+           "accepted_tracked": 0, "legacy_firmware_ops": 0, "import_handover": 0}
+    last_fp = {"name": ""}                  # last keeper fault point passed (stubs log them)
+    scope = {"on": True}                     # rules apply to ops of this repo's firmware only
+
+    def v(rule: str, i: int, msg: str) -> None:
+        if not scope["on"]:
+            return
+        if rule == "cursor":
+            cur_viol.append(f"C-18(cursor) @op{i}: {msg}")
+        else:
+            viol.append(f"C-19({rule}) @op{i}: {msg}")
+
+    r_seqs = set()
+    for e in events:
+        if e.get("op") == "idx":
+            f = _idx_fields(e.get("line", ""))
+            if f and f[0] == "R":
+                try:
+                    r_seqs.add(int(f[1]))
+                except (ValueError, IndexError):
+                    pass
+
+    cid = "c1d00001"
+    segs: dict[int, dict] = {}
+    idx_buf: dict[str, list] = {}
+    pending_idx: list = []                  # (seq, kind) appended to main, not yet synced
+    p_durable: dict[int, int] = {}          # seq -> op index where its P line became durable
+    d_durable: dict[int, int] = {}          # seq -> op index where DELIVERED became durable (D line or cursor)
+    r_pos: dict[int, int] = {}
+    last_flash_sync = -1
+    exists: set = set()                     # (medium_key, path) known to exist
+    gone: set = set()                       # known removed
+    verified: dict = {}                     # (cid, path) -> seq
+    lastw: dict = {}                        # (cid, path) -> op index of last write/rename-to
+    lastr: dict = {}                        # (cid, path) -> op index of last read-open
+    ids_by_seq: dict[int, list] = {}
+    pos: dict[int, tuple] = {}
+    acked: set = set()
+    covered: set = set()
+    handover: set = set()
+    cursor = (0, 0)
+
+    def key(path: str):
+        return ("flash", path) if path.startswith("evstore/") else (cid, path)
+
+    def present(k) -> bool:
+        return k in exists or k not in gone
+
+    def flash_has(seq: int) -> bool:
+        return present(("flash", f"evstore/events/ev-{seq:06d}.log"))
+
+    def good_copy(seq: int) -> bool:
+        if flash_has(seq):
+            return True
+        return any(sq == seq and present(k) for k, sq in verified.items())
+
+    def check_c(seq: int, i: int, what: str) -> None:
+        cnt["copy_loss_events"] += 1
+        if seq in handover:
+            return
+        owed = [x for x in ids_by_seq.get(seq, []) if x not in covered]
+        if owed and not good_copy(seq):
+            v("c", i, f"{what}: segment {seq} holds {len(owed)} accepted un-ACKed id(s) (e.g. {owed[:3]}) "
+                      f"and no verified copy is left")
+
+    def seq_of_verified(k):
+        return verified.get(k)
+
+    def committed_owner(path: str):
+        base = path.rsplit("/", 1)[-1]
+        for s in segs.values():
+            if s["cid"] is not None and s["cid"] != cid:
+                continue
+            if path.startswith("sdcard/events/") and s["primary"] == base:
+                return s, "primary"
+            if path.startswith("sdcard/evq/") and s["mirror"] == base:
+                return s, "mirror"
+        return None, None
+
+    def check_d_sd(path: str, i: int) -> None:
+        s, role = committed_owner(path)
+        if s is None:
+            return
+        cnt["committed_removals"] += 1
+        q = s["seq"]
+        if s["state"] == "REIMPORT":
+            if not (q in r_pos and last_flash_sync > r_pos[q]):
+                v("d", i, f"{role} {path} of seg {q} removed after re-import without a synced flash append after its R line")
+            return
+        if role == "primary":
+            v("d", i, f"committed primary {path} of seg {q} ({s['state']}) unlinked (only a rename into the archive or a re-import may retire it)")
+            return
+        if s["state"] in ("SPOOLED", "SD_ONLY") and not (q < cursor[0]):
+            v("d", i, f"mirror {path} of undelivered seg {q} ({s['state']}) unlinked")
+            return
+        arcs = [k for k in exists if k[0] == cid and (m := _ARC.match(k[1])) and int(m.group(1)) == s["first"]]
+        arc_ok = any(lastr.get(k, -1) > lastw.get(k, -1) for k in arcs)
+        if q not in d_durable:
+            v("d", i, f"mirror {path} of seg {q} removed before a durable DELIVERED index line/cursor")
+        elif not arc_ok:
+            v("d", i, f"mirror {path} of seg {q} removed before any verified archive copy (arc-{s['first']}*) was read back")
+
+    def check_d_flash(seq: int, i: int) -> None:
+        s = segs.get(seq)
+        if s is None or s["state"] != "SPOOLED":
+            return
+        cnt["committed_removals"] += 1
+        if seq not in p_durable:
+            v("d", i, f"flash ev-{seq:06d} reclaimed before its P line was durable")
+            return
+        c = s["cid"] or cid
+        for role, sub in (("primary", "events"), ("mirror", "evq")):
+            k = (c, f"sdcard/{sub}/{s[role]}")
+            if not (lastr.get(k, -1) > lastw.get(k, -1)):
+                v("d", i, f"flash ev-{seq:06d} reclaimed before its {role} {k[1]} was read back after its last write")
+
+    def sd_lost(k, i: int, what: str, imported: bool = False) -> None:
+        q = verified.pop(k, None)
+        if q is not None:
+            if imported:
+                # legacy import (e.g. after an index loss): every record of the
+                # file was appended to the flash tail and synced before this
+                # remove — the obligation moved to flash (R-DUR covers it)
+                handover.add(q)
+                cnt["import_handover"] += 1
+                return
+            check_c(q, i, what)
+
+    def remove_path(path: str, i: int, what: str) -> None:
+        k = key(path)
+        base = path.rsplit("/", 1)[-1]
+        if path.startswith("sdcard/") and base.startswith(("bad-", "xlk-")):
+            v("a", i, f"{path} unlinked ({what})")
+        if path.startswith("sdcard/"):
+            check_d_sd(path, i)
+        exists.discard(k)
+        gone.add(k)
+        if path.startswith("sdcard/"):
+            imported = what == "remove" and last_fp["name"] == "import.after_fsync_before_sd_remove"
+            last_fp["name"] = ""             # one import fault point covers exactly one remove
+            sd_lost(k, i, f"{what} {path}", imported)
+        else:
+            m = _FLASH_EV.match(path)
+            if m:
+                q = int(m.group(1))
+                check_d_flash(q, i)
+                check_c(q, i, f"{what} {path}")
+
+    def create(path: str, i: int) -> None:
+        k = key(path)
+        exists.add(k)
+        gone.discard(k)
+        lastw[k] = i
+
+    def rename(a: str, b: str, i: int, link: bool = False) -> None:
+        ka, kb = key(a), key(b)
+        create(b, i)
+        if link:
+            return
+        exists.discard(ka)
+        gone.add(ka)
+        q = verified.pop(ka, None)
+        if q is not None:
+            bb = b.rsplit("/", 1)[-1]
+            if (b.startswith("sdcard/events/") or (b.startswith("sdcard/evq/") and bb.startswith("m-"))):
+                verified[kb] = q               # the verified bytes keep being a queue copy
+            else:
+                check_c(q, i, f"rename {a} -> {b}")
+        m = _FLASH_EV.match(a)
+        if m:
+            check_c(int(m.group(1)), i, f"rename {a}")
+
+    def replay(lines: list) -> dict:
+        out: dict[int, dict] = {}
+        for ln in lines:
+            f = _idx_fields(ln)
+            if f:
+                _idx_apply(out, f)
+        return out
+
+    def cursor_passed(p: tuple) -> bool:
+        return p[0] < cursor[0] or (p[0] == cursor[0] and p[1] <= cursor[1])
+
+    order: list = []                         # ids sorted by position for the cursor rule
+    ptr = 0
+    for i, e in enumerate(events):
+        op = e.get("op")
+        if not scope["on"]:
+            cnt["legacy_firmware_ops"] += 1
+        if op == "fp":
+            last_fp["name"] = e.get("name", "")
+            continue
+        if op == "mark":
+            w = e.get("what", "")
+            if w.startswith("variant "):
+                # ops of an old-API released firmware (rollback/fixture phases:
+                # b3f9b8a, v2.2.3) are tracked for state but never judged
+                scope["on"] = not w.split(" ", 1)[1].startswith("legacy")
+            elif w.startswith("store_ok "):
+                parts = w.split(" ")
+                m = _FLASH_EV.match(parts[2]) if len(parts) >= 4 else None
+                if m and int(parts[3]) >= 0:
+                    rid, q = int(parts[1]), int(m.group(1))
+                    ids_by_seq.setdefault(q, []).append(rid)
+                    pos[rid] = (q, int(parts[3]))
+                    order.append(rid)
+                    cnt["accepted_tracked"] += 1
+                    if q in handover:
+                        pass
+            elif w.startswith("puback "):
+                rid = int(w.split(" ")[1])
+                acked.add(rid)
+                if rid in pos and cursor_passed(pos[rid]):
+                    covered.add(rid)
+            elif w.startswith("sdcmd "):
+                m = re.search(r"cid=([0-9a-f]{8})", w)
+                if m:
+                    cid = m.group(1)
+        elif op == "nvs":
+            cands = [tuple(e[k]) for k in ("blob", "legacy") if e.get(k) and e[k][0] >= 0]
+            cursor = min(cands) if cands else (0, 0)
+            if e.get("kind") == "commit":
+                cnt["cursor_commits"] += 1
+                # store order == position order (the tail only grows or
+                # rotates forward), so each id is examined once, when the
+                # durable cursor first passes it
+                while ptr < len(order) and cursor_passed(pos[order[ptr]]):
+                    rid = order[ptr]
+                    ptr += 1
+                    p = pos[rid]
+                    if rid in acked:
+                        covered.add(rid)
+                    elif p[0] not in r_seqs and p[0] not in handover:
+                        v("cursor", i, f"durable cursor {cursor} passed accepted id {rid} at {p} before its PUBACK")
+                for q in list(segs):
+                    if q < cursor[0] and q not in d_durable:
+                        d_durable[q] = i
+        elif op == "idx":
+            path = e.get("path", "")
+            line = e.get("line", "")
+            if e.get("load"):
+                continue                         # handled with its idx_load header below
+            if path != _IDX_MAIN:
+                idx_buf.setdefault(path, []).append(line)
+                continue
+            f = _idx_fields(line)
+            if not f:
+                continue
+            k = f[0]
+            try:
+                q = int(f[1]) if k in "SPODRA" and len(f) > 1 else None
+            except ValueError:
+                q = None
+            if k == "S" and q is not None and q in segs and segs[q]["primary"]:
+                old = segs[q]
+                for role, sub in (("primary", "events"), ("mirror", "evq")):
+                    verified.pop(((old["cid"] or cid), f"sdcard/{sub}/{old[role]}"), None)
+            _idx_apply(segs, f)
+            if k == "P" and q is not None and q in segs:
+                s = segs[q]
+                for role, sub in (("primary", "events"), ("mirror", "evq")):
+                    verified[(s["cid"], f"sdcard/{sub}/{s[role]}")] = q
+            if k == "R" and q is not None:
+                r_pos[q] = i
+                handover.add(q)
+            if k == "A" and q is not None:
+                covered.update(ids_by_seq.get(q, []))
+            if q is not None:
+                pending_idx.append((q, k))
+        elif op == "idx_load":
+            lines = []
+            j = i + 1
+            while j < len(events) and events[j].get("op") == "idx" and events[j].get("load"):
+                lines.append(events[j].get("line", ""))
+                j += 1
+            segs = replay(lines)
+            for s in segs.values():
+                if s["state"] == "SPOOLED":
+                    p_durable.setdefault(s["seq"], i)
+                if s["state"] in ("DELIVERED",):
+                    d_durable.setdefault(s["seq"], i)
+                if s["state"] == "REIMPORT":
+                    r_pos.setdefault(s["seq"], i)
+                    handover.add(s["seq"])
+            pending_idx.clear()
+        elif op == "sync":
+            path = e.get("path", "")
+            if path == _IDX_MAIN:
+                for q, k in pending_idx:
+                    if k == "P":
+                        p_durable[q] = i
+                    elif k == "D":
+                        d_durable.setdefault(q, i)
+                pending_idx.clear()
+            elif path.startswith("evstore/events/"):
+                last_flash_sync = i
+        elif op == "open_w":
+            path = e.get("path", "")
+            if "fail" in e:
+                continue
+            k = key(path)
+            create(path, i)
+            if path.startswith("sdcard/"):
+                sd_lost(k, i, f"rewrite of {path}")
+        elif op == "open_r":
+            if "fail" not in e:
+                lastr[key(e.get("path", ""))] = i
+        elif op == "rename":
+            if "fail" in e:
+                continue
+            a, b = e.get("from", ""), e.get("to", "")
+            if a == "" or b == "":
+                continue
+            if b == _IDX_MAIN and a in idx_buf:
+                segs = replay(idx_buf.pop(a))
+                for s in segs.values():
+                    if s["state"] == "SPOOLED":
+                        p_durable.setdefault(s["seq"], i)
+                pending_idx.clear()
+            rename(a, b, i)
+        elif op == "rename_inside":
+            a, b = e.get("from", ""), e.get("to", "")
+            if e.get("outcome") == "applied":
+                rename(a, b, i)
+            elif e.get("outcome") == "both":
+                rename(a, b, i, link=True)
+        elif op == "rename_both_eio":
+            rename(e.get("from", ""), e.get("to", ""), i, link=True)
+        elif op == "remove":
+            if "fail" not in e:
+                remove_path(e.get("path", ""), i, "remove")
+        elif op == "remove_inside":
+            if e.get("outcome") == "applied":
+                remove_path(e.get("path", ""), i, "remove(crash inside)")
+        elif op == "xlink_unlink":
+            cnt["xlink_unlink"] += 1
+            twins = e.get("twins") or []
+            if twins:
+                v("b", i, f"{e.get('path')} unlinked while its twin name(s) {twins} share the chain "
+                          f"(FAT: the survivor's clusters are freed; modelled zero-fill of {e.get('zeroed')} B)")
+            for t in twins:
+                sd_lost(key(t), i, f"zero-fill of twin {t}")
+    return {"violations": viol[:40], "n_violations": len(viol), "counts": cnt,
+            "c18_cursor_violations": cur_viol[:40], "n_c18_cursor": len(cur_viol),
+            "handover_seqs": sorted(handover)[:40], "rules": "C-19 a-d + C-18 cursor (tests/evq_host/evq_lib.py)"}

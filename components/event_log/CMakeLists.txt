@@ -2,7 +2,7 @@ set(event_log_srcs "event_log.c" "evlog_inventory.c" "evq_index.c" "evq_render.c
 # On-device verification build only (CONFIG_AMBYTE_EVQ_HIL, env evq-hil): the
 # I/O trace/fault wrapper. The release image never compiles these files.
 if(CONFIG_AMBYTE_EVQ_HIL)
-    list(APPEND event_log_srcs "evq_hil_io.c" "evq_hil_trace.c")
+    list(APPEND event_log_srcs "evq_hil_io.c" "evq_hil_trace.c" "evq_hil_sdl.c")
 endif()
 
 idf_component_register(

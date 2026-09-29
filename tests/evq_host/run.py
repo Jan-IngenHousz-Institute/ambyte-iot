@@ -3,8 +3,12 @@
 
   run.py --list-faults                 registered fault points (from the production sources)
   run.py --only A2,B1 --seeds 1,7      run named contract scenarios
+  run.py --groups X --seeds 1,7,1337  Sprint-1 SD write-integrity group (X1..X10)
   run.py --matrix --seeds 1,7,1337 [--coverage-report]
                                        D matrix: every point x {crash,eio,enospc} x nth {1,2,last}
+
+An unknown --groups name or --only scenario is an error (exit 2): a typo can
+never silently run zero scenarios.
 
 Evidence goes to $EVQ_OUT (per scenario/seed); scratch to $EVQ_TMPDIR.
 Exit status is non-zero if any run fails or (with --coverage-report) any
@@ -34,6 +38,7 @@ GROUPS = {
     "G": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"],
     "H": ["H1", "H2", "H3", "H4", "H5", "H6"], "Q": ["Q1", "Q2", "Q3"],
     "HIL": ["HOLD1"],
+    "X": ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10"],
 }
 MODES = ["crash", "eio", "enospc"]
 
@@ -135,18 +140,34 @@ def main() -> int:
     ap.add_argument("--coverage-report", action="store_true")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     a = ap.parse_args()
-    seeds = [int(x) for x in a.seeds.split(",") if x]
+    try:
+        seeds = [int(x) for x in a.seeds.split(",") if x]
+    except ValueError:
+        ap.error(f"--seeds must be comma-separated integers, got {a.seeds!r}")
+    if not seeds:
+        ap.error("--seeds is empty")
     if a.list_faults:
         for p in evq_lib.registered_fault_points():
             print(p)
         return 0
     if a.matrix:
         return run_matrix(seeds, a.jobs, a.coverage_report)
+    known = {n for g in GROUPS.values() for n in g}
     names = [n for n in a.only.split(",") if n]
-    for g in [g for g in a.groups.split(",") if g]:
+    bad = [n for n in names if n not in known]
+    if bad:
+        ap.error(f"unknown scenario(s) {bad}; known: {sorted(known)}")
+    groups = [g for g in a.groups.split(",") if g]
+    badg = [g for g in groups if g not in GROUPS]
+    if badg:
+        ap.error(f"unknown group(s) {badg}; known: {sorted(GROUPS)}")
+    for g in groups:
         names += GROUPS[g]
+    if (a.only or a.groups) and not names:
+        ap.error("no scenarios selected")
     if not names:
         names = [n for g in GROUPS.values() for n in g]
+    names = list(dict.fromkeys(names))
     _prebuild()
     tasks = [(n, s) for n in names for s in seeds]
     fails = 0

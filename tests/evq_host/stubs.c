@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "sd_card.h"
+#include "sd_diag.h"
 
 #include "evq_host.h"
 
@@ -122,6 +123,30 @@ static nvs_ent_t s_nvs_pend[NVS_MAX];   /* working copy (sets land here) */
 static bool s_nvs_loaded = false;
 static char s_nvs_ns[8][16];
 
+/* The event_log cursor as committed (or as found at boot), for the C-18/C-19
+ * trace oracle: blob `evlog/cur` {seq, off, crc} and legacy rd_seq/rd_off. */
+static void nvs_note_cursor(const char *kind)
+{
+    long long bs = -1, bo = -1, ls = -1, lo = -1;
+    for (int i = 0; i < NVS_MAX; i++) {
+        const nvs_ent_t *e = &s_nvs[i];
+        if (!e->used || strcmp(e->ns, "evlog") != 0) continue;
+        uint32_t a = 0, b = 0;
+        if (strcmp(e->key, "cur") == 0 && e->len == 12) {
+            memcpy(&a, e->val, 4); memcpy(&b, e->val + 4, 4);
+            bs = a; bo = b;
+        } else if (strcmp(e->key, "rd_seq") == 0 && e->len == 4) {
+            memcpy(&a, e->val, 4); ls = a;
+        } else if (strcmp(e->key, "rd_off") == 0 && e->len == 4) {
+            memcpy(&a, e->val, 4); lo = a;
+        }
+    }
+    char buf[200];
+    snprintf(buf, sizeof buf, "{\"op\":\"nvs\",\"kind\":\"%s\",\"blob\":[%lld,%lld],\"legacy\":[%lld,%lld]}",
+             kind, bs, bo, ls, lo < 0 && ls >= 0 ? 0 : lo);
+    shim_note(buf);
+}
+
 static void nvs_load(void)
 {
     if (s_nvs_loaded) return;
@@ -143,6 +168,7 @@ static void nvs_load(void)
         fclose(f);
     }
     memcpy(s_nvs_pend, s_nvs, sizeof s_nvs);
+    nvs_note_cursor("load");
 }
 
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
@@ -222,7 +248,9 @@ esp_err_t nvs_commit(nvs_handle_t h)
     fflush(f);
     fsync(fileno(f));
     fclose(f);
-    return rename("nvs.txt.tmp", "nvs.txt") == 0 ? ESP_OK : ESP_FAIL;
+    esp_err_t rc = rename("nvs.txt.tmp", "nvs.txt") == 0 ? ESP_OK : ESP_FAIL;
+    if (rc == ESP_OK) nvs_note_cursor("commit");
+    return rc;
 }
 
 /* ── sd_card ─────────────────────────────────────────────────────────────── */
@@ -282,10 +310,17 @@ void sdcard_report_io_ok(void) {}
 bool sdcard_io_lost(void) { return s_sd_lost; }
 
 /* ── fault hook ──────────────────────────────────────────────────────────── */
-static char     s_fault_name[96];
-static unsigned s_fault_nth = 0;
-static char     s_fault_mode[16];
-static unsigned s_fault_hits = 0;
+/* EVQ_FAULT = "<point>:<nth>:<mode>[,<point>:<nth>:<mode>...]" (≤ 4 specs).
+ * One spec behaves exactly as before; several let one run arm faults at
+ * different points (e.g. the commit rename AND the pair-retirement rename that
+ * follows it). Hits per spec accumulate across boots in .shim/fault_hits, one
+ * line per spec in spec order (a single spec keeps the old one-number file). */
+#define FAULT_SPECS 4
+static char     s_fault_name[FAULT_SPECS][96];
+static unsigned s_fault_nth[FAULT_SPECS];
+static char     s_fault_mode[FAULT_SPECS][16];
+static unsigned s_fault_hits[FAULT_SPECS];
+static int      s_fault_n = 0;
 static bool     s_fault_parsed = false;
 
 static void fault_parse(void)
@@ -294,13 +329,19 @@ static void fault_parse(void)
     s_fault_parsed = true;
     const char *e = getenv("EVQ_FAULT");
     if (e == NULL || *e == '\0') return;
-    char buf[160];
+    char buf[400];
     snprintf(buf, sizeof buf, "%s", e);
-    char *a = strtok(buf, ":"), *b = strtok(NULL, ":"), *c = strtok(NULL, ":");
-    if (a && b && c) {
-        snprintf(s_fault_name, sizeof s_fault_name, "%s", a);
-        s_fault_nth = (unsigned)atoi(b);
-        snprintf(s_fault_mode, sizeof s_fault_mode, "%s", c);
+    char *save = NULL;
+    for (char *spec = strtok_r(buf, ",", &save); spec != NULL && s_fault_n < FAULT_SPECS;
+         spec = strtok_r(NULL, ",", &save)) {
+        char *s2 = NULL;
+        char *a = strtok_r(spec, ":", &s2), *b = strtok_r(NULL, ":", &s2), *c = strtok_r(NULL, ":", &s2);
+        if (a && b && c) {
+            snprintf(s_fault_name[s_fault_n], sizeof s_fault_name[0], "%s", a);
+            s_fault_nth[s_fault_n] = (unsigned)atoi(b);
+            snprintf(s_fault_mode[s_fault_n], sizeof s_fault_mode[0], "%s", c);
+            s_fault_n++;
+        }
     }
 }
 
@@ -320,6 +361,20 @@ static void fault_counts_dump(void)
 void evq_fault_point(const char *name)
 {
     fault_parse();
+    /* Keeper-side points go into the ops trace (C-19 context: e.g. an SD
+     * remove right after import.after_fsync_before_sd_remove is a legacy
+     * import handing its records to flash). Store/ACK points are hot and
+     * carry no such meaning: not logged. */
+    static const char *const ctx[] = { "import.", "reimport.", "reclaim.", "archive.", "boot.", "quarantine.", "compact.",
+                                       "retire." };
+    for (size_t i = 0; i < sizeof ctx / sizeof ctx[0]; i++) {
+        if (strncmp(name, ctx[i], strlen(ctx[i])) == 0) {
+            char buf[160];
+            snprintf(buf, sizeof buf, "{\"op\":\"fp\",\"name\":\"%s\"}", name);
+            shim_note(buf);
+            break;
+        }
+    }
     if (!s_cnt_hooked) { s_cnt_hooked = true; atexit(fault_counts_dump); }
     {
         int i;
@@ -337,32 +392,115 @@ void evq_fault_point(const char *name)
         FILE *f = fopen(".shim/faults_reached", "a");
         if (f) { fprintf(f, "%s\n", name); fclose(f); }
     }
-    if (s_fault_name[0] == '\0' || strcmp(name, s_fault_name) != 0) return;
-    /* hits of the ARMED point accumulate across boots (the harness keeps it
+    int fi = -1;
+    for (int i = 0; i < s_fault_n; i++) if (strcmp(name, s_fault_name[i]) == 0) { fi = i; break; }
+    if (fi < 0) return;
+    /* hits of an ARMED point accumulate across boots (the harness keeps it
      * armed until it fires), so nth counts the same way as the dry run */
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
         FILE *hf = fopen(".shim/fault_hits", "r");
-        if (hf) { if (fscanf(hf, "%u", &s_fault_hits) != 1) s_fault_hits = 0; fclose(hf); }
+        if (hf) {
+            for (int i = 0; i < s_fault_n; i++) if (fscanf(hf, "%u", &s_fault_hits[i]) != 1) s_fault_hits[i] = 0;
+            fclose(hf);
+        }
     }
-    ++s_fault_hits;
+    ++s_fault_hits[fi];
     FILE *hf = fopen(".shim/fault_hits", "w");
-    if (hf) { fprintf(hf, "%u\n", s_fault_hits); fclose(hf); }
-    if (s_fault_hits != s_fault_nth) return;
+    if (hf) { for (int i = 0; i < s_fault_n; i++) fprintf(hf, "%u\n", s_fault_hits[i]); fclose(hf); }
+    if (s_fault_hits[fi] != s_fault_nth[fi]) return;
+    const char *mode = s_fault_mode[fi];
     FILE *f = fopen(".shim/fault_fired", "a");
-    if (f) { fprintf(f, "%s:%u:%s\n", name, s_fault_nth, s_fault_mode); fclose(f); }
-    if (strcmp(s_fault_mode, "crash") == 0) {
+    if (f) { fprintf(f, "%s:%u:%s\n", name, s_fault_nth[fi], mode); fclose(f); }
+    {
+        char buf[200];
+        snprintf(buf, sizeof buf, "{\"op\":\"fault_fired\",\"name\":\"%s\",\"mode\":\"%s\"}", name, mode);
+        shim_note(buf);
+    }
+    if (strcmp(mode, "crash") == 0) {
         if (strstr(name, "inside") != NULL) { shim_arm_crash_inside(); return; }
         shim_mark("fault-crash");
         evq_host_flush_manifests();
         _exit(86);
-    } else if (strcmp(s_fault_mode, "remove") == 0) {
+    } else if (strcmp(mode, "crash_both") == 0) {
+        /* crash INSIDE the next rename with the FAT "both names" outcome forced */
+        shim_arm_crash_inside_outcome(2);
+    } else if (strcmp(mode, "remove") == 0) {
         /* card pulled at this exact point (no crash) */
         evq_sd_stub_set(false, evq_sd_stub_cid());
-    } else if (strcmp(s_fault_mode, "eio") == 0) {
+    } else if (strcmp(mode, "eio") == 0) {
         shim_arm_errno(EIO);
-    } else if (strcmp(s_fault_mode, "enospc") == 0) {
+    } else if (strcmp(mode, "eio2") == 0) {
+        shim_arm_errno_n(EIO, 2);      /* the next TWO media ops fail (e.g. a rename and its restore) */
+    } else if (strcmp(mode, "enospc") == 0) {
         shim_arm_errno(ENOSPC);
+    } else if (shim_arm_special(mode) != 0) {
+        fprintf(stderr, "FATAL: unknown fault mode %s\n", mode);
+        abort();
     }
+}
+
+/* ── sd_diag (device API over the pure core, sd_diag_core.c) ─────────────────
+ * event_log.c calls sd_diag_fault/sd_diag_refusal (HEAD only; baselines never
+ * do). The block is kept in .shim/sd_diag.bin, written through on every change:
+ * that models the RTC_NOINIT block surviving the harness's reboots (a CPU
+ * reset keeps counting, diag_exact=1). The simulated power-loss transform is a
+ * media durability model only; it does not model an RTC wipe. Never SD I/O. */
+static sd_diag_block_t s_diag;
+static bool s_diag_loaded = false;
+
+static void diag_load(void)
+{
+    if (s_diag_loaded) return;
+    s_diag_loaded = true;
+    FILE *f = fopen(".shim/sd_diag.bin", "rb");
+    bool have = false;
+    if (f != NULL) { have = fread(&s_diag, 1, sizeof s_diag, f) == sizeof s_diag; fclose(f); }
+    if (have && sd_diag_valid(&s_diag)) {
+        sd_diag_core_boot(&s_diag, true);
+    } else {
+        memset(&s_diag, 0, sizeof s_diag);
+        sd_diag_core_boot(&s_diag, false);
+        sd_diag_core_merge_floor(&s_diag, NULL);            /* no floor: epoch 1, inexact */
+    }
+}
+
+static void diag_save(void)
+{
+    mkdir(".shim", 0777);
+    FILE *f = fopen(".shim/sd_diag.bin.tmp", "wb");
+    if (f == NULL) return;
+    (void)fwrite(&s_diag, 1, sizeof s_diag, f);
+    fclose(f);
+    rename(".shim/sd_diag.bin.tmp", ".shim/sd_diag.bin");
+}
+
+void sd_diag_fault(sd_diag_writer_t w, sd_diag_op_t op, int err)
+{
+    diag_load();
+    uint64_t sd0 = shim_sd_ops();
+    sd_diag_core_fault(&s_diag, w, op, err, evq_clock_now());
+    diag_save();
+    if (shim_sd_ops() != sd0) { fprintf(stderr, "FATAL: sd_diag performed SD I/O\n"); abort(); }   /* C-31 */
+    char buf[160];
+    snprintf(buf, sizeof buf, "{\"op\":\"diag_fault\",\"w\":\"%s\",\"dop\":\"%s\",\"errno\":%d}",
+             sd_diag_writer_name((unsigned)w), sd_diag_op_name((unsigned)op), err);
+    shim_note(buf);
+}
+
+void sd_diag_refusal(sd_diag_refusal_t reason, int64_t id, int err, uint8_t blocked, uint8_t sd_state)
+{
+    diag_load();
+    uint64_t sd0 = shim_sd_ops();
+    sd_diag_core_refusal(&s_diag, reason, id, err, blocked, sd_state, 1758000000000LL + (int64_t)evq_clock_now(),
+                         evq_clock_now());
+    diag_save();
+    if (shim_sd_ops() != sd0) { fprintf(stderr, "FATAL: sd_diag performed SD I/O\n"); abort(); }   /* C-31 */
+}
+
+int evq_sd_diag_render(char *buf, size_t cap)
+{
+    diag_load();
+    return sd_diag_render_json(&s_diag, buf, cap);
 }

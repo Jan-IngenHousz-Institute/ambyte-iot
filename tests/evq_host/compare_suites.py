@@ -3,10 +3,13 @@
 
   compare_suites.py base-collect.txt branch-collect.txt base.xml branch.xml
 
-Fails if (1) the pre-existing test-id collections differ (ids from test files
-the branch ADDS, tests/test_evq_*, are excluded from the branch side), (2) any
-branch failure/error id is not also a failure/error on baseline, or (3) any
-pre-existing id is missing from the branch run.
+Fails if (1) any test id collected on the baseline is not collected on the
+branch, (2) any branch failure/error id is not also a failure/error on the
+baseline, or (3) any id the baseline ran is missing from the branch run.
+Ids the branch ADDS (new files or new tests) are reported, never excluded
+from the failure check. (It used to exclude every tests/test_evq_* id: right
+for the PR that added those files, wrong ever after - pre-existing test_evq_*
+ids then looked "missing" and their failures were ignored.)
 """
 from __future__ import annotations
 
@@ -41,18 +44,26 @@ def outcomes(p: str) -> tuple[set[str], set[str]]:
 
 
 def main() -> int:
+    if len(sys.argv) != 5:
+        print(__doc__, file=sys.stderr)
+        return 2
     bc, rc, bx, rx = sys.argv[1:5]
     base_ids = collected(bc)
-    branch_ids = {i for i in collected(rc) if not i.startswith("tests.test_evq_")}
+    branch_ids = collected(rc)
     rc_ = 0
-    if base_ids != branch_ids:
-        print(f"collection differs: only-base={sorted(base_ids - branch_ids)[:10]} only-branch={sorted(branch_ids - base_ids)[:10]}")
+    gone = sorted(base_ids - branch_ids)
+    added = sorted(branch_ids - base_ids)
+    print(f"collected: baseline {len(base_ids)}, branch {len(branch_ids)} ({len(added)} added)")
+    if not base_ids:
+        print("baseline collection is empty")
+        rc_ = 1
+    if gone:
+        print(f"pre-existing ids no longer collected on branch: {gone[:20]}")
         rc_ = 1
     base_ran, base_bad = outcomes(bx)
     br_ran, br_bad = outcomes(rx)
-    br_bad = {i for i in br_bad if "test_evq_" not in i}
     new_bad = sorted(br_bad - base_bad)
-    missing = sorted(i for i in base_ran if i not in br_ran and "test_evq_" not in i)
+    missing = sorted(base_ran - br_ran)
     print(f"baseline: {len(base_ran)} ran, {len(base_bad)} failed/errored; branch: {len(br_ran)} ran, {len(br_bad)} failed/errored")
     if new_bad:
         print(f"NEW failures on branch: {new_bad[:20]}")

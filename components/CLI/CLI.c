@@ -47,6 +47,7 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
+#include "sd_diag.h"
 #include "wifi_manager.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
@@ -359,6 +360,9 @@ static int cli_cmd_log_status(int argc, char **argv)
     printf(" - file: /sdcard/logs/ambyte.log (%u bytes)\r\n", (unsigned)file_bytes);
     printf(" - buffered: %u bytes, dropped: %u bytes\r\n",
            (unsigned)buffered, (unsigned)dropped);
+    /* Byte accounting + per-op errors: the same JSON the heartbeat carries. */
+    char acct[384];
+    if (sd_logger_render_json(acct, sizeof acct) > 0) printf(" - acct: %s\r\n", acct);
     return 0;
 }
 
@@ -1295,6 +1299,16 @@ static int cli_cmd_evlog(int argc, char **argv)
     }
     printf("%s", text);
     printf("  cursor_off=%u\r\n", (unsigned)rd_off);
+    /* Retained SD-fault / refusal attribution (RTC + NVS, never the SD):
+     * exact=false means a power-on broke continuity and the counts are a floor. */
+    /* Transient heap, not a static: a worst-case render is ~1.6 KiB and the
+     * command is rare (no resident DRAM cost). */
+    char *diag = malloc(2048);
+    sd_diag_block_t db;
+    sd_diag_get(&db);
+    if (diag != NULL && sd_diag_render_json(&db, diag, 2048) >= 0) printf("  sd_diag=%s\r\n", diag);
+    else printf("  sd_diag=unavailable\r\n");
+    free(diag);
     return 0;
 }
 

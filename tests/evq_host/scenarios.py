@@ -16,9 +16,9 @@ from pathlib import Path
 
 import build
 from evq_lib import (Device, HarnessError, OracleFailure, assert_e2e, check_arch_inv, check_durability, cursor_from_nvs,
-                     iter_records, line_sha, load_manifests, media_hashes, nvs_read, nvs_write, parse_index,
-                     quarantined_ids, read_jsonl, reconcile, record_id, registered_fault_points, scratch_root,
-                     sha256_file, write_evidence)
+                     iter_records, last_good_copy_oracle, line_sha, load_manifests, media_hashes, nvs_read, nvs_write,
+                     parse_index, quarantined_ids, read_jsonl, reconcile, record_id, registered_fault_points,
+                     scratch_root, sha256_file, write_evidence)
 
 MiB = 1024 * 1024
 ESP_ERR_NO_MEM = 0x101
@@ -50,6 +50,10 @@ def exe(kind: str = "head", tuning: dict | None = None) -> Path:
                 tmp = f"{name}_p{os.getpid()}"
                 if kind == "head":
                     built = build.build_head(build_root(), tuning, name=tmp)
+                elif kind.startswith("rev:"):
+                    # full baseline of an indexed-store revision (red/green)
+                    built, info = build.build_rev_full(kind[4:], build_root(), name=tmp, tuning=tuning)
+                    (build_root() / (name + ".rewrite.json")).write_text(json.dumps(info, indent=1))
                 else:
                     built, info = build.build_baseline(kind, build_root(), name=tmp)
                     (build_root() / (name + ".rewrite.json")).write_text(json.dumps(info, indent=1))
@@ -137,11 +141,42 @@ def run_ok(dev: Device, lines: list[str], fault: str | None = None, exe_path=Non
     dev.run(lines, fault=fault, exe=exe_path)
 
 
+def c19_mode() -> str:
+    """EVQ_C19=assert (default) fails a run on any C-19/C-18-cursor violation;
+    EVQ_C19=record only records it in reconcile.json["c19"] (explicit opt-out
+    for regression runs that must not be blocked by a known finding)."""
+    m = os.environ.get("EVQ_C19", "assert")
+    if m not in ("assert", "record"):
+        raise HarnessError(f"EVQ_C19={m!r}: expected 'assert' or 'record'")
+    return m
+
+
+def _last_good_copy_oracle(dev: Device) -> dict:
+    """C-19 (a)-(d) + the C-18 cursor rule over this device's ops.jsonl and
+    index lines (implementation: evq_lib.last_good_copy_oracle)."""
+    return last_good_copy_oracle(dev.state)
+
+
+def apply_c19(dev: Device, rec: dict) -> list[str]:
+    """Run the C-19 oracle, record it in `rec`, return the violations."""
+    r = _last_good_copy_oracle(dev)
+    r["mode"] = c19_mode()
+    rec["c19"] = r
+    return r["violations"] if r["n_violations"] else []
+
+
+def raise_c19(rec: dict) -> None:
+    c = rec.get("c19") or {}
+    if c.get("n_violations") and c.get("mode", "assert") == "assert":
+        raise OracleFailure(f"C-19: {c['n_violations']} violation(s): " + " | ".join(c["violations"][:6]))
+
+
 def e2e(dev: Device, extra: dict | None = None, media_before=None, allow_missing=None, dup_bound=None) -> dict:
     dev.run(["drain_all", "service 2", "health final", "checkpoint final"])
     rec = reconcile(dev)
     if extra:
         rec.update(extra)
+    apply_c19(dev, rec)
     try:
         rec["arch_inv"] = check_arch_inv(dev)
     except OracleFailure as e:
@@ -152,6 +187,7 @@ def e2e(dev: Device, extra: dict | None = None, media_before=None, allow_missing
     assert_e2e(rec, allow_missing)
     if dup_bound is not None and rec["duplicate_count"] > dup_bound:
         raise OracleFailure(f"duplicates {rec['duplicate_count']} exceed bound {dup_bound}")
+    raise_c19(rec)
     return rec
 
 
@@ -466,8 +502,10 @@ def C1(seed: int, keep: bool = False):
         return dev, info
     rec = reconcile(dev)
     rec.update(info)
+    apply_c19(dev, rec)
     write_evidence(dev, rec)
     assert_e2e(rec, allow_missing=set(rec["missing_ids"]))  # delivery never ran: only integrity here
+    raise_c19(rec)
     finish(dev)
     return rec
 
@@ -1220,7 +1258,10 @@ def G7(seed: int) -> dict:
     nvs1 = (dev.state / "nvs.txt").read_bytes() if (dev.state / "nvs.txt").exists() else b""
     assert nvs0 == nvs1
     rec = {"scenario": "G7", "seed": seed, "codes": codes, "sd_state": h["sd_state"]}
-    write_evidence(dev, {**reconcile(dev), **rec})
+    full = {**reconcile(dev), **rec}
+    apply_c19(dev, full)
+    write_evidence(dev, full)
+    raise_c19(full)
     finish(dev)
     return rec
 
@@ -1557,6 +1598,767 @@ def Q3(seed: int) -> dict:
     return rec
 
 
+# ═══ X. SD write integrity (Sprint 1: contract §5.3 C-13..C-20, §5.8 C-50..C-52) ═
+# Every X scenario takes `kind` ("head" = working tree, "rev:<sha>" = the full
+# baseline build of an indexed-store revision) and `strict`. strict (default
+# for head) raises on any oracle or GREEN-signature failure; non-strict
+# returns the record with its signature, oracle errors and GREEN errors so
+# red_green.py can judge a baseline as RED. Each run: fault phase → signature
+# snapshot → simulated reboot (C-20) → recovery + E2E → C-18/C-19 + diag.
+ESP_FAIL = -1
+ESP_ERR_INVALID_SIZE = 0x104
+ESP_ERR_NOT_SUPPORTED = 0x106
+ESP_ERR_TIMEOUT = 0x107
+REFUSAL_REASON = {ESP_ERR_NO_MEM: "full", ESP_FAIL: "media", ESP_ERR_INVALID_SIZE: "too_large",
+                  ESP_ERR_NOT_SUPPORTED: "unavailable", ESP_ERR_TIMEOUT: "unavailable"}
+SIMULATED_REBOOT = ("SIMULATED power loss: harness restart + host media durability transform "
+                    "(not an electrical interruption, not an SD power cut)")
+X_SEEDS = [1, 7, 1337]
+
+
+def _x_device(name: str, seed: int, kind: str, flash: int = 16 * MiB, env: dict | None = None) -> Device:
+    dev = device(name, seed, kind=kind, flash=flash, env=env)
+    dev.x_kind = kind  # type: ignore[attr-defined]
+    if kind != "head":
+        # a baseline is expected to break oracles: record, never abort mid-run
+        dev.cp_hook = None
+        dev.durability_mode = "record"
+    return dev
+
+
+def _all_zero(p: Path) -> bool:
+    b = p.read_bytes() if p.exists() else b""
+    return len(b) > 0 and b.count(0) == len(b)
+
+
+def _pending_truth_durable(dev: Device) -> int:
+    """Accepted records the DURABLE cursor has not passed: exactly what a
+    rebooted store owes (un-persisted ACKs are re-delivered, never skipped)."""
+    cseq, coff, _ = cursor_from_nvs(dev.state)
+    n = 0
+    for r in read_jsonl(dev.state / "out" / "accepted.jsonl"):
+        m = re.search(r"ev-(\d+)\.log$", r.get("tail", ""))
+        if not m or r.get("tail_size", -1) < 0:
+            continue
+        q, end = int(m.group(1)), r["tail_size"]
+        if not (q < cseq or (q == cseq and end <= coff)):
+            n += 1
+    return n
+
+
+def _x_render_check(dev: Device) -> list[str]:
+    """C-32/C-52: pending renders as exact ("pending=N") only with
+    pending_exact=1, otherwise as a floor ("pending>=N")."""
+    bad = []
+    for r in health_rows(dev):
+        if "pending_text" not in r:
+            continue
+        want = ("pending=" if r["pending_exact"] else "pending>=") + str(r["pending"])
+        if r["pending_text"] != want:
+            bad.append(f"C-52: health {r['label']} renders {r['pending_text']!r}, expected {want!r}")
+    return bad
+
+
+def _x_diag(dev: Device, label: str) -> dict | None:
+    rows = [r for r in read_jsonl(dev.state / "out" / "sddiag.jsonl") if r.get("label") == label]
+    return rows[-1]["diag"] if rows else None
+
+
+def _x_diag_checks(dev: Device, diag: dict | None, faults: dict[str, int]) -> list[str]:
+    """C-29/C-30 for event_log: evlog fault counters equal exactly the injected
+    SD faults; refusal counts/first/last id exact and disjoint from accepted."""
+    if diag is None:
+        return ["C-29: no sd_diag block rendered"]
+    errs = []
+    if diag.get("faults") != faults:
+        errs.append(f"C-29: sd_diag faults {diag.get('faults')} != injected {faults}")
+    if faults:
+        last = diag.get("last") or {}
+        ops_set = {k.split(".", 1)[1] for k in faults}
+        if last.get("w") != "evlog" or last.get("op") not in ops_set or last.get("errno") != 5:
+            errs.append(f"C-29: sd_diag last fault {last} is not an evlog {sorted(ops_set)} EIO")
+    refused = read_jsonl(dev.state / "out" / "refused.jsonl")
+    want = {"full": 0, "media": 0, "too_large": 0, "unavailable": 0}
+    for r in refused:
+        want[REFUSAL_REASON.get(r["err"], "unavailable")] += 1
+    got = diag.get("refused", {})
+    for k, n in want.items():
+        if got.get(k) != n:
+            errs.append(f"C-30: sd_diag refused.{k}={got.get(k)} but {n} store call(s) were refused {k}")
+    ids = [r["id"] for r in refused if r["id"] > 0]
+    first, last = (ids[0], ids[-1]) if ids else (0, 0)
+    if (got.get("first_id"), got.get("last_id")) != (first, last):
+        errs.append(f"C-30: sd_diag refused first/last id {got.get('first_id')}/{got.get('last_id')} != {first}/{last}")
+    acc = {r["id"] for r in read_jsonl(dev.state / "out" / "accepted.jsonl")}
+    if set(ids) & acc or {got.get("first_id"), got.get("last_id")} & acc:
+        errs.append("C-30: an accepted id is reported refused")
+    return errs
+
+
+def _x_reboot(dev: Device, sig: dict) -> list[str]:
+    """C-20: simulated reboot mid-scenario; pending must be exact afterwards."""
+    n0 = dev.crashes
+    dev.run(["crash", "keeper manual", "health boot", "tick 61000", "service 3", "health xb", "checkpoint xb"])
+    if dev.crashes != n0 + 1:
+        raise HarnessError("simulated reboot did not happen")
+    hb = last_health(dev, "xb")
+    truth = _pending_truth_durable(dev)
+    sig["reboot"] = {"kind": SIMULATED_REBOOT, "pending": hb["pending"], "pending_exact": hb["pending_exact"],
+                     "pending_truth_durable": truth, "transforms": len(dev.transforms)}
+    if not hb["pending_exact"] or hb["pending"] != truth:
+        return [f"C-20: after the simulated reboot pending={hb['pending']} exact={hb['pending_exact']}, "
+                f"durable truth {truth}"]
+    return []
+
+
+def _x_lifecycle(dev: Device) -> None:
+    """After the reboot: a transfer burst (retry/adopt the failed copy), full
+    delivery, then another burst so delivered segments ARCHIVE (the primary is
+    renamed into the archive, the mirror dropped): every later owner of a name
+    touched by the fault gets exercised before the E2E."""
+    dev.run(["keeper auto", "tick 61000", "store 1000 small", "health xc", "checkpoint xc", "deliver all",
+             "tick 61000", "store 1000 small", "health xd", "checkpoint xd"])
+
+
+def _x_e2e(dev: Device, extra: dict) -> tuple[dict, list[str]]:
+    """Recovery + C-18 (accepted-record oracle) + C-19; returns (rec, errors)."""
+    errors: list[str] = []
+    dev.run(["drain_all", "service 2", "health final", "checkpoint final", "sddiag final"])
+    rec = reconcile(dev)
+    rec.update(extra)
+    c = _last_good_copy_oracle(dev)
+    c["mode"] = "assert"
+    rec["c19"] = c
+    errors += c["violations"] if c["n_violations"] else []
+    errors += c["c18_cursor_violations"]
+    try:
+        rec["arch_inv"] = check_arch_inv(dev)
+    except OracleFailure as e:
+        rec["arch_inv"] = {"error": str(e)}
+        errors.append(str(e))
+    try:
+        assert_e2e(rec)
+    except OracleFailure as e:
+        errors.append(f"C-18 {e}")
+    m = load_manifests(dev.state)
+    att = {r["id"] for r in read_jsonl(dev.state / "out" / "attempts.jsonl")}
+    delivered = {d["id"] for d in m["delivered"]}
+    # "no id gap": every accepted id is delivered (ids themselves may jump
+    # across a reboot: next_id is reserved in NVS blocks — never reused)
+    gap = sorted(set(m["accepted"]) - delivered)
+    both = sorted(set(m["accepted"]) & set(m["refused"]))
+    unclassified = sorted(att - set(m["accepted"]) - set(m["refused"]) - set(m["indeterminate"]))
+    rec["c18"] = {"attempted": len(att), "accepted": len(m["accepted"]), "delivered_distinct": len(delivered),
+                  "id_gap": gap[:10], "accepted_and_refused": both[:10], "unclassified": unclassified[:10],
+                  "duplicates_counted": rec["duplicate_count"], "cursor_rule_violations": c["n_c18_cursor"],
+                  "delivered_equals_accepted": delivered - set(m["indeterminate"]) == set(m["accepted"])}
+    if gap:
+        errors.append(f"C-18: accepted ids never delivered (gap): {gap[:10]}")
+    if not rec["c18"]["delivered_equals_accepted"]:
+        errors.append("C-18: delivered set != accepted set")
+    if unclassified:
+        errors.append(f"C-18: store calls not classified: {unclassified[:10]}")
+    if both:
+        errors.append(f"C-18: ids both accepted and refused: {both[:10]}")
+    errors += _x_render_check(dev)
+    for f in dev.durability_findings:
+        errors.append(f"R-DUR at {f['checkpoint']}: {f['finding']}")
+    return rec, errors
+
+
+def _x_post(dev: Device, strict: bool, extra: dict, sig: dict, phases) -> tuple[dict, list[str]]:
+    """Run the post-fault phases (`phases(dev) -> errors`, then recovery/E2E).
+    Strict (head in run.py): any harness/oracle abort propagates. Non-strict
+    (red_green): an abort is recorded — the fault-phase signature (the RED
+    evidence) was already captured — and the record is still produced."""
+    try:
+        errors = phases(dev)
+        rec, e2 = _x_e2e(dev, extra)
+        return rec, errors + e2
+    except (HarnessError, OracleFailure) as e:
+        if strict:
+            raise
+        sig["post_fault_abort"] = f"{type(e).__name__}: {str(e)[:1500]}"
+        rec = reconcile(dev)
+        rec.update(extra)
+        return rec, [f"post-fault phase aborted: {sig['post_fault_abort']}"]
+
+
+def _x_rev_info(kind: str) -> dict:
+    rev = kind[4:]
+    for p in build_root().glob("*.rewrite.json"):
+        d = json.loads(p.read_text())
+        if d.get("mode") == "full" and d.get("rev") == rev:
+            return d
+    return build.rev_full_sources(rev, build_root() / f"rewrite_full_{re.sub(r'[^A-Za-z0-9]', '_', rev)}")
+
+
+def _x_conclude(dev: Device, rec: dict, sig: dict, errors: list[str], green: list[str], red: dict | None,
+                strict: bool) -> dict:
+    rec["signature"] = sig
+    rec["oracle_errors"] = errors[:40]
+    rec["green_errors"] = green
+    rec["red"] = red
+    rec["variant"] = dev.x_kind  # type: ignore[attr-defined]
+    if dev.x_kind != "head":  # type: ignore[attr-defined]
+        k = dev.x_kind  # type: ignore[attr-defined]
+        rec["baseline_sources"] = _x_rev_info(k) if k.startswith("rev:") else baseline_rewrite_info(k)
+    write_evidence(dev, rec)
+    if strict and (errors or green):
+        raise OracleFailure("; ".join((errors + green)[:8]))
+    finish(dev)
+    return rec
+
+
+def _x_ops_since(dev: Device, i0: int) -> list[dict]:
+    return ops(dev)[i0:]
+
+
+def _x_lifecycle_delivered_first(dev: Device) -> None:
+    """Variant: the segment whose commit failed is DELIVERED before any retry
+    re-spools it, so the archive takes the never-spooled (flash) path and
+    meets the interrupted spool's leftover SD copies."""
+    dev.run(["keeper auto", "deliver all", "tick 61000", "store 1000 small", "health xc", "checkpoint xc",
+             "deliver all", "tick 61000", "store 1000 small", "health xd", "checkpoint xd"])
+
+
+def _x_commit_both_run(name: str, fp: str, seed: int, kind: str, prelude: list[str] | None,
+                       phase: list[str] | None, delivered_first: bool, strict: bool):
+    dev = _x_device(name, seed, kind)
+    if prelude:
+        dev.run(prelude)
+    fault = f"{fp}.rename.inside_call:1:both_eio"
+    n0 = len(ops(dev))
+    dev.run((phase or ["keeper auto", "store 1100 small"]) + ["health xa", "checkpoint xa", "sddiag xa"], fault=fault)
+    if not dev.fault_fired():
+        raise HarnessError(f"{name}: {fault} never fired")
+    ev = _x_ops_since(dev, n0)
+    be = [e for e in ev if e["op"] == "rename_both_eio"]
+    if not be:
+        raise HarnessError(f"{name}: armed both_eio did not reach a rename")
+    tmp, dst = be[0]["from"], be[0]["to"]
+    dstp = dev.state / dst
+    xl_a = [e for e in ev if e["op"] == "xlink_unlink"]
+    xlk = sorted((dev.state / "sdcard" / "evq").glob("xlk-*.junk")) if (dev.state / "sdcard" / "evq").exists() else []
+    # S1 policy: neither name of the cross-linked pair stays in service; both are
+    # retired to evq/xlk-* (two junk names on the one chain), never unlinked.
+    inos = [x.stat().st_ino for x in xlk]
+    pair_retired = any(inos.count(i) >= 2 for i in inos)
+    twin = (not dstp.exists()) and (not (dev.state / tmp).exists()) and pair_retired
+    ha = last_health(dev, "xa")
+    sig = {"fault": fault, "lifecycle": "delivered_first" if delivered_first else "retry_first", "tmp": tmp,
+           "dst": dst, "xlink_unlink_after_fault": len(xl_a),
+           "dst_exists_after_fault": dstp.exists(), "dst_zero_filled_after_fault": _all_zero(dstp),
+           "tmp_exists_after_fault": (dev.state / tmp).exists(), "xlk_after_fault": [x.name for x in xlk],
+           "tmp_and_dst_retired_as_pair": twin, "sd_rename_ambiguous_after_fault": ha["sd_rename_ambiguous"]}
+    life = _x_lifecycle_delivered_first if delivered_first else _x_lifecycle
+
+    def phases(d: Device) -> list[str]:
+        errs = _x_reboot(d, sig)
+        life(d)
+        return errs
+    rec, errors = _x_post(dev, strict, {"fault": fault, "lifecycle": sig["lifecycle"]}, sig, phases)
+    ev = ops(dev)
+    xl = [e for e in ev if e["op"] == "xlink_unlink"]
+    sig["xlink_unlink_total"] = len(xl)
+    sig["xlink_unlinked"] = [{"path": e["path"], "twins": e.get("twins"), "why": e.get("why")} for e in xl][:10]
+    arc_rm = [e["path"] for e in ev if e["op"] == "remove" and re.search(r"sdcard/archive/arc-[^/]*\.log$", e.get("path", ""))]
+    sig["arc_unlinked"] = arc_rm[:10]
+    diag = _x_diag(dev, "final")
+    sig["diag"] = diag
+    red = {"expect": "RED", "observed": sig["xlink_unlink_after_fault"] >= 1 and sig["dst_zero_filled_after_fault"],
+           "rule": ">=1 xlink_unlink at the failed commit AND the committed SD copy (dst) reads zero"}
+    green = []
+    if sig["xlink_unlink_total"] != 0:
+        green.append(f"GREEN[{sig['lifecycle']}]: {sig['xlink_unlink_total']} xlink_unlink (expected 0): "
+                     f"{sig['xlink_unlinked'][:3]}")
+    if not twin:
+        green.append(f"GREEN[{sig['lifecycle']}]: tmp (and its committed twin) not both retired to evq/xlk-*")
+    if sig["sd_rename_ambiguous_after_fault"] != 1:
+        green.append(f"GREEN[{sig['lifecycle']}]: sd_rename_ambiguous={sig['sd_rename_ambiguous_after_fault']} (expected 1)")
+    if arc_rm:
+        green.append(f"GREEN[{sig['lifecycle']}]: archive name(s) unlinked: {arc_rm[:3]}")
+    green += [f"[{sig['lifecycle']}] {g}" for g in _x_diag_checks(dev, diag, {"evlog.rename": 1})]
+    return dev, rec, sig, errors, green, red
+
+
+def _x_commit_both(name: str, fp: str, seed: int, kind: str, strict: bool, prelude: list[str] | None = None,
+                   phase: list[str] | None = None) -> dict:
+    """C-13/C-14/C-15: the commit rename of `fp` fails with BOTH names left
+    on one chain (hard link + EIO). Base unlinks tmp → frees dst's clusters
+    (RED: xlink_unlink + zero-filled committed copy). S1 retires tmp to
+    evq/xlk-* and counts sd_rename_ambiguous. For spool/mirror the committed
+    twin is followed through BOTH lifecycles (retry-before-delivery, and
+    delivered-before-retry: evidence under <name>_dfirst/<seed>); an unlink of
+    the twin in either is a C-19(b) violation."""
+    dev, rec, sig, errors, green, red = _x_commit_both_run(name, fp, seed, kind, prelude, phase, False, strict)
+    if fp in ("spool", "mirror"):
+        d2, rec2, sig2, err2, green2, _ = _x_commit_both_run(f"{name}_dfirst", fp, seed, kind, prelude, phase, True,
+                                                             strict)
+        _x_conclude(d2, rec2, sig2, err2, green2, None, False)
+        sig["delivered_first"] = {k: sig2.get(k) for k in ("xlink_unlink_total", "xlink_unlinked", "arc_unlinked",
+                                                           "tmp_retired_as_dst_twin", "reboot", "post_fault_abort")}
+        errors += [f"[delivered_first] {e}" for e in err2]
+        green += green2
+    return _x_conclude(dev, rec, sig, errors, green, red, strict)
+
+
+def X1(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-13 spool-primary commit rename both_eio: tmp retired (xlk-*), never unlinked."""
+    return _x_commit_both("X1", "spool", seed, kind, kind == "head" if strict is None else strict)
+
+
+def X2(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-14 mirror commit rename both_eio: as C-13."""
+    return _x_commit_both("X2", "mirror", seed, kind, kind == "head" if strict is None else strict)
+
+
+def X3(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-15 archive copy-commit rename both_eio (never-spooled delivered segment copied from flash)."""
+    return _x_commit_both("X3", "archive", seed, kind, kind == "head" if strict is None else strict,
+                          prelude=["keeper manual", "store 300 small", "deliver all", "health d0", "checkpoint d0"],
+                          phase=["keeper auto", "store 1000 small"])
+
+
+def X4(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-16 read-back mismatch after a successful commit rename: dst kept under evq/bad-*, flash copy retained."""
+    strict = kind == "head" if strict is None else strict
+    dev = _x_device("X4", seed, kind)
+    fault = "spool.verify_read_error:1:flip"
+    dev.run(["keeper auto", "store 1100 small", "health xa", "checkpoint xa", "sddiag xa"], fault=fault)
+    if not dev.fault_fired():
+        raise HarnessError(f"X4: {fault} never fired")
+    ev = ops(dev)
+    fi = next((i for i, e in enumerate(ev) if e["op"] == "flip"), None)
+    if fi is None:
+        raise HarnessError("X4: armed flip did not reach a read-back")
+    dst, off = ev[fi]["path"], ev[fi]["offset"]
+    first = int(re.search(r"ev-(\d+)\.log$", dst).group(1))
+    segs, _, _ = index_segs(dev)
+    seq = next((q for q, sg in segs.items() if sg.first == first), None)
+    flash = dev.state / "evstore" / "events" / f"ev-{seq:06d}.log" if seq is not None else None
+    unlinked = any(e["op"] == "remove" and e.get("path") == dst for e in ev[fi:])
+    bad = sorted((dev.state / "sdcard" / "evq").glob("bad-*.log")) if (dev.state / "sdcard" / "evq").exists() else []
+    expect = None
+    if flash is not None and flash.exists():
+        b = bytearray(flash.read_bytes())
+        b[off] ^= 0x01
+        expect = bytes(b)
+    ha = last_health(dev, "xa")
+    sig = {"fault": fault, "dst": dst, "flip_offset": off, "seq": seq, "dst_unlinked": unlinked,
+           "bad_copies": [p.name for p in bad], "bad_holds_written_bytes": expect is not None and any(p.read_bytes() == expect for p in bad),
+           "flash_copy_retained": bool(flash is not None and flash.exists()),
+           "sd_verify_fail_after_fault": ha["sd_verify_fail"], "sd_bad_copies_after_fault": ha["sd_bad_copies"]}
+    def phases(d: Device) -> list[str]:
+        errs = _x_reboot(d, sig)
+        _x_lifecycle(d)
+        return errs
+    rec, errors = _x_post(dev, strict, {"fault": fault}, sig, phases)
+    diag = _x_diag(dev, "final")
+    sig["diag"] = diag
+    red = {"expect": "RED", "observed": unlinked and not bad,
+           "rule": "the committed copy that failed read-back is unlinked and no evq/bad-* copy exists"}
+    green = []
+    if unlinked:
+        green.append("GREEN: dst unlinked after the failed read-back")
+    if not sig["bad_holds_written_bytes"]:
+        green.append(f"GREEN: no evq/bad-* holds the written (mismatching) bytes: {sig['bad_copies']}")
+    if not sig["flash_copy_retained"]:
+        green.append("GREEN: flash copy not retained after the failed verification")
+    if sig["sd_verify_fail_after_fault"] != 1:
+        green.append(f"GREEN: sd_verify_fail={sig['sd_verify_fail_after_fault']} (expected 1)")
+    green += _x_diag_checks(dev, diag, {"evlog.verify": 1})
+    return _x_conclude(dev, rec, sig, errors, green, red, strict)
+
+
+def X5(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-17 commit/archive rename applied_eio (applied, reported failed): no loss, dups counted not skipped."""
+    strict = kind == "head" if strict is None else strict
+    dev = _x_device("X5", seed, kind)
+    phases = [("spool.rename.inside_call:1:applied_eio", ["keeper auto", "store 1100 small", "health x1", "checkpoint x1"]),
+              ("mirror.rename.inside_call:1:applied_eio", ["tick 61000", "store 1000 small", "health x2", "checkpoint x2"]),
+              ("archive.rename.inside_call:1:applied_eio", ["deliver all", "tick 61000", "store 1000 small", "health x3",
+                                                            "checkpoint x3"])]
+    fired = []
+    for fault, lines in phases:
+        dev.armed = None
+        dev.run(lines, fault=fault)
+        if not dev.fault_fired():
+            raise HarnessError(f"X5: {fault} never fired")
+        fired.append(fault)
+    ev = ops(dev)
+    applied = [{"from": e["from"], "to": e["to"]} for e in ev if e["op"] == "rename" and e.get("applied_eio")]
+    sig = {"faults": fired, "applied_renames": applied,
+           "sd_rename_ambiguous": [last_health(dev, x)["sd_rename_ambiguous"] for x in ("x1", "x2", "x3")]}
+    def phases(d: Device) -> list[str]:
+        errs = _x_reboot(d, sig)
+        _x_lifecycle(d)
+        return errs
+    rec, errors = _x_post(dev, strict, {"faults": fired}, sig, phases)
+    diag = _x_diag(dev, "final")
+    sig["diag"] = diag
+    sig["duplicate_count"] = rec.get("duplicate_count")
+    sig["missing"] = len(rec.get("missing_ids", []))
+    green = []
+    if len(applied) != 3:
+        green.append(f"GREEN: {len(applied)} applied-then-EIO renames observed (expected 3)")
+    if sig["sd_rename_ambiguous"][0] != 1:
+        green.append(f"GREEN: sd_rename_ambiguous after the spool fault = {sig['sd_rename_ambiguous'][0]} (expected 1)")
+    if not isinstance(rec.get("duplicate_count"), int):
+        green.append("GREEN: duplicates not counted")
+    green += _x_diag_checks(dev, diag, {"evlog.rename": len(applied)})
+    return _x_conclude(dev, rec, sig, errors, green, {"expect": "any"}, strict)
+
+
+def _x6_hook(dev: Device, label: str) -> None:
+    """C-51, checked at EVERY refusal (driver checkpoint `refused_<id>`)."""
+    if dev.x_kind == "head" and not label.startswith("refused_"):  # type: ignore[attr-defined]
+        pending_truth_hook(dev, label)
+    if not label.startswith("refused_"):
+        return
+    rid = int(label.split("_", 1)[1])
+    st = dev.state
+    cseq, coff, _ = cursor_from_nvs(st)
+    segs, _, _ = index_segs(dev)
+    p = st / ".shim" / "ops.jsonl"
+    with open(p, "rb") as f:
+        f.seek(dev.x6_off)  # type: ignore[attr-defined]
+        chunk = f.read()
+    dev.x6_off += len(chunk)  # type: ignore[attr-defined]
+    dev.x6_ops.extend(json.loads(x) for x in chunk.decode().splitlines() if x.strip())  # type: ignore[attr-defined]
+    evs = dev.x6_ops  # type: ignore[attr-defined]
+    b = max((i for i, e in enumerate(evs) if e.get("op") == "mark" and e.get("what") == f"store_begin {rid}"), default=None)
+    r = max((i for i, e in enumerate(evs) if e.get("op") == "mark" and e.get("what", "").startswith(f"store_refused {rid} ")), default=None)
+    evicted_after = []
+    if b is not None and r is not None:
+        span = evs[b:r]
+        fail = next((k for k, e in enumerate(span) if "fail" in e and e.get("path", "").startswith("evstore/")), None)
+        if fail is not None:
+            evicted_after = [e["path"] for e in span[fail:] if e.get("op") == "remove" and
+                             re.match(r"evstore/events/ev-\d+\.log$", e.get("path", ""))]
+    remaining = []
+    for fp in sorted((st / "evstore" / "events").glob("ev-*.log")):
+        q = int(re.search(r"ev-(\d+)", fp.name).group(1))
+        sg = segs.get(q)
+        if q < cseq and not (sg is not None and sg.state == "REIMPORT"):
+            remaining.append(str(fp.relative_to(st)))      # delivered, unpinned (no keeper pass in a store), evictable
+    dev.x6_refusals += 1  # type: ignore[attr-defined]
+    if evicted_after or remaining:
+        dev.x6_c51.append({"refused_id": rid, "durable_cursor": [cseq, coff],  # type: ignore[attr-defined]
+                           "evictable_when_refused": (evicted_after + remaining)[:8],
+                           "evicted_only_after_the_refusal": evicted_after[:8], "still_present": remaining[:8]})
+
+
+def X6(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """C-50..C-52 (AMBYTE194): full internal store, SD unmounted, concurrent drain; remount resumes."""
+    strict = kind == "head" if strict is None else strict
+    dev = _x_device("X6", seed, kind, flash=1 * MiB, env={"EVQ_CP_ON_REFUSE": "1"})
+    dev.x6_off, dev.x6_ops, dev.x6_c51, dev.x6_refusals = 0, [], [], 0  # type: ignore[attr-defined]
+    dev.cp_hook = _x6_hook
+    lines = ["keeper auto", "sd remove"]
+    for i in range(60):
+        lines += ["store 12", "deliver 7"]
+        if i % 6 == 5:
+            lines.append(f"checkpoint f{i}")
+    lines += ["health full", "checkpoint full", "sddiag full"]
+    dev.run(lines)
+    hf = last_health(dev, "full")
+    refused = read_jsonl(dev.state / "out" / "refused.jsonl")
+    m = load_manifests(dev.state)
+    att = {r["id"] for r in read_jsonl(dev.state / "out" / "attempts.jsonl")}
+    n_full = sum(1 for r in refused if r["err"] == ESP_ERR_NO_MEM)
+    sig = {"refused": len(refused), "refused_full": n_full, "refusals_checked_c51": dev.x6_refusals,  # type: ignore[attr-defined]
+           "health_refused_full": hf["refused_full"], "blocked_reason": hf["blocked_reason"],
+           "classified": {"attempted": len(att), "accepted": len(m["accepted"]), "refused": len(m["refused"]),
+                          "indeterminate": len(m["indeterminate"])}}
+    errors: list[str] = []
+    if not refused:
+        raise HarnessError("X6: the internal store never refused (fill not reached)")
+    if m["indeterminate"] or set(m["accepted"]) | set(m["refused"]) != att or set(m["accepted"]) & set(m["refused"]):
+        errors.append(f"C-50: store calls not classified exactly: {sig['classified']}")
+    if hf["refused_full"] != n_full:
+        errors.append(f"C-50: health refused_full={hf['refused_full']} but {n_full} store calls returned NO_MEM")
+
+    def phases(d: Device) -> list[str]:
+        # remount: spool/reclaim and stores resume (C-52)
+        errs = []
+        d.run(["sd insert", "service 3", "health remount", "store 200", "service 2", "health resumed", "checkpoint r"])
+        hr, hs = last_health(d, "remount"), last_health(d, "resumed")
+        tail = read_jsonl(d.state / "out" / "attempts.jsonl")[-200:]
+        acc_now = {r["id"] for r in read_jsonl(d.state / "out" / "accepted.jsonl")}
+        sig["after_remount"] = {"spool_files": hr["spool_files"], "reclaimed": hs["reclaimed"],
+                                "stores_accepted": sum(1 for a in tail if a["id"] in acc_now),
+                                "storage_blocked": hs["storage_blocked"]}
+        # Spooling is demand-driven (flash pressure / every N stores): once the
+        # C-51 eviction has freed space there may be no pressure right at the
+        # remount, so C-52 is judged after the post-remount stores.
+        if max(hr["spool_files"], hs["spool_files"]) < 1:
+            errs.append("C-52: spooling did not resume after the remount")
+        if sig["after_remount"]["stores_accepted"] != 200 or hs["storage_blocked"]:
+            errs.append(f"C-52: stores did not resume after the remount: {sig['after_remount']}")
+        return errs + _x_reboot(d, sig)
+    rec, e2 = _x_post(dev, strict, {}, sig, phases)
+    errors += e2
+    diag = _x_diag(dev, "final")
+    sig["diag"] = diag
+    green = []
+    # ── C-51 (non-negotiable; NOT weakened): no store may be refused while a
+    #    delivered, unpinned, evictable flash file exists. A finding here is a
+    #    firmware defect in the refusal/eviction order, not a harness issue.
+    sig["c51_violations"] = dev.x6_c51[:10]  # type: ignore[attr-defined]
+    sig["c51_violation_count"] = len(dev.x6_c51)  # type: ignore[attr-defined]
+    if dev.x6_c51:  # type: ignore[attr-defined]
+        green.append(f"C-51 VIOLATED: {len(dev.x6_c51)} refusal(s) while a delivered evictable flash file existed, "  # type: ignore[attr-defined]
+                     f"first: {dev.x6_c51[0]}")  # type: ignore[attr-defined]
+    green += _x_diag_checks(dev, diag, {})
+    return _x_conclude(dev, rec, sig, errors, green, {"expect": "any"}, strict)
+
+
+# ── X7..X10: an ambiguous rename pair is retired as a UNIT or left intact ──
+# (eval round 1: a half-retired pair — one name in evq/xlk-*, the other still a
+# normal .log — was later imported and unlinked, freeing the chain its junk
+# twin still referenced). Every run follows the pair's shared inode from the
+# fault through a simulated reboot and the complete import/archive lifecycle,
+# in BOTH lifecycles (retry-first; delivered-first under <name>_dfirst), and
+# requires: zero xlink_unlink, neither original name ever removed, the chain
+# still held by exactly two names at the end, pre-existing xlk sentinels
+# byte-identical, plus C-18/C-19/C-20 and the exact sd_diag rename count.
+X_PAIR_NO_BASE = ("the retire.pair.* fault points do not exist on the baseline (e1ca6ee): "
+                  "recorded, no base expectation")
+
+
+def _x_prefill_xlk(dev: Device, n: int) -> dict[str, str]:
+    """n pre-existing junk names evq/xlk-0..n-1 (slots already used on this card)."""
+    import hashlib
+    d = dev.state / "sdcard" / "evq"
+    d.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for k in range(n):
+        b = f"pre-existing retired name sentinel {k}\n".encode()
+        (d / f"xlk-{k}.junk").write_bytes(b)
+        out[f"sdcard/evq/xlk-{k}.junk"] = hashlib.sha256(b).hexdigest()
+    return out
+
+
+def _x_names_with_ino(dev: Device, ino: int | None) -> list[str]:
+    if ino is None:
+        return []
+    return sorted(str(p.relative_to(dev.state)) for p in (dev.state / "sdcard").rglob("*")
+                  if p.is_file() and p.stat().st_ino == ino)
+
+
+def _x_pair_run(name: str, seed: int, kind: str, strict: bool, faults: str, delivered_first: bool,
+                prefill: int, after_fault, at_end, diag_renames: int | None) -> tuple:
+    """One device: arm `faults` during the first spool burst, snapshot the pair,
+    reboot, run the lifecycle, E2E. `after_fault(sig) -> [errors]` and
+    `at_end(sig) -> [errors]` state the scenario's GREEN signature."""
+    import hashlib
+    dev = _x_device(name, seed, kind)
+    sentinels = _x_prefill_xlk(dev, prefill)
+    dev.run(["keeper auto", "store 1100 small", "health xa", "checkpoint xa", "sddiag xa"], fault=faults)
+    specs = [f.split(":")[0] for f in faults.split(",")]
+    unfired = [sp for sp in specs if not dev.fault_fired(sp)]
+    ev = ops(dev)
+    pair = next(((e["from"], e["to"]) for e in ev if e["op"] == "rename_both_eio" or
+                 (e["op"] == "rename_inside" and e.get("outcome") == "both")), None)
+    sig: dict = {"faults": faults, "lifecycle": "delivered_first" if delivered_first else "retry_first",
+                 "prefilled_xlk": prefill, "unfired": unfired}
+    errors: list[str] = []
+    green: list[str] = []
+    if unfired and (strict or kind == "head"):
+        green.append(f"fault point(s) never fired: {unfired}")
+    ino = None
+    if pair is not None:
+        tmp, dst = pair
+        # follow the pair's names through later renames (e.g. both retired to xlk-*)
+        cur = {tmp, dst}
+        for e in ev:
+            if e["op"] == "rename" and "fail" not in e and e.get("from") in cur:
+                cur.add(e["to"])
+        for pth in [dst, tmp] + sorted(cur - {tmp, dst}):
+            if (dev.state / pth).exists():
+                ino = (dev.state / pth).stat().st_ino
+                break
+        sig.update(tmp=tmp, dst=dst)
+    xlk_dir = dev.state / "sdcard" / "evq"
+    junk = sorted(xlk_dir.glob("xlk-*.junk")) if xlk_dir.exists() else []
+    ha = last_health(dev, "xa")
+    sig["after_fault"] = {"tmp_exists": pair is not None and (dev.state / pair[0]).exists(),
+                          "dst_exists": pair is not None and (dev.state / pair[1]).exists(),
+                          "pair_inode_names": _x_names_with_ino(dev, ino),
+                          "new_xlk": len(junk) - prefill,
+                          "xlink_unlink": sum(1 for e in ev if e["op"] == "xlink_unlink"),
+                          "sd_rename_ambiguous": ha["sd_rename_ambiguous"]}
+    if pair is None:
+        (errors if kind == "head" else green).append("no ambiguous (both-names) rename happened")
+
+    def phases(d: Device) -> list[str]:
+        errs = _x_reboot(d, sig)
+        (_x_lifecycle_delivered_first if delivered_first else _x_lifecycle)(d)
+        return errs
+    rec, e2 = _x_post(dev, strict, {"faults": faults, "lifecycle": sig["lifecycle"]}, sig, phases)
+    errors += e2
+    ev = ops(dev)
+    xl = [e for e in ev if e["op"] == "xlink_unlink"]
+    removed = sorted({e["path"] for e in ev if e["op"] == "remove" and pair is not None and e.get("path") in pair})
+    changed = sorted(k for k, h in sentinels.items() if not (dev.state / k).exists() or
+                     hashlib.sha256((dev.state / k).read_bytes()).hexdigest() != h)
+    sig["at_end"] = {"tmp_exists": pair is not None and (dev.state / pair[0]).exists(),
+                     "dst_exists": pair is not None and (dev.state / pair[1]).exists(),
+                     "pair_inode_names": _x_names_with_ino(dev, ino), "pair_names_removed": removed,
+                     "sentinels_changed": changed[:10]}
+    sig["xlink_unlink_total"] = len(xl)
+    sig["xlink_unlinked"] = [{"path": e["path"], "twins": e.get("twins"), "why": e.get("why")} for e in xl][:10]
+    diag = _x_diag(dev, "final")
+    sig["diag"] = diag
+    lc = sig["lifecycle"]
+    if pair is not None and kind == "head" or (pair is not None and strict):
+        green += [f"GREEN[{lc}] after fault: {g}" for g in after_fault(sig)]
+        green += [f"GREEN[{lc}] at end: {g}" for g in at_end(sig)]
+    if xl:
+        green.append(f"GREEN[{lc}]: {len(xl)} xlink_unlink (expected 0): {sig['xlink_unlinked'][:3]}")
+    if removed:
+        green.append(f"GREEN[{lc}]: pair name(s) unlinked: {removed}")
+    if pair is not None and len(sig["at_end"]["pair_inode_names"]) != 2:
+        green.append(f"GREEN[{lc}]: the pair's chain is held by {sig['at_end']['pair_inode_names']} at the end "
+                     f"(expected exactly two names: never freed, never half-unlinked)")
+    if changed:
+        green.append(f"GREEN[{lc}]: pre-existing xlk sentinel(s) changed/removed: {changed[:5]}")
+    if diag_renames is not None:
+        want = {"evlog.rename": diag_renames} if diag_renames else {}
+        green += [f"[{lc}] {g}" for g in _x_diag_checks(dev, diag, want)]
+    return dev, rec, sig, errors, green
+
+
+def _x_pair(name: str, seed: int, kind: str, strict: bool | None, variants: list[dict], red_rule: dict) -> dict:
+    """Run every variant of one X7..X10 scenario in both lifecycles; the first
+    (retry-first) device is the scenario's own evidence dir, the others are
+    <name>_<variant>[_dfirst]. Errors of every device fail the scenario."""
+    strict = kind == "head" if strict is None else strict
+    main = None
+    agg_err: list[str] = []
+    agg_green: list[str] = []
+    subs = {}
+    for v in variants:
+        for dfirst in (False, True):
+            dname = name + (f"_{v['tag']}" if v["tag"] else "") + ("_dfirst" if dfirst else "")
+            dev, rec, sig, err, green = _x_pair_run(dname, seed, kind, strict, v["faults"], dfirst, v["prefill"],
+                                                    v["after_fault"], v["at_end"], v["diag_renames"])
+            label = dname[len(name):].lstrip("_") or "main"
+            agg_err += [f"[{label}] {e}" for e in err]
+            agg_green += [f"[{label}] {g}" for g in green]
+            if main is None:
+                main = (dev, rec, sig)
+                continue
+            subs[label] = {k: sig.get(k) for k in ("faults", "unfired", "after_fault", "at_end", "xlink_unlink_total",
+                                                   "reboot", "post_fault_abort")}
+            _x_conclude(dev, rec, sig, err, green, None, False)
+    dev, rec, sig = main
+    sig["variants"] = subs
+    red = dict(red_rule)
+    if red.get("expect") == "RED":
+        dst_rm = any(e["op"] == "remove" and e.get("path") == sig.get("dst") for e in ops(dev))
+        red["observed"] = sig["xlink_unlink_total"] >= 1 or dst_rm
+    return _x_conclude(dev, rec, sig, agg_err, agg_green, red, strict)
+
+
+def _pair_intact(stage: str):
+    def f(sig: dict) -> list[str]:
+        s = sig[stage]
+        e = []
+        if not (s["tmp_exists"] and s["dst_exists"]):
+            e.append(f"pair not intact under its own names (tmp={s['tmp_exists']} dst={s['dst_exists']})")
+        if len(s["pair_inode_names"]) != 2:
+            e.append(f"chain held by {s['pair_inode_names']}")
+        return e
+    return f
+
+
+def _no_new_xlk(sig: dict) -> list[str]:
+    s = sig["after_fault"]
+    return [] if s["new_xlk"] == 0 else [f"{s['new_xlk']} new xlk name(s) (expected none: the pair must not be split)"]
+
+
+def _both(*fs):
+    return lambda sig: [x for f in fs for x in f(sig)]
+
+
+def _ambiguous_one(sig: dict) -> list[str]:
+    v = sig["after_fault"]["sd_rename_ambiguous"]
+    return [] if v == 1 else [f"sd_rename_ambiguous={v} (expected 1)"]
+
+
+def _chain_held_by_two(sig: dict) -> list[str]:
+    return []   # checked for every run in _x_pair_run
+
+
+def X7(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """Eval-R1 reproduction: xlk-0..998 used (ONE slot left) + both_eio at the spool commit rename — the pair
+    cannot be retired as a unit, so it stays intact and guarded; also the pair appearing at BOOT (crash inside
+    the rename, 'both' outcome) with one slot left (epoch-repair path)."""
+    return _x_pair(
+        "X7", seed, kind, strict,
+        [{"tag": "", "faults": "spool.rename.inside_call:1:both_eio", "prefill": 999,
+          "after_fault": _both(_pair_intact("after_fault"), _no_new_xlk, _ambiguous_one),
+          "at_end": _pair_intact("at_end"), "diag_renames": 1},
+         {"tag": "boot", "faults": "spool.rename.inside_call:1:crash_both", "prefill": 999,
+          "after_fault": _both(_pair_intact("after_fault"), _no_new_xlk),
+          "at_end": _pair_intact("at_end"), "diag_renames": 0}],
+        {"expect": "RED", "rule": "base e1ca6ee (xlk-0..998 pre-filled, spool both_eio): >=1 xlink_unlink over the "
+                                  "run OR the committed dst unlinked"})
+
+
+def X8(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """Pair retirement whose FIRST rename (the .log) fails: nothing moves, the pair stays intact and guarded."""
+    return _x_pair(
+        "X8", seed, kind, strict,
+        [{"tag": "", "faults": "spool.rename.inside_call:1:both_eio,retire.pair.log:1:eio", "prefill": 0,
+          "after_fault": _both(_pair_intact("after_fault"), _no_new_xlk, _ambiguous_one),
+          "at_end": _chain_held_by_two, "diag_renames": 2}],
+        {"expect": "any", "rule": X_PAIR_NO_BASE})
+
+
+def X9(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """Pair retirement whose SECOND rename (the .tmp) fails: the .log is renamed back, the pair stays intact."""
+    return _x_pair(
+        "X9", seed, kind, strict,
+        [{"tag": "", "faults": "spool.rename.inside_call:1:both_eio,retire.pair.tmp:1:eio", "prefill": 0,
+          "after_fault": _both(_pair_intact("after_fault"), _no_new_xlk, _ambiguous_one),
+          "at_end": _chain_held_by_two, "diag_renames": 2}],
+        {"expect": "any", "rule": X_PAIR_NO_BASE})
+
+
+def _log_junk_tmp_alone(sig: dict) -> list[str]:
+    s = sig["after_fault"]
+    e = []
+    if s["dst_exists"] or not s["tmp_exists"]:
+        e.append(f"expected the .log retired to xlk and the .tmp left alone (tmp={s['tmp_exists']} dst={s['dst_exists']})")
+    junk = [n for n in s["pair_inode_names"] if re.search(r"sdcard/evq/xlk-\d+\.junk$", n)]
+    if len(junk) != 1 or len(s["pair_inode_names"]) != 2:
+        e.append(f"chain names after the fault {s['pair_inode_names']} (expected the .tmp + one xlk junk)")
+    return e
+
+
+def _tmp_retired(sig: dict) -> list[str]:
+    s = sig["at_end"]
+    junk = [n for n in s["pair_inode_names"] if re.search(r"sdcard/evq/xlk-\d+\.junk$", n)]
+    if s["tmp_exists"] or len(junk) != 2:
+        return [f"lone .tmp not retired by rename (tmp exists={s['tmp_exists']}, chain names {s['pair_inode_names']})"]
+    return []
+
+
+def X10(seed: int, kind: str = "head", strict: bool | None = None) -> dict:
+    """Pair retirement: the .tmp rename AND the .log restore both fail — the .log stays as xlk junk, the lone .tmp
+    is later retired (never unlinked); plus a crash at retire.pair.tmp (reboot → lone .tmp retired)."""
+    return _x_pair(
+        "X10", seed, kind, strict,
+        [{"tag": "", "faults": "spool.rename.inside_call:1:both_eio,retire.pair.tmp:1:eio2", "prefill": 0,
+          "after_fault": _both(_log_junk_tmp_alone, _ambiguous_one), "at_end": _tmp_retired, "diag_renames": 3},
+         {"tag": "crash", "faults": "spool.rename.inside_call:1:both_eio,retire.pair.tmp:1:crash", "prefill": 0,
+          "after_fault": lambda sig: [], "at_end": _tmp_retired, "diag_renames": 1}],
+        {"expect": "any", "rule": X_PAIR_NO_BASE})
+
+
 # ═══ D. fault matrix ════════════════════════════════════════════════════════
 MATRIX_TUNING = {"EVLOG_ROTATE_BYTES": 16384, "EVQ_INDEX_COMPACT_BYTES": 2048}
 
@@ -1594,6 +2396,15 @@ def matrix_prepare(dev: Device) -> None:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     _write_legacy(dev, 950000, 20)
+    # An unindexed ambiguous-rename PAIR (both names on one chain: a hard link
+    # here) so the boot epoch repair always runs evq_sd_retire_pair and the
+    # retire.pair.* points are reached/fired on every matrix run. The bytes are
+    # not records (no accepted/delivered obligation): only the chain matters,
+    # and C-19(b) catches any unlink of either name while the other exists.
+    evq = dev.state / "sdcard" / "evq"
+    evq.mkdir(parents=True, exist_ok=True)
+    (evq / "m-000999.log").write_bytes(b"matrix residue: an ambiguous rename pair (not records)\n" * 8)
+    os.link(evq / "m-000999.log", evq / "m-000999.tmp")
 
 
 def matrix_foreign_cursor(dev: Device) -> None:

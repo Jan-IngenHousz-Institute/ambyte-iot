@@ -23,7 +23,8 @@ import threading
 import time
 from pathlib import Path
 
-PORT = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:37:2F:FF:E7:04-if00"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bench  # noqa: E402  (A2: explicit bench identity, no default board)
 
 
 def run(log: Path, ctl: Path, dtr: bool, rts: bool) -> int:
@@ -50,7 +51,7 @@ def run(log: Path, ctl: Path, dtr: bool, rts: bool) -> int:
                 c = serial.Serial(port=None, baudrate=115200, timeout=0.1, exclusive=True)
                 c.dtr = dtr
                 c.rts = rts
-                c.port = PORT
+                c.port = bench.port()
                 c.open()
                 state["opens"] += 1
                 note(f"port open #{state['opens']} dtr={int(dtr)} rts={int(rts)}")

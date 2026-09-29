@@ -28,16 +28,26 @@ class AmbitFlashBootstrapTest(unittest.TestCase):
         self.assertNotIn("state[ch] == CH_NEWER", flash_loop)
 
     def test_missing_recovery_directories_are_created_before_file_preflight(self):
+        # The mkdirs + region preflight moved into ambit_flash_preflight(), which
+        # runs inside one SD io bracket before the UART bus is taken.
         source = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
         function = source.split("esp_err_t ambit_flash_image(", 1)[1]
-        create_root = function.index("mkdir(AMBIT_FW_ROOT, 0777)")
-        create_version = function.index("mkdir(dir, 0777)")
-        file_preflight = function.index("for (size_t i = 0; i < NUM_REGIONS; i++)")
+        preflight_call = function.index("ambit_flash_preflight(AMBIT_FW_ROOT, dir, fnames, NUM_REGIONS)")
         take_uart = function.index("uart_sensors_flash_session_begin")
+        self.assertLess(preflight_call, take_uart)
+
+        pre = (ROOT / "components/ambit_flash/ambit_flash_preflight.c").read_text()
+        body = pre.split("esp_err_t ambit_flash_preflight(", 1)[1]
+        gate = body.index("sdcard_io_begin()")
+        create_root = body.index("mkdir(root, 0777)")
+        create_version = body.index("mkdir(dir, 0777)")
+        file_preflight = body.index("for (size_t i = 0; i < n; i++)")
+        release = body.index("sdcard_io_end()")
+        self.assertLess(gate, create_root)
         self.assertLess(create_root, create_version)
         self.assertLess(create_version, file_preflight)
-        self.assertLess(file_preflight, take_uart)
-        self.assertIn("errno != EEXIST", function[create_root:file_preflight])
+        self.assertLess(file_preflight, release)
+        self.assertIn("errno != EEXIST", body[create_root:file_preflight])
 
     def test_successful_rom_flash_invalidates_cached_ambit_identity(self):
         source = (ROOT / "components/ambit_ota/ambit_ota.c").read_text()

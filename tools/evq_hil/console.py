@@ -16,19 +16,22 @@ from pathlib import Path
 
 import serial
 
-PORT = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:37:2F:FF:E7:04-if00"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bench  # noqa: E402  (A2: explicit bench identity, no default board)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", required=True)
-    ap.add_argument("--port", default=PORT)
+    ap.add_argument("--port", default=None)
     ap.add_argument("--settle", type=float, default=2.0, help="read time after open, before the first command")
     ap.add_argument("--wait", type=float, default=3.0, help="read time after each command")
     ap.add_argument("--until", help="after the last command, read until this regex matches")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("cmds", nargs="*")
     a = ap.parse_args()
+    if a.port is None:
+        a.port = bench.port()
     out = bytearray()
     with serial.Serial(port=None, baudrate=115200, timeout=0.2, exclusive=True) as conn:
         conn.dtr = False

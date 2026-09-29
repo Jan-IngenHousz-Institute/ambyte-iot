@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,6 +92,13 @@ int ambit_flash_check(void);
  * shared enable line). Returns the number of channels flashed AND verified at
  * the target version, or -1 if no SD target image is present. */
 int ambit_flash_boot_sync(void);
+
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+/* Verification build only (Sprint 2 replacement amendment A6); see ambit_flash.c. */
+bool      evq_hil_ambit_sync_held(void);
+void      evq_hil_ambit_sync_set(bool release);
+esp_err_t evq_hil_ambit_nvsdump(uint8_t channel, const char *tag);
+#endif
 
 #ifdef __cplusplus
 }

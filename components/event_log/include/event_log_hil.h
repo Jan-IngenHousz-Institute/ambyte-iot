@@ -61,6 +61,31 @@ esp_err_t event_log_hil_state_dump(void);
  * "eio" | "enospc"; nth = which hit fires (1 = next). */
 esp_err_t event_log_hil_arm(const char *point, const char *mode, unsigned nth);
 
+/* Writer/op-targeted I/O fault (`evq_hil fault io <writer> <op> <mode> [nth]
+ * [count]`). Returns ESP_ERR_INVALID_ARG with *why set for an unknown token or
+ * an invalid op/mode combination; mode "off" disarms. */
+esp_err_t event_log_hil_arm_io(const char *writer, const char *op, const char *mode, unsigned nth,
+                               unsigned count, const char **why);
+/* Slot form (Sprint 2 H1): `add` false = clear both slots and arm A; true = arm
+ * B (refused unless A is armed and B free). `path` NULL/"" = any path, else a
+ * substring the op's path must contain. */
+esp_err_t evq_hil_arm_io_slot(const char *writer, const char *op, const char *mode, unsigned nth,
+                                    unsigned count, const char *path, bool add, const char **why);
+
+/* Retained record of the last fired targeted fault (survives the CPU reset it
+ * caused; invalid after power-on). */
+typedef struct {
+    uint8_t  mode, writer, op;
+    int32_t  err;
+    uint32_t nth;
+    int64_t  uptime_us;
+    char     path[40];
+} evq_hil_last_view_t;
+bool evq_hil_fault_last(evq_hil_last_view_t *out);
+const char *event_log_hil_iom_kind(uint8_t mode);   /* injected_errno|short_write|applied_then_error|cpu_reset */
+const char *event_log_hil_iom_name(uint8_t mode);
+bool        event_log_hil_iom_is_reset(uint8_t mode);
+
 /* Boot-order trace line: "HIL_TRACE <step> <esp_timer µs>". */
 void evq_hil_trace(const char *step);
 

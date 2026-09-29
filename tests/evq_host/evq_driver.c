@@ -32,6 +32,8 @@ static uint64_t s_seed = 1;
 static uint64_t s_gen = 0;         /* records generated so far (persisted) */
 static uint64_t s_calls = 0;
 static bool s_keeper_auto = true;
+static bool s_cp_on_refuse = false;      /* EVQ_CP_ON_REFUSE=1: checkpoint after every refused store */
+static void checkpoint(const char *label);
 static int  s_boot = 0;
 #ifdef EVQ_BASELINE
 static unsigned s_stores_since_keeper = 0;
@@ -196,6 +198,22 @@ static void health(const char *label)
 #else
     char text[1024];
     int tl = evq_render_health_text(&h, text, sizeof text);
+    /* C-32/C-52: the pending token exactly as the evlog CLI renders it. */
+    char ptxt[48] = "";
+    {
+        const char *pp = tl > 0 ? strstr(text, " pending") : NULL;
+        if (pp != NULL) {
+            pp++;
+            size_t k = 0;
+            while (pp[k] != '\0' && pp[k] != ' ' && k + 1 < sizeof ptxt) { ptxt[k] = pp[k]; k++; }
+            ptxt[k] = '\0';
+        }
+    }
+#ifdef EVQ_HEALTH_SDX
+    unsigned sdx_amb = h.sd_rename_ambiguous, sdx_vf = h.sd_verify_fail;
+#else
+    unsigned sdx_amb = 0xFFFFFFFFu, sdx_vf = 0xFFFFFFFFu;   /* field absent in this revision */
+#endif
     fprintf(s_hl, "{\"label\":\"%s\",\"available\":%d,\"write_full\":%d,\"pending\":%lld,\"pending_exact\":%d,"
                   "\"deliverable_pending\":%lld,\"flash_pending\":%lld,\"sd_pending\":%lld,\"reimport_pending\":%lld,"
                   "\"next_id\":%lld,\"last_acked_id\":%lld,\"skipped\":%lld,\"dropped\":%lld,"
@@ -206,7 +224,8 @@ static void health(const char *label)
                   "\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,\"reclaimed\":%u,\"archived\":%u,"
                   "\"reimported\":%u,\"pressure_notifies\":%u,\"sd_bursts\":%u,\"index_segments\":%u,\"index_cap\":%u,"
                   "\"flash_free\":%llu,\"sd_ops\":%llu,\"clock\":%u,\"render_len\":%d,\"boot\":%d,"
-                  "\"sd_retired_names\":%u,\"sd_bad_copies\":%u}\n",
+                  "\"sd_retired_names\":%u,\"sd_bad_copies\":%u,\"sd_rename_ambiguous\":%lld,\"sd_verify_fail\":%lld,"
+                  "\"pending_text\":\"%s\"}\n",
             label, h.available, h.write_full, (long long)h.pending, h.pending_exact, (long long)h.deliverable_pending,
             (long long)h.flash_pending, (long long)h.sd_pending, (long long)h.reimport_pending,
             (long long)h.next_id, (long long)h.last_acked_id, (long long)h.skipped, (long long)h.dropped,
@@ -217,7 +236,8 @@ static void health(const char *label)
             h.storage_blocked, event_log_blocked_reason_name(h.blocked_reason), h.spool_files, h.spool_errors,
             h.mirror_used, h.reclaimed_files, h.archived_files, h.reimported_files, h.pressure_notifies,
             h.sd_bursts, h.index_segments, h.index_cap, (unsigned long long)freeb,
-            (unsigned long long)shim_sd_ops(), evq_clock_now(), tl, s_boot, h.sd_retired_names, h.sd_bad_copies);
+            (unsigned long long)shim_sd_ops(), evq_clock_now(), tl, s_boot, h.sd_retired_names, h.sd_bad_copies,
+            sdx_amb == 0xFFFFFFFFu ? -1LL : (long long)sdx_amb, sdx_vf == 0xFFFFFFFFu ? -1LL : (long long)sdx_vf, ptxt);
 #endif
     fflush(s_hl);
 }
@@ -242,6 +262,12 @@ static void do_store(unsigned n, const char *profile)
             .measure_id = id, .channel = r.channel, .device = r.device, .tag = r.tag, .cmd_raw = r.cmd,
             .start_ms = r.start_ms, .end_ms = r.end_ms, .metadata_json = r.meta, .payload_json = r.payload,
         };
+        if (s_cp_on_refuse) {
+            /* C-51: bounds this call's ops span (what the store did before refusing) */
+            char mk[64];
+            snprintf(mk, sizeof mk, "store_begin %lld", (long long)id);
+            shim_mark(mk);
+        }
         esp_err_t err = event_log_store_event(&d);
         if (err == ESP_OK) {
             char extra[160];
@@ -260,6 +286,15 @@ static void do_store(unsigned n, const char *profile)
             fprintf(s_ref, "{\"k\":%" PRIu64 ",\"id\":%lld,\"call\":%" PRIu64 ",\"err\":%d,\"err_name\":\"%s\",\"boot\":%d}\n",
                     k, (long long)id, call, err, esp_err_to_name(err), s_boot);
             fflush(s_ref);
+            char mk[96];
+            snprintf(mk, sizeof mk, "store_refused %lld %d", (long long)id, err);
+            shim_mark(mk);
+            if (s_cp_on_refuse) {
+                /* C-51: the oracle inspects the store at every refusal */
+                char lbl[48];
+                snprintf(lbl, sizeof lbl, "refused_%lld", (long long)id);
+                checkpoint(lbl);
+            }
         }
         rec_free(&r);
         keeper_auto_tick();
@@ -401,6 +436,11 @@ static void sd_cmd(char *arg1, char *arg2, char *arg3)
         fprintf(stderr, "bad sd command %s\n", arg1);
         exit(6);
     }
+    {
+        char mk[96];
+        snprintf(mk, sizeof mk, "sdcmd %s cid=%08x mounted=%d", arg1, (unsigned)evq_sd_stub_cid(), evq_sd_stub_mounted() ? 1 : 0);
+        shim_mark(mk);
+    }
 #ifndef EVQ_BASELINE
     event_log_sd_notify();
 #endif
@@ -415,6 +455,7 @@ int main(int argc, char **argv)
     if (sd) s_seed = strtoull(sd, NULL, 10);
     const char *bs = getenv("EVQ_BOOT");
     s_boot = bs ? atoi(bs) : 0;
+    s_cp_on_refuse = getenv("EVQ_CP_ON_REFUSE") != NULL && getenv("EVQ_CP_ON_REFUSE")[0] == '1';
     shim_seed(s_seed * 7919 + (bs ? strtoull(bs, NULL, 10) : 0));
     s_brng = mix(s_seed ^ 0xB10C) + (bs ? strtoull(bs, NULL, 10) : 0);
     mkdir("out", 0777);
@@ -422,6 +463,14 @@ int main(int argc, char **argv)
     s_acc = open_out("accepted.jsonl"); s_ref = open_out("refused.jsonl"); s_att = open_out("attempts.jsonl");
     s_del = open_out("delivered.jsonl"); s_hl = open_out("health.jsonl"); s_clm = open_out("claims.jsonl");
     load_gen();
+#ifndef EVQ_VARIANT
+#ifdef EVQ_BASELINE
+#define EVQ_VARIANT "legacy"
+#else
+#define EVQ_VARIANT "head"
+#endif
+#endif
+    shim_mark("variant " EVQ_VARIANT);   /* which firmware produced the ops that follow (C-19 scope) */
 
 #ifdef EVQ_HIL_HOST
     /* Same order as app_main in the evq-hil build: the hold precedes init.
@@ -553,6 +602,14 @@ int main(int argc, char **argv)
         else if (strcmp(cmd, "hil_release") == 0) event_log_hil_release();
         else if (strcmp(cmd, "hil_state") == 0) (void)event_log_hil_state_dump();
 #endif
+        else if (strcmp(cmd, "sddiag") == 0) {
+            /* C-29/C-30: the retained sd_diag block as the device renders it */
+            char dj[2048];
+            int n = evq_sd_diag_render(dj, sizeof dj);
+            FILE *df = open_out("sddiag.jsonl");
+            fprintf(df, "{\"label\":\"%s\",\"diag\":%s}\n", a1 ? a1 : "", n > 0 ? dj : "null");
+            fclose(df);
+        }
         else if (strcmp(cmd, "crash") == 0) { evq_host_flush_manifests(); shim_mark("crash-cmd"); _exit(86); }
         else { fprintf(stderr, "unknown command %s\n", cmd); return 2; }
     }

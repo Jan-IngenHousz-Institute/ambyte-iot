@@ -1,5 +1,6 @@
 #include "device_commands.h"
 #include "event_log.h"
+#include "sd_diag.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -1878,6 +1879,26 @@ static cmd_result_t emit_status_event(bool direct)
             input.evq_reimported_files = eh.reimported_files;
             input.evq_sd_retired_names = eh.sd_retired_names;
             input.evq_sd_bad_copies = eh.sd_bad_copies;
+            input.evq_sd_rename_ambiguous = eh.sd_rename_ambiguous;
+            input.evq_sd_verify_fail = eh.sd_verify_fail;
+        }
+    }
+    /* Retained SD-fault / refusal attribution (never stored on the SD). The
+     * heartbeat cadence is also the NVS snapshot cadence (rate-limited inside).
+     * Rendered into one transient heap block (freed after the payload is
+     * built): no resident DRAM. */
+    enum { DIAG_JSON_CAP = 768, SDLOG_JSON_CAP = 384 };
+    char *diag_mem = malloc(DIAG_JSON_CAP + SDLOG_JSON_CAP);
+    if (diag_mem != NULL) {
+        sd_diag_persist(false);
+        sd_diag_block_t db;
+        sd_diag_get(&db);
+        /* A worst-case counter set can exceed the slice: then the heartbeat
+         * omits it (never a truncated object); `evlog` still renders all. */
+        if (sd_diag_render_json(&db, diag_mem, DIAG_JSON_CAP) > 0) input.sd_diag_json = diag_mem;
+        char *sdlog = diag_mem + DIAG_JSON_CAP;
+        if (s_cfg.sdlog_render != NULL && s_cfg.sdlog_render(sdlog, SDLOG_JSON_CAP) > 0) {
+            input.sdlog_json = sdlog;
         }
     }
 
@@ -1910,20 +1931,27 @@ static cmd_result_t emit_status_event(bool direct)
     }
 
     char *payload = malloc(PAYLOAD_V3_TELEMETRY_CAP);
-    if (payload == NULL) return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
+    if (payload == NULL) {
+        free(diag_mem);
+        return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
+    }
     char build_error[96];
     bool built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                             build_error, sizeof build_error);
-    if (!built && input.attached_count > 0) {
+    if (!built && (input.attached_count > 0 || input.sd_diag_json != NULL)) {
         /* A malformed/stale peripheral cache must not silence the gateway's
          * only firmware-owned health event. Retry without the optional attached
-         * sensor references; the DEVICE_INFO path will still report its own
-         * validation failure and a later healthy heartbeat restores the list. */
-        ESP_LOGW(TAG, "telemetry build retry without attached sensors: %s", build_error);
+         * sensor references (and the optional SD diag objects, which a
+         * worst-case counter set could push over the budget); the DEVICE_INFO
+         * path and `evlog` still report them, and a later heartbeat restores them. */
+        ESP_LOGW(TAG, "telemetry build retry without optional parts: %s", build_error);
         input.attached_count = 0;
+        input.sd_diag_json = input.sdlog_json = NULL;
         built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                            build_error, sizeof build_error);
     }
+    free(diag_mem);                    /* rendered into the payload (or unused) */
+    input.sd_diag_json = input.sdlog_json = NULL;
     if (!built) {
         free(payload);
         return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
