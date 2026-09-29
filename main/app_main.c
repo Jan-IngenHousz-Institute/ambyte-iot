@@ -20,6 +20,7 @@
 #include "command_router.h"
 #include "clock_trust.h"
 #include "ota_update.h"
+#include "iot_jobs.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
 #include "ambit_announcement_nvs.h"
@@ -1195,9 +1196,30 @@ void app_main(void)
         .persistence_healthy  = app_persistence_healthy,
         .status_topic         = status_topic,
         .device_id            = device_id,
+        .confirmed            = iot_jobs_kick,
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");
+    }
+
+    /* openJII firmware rollouts arrive as AWS IoT Jobs. The Thing name is the
+     * MQTT client id: the platform's Jobs policy only resolves when the two are
+     * equal, which is how the flash GUI provisions platform-registered units.
+     * Units on the shared legacy cert get their job subscriptions refused and
+     * the module stays silent (iot_jobs.h). No TLS = not AWS = nothing to ask. */
+    if (certs_ok) {
+        iot_jobs_config_t jobs_cfg = {
+            .thing_name       = mqtt_client_id,
+            .family           = "ambyte",
+            .running_version  = running_app != NULL ? running_app->version : "",
+            .publish          = mqtt_client_get_publish_fn(),
+            .add_subscription = mqtt_client_get_add_subscription_fn(),
+            .connection_stats = mqtt_client_get_connection_stats_fn(),
+        };
+        err = iot_jobs_init(&jobs_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(APP_TAG, "IoT Jobs listener not started: %s", esp_err_to_name(err));
+        }
     }
 
     /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered

@@ -75,6 +75,40 @@ static char                 s_rx_topic[INBOUND_TOPIC_MAX];
 static int                  s_rx_len      = 0;
 static bool                 s_rx_overflow = false;
 
+/* Extra subscriptions (AWS IoT Jobs today). Registered once during init, before
+ * the client starts, and only read afterwards, so the table needs no lock: every
+ * later access is on the esp-mqtt task. Each has its own inbound handler, so
+ * `$aws/...` traffic never reaches the command router's JSON dispatcher. */
+#define EXTRA_SUB_MAX 4
+typedef struct {
+    char                filter[INBOUND_TOPIC_MAX];
+    message_received_fn on_message;
+    message_suback_fn   on_suback;
+    void               *ctx;
+    int                 pending_msg_id;   /* SUBSCRIBE msg_id of this connection, -1 = none */
+} extra_sub_t;
+static extra_sub_t s_extra_subs[EXTRA_SUB_MAX];
+static size_t      s_extra_sub_count;
+
+/* MQTT topic-filter match: `+` is one level, a trailing `#` is the rest. The
+ * `$`-prefixed-topic rule (wildcards never match a leading `$`) is irrelevant
+ * here because every registered filter spells its `$aws` prefix literally. */
+static bool topic_matches(const char *filter, const char *topic)
+{
+    while (*filter != '\0') {
+        if (filter[0] == '#' && filter[1] == '\0') return true;
+        if (*filter == '+') {
+            while (*topic != '\0' && *topic != '/') topic++;
+            filter++;
+            continue;
+        }
+        if (*filter != *topic) return false;
+        filter++;
+        topic++;
+    }
+    return *topic == '\0';
+}
+
 static void rx_large_free(void)
 {
     free(s_rx_large);
@@ -225,6 +259,27 @@ static esp_err_t mqtt_set_disconnect_handler_impl(message_disconnect_fn handler,
     return ESP_OK;
 }
 
+static esp_err_t mqtt_add_subscription_impl(const char *filter, message_received_fn on_message,
+                                            message_suback_fn on_suback, void *ctx)
+{
+    if (filter == NULL || filter[0] == '\0' || on_message == NULL ||
+        strlen(filter) >= INBOUND_TOPIC_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* The table is read lock-free on the esp-mqtt task; growing it under a
+     * running client would race that read. */
+    if (s_started) return ESP_ERR_INVALID_STATE;
+    if (s_extra_sub_count >= EXTRA_SUB_MAX) return ESP_ERR_NO_MEM;
+    extra_sub_t *sub = &s_extra_subs[s_extra_sub_count];
+    memcpy(sub->filter, filter, strlen(filter) + 1);
+    sub->on_message     = on_message;
+    sub->on_suback      = on_suback;
+    sub->ctx            = ctx;
+    sub->pending_msg_id = -1;
+    s_extra_sub_count++;
+    return ESP_OK;
+}
+
 /* Stitch one MQTT_EVENT_DATA fragment into s_rx_buf and, on the final fragment,
  * deliver the whole NUL-terminated payload to the registered handler. esp-mqtt
  * provides the topic only on the first fragment (current_data_offset == 0). */
@@ -270,6 +325,14 @@ static void handle_inbound_data(esp_mqtt_event_handle_t event)
         }
         dst[s_rx_len] = '\0';
         ESP_LOGI(TAG, "inbound %d B on %s", s_rx_len, s_rx_topic);
+        for (size_t i = 0; i < s_extra_sub_count; i++) {
+            if (topic_matches(s_extra_subs[i].filter, s_rx_topic)) {
+                s_extra_subs[i].on_message(s_rx_topic, dst, (size_t)s_rx_len,
+                                           s_extra_subs[i].ctx);
+                rx_large_free();
+                return;
+            }
+        }
         if (s_msg_handler != NULL) {
             s_msg_handler(s_rx_topic, dst, (size_t)s_rx_len, s_msg_ctx);
         }
@@ -302,14 +365,40 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             int sub_id = esp_mqtt_client_subscribe(s_client, s_command_topic, 1);
             ESP_LOGI(TAG, "subscribing to %s (msg_id=%d)", s_command_topic, sub_id);
         }
+        for (size_t i = 0; i < s_extra_sub_count; i++) {
+            s_extra_subs[i].pending_msg_id =
+                esp_mqtt_client_subscribe(s_client, s_extra_subs[i].filter, 1);
+            ESP_LOGI(TAG, "subscribing to %s (msg_id=%d)", s_extra_subs[i].filter,
+                     s_extra_subs[i].pending_msg_id);
+        }
         if (s_connect_handler != NULL) {
             s_connect_handler(s_connect_ctx);
         }
         break;
 
-    case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT subscribed msg_id=%d", event->msg_id);
+    case MQTT_EVENT_SUBSCRIBED: {
+        /* esp-mqtt flags any SUBACK return code >= 0x80 as SUBSCRIBE_FAILED.
+         * AWS IoT answers an unauthorized SUBSCRIBE that way instead of
+         * dropping the connection, which is what makes the grant a safe probe
+         * for whether the policy covers a topic family at all. */
+        bool granted = event->error_handle == NULL ||
+                       event->error_handle->error_type != MQTT_ERROR_TYPE_SUBSCRIBE_FAILED;
+        ESP_LOGI(TAG, "MQTT subscribed msg_id=%d (%s)", event->msg_id,
+                 granted ? "granted" : "REFUSED");
+        for (size_t i = 0; i < s_extra_sub_count; i++) {
+            if (s_extra_subs[i].pending_msg_id != event->msg_id) continue;
+            s_extra_subs[i].pending_msg_id = -1;
+            if (s_extra_subs[i].on_suback != NULL) {
+                uint32_t session;
+                portENTER_CRITICAL(&s_error_disc_mux);
+                session = s_successful_connects;
+                portEXIT_CRITICAL(&s_error_disc_mux);
+                s_extra_subs[i].on_suback(granted, session, s_extra_subs[i].ctx);
+            }
+            break;
+        }
         break;
+    }
 
     case MQTT_EVENT_DATA:
         handle_inbound_data(event);
@@ -533,4 +622,9 @@ message_set_received_handler_fn mqtt_client_get_set_received_handler_fn(void)
 message_set_disconnect_handler_fn   mqtt_client_get_set_disconnect_handler_fn(void)
 {
     return mqtt_set_disconnect_handler_impl;
+}
+
+message_add_subscription_fn mqtt_client_get_add_subscription_fn(void)
+{
+    return mqtt_add_subscription_impl;
 }
