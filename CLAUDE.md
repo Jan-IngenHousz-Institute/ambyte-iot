@@ -77,6 +77,20 @@ Databricks `open_jii_dev.centrum.clean_data`.
   battery. Measurement and the event store KEEP RUNNING through a park — internal littlefs
   is power-loss-safe; delivery of SD-only backlog waits until unpark. New SD writers
   must use sdcard_io_begin/end AND survive the park/unpark cycle (see sd_logger_pause).
+- **SD write integrity (2026-09)**: sd_logger frames every record at the producer (one
+  call = one `\n`-terminated record ≤256 B), rolls a failed write/sync back to the last
+  committed record boundary, and quarantines (rotates away, never appends to) a file it
+  cannot roll back; a failed rotation backs off instead of retrying per write.
+  Names that may share a FAT chain (a `.tmp`/`.log` pair from a failed or interrupted
+  rename) are never unlinked: they are retired to `xlk-*` as a unit (both or neither),
+  a lone `.tmp` is retired rather than removed, and a `.log` that still has a `.tmp` twin
+  is never imported, adopted, archive-cleaned or orphan-converted. A committed copy that
+  fails read-back moves to `evq/bad-*`.
+  AMBIT OTA stages to single-named `ambit_fw.stg-<k>.bin` and never touches
+  `ambit_fw.bin`. Fault/refusal attribution lives in `sd_diag` (RTC_NOINIT + rate-limited
+  NVS, never the SD; `exact=false` after a power-on). Bench-only `evq_hil fault io`
+  (env evq-hil) injects per-writer faults; its resets are CPU resets, never power cuts.
+  Host evidence: tests/sdlog_host, tests/ambit_host, tests/evq_host X group.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

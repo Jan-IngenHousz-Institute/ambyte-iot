@@ -45,3 +45,19 @@ size_t evq_hil_payload(const char *run, uint32_t k, size_t pad_len, char *out, s
     memcpy(p + pad_len, "\"}", 3);
     return (size_t)pre + pad_len + 2;
 }
+
+size_t evq_hil_pad(const char *run, uint32_t k, size_t pad_len, char *out, size_t cap)
+{
+    static const char evq_hil_padset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    if (out == NULL || !run_ok(run) || pad_len + 1 > cap) return 0;
+    uint64_t x = evq_hil_fnv1a64(run) ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL);   /* same stream as the payload */
+    if (x == 0) x = 1;
+    for (size_t i = 0; i < pad_len; i++) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out[i] = evq_hil_padset[x % 36U];
+    }
+    out[pad_len] = '\0';
+    return pad_len;
+}

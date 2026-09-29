@@ -804,10 +804,21 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
         jw_string(&w, input->evq_corrupt_medium);
         jw_append(&w, ",\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,"
                       "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u,"
-                      "\"sd_retired_names\":%u,\"sd_bad_copies\":%u}",
+                      "\"sd_retired_names\":%u,\"sd_bad_copies\":%u,"
+                      "\"sd_rename_ambiguous\":%u,\"sd_verify_fail\":%u}",
                   input->evq_spool_files, input->evq_spool_errors, input->evq_mirror_used,
                   input->evq_reclaimed_files, input->evq_archived_files, input->evq_reimported_files,
-                  input->evq_sd_retired_names, input->evq_sd_bad_copies);
+                  input->evq_sd_retired_names, input->evq_sd_bad_copies,
+                  input->evq_sd_rename_ambiguous, input->evq_sd_verify_fail);
+        storage_comma = true;
+    }
+    if (input->sd_diag_json != NULL) {
+        jw_append(&w, "%s\"sd_diag\":%s", storage_comma ? "," : "", input->sd_diag_json);
+        storage_comma = true;
+    }
+    if (input->sdlog_json != NULL) {
+        jw_append(&w, "%s\"sdlog\":%s", storage_comma ? "," : "", input->sdlog_json);
+        storage_comma = true;
     }
     jw_append(&w, "},\"runtime\":{");
     if (input->runtime_valid) {

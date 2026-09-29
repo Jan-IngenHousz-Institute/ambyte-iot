@@ -24,6 +24,7 @@
 
 #include "esp_loader.h"
 #include "uart_sensors.h"
+#include "ambit_flash_preflight.h"
 #include "sd_card.h"
 #include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
 #include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
@@ -55,6 +56,85 @@ static const flash_region_t s_regions[] = {
 
 /* Serialized by the flash session — safe as a single static scratch buffer. */
 static uint8_t s_flash_buf[FLASH_BLOCK];
+
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+/* ── verification build only: Sprint 2 replacement amendment A6 ──────────────
+ * (1) AMBIT boot-sync HOLD: the bench's SD carries an unreleased 1.0.0 folder,
+ *     and every stock boot would auto-flash the attached v0.0.4 AMBITs to it.
+ *     In this build ambit_flash_boot_sync() does nothing unless the RTC
+ *     release word is set (`evq_hil ambit_sync release`), and a power-on
+ *     always holds. Held by default: an unknown RTC word is not a release.
+ * (2) Raw NVS / partition-table oracles (N0/N1/N2, P0/P1) and the flash-size
+ *     gate (G-AF), read over the same stub session the flasher uses:
+ *       SLT_AMB_BEGIN ch=<c> tag=<t> mac=<m> chip=<n> flash=<bytes> detect=<err>
+ *       SLT_AMB_B64 <c> <t> <pt|nvs> <offset> <b64 of <= 1 KiB>
+ *       SLT_AMB_END ch=<c> tag=<t> pt_sha=<hex> nvs_sha=<hex> ok|err=<n>
+ *     pt = 0x8000..0x8BFF, nvs = 0x9000..0xDFFF (the AMBIT's Preferences). */
+#include "esp_attr.h"
+#include "evq_hil_sdl.h"
+
+#define EVQ_HIL_AMB_SYNC_RELEASE 0x53594e43u
+static RTC_NOINIT_ATTR uint32_t evq_hil_amb_sync_word;
+
+bool evq_hil_ambit_sync_held(void)
+{
+    return esp_reset_reason() == ESP_RST_POWERON || evq_hil_amb_sync_word != EVQ_HIL_AMB_SYNC_RELEASE;
+}
+
+void evq_hil_ambit_sync_set(bool release)
+{
+    evq_hil_amb_sync_word = release ? EVQ_HIL_AMB_SYNC_RELEASE : 0;
+    printf("SLT_AMB sync=%s (applies at the next boot; a power-on always holds)\n",
+           release ? "released" : "held");
+}
+
+static char evq_hil_amb_b64[1400];
+
+static esp_loader_error_t evq_hil_amb_region(esp_loader_t *ld, uint8_t ch, const char *tag, const char *rn,
+                                             uint32_t off, uint32_t len, char hex[65])
+{
+    hil_sdl_sha_ctx_t c;
+    hil_sdl_sha256_init(&c);
+    for (uint32_t p = 0; p < len; p += FLASH_BLOCK) {
+        uint32_t n = (len - p < FLASH_BLOCK) ? len - p : FLASH_BLOCK;
+        esp_loader_error_t le = esp_loader_flash_read(ld, s_flash_buf, off + p, n);
+        if (le != ESP_LOADER_SUCCESS) {
+            printf("SLT_AMB_ERR ch=%u tag=%s region=%s off=0x%lx read=%d\n", ch, tag, rn,
+                   (unsigned long)(off + p), (int)le);
+            return le;
+        }
+        hil_sdl_sha256_update(&c, s_flash_buf, n);
+        hil_sdl_b64(s_flash_buf, n, evq_hil_amb_b64, sizeof evq_hil_amb_b64);
+        printf("SLT_AMB_B64 %u %s %s %lu %s\n", ch, tag, rn, (unsigned long)(off + p), evq_hil_amb_b64);
+    }
+    uint8_t d[32];
+    hil_sdl_sha256_final(&c, d);
+    hil_sdl_hex(d, sizeof d, hex);
+    return ESP_LOADER_SUCCESS;
+}
+
+/* One dump on an already-connected (stub) session. Never writes, never resets. */
+static esp_loader_error_t evq_hil_amb_dump(esp_loader_t *ld, uint8_t ch, const char *tag)
+{
+    uint8_t mac[6] = {0};
+    (void)esp_loader_read_mac(ld, mac);
+    uint32_t fsz = 0;
+    esp_loader_error_t de = esp_loader_flash_detect_size(ld, &fsz);
+    printf("SLT_AMB_BEGIN ch=%u tag=%s mac=%02x:%02x:%02x:%02x:%02x:%02x chip=%d flash=%lu detect=%d\n",
+           ch, tag, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (int)esp_loader_get_target(ld),
+           (unsigned long)fsz, (int)de);
+    char pt[65] = "-", nvs[65] = "-";
+    esp_loader_error_t le = evq_hil_amb_region(ld, ch, tag, "pt", 0x8000, 0xC00, pt);
+    if (le == ESP_LOADER_SUCCESS) le = evq_hil_amb_region(ld, ch, tag, "nvs", 0x9000, 0x5000, nvs);
+    if (le == ESP_LOADER_SUCCESS) {
+        printf("SLT_AMB_END ch=%u tag=%s pt_sha=%s nvs_sha=%s ok\n", ch, tag, pt, nvs);
+    } else {
+        printf("SLT_AMB_END ch=%u tag=%s pt_sha=%s nvs_sha=%s err=%d\n", ch, tag, pt, nvs, (int)le);
+    }
+    fflush(stdout);
+    return le;
+}
+#endif
 
 esp_err_t ambit_flash_probe(uint8_t channel, ambit_flash_probe_result_t *out)
 {
@@ -112,22 +192,44 @@ esp_err_t ambit_flash_probe(uint8_t channel, ambit_flash_probe_result_t *out)
     return ret;
 }
 
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+/* `evq_hil ambit_nvsdump <ch> <tag>` (A6 N0/P0/G-AF, N2): read-only stub session
+ * on one channel. Entering ROM pulses the shared CHIP_EN, so all four AMBITs
+ * reboot - callers quiesce the runner first, exactly as for `ambit_flash`. */
+esp_err_t evq_hil_ambit_nvsdump(uint8_t channel, const char *tag)
+{
+    if (channel >= UART_SENSOR_NUM_CHANNELS || tag == NULL) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);
+    if (e != ESP_OK) {
+        printf("SLT_AMB_ERR ch=%u tag=%s bus=%s\n", channel, tag, esp_err_to_name(e));
+        return e;
+    }
+    ambit_flash_port_t port = { .base = { .ops = &ambit_flash_port_ops }, .channel = channel };
+    esp_loader_t loader;
+    esp_err_t ret = ESP_FAIL;
+    esp_loader_error_t le = esp_loader_init_serial(&loader, &port.base);
+    if (le == ESP_LOADER_SUCCESS) {
+        esp_loader_connect_args_t args = ESP_LOADER_CONNECT_DEFAULT();
+        le = esp_loader_connect_with_stub(&loader, &args);
+        if (le != ESP_LOADER_SUCCESS) {
+            printf("SLT_AMB_ERR ch=%u tag=%s connect=%d\n", channel, tag, (int)le);
+        } else if (esp_loader_get_target(&loader) != ESP32C3_CHIP) {
+            printf("SLT_AMB_ERR ch=%u tag=%s chip=%d\n", channel, tag, (int)esp_loader_get_target(&loader));
+        } else if (evq_hil_amb_dump(&loader, channel, tag) == ESP_LOADER_SUCCESS) {
+            ret = ESP_OK;
+        }
+        esp_loader_reset_target(&loader);        /* back to the (unchanged) app */
+    } else {
+        printf("SLT_AMB_ERR ch=%u tag=%s init=%d\n", channel, tag, (int)le);
+    }
+    uart_set_baudrate(FLASH_UART, ROM_BAUD);
+    uart_sensors_flash_session_end(channel);
+    return ret;
+}
+#endif
+
 /* ── full multi-region ROM flash ─────────────────────────────────────────── */
 
-/* Open dir/fname, return its size (>0) or 0 on error. */
-static long region_file_size(const char *dir, const char *fname)
-{
-    char path[192];
-    snprintf(path, sizeof path, "%s/%s", dir, fname);
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        return 0;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fclose(f);
-    return (sz > 0) ? sz : 0;
-}
 
 /* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5). */
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
@@ -232,28 +334,24 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Recovery folders were historically installed by the factory SD image.
-     * Some field cards predate that layout, which made remote recovery
-     * impossible even when operators could stage the four exact files. Create
-     * only the canonical root/version directories here, before touching the
-     * target. Missing files still fail closed in the preflight below. */
-    if (mkdir(AMBIT_FW_ROOT, 0777) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "cannot create %s", AMBIT_FW_ROOT);
-        return ESP_FAIL;
-    }
-    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "cannot create recovery directory %s", dir);
-        return ESP_FAIL;
-    }
-
-    /* Fail fast: all four region files must be present + non-empty BEFORE we touch
-     * the chip, so we never half-flash because one file was missing. */
-    for (size_t i = 0; i < NUM_REGIONS; i++) {
-        if (region_file_size(dir, s_regions[i].fname) == 0) {
-            ESP_LOGE(TAG, "missing/empty %s/%s — need all 4 region files",
-                     dir, s_regions[i].fname);
-            return ESP_ERR_NOT_FOUND;
+    /* mkdir root/version + all-regions preflight, inside one SD io bracket that
+     * is released before the UART bus is taken (ambit_flash_preflight.h). */
+    {
+        const char *fnames[NUM_REGIONS];
+        for (size_t i = 0; i < NUM_REGIONS; i++) fnames[i] = s_regions[i].fname;
+        esp_err_t pe = ambit_flash_preflight(AMBIT_FW_ROOT, dir, fnames, NUM_REGIONS);
+        if (pe != ESP_OK) {
+            return pe;
         }
+        /* A teardown raised while the preflight held its ref is waiting for us
+         * now: do not reset the AMBIT into its ROM bootloader for a card that is
+         * leaving. (A teardown after this point is caught by each region's own
+         * gate, before any block is written.) */
+        if (!sdcard_io_begin()) {
+            ESP_LOGE(TAG, "SD unavailable: target untouched");
+            return ESP_ERR_INVALID_STATE;
+        }
+        sdcard_io_end();
     }
 
     esp_err_t e = uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);
@@ -323,8 +421,23 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
     ret = ESP_OK;
     ESP_LOGW(TAG, "ch%u: FLASH COMPLETE — %d regions, %lu bytes", channel,
              regions_done, (unsigned long)total);
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+    /* A6 step 4: N1 (raw NVS) and P1 (the partition table just written), read on
+     * this same stub session BEFORE the app reset - the new app's first boot can
+     * no longer have touched NVS. A read failure is reported, never masked. */
+    (void)evq_hil_amb_dump(&loader, channel, "n1");   /* N1 + P1 (tags are case-insensitive) */
+#endif
 
 reset_and_done:
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+    /* A6 recovery: after a failed region write, leave the target in its ROM/stub
+     * loader instead of resetting it into a partial image (which would boot-loop
+     * the shared rail). `ambit_flash <ch> <ver>` re-enters download mode anyway. */
+    if (ret != ESP_OK && le != ESP_LOADER_SUCCESS && regions_done < (int)NUM_REGIONS && chip == ESP32C3_CHIP) {
+        printf("SLT_AMB_HOLD ch=%u regions_done=%d err=%d (target left in ROM)\n", channel, regions_done, (int)le);
+        goto done;
+    }
+#endif
     /* Always return the AMBIT to running its (new or old) application. */
     esp_loader_reset_target(&loader);
 done:
@@ -359,10 +472,11 @@ static bool fw_is_newer_than_target(const ambit_fw_info_t *fw,
                   tgt->major, tgt->minor, tgt->batch);
 }
 
+/* Caller holds an SD io ref. */
 static bool dir_has_all_regions(const char *dir)
 {
     for (size_t i = 0; i < NUM_REGIONS; i++) {
-        if (region_file_size(dir, s_regions[i].fname) == 0) {
+        if (ambit_flash_region_size(dir, s_regions[i].fname) == 0) {
             return false;
         }
     }
@@ -378,8 +492,14 @@ esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* The directory scan + region probes read the FAT volume: bracket them so
+     * a concurrent monitor teardown cannot free it mid-scan (audit R-6 class). */
+    if (!sdcard_io_begin()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     DIR *d = opendir(AMBIT_FW_ROOT);
     if (d == NULL) {
+        sdcard_io_end();
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -407,6 +527,7 @@ esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)
         }
     }
     closedir(d);
+    sdcard_io_end();
 
     if (!found) {
         return ESP_ERR_NOT_FOUND;
@@ -672,6 +793,16 @@ int ambit_flash_boot_sync(void)
         ambit_device_info_t inf;
         (void)cmd_ambit_device_info(ch, &inf);
     }
+
+#if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
+    /* A6 auto-sync prevention: held before the target lookup and before any ROM
+     * probe (which would reboot the whole bank) - nothing below runs. */
+    if (evq_hil_ambit_sync_held()) {
+        printf("SLT_AMB boot_sync=held (no probe, no flash; `evq_hil ambit_sync release` + reboot to run it)\n");
+        return -1;
+    }
+    printf("SLT_AMB boot_sync=released\n");
+#endif
 
     ambit_flash_target_t tgt;
     if (ambit_flash_find_target(&tgt) != ESP_OK) {

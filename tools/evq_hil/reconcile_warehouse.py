@@ -2,7 +2,7 @@
 open_jii_dev.centrum.raw_data, read-only, Databricks profile `sandbox`.
 
     python reconcile_warehouse.py fetch --since '2026-09-26 02:00:00' --until '...' --out rows.json
-    python reconcile_warehouse.py check --rows rows.json --capture CAP [...] [--pre pre.json] \
+    python reconcile_warehouse.py check --rows rows.json --capture CAP [...] \
         [--real real.json] --out wh.json
 
 `fetch` pulls every row of the bench client ingested in the window (10-minute
@@ -26,9 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hilpay  # noqa: E402
 import manifest  # noqa: E402
 
-CLIENT = "ambyte_28:37:2f:ff:e7:04"
-EXPERIMENT = "b3c8d242-dbb3-4520-9a5c-664e364ae6bd"
-MAC = "28:37:2F:FF:E7:04"
+import bench  # noqa: E402  (A2: explicit bench identity and experiment, no default board)
 PROFILE = "sandbox"
 
 
@@ -49,7 +47,7 @@ def fetch(since: str, until: str, slice_min: int = 10) -> list[dict]:
         sql = ("SELECT experiment_id, workbook_version_id, CAST(ingestion_timestamp AS STRING) ingestion_timestamp, "
                "CAST(kinesis_arrival_time AS STRING) kinesis_arrival_time, kinesis_sequence_number, "
                "to_json(parsed_data) pd FROM open_jii_dev.centrum.raw_data "
-               f"WHERE lower(client_id)='{CLIENT}' AND ingest_date >= DATE'{t0.date()}' "
+               f"WHERE lower(client_id)='{bench.client()}' AND ingest_date >= DATE'{t0.date()}' "
                f"AND ingestion_timestamp >= timestamp'{t0:%Y-%m-%d %H:%M:%S}' "
                f"AND ingestion_timestamp < timestamp'{t:%Y-%m-%d %H:%M:%S}'")
         rows.extend(_query(sql))
@@ -106,12 +104,14 @@ def check_synthetic(row: dict, exp: dict, pad: int, workbook: str | None, cfg: d
     data = s.get("data")
     if hilpay.sha(json.dumps(data, separators=(",", ":"))) != hilpay.sha(pl):
         bad.append("data hash")
-    if row["experiment_id"] != EXPERIMENT:
+    if row["experiment_id"] != bench.experiment():
         bad.append(f"experiment {row['experiment_id']}")
     if not _same_instant(e.get("timestamp"), exp["start_ms"]):
         bad.append(f"timestamp {e.get('timestamp')}")
-    if e.get("device_id") != MAC:
+    if e.get("device_id") != bench.device_id():          # configured envelope id, not necessarily the MAC
         bad.append(f"device_id {e.get('device_id')}")
+    if e.get("device_name") != bench.device_name():
+        bad.append(f"device_name {e.get('device_name')!r}")
     for k in ("device_name", "device_version", "device_firmware"):
         if k in cfg and e.get(k) != cfg[k]:
             bad.append(f"{k} {e.get(k)!r}")
@@ -138,6 +138,38 @@ def check_real(row: dict, stored_line: bytes) -> list[str]:
     if not _same_instant(row["env"].get("timestamp"), start_ms):
         bad.append(f"timestamp {row['env'].get('timestamp')} != {_iso(start_ms)}")
     return bad
+
+
+def fetch_ids(ids: list[int], since_date: str = "2026-09-06", chunk: int = 150) -> list[dict]:
+    """Rows of the bench client whose sample measure_id is in `ids`."""
+    rows = []
+    for i in range(0, len(ids), chunk):
+        part = ",".join(str(x) for x in ids[i:i + chunk])
+        sql = ("SELECT experiment_id, workbook_version_id, CAST(ingestion_timestamp AS STRING) ingestion_timestamp, "
+               "CAST(kinesis_arrival_time AS STRING) kinesis_arrival_time, to_json(parsed_data) pd "
+               "FROM open_jii_dev.centrum.raw_data "
+               f"WHERE lower(client_id)='{bench.client()}' AND ingest_date >= DATE'{since_date}' "
+               "AND try_cast(regexp_extract(to_json(parsed_data), 'measure_id[^0-9]+([0-9]+)', 1) AS BIGINT) "
+               f"IN ({part})")
+        rows.extend(_query(sql))
+    return rows
+
+
+def rebuild_line(row: dict) -> bytes | None:
+    """The exact event_log line of a firmware v3 record, from its warehouse
+    sample (the canonical v3 object is spliced verbatim into the envelope):
+    id, channel, device, tag, cmd, start, end, metadata(""), payload."""
+    s = row["sample"]
+    raw = row.get("sample_text")
+    if raw is None or "schema" not in s:
+        return None
+    t = s.get("time", {})
+    start = t.get("start_utc", t.get("observed_utc"))
+    end = t.get("end_utc", start)
+    cmd = (s.get("protocol") or {}).get("cmd", "")
+    fields = [str(s["measure_id"]), s.get("channel") or "", s.get("device") or "", s.get("tag") or "",
+              cmd, str(start), str(end), "", raw]
+    return ("\t".join(fields) + "\n").encode()
 
 
 def main() -> int:
@@ -211,35 +243,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-def fetch_ids(ids: list[int], since_date: str = "2026-09-06", chunk: int = 150) -> list[dict]:
-    """Rows of the bench client whose sample measure_id is in `ids`."""
-    rows = []
-    for i in range(0, len(ids), chunk):
-        part = ",".join(str(x) for x in ids[i:i + chunk])
-        sql = ("SELECT experiment_id, workbook_version_id, CAST(ingestion_timestamp AS STRING) ingestion_timestamp, "
-               "CAST(kinesis_arrival_time AS STRING) kinesis_arrival_time, to_json(parsed_data) pd "
-               "FROM open_jii_dev.centrum.raw_data "
-               f"WHERE lower(client_id)='{CLIENT}' AND ingest_date >= DATE'{since_date}' "
-               "AND try_cast(regexp_extract(to_json(parsed_data), 'measure_id[^0-9]+([0-9]+)', 1) AS BIGINT) "
-               f"IN ({part})")
-        rows.extend(_query(sql))
-    return rows
-
-
-def rebuild_line(row: dict) -> bytes | None:
-    """The exact event_log line of a firmware v3 record, from its warehouse
-    sample (the canonical v3 object is spliced verbatim into the envelope):
-    id, channel, device, tag, cmd, start, end, metadata(""), payload."""
-    s = row["sample"]
-    raw = row.get("sample_text")
-    if raw is None or "schema" not in s:
-        return None
-    t = s.get("time", {})
-    start = t.get("start_utc", t.get("observed_utc"))
-    end = t.get("end_utc", start)
-    cmd = (s.get("protocol") or {}).get("cmd", "")
-    fields = [str(s["measure_id"]), s.get("channel") or "", s.get("device") or "", s.get("tag") or "",
-              cmd, str(start), str(end), "", raw]
-    return ("\t".join(fields) + "\n").encode()

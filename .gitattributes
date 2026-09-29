@@ -1,0 +1,3 @@
+# Hash-bound test baselines (tests/pinned_revs.py): byte-exact - no EOL conversion, and
+# patch context lines of blank source lines legitimately end in a space.
+tests/fixtures/pinned_base/*.patch -text -whitespace

@@ -173,6 +173,53 @@ class Ota1(unittest.TestCase):
         with self.assertRaises(ValueError):
             ota_select.select(_otadata([(1, 2), (2, 2)]), 1)
 
+    @staticmethod
+    def _apply(cur: bytes, slot: int) -> tuple[bytes, dict]:
+        off, sector, meta = ota_select.select(cur, slot)
+        at = off - ota_select.OTADATA_OFFSET
+        return cur[:at] + sector + cur[at + 0x1000:], meta
+
+    def test_alternating_slots_always_executable(self):
+        """Replacement amendment §3: S1..S5 each select the NON-active slot, so the
+        tool never refuses, and each candidate's other sector is the previous
+        VALID image (its rollback target)."""
+        cur = _otadata([(1, 2), None])                           # PRE: ota_0 1.11.0 VALID
+        plan = [1, 0, 1, 0, 1]                                   # R, HIL, REL, HIL, REL
+        for n, slot in enumerate(plan):
+            cur, meta = self._apply(cur, slot)
+            info = ota_select.parse(cur)
+            act = ota_select.active(info)
+            self.assertEqual((act["slot"], act["state_name"], act["seq"]), (slot, "NEW", n + 2))
+            prev = info[1 - act["sector"]]
+            self.assertEqual(prev["slot"], 1 - slot)
+            # the candidate confirms (the app rewrites its own entry VALID)
+            cur = _otadata([(e["seq"], 2 if e is act else e["state"]) if e["valid"] else None for e in info])
+            self.assertEqual(ota_select.next_boot(ota_select.parse(cur))["slot"], slot)
+
+    def test_invalid_newest_is_not_the_base(self):
+        """A rolled-back (INVALID/ABORTED) newest entry keeps its CRC; selecting from
+        it would overwrite the sector holding the rollback target."""
+        for bad in (0x3, 0x4):
+            cur = _otadata([(5, bad), (4, 2)])                   # ota_0 rolled back, ota_1 VALID boots
+            with self.assertRaises(ValueError):
+                ota_select.select(cur, 1)
+            off, _, meta = ota_select.select(cur, 0)
+            self.assertEqual((off, meta["seq"], meta["base"]["sector"]), (0xF000, 5, 1))
+
+    def test_pending_prepass(self):
+        """bootloader_utility.c aborts every PENDING_VERIFY entry before selecting:
+        a PENDING entry is never what boots next, and with no other usable entry
+        next_boot is None (unsafe: the no-factory path tries ota_0)."""
+        info = ota_select.parse(_otadata([(1, 2), (2, 1)]))      # ota_1 PENDING over ota_0 VALID
+        self.assertEqual(ota_select.active(info)["slot"], 1)     # raw bytes
+        nb = ota_select.next_boot(info)
+        self.assertEqual((nb["slot"], nb["state_name"]), (0, "VALID"))
+        for other in (0x1, 0x3, 0x4):
+            info = ota_select.parse(_otadata([(1, other), (2, 1)]))
+            self.assertIsNone(ota_select.next_boot(info))
+        info = ota_select.parse(_otadata([(1, 2), (2, 0)]))      # NEW is booted (then PENDING)
+        self.assertEqual(ota_select.next_boot(info)["state_name"], "NEW")
+
 
 class Io1(unittest.TestCase):
     """IO-1: relevant-op classification, lossless drains with contiguous seqs,
@@ -180,8 +227,9 @@ class Io1(unittest.TestCase):
 
     def test_trace_and_arming(self):
         with tempfile.TemporaryDirectory() as d:
-            exe = _build(["components/event_log/evq_hil_trace.c", "tests/evq_hil_host/trace_main.c"],
-                         ["components/event_log"], ["-DEVQ_HIL_TRACE_HOST"], Path(d) / "trace")
+            exe = _build(["components/event_log/evq_hil_trace.c", "components/sd_card/sd_diag_core.c",
+                          "tests/evq_hil_host/trace_main.c"],
+                         ["components/event_log", "components/sd_card"], ["-DEVQ_HIL_TRACE_HOST"], Path(d) / "trace")
             out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
             rows = [json.loads(x) for x in out.splitlines()]
             self.assertEqual(rows[0]["cls"], [1, 1, 1, 0, 1, 1, 0])

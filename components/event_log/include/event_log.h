@@ -239,6 +239,8 @@ typedef struct {
     uint32_t index_cap;
     uint32_t sd_retired_names;  /* .tmp names retired on this card (possible FAT cross-link; never unlinked) */
     uint32_t sd_bad_copies;     /* damaged SD copies moved aside to /sdcard/evq/bad-* (kept, never delivered) */
+    uint32_t sd_rename_ambiguous; /* commit renames failed with the target present: tmp retired, never unlinked */
+    uint32_t sd_verify_fail;    /* committed SD copies that failed read-back (moved aside; flash copy kept) */
 } evlog_health_t;
 
 /* Stable wire/CLI names (evq_render.c). */
