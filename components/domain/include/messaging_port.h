@@ -61,6 +61,24 @@ typedef void      (*message_received_fn)(const char *topic, const char *payload,
 typedef esp_err_t (*message_set_received_handler_fn)(message_received_fn handler,
                                                      void *ctx);
 
+/* Broker verdict on one additional subscription, delivered once per connection
+ * (a clean session drops subscriptions, so the transport re-subscribes on every
+ * connect). `session` identifies that connection: it equals the
+ * successful_connects value message_connection_stats_fn reports while the same
+ * connection is up, so a consumer can tell a stale grant from a live one.
+ * granted=false is the broker refusing the filter (SUBACK >= 0x80), typically
+ * an IoT policy that does not cover it. Runs in the transport's task context. */
+typedef void      (*message_suback_fn)(bool granted, uint32_t session, void *ctx);
+
+/* Register one extra topic filter (MQTT wildcards allowed) that the transport
+ * subscribes to at QoS 1 on every connect. Messages whose topic matches it are
+ * delivered to on_message instead of the default received handler. Register
+ * during init, before the transport starts; registrations are not removable. */
+typedef esp_err_t (*message_add_subscription_fn)(const char *filter,
+                                                 message_received_fn on_message,
+                                                 message_suback_fn on_suback,
+                                                 void *ctx);
+
 /* Callback delivered when the transport loses its connection at the MQTT level
  * (i.e. MQTT_EVENT_DISCONNECTED — fires even when Wi-Fi stays associated). Lets
  * the app revert every unacknowledged publish-window slot so a reconnect does
