@@ -2265,6 +2265,224 @@ static void scenario_epoch_missing_sta_start_deadline(void)
     check_epoch_failed_truthfully();
 }
 
+/* -- round 8: nothing may credit or resurrect after a failed recovery epoch --- */
+
+typedef struct {
+    int reconnect_count, auth_fail_count;
+    bool reconfigure, connect_requested;
+    int connect_calls, disconnect_calls, stop_calls, start_calls, set_config_calls;
+    int barrier_posts, app_starts;
+    uint32_t request_gen;
+    int log_assoc, log_ip, log_202, log_8;
+} late_snapshot_t;
+
+#define LATE_LOG_ASSOC "association after a failed recovery epoch - reboot required"
+#define LATE_LOG_IP "IP after a failed recovery epoch - reboot required"
+#define LATE_LOG_202 "(reason=202) after a failed recovery epoch - reboot required"
+#define LATE_LOG_8 "(reason=8) after a failed recovery epoch - reboot required"
+
+static late_snapshot_t late_snapshot(void)
+{
+    late_snapshot_t b;
+    b.reconnect_count = s_wifi.reconnect_count;
+    b.auth_fail_count = s_wifi.auth_fail_count;
+    b.reconfigure = s_wifi.reconfigure_in_progress;
+    b.connect_requested = s_wifi.connect_requested;
+    b.connect_calls = g_connect_calls;
+    b.disconnect_calls = g_disconnect_calls;
+    b.stop_calls = g_stop_calls;
+    b.start_calls = g_start_calls;
+    b.set_config_calls = g_set_config_calls;
+    b.barrier_posts = g_barrier_posts;
+    b.app_starts = g_app_link_starts;
+    b.request_gen = s_wifi.request_gen;
+    b.log_assoc = log_count('W', LATE_LOG_ASSOC);
+    b.log_ip = log_count('W', LATE_LOG_IP);
+    b.log_202 = log_count('W', LATE_LOG_202);
+    b.log_8 = log_count('W', LATE_LOG_8);
+    return b;
+}
+
+/* Late events of the failed epoch, in the orders the review named. */
+static void deliver_late_events(void)
+{
+    ev_connected_only();                             /* STA_CONNECTED ...          */
+    ev_got_ip();                                     /* ... then GOT_IP (+ app)    */
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);            /* STA_DISCONNECTED 202       */
+    ev_disconnect(WIFI_REASON_ASSOC_LEAVE);          /* STA_DISCONNECTED 8         */
+    g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_START, NULL);
+    g_wifi_handler(NULL, WIFI_EVENT, WIFI_EVENT_STA_STOP, NULL);
+    ev_connected_only();                             /* and once more after those  */
+    ev_got_ip();
+}
+
+static void check_late_events_ignored(const late_snapshot_t *b)
+{
+    CHECK(!wifi_manager_link_is_current());          /* no app service start */
+    CHECK(!wifi_manager_is_connected());             /* no CONNECTED bit */
+    CHECK(g_app_link_starts == b->app_starts);
+    CHECK(!s_wifi.associated);                       /* no ownership */
+    CHECK(!s_wifi.attempt_in_flight);                /* no attempt credit */
+    CHECK(s_wifi.reconnect_count == b->reconnect_count);   /* no retry-state reset */
+    CHECK(s_wifi.auth_fail_count == b->auth_fail_count);
+    CHECK(s_wifi.reconfigure_in_progress == b->reconfigure);
+    CHECK(!s_wifi.connect_requested && !b->connect_requested);   /* not resurrected */
+    CHECK(failed_bit());
+    CHECK(!g_timer_armed && !s_wifi.timer_armed);
+    CHECK(!g_epoch_timer_armed && !EPOCH_TIMER_ARMED_FLAG);
+    CHECK(EPOCH_STATE == EPOCH_IDLE);
+    CHECK(g_connect_calls == b->connect_calls && g_disconnect_calls == b->disconnect_calls);
+    CHECK(g_stop_calls == b->stop_calls && g_start_calls == b->start_calls);
+    CHECK(g_set_config_calls == b->set_config_calls && g_barrier_posts == b->barrier_posts);
+    CHECK(s_wifi.request_gen == b->request_gen);
+    CHECK(REBOOT_NEEDED);
+    CHECK(log_count('W', LATE_LOG_ASSOC) == b->log_assoc + 2);   /* each one logged */
+    CHECK(log_count('W', LATE_LOG_IP) == b->log_ip + 2);
+    CHECK(log_count('W', LATE_LOG_202) == b->log_202 + 1);
+    CHECK(log_count('W', LATE_LOG_8) == b->log_8 + 1);
+    /* Later requests are still refused, with no driver calls. */
+    CHECK(wifi_manager_connect("LabAP", "pw") == WIFI_MANAGER_ERR_DRIVER_UNRESOLVED);
+    CHECK(wifi_manager_connect_stored_async() == WIFI_MANAGER_ERR_DRIVER_UNRESOLVED);
+    CHECK(g_set_config_calls == b->set_config_calls && g_connect_calls == b->connect_calls);
+    CHECK(g_disconnect_calls == b->disconnect_calls);
+}
+
+static void late_events_after_failure(void)
+{
+    const late_snapshot_t b = late_snapshot();
+    deliver_late_events();
+    check_late_events_ignored(&b);
+}
+
+static void scenario_late_events_after_stop_error_via_retry(void)
+{
+    boot("BenchAP");
+    g_stop_err = ESP_FAIL;
+    open_epoch_via_retry();
+    check_epoch_failed_truthfully();
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_stop_error_via_stored_reentry(void)
+{
+    boot("BenchAP");
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* silent attempt */
+    CHECK(wifi_manager_connect_stored_async() == ESP_OK);   /* kicks it, defers */
+    g_stop_err = ESP_FAIL;
+    CHECK(wifi_manager_connect_stored_async() == WIFI_MANAGER_ERR_DRIVER_UNRESOLVED);
+    CHECK(!s_wifi.connect_requested && REBOOT_NEEDED);
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_barrier_post_failure(void)
+{
+    boot("BenchAP");
+    g_barrier_post_err = ESP_FAIL;
+    open_epoch_via_retry();
+    check_epoch_failed_truthfully();
+    pump_pending();                                  /* the driver's own STA_STOP */
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_missing_sta_stop_deadline(void)
+{
+    boot("BenchAP");
+    g_lose_sta_stop = true;
+    open_epoch_via_retry();
+    pump_pending();
+    fire_epoch_timer();
+    check_epoch_failed_truthfully();
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_missing_barrier_deadline(void)
+{
+    boot("BenchAP");
+    g_lose_barrier = true;
+    open_epoch_via_retry();
+    pump_pending();
+    fire_epoch_timer();
+    check_epoch_failed_truthfully();
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_start_error(void)
+{
+    boot("BenchAP");
+    g_start_err = ESP_FAIL;
+    open_epoch_via_retry();
+    run_epoch();
+    check_epoch_failed_truthfully();
+    late_events_after_failure();
+}
+
+static void scenario_late_events_after_missing_sta_start_deadline(void)
+{
+    boot("BenchAP");
+    g_lose_sta_start = true;
+    open_epoch_via_retry();
+    run_epoch();
+    fire_epoch_timer();
+    check_epoch_failed_truthfully();
+    late_events_after_failure();
+}
+
+/* The round-7 reproduction, exactly: a late STA_CONNECTED then GOT_IP after a
+ * stop-error epoch failure made the link current, set CONNECTED and started app
+ * services while the request was DRIVER_UNRESOLVED. */
+static void scenario_zz_p1_late_connected_after_failed_epoch(void)
+{
+    boot("BenchAP");
+    g_stop_err = ESP_FAIL;
+    open_epoch_via_retry();
+    check_epoch_failed_truthfully();
+    const int before = g_app_link_starts;
+    ev_connected_only();
+    ev_got_ip();
+    CHECK(!wifi_manager_link_is_current() && !wifi_manager_is_connected() &&
+          g_app_link_starts == before);
+    CHECK(REBOOT_NEEDED);
+}
+
+/* Defence in depth: each gate must hold ON ITS OWN. After the latch, the state
+ * each gate protects is FORCED (as if some other path had leaked it), so that
+ * removing any single gate is observable. In the natural flow the STA_CONNECTED
+ * gate already keeps associated false and connect_requested stays false. */
+static void scenario_failed_epoch_gates_hold_even_if_state_leaks(void)
+{
+    boot("BenchAP");
+    g_stop_err = ESP_FAIL;
+    open_epoch_via_retry();
+    check_epoch_failed_truthfully();
+    const int starts = g_app_link_starts;
+    const int calls = g_connect_calls;
+
+    /* link_is_current() and GOT_IP, with ownership leaked. */
+    s_wifi.associated = true;
+    s_wifi.link_gen = s_wifi.request_gen;
+    s_wifi.reconnect_count = 7;
+    s_wifi.auth_fail_count = 3;
+    CHECK(!wifi_manager_link_is_current());
+    ev_got_ip();
+    CHECK(!wifi_manager_is_connected() && g_app_link_starts == starts);
+    CHECK(s_wifi.reconnect_count == 7 && s_wifi.auth_fail_count == 3);
+    s_wifi.associated = false;
+
+    /* STA_CONNECTED: no ownership, FAILED kept. */
+    ev_connected_only();
+    CHECK(!s_wifi.associated && failed_bit());
+
+    /* STA_DISCONNECTED and the reconnect timer, with the request leaked. */
+    s_wifi.connect_requested = true;
+    ev_disconnect(WIFI_REASON_AUTH_FAIL);
+    CHECK(!g_timer_armed && s_wifi.reconnect_count == 7 && s_wifi.auth_fail_count == 3);
+    g_timer_cb(NULL);                                /* a late dispatch */
+    CHECK(g_connect_calls == calls && !s_wifi.attempt_in_flight);
+    CHECK(log_count('W', "reconnect timer after a failed recovery epoch") == 1);
+    s_wifi.connect_requested = false;
+    CHECK(REBOOT_NEEDED);
+}
+
 /* A 32-char SSID fills sta.ssid with no NUL; current_ssid must stay bounded. */
 static void scenario_ssid_32_chars(void)
 {
@@ -2364,6 +2582,23 @@ int main(int argc, char **argv)
         { "epoch_missing_barrier_deadline", scenario_epoch_missing_barrier_deadline },
         { "epoch_start_error_terminal", scenario_epoch_start_error_terminal },
         { "epoch_missing_sta_start_deadline", scenario_epoch_missing_sta_start_deadline },
+        { "late_events_after_stop_error_via_retry",
+          scenario_late_events_after_stop_error_via_retry },
+        { "late_events_after_stop_error_via_stored_reentry",
+          scenario_late_events_after_stop_error_via_stored_reentry },
+        { "late_events_after_barrier_post_failure",
+          scenario_late_events_after_barrier_post_failure },
+        { "late_events_after_missing_sta_stop_deadline",
+          scenario_late_events_after_missing_sta_stop_deadline },
+        { "late_events_after_missing_barrier_deadline",
+          scenario_late_events_after_missing_barrier_deadline },
+        { "late_events_after_start_error", scenario_late_events_after_start_error },
+        { "late_events_after_missing_sta_start_deadline",
+          scenario_late_events_after_missing_sta_start_deadline },
+        { "zz_p1_late_connected_after_failed_epoch",
+          scenario_zz_p1_late_connected_after_failed_epoch },
+        { "failed_epoch_gates_hold_even_if_state_leaks",
+          scenario_failed_epoch_gates_hold_even_if_state_leaks },
     };
     /* Round-6 historical evidence (see the _hist functions): not in SCENARIOS. */
     static const struct { const char *name; void (*fn)(void); } k_round6_hist[] = {

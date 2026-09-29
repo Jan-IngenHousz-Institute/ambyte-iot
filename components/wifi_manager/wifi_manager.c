@@ -936,6 +936,14 @@ static void wifi_manager_reconnect_timer_cb(void *arg)
         return;
     }
     s_wifi.timer_armed = false;
+    if (s_wifi.reboot_needed) {
+        /* reboot_needed gate (round 8): after a failed recovery epoch the driver
+         * state is unknown and the request ended DRIVER_UNRESOLVED; no retry may
+         * run from a late dispatch, even if request state leaked. */
+        wifi_manager_unlock();
+        ESP_LOGW(TAG, "reconnect timer after a failed recovery epoch - reboot required, ignored");
+        return;
+    }
     if (!s_wifi.connect_requested) {
         wifi_manager_unlock();
         return;
@@ -1120,6 +1128,16 @@ static void wifi_event_handler(
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
 
         wifi_manager_lock();
+        if (s_wifi.reboot_needed) {
+            /* reboot_needed gate (round 8): after a failed recovery epoch the
+             * driver state is unknown and the request ended DRIVER_UNRESOLVED; a
+             * late disconnect must not schedule a retry, charge a budget or touch
+             * attribution state. */
+            wifi_manager_unlock();
+            ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d) after a failed recovery epoch - "
+                     "reboot required, ignored", (int)reason);
+            return;
+        }
         if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE) {
             /* Belongs to the stopped epoch (e.g. stop while associated raises
              * ASSOC_LEAVE before STA_STOP): no retry, no charge. */
@@ -1230,6 +1248,16 @@ static void wifi_event_handler(
 
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_CONNECTED)) {
         wifi_manager_lock();
+        if (s_wifi.reboot_needed) {
+            /* reboot_needed gate (round 8): after a failed recovery epoch the attempt
+             * slot was invalidated, so a late STA_CONNECTED would default its owner
+             * to the current (DRIVER_UNRESOLVED) request. It must establish no
+             * ownership (associated / link_gen), clear no FAILED bit and reset no
+             * retry state. */
+            wifi_manager_unlock();
+            ESP_LOGW(TAG, "association after a failed recovery epoch - reboot required, ignored");
+            return;
+        }
         if (s_wifi.epoch_state != WIFI_MANAGER_EPOCH_IDLE) {
             wifi_manager_unlock();
             ESP_LOGW(TAG, "association during recovery epoch - old epoch, not credited");
@@ -1264,6 +1292,14 @@ static void wifi_event_handler(
 
     if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
         wifi_manager_lock();
+        if (s_wifi.reboot_needed) {
+            /* reboot_needed gate (round 8): after a failed recovery epoch no GOT_IP
+             * may set CONNECTED, reset retry state or complete the ended
+             * (DRIVER_UNRESOLVED) request, whatever ownership state it finds. */
+            wifi_manager_unlock();
+            ESP_LOGW(TAG, "IP after a failed recovery epoch - reboot required, ignored");
+            return;
+        }
         const bool current_link = (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_IDLE) &&
                                   s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
         if (current_link) {
@@ -1713,7 +1749,10 @@ bool wifi_manager_link_is_current(void)
         return false;
     }
     wifi_manager_lock();
-    const bool current = (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_IDLE) &&
+    /* reboot_needed gate (round 8): after a failed recovery epoch the app must
+     * start no link services (SNTP/MQTT), whatever ownership state is left. */
+    const bool current = !s_wifi.reboot_needed &&
+                         (s_wifi.epoch_state == WIFI_MANAGER_EPOCH_IDLE) &&
                          s_wifi.associated && (s_wifi.link_gen == s_wifi.request_gen);
     wifi_manager_unlock();
     return current;

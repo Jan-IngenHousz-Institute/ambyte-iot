@@ -87,6 +87,15 @@ SCENARIOS = (
     "epoch_missing_barrier_deadline",
     "epoch_start_error_terminal",
     "epoch_missing_sta_start_deadline",
+    "late_events_after_stop_error_via_retry",
+    "late_events_after_stop_error_via_stored_reentry",
+    "late_events_after_barrier_post_failure",
+    "late_events_after_missing_sta_stop_deadline",
+    "late_events_after_missing_barrier_deadline",
+    "late_events_after_start_error",
+    "late_events_after_missing_sta_start_deadline",
+    "zz_p1_late_connected_after_failed_epoch",
+    "failed_epoch_gates_hold_even_if_state_leaks",
 )
 
 
