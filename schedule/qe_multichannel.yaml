@@ -1,18 +1,29 @@
 schema: jii.ambyte-schedule/v1-draft
 id: urn:jii:schedule:qe-multichannel
-version: 0.2.0-draft
+version: 0.3.0-draft
 name: qe-multichannel
-description: default-multichannel plus a PAR read before every MPF and a twice-daily qE (NPQ induction/relaxation) sequence at 10:00 and 16:00 local.
+description: default-multichannel plus a PAR read before every MPF and a twice-daily qE (NPQ induction/relaxation) sequence at 10:00 and 16:00 local; every spectrum is the raw three-tier read (AMBIT cmd 35).
 
 # Site facts such as location, timezone, deployment, and MAC live in NVS.
 # This schedule is identical across sites.
 #
 # Differences from default-multichannel:
-#   1. Every MPF is preceded by a PAR read (ambit/spectrum). Today that action
-#      sends AMBIT cmd 31 (get_spec: 10 bins + calibrated PAR). The raw
-#      three-tier PAR command (cmd 35, get_spec_raw, AMBIT fw >= 1.2.0) has no
-#      ambyte action yet — see the firmware follow-up in the PR description.
-#   2. A `qe` job runs PAR → MPF → light phase (500 µmol actinic: 10 s, MPF,
+#   1. Every MPF is preceded by a PAR read (ambit/spectrum).
+#   2. Every ambit/spectrum step — the PAR reads AND the 5-min `spectra` grid —
+#      sets `raw: true`: AMBIT cmd 35 (get_spec_raw: unscaled counts, exposure,
+#      quality flags, three-tier PAR) stored as `ambit.spectrum/2`, instead of
+#      cmd 31's legacy `ambit.spectrum/1`. All of them, not just the qE ones,
+#      because /1 and /2 `par` are different quantities: a schedule mixing the
+#      two would put two PAR scales into one experiment's spectrum table.
+#      Requirements, both enforced rather than assumed:
+#        - ambyte firmware with the `raw` input (>= 2.6.0). Older firmware's
+#          strict compiler rejects the unknown input and keeps its current
+#          schedule, so deliver this file with a `gte 2.6.0` version filter.
+#        - AMBIT fw >= 1.2.0 per channel. An older AMBIT falls back to cmd 31
+#          on that channel only and stores /1 there (the schema tag says which).
+#      A workbook processing this schedule needs a `schema == ambit.spectrum/2`
+#      route: a branch matching ambit.spectrum/1 does not match /2 rows.
+#   3. A `qe` job runs PAR → MPF → light phase (500 µmol actinic: 10 s, MPF,
 #      20 s, MPF, 30 s, MPF) → dark phase (10 s, MPF, 20 s, MPF, 30 s, MPF).
 #
 # The runner is a single task, so while `qe` runs (~4.5 min) nothing else
@@ -270,6 +281,8 @@ jobs:
     steps:
       - uses: ambit/spectrum
         continue-on-error: true
+        with:
+          raw: true
       - uses: ambit/trace
         continue-on-error: true
         with:
@@ -325,6 +338,8 @@ jobs:
     steps:
       # With no channels list, every AMBIT that answers a ping is measured.
       - uses: ambit/spectrum
+        with:
+          raw: true
 
   saturating_flash:
     schedule:
@@ -337,6 +352,8 @@ jobs:
       # same minute; the second read is seconds later and costs ~0.4 s.
       - uses: ambit/spectrum
         continue-on-error: true
+        with:
+          raw: true
       - uses: ambit/trace
         with:
           protocol: MPF
@@ -352,6 +369,8 @@ jobs:
     steps:
       - uses: ambit/spectrum
         continue-on-error: true
+        with:
+          raw: true
       - uses: ambit/trace
         with:
           protocol: MPF
