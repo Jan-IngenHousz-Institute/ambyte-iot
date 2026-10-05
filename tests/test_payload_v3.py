@@ -250,6 +250,56 @@ class PayloadV3Test(unittest.TestCase):
         actions = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
         self.assertIn("char payload[PAYLOAD_V3_SPECTRUM_CAP]", actions)
 
+    def test_spectrum_raw_is_its_own_family_version_with_exposure_and_quality(self) -> None:
+        # cmd 35's PAR is the three-tier quantity, not cmd 31's spec_coef PAR,
+        # so it must never share a schema with /1 rows.
+        raw = self.records["SPECTRUM_RAW"]
+        self.assertEqual(raw["schema"], "ambit.spectrum/2")
+        self.assertEqual(
+            set(raw),
+            {"schema", "measure_id", "channel", "device", "sensor_id", "tag", "time",
+             "cal_version", "exposure", "quality", "observations"},
+        )
+        self.assertEqual(raw["tag"], "MEASUREMENT")
+        self.assertEqual(raw["sensor_id"], "3C:DC:75:0D:FD:20")
+        self.assertEqual(raw["cal_version"], "c96cda1b")
+        self.assertEqual(
+            raw["exposure"],
+            {"atime": 99, "astep": 499, "gain_low": 2, "gain_high": 2, "tint_ms": 139.0},
+        )
+        # flags 0x0203: bit0 saturated, bit1 clipped, bit9 tier-3 stored; the
+        # two zones decode independently and the raw word survives.
+        self.assertEqual(
+            raw["quality"],
+            {"flags": 0x0203, "saturated": True, "clipped": True,
+             "analog_saturated": False, "fault": False,
+             "sat_mask": 1, "clip_mask": 0x200,
+             "par_weight_fit": False, "tier3_stored": True},
+        )
+        obs = raw["observations"]
+        self.assertEqual(set(obs), {"par", "par_tier2", "spectrum", "spectrum_cal"})
+        self.assertEqual(obs["par"], {"u": "umol.m-2.s-1", "v": 412.5})
+        self.assertEqual(obs["par_tier2"]["u"], "1")
+        self.assertAlmostEqual(obs["par_tier2"]["v"], 0.00123456, places=9)
+        self.assertEqual(obs["spectrum"], {"u": "count", "v": [65535, 1, 2, 3, 4, 5, 6, 7, 8, 9]})
+        self.assertEqual(obs["spectrum_cal"]["u"], "1")
+        self.assertEqual(obs["spectrum_cal"]["v"][:3], [1.5, 0.25, 0.000125])
+        # /1 consumers are untouched: the legacy family still exists verbatim.
+        self.assertEqual(self.records["SPECTRUM"]["schema"], "ambit.spectrum/1")
+        self.assertNotIn("exposure", self.records["SPECTRUM"])
+
+        header = (ROOT / "components/payload_codec/include/payload_v3.h").read_text()
+        cap = int(
+            header.split("#define PAYLOAD_V3_SPECTRUM_RAW_CAP", 1)[1].split("U", 1)[0].strip()
+        )
+        worst = int(self.raw_records["SPECTRUM_RAW_MAX_LEN"])
+        self.assertLess(worst, cap)
+        actions = (ROOT / "components/sched_runner/sched_runner_actions.c").read_text()
+        self.assertIn("char payload[PAYLOAD_V3_SPECTRUM_RAW_CAP]", actions)
+        # The publisher routes /2 as canonical v3 (no v2 envelope splice).
+        codec = (ROOT / "components/payload_codec/payload_v3.c").read_text()
+        self.assertIn('ambit.spectrum/2\\"") ||', codec)
+
     def test_telemetry_is_one_grouped_object_and_empty_snapshot_is_stable(self) -> None:
         telemetry = self.records["TELEMETRY"]
         self.assertEqual(telemetry["schema"], "ambyte.telemetry/1")

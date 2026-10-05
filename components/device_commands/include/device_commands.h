@@ -15,6 +15,7 @@
 #include "sensing_port.h"
 #include "script_identity_port.h"
 #include "uart_sensor_port.h"
+#include "ambit_protocol.h"   /* ambit_spec_raw_t (cmd 35 frame) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -302,6 +303,10 @@ cmd_result_t cmd_ambit_config_detector(uint8_t ch);
 /* Queries (immediate raw response) */
 cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp);
 cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par);
+/* Cmd 35 (AMBIT fw >= 1.2.0): the decoded 80-byte get_spec_raw frame. Fails
+ * with a timeout on older AMBITs (they answer nothing) and with
+ * ESP_ERR_INVALID_VERSION on an unknown frame format. */
+cmd_result_t cmd_ambit_get_spec_raw(uint8_t ch, ambit_spec_raw_t *out);
 cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
                                      float *chip, int16_t raw[4]);
 cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,

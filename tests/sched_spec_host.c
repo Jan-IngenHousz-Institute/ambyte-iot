@@ -60,6 +60,19 @@ static void expect_compile_err(const char *yaml, const char *needle, int line)
 }
 #define COMPILE_ERR(yaml, needle) expect_compile_err(yaml, needle, __LINE__)
 
+/* Entry lookup by declared input name — the compiler emits explicit entries
+ * first (document order) and materialized defaults after (table order), so
+ * positional indexing is fragile once an action has more than one default. */
+static const sched_entry_t *find_entry(const sched_program_t *p,
+                                       const sched_step_t *step, const char *name)
+{
+    for (int e = 0; e < step->entry_count; e++) {
+        const sched_entry_t *en = &p->entries[step->entry_start + e];
+        if (strcmp(step->action->inputs[en->input_idx].name, name) == 0) return en;
+    }
+    return NULL;
+}
+
 static bool parse_only_ok(const char *yaml)
 {
     sched_yaml_doc_t *doc = NULL;
@@ -414,17 +427,65 @@ static void test_compiler_rules(void)
         "            - 2\n");
     CHECK(p != NULL);
     if (p != NULL) {
+        /* ambit/spectrum materializes two defaults (channels + raw): explicit
+         * entries come first in document order, then defaults in table order,
+         * so look entries up by name rather than by position */
         const sched_step_t *a = &p->jobs[0].steps[0];
-        CHECK(a->entry_count == 1);
-        const sched_entry_t *ea = &p->entries[a->entry_start];
-        CHECK(ea->type == SCHED_VAL_CHANNELS && ea->u.chans.n == 0);
+        CHECK(a->entry_count == 2);
+        const sched_entry_t *ea = find_entry(p, a, "channels");
+        CHECK(ea != NULL && ea->type == SCHED_VAL_CHANNELS && ea->u.chans.n == 0);
+        const sched_entry_t *ra = find_entry(p, a, "raw");
+        CHECK(ra != NULL && ra->type == SCHED_VAL_BOOL && ra->u.i == 0);
         const sched_step_t *b = &p->jobs[1].steps[0];
-        CHECK(b->entry_count == 1);
-        const sched_entry_t *eb = &p->entries[b->entry_start];
-        CHECK(eb->type == SCHED_VAL_CHANNELS && eb->u.chans.n == 2);
-        CHECK(eb->u.chans.v[0] == 0 && eb->u.chans.v[1] == 2);
+        CHECK(b->entry_count == 2);
+        const sched_entry_t *eb = find_entry(p, b, "channels");
+        CHECK(eb != NULL && eb->type == SCHED_VAL_CHANNELS && eb->u.chans.n == 2);
+        CHECK(eb != NULL && eb->u.chans.v[0] == 0 && eb->u.chans.v[1] == 2);
         free(p);
     }
+
+    /* ambit/spectrum raw: opt-in to AMBIT cmd 35; absent = false so every
+     * released schedule keeps its cmd 31 read (ambit.spectrum/1) */
+    p = COMPILE_OK(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  a:\n"
+        "    schedule:\n"
+        "      cron: \"*/5 * * * *\"\n"
+        "    steps:\n"
+        "      - uses: ambit/spectrum\n"
+        "        with:\n"
+        "          raw: true\n");
+    CHECK(p != NULL);
+    if (p != NULL) {
+        const sched_step_t *a = &p->jobs[0].steps[0];
+        CHECK(a->entry_count == 2);
+        const sched_entry_t *ra = find_entry(p, a, "raw");
+        CHECK(ra != NULL && ra->type == SCHED_VAL_BOOL && ra->u.i == 1);
+        const sched_entry_t *ea = find_entry(p, a, "channels");
+        CHECK(ea != NULL && ea->type == SCHED_VAL_CHANNELS && ea->u.chans.n == 0);
+        free(p);
+    }
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+                "jobs:\n"
+                "  a:\n"
+                "    schedule:\n"
+                "      cron: \"*/5 * * * *\"\n"
+                "    steps:\n"
+                "      - uses: ambit/spectrum\n"
+                "        with:\n"
+                "          raw: 1\n",
+                "input 'raw' must be true/false");
+    COMPILE_ERR("schema: jii.ambyte-schedule/v1-draft\n"
+                "jobs:\n"
+                "  a:\n"
+                "    schedule:\n"
+                "      cron: \"*/5 * * * *\"\n"
+                "    steps:\n"
+                "      - uses: ambit/leaf-temp\n"
+                "        with:\n"
+                "          raw: true\n",
+                "unknown input 'raw'");
 
     /* db/store-event: placeholders validated, map entries typed */
     p = COMPILE_OK(
