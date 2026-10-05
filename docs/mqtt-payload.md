@@ -89,6 +89,7 @@ whose conditions all hold for the row it is publishing**:
 | --- | --- |
 | `ambit.trace/3` | `[ambyte-trace]` |
 | `ambit.spectrum/1` | `[ambyte-spectrum]` |
+| `ambit.spectrum/2` | whatever the workbook's `when:` matches — a `schema == ambit.spectrum/1` branch does NOT match it |
 | `ambyte.telemetry/1` | `[ambyte-telemetry]` |
 | a v2 backlog row (no `schema` key) | key omitted entirely |
 
@@ -369,16 +370,21 @@ require idx-8 firmware.
   every raw array, uses `cal_version:null` when unavailable, and includes
   `metadata.sensor_id` whenever identity is known. It has no `schema` key and
   never mixes v2/v3 fields.
-- The spectrum action migrated to `ambit.spectrum/1` (§8a). Leaf-temperature
+- The spectrum action migrated to `ambit.spectrum/1` (§8a); with `raw: true`
+  it stores `ambit.spectrum/2` (§8b). Leaf-temperature
   and the generic `db/store-event` schedule action remain permanently v2 unless
   separately migrated. Dual-read and the v2 compat view are therefore
   permanent, not a backlog-drain window.
 
 ## 8a. Spectrum object (normative, Ambyte only)
 
-The `ambit/spectrum` schedule action reads AMBIT cmd 35 (`get_par`): a
-ten-bin spectrum plus a PAR scalar. It has no arrays and no stimulus, so it is
-its own small family rather than a degenerate trace.
+The `ambit/spectrum` schedule action (without `raw`) reads AMBIT cmd 31
+(`get_spec`, ASCII vocabulary `get_par`): a ten-bin spectrum plus a PAR scalar.
+It has no arrays and no stimulus, so it is its own small family rather than a
+degenerate trace. The PAR here is the AMBIT's legacy chain — integer channel
+weights scaled by the calibration `spec_coef` — and cmd 31 is frozen against
+the deployed fleet. (Earlier revisions of this section said cmd 35; the
+firmware never sent 35 until the `raw` input of §8b existed.)
 
 ```jsonc
 {
@@ -409,6 +415,73 @@ Notes:
   schedule shipped two payload generations at once. Rows stored before the
   migration keep that shape and are read through the v2 compat view; the
   `cmd_raw` column still records `get_par` for replay.
+
+## 8b. Raw spectrum object `ambit.spectrum/2` (normative, Ambyte only)
+
+With `raw: true`, `ambit/spectrum` sends AMBIT cmd 35 (`get_spec_raw`, AMBIT fw
+≥ 1.2.0) and stores `ambit.spectrum/2`. It is a **separate family version**
+because its `par` is a different quantity from /1's: the AMBIT's three-tier
+chain
+
+```
+tint_ms  = (atime+1) * (astep+1) * 2.78e-3           // ms; 99/499 → 139 ms
+x[i]     = raw[i] / (gain(i) * tint_ms)              // tier 1, gain = 0.5 * 2^ordinal
+s[i]     = max(0, x[i] - spec_offset[i])             // dark offset → clip_mask
+spectrum_cal[i] = s[i] * spec_sens[i]                // goal A
+par_tier2 = Σ par_weight[i] * s[i]                   // goal B, tier 2
+par       = par_slope * par_tier2 + par_intercept    // goal B, tier 3
+```
+
+Slots 0–3 (F1–F4) divide by `gain_low`; slots 4–9 (F5–F8, NIR, Clear) by
+`gain_high`. Never average /1 and /2 `par` values under one column.
+
+```jsonc
+{
+  "schema": "ambit.spectrum/2",
+  "measure_id": 65929,
+  "channel": "uart_0",
+  "device": "AD81",
+  "sensor_id": "3C:DC:75:0D:FD:20",     // OPTIONAL, as in /1
+  "tag": "MEASUREMENT",
+  "time": { "start_utc": 1788718543000, "end_utc": 1788718543400 },
+  "cal_version": "c96cda1b",            // null when calibration is unread
+  "exposure": { "atime": 99, "astep": 499, "gain_low": 2, "gain_high": 2, "tint_ms": 139.000 },
+  "quality": {
+    "flags": 0,                          // raw wire word, reserved bits included
+    "saturated": false,                  // bit0: a channel at digital full scale
+    "clipped": false,                    // bit1: a channel clipped at its dark offset
+    "analog_saturated": false,           // bit2: AS7341 ASAT
+    "fault": false,                      // bit3: I2C read failed — treat counts as junk
+    "sat_mask": 0, "clip_mask": 0,       // bit i = channel i (F1..F8, NIR, Clear)
+    "par_weight_fit": false,             // bit8: tier-2 vector is an ambit fleet fit (0 = borrowed seed)
+    "tier3_stored": false                // bit9: per-device slope/intercept stored
+  },
+  "observations": {
+    "par":          { "u": "umol.m-2.s-1", "v": 0.00 },
+    "par_tier2":    { "u": "1", "v": 0 },
+    "spectrum":     { "u": "count", "v": [0,0,0,0,0,0,0,0,0,0] },
+    "spectrum_cal": { "u": "1", "v": [0,0,0,0,0,0,0,0,0,0] }
+  }
+}
+```
+
+Notes:
+
+- `spectrum` keeps /1's meaning (unscaled ADC counts); `spectrum_cal` and
+  `par_tier2` are dimensionless (UCUM `1`) until goal A / tier 2 are fitted in
+  absolute units on ambit optics — the shipped vectors are miniPar seeds, which
+  is exactly what `par_weight_fit: false` says. A consumer wanting one
+  "is this PAR trustworthy" test requires **both** `par_weight_fit` and
+  `tier3_stored`; treating an unset bit as trustworthy is the failure the
+  two-zone flags word exists to prevent.
+- `par_tier2` is stored so a later Li-250A comparison can rescale every past
+  reading without repeating bench work.
+- Gains are `as7341_gain_t` ordinals (n → 0.5·2ⁿ), not multipliers.
+- Floats in `spectrum_cal`/`par_tier2` use `%.6g`; `par` keeps /1's `%.2f`.
+- Fallback: an AMBIT whose cached firmware version predates 1.2.0 cannot answer
+  cmd 35, so the action takes cmd 31 instead and stores `ambit.spectrum/1` for
+  that channel — the schema tag, not the schedule, says which read happened.
+- The `cmd_raw` column records `get_spec_raw` for replay.
 
 ## 9. Ambyte telemetry object (normative, Ambyte only)
 

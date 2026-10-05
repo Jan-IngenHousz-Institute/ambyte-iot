@@ -13,7 +13,7 @@ extern "C" {
 #define PAYLOAD_V3_MAX_ARRAYS   12U
 #define PAYLOAD_V3_MAX_ATTACHED  4U
 #define PAYLOAD_V3_TICK_FACTOR_MAX 100.0
-/* AMBIT cmd 35 returns a fixed ten-bin spectrum plus a PAR scalar. */
+/* AMBIT cmd 31 (and cmd 35) return a fixed ten-bin spectrum plus a PAR scalar. */
 #define PAYLOAD_V3_SPECTRUM_BINS 10U
 /* Every producer MUST size its output buffer with this, not a hand-guessed
  * literal: a 320 B guess overflowed on the bench with a real 20-char ambit_name
@@ -22,6 +22,12 @@ extern "C" {
  * escaped device name ≤ 40, sensor_id 32, two epoch-ms stamps ~30, ten bins at
  * "65535," = 60 — so 512 leaves headroom without another heap tenant. */
 #define PAYLOAD_V3_SPECTRUM_CAP 512U
+/* ambit.spectrum/2 (cmd 35) adds the exposure block, the quality block, ten
+ * calibrated float bins and par_tier2 on top of the /1 shape. Worst case ≈
+ * 880 B: /1's ~416 + exposure ~75 + quality ~150 + ten "%.6g" bins at 13 =
+ * 130 + par_tier2 ~35. 1024 leaves headroom; the host test pins the measured
+ * worst case against this constant. */
+#define PAYLOAD_V3_SPECTRUM_RAW_CAP 1024U
 
 typedef struct {
     uint8_t type;
@@ -167,8 +173,8 @@ typedef struct {
     double tick_factor;
 } payload_v3_device_input_t;
 
-/* Point read from AMBIT cmd 35 (`get_par`). Small enough to carry its samples
- * by value, unlike a trace's borrowed arrays. */
+/* Point read from AMBIT cmd 31 (`get_spec`, ASCII `get_par`). Small enough to
+ * carry its samples by value, unlike a trace's borrowed arrays. */
 typedef struct {
     int64_t measure_id;
     const char *channel;
@@ -181,6 +187,38 @@ typedef struct {
     double par;
     uint16_t spectrum[PAYLOAD_V3_SPECTRUM_BINS];
 } payload_v3_spectrum_input_t;
+
+/* Point read from AMBIT cmd 35 (`get_spec_raw`, fw >= 1.2.0) → ambit.spectrum/2.
+ * A separate family version, not extra keys on /1: its `par` is the
+ * three-tier quantity (par_slope * par_weight . basic_counts + par_intercept),
+ * not cmd 31's spec_coef-scaled legacy PAR, and a consumer must never average
+ * the two under one schema. Fields mirror the wire frame (ambit_protocol.h);
+ * this component stays free of that header so the host test builds it alone. */
+typedef struct {
+    int64_t measure_id;
+    const char *channel;
+    const char *device;
+    const char *sensor_id;
+    int64_t start_utc_ms;
+    int64_t end_utc_ms;
+    bool calibration_present;
+    uint32_t cal_version;
+    /* exposure the counts were taken under */
+    uint8_t atime;
+    uint16_t astep;
+    uint8_t gain_low;    /* as7341_gain_t ORDINAL (n = 0.5 * 2^n), F1-F4 */
+    uint8_t gain_high;   /* ORDINAL, F5-F8 + NIR + Clear */
+    double tint_ms;      /* (atime+1)(astep+1) * 2.78e-3, precomputed by the producer */
+    /* quality: raw flags word plus the per-channel masks */
+    uint16_t flags;      /* low byte conditions (1 = attention), high byte calibration (1 = confirmed) */
+    uint16_t sat_mask;
+    uint16_t clip_mask;
+    /* observations */
+    double par;          /* goal B tier 3 */
+    double par_tier2;    /* goal B tier 2, before slope/intercept */
+    uint16_t spectrum[PAYLOAD_V3_SPECTRUM_BINS];      /* unscaled counts F1..F8, NIR, Clear */
+    double spectrum_cal[PAYLOAD_V3_SPECTRUM_BINS];    /* goal A: normalised, offset-corrected, spec_sens-scaled */
+} payload_v3_spectrum_raw_input_t;
 
 typedef enum {
     PAYLOAD_TRACE_ROUTE_ERROR = 0,
@@ -203,6 +241,9 @@ payload_trace_route_t payload_v3_build_trace_lossless(
 bool payload_v3_build_spectrum(char *out, size_t cap,
                                const payload_v3_spectrum_input_t *input,
                                char *error, size_t error_cap);
+bool payload_v3_build_spectrum_raw(char *out, size_t cap,
+                                   const payload_v3_spectrum_raw_input_t *input,
+                                   char *error, size_t error_cap);
 bool payload_v3_build_telemetry(char *out, size_t cap,
                                 const payload_v3_telemetry_input_t *input,
                                 char *error, size_t error_cap);
@@ -210,8 +251,9 @@ bool payload_v3_build_device(char *out, size_t cap,
                              const payload_v3_device_input_t *input,
                              char *error, size_t error_cap);
 
-/* Schema routing is intentionally strict: only the three firmware-owned v3
- * families bypass the legacy v2 sample builder. */
+/* Schema routing is intentionally strict: only the firmware-owned v3
+ * families (trace/3, spectrum/1, spectrum/2, telemetry/1, device/1) bypass the
+ * legacy v2 sample builder. */
 bool payload_v3_is_canonical_object(const char *json);
 
 bool payload_v3_can_fetch_retained(bool trigger_valid, size_t segment_count);

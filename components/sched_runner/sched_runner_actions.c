@@ -7,7 +7,9 @@
  *   ambit/trace        ← run_trace behavior (ping gate, parallel trigger,
  *                        poll from 90 % of the estimate every 500 ms, fetch +
  *                        store on done, broken past est + deadline_margin)
- *   ambit/spectrum     ← spectrum read + store (missing id = failure)
+ *   ambit/spectrum     ← spectrum read + store (missing id = failure);
+ *                        `raw: true` = AMBIT cmd 35 (get_spec_raw) → ambit.spectrum/2,
+ *                        else cmd 31 (get_spec) → ambit.spectrum/1
  *   ambit/leaf-temp    ← leaf/chip temperature read + store
  *   ambit/actinic      ← cmd_ambit_actinic, mandatory duration, off on stop
  *   device/status-report ← cmd_store_status_event (firmware heartbeat schema)
@@ -293,12 +295,13 @@ static int64_t store_small(uint8_t ch, const char *cmd_raw, const char *payload,
 
 /* Spectra are on the schema-tagged v3 family, so their provenance lives inside
  * the payload and the v2 metadata splice above does not apply. cmd_raw is still
- * stored for replay diagnostics; the publisher routes on the schema prefix. */
-static int64_t store_spectrum(uint8_t ch, const uint16_t *spec, float par,
+ * stored for replay diagnostics; the publisher routes on the schema prefix.
+ * The caller resolves identity once so the cmd 35 firmware gate and the store
+ * share the same cached view. */
+static int64_t store_spectrum(uint8_t ch, const char *dev, const ambit_device_info_t *info,
+                              const uint16_t *spec, float par,
                               int64_t start_ms, int64_t end_ms)
 {
-    ambit_device_info_t info;
-    const char *dev = ambit_device_name(ch, &info);
     char chan[12];
     snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
     int64_t mid = 0;
@@ -308,11 +311,11 @@ static int64_t store_spectrum(uint8_t ch, const uint16_t *spec, float par,
         .measure_id          = mid,
         .channel             = chan,
         .device              = dev,
-        .sensor_id           = info.valid ? info.device_id : NULL,
+        .sensor_id           = info->valid ? info->device_id : NULL,
         .start_utc_ms        = start_ms,
         .end_utc_ms          = end_ms,
-        .calibration_present = info.valid,
-        .cal_version         = info.cal_version,
+        .calibration_present = info->valid,
+        .cal_version         = info->cal_version,
         .par                 = (double)par,
     };
     for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) in.spectrum[i] = spec[i];
@@ -336,11 +339,87 @@ static int64_t store_spectrum(uint8_t ch, const uint16_t *spec, float par,
     return cmd_store_event(&d).status == ESP_OK ? mid : -1;
 }
 
+/* cmd 35 sibling: the decoded frame goes out as ambit.spectrum/2. The frame is
+ * copied field by field into the payload input because payload_codec does not
+ * see ambit_protocol.h (its host test builds the codec alone). */
+static int64_t store_spectrum_raw(uint8_t ch, const char *dev, const ambit_device_info_t *info,
+                                  const ambit_spec_raw_t *f,
+                                  int64_t start_ms, int64_t end_ms)
+{
+    char chan[12];
+    snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+    int64_t mid = 0;
+    if (cmd_next_measure_id(&mid).status != ESP_OK) return -1;
+
+    payload_v3_spectrum_raw_input_t in = {
+        .measure_id          = mid,
+        .channel             = chan,
+        .device              = dev,
+        .sensor_id           = info->valid ? info->device_id : NULL,
+        .start_utc_ms        = start_ms,
+        .end_utc_ms          = end_ms,
+        .calibration_present = info->valid,
+        .cal_version         = info->cal_version,
+        .atime               = f->atime,
+        .astep               = f->astep,
+        .gain_low            = f->gain_low,
+        .gain_high           = f->gain_high,
+        .tint_ms             = (double)ambit_spec_tint_ms(f->atime, f->astep),
+        .flags               = f->flags,
+        .sat_mask            = f->sat_mask,
+        .clip_mask           = f->clip_mask,
+        .par                 = (double)f->par,
+        .par_tier2           = (double)f->par_tier2,
+    };
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        in.spectrum[i]     = f->raw[i];
+        in.spectrum_cal[i] = (double)f->chan[i];
+    }
+
+    char payload[PAYLOAD_V3_SPECTRUM_RAW_CAP];
+    char err[96];
+    if (!payload_v3_build_spectrum_raw(payload, sizeof payload, &in, err, sizeof err)) {
+        ESP_LOGE(TAG, "spectrum raw payload build failed: %s", err);
+        return -1;
+    }
+    measurement_event_desc_t d = {
+        .measure_id = mid,
+        .channel    = chan,
+        .device     = dev,
+        .tag        = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw    = "get_spec_raw",
+        .start_ms   = start_ms,
+        .end_ms     = end_ms,
+        .payload_json = payload,
+    };
+    return cmd_store_event(&d).status == ESP_OK ? mid : -1;
+}
+
+/* cmd 35 shipped in AMBIT fw 1.2.0; an older image logs "Bad command" and
+ * answers nothing, so asking it costs the full 5 s query timeout per read per
+ * channel — before every MPF in a qE schedule. Gate on the cached identity
+ * instead and fall back to cmd 31, which every AMBIT answers. Unknown
+ * identity (fetch failed) tries cmd 35 and lets the read report. */
+static bool ambit_supports_spec_raw(const ambit_device_info_t *info)
+{
+    if (!info->valid) return true;
+    unsigned major = 0, minor = 0;
+    if (sscanf(info->fw_version, "%u.%u", &major, &minor) != 2) return true;
+    return major > 1 || (major == 1 && minor >= 2);
+}
+
 static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
                                     const sched_program_t *prog)
 {
     sched_runner_act_ctx_t *ctx = vctx;
     const uint8_t mask = channels_mask(step, prog);
+    const sched_entry_t *e_raw = step_input(step, prog, "raw");
+    const bool want_raw = e_raw != NULL && e_raw->u.i != 0;
+    /* One WARN per channel per boot when `raw: true` degrades to cmd 31: the
+     * data says which schema it got, and repeating the line every five
+     * minutes for the life of an old AMBIT is the flood the throttle exists
+     * to prevent. */
+    static uint8_t s_raw_fallback_warned = 0;
     int present = 0, stored_ok = 0;
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (!(mask & (1u << ch))) continue;
@@ -348,24 +427,46 @@ static esp_err_t act_ambit_spectrum(void *vctx, const sched_step_t *step,
         if (!ch_present(ch)) continue;
         if (sched_runner_should_stop()) break; /* between ping and read */
         present++;
-        int64_t start_ms = now_wall_ms();
-        uint16_t spec[10] = { 0 };
-        float par = 0;
-        cmd_result_t r = cmd_ambit_get_spec(ch, spec, &par);
-        int64_t end_ms = now_wall_ms();
-        if (r.status != ESP_OK) {
-            (void)act_fail(ctx, "spectra ch%u: read failed: %s", ch, r.message);
-            continue;
+        ambit_device_info_t info;
+        const char *dev = ambit_device_name(ch, &info);
+        const bool use_raw = want_raw && ambit_supports_spec_raw(&info);
+        if (want_raw && !use_raw && !(s_raw_fallback_warned & (1u << ch))) {
+            s_raw_fallback_warned |= (uint8_t)(1u << ch);
+            ESP_LOGW(TAG, "%s: spectra ch%u: AMBIT fw %s predates cmd 35 (1.2.0); "
+                     "using cmd 31 (ambit.spectrum/1)", ctx->job_name, ch, info.fw_version);
         }
-        int64_t mid = store_spectrum(ch, spec, par, start_ms, end_ms);
+        int64_t start_ms = now_wall_ms();
+        int64_t mid;
+        float par;
+        if (use_raw) {
+            ambit_spec_raw_t f;
+            cmd_result_t r = cmd_ambit_get_spec_raw(ch, &f);
+            int64_t end_ms = now_wall_ms();
+            if (r.status != ESP_OK) {
+                (void)act_fail(ctx, "spectra ch%u: raw read failed: %s", ch, r.message);
+                continue;
+            }
+            par = f.par;
+            mid = store_spectrum_raw(ch, dev, &info, &f, start_ms, end_ms);
+        } else {
+            uint16_t spec[10] = { 0 };
+            par = 0;
+            cmd_result_t r = cmd_ambit_get_spec(ch, spec, &par);
+            int64_t end_ms = now_wall_ms();
+            if (r.status != ESP_OK) {
+                (void)act_fail(ctx, "spectra ch%u: read failed: %s", ch, r.message);
+                continue;
+            }
+            mid = store_spectrum(ch, dev, &info, spec, par, start_ms, end_ms);
+        }
         /* A missing stored id is a failure, not a warning — a measurement
          * that did not persist did not happen. */
         if (mid < 0) {
             (void)act_fail(ctx, "spectra ch%u: PAR=%.2f store failed", ch, (double)par);
             continue;
         }
-        ESP_LOGI(TAG, "%s: spectra ch%u: PAR=%.2f id=%lld",
-                 ctx->job_name, ch, (double)par, (long long)mid);
+        ESP_LOGI(TAG, "%s: spectra ch%u: PAR=%.2f%s id=%lld",
+                 ctx->job_name, ch, (double)par, use_raw ? " (cmd35)" : "", (long long)mid);
         stored_ok++;
     }
     if (present == 0) {

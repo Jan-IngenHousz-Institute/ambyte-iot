@@ -48,7 +48,7 @@ extern "C" {
  * (format v2, 9 fields):
  *   <measure_id>\t<channel>\t<device>\t<tag>\t<cmd_raw>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
  * The record layout is deliberately schema-neutral: new firmware writes the
- * complete canonical ambit.trace/3, ambyte.telemetry/1, or ambit.device/1 object
+ * complete canonical ambit.trace/3, ambit.spectrum/1|2, ambyte.telemetry/1, or ambit.device/1 object
  * in the payload column and leaves metadata empty. New firmware also keeps a
  * permanent lossless v2 trace fallback for missing v3 prerequisites or an
  * unrepresentable time model; those rows use the same split metadata/payload

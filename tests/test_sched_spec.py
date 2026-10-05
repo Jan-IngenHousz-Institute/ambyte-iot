@@ -252,6 +252,14 @@ class SchedSpecTest(unittest.TestCase):
                 self.assertNotIn("channels", required, uses)
             if uses == "ambit/trace":
                 self.assertEqual(required, ["protocol"])
+            # raw (cmd 35) is opt-in: optional, boolean, default false, so no
+            # released schedule changes what it publishes
+            if uses == "ambit/spectrum":
+                self.assertEqual(required, [])
+                self.assertEqual(
+                    branch["properties"]["with"]["properties"]["raw"],
+                    {"type": "boolean", "default": False},
+                )
             # kind is required on store-event (T3 review: NULL deref on device)
             if uses == "db/store-event":
                 self.assertIn("kind", required, uses)

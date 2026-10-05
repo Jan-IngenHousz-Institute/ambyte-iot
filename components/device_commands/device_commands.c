@@ -2607,6 +2607,71 @@ cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par)
     return make_result(ESP_OK, "AMBIT%u spectrum OK", ch + 1);
 }
 
+/* Cmd 35 — get_spec_raw (AMBIT fw >= 1.2.0): the same AS7341 read as cmd 31,
+ * reported as unscaled counts + the exposure they were taken under (atime,
+ * astep, per-bank gain ordinals) + saturation/clip masks + the three-tier
+ * calibrated spectrum and PAR. Response: 80 bytes, byte-explicit
+ * little-endian (layout in ambit_protocol.h next to ambit_spec_raw_t).
+ *
+ * Decoded field by field rather than blitted: the frame is padding-free by
+ * construction, but the point of a byte-explicit layout is that neither side
+ * depends on the other's struct alignment. memcpy of the multi-byte fields is
+ * exact because the S3 is little-endian like the sender.
+ *
+ * The frame's `par` is NOT cmd 31's PAR (spec_coef * legacy integer weights);
+ * it is par_slope * (par_weight . basic_counts) + par_intercept. Callers must
+ * keep the two under different schemas (ambit.spectrum/1 vs /2).
+ *
+ * An older AMBIT logs "Bad command" and sends nothing, so an unsupported
+ * firmware surfaces here as the query timeout, not as an error frame. The
+ * schedule action gates on the cached firmware version to avoid paying that
+ * 5 s per read; this primitive just reports it.
+ * CLI:  ambit_spec_raw <ch>                                           */
+cmd_result_t cmd_ambit_get_spec_raw(uint8_t ch, ambit_spec_raw_t *out)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_GET_SPEC_RAW, 0, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     AMBIT_RESP_SPEC_RAW_SIZE, &resp, 5000);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_SPEC_RAW_SIZE) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u get_spec_raw failed (needs AMBIT fw >= 1.2.0)", ch + 1);
+    }
+    const uint8_t *b = resp.raw;
+    if (b[0] != AMBIT_SPEC_RAW_FORMAT) {
+        /* A format bump means the layout below is wrong for this frame; refuse
+         * rather than publish misaligned counts as science data. */
+        unsigned fmt = b[0];
+        uart_sensor_response_free(&resp);
+        return make_result(ESP_ERR_INVALID_VERSION,
+                           "AMBIT%u get_spec_raw frame format %u unsupported (want %u)",
+                           ch + 1, fmt, (unsigned)AMBIT_SPEC_RAW_FORMAT);
+    }
+    ambit_spec_raw_t f;
+    memset(&f, 0, sizeof f);
+    f.format    = b[0];
+    f.atime     = b[1];
+    f.gain_low  = b[2];
+    f.gain_high = b[3];
+    memcpy(&f.astep,     b + 4,  2);
+    memcpy(&f.flags,     b + 6,  2);
+    memcpy(&f.sat_mask,  b + 8,  2);
+    memcpy(&f.clip_mask, b + 10, 2);
+    memcpy(f.raw,        b + 12, sizeof f.raw);    /* 10 x u16 -> ends at 32 */
+    memcpy(f.chan,       b + 32, sizeof f.chan);   /* 10 x f32 -> ends at 72 */
+    memcpy(&f.par,       b + 72, 4);
+    memcpy(&f.par_tier2, b + 76, 4);
+    uart_sensor_response_free(&resp);
+    if (out) *out = f;
+    return make_result(ESP_OK, "AMBIT%u spectrum raw OK PAR=%.2f flags=0x%04x",
+                       ch + 1, (double)f.par, (unsigned)f.flags);
+}
+
 /* Cmd 34 — Extended temperature read: two leaf algorithms + chip + 4 raw
  * MLX90632 register values for diagnostics.
  * Response: 14 bytes (7 × int16_t: leaf*10, leaf1*10, chip*10, a1..a4).

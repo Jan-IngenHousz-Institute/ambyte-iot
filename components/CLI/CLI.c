@@ -1028,6 +1028,47 @@ static int cli_cmd_ambit_spec(int argc, char **argv)
     return 0;
 }
 
+/* cmd 35 bench readout: everything on the wire, decoded, so a bench operator
+ * can recompute tier 1 by hand (raw / (gain * tint)) and compare with chan[]. */
+static int cli_cmd_ambit_spec_raw(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: ambit_spec_raw <channel 0-3>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    ambit_spec_raw_t f;
+    cmd_result_t res = cmd_ambit_get_spec_raw((uint8_t)ch, &f);
+    if (res.status != ESP_OK) {
+        printf("Error: %s\r\n", res.message);
+        return 1;
+    }
+    /* gain ordinal n = 0.5 * 2^n; dividing by the ordinal itself is the
+     * classic mistake (divide by zero at 0.5x, only right at ordinal 2). */
+    const float g_lo = 0.5f * (float)(1UL << (f.gain_low  > 10 ? 10 : f.gain_low));
+    const float g_hi = 0.5f * (float)(1UL << (f.gain_high > 10 ? 10 : f.gain_high));
+    printf("AMBIT%d spectrum raw (cmd 35, format %u)\r\n", ch + 1, f.format);
+    printf("  exposure: atime=%u astep=%u tint=%.3f ms gain_low=%u (x%.1f) gain_high=%u (x%.1f)\r\n",
+           f.atime, f.astep, (double)ambit_spec_tint_ms(f.atime, f.astep),
+           f.gain_low, (double)g_lo, f.gain_high, (double)g_hi);
+    printf("  flags=0x%04x sat=%u clip=%u asat=%u fault=%u | par_weight_fit=%u tier3_stored=%u\r\n",
+           f.flags,
+           !!(f.flags & AMBIT_SPEC_RAW_FLAG_SATURATED), !!(f.flags & AMBIT_SPEC_RAW_FLAG_CLIPPED),
+           !!(f.flags & AMBIT_SPEC_RAW_FLAG_ANALOG_SAT), !!(f.flags & AMBIT_SPEC_RAW_FLAG_FAULT),
+           !!(f.flags & AMBIT_SPEC_RAW_FLAG_PAR_FIT), !!(f.flags & AMBIT_SPEC_RAW_FLAG_TIER3_STORED));
+    printf("  sat_mask=0x%03x clip_mask=0x%03x\r\n", f.sat_mask, f.clip_mask);
+    printf("  raw (F1..F8,NIR,Clr):");
+    for (int i = 0; i < AMBIT_SPEC_RAW_CHANNELS; i++) printf(" %u", f.raw[i]);
+    printf("\r\n  cal:");
+    for (int i = 0; i < AMBIT_SPEC_RAW_CHANNELS; i++) printf(" %.4g", (double)f.chan[i]);
+    printf("\r\n  PAR=%.2f (tier 3)  par_tier2=%.5g\r\n", (double)f.par, (double)f.par_tier2);
+    return 0;
+}
+
 static int cli_cmd_ambit_info(int argc, char **argv)
 {
     if (argc != 3) {
@@ -2198,6 +2239,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "ambit_spec <0-3>  read spectrum + PAR from AMBIT sensor",
         .func    = cli_cmd_ambit_spec,
     };
+    static const esp_console_cmd_t ambit_spec_raw_cmd = {
+        .command = "ambit_spec_raw",
+        .help    = "ambit_spec_raw <0-3>  read raw counts + exposure + 3-tier PAR (AMBIT cmd 35, fw >= 1.2.0)",
+        .func    = cli_cmd_ambit_spec_raw,
+    };
     static const esp_console_cmd_t ambit_info_cmd = {
         .command = "ambit_info",
         .help    = "ambit_info <0-3> <1=cal|2=fw|3=meta>  read sensor info",
@@ -2376,6 +2422,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_spec_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_spec_raw_cmd);
     if (err != ESP_OK) {
         return err;
     }

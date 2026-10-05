@@ -469,12 +469,86 @@ static void print_spectrum_fixture(void)
     printf("SPECTRUM_MAX_LEN=%u\n", (unsigned)strlen(exact));
 }
 
+/* cmd 35 → ambit.spectrum/2. Values mirror a format-1 frame at the pinned
+ * exposure (ATIME 99 / ASTEP 499 / 2X both banks → tint 139 ms). */
+static void print_spectrum_raw_fixture(void)
+{
+    payload_v3_spectrum_raw_input_t input = {
+        .measure_id = 65929,
+        .channel = "uart_0",
+        .device = "AD81",
+        .sensor_id = "3C:DC:75:0D:FD:20",
+        .start_utc_ms = 1788718543000LL,
+        .end_utc_ms = 1788718543400LL,
+        .calibration_present = true,
+        .cal_version = 0xc96cda1bU,
+        .atime = 99,
+        .astep = 499,
+        .gain_low = 2,
+        .gain_high = 2,
+        .tint_ms = 139.0,
+        .flags = 0x0203,   /* saturated + clipped conditions; tier-3 stored */
+        .sat_mask = 0x0001,
+        .clip_mask = 0x0200,
+        .par = 412.5,
+        .par_tier2 = 0.00123456,
+        .spectrum = {65535, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+        .spectrum_cal = {1.5, 0.25, 0.000125, 3, 4, 5, 6, 7, 8, 9},
+    };
+    char output[1024], error[128];
+    assert(payload_v3_build_spectrum_raw(output, sizeof output, &input, error, sizeof error));
+    printf("SPECTRUM_RAW=%s\n", output);
+    assert(payload_v3_is_canonical_object(output));
+
+    /* Same envelope rules as /1: null cal_version, omitted sensor_id. */
+    input.calibration_present = false;
+    assert(payload_v3_build_spectrum_raw(output, sizeof output, &input, error, sizeof error));
+    assert(strstr(output, "\"cal_version\":null") != NULL);
+    input.calibration_present = true;
+    input.sensor_id = NULL;
+    assert(payload_v3_build_spectrum_raw(output, sizeof output, &input, error, sizeof error));
+    assert(strstr(output, "sensor_id") == NULL);
+    input.sensor_id = "3C:DC:75:0D:FD:20";
+
+    /* Non-finite anywhere in the float fields is rejected, never emitted. */
+    input.par = NAN;
+    assert(!payload_v3_build_spectrum_raw(output, sizeof output, &input, error, sizeof error));
+    input.par = 412.5;
+    input.spectrum_cal[3] = INFINITY;
+    assert(!payload_v3_build_spectrum_raw(output, sizeof output, &input, error, sizeof error));
+    input.spectrum_cal[3] = 3;
+    assert(!payload_v3_build_spectrum_raw(output, 64, &input, error, sizeof error));
+
+    /* Worst case against the producer's cap: longest name, widest numbers,
+     * every flag bit, full-scale counts, %.6g bins at their widest. */
+    char exact[PAYLOAD_V3_SPECTRUM_RAW_CAP];
+    input.device = "AmbitVeryLongName01";
+    input.measure_id = 9223372036854775807LL;
+    input.atime = 255;
+    input.astep = 65535;
+    input.gain_low = 10;
+    input.gain_high = 10;
+    input.tint_ms = 46601.0;
+    input.flags = 0xffff;
+    input.sat_mask = 0x03ff;
+    input.clip_mask = 0x03ff;
+    input.par = -123456.78;
+    input.par_tier2 = -1.23456e-100;
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        input.spectrum[i] = 65535U;
+        input.spectrum_cal[i] = -1.23456e-100;
+    }
+    assert(payload_v3_build_spectrum_raw(exact, sizeof exact, &input, error, sizeof error));
+    printf("SPECTRUM_RAW_MAX_LEN=%u\n", (unsigned)strlen(exact));
+}
+
 int main(void)
 {
     print_trace_fixtures();
     test_lossless_trace_routes();
     print_tagged_trace_fixture();
     print_spectrum_fixture();
+    print_spectrum_raw_fixture();
     print_telemetry_fixture();
     print_device_fixture();
     return 0;

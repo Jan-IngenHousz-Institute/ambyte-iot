@@ -42,6 +42,18 @@ static const sched_input_decl_t k_channels_only[] = {
     { "channels", SCHED_IN_CHANNELS, 0, 1, 0, 0, 0, NULL },
 };
 
+/* ambit/spectrum: `raw` selects AMBIT cmd 35 (get_spec_raw, fw >= 1.2.0 —
+ * unscaled counts + exposure + three-tier PAR, stored as ambit.spectrum/2)
+ * instead of the frozen cmd 31 read (ambit.spectrum/1). Default false so
+ * every released schedule keeps publishing byte-identically; has_default so
+ * the JSON schema advertises it and an absent key compiles to an explicit
+ * false entry, like hold_window. An AMBIT whose cached firmware predates
+ * 1.2.0 falls back to cmd 31 at run time (the schema tag says which). */
+static const sched_input_decl_t k_spectrum_inputs[] = {
+    { "channels", SCHED_IN_CHANNELS, 0, 1, 0, 0, 0, NULL },
+    { "raw",      SCHED_IN_BOOL,     0, 1, 0, 0, 0, NULL },
+};
+
 static const sched_input_decl_t k_actinic_inputs[] = {
     { "channels", SCHED_IN_CHANNELS,    0, 1, 0, 0, 0, NULL },
     { "level",    SCHED_IN_INT,         1, 0, ACTINIC_LEVEL_MIN, ACTINIC_LEVEL_MAX, 0, NULL },
@@ -78,7 +90,7 @@ static const sched_input_decl_t k_sleep_inputs[] = {
  * immutable after that. */
 static sched_action_t k_actions[] = {
     ACTION("ambit/trace",          k_trace_inputs),
-    ACTION("ambit/spectrum",       k_channels_only),
+    ACTION("ambit/spectrum",       k_spectrum_inputs),
     ACTION("ambit/leaf-temp",      k_channels_only),
     ACTION("ambit/actinic",        k_actinic_inputs),
     ACTION("device/status-report", k_status_report_inputs),

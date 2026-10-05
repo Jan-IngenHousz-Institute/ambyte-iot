@@ -180,7 +180,7 @@ lists in site-independent schedules.
 | `uses` | Inputs |
 | --- | --- |
 | `ambit/trace` | required `protocol`; optional `channels`, `hold_window`, `tag`, `deadline_margin` |
-| `ambit/spectrum` | optional `channels` |
+| `ambit/spectrum` | optional `channels`; optional `raw` (default `false`; `true` = AMBIT cmd 35 → `ambit.spectrum/2`, needs AMBIT fw ≥ 1.2.0, older AMBITs fall back to cmd 31) |
 | `ambit/leaf-temp` | optional `channels` |
 | `ambit/actinic` | optional `channels`; required `level` and bounded `duration` |
 | `device/status-report` | optional flat `tags` map |

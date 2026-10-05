@@ -656,6 +656,80 @@ bool payload_v3_build_spectrum(char *out, size_t cap,
     return w.ok;
 }
 
+/* ambit.spectrum/2 — the cmd 35 point read. Same envelope members as /1 so a
+ * consumer's identity/time handling is shared, plus `exposure` (what the
+ * counts were taken under — a host needs it to normalise across exposures,
+ * per-measurement the day autoranging lands), `quality` (the flags word
+ * decoded into booleans a warehouse can filter on, with the raw word and
+ * masks kept for the reserved bits), and four observations. `spectrum` keeps
+ * /1's meaning (unscaled counts); `spectrum_cal` is the goal-A calibrated
+ * spectrum; `par` is tier 3 and `par_tier2` the pre-slope quantity an
+ * intensity sweep regresses against, stored so a later Li-250A comparison can
+ * rescale every past reading without repeating bench work.
+ *
+ * Calibrated values are dimensionless until goal A is fitted in absolute
+ * units on ambit optics (the shipped vectors are miniPar seeds), hence UCUM
+ * "1". %.6g keeps a night-time 1e-4 bin from rounding to 0 and stays valid
+ * JSON (no inf/nan — those are rejected up front). */
+bool payload_v3_build_spectrum_raw(char *out, size_t cap,
+                                   const payload_v3_spectrum_raw_input_t *input,
+                                   char *error, size_t error_cap)
+{
+    json_writer_t w;
+    jw_init(&w, out, cap);
+    if (input == NULL || input->device == NULL || input->channel == NULL ||
+        !isfinite(input->par) || !isfinite(input->par_tier2) || !isfinite(input->tint_ms)) {
+        set_error(error, error_cap, "invalid spectrum raw input");
+        return false;
+    }
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        if (!isfinite(input->spectrum_cal[i])) {
+            set_error(error, error_cap, "invalid spectrum raw input");
+            return false;
+        }
+    }
+    jw_append(&w, "{\"schema\":\"ambit.spectrum/2\",\"measure_id\":%lld,\"channel\":",
+              (long long)input->measure_id);
+    jw_string(&w, input->channel);
+    jw_append(&w, ",\"device\":"); jw_string(&w, input->device);
+    if (input->sensor_id != NULL && input->sensor_id[0] != '\0') {
+        jw_append(&w, ",\"sensor_id\":"); jw_string(&w, input->sensor_id);
+    }
+    jw_append(&w, ",\"tag\":\"MEASUREMENT\",\"time\":{\"start_utc\":%lld,\"end_utc\":%lld},"
+                  "\"cal_version\":",
+              (long long)input->start_utc_ms, (long long)input->end_utc_ms);
+    if (input->calibration_present)
+        jw_append(&w, "\"%08x\"", (unsigned)input->cal_version);
+    else
+        jw_append(&w, "null");
+    jw_append(&w, ",\"exposure\":{\"atime\":%u,\"astep\":%u,\"gain_low\":%u,"
+                  "\"gain_high\":%u,\"tint_ms\":%.3f}",
+              (unsigned)input->atime, (unsigned)input->astep,
+              (unsigned)input->gain_low, (unsigned)input->gain_high, input->tint_ms);
+    const unsigned fl = input->flags;
+#define FLAG_BOOL(bit) (((fl) & (1u << (bit))) ? "true" : "false")
+    jw_append(&w, ",\"quality\":{\"flags\":%u,\"saturated\":%s,\"clipped\":%s,"
+                  "\"analog_saturated\":%s,\"fault\":%s,\"sat_mask\":%u,\"clip_mask\":%u,"
+                  "\"par_weight_fit\":%s,\"tier3_stored\":%s}",
+              fl, FLAG_BOOL(0), FLAG_BOOL(1), FLAG_BOOL(2), FLAG_BOOL(3),
+              (unsigned)input->sat_mask, (unsigned)input->clip_mask,
+              FLAG_BOOL(8), FLAG_BOOL(9));
+#undef FLAG_BOOL
+    jw_append(&w, ",\"observations\":{\"par\":{\"u\":\"umol.m-2.s-1\",\"v\":%.2f},"
+                  "\"par_tier2\":{\"u\":\"1\",\"v\":%.6g},"
+                  "\"spectrum\":{\"u\":\"count\",\"v\":[", input->par, input->par_tier2);
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        jw_append(&w, "%s%u", i ? "," : "", (unsigned)input->spectrum[i]);
+    }
+    jw_append(&w, "]},\"spectrum_cal\":{\"u\":\"1\",\"v\":[");
+    for (size_t i = 0; i < PAYLOAD_V3_SPECTRUM_BINS; ++i) {
+        jw_append(&w, "%s%.6g", i ? "," : "", input->spectrum_cal[i]);
+    }
+    jw_append(&w, "]}}}");
+    if (!w.ok) set_error(error, error_cap, "spectrum raw payload exceeds buffer");
+    return w.ok;
+}
+
 bool payload_v3_build_telemetry(char *out, size_t cap,
                                 const payload_v3_telemetry_input_t *input,
                                 char *error, size_t error_cap)
@@ -817,6 +891,7 @@ bool payload_v3_is_canonical_object(const char *json)
 #define SCHEMA_PREFIX(s) strncmp(json, (s), sizeof(s) - 1U) == 0
     return SCHEMA_PREFIX("{\"schema\":\"ambit.trace/3\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambit.spectrum/1\"") ||
+           SCHEMA_PREFIX("{\"schema\":\"ambit.spectrum/2\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambyte.telemetry/1\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambit.device/1\"");
 #undef SCHEMA_PREFIX
