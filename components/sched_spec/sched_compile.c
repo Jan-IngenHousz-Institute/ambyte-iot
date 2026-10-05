@@ -1370,8 +1370,10 @@ static bool compile_job(ctx_t *c, const char *name, const sched_node_t *node,
              * the shipped default fits exactly (SS 45 pulses: 45.0 s +
              * 15 s = 60.0 s on a 1 m grid) while the incident case, 59
              * pulses, still fails at 74 s. sched_estimate_ms keeps the
-             * firmware-exact +300 ms/segment for the runner's poll
-             * scheduling. (Orchestrator ruling on plan ambiguity, T2.) */
+             * free-run +300 ms/segment formula as the compiler-side
+             * reference; the runner's own poll scheduling is engine-aware
+             * (ambit_trace_estimate_ms_for, paced fw >= 1.4.0 runs longer).
+             * (Orchestrator ruling on plan ambiguity, T2.) */
             int64_t pulse_ms = 0;
             for (int s = 0; s < proto->segment_count; s++) {
                 pulse_ms += (int64_t)proto->segments[s].pulses * 1000 /

@@ -405,9 +405,12 @@ esp_err_t sched_compile(const sched_node_t *root, sched_program_t *out,
 esp_err_t sched_compile_text(const char *text, size_t len, sched_program_t *out,
                              char *err, size_t err_cap);
 
-/* Duration estimate exposed for the runner's poll scheduling (90 % poll
- * start, broken-channel deadline): Σ(pulses/freq·1000 + 300) ms — 300 ms
- * per-segment configuration/light-sleep slack, the established field formula.
+/* Free-run duration estimate: Σ(pulses/freq·1000 + 300) ms — 300 ms
+ * per-segment configuration/light-sleep slack, the established field formula
+ * for AMBIT fw < 1.4.0. The runner schedules its polls and the broken-channel
+ * deadline through ambit_trace_estimate_ms_for(), which picks the free-run or
+ * the paced (fw >= 1.4.0, longer) time base per channel; this copy stays as
+ * the compiler-side reference of the free-run formula.
  * NOTE: the compiler's duration-vs-period rule
  * deliberately uses pulse time + deadline_margin without this overhead (see
  * sched_compile.c for why). */
