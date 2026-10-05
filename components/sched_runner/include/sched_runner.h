@@ -123,10 +123,12 @@ esp_err_t sched_runner_start(void);
 
 /* Signal stop and wait up to wait_ms. Actions poll
  * sched_runner_should_stop() between UART transactions and inside poll loops,
- * so a stop normally lands within one poll interval plus one transaction,
- * inside the 5 s budget app_main uses. ESP_ERR_TIMEOUT when a long UART call
- * is still in flight; the task exits on its own afterwards. No-op when not
- * running. */
+ * so actions unwind within one poll interval plus one transaction. If this
+ * generation attempted a persistent trace, exit also resets the shared AMBIT
+ * bank and waits 5 s for boot (discarding unfinished/buffered traces on ALL
+ * channels). ESP_ERR_TIMEOUT if UART work, reset locks or boot grace outlast
+ * wait_ms; the task remains STOPPING until cleanup completes, then exits on
+ * its own. No-op when not running. */
 esp_err_t sched_runner_stop(uint32_t wait_ms);
 
 bool      sched_runner_is_running(void);

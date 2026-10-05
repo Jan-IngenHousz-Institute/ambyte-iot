@@ -206,6 +206,56 @@ static const payload_v3_array_t *find_array(const payload_v3_trace_input_t *inpu
     return NULL;
 }
 
+/* Array 9 is an additive clock from the AMBIT EXT_SYNC engine: one uint32
+ * microsecond offset per stored main sample, relative to array 7's run start.
+ * It supersedes tick_factor only for this run; the calibration stays unchanged.
+ * Subsampled channels average the same eight edges as their count window, with
+ * a fresh window at each segment. A partial last window produces no value. */
+static size_t write_recorded_times(json_writer_t *w,
+                                   const payload_v3_trace_input_t *input,
+                                   const payload_v3_array_t *edges,
+                                   series_clock_t clock)
+{
+    size_t offset = 0, emitted = 0;
+    jw_append(w, "\"t\":[");
+    for (size_t i = 0; i < input->segment_count && offset < edges->length; ++i) {
+        const payload_v3_segment_t *s = &input->segments[i];
+        if (!valid_segment(s)) continue;
+        const size_t remaining = edges->length - offset;
+        const size_t acquired = remaining < s->pulses ? remaining : s->pulses;
+        if (segment_points(s, clock) != 0U) {
+            const size_t width = (clock != CLOCK_MAIN && s->subsampling == 2U) ? 8U : 1U;
+            for (size_t p = 0; p + width <= acquired; p += width) {
+                uint64_t sum = 0;
+                for (size_t j = 0; j < width; ++j) sum += edges->values[offset + p + j];
+                jw_append(w, "%s", emitted++ ? "," : "");
+                jw_time(w, (double)sum / ((double)width * 1000000.0));
+            }
+        }
+        offset += acquired;
+    }
+    jw_append(w, "]");
+    return emitted;
+}
+
+static bool recorded_times_valid(const payload_v3_trace_input_t *input)
+{
+    const payload_v3_array_t *edges = find_array(input, 9U);
+    if (edges == NULL) return true; /* older AMBIT: retain the free-run model */
+    const payload_v3_array_t *main = find_array(input, 1U);
+    const payload_v3_array_t *ref = find_array(input, 2U);
+    if (main == NULL || edges->length == 0U || edges->values == NULL ||
+        main->length != edges->length || (ref != NULL && ref->length != edges->length))
+        return false;
+    size_t planned = 0;
+    for (size_t i = 0; i < input->segment_count; ++i) planned += input->segments[i].pulses;
+    if (edges->length > planned) return false;
+    for (size_t i = 1; i < edges->length; ++i) {
+        if (edges->values[i] <= edges->values[i - 1U]) return false;
+    }
+    return true;
+}
+
 static const char *series_name(uint8_t index)
 {
     switch (index) {
@@ -259,13 +309,16 @@ static bool write_count_series(json_writer_t *w,
     }
     const series_clock_t clock = series_clock(array->index);
     const time_model_t model = analyze_time(input, clock, array->length);
-    if (model.generated != array->length) return false;
+    const payload_v3_array_t *edges = find_array(input, 9U);
+    if (edges == NULL && model.generated != array->length) return false;
 
     jw_append(w, "%s", *first ? "" : ",");
     *first = false;
     jw_string(w, name);
     jw_append(w, ":{\"u\":\"count\",");
-    if (model.regular) {
+    if (edges != NULL) {
+        if (write_recorded_times(w, input, edges, clock) != array->length) return false;
+    } else if (model.regular) {
         jw_append(w, "\"t0\":"); jw_time(w, model.t0);
         jw_append(w, ",\"dt\":"); jw_time(w, model.dt);
     } else {
@@ -357,6 +410,10 @@ bool payload_v3_build_trace(char *out, size_t cap,
             }
         }
     }
+    if (!recorded_times_valid(input)) {
+        set_error(error, error_cap, "recorded sample times misaligned or nonmonotonic");
+        return false;
+    }
     const payload_v3_array_t *env = find_array(input, 0U);
     const payload_v3_array_t *offsets = find_array(input, 8U);
     if (offsets != NULL &&
@@ -426,7 +483,7 @@ bool payload_v3_build_trace(char *out, size_t cap,
     }
     for (size_t i = 0; i < input->array_count; ++i) {
         const uint8_t idx = input->arrays[i].index;
-        if (idx <= 8U) continue;
+        if (idx <= 9U) continue;
         if (!write_count_series(&w, input, &input->arrays[i], &first)) {
             set_error(error, error_cap, "unknown series length does not match protocol");
             return false;
@@ -793,6 +850,49 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   (long long)input->sd_skipped, (long long)input->sd_dropped,
                   (long long)input->last_acked_id,
                   input->sd_io_lost ? "true" : "false");
+        storage_comma = true;
+    }
+    if (input->evq_valid) {
+        jw_append(&w, "%s\"evq\":{\"pending\":%lld,\"pending_exact\":%s,"
+                      "\"deliverable_pending\":%lld,\"flash_pending\":%lld,"
+                      "\"sd_pending\":%lld,\"reimport_pending\":%lld,\"sd_state\":",
+                  storage_comma ? "," : "",
+                  (long long)input->evq_pending, input->evq_pending_exact ? "true" : "false",
+                  (long long)input->evq_deliverable_pending, (long long)input->evq_flash_pending,
+                  (long long)input->evq_sd_pending, (long long)input->evq_reimport_pending);
+        jw_string(&w, input->evq_sd_state);
+        jw_append(&w, ",\"head_block\":");
+        jw_string(&w, input->evq_head_block);
+        jw_append(&w, ",\"storage_blocked\":%s,\"blocked_reason\":",
+                  input->evq_storage_blocked ? "true" : "false");
+        jw_string(&w, input->evq_blocked_reason);
+        jw_append(&w, ",\"refused_full\":%lld,\"refused_media\":%lld,"
+                      "\"refused_too_large\":%lld,\"refused_unavailable\":%lld,"
+                      "\"quarantined_poison\":%lld,\"quarantined_malformed\":%lld,"
+                      "\"skipped_unindexed_gap\":%lld,\"corrupt_detected\":%lld,"
+                      "\"corrupt_medium\":",
+                  (long long)input->evq_refused_full, (long long)input->evq_refused_media,
+                  (long long)input->evq_refused_too_large, (long long)input->evq_refused_unavailable,
+                  (long long)input->evq_quarantined_poison, (long long)input->evq_quarantined_malformed,
+                  (long long)input->evq_skipped_unindexed_gap, (long long)input->evq_corrupt_detected);
+        jw_string(&w, input->evq_corrupt_medium);
+        jw_append(&w, ",\"spool_files\":%u,\"spool_errors\":%u,\"mirror_used\":%u,"
+                      "\"reclaimed_files\":%u,\"archived_files\":%u,\"reimported_files\":%u,"
+                      "\"sd_retired_names\":%u,\"sd_bad_copies\":%u,"
+                      "\"sd_rename_ambiguous\":%u,\"sd_verify_fail\":%u}",
+                  input->evq_spool_files, input->evq_spool_errors, input->evq_mirror_used,
+                  input->evq_reclaimed_files, input->evq_archived_files, input->evq_reimported_files,
+                  input->evq_sd_retired_names, input->evq_sd_bad_copies,
+                  input->evq_sd_rename_ambiguous, input->evq_sd_verify_fail);
+        storage_comma = true;
+    }
+    if (input->sd_diag_json != NULL) {
+        jw_append(&w, "%s\"sd_diag\":%s", storage_comma ? "," : "", input->sd_diag_json);
+        storage_comma = true;
+    }
+    if (input->sdlog_json != NULL) {
+        jw_append(&w, "%s\"sdlog\":%s", storage_comma ? "," : "", input->sdlog_json);
+        storage_comma = true;
     }
     jw_append(&w, "},\"runtime\":{");
     if (input->runtime_valid) {

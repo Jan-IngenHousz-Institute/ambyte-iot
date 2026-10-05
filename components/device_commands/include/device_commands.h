@@ -89,6 +89,9 @@ typedef struct {
     /* Optional SD/persistence telemetry for the TELEMETRY heartbeat, so silent-loss
      * sites become visible in the field. Fills any non-NULL out-param; returns
      * ESP_OK if the event-log health snapshot was read. NULL = omit the SD fields. */
+    /* sd_logger byte accounting rendered as one JSON object (storage.sdlog);
+     * returns the length, or <= 0 to omit it. Optional. */
+    int                               (*sdlog_render)(char *buf, size_t cap);
     esp_err_t                         (*sd_health)(bool *io_lost, uint64_t *free_bytes,
                                                    int64_t *skipped, int64_t *dropped,
                                                    int64_t *last_acked_id);
@@ -371,6 +374,8 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
 /* Actions (wait for CMD_END, no response data) */
 cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity);
 cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch);
+/* A type-5 zero-current request is off-only (cmd 4 type 0), with no pulse or
+ * duration. Other types and nonzero-current pulses retain their wire form. */
 cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2);
 
 /* Write commands (extra data buffered, wait for CMD_END) */
@@ -434,6 +439,11 @@ void device_commands_inflight_status(int *msg_id, int64_t *measure_id, int64_t *
 /* Snapshot active/reserved MQTT slot count and exact serialized envelope bytes.
  * Any out-pointer may be NULL. */
 void device_commands_window_status(size_t *slots, size_t *bytes);
+
+/* Records the drain can reach right now (event_log health's deliverable_pending:
+ * 0 while the delivery head waits on an unreadable SD copy). Liveness
+ * watchdogs use this instead of the raw pending count. */
+int64_t device_commands_deliverable_pending(void);
 
 /* Test hook: inject a fake, already-stale in-flight slot (no real measure_id) so
  * the reaper path can be exercised on hardware without engineering a lost PUBACK.

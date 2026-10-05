@@ -47,6 +47,7 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
+#include "sd_diag.h"
 #include "wifi_manager.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
@@ -359,6 +360,9 @@ static int cli_cmd_log_status(int argc, char **argv)
     printf(" - file: /sdcard/logs/ambyte.log (%u bytes)\r\n", (unsigned)file_bytes);
     printf(" - buffered: %u bytes, dropped: %u bytes\r\n",
            (unsigned)buffered, (unsigned)dropped);
+    /* Byte accounting + per-op errors: the same JSON the heartbeat carries. */
+    char acct[384];
+    if (sd_logger_render_json(acct, sizeof acct) > 0) printf(" - acct: %s\r\n", acct);
     return 0;
 }
 
@@ -1158,7 +1162,20 @@ static int cli_cmd_wifi_join(int argc, char **argv)
         return 1;
     }
     esp_err_t err = wifi_manager_connect(argv[1], argv[2]);
-    printf("wifi_join \"%s\": %s\r\n", argv[1], esp_err_to_name(err));
+    printf("wifi_join \"%s\": %s\r\n", argv[1], wifi_manager_err_to_name(err));
+    if (err == WIFI_MANAGER_ERR_AUTH_REJECTED) {
+        /* The credentials are saved and still being retried in the background;
+         * a transient rejection (AP holding a stale association) heals on its
+         * own, a wrong password needs another wifi_join. */
+        printf("  AP rejected the credentials (auth/handshake failure) — likely a wrong "
+               "password; still retrying on backoff, re-run wifi_join to correct it\r\n");
+    } else if (err == WIFI_MANAGER_ERR_DRIVER_UNRESOLVED) {
+        printf("  the Wi-Fi driver never reported an earlier attempt's outcome - not "
+               "retrying; reboot to recover\r\n");
+    } else if (err == WIFI_MANAGER_ERR_NOT_RETRYING) {
+        printf("  attempt failed and no retry could be scheduled - re-run wifi_join "
+               "(or reboot)\r\n");
+    }
     return (err == ESP_OK) ? 0 : 1;
 }
 
@@ -1264,8 +1281,8 @@ static int cli_cmd_netwd(int argc, char **argv)
 }
 
 /* evlog              → print the event-log cursor + pending backlog
- * evlog rewind       → rewind the cursor to the OLDEST file still on the card
- *                      (re-publish everything) and kick a drain
+ * evlog rewind       → rewind the cursor to the OLDEST file the queue can still
+ *                      read (flash or a spooled SD copy) and kick a drain
  * evlog rewind <seq> → rewind to ev-<seq>.log so that record and all newer ones
  *                      revert to PENDING and re-publish. There is no per-record
  *                      state in the .log files — a record is PENDING iff it sits
@@ -1304,15 +1321,35 @@ static int cli_cmd_evlog(int argc, char **argv)
         return 1;
     }
 
-    bool     available = false;
-    int64_t  pending = 0, next_id = 0;
     uint32_t rd_seq = 0, rd_off = 0, tail_seq = 0;
-    event_log_db_stats(&available, NULL, &pending, &next_id);
     event_log_cursor_info(&rd_seq, &rd_off, &tail_seq);
-    printf("event log: %s\r\n", available ? "available" : "OFFLINE (SD not mounted?)");
-    printf(" - cursor: ev-%06u.log @ off %u  (tail ev-%06u.log)\r\n",
-           (unsigned)rd_seq, (unsigned)rd_off, (unsigned)tail_seq);
-    printf(" - pending: %lld   next_id: %lld\r\n", (long long)pending, (long long)next_id);
+    evlog_health_t h;
+    if (event_log_health(&h) != ESP_OK) {
+        printf("evlog: health unavailable (store not initialised or lock busy)\r\n");
+        return 1;
+    }
+    /* Both surfaces render through the production helpers (evq_render.c /
+     * payload_v3.c) the host tests exercise — never a hand-rolled subset here.
+     * The renderer refuses rather than truncates; say so instead of printing a
+     * clipped status. */
+    static char text[1536];                     /* worst case (every counter INT64_MIN) ≈ 1.1 KiB */
+    if (evq_render_health_text(&h, text, sizeof text) < 0) {
+        printf("evlog: status rendering exceeded %u B — refusing to print a truncated status\r\n",
+               (unsigned)sizeof text);
+        return 1;
+    }
+    printf("%s", text);
+    printf("  cursor_off=%u\r\n", (unsigned)rd_off);
+    /* Retained SD-fault / refusal attribution (RTC + NVS, never the SD):
+     * exact=false means a power-on broke continuity and the counts are a floor. */
+    /* Transient heap, not a static: a worst-case render is ~1.6 KiB and the
+     * command is rare (no resident DRAM cost). */
+    char *diag = malloc(2048);
+    sd_diag_block_t db;
+    sd_diag_get(&db);
+    if (diag != NULL && sd_diag_render_json(&db, diag, 2048) >= 0) printf("  sd_diag=%s\r\n", diag);
+    else printf("  sd_diag=unavailable\r\n");
+    free(diag);
     return 0;
 }
 
@@ -1853,18 +1890,18 @@ static int cli_cmd_schedule(int argc, char **argv)
         return (err == ESP_OK || err == ESP_ERR_INVALID_STATE) ? 0 : 1;
     }
     if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
-            printf("still busy in a UART transaction — it will exit when that returns\r\n");
+            printf("stop still in progress (UART or AMBIT cleanup) — it will exit when cleanup completes\r\n");
         } else {
             printf("%s\r\n", sched_runner_is_running() ? "stop signaled" : "stopped");
         }
         return 0;
     }
     if (strcmp(argv[1], "reload") == 0) {
-        esp_err_t err = sched_runner_stop(5000);
+        esp_err_t err = sched_runner_stop(10000); /* includes AMBIT reset/boot */
         if (err == ESP_ERR_TIMEOUT) {
-            printf("stop timed out (UART busy) — retry when the transaction returns\r\n");
+            printf("stop timed out (UART or AMBIT cleanup) — retry when cleanup completes\r\n");
             return 1;
         }
         err = sched_runner_start();

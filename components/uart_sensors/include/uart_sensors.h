@@ -38,6 +38,13 @@ void      uart_sensors_flash_session_end(uint8_t ch);
 esp_err_t uart_sensors_enter_download(uint8_t ch);   /* session must be held */
 esp_err_t uart_sensors_run_app(uint8_t ch);          /* session must be held */
 
+/* Abort autonomous runs on the shared AMBIT bank and boot all applications
+ * (startup disables the actinic LEDs). Takes ALL channel locks; wait_ms bounds
+ * lock acquisition, then a successful reset waits the 5 s boot grace. Intended
+ * for runner exit; destroys unfinished/buffered traces on every channel.
+ * On lock timeout, no GPIOs change and all acquired locks are released. */
+esp_err_t uart_sensors_reset_all(uint32_t wait_ms);
+
 /* Forget positive and negative ping results for every channel. Maintenance
  * operations call this only after stopping measurement and waiting for autonomous AMBIT
  * measurements to finish, so their presence checks always reach the wire rather

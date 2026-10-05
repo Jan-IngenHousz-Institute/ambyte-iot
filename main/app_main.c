@@ -20,6 +20,7 @@
 #include "command_router.h"
 #include "clock_trust.h"
 #include "ota_update.h"
+#include "iot_jobs.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
 #include "ambit_announcement_nvs.h"
@@ -45,12 +46,21 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
+#include "sd_diag.h"
 #include "event_log.h"
 #include "evlog_replay.h"
 #include "sync_runner.h"
 #include "status_heartbeat.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
+#if CONFIG_AMBYTE_EVQ_HIL
+#include "event_log_hil.h"   /* on-device verification build only */
+#include "evq_hil.h"
+#include "evq_hil_sdl.h"
+#define HIL_TRACE(step) evq_hil_trace(step)
+#else
+#define HIL_TRACE(step) ((void)0)
+#endif
 
 #define APP_TAG "APP_MAIN"
 
@@ -230,14 +240,16 @@ static void app_workload_suspend(void)
     taskENTER_CRITICAL(&s_workload_mux);
     bool first = (s_workload_susp_n++ == 0);
     taskEXIT_CRITICAL(&s_workload_mux);
-    if (first && sched_runner_stop(5000) != ESP_OK) {
+    /* Includes the 5 s AMBIT boot grace after persisted-trace stop cleanup. */
+    if (first && sched_runner_stop(10000) != ESP_OK) {
         ESP_LOGW(APP_TAG, "schedule runner did not stop before the maintenance op — "
                           "UART may be busy / heap may fragment");
     }
 }
 
 /* The runner's worst-case unwind after a stop request: one 30 s trace fetch
- * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval and cleanup. Resume must
+ * (TRACE_FETCH_TIMEOUT_MS) plus a poll interval, reset-lock wait and 5 s
+ * AMBIT boot grace. Resume must
  * out-retry that, or a stop that timed out leaves measurement permanently
  * dead (T3 review blocker 3). */
 #define WORKLOAD_RESUME_RETRIES 90 /* 90 × 500 ms = 45 s > 30 s fetch + margin */
@@ -595,8 +607,11 @@ static esp_err_t app_init_sdcard(void)
 static void app_on_sd_state_change(bool mounted)
 {
     if (!mounted) {
-        ESP_LOGW(APP_TAG, "SD out — archive/logs paused; measurement + publishing unaffected");
+        ESP_LOGW(APP_TAG, "SD out — overflow/archive/logs paused; measurement continues on the internal store");
     }
+    /* A card appearing (or leaving) changes what the keeper may do and whether
+     * an SD-only backlog is readable: wake it rather than waiting a period. */
+    event_log_sd_notify();
 }
 
 /* Pre-reboot power-safety hook (Item B). Every esp_restart() in the tree (OTA,
@@ -613,6 +628,7 @@ static void app_prepare_reboot(void)
      * unmount below (audit R-9) — the drains then run monitor-free, and sdcard_unmount
      * sees no writer refs so it completes immediately. */
     sdcard_monitor_suspend();
+    sd_diag_persist(true);          /* orderly reboot: snapshot unpersisted fault/refusal counts (NVS, not SD) */
     event_log_prepare_shutdown();   /* flush + fsync + close the events tail */
     sd_logger_prepare_shutdown();   /* drain the log ring + close the log file */
     (void)sdcard_unmount();         /* finalize FATFS metadata (f_mount(NULL)) */
@@ -653,6 +669,49 @@ static void app_prepare_reboot(void)
 static power_read_fn s_pwrguard_read;         /* MP2731 read fn, set before task start */
 static volatile bool s_pwrguard_parked;       /* guard state; also vetoes self-reboots (below) */
 
+/* The park and un-park sequences themselves (also driven by the evq_hil
+ * verification build's sd_park/sd_unpark, so hardware tests exercise exactly
+ * this path). */
+static void app_sd_park_now(void)
+{
+#if CONFIG_AMBYTE_EVQ_HIL
+    hil_sdl_guard_note(true);        /* H7 interlock: a quiesce spanning this park is void */
+#endif
+    sdcard_monitor_suspend();
+    event_log_set_sd_parked(true);   /* keeper + claim: zero SD operations while parked */
+    sd_logger_pause();               /* drain ring, fsync + close (resumable) */
+    esp_err_t err = ESP_OK;
+    for (int i = 0; i < 5; i++) {    /* TIMEOUT = in-flight FATFS op draining */
+        err = sdcard_unmount();
+        if (err != ESP_ERR_TIMEOUT) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (err != ESP_OK) {
+        /* Writers are already halted, so a failed final unmount leaves an
+         * idle-clean volume — log it, stay parked, don't re-arm writes. */
+        ESP_LOGW(APP_TAG, "park: unmount incomplete (%s)", esp_err_to_name(err));
+    }
+}
+
+static void app_sd_unpark_now(void)
+{
+#if CONFIG_AMBYTE_EVQ_HIL
+    hil_sdl_guard_note(false);
+#endif
+    sd_logger_resume();
+    /* Remount HERE (not via the monitor): the monitor was suspended while
+     * it believed the card mounted, so an un-parked remount on its own
+     * probe would look like no transition. Nothing else needs restoring —
+     * the event store and the schedule runner never stopped. If the mount
+     * fails (card pulled while parked), the resumed monitor's retry takes
+     * over. */
+    if (sdcard_mount() != ESP_OK) {
+        ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
+    }
+    sdcard_monitor_resume();
+    event_log_set_sd_parked(false);  /* wakes the keeper: resume overflow/delivery from SD */
+}
+
 static void app_power_guard_task(void *arg)
 {
     (void)arg;
@@ -685,19 +744,7 @@ static void app_power_guard_task(void *arg)
              * card needs to be out of harm's way. Monitor first so no remount/
              * teardown can race the flush + unmount below (same order as
              * app_prepare_reboot). */
-            sdcard_monitor_suspend();
-            sd_logger_pause();               /* drain ring, fsync + close (resumable) */
-            esp_err_t err = ESP_OK;
-            for (int i = 0; i < 5; i++) {    /* TIMEOUT = in-flight FATFS op draining */
-                err = sdcard_unmount();
-                if (err != ESP_ERR_TIMEOUT) break;
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-            if (err != ESP_OK) {
-                /* Writers are already halted, so a failed final unmount leaves an
-                 * idle-clean volume — log it, stay parked, don't re-arm writes. */
-                ESP_LOGW(APP_TAG, "park: unmount incomplete (%s)", esp_err_to_name(err));
-            }
+            app_sd_park_now();
             s_pwrguard_parked = true;
             good_n = 0;
         } else {
@@ -707,17 +754,7 @@ static void app_power_guard_task(void *arg)
 
             ESP_LOGW(APP_TAG, "power recovered (battery %umV, input %s) — resuming SD persistence",
                      (unsigned)p.battery_mv, p.input_present ? "present" : "absent");
-            sd_logger_resume();
-            /* Remount HERE (not via the monitor): the monitor was suspended while
-             * it believed the card mounted, so an un-parked remount on its own
-             * probe would look like no transition. Nothing else needs restoring —
-             * the event store and the schedule runner never stopped. If the mount
-             * fails (card pulled while parked), the resumed monitor's retry takes
-             * over. */
-            if (sdcard_mount() != ESP_OK) {
-                ESP_LOGW(APP_TAG, "un-park: remount failed — SD monitor will keep retrying");
-            }
-            sdcard_monitor_resume();
+            app_sd_unpark_now();
             s_pwrguard_parked = false;
             low_n = 0;
         }
@@ -771,8 +808,10 @@ static esp_err_t app_sd_health(bool *io_lost, uint64_t *free_bytes,
                                int64_t *skipped, int64_t *dropped, int64_t *last_acked_id)
 {
     if (io_lost)    *io_lost = sdcard_io_lost();     /* SD (archive) subsystem state */
-    /* free_bytes now reports the INTERNAL store headroom — that is the number the
-     * storage-full watermark + eviction act on; SD fullness only delays archiving. */
+    /* free_bytes reports the INTERNAL store headroom — the number the pressure
+     * watermark, reclaim and the storage-full refusal act on. The full SD-overflow
+     * state (sd_state, blocked_reason, exact/floor pending split, refusals by
+     * reason) is carried separately via event_log_health in the STATUS metadata. */
     if (free_bytes) { *free_bytes = 0; (void)event_log_free_bytes(free_bytes); }
     evlog_health_t h;
     if (event_log_health(&h) != ESP_OK) return ESP_FAIL;
@@ -827,40 +866,14 @@ static esp_err_t app_init_evstore(void)
     return ESP_OK;
 }
 
-/* ── SD keeper task ─────────────────────────────────────────────────────────
- * The one place the event pipeline still touches the SD, on a slow cadence and
- * always in bulk: (1) legacy migration — drain the pre-internal-store
- * /sdcard/events backlog into the internal store (oldest-first, a few files per
- * pass so this task never hogs the store mutex); (2) bulk archive — once
- * EVLOG_ARCHIVE_EVERY_N stores accumulate, copy every fully-synced retained file
- * to /sdcard/archive in one burst. Both are keeper-paced, so a dead/absent/
- * parked SD costs nothing but a skipped pass — measurement and publishing never
- * notice. Priority 2 (with the other background housekeeping). */
-#define SD_KEEPER_PERIOD_MS       60000
-#define SD_KEEPER_MIGRATE_FILES   4       /* per pass: bounds mutex hold + task burst */
-#define SD_KEEPER_TASK_STACK      6144    /* file copy loops + VFS, no mount fan-out */
-
-static void app_sd_keeper_task(void *arg)
-{
-    (void)arg;
-    bool migration_done_logged = false;
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SD_KEEPER_PERIOD_MS));
-        if (!sdcard_is_mounted()) continue;
-
-        size_t migrated = event_log_import_sd_backlog(SD_KEEPER_MIGRATE_FILES);
-        if (migrated > 0) {
-            migration_done_logged = false;
-        } else if (!migration_done_logged) {
-            migration_done_logged = true;   /* quiet once the legacy dir is empty */
-        }
-
-        if (event_log_archive_pending()) {
-            size_t archived = 0;
-            (void)event_log_archive_to_sd(&archived);
-        }
-    }
-}
+/* ── SD keeper ──────────────────────────────────────────────────────────────
+ * The keeper task now lives in event_log (event_log_sd_keeper_start): SD
+ * overflow of UNSENT files (primary + mirror, verified before any flash copy is
+ * reclaimed), bulk archive of delivered files, re-import after a rollback, and
+ * the legacy /sdcard/events migration. It runs every 60 s and immediately when
+ * the store crosses the pressure watermark or the 1000-store batch count, when
+ * a card mounts, or when the power guard un-parks. A dead/absent/parked card
+ * costs only skipped passes — measurement and publishing never wait on it. */
 
 static void app_start_sched_runner(void)
 {
@@ -920,6 +933,13 @@ static void app_start_sntp_once(void)
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    /* GOT_IP reaches every handler, including for a superseded connect
+     * request's late association, which wifi_manager does not credit and is
+     * about to tear down. Link services start only on the current link. */
+    if (!wifi_manager_link_is_current()) {
+        ESP_LOGW(APP_TAG, "IP on a superseded Wi-Fi link - not starting SNTP/MQTT");
+        return;
+    }
     app_start_sntp_once();
     taskENTER_CRITICAL(&s_boot_mux);
     bool defer = !s_boot_complete;
@@ -957,12 +977,23 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
 
 void app_main(void)
 {
+#if CONFIG_AMBYTE_EVQ_HIL
+    /* Verification build: the SD hold goes in before ANY other init, so no
+     * record-directory writer can run ahead of the SD baseline capture. */
+    HIL_TRACE("app_main_entry");
+    event_log_hil_boot_init();
+#endif
+    /* SD-fault / refusal attribution must be live before the first SD writer
+     * (sd_logger) can fail: validate/continue the RTC block now, merge the NVS
+     * floor once NVS is up (sd_diag.h). */
+    sd_diag_boot_early();
     /* Capture WARN/ERROR logs to the SD card (INFO/DEBUG go to the console only).
      * Verbose continuous logging concurrent with the events DB corrupted the FAT
      * on a consumer card, so the file is now low-volume + idle-quiet by design. */
     if (sd_logger_init() != ESP_OK) {
         ESP_LOGW(APP_TAG, "SD logger failed to start");
     }
+    HIL_TRACE("sd_logger_init");
 
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
@@ -975,6 +1006,7 @@ void app_main(void)
         return;
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
+    sd_diag_boot_nvs();
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── Power management (Phase 2, DFS-only) ─────────────────────────
@@ -1171,9 +1203,30 @@ void app_main(void)
         .persistence_healthy  = app_persistence_healthy,
         .status_topic         = status_topic,
         .device_id            = device_id,
+        .confirmed            = iot_jobs_kick,
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");
+    }
+
+    /* openJII firmware rollouts arrive as AWS IoT Jobs. The Thing name is the
+     * MQTT client id: the platform's Jobs policy only resolves when the two are
+     * equal, which is how the flash GUI provisions platform-registered units.
+     * Units on the shared legacy cert get their job subscriptions refused and
+     * the module stays silent (iot_jobs.h). No TLS = not AWS = nothing to ask. */
+    if (certs_ok) {
+        iot_jobs_config_t jobs_cfg = {
+            .thing_name       = mqtt_client_id,
+            .family           = "ambyte",
+            .running_version  = running_app != NULL ? running_app->version : "",
+            .publish          = mqtt_client_get_publish_fn(),
+            .add_subscription = mqtt_client_get_add_subscription_fn(),
+            .connection_stats = mqtt_client_get_connection_stats_fn(),
+        };
+        err = iot_jobs_init(&jobs_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(APP_TAG, "IoT Jobs listener not started: %s", esp_err_to_name(err));
+        }
     }
 
     /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered
@@ -1312,6 +1365,7 @@ void app_main(void)
     /* ── SD Card ──────────────────────────────────────────────────── */
     bool sd_available = false;
     err = app_init_sdcard();
+    HIL_TRACE("sd_mount");
     if (err == ESP_OK) {
         sd_available = true;
     } else {
@@ -1337,6 +1391,7 @@ void app_main(void)
     err = app_init_evstore();
     if (err == ESP_OK) {
         err = event_log_init();
+        HIL_TRACE("event_log_init");
         if (err == ESP_OK) {
             persistence_available = true;
             ESP_LOGI(APP_TAG, "Persistence layer ready (internal store)");
@@ -1364,11 +1419,11 @@ void app_main(void)
      * out of the internal store. Missing-task fallback: nothing breaks, the
      * store just retains synced files until eviction bounds them. */
     if (persistence_available) {
-        if (xTaskCreate(app_sd_keeper_task, "sd_keeper", SD_KEEPER_TASK_STACK,
-                        NULL, 2, NULL) != pdPASS) {
+        if (event_log_sd_keeper_start() != ESP_OK) {
             ESP_LOGW(APP_TAG, "SD keeper not started (task alloc failed) — "
-                              "no SD archive/migration this session");
+                              "no SD overflow/archive/migration this session");
         }
+        HIL_TRACE("keeper_start");
     }
 
     /* ── Pre-reboot SD power-safety hook (Item B) ─────────────────────
@@ -1416,6 +1471,7 @@ void app_main(void)
         .quarantine_event   = persistence_available ? event_log_get_quarantine_fn()         : NULL,
         .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .sd_health          = persistence_available ? app_sd_health                         : NULL,
+        .sdlog_render       = sd_logger_render_json,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .error_disconnect_count = mqtt_client_get_error_disconnect_count_fn(),
@@ -1470,6 +1526,11 @@ void app_main(void)
      * live prompt while it runs. Commands degrade gracefully for anything not
      * started yet. */
     app_start_cli();
+#if CONFIG_AMBYTE_EVQ_HIL
+    evq_hil_set_park_hooks(app_sd_park_now, app_sd_unpark_now);
+    evq_hil_register();
+    HIL_TRACE("cli");
+#endif
 
     /* Canonical telemetry goes straight to the ingest topic, independently of
      * the FIFO's power gate and store availability. It shares only the NVS ID
@@ -1492,6 +1553,7 @@ void app_main(void)
         /* Veto = maintenance op in flight OR low-battery park (see app_self_reboot_veto). */
         sync_runner_set_maintenance_probe(app_self_reboot_veto);
         esp_err_t sr_err = sync_runner_start(heartbeat_s);
+        HIL_TRACE("sync_runner_start");
         if (sr_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
         } else {
@@ -1525,6 +1587,7 @@ void app_main(void)
      * publishing. Detect-only `ambit_check` remains available from the CLI. */
     if (sd_available && uart_available) {
         (void)ambit_flash_boot_sync();
+        HIL_TRACE("ambit_boot_sync");
     }
 
     /* ── Start the measurement loop ───────────────────────────────── */

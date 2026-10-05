@@ -571,9 +571,9 @@ static void do_update_impl(const script_req_t *r)
         return;
     }
 
-    /* Stop the runner before the swap; a stop timeout means the script is wedged
-     * in a long C call — leave everything untouched and let the operator retry. */
-    if (sched_runner_stop(5000) == ESP_ERR_TIMEOUT) {
+    /* Allow the 5 s AMBIT reset/boot cleanup after persistent traces. A longer
+     * UART call or lock wait can still time out; leave the script untouched. */
+    if (sched_runner_stop(10000) == ESP_ERR_TIMEOUT) {
         ESP_LOGE(TAG, "schedule task still busy — not swapping; retry in a moment");
         report_script("failed", r->id, "schedule task busy; retry");
         return;

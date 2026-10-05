@@ -428,6 +428,9 @@ cmd_result_t ambit_trace_fetch(uint8_t ch, ambit_trace_pending_t *pending,
     uart_sensor_response_t response;
     cmd_result_t result = cmd_ambit_fetch(ch, &response, timeout_ms);
     if (result.status != ESP_OK) {
+        /* A completed but empty/invalid stream cannot be fetched again. Keep
+         * transport timeout retry behaviour, but discard a consumed/absent run. */
+        if (result.status == ESP_ERR_INVALID_RESPONSE) pending->valid = false;
         uart_sensor_response_free(&response);
         return result;
     }

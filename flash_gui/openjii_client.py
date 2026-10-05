@@ -323,9 +323,9 @@ class OpenJIIClient:
     def list_experiment_devices(self, experiment_id: str) -> list[dict]:
         """Devices bound to an experiment, flattened to the device objects.
 
-        GET /experiments/{id}/devices answers ``[{device: {...}, addedBy,
-        addedAt}]``; only collaborators see it, and it is gated by the same
-        `iot-devices` flag as the registry.
+        Accept both the legacy binding list and the current overview envelope.
+        The overview also includes observed publishers; only entries with a
+        binding authorize installing this experiment's workbook on a device.
         """
         status, payload = self._request(
             "GET", f"/api/v1/experiments/{experiment_id}/devices")
@@ -334,12 +334,17 @@ class OpenJIIClient:
                 f"openJII refused the device list of {experiment_id} (403): "
                 "you need collaborator access and the `iot-devices` flag: "
                 f"{self._error_text(payload)}")
-        if status != 200 or not isinstance(payload, list):
+        overview = isinstance(payload, dict)
+        entries = payload.get("devices") if overview else payload
+        if status != 200 or not isinstance(entries, list):
             raise OpenJIIError(
                 f"listing devices of experiment {experiment_id} failed "
                 f"({status}): {self._error_text(payload)}")
         devices = []
-        for entry in payload:
+        for entry in entries:
+            if overview and (not isinstance(entry, dict)
+                             or not isinstance(entry.get("binding"), dict)):
+                continue
             device = entry.get("device") if isinstance(entry, dict) else None
             if isinstance(device, dict):
                 devices.append(device)

@@ -606,6 +606,12 @@ CONFIG_AMBYTE_WIFI_PASSWORD="__UNPROVISIONED__"
 # end of Ambyte bench diagnostics
 
 #
+# Ambyte SD overflow on-device verification
+#
+# CONFIG_AMBYTE_EVQ_HIL is not set
+# end of Ambyte SD overflow on-device verification
+
+#
 # Ambyte MQTT Client
 #
 CONFIG_AMBYTE_DEVICE_ID="1"

@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "ambit_stage.h"
 #include "sd_card.h"
 #include "uart_sensor_port.h"
 
@@ -31,7 +32,6 @@
 #define AMBIT_OTA_REBOOT_WAIT_MS 5000     /* let the C3 reboot into the new image before re-querying */
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
-#define AMBIT_FW_PATH          "/sdcard/ambit_fw.bin"
 #define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
 /* The schedule runner estimates autonomous traces with ambit_trace_estimate_ms().
  * Suspending it prevents a new trigger; this conservative bound lets any
@@ -234,23 +234,29 @@ static void wait_for_fleet_slot(void)
  * (release-asset 302 following is a follow-up). Same proven TLS/buffer settings
  * as the ambyte self-OTA (cert bundle validates GitHub + its CDN; 4 KiB buffers
  * fit GitHub's long signed-redirect URLs). */
-static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t *out_size);
+static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st);
 
 /* SD RW-gate wrapper (audit R-6): guard the download's fwrite loop against a monitor
- * teardown freeing the volume mid-write. */
-static esp_err_t http_get_to_file(const char *url, const char *path, size_t *out_size)
+ * teardown freeing the volume mid-write. The image goes to a fresh single-named
+ * stage (ambit_stage.h) — the legacy /sdcard/ambit_fw.bin is never touched. */
+__attribute__((cold)) static esp_err_t http_get_to_stage(const char *url, ambit_stage_t *st)
 {
-    if (out_size) *out_size = 0;
+    memset(st, 0, sizeof *st);
     if (!sdcard_io_begin()) return ESP_ERR_INVALID_STATE;
-    esp_err_t rc = http_get_to_file_impl(url, path, out_size);
+    esp_err_t rc = http_get_to_stage_impl(url, st);
     sdcard_io_end();
     return rc;
 }
 
-static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t *out_size)
+static int http_stage_read(void *ctx, uint8_t *buf, size_t cap)
 {
-    *out_size = 0;
+    int r = esp_http_client_read((esp_http_client_handle_t)ctx, (char *)buf, (int)cap);
+    vTaskDelay(1);       /* yield so the idle task is fed on a fast link */
+    return r;
+}
 
+__attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st)
+{
     esp_http_client_config_t cfg = {
         .url               = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
@@ -298,42 +304,17 @@ static esp_err_t http_get_to_file_impl(const char *url, const char *path, size_t
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "cannot open %s for write", path);
-        esp_http_client_close(c);
-        esp_http_client_cleanup(c);
-        return ESP_FAIL;
-    }
-    uint8_t *buf = malloc(AMBIT_OTA_DL_BUF);
-    if (buf == NULL) {
-        fclose(f);
-        esp_http_client_close(c);
-        esp_http_client_cleanup(c);
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t total = 0;
-    while (1) {
-        int r = esp_http_client_read(c, (char *)buf, AMBIT_OTA_DL_BUF);
-        if (r < 0) { err = ESP_FAIL; break; }
-        if (r == 0) break;   /* EOF (content-length reached or stream closed) */
-        if (fwrite(buf, 1, (size_t)r, f) != (size_t)r) { err = ESP_ERR_NO_MEM; break; }
-        total += (size_t)r;
-        vTaskDelay(1);       /* yield so the idle task is fed on a fast link */
-    }
-
-    free(buf);
-    fclose(f);
+    ambit_stage_why_t why = AMBIT_STAGE_OK;
+    ambit_stage_cleanup_t cl = { 0 };
+    err = ambit_stage_download(SD_MOUNT_POINT, http_stage_read, c, clen > 0 ? clen : 0, st, &why, &cl);
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
-
-    if (err == ESP_OK && clen > 0 && total != (size_t)clen) {
-        ESP_LOGE(TAG, "short download: %u of %lld bytes", (unsigned)total, (long long)clen);
-        err = ESP_FAIL;
+    if (err != ESP_OK || cl.stale_removed || cl.stale_remove_err) {
+        ESP_LOGW(TAG, "stage %s (%s), stale %u removed/%u failed", ambit_stage_why_name(why),
+                 st->path[0] ? st->path : "-", cl.stale_removed, cl.stale_remove_err);
     }
-    if (err == ESP_OK) *out_size = total;
-    return err;
+    if (err != ESP_OK) return ESP_FAIL;
+    return ESP_OK;
 }
 
 /* ── version read (cmd 33/2) — pre/post-OTA confirmation ─────────────────── */
@@ -356,49 +337,62 @@ static bool ambit_log_version(uint8_t ch, const char *when)
 
 /* ── stream a staged image to one AMBIT ──────────────────────────────────── */
 
-static bool ambit_stream_image(uint8_t ch, FILE *f, size_t img_size)
-{
-    uint8_t status = 0xFF;
+typedef struct {
+    uint8_t  ch;
+    uint16_t seq;
+    size_t   sent, total;
+    int      last_decile;
+} ota_sink_ctx_t;
 
-    cmd_result_t r = cmd_ambit_ota_begin(ch, (uint32_t)img_size, &status);
+__attribute__((cold)) static bool ota_sink_begin(void *vctx, size_t len)
+{
+    ota_sink_ctx_t *x = vctx;
+    uint8_t status = 0xFF;
+    x->total = len;
+    cmd_result_t r = cmd_ambit_ota_begin(x->ch, (uint32_t)len, &status);
     if (r.status != ESP_OK || status != 0) {
         ESP_LOGE(TAG, "OTA_BEGIN failed (%s, status=%u)", esp_err_to_name(r.status), status);
         return false;
     }
+    return true;
+}
 
-    uint8_t  buf[AMBIT_OTA_CHUNK_MAX];
-    uint16_t seq = 0;
-    size_t   sent = 0;
-    int      last_decile = -1;
-    size_t   n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
-        bool chunk_ok = false;
-        for (int tries = 0; tries < AMBIT_OTA_MAX_RETRY && !chunk_ok; tries++) {
-            r = cmd_ambit_ota_data(ch, seq, buf, (uint8_t)n, &status);
-            if (r.status == ESP_OK && status == 0) {
-                chunk_ok = true;
-            } else {
-                ESP_LOGW(TAG, "chunk seq=%u try=%d: err=%s status=%u",
-                         seq, tries + 1, esp_err_to_name(r.status), status);
-            }
-        }
-        if (!chunk_ok) {
-            ESP_LOGE(TAG, "chunk seq=%u failed after %d tries (status=%u) — aborting",
-                     seq, AMBIT_OTA_MAX_RETRY, status);
-            cmd_ambit_ota_abort(ch, &status);
-            return false;
-        }
-        sent += n;
-        seq++;
-        int decile = (img_size > 0) ? (int)(sent * 10 / img_size) : 0;
-        if (decile != last_decile) {
-            ESP_LOGW(TAG, "  streaming %d%% (%u/%u B, %u chunks)",
-                     decile * 10, (unsigned)sent, (unsigned)img_size, (unsigned)seq);
-            last_decile = decile;
+__attribute__((cold)) static bool ota_sink_data(void *vctx, const uint8_t *buf, size_t n)
+{
+    ota_sink_ctx_t *x = vctx;
+    uint8_t status = 0xFF;
+    cmd_result_t r = { 0 };
+    bool chunk_ok = false;
+    for (int tries = 0; tries < AMBIT_OTA_MAX_RETRY && !chunk_ok; tries++) {
+        r = cmd_ambit_ota_data(x->ch, x->seq, buf, (uint8_t)n, &status);
+        if (r.status == ESP_OK && status == 0) {
+            chunk_ok = true;
+        } else {
+            ESP_LOGW(TAG, "chunk seq=%u try=%d: err=%s status=%u",
+                     x->seq, tries + 1, esp_err_to_name(r.status), status);
         }
     }
+    if (!chunk_ok) {
+        ESP_LOGE(TAG, "chunk seq=%u failed after %d tries (status=%u) — aborting",
+                 x->seq, AMBIT_OTA_MAX_RETRY, status);
+        return false;                       /* ambit_stage_stream sends the abort */
+    }
+    x->sent += n;
+    x->seq++;
+    int decile = (x->total > 0) ? (int)(x->sent * 10 / x->total) : 0;
+    if (decile != x->last_decile) {
+        ESP_LOGW(TAG, "  streaming %d%% (%u/%u B, %u chunks)",
+                 decile * 10, (unsigned)x->sent, (unsigned)x->total, (unsigned)x->seq);
+        x->last_decile = decile;
+    }
+    return true;
+}
 
-    r = cmd_ambit_ota_end(ch, &status);
+__attribute__((cold)) static bool ota_sink_end(void *vctx)
+{
+    ota_sink_ctx_t *x = vctx;
+    uint8_t status = 0xFF;
+    cmd_result_t r = cmd_ambit_ota_end(x->ch, &status);
     if (r.status != ESP_OK || status != 0) {
         ESP_LOGE(TAG, "OTA_END failed (%s, status=%u) — AMBIT kept its old image",
                  esp_err_to_name(r.status), status);
@@ -407,36 +401,49 @@ static bool ambit_stream_image(uint8_t ch, FILE *f, size_t img_size)
     return true;
 }
 
+__attribute__((cold)) static void ota_sink_abort(void *vctx)
+{
+    ota_sink_ctx_t *x = vctx;
+    uint8_t status = 0xFF;
+    ESP_LOGE(TAG, "AMBIT%u stream aborted before OTA_END", x->ch + 1);
+    cmd_ambit_ota_abort(x->ch, &status);
+}
+
+/* Stream the verified stage to channel `ch`: ambit_stage_stream re-hashes the
+ * bytes it reads and aborts instead of OTA_END on any mismatch. */
+__attribute__((cold)) static bool ambit_stream_image(uint8_t ch, const ambit_stage_t *st)
+{
+    ota_sink_ctx_t x = { .ch = ch, .last_decile = -1 };
+    const ambit_stage_sink_t sink = {
+        .ctx = &x, .begin = ota_sink_begin, .data = ota_sink_data, .end = ota_sink_end, .abort = ota_sink_abort,
+    };
+    uint8_t buf[AMBIT_OTA_CHUNK_MAX];
+    return ambit_stage_stream(st, &sink, buf, sizeof buf);
+}
+
 /* ── one channel: stream the staged image + confirm after reboot ──────────── */
 
-/* Stream AMBIT_FW_PATH (img_size bytes) to channel `ch`, then — after the C3
+/* Stream the verified stage to channel `ch`, then — after the C3
  * reboots into the new (PENDING_VERIFY) image — confirm it ONLY if it answers.
  * If it doesn't answer or the confirm fails, the C3 bootloader rolls back to the
  * previous image on its next reboot. Returns true only when confirmed healthy. */
-static bool ambit_ota_one_impl(uint8_t ch, size_t img_size);
+static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage);
 
 /* SD RW-gate wrapper (audit R-6): guard the fopen + fread stream of the AMBIT image
  * from SD against a monitor teardown freeing the volume mid-stream. */
-static bool ambit_ota_one(uint8_t ch, size_t img_size)
+static bool ambit_ota_one(uint8_t ch, const ambit_stage_t *st)
 {
     if (!sdcard_io_begin()) return false;
-    bool ok = ambit_ota_one_impl(ch, img_size);
+    bool ok = ambit_ota_one_impl(ch, st);
     sdcard_io_end();
     return ok;
 }
 
-static bool ambit_ota_one_impl(uint8_t ch, size_t img_size)
+static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage)
 {
     ambit_log_version(ch, "before");
 
-    FILE *f = fopen(AMBIT_FW_PATH, "rb");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "cannot reopen %s for read", AMBIT_FW_PATH);
-        return false;
-    }
-    bool streamed = ambit_stream_image(ch, f, img_size);
-    fclose(f);
-    if (!streamed) return false;
+    if (!ambit_stream_image(ch, stage)) return false;
 
     ESP_LOGW(TAG, "OTA_END ok — AMBIT%u rebooting; waiting %d ms then re-checking",
              ch + 1, AMBIT_OTA_REBOOT_WAIT_MS);
@@ -539,13 +546,13 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
         ESP_LOGE(TAG, "SD not available — cannot stage the AMBIT image");
         detail = "SD not available";
     } else {
-        size_t    img_size = 0;
-        esp_err_t err = http_get_to_file(url, AMBIT_FW_PATH, &img_size);   /* download once */
-        if (err != ESP_OK || img_size == 0) {
-            ESP_LOGE(TAG, "download failed (%s, %u bytes)", esp_err_to_name(err), (unsigned)img_size);
+        ambit_stage_t stage;
+        esp_err_t err = http_get_to_stage(url, &stage);   /* download once, verified */
+        if (err != ESP_OK || stage.len == 0) {
+            ESP_LOGE(TAG, "download failed (%s)", esp_err_to_name(err));
             detail = "download failed";
         } else {
-            ESP_LOGW(TAG, "downloaded %u bytes -> %s", (unsigned)img_size, AMBIT_FW_PATH);
+            ESP_LOGW(TAG, "downloaded + verified %u bytes -> %s", (unsigned)stage.len, stage.path);
             if (all) {
                 /* Sweep every present channel, sequentially (the UART is shared). */
                 int present = 0, ok_count = 0;
@@ -558,7 +565,7 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
                         continue;
                     }
                     present++;
-                    bool ok_c = ambit_ota_one(c, img_size);
+                    bool ok_c = ambit_ota_one(c, &stage);
                     res[c] = ok_c ? OTA_OK : OTA_FAIL;
                     if (ok_c) ok_count++;
                 }
@@ -566,8 +573,15 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
                 ok = (present > 0 && ok_count == present);
                 if (!ok) detail = (present == 0) ? "no AMBIT present" : "one or more channels failed";
             } else {
-                ok = ambit_ota_one(r->channel, img_size);
+                ok = ambit_ota_one(r->channel, &stage);
                 if (!ok) detail = "stream/confirm failed";
+            }
+            /* Stage served its purpose (success or failure): remove it under the
+             * gate. Single-named, never renamed; a failed remove is cleared by
+             * the next attempt's cleanup. */
+            if (sdcard_io_begin()) {
+                (void)ambit_stage_remove(&stage);
+                sdcard_io_end();
             }
         }
     }

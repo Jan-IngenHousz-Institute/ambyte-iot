@@ -223,7 +223,7 @@ jobs:
             tools/sched_host.c components/sched_spec/*.c \
             components/time_sync/time_sync.c -lm -o "${RUNNER_TEMP}/sched_host"
           "${RUNNER_TEMP}/sched_host" --schema > dist/actions.schema.json
-          SCHEDULES=(default legacy_1hz_spec)
+          SCHEDULES=(default legacy_1hz_spec qe_multichannel)
           for SCRIPT in "${SCHEDULES[@]}"; do
             "${RUNNER_TEMP}/sched_host" --check "schedule/${SCRIPT}.yaml"
             {

@@ -585,6 +585,8 @@ static void sched_runner_task(void *arg)
         }
     }
 
+    sched_runner_cleanup_lights();
+
     /* Stack high-water at exit: the number that trims SCHED_TASK_STACK after
      * the hardware soak (acceptance criterion 4). */
     ESP_LOGI(TAG, "stopped; stack high-water mark %u bytes of %u",

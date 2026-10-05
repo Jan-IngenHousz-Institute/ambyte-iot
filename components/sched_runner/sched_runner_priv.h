@@ -181,4 +181,7 @@ bool sched_build_map_json(char *buf, size_t cap, const char *input_name,
  * called by sched_runner_start(). */
 void sched_runner_bind_actions(void);
 
+/* Runner-task exit only; complete persisted-light cleanup before STOPPED. */
+void sched_runner_cleanup_lights(void);
+
 #endif

@@ -24,6 +24,8 @@ export default {
           { path: "../release-assets/default.yaml.manifest.json", label: "Default schedule manifest" },
           { path: "../release-assets/legacy_1hz_spec.yaml", label: "Legacy 1 Hz field schedule" },
           { path: "../release-assets/legacy_1hz_spec.yaml.manifest.json", label: "Legacy 1 Hz schedule manifest" },
+          { path: "../release-assets/qe_multichannel.yaml", label: "qE multichannel field schedule" },
+          { path: "../release-assets/qe_multichannel.yaml.manifest.json", label: "qE multichannel schedule manifest" },
           { path: "../release-assets/actions.schema.json", label: "Schedule action schema" },
         ],
         successComment: false,
