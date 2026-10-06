@@ -30,6 +30,19 @@
  * when it fails to compile the embedded default runs as EMBEDDED_FALLBACK
  * with the compile reason kept for `schedule status`. There is deliberately
  * no SD path anywhere: the embedded default covers a blank unit.
+ *
+ * Two trace time bases (ambit/trace, sched_runner_actions.c): an AMBIT below
+ * fw 1.4.0 free-runs the ADPD, so a nominal 1 Hz pulse takes tick_factor s
+ * (< 1, decoder-corrected) and the nominal Σ pulses/freq + 300 ms/segment
+ * estimate overshoots the run; from fw 1.4.0 the EXT_SYNC engine paces every
+ * pulse at exactly 1/freq from the ESP clock, plus ~0.5 s of setup and
+ * warm-up, so the same 45-pulse SS run grows from ~41.2 s to ~44.4 s (and
+ * ships additive array 9, edge times). The AMBIT runs cmd 22 inline and
+ * cannot answer a poll while measuring, so the runner estimates each channel
+ * from its cached identity (ambit_trace_engine_for +
+ * ambit_trace_estimate_ms_for, one value per channel) and never polls before
+ * 100 % of that estimate; the broken-AMBIT deadline is the same estimate plus
+ * deadline_margin. Nothing on the wire differs between the two engines.
  */
 
 #include <stdbool.h>

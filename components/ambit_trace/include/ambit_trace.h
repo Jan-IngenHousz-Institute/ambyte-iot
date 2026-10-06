@@ -97,9 +97,58 @@ void ambit_build_cmd_ascii(char *out, size_t cap, const uint8_t *run_arr,
 uint8_t *ambit_trace_build_run_arr(const ambit_trace_segment_t *segments,
                                    size_t nseg, uint8_t ch);
 
-/* Approximate run time: pulses/freq seconds plus 300 ms of
- * per-segment configuration/light-sleep slack. The scheduler uses the estimate
- * only to defer polling and bound a broken AMBIT, not as a measurement clock. */
+/* ── Run-time estimate: two acquisition engines, two time bases ──────────
+ *
+ * The scheduler uses the estimate only to defer polling and to bound a broken
+ * AMBIT, never as a measurement clock — but it must be an UPPER bound of the
+ * wall-clock run. The AMBIT executes a retained run (cmd 22) inline on its
+ * serial loop: it cannot answer a poll (cmd 23) while measuring, and the wake
+ * bytes a poll pushes into a light-sleeping AMBIT are mangled by the UART wake,
+ * queued, and parsed only after the run, which can desynchronise the following
+ * poll/fetch. So a poll must never land inside the run.
+ *
+ *  FREE_RUN  AMBIT fw < 1.4.0. The ADPD period counter paces the run; a nominal
+ *            1 Hz pulse really takes tick_factor s (below 1 — 0.85…0.94 across
+ *            shipped calibrations, which the trace decoder corrects for), so
+ *            Σ pulses/freq already overshoots the run and 300 ms per segment of
+ *            configuration/light-sleep slack is the only overhead. The shipped
+ *            45-pulse 1 Hz SS: ~41.2 s measured, 45.3 s estimated.
+ *  PACED     AMBIT fw >= 1.4.0 (EXT_SYNC engine, v1.4.0-rc.1, ambit PR #10).
+ *            The ESP clock fires every pulse at exactly 1/freq, after ~0.5 s of
+ *            per-run setup (environment read, ADPD reconfiguration, arm settle,
+ *            three discarded warm-up sequences) plus a per-line reconfiguration.
+ *            The same SS run takes ~44.4 s — past 90 % of the free-run estimate
+ *            (40.8 s), which is how 2.5.2 gateways polled 1.4.0 AMBITs mid-run
+ *            and lost channel 0's SS traces for hours (Nergena, 2026-10-05).
+ *            Estimate: Σ pulses/freq + 500 ms per run + 100 ms per segment —
+ *            45.6 s / 10.1 s for the shipped SS / MPF. Σ pulses/freq counts N
+ *            periods for N edges spanning (N-1)/freq, so each segment carries
+ *            one period of slack on top; that and the setup term are the guard.
+ *            Array 9 (edge times) is additive; arrays 0–8, the wire bytes and
+ *            the decoder are identical for both engines.
+ *
+ * The engine comes from the cached cmd 33/2 identity (cmd_ambit_device_info).
+ * An UNKNOWN identity is treated as PACED: polling a free-run AMBIT a few
+ * seconds late costs nothing, polling a paced one early loses the trace. */
+typedef enum {
+    AMBIT_TRACE_ENGINE_FREE_RUN = 0,
+    AMBIT_TRACE_ENGINE_PACED,
+} ambit_trace_engine_t;
+
+#define AMBIT_TRACE_PACED_FW_MAJOR       1
+#define AMBIT_TRACE_PACED_FW_MINOR       4
+#define AMBIT_TRACE_FREE_RUN_SEGMENT_MS  300
+#define AMBIT_TRACE_PACED_SETUP_MS       500
+#define AMBIT_TRACE_PACED_SEGMENT_MS     100
+
+/* NULL or an invalid identity → PACED (see above). */
+ambit_trace_engine_t ambit_trace_engine_for(const ambit_device_info_t *info);
+/* Upper bound of the wall-clock run for `engine`; 0 for no segments. The
+ * runner uses ONE value per channel for both the poll start (>= 100 % of it)
+ * and the broken-AMBIT deadline (it plus deadline_margin). */
+int64_t ambit_trace_estimate_ms_for(const ambit_trace_segment_t *segments, size_t nseg,
+                                    ambit_trace_engine_t engine);
+/* The FREE_RUN estimate, for callers without a channel identity. */
 int64_t ambit_trace_estimate_ms(const ambit_trace_segment_t *segments, size_t nseg);
 
 /* Consumes `resp` on every path, including errors. A failed optional store is

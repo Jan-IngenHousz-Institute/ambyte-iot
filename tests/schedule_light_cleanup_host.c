@@ -60,8 +60,15 @@ cmd_result_t cmd_uart_ping(uint8_t ch, bool *connected)
 }
 void device_commands_measurement_begin(void) {}
 void device_commands_measurement_end(void) {}
-int64_t ambit_trace_estimate_ms(const ambit_trace_segment_t *segs, size_t n)
-{ (void)segs; (void)n; return 1; }
+/* No cached identity → the action resolves the paced engine; a 1 ms estimate
+ * keeps the first poll sweep immediate, as the old stub did. */
+bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out)
+{ (void)ch; (void)out; return false; }
+ambit_trace_engine_t ambit_trace_engine_for(const ambit_device_info_t *info)
+{ (void)info; return AMBIT_TRACE_ENGINE_PACED; }
+int64_t ambit_trace_estimate_ms_for(const ambit_trace_segment_t *segs, size_t n,
+                                    ambit_trace_engine_t engine)
+{ (void)segs; (void)n; (void)engine; return 1; }
 cmd_result_t ambit_trace_trigger(uint8_t ch, const ambit_trace_segment_t *segs,
         size_t n, const ambit_trace_options_t *opts, ambit_trace_pending_t *pending)
 {

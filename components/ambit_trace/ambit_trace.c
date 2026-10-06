@@ -230,15 +230,46 @@ uint8_t *ambit_trace_build_run_arr(const ambit_trace_segment_t *segments,
     return run_arr;
 }
 
-int64_t ambit_trace_estimate_ms(const ambit_trace_segment_t *segments, size_t nseg)
+/* Engine from the cached identity. Same "major.minor" parse as the cmd 35
+ * gate in sched_runner_actions.c, but the unknown case resolves the other
+ * way: there an unknown AMBIT tries the newer command and lets the read
+ * report; here it must assume the LONGER run (ambit_trace.h). */
+ambit_trace_engine_t ambit_trace_engine_for(const ambit_device_info_t *info)
 {
-    if (segments == NULL) return 0;
-    double total = 0.0;
+    if (info == NULL || !info->valid) return AMBIT_TRACE_ENGINE_PACED;
+    unsigned major = 0, minor = 0;
+    if (sscanf(info->fw_version, "%u.%u", &major, &minor) != 2) {
+        return AMBIT_TRACE_ENGINE_PACED;
+    }
+    const bool paced = major > AMBIT_TRACE_PACED_FW_MAJOR ||
+                       (major == AMBIT_TRACE_PACED_FW_MAJOR &&
+                        minor >= AMBIT_TRACE_PACED_FW_MINOR);
+    return paced ? AMBIT_TRACE_ENGINE_PACED : AMBIT_TRACE_ENGINE_FREE_RUN;
+}
+
+int64_t ambit_trace_estimate_ms_for(const ambit_trace_segment_t *segments, size_t nseg,
+                                    ambit_trace_engine_t engine)
+{
+    if (segments == NULL || nseg == 0U) return 0;
+    const bool paced = engine == AMBIT_TRACE_ENGINE_PACED;
+    const double per_segment_ms = paced ? (double)AMBIT_TRACE_PACED_SEGMENT_MS
+                                        : (double)AMBIT_TRACE_FREE_RUN_SEGMENT_MS;
+    /* Σ pulses/freq is N full periods for N edges that span (N-1)/freq: one
+     * period of slack per segment, on top of the per-run setup, is what keeps
+     * the first poll behind the measured run (SS: 45.6 s estimate, ~44.4 s
+     * paced run). Free-run is faster-clocked than nominal (tick_factor < 1)
+     * and needs no setup term; it keeps the established field formula. */
+    double total_ms = paced ? (double)AMBIT_TRACE_PACED_SETUP_MS : 0.0;
     for (size_t i = 0; i < nseg; ++i) {
         const uint16_t freq = segments[i].freq > 0U ? segments[i].freq : 1U;
-        total += ((double)segments[i].pulses / (double)freq) * 1000.0 + 300.0;
+        total_ms += ((double)segments[i].pulses / (double)freq) * 1000.0 + per_segment_ms;
     }
-    return (int64_t)total;
+    return (int64_t)total_ms;
+}
+
+int64_t ambit_trace_estimate_ms(const ambit_trace_segment_t *segments, size_t nseg)
+{
+    return ambit_trace_estimate_ms_for(segments, nseg, AMBIT_TRACE_ENGINE_FREE_RUN);
 }
 
 /* Decode the binary FSM response and optionally store one event. The synchronous

@@ -5,8 +5,9 @@
  * from the previous field measurement implementation:
  *
  *   ambit/trace        ← run_trace behavior (ping gate, parallel trigger,
- *                        poll from 90 % of the estimate every 500 ms, fetch +
- *                        store on done, broken past est + deadline_margin)
+ *                        per-channel engine-aware run estimate — never polled
+ *                        before 100 % of it — then every 500 ms, fetch + store
+ *                        on done, broken past est + deadline_margin)
  *   ambit/spectrum     ← spectrum read + store (missing id = failure);
  *                        `raw: true` = AMBIT cmd 35 (get_spec_raw) → ambit.spectrum/2,
  *                        else cmd 31 (get_spec) → ambit.spectrum/1
@@ -56,7 +57,16 @@
 
 /* ── parallel-run tuning retained from the field schedule ────────────── */
 #define POLL_INTERVAL_MS   500    /* gap between poll sweeps */
-#define POLL_START_PCT     90     /* don't poll until 90 % of the estimate elapsed */
+/* A channel is polled only once its FULL run estimate has elapsed (it used
+ * to start at 90 %). The AMBIT runs cmd 22 inline on its serial loop: a poll
+ * that lands mid-run gets no answer, and its wake bytes are mangled by the
+ * UART wake from light sleep, queued, and parsed after the run — desyncing
+ * the next poll/fetch. On AMBIT fw 1.4.0 (paced engine: ~44.4 s for the
+ * 45-pulse SS, against a 45.3 s free-run estimate) the 90 % start put ~7 such
+ * polls into every SS run of the first-polled channel, and channel 0 stopped
+ * delivering SS traces for hours (Nergena, 2026-10-05). The estimate itself
+ * carries the guard over the measured run (ambit_trace.h), so there is no
+ * extra offset here; the deadline margin still absorbs slow runs. */
 #define TRACE_TRIGGER_TIMEOUT_MS 3000   /* covers wake + ack only */
 #define TRACE_FETCH_TIMEOUT_MS  30000   /* must cover the array stream */
 #define TRACE_POLL_TIMEOUT_MS   400     /* a measuring AMBIT fails fast */
@@ -208,7 +218,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
             .subsampling = proto->segments[i].subsampling,
         };
     }
-    const int64_t est_ms = ambit_trace_estimate_ms(segs, (size_t)nseg);
     const uint8_t mask = channels_mask(step, prog);
 
     if (hold_window) device_commands_measurement_begin();
@@ -226,6 +235,11 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
 
     int pending_count = 0;
     int64_t t0[UART_SENSOR_NUM_CHANNELS] = { 0 };
+    /* Per channel: one gateway carries AMBITs on different firmware (the
+     * Nergena cohort mixes 1.4.0 on channels 0/1 with 1.3.0 on 2/3), and the
+     * two engines have different time bases (ambit_trace.h). Poll start AND
+     * deadline use this one value, from the single helper in ambit_trace. */
+    int64_t est_ms[UART_SENSOR_NUM_CHANNELS] = { 0 };
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (!(mask & (1u << ch))) continue;
         if (sched_runner_should_stop()) break;
@@ -235,6 +249,14 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         cmd_result_t r = ambit_trace_trigger(ch, segs, (size_t)nseg, &opts, &s_pend[ch]);
         if (r.status == ESP_OK) {
             t0[ch] = esp_timer_get_time() / 1000;
+            /* Cache-only identity: building the run array inside the trigger
+             * already fetched it (or failed to), and the AMBIT is measuring
+             * now, so a UART fetch here could not be answered anyway. An
+             * unknown identity resolves to the paced (longer) estimate. */
+            ambit_device_info_t info;
+            const bool known = cmd_ambit_device_info_cached(ch, &info);
+            est_ms[ch] = ambit_trace_estimate_ms_for(
+                segs, (size_t)nseg, ambit_trace_engine_for(known ? &info : NULL));
             pending_count++;
         } else {
             (void)act_fail(ctx, "ch%u trigger: %s", ch, r.message);
@@ -249,7 +271,9 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
             if (t0[ch] == 0) continue;
             if (sched_runner_should_stop()) break; /* before the next channel */
             int64_t elapsed = now - t0[ch];
-            if (elapsed < est_ms * POLL_START_PCT / 100) continue;
+            /* Inside its run window the channel is measuring by definition:
+             * no poll, so nothing lands on a light-sleeping AMBIT. */
+            if (elapsed < est_ms[ch]) continue;
             uint8_t st = 0xFF;
             cmd_result_t pr = cmd_ambit_poll(ch, &st, TRACE_POLL_TIMEOUT_MS);
             if (sched_runner_should_stop()) break; /* between poll and fetch */
@@ -258,9 +282,11 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                 cmd_result_t fr = ambit_trace_fetch(ch, &s_pend[ch], true,
                                                     TRACE_FETCH_TIMEOUT_MS, &res);
                 if (fr.status == ESP_OK) {
-                    ESP_LOGI(TAG, "%s ch%u: %u points, %.1fC, stored %lld",
+                    ESP_LOGI(TAG, "%s ch%u: %u points, %.1fC, stored %lld "
+                             "(%llds after trigger, est %llds)",
                              label, ch, (unsigned)res.points, res.leaf_temp,
-                             (long long)res.measure_id);
+                             (long long)res.measure_id, (long long)(elapsed / 1000),
+                             (long long)(est_ms[ch] / 1000));
                     fetched++;
                 } else {
                     (void)act_fail(ctx, "ch%u fetch: %s", ch, fr.message);
@@ -273,14 +299,17 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                 t0[ch] = 0;
                 pending_count--;
                 chan_failed++;
-            } else if (elapsed > est_ms + margin_ms) {
-                (void)act_fail(ctx, "ch%u: no result after %lldms — ambit broken?",
-                               ch, (long long)elapsed);
+            } else if (elapsed > est_ms[ch] + margin_ms) {
+                (void)act_fail(ctx, "ch%u: no result after %lldms (est %lldms) — ambit broken?",
+                               ch, (long long)elapsed, (long long)est_ms[ch]);
                 t0[ch] = 0;
                 pending_count--;
                 chan_failed++;
             }
-            /* else idle/busy: keep waiting */
+            /* else idle/busy — or no answer at all: a run slightly past its
+             * estimate looks exactly like that (the AMBIT cannot answer while
+             * measuring), so the channel stays "measuring" until the deadline.
+             * Same accounting as before; only the pre-window polls are gone. */
         }
     }
 

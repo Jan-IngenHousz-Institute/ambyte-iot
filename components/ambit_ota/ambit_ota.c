@@ -33,9 +33,13 @@
 #define AMBIT_OTA_DL_BUF       4096
 #define AMBIT_OTA_ID_MAX       64
 #define AMBIT_OTA_FLEET_JITTER_SLOTS 900U   /* one-second slots: 0:00 through 14:59 */
-/* The schedule runner estimates autonomous traces with ambit_trace_estimate_ms().
+/* The schedule runner estimates autonomous traces with
+ * ambit_trace_estimate_ms_for() (free-run or paced engine, per channel).
  * Suspending it prevents a new trigger; this conservative bound lets any
- * already-started shipped trace finish before maintenance probes the UART. */
+ * already-started shipped trace finish before maintenance probes the UART.
+ * Longest catalog protocol (qe_multichannel qE_light_a/qE_dark_a): ~52.2 s
+ * free-run / ~49.9 s paced; SS 45.3 / 45.6 s. tests/ambit_trace_estimate_host.c
+ * asserts every catalog protocol stays under this bound on both engines. */
 #define AMBIT_IDLE_SETTLE_MS   65000U
 /* Presence ping and cmd 33/2 are separate UART transactions. Field sweeps show
  * that the first identity reply can occasionally be dropped even after a valid
