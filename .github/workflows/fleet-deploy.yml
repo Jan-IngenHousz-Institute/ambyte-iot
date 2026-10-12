@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Target account/fleet (the whole fleet lives on dev today; prod is provisioned for the migration)"
+        description: "Target account/fleet (the field fleet lives on prod since the Sept 2026 migration; dev holds bench boards)"
         type: choice
         options: [dev, prod]
         default: dev
