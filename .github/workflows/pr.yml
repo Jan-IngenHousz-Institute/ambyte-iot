@@ -172,6 +172,17 @@ jobs:
           AMBYTE_PROJECT_VER: ${{ steps.preview.outputs.firmware-build-version }}
         run: "${RUNNER_TEMP}/platformio/bin/pio run -e esp32-s3-devkitm-1"
 
+      # The fleet installs this artifact, so the bench-only HIL fault command must be
+      # proven absent before the image is copied into dist/ (contract C-37).
+      - name: Check release image excludes bench HIL
+        if: steps.scope.outputs.firmware-build-required == 'true'
+        run: |
+          python tools/check_release_no_hil.py --self-test
+          python tools/check_release_no_hil.py \
+            --elf .pio/build/esp32-s3-devkitm-1/firmware.elf \
+            --bin .pio/build/esp32-s3-devkitm-1/firmware.bin \
+            --sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json
+
       - name: Verify version and create flash ZIP
         if: steps.scope.outputs.firmware-build-required == 'true'
         env:
