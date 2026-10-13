@@ -118,8 +118,10 @@ Both GitHub environments have **required reviewers**: the job deploys to
 real hardware, and `workflow_dispatch` runs whichever ref's copy of the
 workflow and script was selected, so the approval gate is the only thing
 between a modified feature-branch script and the fleet. Dispatch from
-`main` unless deliberately testing. The whole fleet connects to the dev
-IoT Core today; prod is pre-provisioned for the platform migration.
+`main` unless deliberately testing. The field fleet connects to the prod
+IoT Core (`494249241400`, eu-central-1) since the September 2026 migration;
+dev holds bench boards and the occasional straggler, so a dev dry run is
+not a fleet preview.
 
 Each account's role reuses that account's existing GitHub OIDC provider
 (created by open-jii's `iam-oidc` module) and trusts exactly its own

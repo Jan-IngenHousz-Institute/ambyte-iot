@@ -2,8 +2,9 @@
 
 ESP32-S3 firmware for Ambyte field devices (plant-measurement loggers carrying up to 4 AMBIT
 sensor boards over UART). Data flows: declarative schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = overflow for unsent + bulk archive) →
-QoS1 MQTT → AWS IoT Core (dev: account 084375565727, eu-central-1) → Kinesis/S3 →
-Databricks `open_jii_dev.centrum.clean_data`.
+QoS1 MQTT → AWS IoT Core → Kinesis/S3 → Databricks `centrum.clean_data`. The field fleet is on
+prod (account 494249241400, eu-central-1, `open_jii_prod`); dev (084375565727, `open_jii_dev`)
+holds bench boards.
 
 ## Commands
 
@@ -133,5 +134,6 @@ Databricks `open_jii_dev.centrum.clean_data`.
 - Commits: Conventional Commits for every commit message and PR title —
   `type(scope): description` (e.g. `feat(evlog): …`, `fix(rtc): …`, `docs: …`,
   `test(bench): …`). No Claude co-author trailers.
-- Fleet realities: all devices share one X.509 cert (fleet-provisioning migration planned);
+- Fleet realities: prod devices each have their own X.509 cert (245 as of Sept 2026); dev bench
+  boards share one;
   client ids are `AMBYTE_<MAC>`; ~500 devices/site is the target scale.
