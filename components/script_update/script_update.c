@@ -335,34 +335,43 @@ static bool request_already_active(const script_req_t *r)
 /* Compile into heap scratch state so install validation and runner loading use
  * the same parser, action catalog and semantic checks without growing this
  * maintenance worker's stack by sizeof(sched_program_t). */
-static bool schedule_ok(const char *text, size_t len, char *err, size_t err_cap)
+static const char *schedule_check(const char *text, size_t len, const char *workbook,
+                                   char *err, size_t err_cap)
 {
     sched_program_t *scratch = malloc(sizeof(*scratch));
     if (scratch == NULL) {
         snprintf(err, err_cap, "out of memory for schedule validation");
-        return false;
+        return "storage_error";
     }
     bool ok = sched_compile_text(text, len, scratch, err, err_cap) == ESP_OK;
+    const char *reason = ok ? NULL : "compile_failed";
+    if (ok && workbook != NULL) {
+        const char *compiled = sched_pool_str(scratch, scratch->workbook_version_id_off);
+        if (strcmp(workbook, compiled != NULL ? compiled : "") != 0) reason = "workbook_mismatch";
+    }
     free(scratch);
-    return ok;
+    return reason;
 }
-
-static bool sched_spec_compile_file(const char *path, char *err, size_t err_cap)
+static bool schedule_ok(const char *text, size_t len, char *err, size_t err_cap)
+{
+    return schedule_check(text, len, NULL, err, err_cap) == NULL;
+}
+static const char *schedule_check_file(const char *path, const char *workbook, char *err, size_t err_cap)
 {
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
         snprintf(err, err_cap, "%s: %s", path, strerror(errno));
-        return false;
+        return "storage_error";
     }
     char *buf = malloc(SCHED_YAML_MAX_FILE_BYTES + 1);
     if (buf == NULL) {
         fclose(f);
         snprintf(err, err_cap, "out of memory for schedule validation");
-        return false;
+        return "storage_error";
     }
     size_t len = fread(buf, 1, SCHED_YAML_MAX_FILE_BYTES + 1, f);
     bool ok = !ferror(f) && len <= SCHED_YAML_MAX_FILE_BYTES;
-    fclose(f);
+    if (fclose(f) != 0) ok = false;
     if (!ok) {
         if (len > SCHED_YAML_MAX_FILE_BYTES) {
             snprintf(err, err_cap, "schedule exceeds %u-byte limit",
@@ -371,11 +380,15 @@ static bool sched_spec_compile_file(const char *path, char *err, size_t err_cap)
             snprintf(err, err_cap, "schedule read failed");
         }
         free(buf);
-        return false;
+        return "storage_error";
     }
-    ok = schedule_ok(buf, len, err, err_cap);
+    const char *reason = schedule_check(buf, len, workbook, err, err_cap);
     free(buf);
-    return ok;
+    return reason;
+}
+static bool sched_spec_compile_file(const char *path, char *err, size_t err_cap)
+{
+    return schedule_check_file(path, NULL, err, err_cap) == NULL;
 }
 
 /* Stream `url` (HTTPS) into `path`, hashing the bytes as they arrive. 4 KB chunks
@@ -642,6 +655,30 @@ static void do_update_url(const script_req_t *r)
  * URL worker and the serial-push worker so the ONLY difference between them is
  * how schedule.yaml.new got written; the dangerous half has exactly one
  * implementation. Leaves schedule.yaml untouched on every failure path. */
+static bool swap_validated_path(const script_req_t *r, const char *path, const char *got,
+                                 bool strict, char *detail, size_t detail_cap)
+{
+    /* Legacy callers retain their literal errors and best-effort behavior.
+     * Service callers check each filesystem boundary because their durable
+     * result must distinguish an unapplied failure from an unknown activation. */
+    int removed = remove(SCHEDULE_PATH_BAK);
+    if (strict && removed != 0 && errno != ENOENT) {
+        snprintf(detail, detail_cap, "backup removal failed"); return false;
+    }
+    int rotated = rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK);
+    if (strict && rotated != 0 && errno != ENOENT) {
+        snprintf(detail, detail_cap, "backup rename failed"); return false;
+    }
+    if (rename(path, SCHEDULE_PATH) != 0) {
+        ESP_LOGE(TAG, "rename to %s failed", SCHEDULE_PATH);
+        int restored = rename(SCHEDULE_PATH_BAK, SCHEDULE_PATH);
+        snprintf(detail, detail_cap, strict && rotated == 0 && restored != 0 ? "rollback failed" : "rename failed");
+        return false;
+    }
+    identity_set(r, got);
+    return true;
+}
+
 static bool verify_and_swap_staged(const script_req_t *r, const char *got, size_t n,
                                    char *detail, size_t detail_cap)
 {
@@ -658,17 +695,58 @@ static bool verify_and_swap_staged(const script_req_t *r, const char *got, size_
         return false;
     }
     ESP_LOGW(TAG, "staged %u bytes, sha256=%s", (unsigned)n, got);
-    /* Swap: previous schedule survives as schedule.yaml.bak (manual recovery). */
-    remove(SCHEDULE_PATH_BAK);
-    (void)rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK);
-    if (rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH) != 0) {
-        ESP_LOGE(TAG, "rename to %s failed", SCHEDULE_PATH);
-        (void)rename(SCHEDULE_PATH_BAK, SCHEDULE_PATH);   /* best-effort restore */
-        snprintf(detail, detail_cap, "rename failed");
-        return false;
-    }
-    identity_set(r, got); /* before any reboot: dedupes retained trigger + records provenance */
-    return true;
+    return swap_validated_path(r, SCHEDULE_PATH_NEW, got, false, detail, detail_cap);
+}
+
+bool script_update_service_matches(const script_service_descriptor_t *d)
+{
+    if (!d || !d->sha256 || !d->workbook || !d->version || !d->built_fw) return false;
+    sched_identity_t loaded = {0}, after = {0};
+    script_identity_t release = {0};
+    if (sched_runner_identity(&loaded) != ESP_OK || loaded.kind != SCHED_SOURCE_INSTALLED ||
+        !sched_runner_is_running() || strcmp(loaded.sha256, d->sha256) ||
+        strcmp(loaded.has_workbook ? loaded.workbook : "", d->workbook) ||
+        script_update_get_identity(&release) != ESP_OK || !release.release_metadata_verified ||
+        strcmp(release.sha256, d->sha256) || strcmp(release.version, d->version) ||
+        strcmp(release.built_against_fw, d->built_fw)) return false;
+    /* File hashing/NVS reads cannot combine snapshots from two runner reloads. */
+    return sched_runner_identity(&after) == ESP_OK && after.generation == loaded.generation &&
+           after.kind == loaded.kind && !strcmp(after.sha256, loaded.sha256) && sched_runner_is_running();
+}
+
+const char *script_update_service_apply(const script_service_descriptor_t *d, bool *applied)
+{
+    if (!applied) return "invalid_args";
+    *applied = false;
+    if (!d || !d->source_path || strcmp(d->source_path, SCRIPT_UPDATE_SERVICE_STAGING_PATH) ||
+        !d->sha256 || strlen(d->sha256) != 64 || !d->workbook || !d->version || !d->built_fw ||
+        !d->size || d->size > SCHED_YAML_MAX_FILE_BYTES || !d->version[0] || !d->built_fw[0] ||
+        strlen(d->version) >= SCRIPT_IDENTITY_VERSION_LEN || strlen(d->built_fw) >= SCRIPT_IDENTITY_VERSION_LEN)
+        return "invalid_args";
+    if (!s_ready || !s_cfg.workload_suspend || !s_cfg.workload_resume) return "busy";
+    long size = file_size(d->source_path);
+    if (size < 0) return "storage_error";
+    if ((size_t)size != d->size) return "incomplete";
+    char got[65] = "", detail[192] = "";
+    if (sha256_file(d->source_path, got) != ESP_OK) return "storage_error";
+    if (strcmp(got, d->sha256)) return "checksum_mismatch";
+    const char *error = schedule_check_file(d->source_path, d->workbook, detail, sizeof detail);
+    if (error) return error;
+    if (script_update_service_matches(d)) return NULL;
+
+    script_req_t request = {0};
+    /* Service IDs belong to the service store, not the legacy MQTT dedupe
+     * namespace. Existing provenance keys carry the exact same release tuple. */
+    strcpy(request.checksum, d->sha256);
+    strcpy(request.script_version, d->version); strcpy(request.built_against_fw, d->built_fw);
+    s_cfg.workload_suspend();
+    if (sched_runner_is_running()) error = "activation_unverified";
+    else if (!swap_validated_path(&request, d->source_path, got, true, detail, sizeof detail))
+        error = !strcmp(detail, "rollback failed") ? "activation_unverified" : "storage_error";
+    else *applied = true;
+    s_cfg.workload_resume();
+    if (!error && !script_update_service_matches(d)) error = "activation_unverified";
+    return error;
 }
 
 static void do_update_url_impl(const script_req_t *r)
