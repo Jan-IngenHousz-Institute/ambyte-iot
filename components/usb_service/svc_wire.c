@@ -159,7 +159,7 @@ const char *svc_rx_byte(svc_rx_t *rx, unsigned char byte, int64_t now_ms,
         return NULL;
     }
     size_t n = rx->length;
-    if (n < 20 || rx->line[n - 9] != '*' || rx->line[8] != ' ') {
+    if (n < 18 || rx->line[n - 9] != '*' || rx->line[8] != ' ') {
         svc_rx_clear(rx);
         return "bad_frame";
     }

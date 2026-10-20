@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "svc_wire.c" "svc_store.c" "svc_usb.c"
+    SRCS "svc_wire.c" "svc_store.c" "svc_protocol.c" "svc_usb.c"
     INCLUDE_DIRS "include"
     PRIV_REQUIRES console driver esp_timer
 )
