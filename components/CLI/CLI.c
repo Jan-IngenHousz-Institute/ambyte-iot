@@ -11,6 +11,7 @@
 #include "mbedtls/base64.h"
 
 #include "CLI.h"
+#include "cli_identity.h"
 #include "driver/i2c.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -2199,6 +2200,16 @@ static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
         return ESP_OK;
+    }
+
+    static const esp_console_cmd_t identity_cmd = {
+        .command = "identity",
+        .help = "read gateway identity and maintenance contract v1 as one JSON line",
+        .func = cli_cmd_identity,
+    };
+    esp_err_t identity_err = esp_console_cmd_register(&identity_cmd);
+    if (identity_err != ESP_OK) {
+        return identity_err;
     }
 
     static const esp_console_cmd_t status_cmd = {

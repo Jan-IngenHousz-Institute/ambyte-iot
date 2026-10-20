@@ -158,6 +158,20 @@ bool      sched_runner_should_stop(void);
 /* Source of the currently loaded program (valid after the first start). */
 void      sched_runner_source(sched_source_t *out);
 
+/* Loaded-program identity copied in one lifecycle critical section. Unlike
+ * separate source/header reads this cannot combine two reload generations.
+ * A stopped program remains loaded. Before first start, kind is NONE; during
+ * compilation the snapshot is unavailable (ESP_ERR_INVALID_STATE). */
+typedef struct {
+    sched_source_kind_t kind;
+    uint32_t generation;
+    char sha256[65];
+    char workbook[64];
+    bool has_workbook;
+} sched_identity_t;
+
+esp_err_t sched_runner_identity(sched_identity_t *out);
+
 /* Stats for one job; ESP_ERR_NOT_FOUND when the name is unknown. */
 esp_err_t sched_runner_stats(const char *job, sched_job_stats_t *out);
 

@@ -889,6 +889,29 @@ static void hdr_copy(char *dst, size_t cap, const char *src)
     dst[n] = '\0';
 }
 
+esp_err_t sched_runner_identity(sched_identity_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof *out);
+    esp_err_t ret = ESP_OK;
+    taskENTER_CRITICAL(&s_state_mux);
+    if (!s_prog_valid) {
+        /* start() invalidates the program before compiling but retains the
+         * previous source until publication. That old source is not a valid
+         * snapshot. Only generation zero means "never loaded". */
+        if (s_lifecycle.generation != 0) ret = ESP_ERR_INVALID_STATE;
+    } else {
+        out->kind = s_source.kind;
+        out->generation = s_lifecycle.generation;
+        memcpy(out->sha256, s_source.sha256, sizeof out->sha256);
+        const char *wb = sched_pool_str(&s_prog, s_prog.workbook_version_id_off);
+        out->has_workbook = wb != NULL;
+        hdr_copy(out->workbook, sizeof out->workbook, wb != NULL ? wb : "");
+    }
+    taskEXIT_CRITICAL(&s_state_mux);
+    return ret;
+}
+
 esp_err_t sched_runner_header(sched_header_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_STATE;
