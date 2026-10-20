@@ -23,7 +23,9 @@ class ServiceStoreTest(unittest.TestCase):
             "-I" + str(ROOT / "components/usb_service/include"),
             str(ROOT / "components/usb_service/svc_wire.c"),
             str(ROOT / "components/usb_service/svc_store.c"),
-            str(ROOT / "tests/svc_host/store_driver.c"), "-o", str(cls.binary),
+            str(ROOT / "tests/svc_host/store_driver.c"), str(ROOT / "tests/svc_host/store_io.c"),
+            *(f"-Wl,--wrap={name}" for name in ("fopen", "fwrite", "fflush", "fsync", "fclose", "rename", "unlink", "ftruncate", "fseek")),
+            "-o", str(cls.binary),
         ], check=True)
 
     @classmethod
@@ -122,6 +124,79 @@ class ServiceStoreTest(unittest.TestCase):
             if result.get("error") == "expired":
                 self.assertEqual(self.call("admit", "1", 144, 1, directory=case)["error"], "expired")
 
+    def test_enospc_and_io_error_matrix_preserves_acknowledged_prefix(self):
+        self.call("admit", "1", 288, 1)
+        self.put(0, b"a" * 144)
+        snapshot = Path(self.tmp.name) / "snapshot"
+        shutil.copytree(self.root, snapshot)
+        for operation, indices in (("open", (1, 2)), ("write", (1, 2)), ("flush", (1, 2)),
+                                   ("sync", (1, 2)), ("rename", (1,)), ("seek", (1,))):
+            for index in indices:
+                for eio in (False, True):
+                    with self.subTest(operation=operation, index=index, eio=eio):
+                        case = Path(self.tmp.name) / f"{operation}-{index}-{eio}"
+                        shutil.copytree(snapshot, case)
+                        env = {"SVC_IO_OP": operation, "SVC_IO_AT": str(index)}
+                        if eio: env["SVC_IO_EIO"] = "1"
+                        failed = self.put(144, b"b" * 144, directory=case, env=env)
+                        self.assertIn(failed["error"], ("no_space", "storage_error", "corrupt_store"))
+                        result = self.call("get", "1", directory=case)
+                        self.assertEqual(result["offset"], 144)
+                        self.assertEqual((case / "stage.bin").read_bytes(), b"a" * 144)
+                        self.assertEqual(self.put(144, b"b" * 144, directory=case)["offset"], 288)
+
+    def test_final_result_crash_and_gc_matrix(self):
+        for op in range(1, 9):
+            self.call("admit", f"{op:x}", 144, 1)
+            self.call("abort", f"{op:x}")
+        self.call("admit", "9", 144, 1)
+        snapshot = Path(self.tmp.name) / "gc-snapshot"
+        shutil.copytree(self.root, snapshot)
+        states = set()
+        for cut in range(1, 11):
+            case = Path(self.tmp.name) / f"gc-cut-{cut}"
+            shutil.copytree(snapshot, case)
+            self.call("finish", "9", directory=case, env={"SVC_CUT": str(cut)}, crash=True)
+            result = self.call("get", "9", directory=case)
+            states.add(result["state"])
+            self.assertIn(result["state"], ("staging", "succeeded"))
+            if result["state"] == "succeeded":
+                self.assertEqual(len(list(case.glob("*.rec"))), 8)
+                self.assertEqual(self.call("get", "1", directory=case)["error"], "expired")
+            self.assertEqual(self.call("admit", "9", 144, 1, directory=case)["state"], result["state"])
+        self.assertEqual(states, {"staging", "succeeded"})
+        case = Path(self.tmp.name) / "gc-unlink-failure"
+        shutil.copytree(snapshot, case)
+        self.assertEqual(self.call("finish", "9", directory=case, env={"SVC_IO_OP": "unlink"})["error"], "no_space")
+        self.assertEqual(self.call("get", "9", directory=case)["state"], "succeeded")
+        self.assertEqual(len(list(case.glob("*.rec"))), 8)
+
+    def test_abort_cleanup_and_truncate_errors_recover_without_reexecution(self):
+        self.call("admit", "1", 288, 1)
+        self.put(0, b"a" * 144)
+        result = self.call("abort", "1", env={"SVC_IO_OP": "unlink"})
+        self.assertEqual(result["error"], "no_space")
+        self.assertEqual(self.call("get", "1")["state"], "aborted")
+        self.assertEqual(self.call("admit", "1", 288, 1)["state"], "aborted")
+        self.call("admit", "2", 288, 1)
+        (self.root / "stage.bin").write_bytes(b"unacknowledged")
+        self.assertEqual(self.call("get", "2", env={"SVC_IO_OP": "truncate"})["error"], "no_space")
+        self.assertEqual(self.call("get", "2")["offset"], 0)
+        self.assertEqual((self.root / "stage.bin").read_bytes(), b"")
+
+    def test_result_close_errors_cannot_ack_false_success(self):
+        self.call("admit", "1", 288, 1)
+        # The open path first closes the header and record reads; fail the
+        # chunk or replacement write close by tracing all reachable indices.
+        for index in range(1, 15):
+            case = Path(self.tmp.name) / f"close-{index}"
+            shutil.copytree(self.root, case)
+            result = self.put(0, b"a" * 144, directory=case, env={"SVC_IO_OP": "close", "SVC_IO_AT": str(index)})
+            resumed = self.call("get", "1", directory=case)
+            if "error" not in result: self.assertEqual(resumed["offset"], 144)
+            else: self.assertIn(resumed["offset"], (0, 144))
+            self.assertEqual(self.put(0, b"a" * 144, directory=case)["offset"], 144)
+
     def test_corrupt_store_never_reinitializes(self):
         self.call("admit", "1", 144, 1)
         original = (self.root / "store").read_bytes()
@@ -133,6 +208,12 @@ class ServiceStoreTest(unittest.TestCase):
         (self.root / "store").write_bytes(b"unsupported")
         self.assertEqual(self.call("admit", "2", 144, 1)["error"], "corrupt_store")
         self.assertEqual((self.root / "store").read_bytes(), b"unsupported")
+
+    def test_identifier_exhaustion_never_wraps_or_admits_again(self):
+        self.call("admit", "ffffffffffffffff", 144, 1)
+        self.call("abort", "ffffffffffffffff")
+        self.assertEqual(self.call("admit", "1", 144, 1)["error"], "id_exhausted")
+        self.assertEqual(self.call("init")["highest"], 2**64 - 1)
 
     def test_missing_acknowledged_data_is_corruption(self):
         self.call("admit", "1", 144, 1)
