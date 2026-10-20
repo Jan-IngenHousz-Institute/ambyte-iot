@@ -56,7 +56,7 @@ APP_OFFSET = "0x10000"
 CHANNELS = tuple(range(4))
 OTA_CHANNEL_ALL = 255
 AMBIT_OTA_TERMINAL_STATES = {"success", "failed", "absent"}
-INVALID_REPLY_DETAIL_MAX_BYTES = 2048
+INVALID_REPLY_MAX_BYTES = 2048
 
 
 class ReleaseError(ValueError):
@@ -400,6 +400,28 @@ def _parse_versions_report(data: dict[str, Any]) -> dict[str, Any] | None:
     return {"state": "complete", "channels": channels}
 
 
+def _invalid_versions_report(data: dict[str, Any]) -> dict[str, Any]:
+    report = {
+        "state": "invalid_reply",
+        "channels": {},
+        "detail": "invalid correlated ambit_versions channel inventory",
+        "reply_prefix": "",
+    }
+    inventory = json.dumps(_redact(data.get("channels")), separators=(",", ":"))
+    inventory = _redact_text(inventory)
+    low, high = 0, min(len(inventory), INVALID_REPLY_MAX_BYTES)
+    # JSON escaping can expand the snippet, so cap the serialized evidence.
+    while low < high:
+        middle = (low + high + 1) // 2
+        report["reply_prefix"] = inventory[:middle]
+        if len(json.dumps(report, indent=2).encode("utf-8")) <= INVALID_REPLY_MAX_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    report["reply_prefix"] = inventory[:low]
+    return report
+
+
 def fleet_ambit_versions(
     session: Any,
     devices: list[str],
@@ -440,14 +462,7 @@ def fleet_ambit_versions(
         if report is None:
             # Invalid inventory must not become apparent silence: that could
             # hide a present channel when no-presence gateways are skipped.
-            detail = _redact_text("invalid correlated ambit_versions channel inventory")
-            report = {
-                "state": "invalid_reply",
-                "channels": {},
-                "detail": detail.encode("utf-8")[:INVALID_REPLY_DETAIL_MAX_BYTES].decode(
-                    "utf-8", "ignore"
-                ),
-            }
+            report = _invalid_versions_report(data)
         elif device in reports:
             return
         reports[device] = report

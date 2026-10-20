@@ -1290,18 +1290,23 @@ class PreflightSkipRunnerTest(unittest.TestCase):
                         self.assertIn(DEVICE_B, plan["blocking_preflight"])
 
     def test_invalid_reply_evidence_is_bounded_redacted_and_cannot_be_washed_away(self):
-        oversized = {"channels": [{"ch": 0, "present": True, "version": "token=sensitive-value " + "x" * 10000}], "detail": "password=secret-value"}
         valid = {"channels": [{"ch": index, "present": False} for index in range(4)]}
-        for raw in ([oversized], [oversized, valid], [valid, oversized]):
-            report = collect_version_replies(raw)[DEVICE_A]
-            self.assertEqual(report["state"], "invalid_reply")
-            code, plan, _, ota, _ = self.run_case({DEVICE_A: self.healthy(), DEVICE_B: report}, {DEVICE_B: self.healthy()})
-            self.assertEqual(code, 1)
-            ota.assert_not_called()
-            evidence = plan["preflight_attempts"][0]["reports"][DEVICE_B]
-            self.assertLessEqual(len(json.dumps(evidence).encode()), 2048)
-            self.assertNotIn("sensitive-value", json.dumps(plan))
-            self.assertNotIn("secret-value", json.dumps(plan))
+        for padding in ("x" * 50000, '\u2603"' * 10000, "\\\n" * 10000):
+            oversized = {"channels": [{"ch": 0, "present": True, "version": "token=sensitive-value " + padding}], "detail": "password=secret-value"}
+            for raw in ([oversized], [oversized, valid], [valid, oversized]):
+                with self.subTest(padding=padding[:10], reply_count=len(raw)):
+                    report = collect_version_replies(raw)[DEVICE_A]
+                    self.assertEqual(report["state"], "invalid_reply")
+                    code, plan, _, ota, _ = self.run_case({DEVICE_A: self.healthy(), DEVICE_B: report}, {DEVICE_B: self.healthy()})
+                    self.assertEqual(code, 1)
+                    ota.assert_not_called()
+                    evidence = plan["preflight_attempts"][0]["reports"][DEVICE_B]
+                    self.assertIn('"ch":0,"present":true', evidence["reply_prefix"])
+                    self.assertIn("token=<redacted>", evidence["reply_prefix"])
+                    self.assertLessEqual(len(json.dumps(evidence, indent=2).encode()), 2048)
+                    self.assertGreater(len(json.dumps(evidence).encode()), 1900)
+                    self.assertNotIn("sensitive-value", json.dumps(plan))
+                    self.assertNotIn("secret-value", json.dumps(plan))
 
 
 class MqttOperationTest(unittest.TestCase):
