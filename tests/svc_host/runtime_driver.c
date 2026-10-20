@@ -15,6 +15,10 @@ static void *worker_arg;
 static char input[2048];
 static size_t input_at, input_length;
 static const char *case_name;
+#ifdef SVC_JOBS_INTEGRATION
+static void jobs_during_trial(void);
+static void jobs_queued(void (*run)(void *), void *arg);
+#endif
 
 void svc_test_enter(void) { assert(critical++ == 0); }
 void svc_test_exit(void) { assert(critical-- == 1); }
@@ -44,7 +48,12 @@ static bool app_maint_submit(void (*run)(void *), void *arg)
 {
     if (reject) return false;
     if (arg == &s_engine) { assert(!pending_worker); ++raw_submissions; pending_worker = run; worker_arg = arg; }
-    else ++legacy_submissions;
+    else {
+        ++legacy_submissions;
+#ifdef SVC_JOBS_INTEGRATION
+        jobs_queued(run, arg);
+#endif
+    }
     return true;
 }
 #include "../../main/service_admission.h"
@@ -61,6 +70,9 @@ esp_err_t wifi_manager_trial(const char *ssid, const char *password, wifi_manage
     assert(usb_service_wifi_busy());
     /* All three component ports use this same real composition predicate. */
     for (unsigned i = 0; i < 3; ++i) assert(!app_maint_submit_legacy(ignored_job, NULL));
+#ifdef SVC_JOBS_INTEGRATION
+    jobs_during_trial();
+#endif
     assert(prepare(false, "original", "original-password", context));
     if (strcmp(case_name, "success")) {
         out->restored = true; out->connected = true;
@@ -141,4 +153,5 @@ int main(int argc, char **argv)
     add_request("svc.stats", 6); add_request("svc.wifi.status", 7); add_request("svc.exit", 8);
     assert(usb_service_command(1, NULL) == 0);
     assert(!gate && !mutex_held && !critical);
+    return 0;
 }
