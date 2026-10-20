@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <stdio.h>
+#include <stdio_ext.h>
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/evp.h>
@@ -9,6 +10,24 @@
 #include "script_update.h"
 
 static unsigned file_reads, nvs_reads;
+static unsigned scratch_heap_allocations;
+static size_t peak_stdio_buffer;
+
+void *__real_malloc(size_t n);
+void *__wrap_malloc(size_t n)
+{
+    scratch_heap_allocations++;
+    return __real_malloc(n);
+}
+
+size_t __real_fread(void *buf, size_t size, size_t n, FILE *f);
+size_t __wrap_fread(void *buf, size_t size, size_t n, FILE *f)
+{
+    size_t got = __real_fread(buf, size, n, f);
+    size_t buffered = __fbufsize(f);
+    if (buffered > peak_stdio_buffer) peak_stdio_buffer = buffered;
+    return got;
+}
 
 FILE *__real_fopen(const char *, const char *);
 FILE *__wrap_fopen(const char *path, const char *mode)
@@ -62,6 +81,11 @@ int main(void)
     esp_err_t rc = script_update_get_identity(&out);
     assert(file_reads == 1);
     assert(nvs_reads <= 1);
+    if (getenv("A2_CHECK_READ_MEMORY")) {
+        fprintf(stderr, "hash read: scratch heap allocations=%u stdio buffer=%zu\n",
+                scratch_heap_allocations, peak_stdio_buffer);
+        assert(scratch_heap_allocations == 0 && peak_stdio_buffer <= 1);
+    }
     printf("rc=%d\nsha=%s\nversion=%s\nbuilt=%s\ninstalled=%s\nverified=%d\n",
            rc, out.sha256, out.version, out.built_against_fw,
            out.installed_on_fw, out.release_metadata_verified);

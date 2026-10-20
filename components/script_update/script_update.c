@@ -249,17 +249,25 @@ static esp_err_t sha256_file(const char *path, char hex[65])
 {
     FILE *f = fopen(path, "rb");
     if (f == NULL) return ESP_ERR_NOT_FOUND;
-    uint8_t *buf = malloc(1024);
-    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    /* LittleFS reports a 4 KiB st_blksize, so newlib's default FILE buffer
+     * plus a separate hash buffer made every identity read transiently consume
+     * >5 KiB. During acquisition/publish that lowered the heap low-water mark
+     * even though the post-response free-heap sample looked unchanged. Keep
+     * reads unbuffered and scratch bounded on the caller's stack instead. */
+    if (setvbuf(f, NULL, _IONBF, 0) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    uint8_t buf[256];
 
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts(&sha, 0);
     esp_err_t err = ESP_OK;
     while (1) {
-        size_t n = fread(buf, 1, 1024, f);
+        size_t n = fread(buf, 1, sizeof buf, f);
         if (n > 0) mbedtls_sha256_update(&sha, buf, n);
-        if (n < 1024) {
+        if (n < sizeof buf) {
             if (ferror(f)) err = ESP_FAIL;
             break;
         }
@@ -267,7 +275,6 @@ static esp_err_t sha256_file(const char *path, char hex[65])
     unsigned char digest[32];
     if (err == ESP_OK) mbedtls_sha256_finish(&sha, digest);
     mbedtls_sha256_free(&sha);
-    free(buf);
     fclose(f);
     if (err != ESP_OK) return err;
     for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", digest[i]);

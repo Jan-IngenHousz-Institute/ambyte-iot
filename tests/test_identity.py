@@ -53,7 +53,7 @@ class IdentityTest(unittest.TestCase):
             "runner": [HOST / "runner.c", *sorted((ROOT / "components/sched_spec").glob("*.c")),
                        ROOT / "components/time_sync/time_sync.c", "-Wl,--wrap=sched_pool_str", "-lm"],
             "provider": [HOST / "provider.c", ROOT / "components/script_update/script_update.c",
-                         "-Wl,--wrap=fopen", "-lcrypto"],
+                         "-Wl,--wrap=fopen", "-Wl,--wrap=fread", "-Wl,--wrap=malloc", "-lcrypto"],
         }
         for name, sources in builds.items():
             cmd = [*common, *(str(p) for p in sources), "-o", str(cls.out / name)]
@@ -217,6 +217,13 @@ class IdentityTest(unittest.TestCase):
         obj, _ = self.provider(A2_INSTALLED_FW="1.0.0")
         self.assertEqual(obj["verified"], "1")
         self.assertEqual(obj["installed"], "1.0.0")
+
+    def test_real_provider_bounds_transient_read_memory(self):
+        data = bytes(range(256)) * 64
+        obj, digest = self.provider(data, A2_CHECK_READ_MEMORY="1")
+        self.assertEqual(obj["rc"], "0")
+        self.assertEqual(obj["sha"], digest)
+        self.assertEqual(obj["verified"], "1")
 
     def test_real_provider_rejects_stale_or_incomplete_release_metadata(self):
         for changes in ({"A2_STORED_SHA": "b" * 64}, {"A2_RELEASE_VERSION": ""},

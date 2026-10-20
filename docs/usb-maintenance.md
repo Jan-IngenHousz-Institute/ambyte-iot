@@ -10,7 +10,11 @@ and radio authorization have separate contracts.
 ## Connect and find a response
 
 Use USB-Serial/JTAG at 115200 baud. Deassert DTR and RTS **before opening** the
-port; asserting them can reset the ESP32-S3. The existing Python client uses:
+port, as the existing Python client does. **Opening may still reset the gateway**
+on the host/driver in use, even with both lines deasserted. Always wait for the
+REPL after every open before sending discovery or another command. A command
+sent during boot can be lost; silence before a prompt is not an unsupported
+firmware response. The existing Python client opens the port as follows:
 
 ```python
 import serial
@@ -24,8 +28,10 @@ ser.rts = False
 ser.open()
 ```
 
-After a reset, the console can take 20–35 seconds to appear. It retains the
-`ambyte> ` prompt, command echo and diagnostic output. Send each command as an
+After an open/reset, the console can take 20–35 seconds to appear. Wait until
+the `ambyte> ` prompt is observed; keep the same port open through discovery
+and later operations, since reopening may reset it again. The console retains
+command echo and diagnostic output. Send each command as an
 ASCII line terminated by LF. The parser allows 512 bytes, but the USB driver's
 RX buffer is only 256 bytes. Keep a complete request **at most 224 ASCII bytes,
 including its newline**, counting the command, spaces, quotes and values.
@@ -34,7 +40,8 @@ through this transport. Use quoted arguments for spaces; escaped quotes and
 backslashes count toward the wire limit.
 
 For discovery, split received bytes into physical LF-terminated lines, remove
-only trailing CR/LF, and select the first line that parses as one JSON object
+**all** trailing CR/LF bytes (for example `line.rstrip(b"\r\n")`, not just one CR),
+and select the first line that parses as one JSON object
 whose `contract` is an integer (a JSON boolean does not qualify). The line must
 start with `{` at column 0 and have no bytes after its closing `}`. Check the
 version and required fields/types before using the result. Ignore blank lines,
@@ -65,8 +72,12 @@ ESP-IDF diagnostic:
 Command returned non-zero error code: 0x1 (ERROR)
 ```
 
-The blocks below omit prompt/echo/log lines and show response text. Output
-line endings may be LF or CRLF (the device's VFS translates stdout newlines).
+The blocks below omit prompt/echo/log lines and show response text. Accept LF,
+CRLF and CR-CR-LF line endings. On the current USB build, `identity` and many
+legacy handlers end their text with `\r\n`, and the VFS converts that LF to
+CRLF again: the JSON response therefore ends with **`}\r\r\n`**. IDF diagnostics
+that write just LF become CRLF. Strip the whole trailing CR/LF sequence before
+checking a line, while still rejecting any other bytes after the closing `}`.
 Angle-bracketed values are placeholders for the particular request/device,
 rather than literal response bytes.
 
