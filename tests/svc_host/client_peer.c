@@ -17,6 +17,7 @@ static void (*pending)(void *);
 static void *pending_arg;
 static uint64_t applied_id;
 static unsigned applies;
+static bool initialized;
 static void lock(void *context) { (void)context; assert(!held); held = true; }
 static void unlock(void *context) { (void)context; assert(held); held = false; }
 static bool ready(void *context) { (void)context; return true; }
@@ -31,7 +32,13 @@ static bool hash(void *context, const void *bytes, size_t n, unsigned char out[3
     return EVP_Digest(bytes, n, out, &size, EVP_sha256(), NULL) == 1 && size == 32;
 }
 static size_t free_bytes(void *context) { (void)context; return 1024 * 1024; }
-void svc_store_fault(const char *point) { (void)point; }
+void svc_store_fault(const char *point)
+{
+    (void)point;
+    /* The benchmark test allows initialization, then makes every persistent
+     * mutation boundary fatal. A no-op rewrite is caught as well as new data. */
+    assert(!initialized || !getenv("SVC_ASSERT_NO_WRITES"));
+}
 static bool submit(void *context, void (*run)(void *), void *arg)
 { (void)context; assert(held && !pending); pending = run; pending_arg = arg; return true; }
 static bool maintenance_begin(void *context) { (void)context; return true; }
@@ -77,6 +84,7 @@ int main(int argc, char **argv)
         .maintenance_begin = maintenance_begin, .maintenance_end = maintenance_end,
         .schedule_apply = apply, .schedule_matches = matches};
     svc_engine_init(&engine, &store, &e);
+    initialized = true;
     svc_session_ports_t io = {.enter = enter, .leave = leave, .read = read_bytes,
         .write = write_bytes, .overrun = overrun, .now_ms = now};
     char line[249]; size_t length = 0; unsigned char byte;

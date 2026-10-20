@@ -3,6 +3,13 @@
 #include "svc_store.h"
 #include "svc_wire.h"
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+#if CONFIG_AMBYTE_SVC_BENCH
+#include "svc_bench.h"
+#endif
+
 typedef struct {
     uint32_t free_heap, largest_block, min_heap;
     uint32_t cli_stack, worker_stack, runner_stack;
@@ -30,6 +37,9 @@ typedef struct {
     svc_store_t *store;
     svc_protocol_ports_t ports;
     uint64_t bound_instance;
+#if CONFIG_AMBYTE_SVC_BENCH
+    svc_bench_t bench;
+#endif
 } svc_protocol_t;
 
 void svc_protocol_init(svc_protocol_t *protocol, svc_store_t *store,

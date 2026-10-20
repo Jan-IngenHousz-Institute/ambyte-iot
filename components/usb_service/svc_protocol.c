@@ -157,7 +157,13 @@ void svc_protocol_init(svc_protocol_t *p, svc_store_t *s, const svc_protocol_por
 {
     memset(p, 0, sizeof *p); p->store = s; p->ports = *ports;
 }
-void svc_protocol_unbind(svc_protocol_t *p) { p->bound_instance = 0; }
+void svc_protocol_unbind(svc_protocol_t *p)
+{
+    p->bound_instance = 0;
+#if CONFIG_AMBYTE_SVC_BENCH
+    svc_wipe(&p->bench, sizeof p->bench);
+#endif
+}
 
 static const char *queue(svc_protocol_t *p, svc_record_t *r, const char *password)
 {
@@ -183,7 +189,11 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     if (!strcmp(a[0], "svc.version")) {
         if (n != 1) { error = "invalid_args"; goto done; }
         prefix(p, &j, true);
-        append(&j, ",\"service\":1,\"actions\":[\"svc.version\",\"svc.bind\",\"svc.result\",\"svc.stats\",\"schedule.begin\",\"p\",\"schedule.commit\",\"svc.abort\",\"svc.wifi.join\",\"svc.wifi.status\",\"svc.exit\"],\"max_line\":248,\"chunk\":144,\"result_slots\":8,\"highest_id\":\"%016llx\"", (unsigned long long)p->store->highest);
+        append(&j, ",\"service\":1,\"actions\":[\"svc.version\",\"svc.bind\",\"svc.result\",\"svc.stats\",\"schedule.begin\",\"p\",\"schedule.commit\",\"svc.abort\",\"svc.wifi.join\",\"svc.wifi.status\",\"svc.exit\""
+#if CONFIG_AMBYTE_SVC_BENCH
+               ",\"bench.begin\",\"bench.read\",\"bench.end\",\"bench.abort\""
+#endif
+               "],\"max_line\":248,\"chunk\":144,\"result_slots\":8,\"highest_id\":\"%016llx\"", (unsigned long long)p->store->highest);
         finish(p, &j); goto done;
     }
     if (!strcmp(a[0], "svc.bind")) {
@@ -222,6 +232,14 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     bool begin = !strcmp(a[0], "schedule.begin"), put = !strcmp(a[0], "p");
     bool join = !strcmp(a[0], "svc.wifi.join"), commit = !strcmp(a[0], "schedule.commit");
     bool abort = !strcmp(a[0], "svc.abort"), result = !strcmp(a[0], "svc.result");
+#if CONFIG_AMBYTE_SVC_BENCH
+    if (!strncmp(a[0], "bench.", 6) || (put && n >= 2 && !strcmp(a[1], "0000000000000000"))) {
+        if (!p->bound_instance || p->bound_instance != p->store->instance) error = "store_changed";
+        else error = svc_bench_dispatch(&p->bench, p->store, a, n, out);
+        goto done;
+    }
+    if (p->bench.active && (begin || put || join || commit || abort)) { error = "busy"; goto done; }
+#endif
     if (!begin && !put && !join && !commit && !abort && !result) { error = "unsupported"; goto done; }
     unsigned wanted = begin ? 7 : put ? 5 : join ? 4 : 2;
     if (n != wanted || !hex(a[1], 16, &id) || !id) { error = "invalid_args"; goto done; }

@@ -621,6 +621,12 @@ CONFIG_AMBYTE_MQTT_TOPIC_ROOT="ambyte"
 # end of Ambyte MQTT Client
 
 #
+# Ambyte USB service benchmark
+#
+# CONFIG_AMBYTE_SVC_BENCH is not set
+# end of Ambyte USB service benchmark
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

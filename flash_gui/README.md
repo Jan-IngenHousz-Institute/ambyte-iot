@@ -432,6 +432,7 @@ flash_gui/
   ambyte_serial.py   firmware console client (probe / cfg / rtc / verify)
   service_client.py  bounded framed operations, resume and result recovery
   service_wire.py    strict CRC/JSON codec and nonsecret result validation
+  service_benchmark.py bench measurement adapters over the shared client
   service_journal.py per-gateway durable intent and process ownership
   openjii_client.py  API-key auth, experiments, device registry, credentials
   timezones.py       host IANA zone + the firmware's supported-zone table

@@ -4,6 +4,10 @@ idf_component_register(
     PRIV_REQUIRES console driver esp_timer heap littlefs esp_wifi esp_hw_support mbedtls script_update wifi_manager
 )
 
+if(CONFIG_AMBYTE_SVC_BENCH)
+    target_sources(${COMPONENT_LIB} PRIVATE "svc_bench.c")
+endif()
+
 # These are defined in separate pinned-IDF translation units. The qualification
 # records the final map/disassembly, so an SDK/LTO change cannot silently bypass
 # the no-echo/no-unframed-output boundary.

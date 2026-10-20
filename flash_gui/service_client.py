@@ -44,6 +44,7 @@ class ServiceClient:
         self.store = None
         self.highest = 0
         self.active = False
+        self.actions = frozenset()
         self._permission = None
         self._carry = bytearray()
         self._deadline = None
@@ -203,6 +204,7 @@ class ServiceClient:
                 not _hex(result["highest_id"])):
             raise ProtocolError("Advertised service version, actions or bounds are incompatible.")
         self.store, self.highest = result["store"], int(result["highest_id"], 16)
+        self.actions = frozenset(result["actions"])
 
     def connect(self):
         self._configure_transport()
@@ -440,7 +442,7 @@ class ServiceClient:
     @_journalled
     def upload_schedule(self, blob: bytes, sha256: str, version: str, built_fw: str,
                         workbook: str | None = None, *, cancelled=lambda: False, log=None,
-                        new_request=False, deadline_s=360.0):
+                        new_request=False, deadline_s=360.0, stage_only=False, on_staged=None):
         descriptor = schedule_descriptor(blob, sha256, version, built_fw, workbook)
         self._deadline = self.clock() + deadline_s
         entry = None
@@ -461,10 +463,16 @@ class ServiceClient:
                 if result is None:
                     raise ProtocolError("Admitted operation has no durable result.")
             if result["state"] in TERMINAL:
+                if stage_only:
+                    raise ServiceClientError("The saved staging measurement is terminal; use an explicit new request after readback.")
                 return self._finish(entry, result)
             if result["state"] != "staging":
+                if stage_only:
+                    raise ServiceClientError("A staging measurement cannot take over a committed operation.")
                 return self._poll(entry, cancelled)
             offset = result["offset"]
+            if stage_only and offset:
+                raise ServiceClientError("A staging measurement requires a fresh zero-byte prefix; recover the saved upload first.")
             if offset != len(blob) and offset % CHUNK:
                 raise ProtocolError("Device upload offset is not a chunk boundary.")
             if log and offset:
@@ -485,6 +493,17 @@ class ServiceClient:
             if cancelled():
                 self.abort(entry)
                 raise TransferCancelled("Schedule transfer cancelled before commit.")
+            if stage_only:
+                # Bench real-fsync measurement uses exactly the GUI's p path.
+                # Record its end before cleanup, then explicitly abort our own
+                # verified staging intent. Never admit install/activation.
+                if on_staged:
+                    on_staged()
+                self.abort(entry)
+                result = self._read_intent(entry)
+                if result is None or result["state"] != "aborted" or result["offset"] != len(blob):
+                    raise ProtocolError("Staging measurement cleanup is not confirmed.")
+                return result
             self._phase(entry, "committing")
             # The immediate reply is not completion evidence. Read the complete
             # stored result even when commit itself returned a terminal result.
