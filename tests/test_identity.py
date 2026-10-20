@@ -53,7 +53,9 @@ class IdentityTest(unittest.TestCase):
             "runner": [HOST / "runner.c", *sorted((ROOT / "components/sched_spec").glob("*.c")),
                        ROOT / "components/time_sync/time_sync.c", "-Wl,--wrap=sched_pool_str", "-lm"],
             "provider": [HOST / "provider.c", ROOT / "components/script_update/script_update.c",
-                         "-Wl,--wrap=fopen", "-Wl,--wrap=fread", "-Wl,--wrap=malloc", "-lcrypto"],
+                         "-Wl,--wrap=open", "-Wl,--wrap=read", "-Wl,--wrap=close",
+                         "-Wl,--wrap=write", "-Wl,--wrap=unlink", "-Wl,--wrap=rename",
+                         "-Wl,--wrap=malloc", "-lcrypto"],
         }
         for name, sources in builds.items():
             cmd = [*common, *(str(p) for p in sources), "-o", str(cls.out / name)]
@@ -225,6 +227,19 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(obj["sha"], digest)
         self.assertEqual(obj["verified"], "1")
 
+    def test_real_provider_short_reads_and_error_cleanup(self):
+        data = bytes(range(256)) * 64
+        obj, digest = self.provider(data, A2_SHORT_READS="1")
+        self.assertEqual(obj["sha"], digest)
+        self.assertEqual(obj["verified"], "1")
+        for fault in ("A2_READ_ERROR", "A2_DIGEST_START_ERROR",
+                      "A2_DIGEST_UPDATE_ERROR", "A2_DIGEST_FINISH_ERROR"):
+            with self.subTest(fault=fault):
+                obj, _ = self.provider(data, **{fault: "1"})
+                self.assertNotEqual(obj["rc"], "0")
+                self.assertEqual(obj["sha"], "")
+                self.assertEqual(obj["verified"], "0")
+
     def test_real_provider_rejects_stale_or_incomplete_release_metadata(self):
         for changes in ({"A2_STORED_SHA": "b" * 64}, {"A2_RELEASE_VERSION": ""},
                         {"A2_BUILT_FW": ""}, {"A2_NVS_FAIL": "1"}):
@@ -234,7 +249,7 @@ class IdentityTest(unittest.TestCase):
                 self.assertEqual(obj["sha"], digest)
                 self.assertEqual(obj["verified"], "0")
                 self.assertEqual(obj["version"], "")
-        obj, _ = self.provider(A2_SCHEDULE_FILE=str(self.out / "missing-during-rename"))
+        obj, _ = self.provider(A2_SCHEDULE_FILE=str(self.out / "missing-during-rename"), A2_EXPECT_OPEN_FAIL="1")
         self.assertNotEqual(obj["rc"], "0")
         self.assertEqual(obj["verified"], "0")
 

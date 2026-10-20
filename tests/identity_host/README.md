@@ -13,10 +13,12 @@ Requires a C11 compiler, ASan/UBSan, pthreads and libcrypto development headers.
   source/workbook/generation snapshots and stopped-but-loaded identity.
 - `provider.c` links the whole production `script_update.c`. Only file paths,
   NVS and mbedTLS's crypto boundary are replaced. The file wrapper permits only
-  `rb`, the NVS open permits only READONLY, and writes abort. SHA-256 is computed
-  by OpenSSL over the real bytes read by the production provider. Allocation
-  and fread wrappers also check that hashing requests no heap scratch buffer
-  and leaves stdio unbuffered (rather than allocating a 4 KiB read buffer).
+  `O_RDONLY`, the NVS open permits only READONLY, and write/unlink/rename abort.
+  SHA-256 is computed by OpenSSL over the real bytes read by the production
+  provider. The read wrapper injects 1/255-byte short reads and mid-file errors;
+  digest failures also verify descriptor cleanup. The allocation wrapper checks
+  that hashing requests no heap scratch buffer. POSIX reads avoid newlib FILE
+  allocation and its default 4 KiB read buffer.
 
 Section GC drops unused hardware paths; no production function is copied or
 extracted. Host SDK declarations are in `include/` and `tests/host_stubs`.

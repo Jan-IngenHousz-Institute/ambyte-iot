@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <stdio.h>
-#include <stdio_ext.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/evp.h>
@@ -11,7 +13,8 @@
 
 static unsigned file_reads, nvs_reads;
 static unsigned scratch_heap_allocations;
-static size_t peak_stdio_buffer;
+static int active_fd = -1;
+static unsigned closes, read_calls;
 
 void *__real_malloc(size_t n);
 void *__wrap_malloc(size_t n)
@@ -19,24 +22,35 @@ void *__wrap_malloc(size_t n)
     scratch_heap_allocations++;
     return __real_malloc(n);
 }
-
-size_t __real_fread(void *buf, size_t size, size_t n, FILE *f);
-size_t __wrap_fread(void *buf, size_t size, size_t n, FILE *f)
+int __real_open(const char *path, int flags, ...);
+int __wrap_open(const char *path, int flags, ...)
 {
-    size_t got = __real_fread(buf, size, n, f);
-    size_t buffered = __fbufsize(f);
-    if (buffered > peak_stdio_buffer) peak_stdio_buffer = buffered;
-    return got;
-}
-
-FILE *__real_fopen(const char *, const char *);
-FILE *__wrap_fopen(const char *path, const char *mode)
-{
-    assert(!strcmp(path, "/littlefs/schedule.yaml"));
-    assert(!strcmp(mode, "rb"));
+    assert(!strcmp(path, "/littlefs/schedule.yaml") && flags == O_RDONLY);
     file_reads++;
-    return __real_fopen(getenv("A2_SCHEDULE_FILE"), mode);
+    active_fd = __real_open(getenv("A2_SCHEDULE_FILE"), flags);
+    return active_fd;
 }
+ssize_t __real_read(int fd, void *buf, size_t n);
+ssize_t __wrap_read(int fd, void *buf, size_t n)
+{
+    assert(fd == active_fd);
+    read_calls++;
+    if (getenv("A2_READ_ERROR") && read_calls == 2) { errno = EIO; return -1; }
+    if (getenv("A2_SHORT_READS")) n = read_calls % 2 ? 1 : 255;
+    return __real_read(fd, buf, n);
+}
+int __real_close(int fd);
+int __wrap_close(int fd)
+{
+    assert(fd == active_fd);
+    closes++;
+    active_fd = -1;
+    return __real_close(fd);
+}
+ssize_t __wrap_write(int fd, const void *buf, size_t n)
+{ (void)fd; (void)buf; (void)n; abort(); }
+int __wrap_unlink(const char *path) { (void)path; abort(); }
+int __wrap_rename(const char *a, const char *b) { (void)a; (void)b; abort(); }
 
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
 {
@@ -68,11 +82,11 @@ esp_err_t nvs_commit(nvs_handle_t h) { (void)h; abort(); }
 
 void mbedtls_sha256_init(mbedtls_sha256_context *c) { c->ctx = EVP_MD_CTX_new(); }
 int mbedtls_sha256_starts(mbedtls_sha256_context *c, int is224)
-{ assert(!is224); return EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
+{ assert(!is224); return getenv("A2_DIGEST_START_ERROR") ? -1 : EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
 int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *buf, size_t n)
-{ return EVP_DigestUpdate(c->ctx, buf, n) == 1 ? 0 : -1; }
+{ return getenv("A2_DIGEST_UPDATE_ERROR") ? -1 : EVP_DigestUpdate(c->ctx, buf, n) == 1 ? 0 : -1; }
 int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char out[32])
-{ return EVP_DigestFinal_ex(c->ctx, out, NULL) == 1 ? 0 : -1; }
+{ return getenv("A2_DIGEST_FINISH_ERROR") ? -1 : EVP_DigestFinal_ex(c->ctx, out, NULL) == 1 ? 0 : -1; }
 void mbedtls_sha256_free(mbedtls_sha256_context *c) { EVP_MD_CTX_free(c->ctx); }
 
 int main(void)
@@ -81,10 +95,11 @@ int main(void)
     esp_err_t rc = script_update_get_identity(&out);
     assert(file_reads == 1);
     assert(nvs_reads <= 1);
+    assert(active_fd == -1);
+    assert(closes == (getenv("A2_EXPECT_OPEN_FAIL") ? 0u : 1u));
     if (getenv("A2_CHECK_READ_MEMORY")) {
-        fprintf(stderr, "hash read: scratch heap allocations=%u stdio buffer=%zu\n",
-                scratch_heap_allocations, peak_stdio_buffer);
-        assert(scratch_heap_allocations == 0 && peak_stdio_buffer <= 1);
+        fprintf(stderr, "hash read: scratch heap allocations=%u\n", scratch_heap_allocations);
+        assert(scratch_heap_allocations == 0);
     }
     printf("rc=%d\nsha=%s\nversion=%s\nbuilt=%s\ninstalled=%s\nverified=%d\n",
            rc, out.sha256, out.version, out.built_against_fw,

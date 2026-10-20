@@ -1,6 +1,7 @@
 #include "script_update.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,35 +248,28 @@ static long file_size(const char *path)
 
 static esp_err_t sha256_file(const char *path, char hex[65])
 {
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) return ESP_ERR_NOT_FOUND;
-    /* LittleFS reports a 4 KiB st_blksize, so newlib's default FILE buffer
-     * plus a separate hash buffer made every identity read transiently consume
-     * >5 KiB. During acquisition/publish that lowered the heap low-water mark
-     * even though the post-response free-heap sample looked unchanged. Keep
-     * reads unbuffered and scratch bounded on the caller's stack instead. */
-    if (setvbuf(f, NULL, _IONBF, 0) != 0) {
-        fclose(f);
-        return ESP_FAIL;
-    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return ESP_ERR_NOT_FOUND;
+    /* Avoid newlib FILE allocation and buffering on frequent discovery reads.
+     * Short reads are not EOF; only read()==0 completes the digest. */
     uint8_t buf[256];
-
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
-    mbedtls_sha256_starts(&sha, 0);
-    esp_err_t err = ESP_OK;
-    while (1) {
-        size_t n = fread(buf, 1, sizeof buf, f);
-        if (n > 0) mbedtls_sha256_update(&sha, buf, n);
-        if (n < sizeof buf) {
-            if (ferror(f)) err = ESP_FAIL;
-            break;
+    esp_err_t err = mbedtls_sha256_starts(&sha, 0) == 0 ? ESP_OK : ESP_FAIL;
+    while (err == ESP_OK) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            err = ESP_FAIL;
+        } else if (mbedtls_sha256_update(&sha, buf, (size_t)n) != 0) {
+            err = ESP_FAIL;
         }
     }
     unsigned char digest[32];
-    if (err == ESP_OK) mbedtls_sha256_finish(&sha, digest);
+    if (err == ESP_OK && mbedtls_sha256_finish(&sha, digest) != 0) err = ESP_FAIL;
     mbedtls_sha256_free(&sha);
-    fclose(f);
+    close(fd);
     if (err != ESP_OK) return err;
     for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", digest[i]);
     hex[64] = '\0';
