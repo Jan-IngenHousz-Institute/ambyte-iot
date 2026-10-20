@@ -56,7 +56,7 @@ class ServiceStoreTest(unittest.TestCase):
         self.assertEqual(self.call("admit", "2", 288, 1)["error"], "busy")
         self.assertEqual(self.call("abort", "1")["state"], "aborted")
         self.assertEqual(self.call("abort", "1")["state"], "aborted")
-        for n in range(2, 22):
+        for n in range(2, 102):
             self.call("admit", f"{n:x}", 144, 1)
             self.call("abort", f"{n:x}")
         self.assertEqual(len(list(self.root.glob("*.rec"))), 8)
