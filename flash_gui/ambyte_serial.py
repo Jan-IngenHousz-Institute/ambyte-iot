@@ -497,10 +497,17 @@ def probe_device(port: str, timeout: float = PROBE_READY_TIMEOUT_S,
     """
     result = ProbeResult()
     try:
-        con = connect_after_boot(port, deadline_s=timeout)
-    except (ConsoleError, OSError, serial.SerialException):
+        con = AmbyteConsole(port)
+    except (OSError, serial.SerialException):
         return result
     try:
+        # Preflight is bound to the selected port; scanning unrelated boards
+        # here could associate their MAC with the port later flashed by the GUI.
+        try:
+            if not con.wait_prompt(timeout):
+                return result
+        except ConsoleError:
+            return result
         result.is_ambyte = True
         try:
             result.identity = con.identity()

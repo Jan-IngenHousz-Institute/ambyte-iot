@@ -352,3 +352,12 @@ def test_reconnect_discovers_new_capabilities_before_verifying(monkeypatch, inst
     with pytest.raises(procedure.ProcedureError, match="schedule.release"):
         procedure.install_schedule_source(source(), SimpleNamespace(port="bench"), log=lambda _: None)
     assert first.closed and replacement.closed and replacement.calls == ["identity"]
+
+
+def test_preflight_probe_never_scans_another_board(transport, monkeypatch):
+    _, ser = transport([wire() + b"\r\nambyte> "], open_console=False)
+    monkeypatch.setattr(serial_client, "connect_after_boot", lambda *a, **kw:
+                        pytest.fail("preflight cannot select another enumerated board"))
+    monkeypatch.setattr(serial_client, "esp_jtag_ports", lambda: ["other-board"])
+    assert serial_client.probe_device("bench").mac == MAC
+    assert ser.port == "bench" and ser.opens == 1
