@@ -140,6 +140,7 @@ class PreflightInfo:
     mac: str
     had_console: bool
     stored_name: str | None            # expanded; None if default/unnamed
+    console_identity: ambyte_serial.ConsoleIdentity | None = None
 
     @property
     def proposed_name(self) -> str:
@@ -298,12 +299,22 @@ class DeviceRun:
     nvs_path: Path | None = None
     schedule_image_path: Path | None = None
     verify_results: list[VerifyItem] = field(default_factory=list)
+    console_identity: ambyte_serial.ConsoleIdentity | None = None
 
 
 # ── step 1: pre-flash check ──────────────────────────────────────────────────
 def preflight(port: str, log=print) -> PreflightInfo:
-    log("Checking for a live ambyte console (2 s probe)...")
-    probe = ambyte_serial.probe_device(port, timeout=2.0, retries=1)
+    log("Waiting for console readiness, then discovering device identity...")
+    try:
+        probe = ambyte_serial.probe_device(
+            port, timeout=ambyte_serial.PROBE_READY_TIMEOUT_S)
+    except ConsoleError as exc:
+        raise ProcedureError("check", str(exc)) from exc
+    if probe.identity:
+        identity = probe.identity
+        log(f"Compiled firmware: {identity.fw}; effective thing: "
+            f"{identity.thing_name}; console contract: {identity.contract}; "
+            f"capabilities: {', '.join(sorted(identity.capabilities))}")
 
     mac = probe.mac
     if probe.is_ambyte and mac:
@@ -330,7 +341,7 @@ def preflight(port: str, log=print) -> PreflightInfo:
         log(f"Stored device name: {expanded}")
 
     return PreflightInfo(port=port, mac=mac, had_console=probe.is_ambyte,
-                         stored_name=stored)
+                         stored_name=stored, console_identity=probe.identity)
 
 
 # ── steps 2-3: credentials + NVS image ───────────────────────────────────────
@@ -477,11 +488,28 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
         raise ProcedureError("provision", str(exc)) from exc
 
     try:
+        try:
+            run.console_identity = con.identity()
+        except UnsupportedConsoleCommand:
+            run.console_identity = None
         now = int(time.time())
         log(f"Setting RTC to UTC epoch {now}...")
         con.rtc_set(now)
 
         results: list[VerifyItem] = []
+        discovered = run.console_identity
+        if discovered is not None:
+            expected_fw = ctx.release.version.removeprefix("v")
+            results.extend([
+                VerifyItem("Console MAC", discovered.mac == run.preflight.mac.upper(),
+                           f"device reports {discovered.mac}, expected {run.preflight.mac}"),
+                VerifyItem("Effective thing name", discovered.thing_name == plan.client_id,
+                           f"device reports {discovered.thing_name}, expected {plan.client_id}"),
+                VerifyItem("Compiled firmware", (discovered.fw or "").removeprefix("v") == expected_fw,
+                           f"device reports {discovered.fw}, expected {ctx.release.version}"),
+            ])
+            log(f"Console contract {discovered.contract}; loaded schedule: "
+                f"{discovered.schedule}; capabilities: {', '.join(sorted(discovered.capabilities))}")
 
         raw_name = con.cfg_get("device_name")
         got_name = expand_mac_token(raw_name or "", run.preflight.mac)
@@ -578,20 +606,26 @@ def _require_network(con, ssid: str, log=print) -> None:
 
 
 def install_schedule_script(ctx: SessionContext, run: DeviceRun,
-                       log=print) -> VerifyItem:
-    """Install and positively verify the session's schedule (workbook or catalog).
-
-    The console only submits bytes (serial push) or an immutable URL + manifest
-    identity. All byte transfer, hashing, compile validation, atomic littlefs
-    swap, .bak recovery, and runner restart remain firmware-owned in
-    script_update — a device-side rejection of a stamped schedule IS the
-    install failure, surfaced by the verify loop below never matching.
-
-    A workbook source has no URL, so old firmware without the push commands
-    cannot install it at all; that is reported, not silently fallen back.
-    """
+                            log=print) -> VerifyItem:
+    """Resolve the session selection and use the shared console installer."""
     source = schedule_source(ctx, log=log)
-    script = ctx.schedule_script
+    def load_blob():
+        return release_fetch.script_bytes(ctx.schedule_script, log=log)
+    return _install_schedule_source(source, run, wifi_ssid=ctx.wifi_ssid,
+                                    log=log, load_blob=load_blob)
+
+
+def install_schedule_source(source: ScheduleSource, run: DeviceRun, *,
+                            wifi_ssid="", log=print) -> VerifyItem:
+    """Install supplied bytes/URL and verify activation without a Tk session.
+
+    Bench callers provide the exact fixture or restore bytes in source.blob.
+    The GUI uses this same implementation for workbook and catalog sources.
+    """
+    return _install_schedule_source(source, run, wifi_ssid=wifi_ssid, log=log)
+
+
+def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
     try:
         con = ambyte_serial.connect_after_boot(
             run.port, deadline_s=CONSOLE_BOOT_DEADLINE_S, log=log)
@@ -607,18 +641,71 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
             and status.running
         )
 
+    json_path = False
+    capabilities: frozenset[str] | None = None
+    loaded_workbook = None
+
+    def discover():
+        nonlocal json_path, capabilities
+        try:
+            discovered = con.identity()
+        except UnsupportedConsoleCommand:
+            run.console_identity = None
+            json_path = False
+            capabilities = None
+        else:
+            run.console_identity = discovered
+            capabilities = discovered.capabilities
+            json_path = "identity" in capabilities
+            if "schedule.release" not in capabilities:
+                raise ProcedureError("schedule", "identity does not advertise schedule.release; "
+                                     "activation cannot be verified")
+
+    def read_current(timeout=10.0):
+        nonlocal loaded_workbook, capabilities
+        if not json_path:
+            return con.schedule_release(timeout=timeout)
+        before = con.identity(timeout=timeout)
+        if before.schedule == ambyte_serial.ScheduleIdentity(None, None, None, None):
+            return None
+        try:
+            release = con.schedule_release(timeout=timeout)
+        except ConsoleError:
+            # No installed file is legitimate for an empty/embedded device.
+            if before.schedule.source == "INSTALLED":
+                raise
+            release = None
+        after = con.identity(timeout=timeout)
+        run.console_identity = after
+        if (before.schedule != after.schedule or before.capabilities != after.capabilities
+                or "identity" not in after.capabilities
+                or "schedule.release" not in after.capabilities):
+            return None
+        capabilities = after.capabilities
+        loaded = after.schedule
+        loaded_workbook = loaded.workbook_version_id
+        if loaded.source != "INSTALLED":
+            return ambyte_serial.ScheduleReleaseStatus("", "", "", "", False, False)
+        if (release is None or release.sha256 != loaded.sha256
+                or release.script_version != (loaded.script_version or "")):
+            return None
+        return ambyte_serial.ScheduleReleaseStatus(
+            loaded.sha256 or "", loaded.script_version or "", release.built_against_fw,
+            release.installed_on_fw, release.verified, release.running)
+
     def workbook_check() -> VerifyItem | None:
-        """Step-7 provenance check: `schedule status` workbook= must be the id
-        we stamped. Returns None when the firmware does not report the header
-        (too old to know it) — the sha identity already matched by then."""
+        """Verify the loaded workbook from JSON, or the legacy status header.
+
+        Only legacy images may omit the header without failing this check.
+        """
         if source.workbook_version_id is None:
             return None
         try:
-            reported = con.schedule_status_workbook()
+            reported = loaded_workbook if json_path else con.schedule_status_workbook()
         except ConsoleError as exc:
             return VerifyItem("Schedule workbook", False,
                               f"could not read schedule status: {exc}")
-        if reported is None:
+        if reported is None and not json_path:
             log("This firmware's `schedule status` does not report the "
                 "workbook header; skipping the workbook identity check.")
             return None
@@ -629,14 +716,24 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
             f"{source.workbook_version_id}")
 
     try:
+        discover()
         current = None
-        try:
-            current = con.schedule_release()
-        except ConsoleError as exc:
-            # A blank device legitimately has no /littlefs/schedule.yaml identity yet.
-            # Submit the install anyway; unsupported older firmware will reject
-            # the following `schedule install` command with an actionable reply.
-            log(f"No active Schedule release identity yet ({exc}); installing the selection.")
+        initial_deadline = time.time() + SCHEDULE_INSTALL_DEADLINE_S
+        while time.time() < initial_deadline:
+            try:
+                current = read_current()
+            except ConsoleError as exc:
+                if json_path:
+                    log(f"Waiting for a consistent loaded Schedule identity ({exc}).")
+                    time.sleep(2.0)
+                    continue
+                log(f"No active Schedule release identity yet ({exc}); installing the selection.")
+                break
+            if current is not None:
+                break
+            time.sleep(2.0)
+        else:
+            raise ProcedureError("schedule", "loaded Schedule identity did not become consistent")
 
         if current is not None and matches(current):
             log(f"Schedule {source.label} is already active and verified.")
@@ -654,14 +751,20 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
         # possible for a catalog asset, which has an immutable release URL.
         pushed = False
         blob = source.blob
-        if blob is None:
+        if blob is None and load_blob is not None:
             try:
-                blob = release_fetch.script_bytes(script, log=log)
+                blob = load_blob()
             except ReleaseError as exc:
-                log(f"Cannot read {script.asset_name} locally ({exc}); "
+                log(f"Cannot read {source.label} locally ({exc}); "
                     "falling back to a device-side download.")
 
-        if blob is not None:
+        push_allowed = (capabilities is None or {
+            "schedule.begin", "schedule.put", "schedule.commit", "schedule.abort"
+        } <= capabilities)
+        if not push_allowed and source.asset_url is None:
+            raise ProcedureError("schedule", "firmware does not advertise all serial-push capabilities; "
+                                 "this workbook schedule has no release URL")
+        if blob is not None and push_allowed:
             log(f"Pushing {source.label} ({len(blob)} bytes) over serial...")
             try:
                 con.schedule_push(
@@ -688,16 +791,17 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
 
         if not pushed:
             # Only this path needs the board on the network.
-            _require_network(con, ctx.wifi_ssid, log=log)
-            log(f"Installing {script.asset_name} from {script.tag} "
-                f"({script.size_bytes} bytes)...")
+            if source.asset_url is None:
+                raise ProcedureError("schedule", "schedule has neither readable bytes nor a release URL")
+            _require_network(con, wifi_ssid, log=log)
+            log(f"Installing {source.label} from {source.asset_url}...")
             try:
                 con.schedule_install(
-                    script.asset_url,
-                    script.sha256,
-                    script.campaign_id,
-                    script.script_version,
-                    script.built_against_fw,
+                    source.asset_url,
+                    source.sha256,
+                    source.campaign_id,
+                    source.script_version,
+                    source.built_against_fw,
                 )
             except ConsoleError as exc:
                 raise ProcedureError("schedule", str(exc)) from exc
@@ -727,7 +831,7 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
         time.sleep(SCHEDULE_INSTALL_SETTLE_S)
         while time.time() < deadline:
             try:
-                current = con.schedule_release(timeout=20.0)
+                current = read_current(timeout=20.0)
             except ConsoleError as exc:
                 # A busy SD identity read or asynchronous firmware log can make
                 # one command miss its prompt. Keep the same serial handle: a
@@ -751,8 +855,14 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
                 if replacement is None:
                     break
                 con = replacement
+                discover()
                 continue
 
+            if current is None:
+                last_detail = "loaded Schedule identity is changing"
+                report_progress()
+                time.sleep(2.0)
+                continue
             if matches(current):
                 log(f"Schedule install verified: {source.label}, "
                     f"sha256={current.sha256}.")
@@ -780,6 +890,8 @@ def install_schedule_script(ctx: SessionContext, run: DeviceRun,
             f"{source.label} was not verified within "
             f"{SCHEDULE_INSTALL_DEADLINE_S:.0f}s ({last_detail}); the previous "
             "schedule.yaml remains recoverable")
+    except ConsoleError as exc:
+        raise ProcedureError("schedule", str(exc)) from exc
     finally:
         con.close()
 

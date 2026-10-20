@@ -32,6 +32,9 @@ class _FakeClock:
 
 
 class _FakeConsole:
+    def identity(self, timeout=5.0):
+        raise ambyte_serial.UnsupportedConsoleCommand("identity: Unrecognized command")
+
     def __init__(self, replies):
         self._replies = list(replies)
         self.closed = False

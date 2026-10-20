@@ -167,6 +167,9 @@ def test_script_bytes_rejects_a_download_that_does_not_match_the_manifest(
 
 # ── procedure integration ────────────────────────────────────────────────────
 class _ProcConsole(_PushConsole):
+    def identity(self, timeout=5.0):
+        raise ambyte_serial.UnsupportedConsoleCommand("identity: Unrecognized command")
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.wifi_checked = False

@@ -161,6 +161,9 @@ def test_a_snapshot_resolved_without_routing_never_installs_on_when_firmware():
 
 # ── the serial install path ──────────────────────────────────────────────────
 class _WorkbookConsole:
+    def identity(self, timeout=5.0):
+        raise ambyte_serial.UnsupportedConsoleCommand("identity: Unrecognized command")
+
     def __init__(self, workbook_reply=VERSION_ID, begin_reply="schedule begin: ready"):
         self.begin_reply = begin_reply
         self.workbook_reply = workbook_reply
