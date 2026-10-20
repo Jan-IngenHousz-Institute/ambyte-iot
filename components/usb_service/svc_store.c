@@ -110,7 +110,7 @@ static void encode_record(const svc_record_t *r, unsigned char out[SVC_DISK_RECO
     out[24] = (unsigned char)r->kind; out[25] = (unsigned char)r->state;
     out[26] = (unsigned char)r->saved; out[27] = (unsigned char)r->connected;
     out[28] = (unsigned char)r->applied; out[29] = r->retrying; out[30] = r->timed_out;
-    out[31] = r->restored;
+    out[31] = (r->restored ? 1 : 0) | (r->restoration_connected ? 2 : 0);
     size_t at = 32;
 #define ENCODE(field) memcpy(out + at, r->field, sizeof r->field); at += sizeof r->field
     ENCODE(reason); ENCODE(sha256); ENCODE(workbook); ENCODE(version); ENCODE(built_fw);
@@ -127,7 +127,7 @@ static bool decode_record(const unsigned char in[SVC_DISK_RECORD], svc_record_t 
     r->id = get64(in + 8); r->size = get32(in + 16); r->offset = get32(in + 20);
     r->kind = in[24]; r->state = in[25]; r->saved = in[26]; r->connected = in[27];
     r->applied = in[28]; r->retrying = in[29]; r->timed_out = in[30];
-    r->restored = in[31];
+    r->restored = (in[31] & 1) != 0; r->restoration_connected = (in[31] & 2) != 0;
     size_t at = 32;
 #define DECODE(field) memcpy(r->field, in + at, sizeof r->field); at += sizeof r->field
     DECODE(reason); DECODE(sha256); DECODE(workbook); DECODE(version); DECODE(built_fw);
@@ -136,7 +136,7 @@ static bool decode_record(const unsigned char in[SVC_DISK_RECORD], svc_record_t 
     if (!r->id || r->kind < SVC_SCHEDULE || r->kind > SVC_WIFI ||
         r->state < SVC_STAGING || r->state > SVC_UNCERTAIN || r->offset > r->size ||
         r->size > SVC_DATA_MAX || r->saved > SVC_UNKNOWN || r->connected > SVC_UNKNOWN ||
-        r->applied > SVC_UNKNOWN || in[29] > 1 || in[30] > 1 || in[31] > 1) return false;
+        r->applied > SVC_UNKNOWN || in[29] > 1 || in[30] > 1 || in[31] > 3) return false;
 #define TERMINATED(field) if (!memchr(r->field, 0, sizeof r->field)) return false
     TERMINATED(reason); TERMINATED(sha256); TERMINATED(workbook); TERMINATED(version);
     TERMINATED(built_fw); TERMINATED(ssid);

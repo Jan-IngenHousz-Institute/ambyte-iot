@@ -21,7 +21,7 @@ typedef struct {
     svc_kind_t kind;
     svc_state_t state;
     svc_truth_t saved, connected, applied;
-    bool retrying, timed_out, restored;
+    bool retrying, timed_out, restored, restoration_connected;
     char reason[32];
     char sha256[65], workbook[37], version[32], built_fw[32], ssid[33];
     unsigned char fingerprint[32], previous_fingerprint[32];

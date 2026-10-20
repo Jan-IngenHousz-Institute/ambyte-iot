@@ -67,8 +67,9 @@ void svc_protocol_result(const svc_protocol_t *p, const svc_record_t *r, char *o
         if (r->timed_out) append(&j, ",\"timed_out\":true");
     } else {
         append(&j, ",\"ssid\":"); quoted(&j, r->ssid);
-        append(&j, ",\"saved\":%s,\"connected\":%s,\"retrying\":%s,\"restored\":%s",
-               truth(r->saved), truth(r->connected), r->retrying ? "true" : "false", r->restored ? "true" : "false");
+        append(&j, ",\"saved\":%s,\"connected\":%s,\"retrying\":%s,\"restored\":%s,\"restoration_connected\":%s",
+               truth(r->saved), truth(r->connected), r->retrying ? "true" : "false", r->restored ? "true" : "false",
+               r->restoration_connected ? "true" : "false");
     }
     finish(p, &j);
 }
