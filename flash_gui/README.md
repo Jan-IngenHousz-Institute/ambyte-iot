@@ -389,6 +389,9 @@ flash_gui/
   nvs_builder.py     per-board NVS image (identity/certs/Wi-Fi/RTC seed)
   esptool_ops.py     esptool>=5 scripting API (read MAC, flash, NVS-only)
   ambyte_serial.py   firmware console client (probe / cfg / rtc / verify)
+  service_client.py  bounded framed operations, resume and result recovery
+  service_wire.py    strict CRC/JSON codec and nonsecret result validation
+  service_journal.py per-gateway durable intent and process ownership
   openjii_client.py  API-key auth, experiments, device registry, credentials
   timezones.py       host IANA zone + the firmware's supported-zone table
   vendor/            vendored ESP-IDF nvs_partition_gen.py
