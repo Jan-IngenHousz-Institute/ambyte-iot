@@ -41,9 +41,39 @@ static void json_raw(identity_json_t *w, const char *value)
     w->data[w->len] = '\0';
 }
 
+static bool valid_utf8(const unsigned char *p)
+{
+    while (*p) {
+        unsigned char lead = *p++;
+        unsigned continuation;
+        if (lead < 0x80) continue;
+        if (lead >= 0xc2 && lead <= 0xdf) continuation = 1;
+        else if (lead >= 0xe0 && lead <= 0xef) continuation = 2;
+        else if (lead >= 0xf0 && lead <= 0xf4) continuation = 3;
+        else return false;
+
+        /* Reject overlong encodings, surrogate code points and values above
+         * U+10FFFF. Check each continuation before advancing, so a truncated
+         * sequence never reads beyond the string's terminating NUL. */
+        if ((lead == 0xe0 && *p < 0xa0) ||
+            (lead == 0xed && *p > 0x9f) ||
+            (lead == 0xf0 && *p < 0x90) ||
+            (lead == 0xf4 && *p > 0x8f)) return false;
+        for (unsigned i = 0; i < continuation; ++i) {
+            if (*p < 0x80 || *p > 0xbf) return false;
+            ++p;
+        }
+    }
+    return true;
+}
+
 static void json_string(identity_json_t *w, const char *value)
 {
-    if (value == NULL || value[0] == '\0') {
+    /* Existing cfg/commit setters accept bytes without checking encoding.
+     * An unrepresentable identifier is unavailable, rather than a repaired
+     * identifier that could incorrectly match a different device/workbook. */
+    if (value == NULL || value[0] == '\0' ||
+        !valid_utf8((const unsigned char *)value)) {
         json_raw(w, "null");
         return;
     }

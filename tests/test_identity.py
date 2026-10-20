@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import tempfile
@@ -64,21 +65,21 @@ class IdentityTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def invoke(self, scenario):
-        run = subprocess.run([self.out / "handler", scenario], capture_output=True, timeout=30)
+    def invoke(self, scenario, *args):
+        run = subprocess.run([self.out / "handler", scenario, *args], capture_output=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr.decode())
         self.assertIn(b"IDENTITY_HOST_OK", run.stderr)
         return run.stdout
 
-    def response(self, scenario):
-        raw = self.invoke(scenario)
+    def response(self, scenario, *args):
+        raw = self.invoke(scenario, *args)
         physical = raw.split(b"\n")
         objects = [line.rstrip(b"\r") for line in physical if line.startswith(b"{")]
         self.assertEqual(len(objects), 1, raw)
         line = objects[0]
         self.assertTrue(line.endswith(b"}"))
         self.assertTrue(all(c >= 32 for c in line))
-        result = json.loads(line)
+        result = json.loads(line.decode("utf-8"))
         self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities"})
         self.assertIs(type(result["contract"]), int)
         self.assertEqual(result["contract"], 1)
@@ -142,6 +143,39 @@ class IdentityTest(unittest.TestCase):
         for prefix in ("prompt", "log_tail"):
             self.response(prefix)
         self.assertEqual(self.invoke("usage"), b"Usage: identity\r\n")
+
+    def test_invalid_utf8_fields_are_null_and_discovery_remains_json(self):
+        invalid = [
+            b"x\xff\xfey", b"\x80", b"\xbf", b"\xc0\x80", b"\xc1\xbf",
+            b"\xe0\x80\x80", b"\xf0\x80\x80\x80", b"\xed\xa0\x80",
+            b"\xed\xbf\xbf", b"\xf4\x90\x80\x80", b"\xf5\x80\x80\x80",
+            b"\xc2", b"\xe2\x82", b"\xf0\x9f\x92", b"\xe2(\xa1",
+            b"valid\xc3\xa9\x80tail", b"\xf8\x88\x80\x80\x80",
+            b"a" * 30 + b"\xc2", b"a" * 28 + b"\xf0\x9f\x92",
+        ]
+        valid = [
+            b"plain\x7f", "é€🙂".encode(), b"\xc2\x80", b"\xdf\xbf",
+            b"\xe0\xa0\x80", b"\xed\x9f\xbf", b"\xef\xbf\xbf",
+            b"\xf0\x90\x80\x80", b"\xf4\x8f\xbf\xbf",
+        ]
+        rng = random.Random(0xA2)
+        vectors = invalid + valid + [bytes([byte]) for byte in range(1, 256)] + [
+            bytes(rng.randrange(1, 256) for _ in range(rng.randrange(1, 32)))
+            for _ in range(100)
+        ]
+        for data in vectors:
+            with self.subTest(hex=data.hex()):
+                try:
+                    expected = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    expected = None
+                obj = self.response("utf8_bytes", data.hex())
+                self.assertEqual(obj["thing_name"], expected)
+                self.assertEqual(obj["fw"], expected)
+                self.assertEqual(obj["schedule"]["workbookVersionId"],
+                                 None if expected == "-" else expected)
+                self.assertEqual(obj["schedule"]["script_version"], expected)
+                self.assertEqual(obj["schedule"]["sha256"], "a" * 64)
 
     def test_real_handler_blocks_competing_writer_until_record_complete(self):
         output = self.invoke("interleaving")

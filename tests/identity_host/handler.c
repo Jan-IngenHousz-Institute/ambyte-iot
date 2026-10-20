@@ -91,7 +91,7 @@ static void *logger(void *unused)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
     const char *scenario = argv[1];
     loaded.kind = SCHED_SOURCE_INSTALLED;
     loaded.generation = 7;
@@ -104,7 +104,19 @@ int main(int argc, char **argv)
     strcpy(release.installed_on_fw, "2.5.0");
     release.release_metadata_verified = true;
     cli_set_thing_name("Field_MixedCase_7");
-    if (!strcmp(scenario, "none")) {
+    if (!strcmp(scenario, "utf8_bytes")) {
+        assert(argc == 3 && strlen(argv[2]) <= 62 && strlen(argv[2]) % 2 == 0);
+        static char bytes[32];
+        for (size_t i = 0; i < strlen(argv[2]) / 2; ++i) {
+            unsigned value;
+            assert(sscanf(argv[2] + i * 2, "%2x", &value) == 1 && value != 0);
+            bytes[i] = (char)value;
+        }
+        cli_set_thing_name(bytes);
+        strcpy(app.version, bytes);
+        strcpy(loaded.workbook, bytes);
+        strcpy(release.version, bytes);
+    } else if (!strcmp(scenario, "none")) {
         memset(&loaded, 0, sizeof loaded);
     } else if (!strcmp(scenario, "template")) {
         cli_set_thing_name("ambyte_02:00:00:00:00:01");

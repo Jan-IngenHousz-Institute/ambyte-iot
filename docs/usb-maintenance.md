@@ -103,6 +103,15 @@ fields are null. A stopped-but-loaded program retains its loaded identity;
 discovery alone does not claim jobs are running. A staged or queued upload is
 never reported as activated.
 
+Discovery strings must be valid UTF-8. If a stored or injected string contains
+any invalid UTF-8 sequence (including a truncated sequence, overlong encoding,
+surrogate or value above U+10FFFF), the **entire field is JSON null**. Valid
+UTF-8 is preserved exactly, with JSON escaping for quotes, backslashes and
+control characters. This also applies to thing name, compiled version, workbook
+and release version: discovery never invents a replacement identifier or emits
+invalid JSON. A null identity/provenance value cannot count as a match to an
+expected identifier. This read does not change the stored bytes.
+
 The v1 capability tokens are exactly:
 
 ```text
