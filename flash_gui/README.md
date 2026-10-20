@@ -107,25 +107,66 @@ price:
 macOS builds are not notarized either: expect the Gatekeeper right-click-Open
 dance.
 
-### The Schedule script is pushed, not downloaded
+### Schedule transfer and recovery
 
-The GUI streams the selected script down the console it already holds open
-(`schedule begin` / `schedule put` / `schedule commit`), so **the board needs no network to be
-onboarded**. The bytes are cached and digest-checked on the PC; the firmware
-re-hashes what it received, compiles it, and keeps the previous schedule as
-`schedule.yaml.bak`, exactly as it does for a remote install.
+The GUI reads the device's versioned `identity` JSON. An advertised `svc`
+capability selects the bounded service transactions described in
+[USB maintenance](../docs/usb-maintenance.md). The PC supplies digest-verified
+bytes; the device checks their SHA-256, compiles them, checks the declared
+workbook, installs them and verifies activation. Neither serial upload path
+needs the board on Wi-Fi. A URL-only selection must first be downloaded and
+verified on the PC; if those bytes are unavailable, the GUI asks you to cache
+the selection and retry.
 
-Chunks are base64 and 144 bytes each, giving a 200-character command line. The
-binding limit is **not** the console's 512-byte `max_cmdline_length` but the
-USB-Serial-JTAG driver's 256-byte `rx_buffer_size`, which ESP-IDF fixes and the
-REPL does not expose; a longer line is swallowed and the command never answers.
-Measured on hardware: a 224-character line works, 264 hangs. Each `schedule put`
-replies with the staged file's own size, so a dropped chunk is caught as it
-happens rather than at the final digest check.
+The service client saves nonsecret intent in `<config>/service_operations/`,
+keyed by gateway MAC and the device's store instance. It flushes that intent
+before admitting an operation. Every 144-byte chunk is acknowledged with the
+durable offset. Disconnecting or closing the app preserves the journal; retrying
+the same selection resumes the same operation from the recorded offset. A lost
+commit or final response is resolved by reading the recorded result, including
+after restarting the app. Transfer and polling run on a worker thread. The GUI
+permits at most two automatic reconnects within the six-minute transfer budget.
+Opening a port keeps DTR and RTS deasserted; a board that resets on USB reopen is
+allowed to boot before recovery. A fresh identity must prove the same gateway.
 
-If the board runs firmware older than these commands, the GUI says so and falls
-back to the old behaviour of asking the device to download the script itself.
-That fallback is the only path that needs the board on Wi-Fi.
+Success requires a durable successful result for the exact descriptor. After
+exiting service mode, the GUI independently checks identity JSON for the loaded
+source, digest, workbook and version, plus release metadata for verified/running
+state and built-against firmware. Acknowledging commit is not success. A changing
+identity, fallback program, stopped runner or disagreement with release metadata
+cannot pass verification. If the selected tuple was already active, the stored
+result says `applied:false`.
+
+**Cancel schedule transfer** explicitly aborts only this client's verified
+staging operation. Once commit is admitted, cancel stops waiting and keeps the
+journal; it does not undo the install. **Retry provisioning** resumes saved
+work. A different client's active operation reports its kind and state as busy;
+the GUI does not take it over.
+
+An uncertain or expired result means the previous outcome is unknown. A changed
+store instance invalidates all IDs from the old store. The GUI preserves this
+evidence and stops automatic replay. After a failure, **New schedule request…**
+reads a stable current identity and shows the loaded tuple. You may then choose
+to preserve the old journal and admit a new operation for the selected schedule.
+Declining leaves the saved intent untouched. A live operation still blocks this
+action. Keep the journal directory when moving or cleaning the PC; an OS lock
+prevents two GUI processes from replacing the same gateway's intent.
+
+Images without `svc` retain the console `schedule begin/put/commit/abort` path.
+Its chunks are still 144 raw bytes (200 characters per put), below the fixed
+256-byte USB RX ring. Firmware predating serial push retains the immutable URL
+installer fallback; that path requires device Wi-Fi. Explicit `Unrecognized
+command` selects the 2.5.0 identity fallback. Invalid JSON or a service error
+never downgrades an advertised service board to legacy mutation. A device left
+in service mode after disconnect can send framed errors to ordinary console
+clients for up to 60 seconds; the schedule installer performs read-only mode
+recovery before identity discovery.
+
+The GUI has no live Wi-Fi join control. Its existing onboarding credentials
+remain part of the NVS image. The shared service client offers a distinct bounded
+join for service consumers and bench tools, with fresh same-port confirmation,
+readback by ID and no automatic credential retransmission. Passwords are absent
+from service journals and service progress/error messages.
 
 ### GitHub rate limits
 
@@ -321,19 +362,19 @@ sequenceDiagram
     openJII-->>GUI: Thing, MQTT endpoint, ingest topic prefix
     GUI->>Device: Flash firmware + per-device NVS
     GUI->>Device: Set RTC and verify configuration
-    GUI->>Device: schedule install <immutable URL + SHA + release metadata>
-    Device->>GitHub: Stream selected .yaml asset
-    Device->>Device: Verify, parse, atomic swap, restart Schedule
-    GUI->>Device: Poll active script identity
-    Device-->>GUI: Verified SHA and release metadata
+    GUI->>Device: identity (capability discovery)
+    GUI->>Device: svc begin / 144-byte puts / commit, or legacy fallback
+    Device->>Device: Verify, compile, atomic swap, restart Schedule
+    GUI->>Device: Read durable result, then loaded identity + release metadata
+    Device-->>GUI: Verified running SHA, workbook and release metadata
 ```
 
 ## Design notes / firmware facts this tool relies on
 
-- Certificates and Wi-Fi credentials have **no console path** in the firmware
-  (the cert setters are dead code; `wifi_join` doesn't set the provisioned
-  flag) — NVS baking at 0x9000 (`0x6000` bytes, matches `partitions.csv`) is
-  the provisioning protocol. The NVS generator is vendored
+- The GUI provisions certificates and Wi-Fi credentials through NVS baking at
+  0x9000 (`0x6000` bytes, matches `partitions.csv`). The certificate setters are
+  dead code; legacy `wifi_join` does not set the provisioned flag. The bounded
+  service join is a separate credential write and does not change this flow. The NVS generator is vendored
   (`vendor/nvs_partition_gen.py`, from ESP-IDF), so no IDF install is needed.
 - `cfg get` returns **raw NVS strings**: a fleet-default board answers
   `device_name = AMBYTE_{MAC}` — the tool expands the token before comparing.

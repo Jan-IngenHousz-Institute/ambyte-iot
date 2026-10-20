@@ -341,7 +341,13 @@ class ServiceClient:
             # An explicit restart may abandon our local intent only after the
             # device says it is terminal; it never cancels someone else's work.
             if previous["store"] == self.store and previous["phase"] != "complete":
-                result = self._read_intent(previous)
+                try:
+                    result = self._read_intent(previous)
+                except UnknownOutcome:
+                    # new_request is an explicit caller decision after device
+                    # state verification. _foreign already ruled out a live
+                    # operation, including when this older ID has expired.
+                    result = None
                 if result and result["state"] not in TERMINAL:
                     raise BusyOperation(result["kind"], result["state"])
             self.journal.preserve()

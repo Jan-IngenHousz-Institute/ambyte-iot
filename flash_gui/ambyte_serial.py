@@ -31,7 +31,10 @@ from dataclasses import dataclass, field
 import serial
 from serial.tools import list_ports
 
+from . import config
 from .config import USB_JTAG_VID
+from .service_client import (OperationJournal, ServiceClient, ServiceClientError,
+                             decode_frame)
 
 PROMPT = "ambyte> "
 PROBE_READY_TIMEOUT_S = 45.0
@@ -206,7 +209,7 @@ class AmbyteConsole:
             raise ConsoleError(f"port {self.port} went away: {exc}") from exc
         return self._decoder.decode(chunk) if chunk else ""
 
-    def wait_prompt(self, timeout: float | None = None) -> bool:
+    def wait_prompt(self, timeout: float | None = None, *, recover_service=False) -> bool:
         """Nudge with empty lines until the `ambyte> ` prompt shows up.
 
         An empty line makes linenoise re-print the prompt (we may have
@@ -224,6 +227,30 @@ class AmbyteConsole:
                 buf += got
                 if PROMPT in _ANSI_RE.sub("", buf):
                     return True
+                if recover_service:
+                    for line in buf.splitlines(keepends=True):
+                        try:
+                            decode_frame(line.encode("utf-8"))
+                        except (ServiceClientError, UnicodeError):
+                            continue
+                        # A disconnected client can leave svc active for 60s.
+                        # Exit through a fresh read-only version/bind exchange;
+                        # never let repeated console nudges keep it alive forever.
+                        self._ser.reset_input_buffer()
+                        session = ServiceClient(self._ser, None, clock=time.monotonic, sleep=time.sleep)
+                        session._deadline = time.monotonic() + max(0.1, deadline - time.time())
+                        try:
+                            session.connect()
+                            session.exit()
+                        except ServiceClientError as exc:
+                            try:
+                                session.exit()
+                            except ServiceClientError:
+                                pass
+                            raise ConsoleError(str(exc)) from exc
+                        self._write_line("")
+                        buf = ""
+                        break
             elif time.time() - last_nudge > 1.0:
                 self._write_line("")
                 last_nudge = time.time()
@@ -442,6 +469,46 @@ class AmbyteConsole:
         except ConsoleError:
             pass
 
+    def schedule_service_push(self, blob: bytes, sha256: str, script_version: str,
+                              built_against_fw: str, *, mac: str, workbook=None,
+                              cancelled=lambda: False, log=None, deadline_s=360.0,
+                              new_request=False):
+        """Use the same journaled client as the bench on this open handle.
+
+        Reconnection is read-only until strict identity proves the same gateway
+        and capability. The new handle belongs to this console, so subsequent
+        activation verification and close use it too.
+        """
+        journal = OperationJournal(config.SERVICE_OPERATIONS_DIR, mac)
+
+        def reconnect(remaining):
+            reconnect_deadline = time.monotonic() + remaining
+            self.close()
+            replacement = connect_after_boot(self.port, deadline_s=min(45.0, remaining),
+                                             log=log, recover_service=True)
+            try:
+                remaining = reconnect_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConsoleError("Transfer deadline reached while waiting for the gateway.")
+                identity = replacement.identity(timeout=min(5.0, remaining))
+                if identity.mac != journal.mac or "svc" not in identity.capabilities:
+                    raise ConsoleError("Reconnected gateway identity or service capability changed; transfer preserved.")
+            except Exception:
+                replacement.close()
+                raise
+            self.port, self._ser = replacement.port, replacement._ser
+            self._decoder.reset()
+            return self._ser
+
+        client = ServiceClient(self._ser, journal, reconnect=reconnect,
+                               clock=time.monotonic, sleep=time.sleep)
+        try:
+            return client.upload_schedule(blob, sha256, script_version, built_against_fw,
+                                          workbook, cancelled=cancelled, log=log,
+                                          new_request=new_request, deadline_s=deadline_s)
+        except ServiceClientError as exc:
+            raise ConsoleError(str(exc)) from exc
+
     def schedule_release(self, timeout: float = 10.0) -> ScheduleReleaseStatus:
         """Read the active /littlefs/schedule.yaml identity and runner state."""
         reply = self.command("schedule release", timeout=timeout)
@@ -526,7 +593,7 @@ def probe_device(port: str, timeout: float = PROBE_READY_TIMEOUT_S,
 
 
 def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
-                       log=None) -> AmbyteConsole:
+                       log=None, *, recover_service=False) -> AmbyteConsole:
     """Console session on a freshly rebooted board.
 
     The ESP32-S3 native USB-Serial-JTAG re-enumerates to a NEW port name on
@@ -557,7 +624,8 @@ def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,
                 # and reopening it every three seconds traps startup in a boot
                 # loop before the CLI has time to appear.
                 remaining = max(0.1, deadline - time.time())
-                if con.wait_prompt(timeout=min(3.0, remaining)):
+                options = {"recover_service": True} if recover_service else {}
+                if con.wait_prompt(timeout=min(3.0, remaining), **options):
                     if log:
                         log(f"Console up on {active_port}.")
                     return con

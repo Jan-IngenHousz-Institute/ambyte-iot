@@ -103,6 +103,7 @@ class App(ttk.Frame):
         self.experiments: list = []
         self.current_run: DeviceRun | None = None
         self.busy = False
+        self._schedule_cancel = threading.Event()
         self.local_tz = timezones.local_iana_zone()
         self.gui_release_url = app_update.RELEASES_PAGE
         # Workbook programming of the selected experiment, resolved async at
@@ -296,6 +297,16 @@ class App(ttk.Frame):
             btn_row, text="Retry provisioning (no re-flash)",
             command=self._retry_provision, state="disabled")
         self.retry_prov_btn.pack(side="left", padx=(8, 0))
+        transfer_row = ttk.Frame(frame)
+        transfer_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.cancel_schedule_btn = ttk.Button(
+            transfer_row, text="Cancel schedule transfer", command=self._cancel_schedule,
+            state="disabled")
+        self.cancel_schedule_btn.pack(side="left")
+        self.new_schedule_btn = ttk.Button(
+            transfer_row, text="New schedule request…", command=self._retry_new_schedule,
+            state="disabled")
+        self.new_schedule_btn.pack(side="left", padx=(8, 0))
         self.result_var = tk.StringVar()
         ttk.Label(btn_row, textvariable=self.result_var,
                   font="TkHeadingFont").pack(side="left", padx=(16, 0))
@@ -303,9 +314,9 @@ class App(ttk.Frame):
         self.log_text = scrolledtext.ScrolledText(frame, height=14,
                                                   state="disabled",
                                                   font="TkFixedFont")
-        self.log_text.grid(row=3, column=0, columnspan=4, sticky="nsew",
+        self.log_text.grid(row=4, column=0, columnspan=4, sticky="nsew",
                            pady=(8, 0))
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
 
     # ── thread-safe UI helpers ───────────────────────────────────────────
     def _post(self, fn, *args) -> None:
@@ -338,8 +349,11 @@ class App(ttk.Frame):
         self.result_var.set("")
         self.retry_flash_btn.configure(state="disabled")
         self.retry_prov_btn.configure(state="disabled")
+        self.new_schedule_btn.configure(state="disabled")
 
     def _set_busy(self, busy: bool) -> None:
+        if busy:
+            self._schedule_cancel.clear()
         def apply():
             self.busy = busy
             self.onboard_btn.configure(
@@ -349,7 +363,21 @@ class App(ttk.Frame):
                 else "readonly")
             self.schedule_refresh_btn.configure(
                 state="disabled" if busy else "normal")
+            if not busy:
+                self.cancel_schedule_btn.configure(state="disabled")
+            else:
+                self.new_schedule_btn.configure(state="disabled")
         self._post(apply)
+
+    def _enable_schedule_cancel(self) -> None:
+        self._post(self.cancel_schedule_btn.configure, {"state": "normal"})
+
+    def _cancel_schedule(self) -> None:
+        # Only a thread-safe signal crosses to the serial worker. It decides
+        # from the verified device state whether an abort is still possible.
+        self._schedule_cancel.set()
+        self.cancel_schedule_btn.configure(state="disabled")
+        self.log("Cancellation requested. A committed operation remains saved for readback.")
 
     def _ask_on_main(self, fn):
         """Run fn() on the main thread, block the worker for its result."""
@@ -890,7 +918,12 @@ class App(ttk.Frame):
         config_ok = all(r.passed for r in results)
         if config_ok:
             self._set_step("schedule", "running")
-            results.append(procedure.install_schedule_script(ctx, run, log=self.log))
+            try:
+                results.append(procedure.install_schedule_script(
+                    ctx, run, log=self.log, cancelled=self._schedule_cancel.is_set,
+                    on_service_start=self._enable_schedule_cancel))
+            finally:
+                self._post(self.cancel_schedule_btn.configure, {"state": "disabled"})
             self._set_step("schedule", "ok")
 
         all_ok = config_ok and all(r.passed for r in results)
@@ -916,6 +949,8 @@ class App(ttk.Frame):
             self._post(self.retry_flash_btn.configure, {"state": "normal"})
         elif exc.step in ("provision", "schedule", "verify"):
             self._post(self.retry_prov_btn.configure, {"state": "normal"})
+            if exc.step == "schedule":
+                self._post(self.new_schedule_btn.configure, {"state": "normal"})
         self._post(messagebox.showerror, "On-boarding failed", str(exc))
 
     def _retry_flash(self) -> None:
@@ -948,6 +983,44 @@ class App(ttk.Frame):
         def work():
             try:
                 self._verify(ctx, run, repair=True)
+            except ProcedureError as exc:
+                self._fail_step(exc)
+            except Exception as exc:
+                self.log(f"UNEXPECTED ERROR: {exc!r}")
+            finally:
+                self._set_busy(False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _retry_new_schedule(self) -> None:
+        run = self.current_run
+        if not run or self.busy:
+            return
+        ctx = self._make_context()
+        self._set_busy(True)
+
+        def work():
+            try:
+                identity = procedure.service_recovery_identity(run, log=self.log)
+                loaded = identity.schedule
+                approved = self._ask_on_main(lambda: messagebox.askyesno(
+                    "Start a new schedule request?",
+                    f"Gateway: {identity.mac}\nCurrent source: {loaded.source}\n"
+                    f"SHA-256: {loaded.sha256 or '(none)'}\n"
+                    f"Workbook: {loaded.workbook_version_id or '(none)'}\n"
+                    f"Version: {loaded.script_version or '(none)'}\n\n"
+                    "The previous operation's outcome may remain unknown. "
+                    "Preserve its saved intent and start a new request for the selected schedule?",
+                    parent=self))
+                if not approved:
+                    self.log("New request declined; the saved intent is preserved.")
+                    self._post(self.new_schedule_btn.configure, {"state": "normal"})
+                    return
+                self._set_step("schedule", "running")
+                result = procedure.install_schedule_script(
+                    ctx, run, log=self.log, cancelled=self._schedule_cancel.is_set,
+                    on_service_start=self._enable_schedule_cancel, new_request=True)
+                self._set_step("schedule", "ok" if result.passed else "fail")
+                self.log(f"{result.label}: {'PASS' if result.passed else 'FAIL'} — {result.detail}")
             except ProcedureError as exc:
                 self._fail_step(exc)
             except Exception as exc:
