@@ -22,6 +22,7 @@ static TaskHandle_t s_install_task;
 static bool s_active;
 static bool s_overrun;
 static uint32_t s_dropped_calls, s_dropped_bytes;
+static unsigned s_passthrough_writers;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static void *s_borrowed;
 static size_t s_borrowed_length;
@@ -96,8 +97,14 @@ void __wrap_vRingbufferReturnItem(RingbufHandle_t ring, void *item)
 
 int __wrap_usb_serial_jtag_write_bytes(const void *data, size_t length, TickType_t wait)
 {
-    if (!svc_usb_active()) return __real_usb_serial_jtag_write_bytes(data, length, wait);
     portENTER_CRITICAL(&s_mux);
+    if (!s_active) {
+        ++s_passthrough_writers;
+        portEXIT_CRITICAL(&s_mux);
+        int result = __real_usb_serial_jtag_write_bytes(data, length, wait);
+        portENTER_CRITICAL(&s_mux); --s_passthrough_writers; portEXIT_CRITICAL(&s_mux);
+        return result;
+    }
     if (s_dropped_calls != UINT32_MAX) ++s_dropped_calls;
     if (length > UINT32_MAX - s_dropped_bytes) s_dropped_bytes = UINT32_MAX;
     else s_dropped_bytes += (uint32_t)length;
@@ -160,7 +167,18 @@ bool svc_usb_enter(void)
     s_active = true;
     s_overrun = false;
     portEXIT_CRITICAL(&s_mux);
-    return usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(1000)) == ESP_OK;
+    /* An already admitted normal writer may have been preempted before its
+     * driver call. Wait for it as well as the hardware TX ring; otherwise that
+     * writer could emit raw bytes after the ready frame. */
+    int64_t deadline = esp_timer_get_time() + 1000000;
+    for (;;) {
+        portENTER_CRITICAL(&s_mux); unsigned writers = s_passthrough_writers; portEXIT_CRITICAL(&s_mux);
+        if (!writers) break;
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    int64_t left = deadline - esp_timer_get_time();
+    return left > 0 && usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS((left + 999) / 1000)) == ESP_OK;
 }
 
 void svc_usb_leave(void)
@@ -195,17 +213,20 @@ int svc_usb_read(void *buffer, size_t length, unsigned timeout_ms)
 
 bool svc_usb_write(const void *buffer, size_t length)
 {
+    flockfile(stdout);
     const unsigned char *p = buffer;
     int64_t deadline = esp_timer_get_time() + 1000000;
     while (length) {
         size_t n = length > 64 ? 64 : length;
         int64_t remaining = deadline - esp_timer_get_time();
-        if (remaining <= 0) return false;
+        if (remaining <= 0) { funlockfile(stdout); return false; }
         int wrote = __real_usb_serial_jtag_write_bytes(p, n, pdMS_TO_TICKS((remaining + 999) / 1000));
-        if (wrote <= 0) return false;
+        if (wrote <= 0 || (size_t)wrote > n) { funlockfile(stdout); return false; }
         p += wrote;
         length -= (size_t)wrote;
     }
     int64_t remaining = deadline - esp_timer_get_time();
-    return remaining > 0 && usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS((remaining + 999) / 1000)) == ESP_OK;
+    bool ok = remaining > 0 && usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS((remaining + 999) / 1000)) == ESP_OK;
+    funlockfile(stdout);
+    return ok;
 }

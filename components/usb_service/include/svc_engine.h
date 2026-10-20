@@ -47,3 +47,4 @@ void svc_engine_init(svc_engine_t *engine, svc_store_t *store, const svc_engine_
 bool svc_engine_dispatch(svc_engine_t *engine, char *body, char *json);
 const char *svc_engine_tick(svc_engine_t *engine);
 bool svc_engine_wifi_busy(svc_engine_t *engine);
+void svc_engine_unbind(svc_engine_t *engine);

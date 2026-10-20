@@ -1844,12 +1844,14 @@ esp_err_t wifi_manager_trial(const char *ssid, const char *password,
 {
     if (!out || !ssid || !password || !prepare) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
-    if (!s_wifi.lock || !s_wifi.initialized || !s_wifi.started) return ESP_ERR_INVALID_STATE;
+    if (!s_wifi.lock || !s_wifi.initialized || !s_wifi.started) {
+        out->result = ESP_ERR_INVALID_STATE; return out->result;
+    }
     wifi_manager_lock();
     bool busy = s_service_trial || s_config_callers != 0;
     if (!busy) s_service_trial = true;
     wifi_manager_unlock();
-    if (busy) return ESP_ERR_INVALID_STATE;
+    if (busy) { out->result = ESP_ERR_INVALID_STATE; return out->result; }
 
     wifi_config_t previous = {0}, requested = {0};
     char old_ssid[33] = {0}, old_password[65] = {0};

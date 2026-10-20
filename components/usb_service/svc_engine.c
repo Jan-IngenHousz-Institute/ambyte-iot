@@ -144,6 +144,10 @@ bool svc_engine_wifi_busy(svc_engine_t *e)
     unlock(e);
     return busy;
 }
+void svc_engine_unbind(svc_engine_t *e)
+{
+    lock(e); svc_protocol_unbind(&e->protocol); unlock(e);
+}
 const char *svc_engine_tick(svc_engine_t *e)
 {
     lock(e);

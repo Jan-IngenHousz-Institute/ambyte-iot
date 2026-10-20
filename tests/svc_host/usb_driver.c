@@ -13,11 +13,21 @@ static char output[8192];
 static size_t output_length;
 static linenoise_read_bytes_fn editor;
 static int64_t now;
+static bool release_writer;
 
 void svc_test_enter(void) { assert(critical++ == 0); }
 void svc_test_exit(void) { assert(critical-- == 1); }
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
 int64_t esp_timer_get_time(void) { return ++now * 1000; }
+void vTaskDelay(TickType_t ticks)
+{
+    now += ticks;
+    if (release_writer) {
+        assert(s_passthrough_writers == 1);
+        __real_usb_serial_jtag_write_bytes("tail", 4, 0);
+        --s_passthrough_writers; release_writer = false;
+    }
+}
 
 RingbufHandle_t __real_xRingbufferCreate(size_t size, RingbufferType_t type)
 {
@@ -109,6 +119,13 @@ int main(void)
     assert(calls == 1 && bytes == sizeof secret);
     svc_usb_leave();
     assert(__wrap_usb_serial_jtag_write_bytes("legacy", 6, 0) == 6);
+    s_passthrough_writers = 1; release_writer = true;
+    assert(svc_usb_enter() && !s_passthrough_writers && !release_writer);
+    assert(!memcmp(output + output_length - 4, "tail", 4));
+    svc_usb_leave();
+    s_passthrough_writers = 1;
+    assert(!svc_usb_enter()); /* a stuck pre-entry writer prevents the marker */
+    s_passthrough_writers = 0; svc_usb_leave();
     svc_usb_notice_handler(notice);
     int descriptors[2]; assert(pipe(descriptors) == 0);
     const char *input = "00000001 svc.wifi.join password-sentinel\nidentity\n";

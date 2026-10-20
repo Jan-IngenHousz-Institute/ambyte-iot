@@ -53,6 +53,7 @@
 #include "status_heartbeat.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
+#include "usb_service.h"
 #if CONFIG_AMBYTE_EVQ_HIL
 #include "event_log_hil.h"   /* on-device verification build only */
 #include "evq_hil.h"
@@ -370,6 +371,7 @@ typedef struct {
 } maint_job_t;
 
 static QueueHandle_t s_maint_q;
+static TaskHandle_t s_maint_task;
 
 /* Submit hook handed to every update worker's config. Enqueues a job for the
  * shared worker; returns false if the queue is full (op is then reported dropped
@@ -379,6 +381,17 @@ static bool app_maint_submit(void (*run)(void *arg), void *arg)
     if (s_maint_q == NULL || run == NULL) return false;
     maint_job_t job = { .run = run, .arg = arg };
     return xQueueSend(s_maint_q, &job, 0) == pdTRUE;
+}
+
+/* A service Wi-Fi trial occupies this same resident worker. Queuing an update
+ * behind it would execute after the trial, instead of preserving the existing
+ * busy/drop/retry semantics at arrival. Filter every legacy producer here;
+ * service jobs use the raw submit above. No component payload/schema changes. */
+#include "service_admission.h"
+
+static uint32_t app_maint_stack_margin(void)
+{
+    return s_maint_task ? uxTaskGetStackHighWaterMark(s_maint_task) * sizeof(StackType_t) : 0;
 }
 
 static void app_maint_worker(void *arg)
@@ -408,6 +421,14 @@ static portMUX_TYPE s_boot_mux      = portMUX_INITIALIZER_UNLOCKED;
 static bool         s_boot_complete = false;
 static bool         s_mqtt_deferred = false;
 
+static bool app_service_boot_ready(void)
+{
+    taskENTER_CRITICAL(&s_boot_mux);
+    bool ready = s_boot_complete;
+    taskEXIT_CRITICAL(&s_boot_mux);
+    return ready;
+}
+
 /* MQTT reconnects can land while the publisher is sleeping on its 30 s safety
  * fallback. Wake it immediately; sync_runner_notify() is a no-op before start. */
 static void app_on_mqtt_connect(void *ctx)
@@ -434,6 +455,7 @@ static void app_open_boot_gate(void)
         mqtt_client_start();
     }
     sync_runner_boot_complete();
+    usb_service_boot_ready();
 }
 
 static esp_err_t app_init_i2c_and_sensors(void)
@@ -1200,7 +1222,7 @@ void app_main(void)
         .workload_resume      = app_workload_resume,
         .maintenance_begin    = app_maintenance_begin,
         .maintenance_end      = app_maintenance_end,
-        .submit               = app_maint_submit,
+        .submit               = app_maint_submit_legacy,
         .persistence_healthy  = app_persistence_healthy,
         .status_topic         = status_topic,
         .device_id            = device_id,
@@ -1242,7 +1264,7 @@ void app_main(void)
         .comms_resume      = app_comms_resume,
         .maintenance_begin = app_maintenance_begin,
         .maintenance_end   = app_maintenance_end,
-        .submit            = app_maint_submit,
+        .submit            = app_maint_submit_legacy,
         .publish           = mqtt_client_get_publish_fn(),
         .is_connected      = mqtt_client_get_is_connected_fn(),
         .status_topic      = status_topic,
@@ -1269,7 +1291,7 @@ void app_main(void)
         .comms_resume      = app_comms_resume,
         .maintenance_begin = app_maintenance_begin,
         .maintenance_end   = app_maintenance_end,
-        .submit            = app_maint_submit,
+        .submit            = app_maint_submit_legacy,
     };
     if (script_update_init(&script_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "script_update worker not started");
@@ -1285,7 +1307,7 @@ void app_main(void)
     s_maint_q = xQueueCreate(MAINT_WORKER_QLEN, sizeof(maint_job_t));
     if (s_maint_q == NULL ||
         xTaskCreatePinnedToCore(app_maint_worker, "maint", MAINT_WORKER_STACK,
-                                NULL, MAINT_WORKER_PRIO, NULL, 0) != pdPASS) {
+                                NULL, MAINT_WORKER_PRIO, &s_maint_task, 0) != pdPASS) {
         if (s_maint_q != NULL) { vQueueDelete(s_maint_q); s_maint_q = NULL; }
         ESP_LOGE(APP_TAG, "maintenance worker failed to start — remote OTA/flash/script disabled");
     } else {
@@ -1526,6 +1548,14 @@ void app_main(void)
      * schedule runner) can take seconds to minutes, and the operator needs a
      * live prompt while it runs. Commands degrade gracefully for anything not
      * started yet. */
+    const usb_service_config_t service_config = {
+        .submit = app_maint_submit,
+        .maintenance_begin = app_maintenance_begin, .maintenance_end = app_maintenance_end,
+        .boot_ready = app_service_boot_ready, .worker_stack = app_maint_stack_margin,
+    };
+    if (usb_service_init(&service_config) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "USB service store unavailable; inspect svc/identity and use legacy recovery");
+    }
     app_start_cli();
 #if CONFIG_AMBYTE_EVQ_HIL
     evq_hil_set_park_hooks(app_sd_park_now, app_sd_unpark_now);

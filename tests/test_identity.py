@@ -21,6 +21,7 @@ HOST = ROOT / "tests/identity_host"
 CAPABILITIES = {
     "identity", "cfg.get", "cfg.set", "reboot", "schedule.status",
     "schedule.release", "schedule.begin", "schedule.put", "schedule.commit", "schedule.abort",
+    "svc",
 }
 WORKBOOK = "11111111-2222-4333-8444-555555555555"
 
