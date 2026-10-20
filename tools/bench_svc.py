@@ -26,7 +26,14 @@ def padded_yaml(blob):
         raise ValueError("Supply a valid UTF-8 YAML fixture ending in LF, at most 16,384 bytes.")
     blob.decode("utf-8", "strict")
     left = 16384 - len(blob)
-    return blob + (b"#" + b"x" * (left - 2) + b"\n" if left >= 2 else b"\n" * left)
+    # The production compiler applies its line limit before stripping comments.
+    # A single 16 KiB comment would stage successfully but fail compilation.
+    padding = bytearray()
+    while left:
+        count = min(left, 128)
+        padding.extend(b"#" + b"x" * (count - 2) + b"\n" if count >= 2 else b"\n")
+        left -= count
+    return blob + padding
 
 
 def main(argv=None):

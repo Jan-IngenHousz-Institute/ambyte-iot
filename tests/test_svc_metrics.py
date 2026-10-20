@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from tools.bench_svc import padded_yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,5 +21,10 @@ class ServiceCompilerMetricsTest(unittest.TestCase):
                                 *(f"-Wl,--wrap={name}" for name in ("malloc", "calloc", "realloc", "free")), "-lm", "-o", str(binary)], capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             p = subprocess.run([str(binary), str(ROOT / "components/sched_runner/default.yaml")], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("COMPILER_METRICS_OK", p.stdout)
+            padded = Path(temporary) / "benchmark.yaml"
+            padded.write_bytes(padded_yaml((ROOT / "tests/identity_host/bench.yaml").read_bytes()))
+            p = subprocess.run([str(binary), str(padded)], capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("COMPILER_METRICS_OK", p.stdout)
