@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "svc_usb.h"
 #include "svc_session.h"
 #include "driver/usb_serial_jtag.h"
@@ -29,6 +30,15 @@ static unsigned char fifo[64]; static size_t fifo_n;
 static char output[65536]; static size_t output_n;
 static void (*isr)(void *); static void *isr_arg;
 static bool pumping;
+static bool check_stream_progress;
+static void *other_task_output(void *context)
+{
+    (void)context;
+    printf("concurrent printf sentinel\n");
+    puts("concurrent puts sentinel");
+    fprintf(stderr, "concurrent stderr sentinel\n");
+    return NULL;
+}
 extern void sdk_sd_log(const char *, ...);
 extern void sdk_sd_check(void);
 void host_crit_enter(void) { assert(!critical++); }
@@ -97,7 +107,16 @@ int usb_serial_jtag_ll_txfifo_writable(void) { return 1; }
 uint32_t usb_serial_jtag_ll_read_rxfifo(void *p,uint32_t max)
 { assert(fifo_n<=max); memcpy(p,fifo,fifo_n); size_t n=fifo_n; fifo_n=0; return (uint32_t)n; }
 uint32_t usb_serial_jtag_ll_write_txfifo(const void *p,uint32_t n)
-{ assert(output_n+n<sizeof output); memcpy(output+output_n,p,n); output_n+=n; return n; }
+{
+    if (check_stream_progress) {
+        check_stream_progress=false;
+        pthread_t producer; assert(!pthread_create(&producer,NULL,other_task_output,NULL));
+        /* A framed writer holding stdout would deadlock this join. The Python
+         * test bounds the subprocess so that regression fails, never hangs. */
+        assert(!pthread_join(producer,NULL));
+    }
+    assert(output_n+n<sizeof output); memcpy(output+output_n,p,n); output_n+=n; return n;
+}
 void usb_serial_jtag_ll_txfifo_flush(void) {}
 void usb_serial_jtag_ll_ena_intr_mask(uint32_t mask) { enabled|=mask; pump(); }
 void usb_serial_jtag_ll_disable_intr_mask(uint32_t mask) { enabled&=~mask; }
@@ -173,7 +192,7 @@ int main(int argc,char **argv)
     cookie_io_functions_t funcs={.write=cookie_write};FILE *stream=fopencookie(NULL,"w",funcs);assert(stream);setvbuf(stream,NULL,_IONBF,0);
     stdout=stderr=stream;
     printf("plain-before\n");assert(output_n==13 && !memcmp(output,"plain-before\n",13));output_n=0;
-    assert(svc_usb_enter());emit_frame(0,"{\"state\":\"ready\"}");
+    assert(svc_usb_enter());check_stream_progress=true;emit_frame(0,"{\"state\":\"ready\"}");
     for(unsigned i=1;i<=100;++i) {
         task=i%4+2; printf("printf sentinel %u\n",i);puts("puts sentinel");fprintf(stderr,"stderr sentinel %u\n",i);
         assert(usb_serial_jtag_write_bytes(secret,sizeof secret,0)==sizeof secret);

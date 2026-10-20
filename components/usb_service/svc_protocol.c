@@ -218,6 +218,9 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
                (unsigned long)metrics.free_heap, (unsigned long)metrics.largest_block, (unsigned long)metrics.min_heap,
                (unsigned long)metrics.cli_stack, (unsigned long)metrics.worker_stack, (unsigned long)metrics.runner_stack,
                (unsigned long)metrics.dropped_bytes, (unsigned long)metrics.dropped_calls, (unsigned long)logical, records);
+        append(&j, ",\"min_free_heap\":%lu,\"min_largest_block\":%lu,\"samples\":%lu,\"fs_total\":%lu,\"fs_used\":%lu",
+               (unsigned long)metrics.min_free_heap, (unsigned long)metrics.min_largest_block,
+               (unsigned long)metrics.samples, (unsigned long)metrics.fs_total, (unsigned long)metrics.fs_used);
         finish(p, &j); goto done;
     }
     if (!strcmp(a[0], "svc.wifi.status")) {

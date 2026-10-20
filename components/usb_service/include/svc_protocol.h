@@ -12,6 +12,8 @@
 
 typedef struct {
     uint32_t free_heap, largest_block, min_heap;
+    uint32_t min_free_heap, min_largest_block, samples;
+    uint32_t fs_total, fs_used;
     uint32_t cli_stack, worker_stack, runner_stack;
     uint32_t dropped_bytes, dropped_calls;
 } svc_metrics_t;

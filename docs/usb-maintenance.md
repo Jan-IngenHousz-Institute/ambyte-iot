@@ -495,7 +495,7 @@ Base64 is canonical, padded, without whitespace.
 | `svc.result <op>` | Full nonsecret retained descriptor, state and evidence. Never retries the action. |
 | `svc.wifi.join <op> <ssid_base64> <password_base64-or-dash>` | Distinct bounded credential write. Immediate `connecting` result after durable admission; outcome below. SSID 1..31 UTF-8 bytes, no NUL. Password empty (`-`) or 8..63 printable ASCII bytes. No truncation, enterprise credentials or certificate inputs. |
 | `svc.wifi.status` | `configured_ssid,trial_ssid,trial,connected,provisioned`; current RAM/connection read, not NVS proof. Original/configured SSID remains separate from the trial SSID (`null` outside trial). A current IP can belong to the trial while `trial:true`. |
-| `svc.stats` | Integer `free_heap,largest_block,min_heap,cli_stack,worker_stack,runner_stack,dropped_bytes,dropped_calls,logical_bytes,records,log_buffer_bytes`. Byte units; log buffer is zero. Unavailable stack data is zero. Heap/stack diagnostics do not themselves establish a qualified resource floor. |
+| `svc.stats` | Integer `free_heap,largest_block,min_heap,min_free_heap,min_largest_block,samples,cli_stack,worker_stack,runner_stack,dropped_bytes,dropped_calls,logical_bytes,records,log_buffer_bytes,fs_total,fs_used`. Byte units except counts; log buffer is zero. `min_heap` is the since-boot allocator low-water; `min_free_heap` and `min_largest_block` are sampled minima since service initialization. Samples cover parser allocation/free and compile boundaries, schedule validation buffers, operation boundaries and each 250 ms in mode. Runner stack is cached from the runner itself across task generations; zero means no sample yet. `fs_used` is total littlefs allocation, so measure its delta with other filesystem writers quiet; it is not per-directory attribution. Heap/stack diagnostics do not themselves establish a qualified resource floor. |
 | `svc.exit` | `state:"exit"`, then prompt restoration. Leaves staging/results intact. |
 
 A schedule result has exactly the base fields below, plus optional boolean
@@ -768,3 +768,19 @@ which does not predict an OTA slot writer or SD export adapter. A7/A9 must
 remeasure their adapters. Host-pipe correctness tests provide no device rate.
 Numerical device throughput and resource floors remain bench evidence;
 acquisition jitter is **not measured** by this implementation.
+
+Service storage workspace has a 21,536-byte logical worst case: 16,384 staged
+bytes + nine 512-byte records + 32-byte watermark + 512-byte atomic temp. The
+physical littlefs allocation may be larger; record `fs_used` before admission,
+at the largest staged prefix, during replacement/GC and after cleanup, with
+other writers quiet. Do not infer flash allocation from logical file lengths.
+Target builds emit `.su` stack-usage records for service handlers and USB hooks;
+these are static per-function frames, while task high-water margins remain the
+runtime acceptance measurement. Acquisition jitter is not measured.
+
+Record build-side F6 evidence for each image with:
+
+```sh
+python3 tools/qualify_svc_resources.py .pio/build/esp32-s3-devkitm-1 --output /tmp/svc-release-resources.json
+python3 tools/qualify_svc_resources.py .pio/build/svc-bench --output /tmp/svc-bench-resources.json
+```

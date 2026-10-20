@@ -213,20 +213,22 @@ int svc_usb_read(void *buffer, size_t length, unsigned timeout_ms)
 
 bool svc_usb_write(const void *buffer, size_t length)
 {
-    flockfile(stdout);
+    /* The CLI is the only framed writer. Ordinary driver writers are already
+     * gated, and entry drained every admitted predecessor before ready. Do
+     * not hold a libc stream lock across a stalled USB transfer: runner/log
+     * producers must be able to reach the drop gate without waiting for it. */
     const unsigned char *p = buffer;
     int64_t deadline = esp_timer_get_time() + 1000000;
     while (length) {
         size_t n = length > 64 ? 64 : length;
         int64_t remaining = deadline - esp_timer_get_time();
-        if (remaining <= 0) { funlockfile(stdout); return false; }
+        if (remaining <= 0) return false;
         int wrote = __real_usb_serial_jtag_write_bytes(p, n, pdMS_TO_TICKS((remaining + 999) / 1000));
-        if (wrote <= 0 || (size_t)wrote > n) { funlockfile(stdout); return false; }
+        if (wrote <= 0 || (size_t)wrote > n) return false;
         p += wrote;
         length -= (size_t)wrote;
     }
     int64_t remaining = deadline - esp_timer_get_time();
     bool ok = remaining > 0 && usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS((remaining + 999) / 1000)) == ESP_OK;
-    funlockfile(stdout);
     return ok;
 }

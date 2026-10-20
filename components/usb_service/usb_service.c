@@ -46,17 +46,31 @@ static void sample(void *context)
     portENTER_CRITICAL(&s_metrics_mux); TaskHandle_t cli_task = s_cli_task; portEXIT_CRITICAL(&s_metrics_mux);
     uint32_t cli = cli_task ? uxTaskGetStackHighWaterMark(cli_task) * sizeof(StackType_t) : 0;
     uint32_t worker = s_config.worker_stack ? s_config.worker_stack() : 0;
+    uint32_t runner = s_config.runner_stack ? s_config.runner_stack() : 0;
     portENTER_CRITICAL(&s_metrics_mux);
     s_metrics.free_heap = free; s_metrics.largest_block = largest; s_metrics.min_heap = min;
+    if (!s_metrics.samples || free < s_metrics.min_free_heap) s_metrics.min_free_heap = free;
+    if (!s_metrics.samples || largest < s_metrics.min_largest_block) s_metrics.min_largest_block = largest;
+    if (s_metrics.samples != UINT32_MAX) ++s_metrics.samples;
+    if (runner && (!s_metrics.runner_stack || runner < s_metrics.runner_stack)) s_metrics.runner_stack = runner;
     if (cli && (!s_metrics.cli_stack || cli < s_metrics.cli_stack)) s_metrics.cli_stack = cli;
     if (worker && (!s_metrics.worker_stack || worker < s_metrics.worker_stack)) s_metrics.worker_stack = worker;
     portEXIT_CRITICAL(&s_metrics_mux);
 }
+/* Strong implementation of the sched_spec optional observer. It samples no
+ * filesystem and takes no service/maintenance mutex, so parser callbacks are
+ * safe inside synchronous schedule validation and runner restart. */
+void sched_resource_sample(void) { sample(NULL); }
+
 static void metrics(void *context, svc_metrics_t *out)
 {
     sample(context);
     portENTER_CRITICAL(&s_metrics_mux); *out = s_metrics; portEXIT_CRITICAL(&s_metrics_mux);
     svc_usb_counters(&out->dropped_calls, &out->dropped_bytes);
+    size_t total = 0, used = 0;
+    if (esp_littlefs_info("littlefs", &total, &used) == ESP_OK) {
+        out->fs_total = (uint32_t)total; out->fs_used = (uint32_t)used;
+    }
 }
 static bool sha256(void *context, const void *bytes, size_t n, unsigned char out[32])
 {

@@ -41,9 +41,9 @@ class ServicePinnedSdkTest(unittest.TestCase):
                        "xRingbufferReceiveUpTo", "vRingbufferReturnItem", "usb_serial_jtag_write_bytes")
             binary = build / "sdk"
             p = subprocess.run([*base, *map(str, objects), str(sd_obj), "-Wl,--gc-sections",
-                                *(f"-Wl,--wrap={name}" for name in symbols), "-o", str(binary)], capture_output=True, text=True)
+                                *(f"-Wl,--wrap={name}" for name in symbols), "-pthread", "-o", str(binary)], capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
-            p = subprocess.run([str(binary), str(build / "svc")], capture_output=True)
+            p = subprocess.run([str(binary), str(build / "svc")], capture_output=True, timeout=10)
             self.assertEqual(p.returncode, 0, p.stderr.decode())
             self.assertIn(b"PINNED_SDK_OK", p.stderr)
             replies = []

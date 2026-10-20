@@ -47,6 +47,11 @@ class ServiceRuntimeTest(unittest.TestCase):
                     responses[int(prefix[:8], 16)] = json.loads(prefix[9:])
                 self.assertEqual((responses[5]["state"], responses[5]["reason"]), (state, reason))
                 self.assertEqual((responses[6]["free_heap"], responses[6]["worker_stack"], responses[6]["cli_stack"]), (64000, 4444, 8888))
+                self.assertEqual(responses[6]["runner_stack"], 2700)
+                self.assertEqual((responses[6]["min_free_heap"], responses[6]["min_largest_block"]),
+                                 (64000, 32000) if case == "queue_failure" else (12000, 5000))
+                self.assertGreater(responses[6]["samples"], 0)
+                self.assertEqual((responses[6]["fs_total"], responses[6]["fs_used"]), (1048576, 1024))
                 self.assertEqual(responses[7]["configured_ssid"], "original")
                 for path in (Path(temporary) / "svc").iterdir():
                     self.assertNotIn(b"wrongpass", path.read_bytes())

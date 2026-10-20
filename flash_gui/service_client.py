@@ -178,7 +178,10 @@ class ServiceClient:
             if body == "svc.stats":
                 counters = {"free_heap", "largest_block", "min_heap", "cli_stack", "worker_stack", "runner_stack",
                             "dropped_bytes", "dropped_calls", "logical_bytes", "records", "log_buffer_bytes"}
-                _keys(result, {"ok", "store"} | counters)
+                extra = {"min_free_heap", "min_largest_block", "samples", "fs_total", "fs_used"}
+                _keys(result, {"ok", "store"} | counters, extra)
+                if extra & result.keys() and (not extra <= result.keys() or not all(_integer(result[key], 0, 0xffffffff) for key in extra)):
+                    raise ProtocolError("Invalid sampled service budget counters.")
                 if not all(_integer(result[key], 0, 0xffffffff) for key in counters) or result["logical_bytes"] > 32768 or result["records"] > 10 or result["log_buffer_bytes"] != 0:
                     raise ProtocolError("Invalid service budget counters.")
             else:

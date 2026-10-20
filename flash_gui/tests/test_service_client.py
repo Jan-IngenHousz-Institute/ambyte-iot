@@ -302,3 +302,19 @@ def test_abort_requires_owned_journal_and_repeat_is_idempotent(tmp_path):
         foreign.abort(owner.journal.load())
     foreign.exit()
     assert board.aborts == 1
+
+
+def test_sampled_budget_counters_are_typed_and_preserved(tmp_path, monkeypatch):
+    c, _, _ = client(tmp_path)
+    c.connect()
+    counters = dict(ok=True, store=STORE, free_heap=64000, largest_block=32000, min_heap=11000,
+                    cli_stack=4000, worker_stack=5000, runner_stack=3000, dropped_bytes=0,
+                    dropped_calls=0, logical_bytes=21536, records=9, log_buffer_bytes=0,
+                    min_free_heap=12000, min_largest_block=5000, samples=800, fs_total=1000000, fs_used=100000)
+    monkeypatch.setattr(c, "_exchange", lambda _: dict(counters))
+    assert c.command("svc.stats") == counters
+    counters["min_largest_block"] = True
+    with pytest.raises(svc.ProtocolError): c.command("svc.stats")
+    c.active = True
+    del counters["min_largest_block"]
+    with pytest.raises(svc.ProtocolError): c.command("svc.stats")

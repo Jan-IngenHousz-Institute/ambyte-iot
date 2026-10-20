@@ -16,3 +16,7 @@ foreach(symbol usb_serial_jtag_driver_install xRingbufferCreate
                usb_serial_jtag_write_bytes)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=${symbol}")
 endforeach()
+
+# Evidence only: emit per-function target stack frames, with no code-generation
+# change or runtime hook. Runtime task margins remain the acceptance authority.
+target_compile_options(${COMPONENT_LIB} PRIVATE -fstack-usage)

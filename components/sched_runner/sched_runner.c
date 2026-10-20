@@ -501,6 +501,25 @@ static void drain_dispatch(void)
 
 /* ── the task ────────────────────────────────────────────────────────── */
 
+/* Sample only from the live task itself: retaining a TaskHandle_t for stats
+ * would race vTaskDelete during a service-triggered schedule restart. Cache
+ * the minimum across generations so a restart cannot hide the old margin. */
+static uint32_t s_stack_margin;
+static void sample_stack_margin(void)
+{
+    uint32_t margin = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    taskENTER_CRITICAL(&s_state_mux);
+    if (margin && (!s_stack_margin || margin < s_stack_margin)) s_stack_margin = margin;
+    taskEXIT_CRITICAL(&s_state_mux);
+}
+uint32_t sched_runner_stack_margin(void)
+{
+    taskENTER_CRITICAL(&s_state_mux);
+    uint32_t margin = s_stack_margin;
+    taskEXIT_CRITICAL(&s_state_mux);
+    return margin;
+}
+
 static void sched_runner_task(void *arg)
 {
     const uint32_t generation = (uint32_t)(uintptr_t)arg;
@@ -543,6 +562,7 @@ static void sched_runner_task(void *arg)
     }
 
     for (;;) {
+        sample_stack_margin();
         if (s_should_stop) break;
 
         /* Compare real wall UTC with the wall projected from the last
@@ -565,6 +585,7 @@ static void sched_runner_task(void *arg)
             if (mask & (1u << j)) run_job(j);
         }
         drain_dispatch();
+        sample_stack_margin();
         if (s_should_stop) break;
 
         /* Armed dues and this wait are both monotonic. The 60 s ceiling exists
@@ -586,6 +607,7 @@ static void sched_runner_task(void *arg)
     }
 
     sched_runner_cleanup_lights();
+    sample_stack_margin();
 
     /* Stack high-water at exit: the number that trims SCHED_TASK_STACK after
      * the hardware soak (acceptance criterion 4). */

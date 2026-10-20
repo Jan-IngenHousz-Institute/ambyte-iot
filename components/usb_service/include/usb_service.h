@@ -10,6 +10,7 @@ typedef struct {
     void (*maintenance_end)(void);
     bool (*boot_ready)(void);
     uint32_t (*worker_stack)(void);
+    uint32_t (*runner_stack)(void);
 } usb_service_config_t;
 
 /* Init after littlefs and boot Wi-Fi config, before CLI starts. This captures

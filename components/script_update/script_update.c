@@ -338,7 +338,9 @@ static bool request_already_active(const script_req_t *r)
 static const char *schedule_check(const char *text, size_t len, const char *workbook,
                                    char *err, size_t err_cap)
 {
+    sched_resource_sample();
     sched_program_t *scratch = malloc(sizeof(*scratch));
+    sched_resource_sample();
     if (scratch == NULL) {
         snprintf(err, err_cap, "out of memory for schedule validation");
         return "storage_error";
@@ -349,7 +351,9 @@ static const char *schedule_check(const char *text, size_t len, const char *work
         const char *compiled = sched_pool_str(scratch, scratch->workbook_version_id_off);
         if (strcmp(workbook, compiled != NULL ? compiled : "") != 0) reason = "workbook_mismatch";
     }
+    sched_resource_sample();
     free(scratch);
+    sched_resource_sample();
     return reason;
 }
 static bool schedule_ok(const char *text, size_t len, char *err, size_t err_cap)
@@ -363,7 +367,9 @@ static const char *schedule_check_file(const char *path, const char *workbook, c
         snprintf(err, err_cap, "%s: %s", path, strerror(errno));
         return "storage_error";
     }
+    sched_resource_sample();
     char *buf = malloc(SCHED_YAML_MAX_FILE_BYTES + 1);
+    sched_resource_sample();
     if (buf == NULL) {
         fclose(f);
         snprintf(err, err_cap, "out of memory for schedule validation");
@@ -379,11 +385,15 @@ static const char *schedule_check_file(const char *path, const char *workbook, c
         } else {
             snprintf(err, err_cap, "schedule read failed");
         }
+        sched_resource_sample();
         free(buf);
+        sched_resource_sample();
         return "storage_error";
     }
     const char *reason = schedule_check(buf, len, workbook, err, err_cap);
+    sched_resource_sample();
     free(buf);
+    sched_resource_sample();
     return reason;
 }
 static bool sched_spec_compile_file(const char *path, char *err, size_t err_cap)

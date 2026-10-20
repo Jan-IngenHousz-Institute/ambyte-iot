@@ -1552,6 +1552,7 @@ void app_main(void)
         .submit = app_maint_submit,
         .maintenance_begin = app_maintenance_begin, .maintenance_end = app_maintenance_end,
         .boot_ready = app_service_boot_ready, .worker_stack = app_maint_stack_margin,
+        .runner_stack = sched_runner_stack_margin,
     };
     if (usb_service_init(&service_config) != ESP_OK) {
         ESP_LOGW(APP_TAG, "USB service store unavailable; inspect svc/identity and use legacy recovery");

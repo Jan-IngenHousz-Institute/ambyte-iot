@@ -10,6 +10,7 @@
 static unsigned critical, manager_calls, raw_submissions, legacy_submissions, maintenance_ends;
 static bool mutex_held, gate, maintenance, reject;
 static int64_t clock_us;
+static bool resource_trough;
 static void (*pending_worker)(void *);
 static void *worker_arg;
 static char input[2048];
@@ -30,8 +31,8 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t mutex)
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
 UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) { assert(task == (void *)1); return 8888; }
 int64_t esp_timer_get_time(void) { clock_us += 1000; return clock_us; }
-size_t heap_caps_get_free_size(unsigned caps) { assert(caps == 3); return 64000; }
-size_t heap_caps_get_largest_free_block(unsigned caps) { assert(caps == 3); return 32000; }
+size_t heap_caps_get_free_size(unsigned caps) { assert(caps == 3); return resource_trough ? 12000 : 64000; }
+size_t heap_caps_get_largest_free_block(unsigned caps) { assert(caps == 3); return resource_trough ? 5000 : 32000; }
 size_t heap_caps_get_minimum_free_size(unsigned caps) { assert(caps == 3); return 60000; }
 esp_err_t esp_littlefs_info(const char *partition, size_t *total, size_t *used)
 { assert(!strcmp(partition, "littlefs")); *total = 1024 * 1024; *used = 1024; return ESP_OK; }
@@ -61,12 +62,14 @@ static bool backend_begin(void) { assert(!maintenance); maintenance = true; retu
 static void backend_end(void) { assert(maintenance); maintenance = false; ++maintenance_ends; }
 static bool backend_ready(void) { return true; }
 static uint32_t backend_stack(void) { return 4444; }
+static uint32_t runner_stack(void) { return 2700; }
 static void ignored_job(void *arg) { (void)arg; abort(); }
 esp_err_t wifi_manager_trial(const char *ssid, const char *password, wifi_manager_trial_prepare_fn prepare,
                              void *context, wifi_manager_trial_result_t *out)
 {
     assert(!mutex_held && maintenance && !strcmp(ssid, "A3Bench") && !strcmp(password, "wrongpass"));
     ++manager_calls; memset(out, 0, sizeof *out);
+    resource_trough = true; sched_resource_sample(); resource_trough = false;
     assert(usb_service_wifi_busy());
     /* All three component ports use this same real composition predicate. */
     for (unsigned i = 0; i < 3; ++i) assert(!app_maint_submit_legacy(ignored_job, NULL));
@@ -118,7 +121,7 @@ int main(int argc, char **argv)
 {
     assert(argc == 2); case_name = argv[1];
     usb_service_config_t config = {.submit = app_maint_submit, .maintenance_begin = backend_begin,
-        .maintenance_end = backend_end, .boot_ready = backend_ready, .worker_stack = backend_stack};
+        .maintenance_end = backend_end, .boot_ready = backend_ready, .worker_stack = backend_stack, .runner_stack = runner_stack};
     assert(usb_service_init(&config) == ESP_OK);
     assert(s_boot_fingerprint_known);
     unsigned char expected[32];
