@@ -102,6 +102,38 @@ def channels(*versions: str | None) -> dict[str, dict]:
     }
 
 
+def collect_version_replies(replies: list[dict]) -> dict[str, dict]:
+    class Future:
+        def result(self):
+            return None
+
+    class Connection:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def publish(self, **kwargs):
+            query_id = json.loads(kwargs["payload"])["id"]
+            for reply in replies:
+                self.callback(
+                    STATUS_A,
+                    json.dumps({"type": "ambit_versions", "id": query_id, **reply}),
+                    False, 1, False,
+                )
+            return Future(), 1
+
+        def disconnect(self):
+            return Future()
+
+    fake_mqtt = types.SimpleNamespace(QoS=types.SimpleNamespace(AT_LEAST_ONCE=1))
+    with mock.patch.dict(sys.modules, {"awscrt": types.SimpleNamespace(mqtt=fake_mqtt)}):
+        reports, error = ambit_deploy.fleet_ambit_versions(
+            object(), [DEVICE_A], "test-query", 1,
+            connection_factory=lambda session, topic, callback, client_id: Connection(callback),
+        )
+    assert error is None, error
+    return reports
+
+
 class ReleaseValidationTest(unittest.TestCase):
     def test_anonymous_immutable_release_manifest_and_app_are_verified(self) -> None:
         release, manifest, manifest_bytes, image = release_fixture()
@@ -280,9 +312,10 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(decisions[cohort[2]]["skip_reason"], "unproven_ambit_version")
         self.assertEqual(decisions[cohort[3]]["skip_reason"], "no_preflight_reply")
         self.assertTrue(decisions[cohort[2]]["blocking"])
-        self.assertTrue(decisions[cohort[3]]["blocking"])
+        self.assertFalse(decisions[cohort[3]]["blocking"])
+        self.assertEqual(decisions[cohort[3]]["action"], "skipped_preflight")
 
-    def test_unconfirmed_absence_is_ambiguous_and_blocking(self) -> None:
+    def test_unconfirmed_absence_without_presence_is_skipped(self) -> None:
         reports = {
             DEVICE_A: {
                 "state": "ambiguous",
@@ -295,7 +328,8 @@ class PreflightTest(unittest.TestCase):
         )
         self.assertEqual(deploy, [])
         self.assertEqual(decisions[DEVICE_A]["skip_reason"], "ambiguous_preflight")
-        self.assertTrue(decisions[DEVICE_A]["blocking"])
+        self.assertFalse(decisions[DEVICE_A]["blocking"])
+        self.assertEqual(decisions[DEVICE_A]["action"], "skipped_preflight")
 
 
 class ColdWakePreflightTest(unittest.TestCase):
@@ -838,7 +872,7 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual(rendered["deployed_gateways"], [DEVICE_A])
 
-    def test_unconfirmed_cold_wake_absence_blocks_live_campaign(self) -> None:
+    def test_unconfirmed_cold_wake_absence_skips_and_all_skipped_fails(self) -> None:
         manifest, proof = verified_fixture()
         absent = {DEVICE_A: {"state": "complete", "channels": channels()}}
         with tempfile.TemporaryDirectory() as temporary:
@@ -877,11 +911,12 @@ class RunnerTest(unittest.TestCase):
             rendered = json.loads(path.read_text())
         self.assertEqual(code, 1)
         ota.assert_not_called()
-        self.assertIn("ambiguous or unproven", rendered["error"])
+        self.assertIn("all selected gateways were skipped_preflight", rendered["error"])
         self.assertEqual(
             rendered["gateway_decisions"][DEVICE_A]["skip_reason"],
             "ambiguous_preflight",
         )
+        self.assertEqual(set(rendered["skipped_preflight"]), {DEVICE_A})
 
     def test_zero_universe_and_zero_selected_cohort_fail_dry_and_live(self) -> None:
         manifest, proof = verified_fixture()
@@ -1047,6 +1082,231 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual(rendered["tracking_error"], "terminal reports dropped")
         self.assertIsNone(rendered["error"])
+
+
+class PreflightSkipRunnerTest(unittest.TestCase):
+    def run_case(self, first, retry, *, devices=None, dry_run=False, retry_error=None):
+        devices = devices or [DEVICE_A, DEVICE_B]
+        manifest, proof = verified_fixture()
+        after = {
+            device: {"state": "complete", "channels": channels(*(["1.2.3"] * 4))}
+            for device in devices
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "results.json"
+            summary_path = Path(temporary) / "summary.md"
+            with (
+                mock.patch.object(ambit_deploy, "fetch_release", return_value=(manifest, b"", proof)),
+                mock.patch.object(ambit_deploy.fleet, "boto_session", return_value=object()),
+                mock.patch.object(ambit_deploy.fleet, "fleet_ping", return_value=dict.fromkeys(devices, "2.6.1")),
+                mock.patch.object(ambit_deploy, "fleet_ambit_versions", side_effect=[(first, None), (retry, retry_error), (after, None)]) as versions,
+                mock.patch.object(ambit_deploy, "fleet_ambit_ota", return_value=({}, None)) as ota,
+                mock.patch.dict("os.environ", {"GITHUB_STEP_SUMMARY": str(summary_path)}),
+            ):
+                argv = ["--tag", TAG, "--devices", ",".join(devices), "--absent-retry-delay-seconds", "0", "--results-json", str(path)]
+                if dry_run:
+                    argv.append("--dry-run")
+                code = ambit_deploy.main(argv)
+            rendered = json.loads(path.read_text())
+            summary = summary_path.read_text()
+        return code, rendered, summary, ota, versions
+
+    def healthy(self, version="1.2.2"):
+        return {"state": "complete", "channels": channels(*([version] * 4))}
+
+    def test_mixed_skips_preserve_both_attempts_and_only_deploy_healthy(self):
+        absent = {"state": "complete", "channels": channels()}
+        busy = {"state": "busy", "channels": {}, "detail": "measurement busy"}
+        incomplete = {"state": "incomplete", "channels": {}, "detail": "partial"}
+        for first, second in (
+            (absent, absent), (absent, None), (None, None),
+            (busy, busy), (None, absent), (absent, busy),
+            (incomplete, incomplete),
+        ):
+            for dry_run in (False, True):
+                with self.subTest(first=first, second=second, dry_run=dry_run):
+                    initial = {DEVICE_A: self.healthy()}
+                    retry = {}
+                    if first is not None:
+                        initial[DEVICE_B] = first
+                    if second is not None:
+                        retry[DEVICE_B] = second
+                    code, plan, summary, ota, versions = self.run_case(initial, retry, dry_run=dry_run)
+                    self.assertEqual(code, 0)
+                    self.assertIsNone(plan["error"])
+                    self.assertEqual(plan["deployed_gateways"], [DEVICE_A])
+                    self.assertEqual(set(plan["skipped_preflight"]), {DEVICE_B})
+                    self.assertEqual(plan["gateway_decisions"][DEVICE_B]["action"], "skipped_preflight")
+                    evidence = plan["skipped_preflight"][DEVICE_B]
+                    self.assertEqual(evidence["inventory"], plan["preflight_versions"][DEVICE_B])
+                    self.assertEqual(evidence["reason"], "no_ambit_present" if first == second == absent else "ambiguous_preflight")
+                    for index, report in enumerate((first, second)):
+                        attempt = evidence["attempts"][index]
+                        self.assertEqual(attempt["attempt"], index + 1)
+                        self.assertEqual(attempt["state"], report["state"] if report else "no_reply")
+                        self.assertEqual(attempt["channels"], report["channels"] if report else {})
+                        self.assertIsNone(attempt["error"])
+                    self.assertEqual(plan["preflight_summary"]["reachable_gateways"], 1 + int(any(r and r["state"] in {"busy", "complete"} for r in (first, second))))
+                    self.assertIn(f"preflight reachable {plan['preflight_summary']['reachable_gateways']}", summary)
+                    general, skips = summary.split("### Skipped preflight gateways")
+                    self.assertNotIn(DEVICE_B, general)
+                    self.assertIn(DEVICE_B, skips)
+                    self.assertIn(evidence["reason"], skips)
+                    self.assertEqual(plan["live_failures"], [])
+                    self.assertNotIn(DEVICE_B, plan["results"])
+                    self.assertNotIn(DEVICE_B, plan["verification"])
+                    self.assertEqual(versions.call_args_list[1].args[1], [DEVICE_B])
+                    if dry_run:
+                        ota.assert_not_called()
+                        self.assertEqual(versions.call_count, 2)
+                    else:
+                        self.assertEqual(ota.call_args.args[1], [DEVICE_A])
+                        self.assertEqual(versions.call_args_list[2].args[1], [DEVICE_A])
+                        self.assertEqual(plan["verification"][DEVICE_A]["outcome"], "confirmed_success")
+
+    def test_all_preflight_skipped_fails_dry_and_live(self):
+        for report in (None, {"state": "complete", "channels": channels()}, {"state": "busy", "channels": {}}):
+            for dry_run in (False, True):
+                with self.subTest(report=report, dry_run=dry_run):
+                    reports = dict.fromkeys((DEVICE_A, DEVICE_B), report) if report else {}
+                    code, plan, summary, ota, versions = self.run_case(reports, reports, dry_run=dry_run)
+                    self.assertEqual(code, 1)
+                    ota.assert_not_called()
+                    self.assertEqual(versions.call_count, 2)
+                    self.assertEqual(set(plan["skipped_preflight"]), {DEVICE_A, DEVICE_B})
+                    self.assertEqual(plan["live_failures"], [])
+                    self.assertEqual(plan["results"], {})
+                    self.assertIn("all selected gateways were skipped_preflight", plan["error"])
+                    self.assertIn("a live run would fail closed", summary)
+
+    def test_presence_in_either_inconclusive_attempt_blocks_whole_cohort(self):
+        absent = {"state": "complete", "channels": channels()}
+        for first, second in (
+            ({"state": "complete", "channels": {**channels(), "0": {"present": True, "version": None}}}, absent),
+            ({"state": "complete", "channels": channels("1.2.2")}, None),
+            (absent, {"state": "complete", "channels": {**channels(), "0": {"present": True, "version": None}}}),
+            ({"state": "busy", "channels": channels("1.2.2")}, absent),
+            (absent, {"state": "busy", "channels": channels("1.2.2")}),
+            ({"state": "incomplete", "channels": channels("1.2.2")}, absent),
+            ({"state": "complete", "channels": channels("1.2.1")}, {"state": "complete", "channels": channels("1.2.2")}),
+        ):
+            for dry_run in (False, True):
+                with self.subTest(first=first, second=second, dry_run=dry_run):
+                    initial = {DEVICE_A: self.healthy(), DEVICE_B: first}
+                    retry = {DEVICE_B: second} if second else {}
+                    code, plan, summary, ota, _ = self.run_case(initial, retry, dry_run=dry_run)
+                    self.assertEqual(code, 1)
+                    ota.assert_not_called()
+                    self.assertTrue(plan["gateway_decisions"][DEVICE_B]["blocking"])
+                    self.assertEqual(plan["skipped_preflight"], {})
+                    self.assertIn(DEVICE_B, plan["blocking_preflight"])
+                    self.assertIn("ambiguous or unproven", plan["error"])
+                    self.assertNotIn("### Skipped preflight gateways", summary)
+
+    def test_non_null_unparseable_present_version_stays_blocking(self):
+        report = {"state": "complete", "channels": channels("garbage")}
+        decisions, deploy = ambit_deploy.decide_gateways([DEVICE_B], {DEVICE_B: report}, "1.2.3", False)
+        self.assertEqual(deploy, [])
+        self.assertEqual(decisions[DEVICE_B]["skip_reason"], "unproven_ambit_version")
+        self.assertTrue(decisions[DEVICE_B]["blocking"])
+        for dry_run in (False, True):
+            code, plan, _, ota, _ = self.run_case({DEVICE_A: self.healthy(), DEVICE_B: report}, {DEVICE_B: report}, dry_run=dry_run)
+            self.assertEqual(code, 1)
+            ota.assert_not_called()
+            self.assertEqual(plan["gateway_decisions"][DEVICE_B]["skip_reason"], "unproven_ambit_version")
+            self.assertNotIn(DEVICE_B, plan["skipped_preflight"])
+
+    def test_retry_transport_error_stays_fatal_and_visible(self):
+        for dry_run in (False, True):
+            for first in (None, {"state": "complete", "channels": channels()}):
+                with self.subTest(dry_run=dry_run, first=first):
+                    initial = {DEVICE_A: self.healthy()}
+                    if first:
+                        initial[DEVICE_B] = first
+                    code, plan, summary, ota, _ = self.run_case(initial, {}, dry_run=dry_run, retry_error="RuntimeError: token=secret-value transport down")
+                    self.assertEqual(code, 1)
+                    ota.assert_not_called()
+                    self.assertIn("transport down", plan["error"])
+                    self.assertIn("transport down", summary)
+                    self.assertIn("transport down", plan["skipped_preflight"][DEVICE_B]["attempts"][1]["error"])
+                    self.assertNotIn("secret-value", json.dumps(plan) + summary)
+
+    def test_policy_skip_beside_preflight_skip_is_successful_noop(self):
+        for version, reason in (("1.2.3", "all_ambits_up_to_date"), ("1.2.4", "newer_ambit_present")):
+            code, plan, summary, ota, _ = self.run_case({DEVICE_A: self.healthy(version)}, {})
+            self.assertEqual(code, 0)
+            self.assertIsNone(plan["error"])
+            ota.assert_not_called()
+            self.assertEqual(plan["deployed_gateways"], [])
+            self.assertEqual(plan["gateway_decisions"][DEVICE_A]["skip_reason"], reason)
+            self.assertEqual(set(plan["skipped_preflight"]), {DEVICE_B})
+            self.assertIn(reason, summary)
+
+    def test_three_gateway_mix_and_four_versions_only_on_retry(self):
+        device_c = "AMBYTE_12:34:56:78:9A:BC"
+        code, plan, _, ota, versions = self.run_case(
+            {DEVICE_A: self.healthy(), device_c: self.healthy("1.2.3")}, {},
+            devices=[DEVICE_A, DEVICE_B, device_c],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(ota.call_args.args[1], [DEVICE_A])
+        self.assertEqual(versions.call_args_list[1].args[1], [DEVICE_B])
+        self.assertEqual(set(plan["skipped_preflight"]), {DEVICE_B})
+        self.assertEqual(plan["gateway_decisions"][device_c]["skip_reason"], "all_ambits_up_to_date")
+        for dry_run in (False, True):
+            code, plan, _, ota, _ = self.run_case(
+                {}, {DEVICE_A: self.healthy()}, devices=[DEVICE_A], dry_run=dry_run,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(plan["skipped_preflight"], {})
+            self.assertEqual(plan["preflight_summary"]["reachable_gateways"], 1)
+            self.assertEqual(plan["deployed_gateways"], [DEVICE_A])
+            if dry_run:
+                ota.assert_not_called()
+            else:
+                self.assertEqual(ota.call_args.args[1], [DEVICE_A])
+
+    def test_invalid_correlated_inventory_blocks_either_attempt(self):
+        valid_channels = [{"ch": index, "present": index == 0, "version": "1.2.2" if index == 0 else None} for index in range(4)]
+        bad_channels = (
+            valid_channels[:3], valid_channels + [valid_channels[0]],
+            [{**valid_channels[0], "present": "true"}, *valid_channels[1:]],
+            [{**valid_channels[0], "version": 12}, *valid_channels[1:]],
+            [{**valid_channels[0], "ch": True}, *valid_channels[1:]],
+        )
+        for raw_channels in bad_channels:
+            collected = collect_version_replies([{"channels": raw_channels}])[DEVICE_A]
+            self.assertEqual(collected["state"], "invalid_reply")
+            for attempt in (1, 2):
+                for dry_run in (False, True):
+                    with self.subTest(raw=raw_channels, attempt=attempt, dry_run=dry_run):
+                        first = {DEVICE_A: self.healthy(), DEVICE_B: collected} if attempt == 1 else {DEVICE_A: self.healthy()}
+                        second = {} if attempt == 1 else {DEVICE_B: collected}
+                        code, plan, _, ota, _ = self.run_case(first, second, dry_run=dry_run)
+                        self.assertEqual(code, 1)
+                        ota.assert_not_called()
+                        self.assertEqual(plan["preflight_attempts"][attempt - 1]["reports"][DEVICE_B]["state"], "invalid_reply")
+                        self.assertNotIn(DEVICE_B, plan["skipped_preflight"])
+                        self.assertIn(DEVICE_B, plan["blocking_preflight"])
+
+    def test_invalid_reply_evidence_is_bounded_redacted_and_cannot_be_washed_away(self):
+        valid = {"channels": [{"ch": index, "present": False} for index in range(4)]}
+        for padding in ("x" * 50000, '\u2603"' * 10000, "\\\n" * 10000):
+            oversized = {"channels": [{"ch": 0, "present": True, "version": "token=sensitive-value " + padding}], "detail": "password=secret-value"}
+            for raw in ([oversized], [oversized, valid], [valid, oversized]):
+                with self.subTest(padding=padding[:10], reply_count=len(raw)):
+                    report = collect_version_replies(raw)[DEVICE_A]
+                    self.assertEqual(report["state"], "invalid_reply")
+                    code, plan, _, ota, _ = self.run_case({DEVICE_A: self.healthy(), DEVICE_B: report}, {DEVICE_B: self.healthy()})
+                    self.assertEqual(code, 1)
+                    ota.assert_not_called()
+                    evidence = plan["preflight_attempts"][0]["reports"][DEVICE_B]
+                    self.assertIn('"ch":0,"present":true', evidence["reply_prefix"])
+                    self.assertIn("token=<redacted>", evidence["reply_prefix"])
+                    self.assertLessEqual(len(json.dumps(evidence, indent=2).encode()), 2048)
+                    self.assertGreater(len(json.dumps(evidence).encode()), 1900)
+                    self.assertNotIn("sensitive-value", json.dumps(plan))
+                    self.assertNotIn("secret-value", json.dumps(plan))
 
 
 class MqttOperationTest(unittest.TestCase):

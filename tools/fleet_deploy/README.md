@@ -241,9 +241,15 @@ already-triggered SS/MPF run to finish before reading versions, so a scheduled
 measurement cannot masquerade as missing hardware. The runner additionally
 retries incomplete, busy, absent, or unversioned inventory after a bounded idle
 delay and reconciles compatible positive version evidence. Both correlated
-attempts are retained. Absence requires two complete observations; a missing,
-incomplete, unversioned, or conflicting retry becomes `ambiguous_preflight` and
-blocks the whole run instead of silently narrowing a live cohort.
+attempts are retained. A gateway with empty or ambiguous inventory after both
+attempts and no channel observed present is `skipped_preflight`; the rest of
+the cohort can proceed. Two complete empty observations retain the reason
+`no_ambit_present`; unresolved absence retains `ambiguous_preflight` and is
+not presented as proven absence. Positive presence in either attempt vetoes
+this skip: unresolved, unversioned, or conflicting inventory remains blocking
+for the whole cohort, including a channel seen in an incomplete/busy report.
+Invalid correlated replies also block, with bounded, redacted failure evidence.
+Transport errors remain fatal rather than becoming per-gateway skips.
 
 The execution unit is a gateway, not an individual sensor channel. Every
 eligible gateway receives exactly one command:
@@ -280,10 +286,20 @@ reported present-channel failure/absence. A forced same-version reflash cannot
 be proven by version effect, so it requires the complete successful terminal
 set. Otherwise the gateway is `indeterminate` and the live run fails.
 
-Empty universes/cohorts, any unresolved preflight ambiguity, live zero
+`results.json` lists `skipped_preflight` separately from blocking preflight and
+deployment failures, with the reason and self-contained state/channel evidence
+from both attempts for each skipped gateway. The job summary has a separate
+skipped-preflight table. Reachability counts actual valid correlated replies,
+not synthetic records for gateways that never replied.
+
+Empty universes/cohorts, an entirely preflight-skipped cohort, unresolved
+ambiguity with positive presence, invalid replies, transport errors, live zero
 reachable/zero present, post-OTA mismatches or missing verification, and every
 present-channel failure/timeout fail closed. These checks also make an empty
-dry-run cohort fail instead of presenting a misleading successful preview.
+or entirely preflight-skipped dry-run cohort fail instead of presenting a
+misleading successful preview. A mixed healthy/skipped dry run can succeed.
+Proven all-current or newer-version policy skips remain successful no-ops,
+including when the other gateways are preflight-skipped.
 Partial evidence survives publish, tracking, and verification errors.
 
 For a local exact-gateway preview:

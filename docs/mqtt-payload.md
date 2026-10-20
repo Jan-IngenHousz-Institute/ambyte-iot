@@ -17,9 +17,24 @@ and attached-device objects in §9 and §10. This document is normative for
 these persisted-event schemas: until the implementations land, the spec wins;
 after that, divergence is a bug in whichever side moved.
 
-**Status:** contract. Firmware on `main` still emits v2 (see §8 for the v2→v3
-mapping and the dual-read rule). The v2 spec is recoverable with
-`git show c713c52^:docs/mqtt-payload.md`.
+**Status:** contract. Ambyte firmware **v1.12.0** introduced canonical v3
+traces (§3), telemetry (§9), and attached-device inventory (§10), with v2 as
+the per-row fallback. Consumers must keep the dual-read rule (§8). The v2
+spec is recoverable with `git show c713c52^:docs/mqtt-payload.md`.
+
+| Released Ambyte firmware | Persisted objects emitted | Compiled gateway firmware version |
+| --- | --- | --- |
+| Through v1.0.5 | v2 only | No STATUS `app_version` field |
+| v1.1.0–v1.11.0 (including v1.11.0-recovery) | v2 only | v2 STATUS: `sample[0].metadata.app_version` |
+| v1.12.0–v1.12.1 | Canonical v3 trace, telemetry, and device inventory; per-row v2 fallback. Spectrum remains v2. | `ambyte.telemetry/1`: `sample[0].health.software.firmware`; legacy v2 STATUS backlog: `sample[0].metadata.app_version` |
+| v2.0.0 and later | Also canonical `ambit.spectrum/1` (§8a); later raw-spectrum support uses `ambit.spectrum/2` (§8b). Per-row v2 fallback remains. | Same telemetry field; legacy v2 STATUS backlog retains `metadata.app_version` |
+
+Leaf-temperature and generic `db/store-event` rows remain v2 on current
+firmware (§8), alongside legacy backlog and traces that cannot be represented
+as canonical v3. Software health belongs to telemetry/STATUS, so other rows
+need not contain a gateway firmware version. The outer `device_firmware` in
+both envelopes (§2) is the provisioning/configuration string, **not** the
+compiled app version. For older STATUS health stored in `data`, see §11.1.
 
 ## 1. Model: store, then publish (unchanged from v2)
 

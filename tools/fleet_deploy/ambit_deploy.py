@@ -56,6 +56,7 @@ APP_OFFSET = "0x10000"
 CHANNELS = tuple(range(4))
 OTA_CHANNEL_ALL = 255
 AMBIT_OTA_TERMINAL_STATES = {"success", "failed", "absent"}
+INVALID_REPLY_MAX_BYTES = 2048
 
 
 class ReleaseError(ValueError):
@@ -368,7 +369,7 @@ def _new_id(prefix: str, version: str) -> str:
 
 
 def _parse_versions_report(data: dict[str, Any]) -> dict[str, Any] | None:
-    if data.get("state") == "busy":
+    if data.get("state") == "busy" and "channels" not in data:
         return {"state": "busy", "detail": data.get("detail"), "channels": {}}
     raw_channels = data.get("channels")
     if not isinstance(raw_channels, list):
@@ -380,7 +381,12 @@ def _parse_versions_report(data: dict[str, Any]) -> dict[str, Any] | None:
             return None
         channel = entry.get("ch")
         present = entry.get("present")
-        if channel not in CHANNELS or channel in seen or not isinstance(present, bool):
+        if (
+            type(channel) is not int
+            or channel not in CHANNELS
+            or channel in seen
+            or not isinstance(present, bool)
+        ):
             return None
         seen.add(channel)
         version = entry.get("version")
@@ -389,7 +395,31 @@ def _parse_versions_report(data: dict[str, Any]) -> dict[str, Any] | None:
         channels[str(channel)] = {"present": present, "version": version}
     if seen != set(CHANNELS):
         return None
+    if data.get("state") == "busy":
+        return {"state": "busy", "detail": data.get("detail"), "channels": channels}
     return {"state": "complete", "channels": channels}
+
+
+def _invalid_versions_report(data: dict[str, Any]) -> dict[str, Any]:
+    report = {
+        "state": "invalid_reply",
+        "channels": {},
+        "detail": "invalid correlated ambit_versions channel inventory",
+        "reply_prefix": "",
+    }
+    inventory = json.dumps(_redact(data.get("channels")), separators=(",", ":"))
+    inventory = _redact_text(inventory)
+    low, high = 0, min(len(inventory), INVALID_REPLY_MAX_BYTES)
+    # JSON escaping can expand the snippet, so cap the serialized evidence.
+    while low < high:
+        middle = (low + high + 1) // 2
+        report["reply_prefix"] = inventory[:middle]
+        if len(json.dumps(report, indent=2).encode("utf-8")) <= INVALID_REPLY_MAX_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    report["reply_prefix"] = inventory[:low]
+    return report
 
 
 def fleet_ambit_versions(
@@ -400,7 +430,7 @@ def fleet_ambit_versions(
     *,
     connection_factory: Callable[..., Any] = fleet.mqtt_connection,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
-    """Publish correlated AMBIT inventory queries and retain one valid reply/device."""
+    """Publish correlated inventory queries and retain invalid replies as evidence."""
     from awscrt import mqtt
 
     payload = json.dumps(
@@ -426,12 +456,17 @@ def fleet_ambit_versions(
         device = fleet.requested_device_from_status_topic(
             topic, devices_by_identity
         )
-        if device is None or device in reports:
+        if device is None:
             return
         report = _parse_versions_report(data)
-        if report is not None:
-            reports[device] = report
-            print(f"  ambit_versions {device}  {report['state']}")
+        if report is None:
+            # Invalid inventory must not become apparent silence: that could
+            # hide a present channel when no-presence gateways are skipped.
+            report = _invalid_versions_report(data)
+        elif device in reports:
+            return
+        reports[device] = report
+        print(f"  ambit_versions {device}  {report['state']}")
 
     try:
         connection = connection_factory(
@@ -502,7 +537,8 @@ def retry_absent_preflight(
     has the same observable result. Retry every report that is not four proven
     versions, then merge only compatible positive evidence. Absence requires
     two matching observations; a missing retry or conflicting version remains
-    ambiguous and blocks live deployment.
+    ambiguous. Only ambiguity with no positive presence can be safely skipped;
+    an invalid reply always blocks deployment.
     """
 
     def proven_version(entry: dict[str, Any]) -> str | None:
@@ -547,6 +583,34 @@ def retry_absent_preflight(
     for device in retry_devices:
         initial = initial_reports.get(device)
         retry = retry_reports.get(device)
+        if any(
+            report and report.get("state") == "invalid_reply"
+            for report in (initial, retry)
+        ):
+            effective[device] = {
+                "state": "ambiguous",
+                "channels": {},
+                "invalid_reply": True,
+                "detail": "invalid correlated inventory in preflight",
+            }
+            continue
+        conflicts = [
+            channel
+            for channel in map(str, CHANNELS)
+            if (first := proven_version((initial or {}).get("channels", {}).get(channel, {})))
+            and (second := proven_version((retry or {}).get("channels", {}).get(channel, {})))
+            and first != second
+        ]
+        if conflicts:
+            effective[device] = {
+                "state": "ambiguous",
+                "channels": {
+                    channel: {"present": True, "version": None}
+                    for channel in conflicts
+                },
+                "detail": "conflicting versions on channels " + ",".join(conflicts),
+            }
+            continue
         if retry is None or retry.get("state") != "complete":
             effective[device] = {
                 "state": "ambiguous",
@@ -611,6 +675,7 @@ def retry_absent_preflight(
             effective[device] = {
                 "state": "ambiguous",
                 "channels": merged,
+                "unknown_version_channels": unknown,
                 "detail": "; ".join(detail_parts),
                 "initial_state": initial.get("state"),
                 "retry_state": retry.get("state"),
@@ -623,6 +688,17 @@ def retry_absent_preflight(
                 "preflight_source_attempt": 2,
                 "absence_confirmed_after_retry": not present,
             }
+    for device in retry_devices:
+        effective[device]["observed_present_channels"] = sorted(
+            {
+                channel
+                for report in (initial_reports.get(device), retry_reports.get(device))
+                if report
+                for channel, entry in report.get("channels", {}).items()
+                if entry.get("present")
+            },
+            key=int,
+        )
     return effective, {
         "attempt": 2,
         "id": retry_id,
@@ -655,27 +731,42 @@ def decide_gateways(
     deploy: list[str] = []
     for device in cohort:
         report = reports.get(device)
+        observed_present = bool(
+            report
+            and (
+                report.get("observed_present_channels")
+                or any(entry.get("present") for entry in report.get("channels", {}).values())
+            )
+        )
+        blocking = observed_present or bool(
+            report and (report.get("invalid_reply") or report.get("state") == "invalid_reply")
+        )
+        preflight_skip = {
+            "action": "skip" if blocking else "skipped_preflight",
+            "blocking": blocking,
+        }
         if report is None:
             decisions[device] = {
-                "action": "skip",
+                **preflight_skip,
                 "skip_reason": "no_preflight_reply",
-                "blocking": True,
             }
             continue
         if report.get("state") == "busy":
             decisions[device] = {
-                "action": "skip",
+                **preflight_skip,
                 "skip_reason": "preflight_busy",
                 "detail": report.get("detail"),
-                "blocking": True,
             }
             continue
         if report.get("state") != "complete":
             decisions[device] = {
-                "action": "skip",
-                "skip_reason": "ambiguous_preflight",
+                **preflight_skip,
+                "skip_reason": (
+                    "unproven_ambit_version"
+                    if report.get("unknown_version_channels")
+                    else "ambiguous_preflight"
+                ),
                 "detail": report.get("detail"),
-                "blocking": True,
             }
             continue
         present = {
@@ -684,7 +775,10 @@ def decide_gateways(
             if entry["present"]
         }
         if not present:
-            decisions[device] = {"action": "skip", "skip_reason": "no_ambit_present"}
+            decisions[device] = {
+                **preflight_skip,
+                "skip_reason": "ambiguous_preflight" if blocking else "no_ambit_present",
+            }
             continue
 
         current: list[str] = []
@@ -1319,7 +1413,29 @@ def main(argv: list[str] | None = None) -> int:
         if decision.get("blocking")
     )
 
-    reachable = len(reports)
+    skipped_preflight = {
+        device: {
+            "reason": decision["skip_reason"],
+            "inventory": reports.get(device),
+            "attempts": [
+                {
+                    "attempt": attempt["attempt"],
+                    **attempt["reports"].get(device, {"state": "no_reply", "channels": {}}),
+                    "error": attempt["error"],
+                }
+                for attempt in preflight_attempts
+                if device in attempt["devices"]
+            ],
+        }
+        for device, decision in decisions.items()
+        if decision["action"] == "skipped_preflight"
+    }
+    reachable = len({
+        device
+        for attempt in preflight_attempts
+        for device, report in attempt["reports"].items()
+        if report.get("state") in {"complete", "busy"}
+    })
     present_gateways = sum(
         1
         for report in reports.values()
@@ -1381,6 +1497,9 @@ def main(argv: list[str] | None = None) -> int:
             "present_channels": present_channels,
         },
         "gateway_decisions": decisions,
+        "skipped_preflight": skipped_preflight,
+        "blocking_preflight": blocking_preflight,
+        "live_failures": [],
         "deployed_gateways": to_deploy,
         "terminal_observation_seconds": args.final_seconds,
         "post_verify_wait_seconds": args.verify_seconds,
@@ -1390,7 +1509,7 @@ def main(argv: list[str] | None = None) -> int:
         "post_verify_error": None,
         "verification": {},
         "results": {},
-        "error": preflight_error,
+        "error": None,
     }
 
     exit_code = 0
@@ -1406,15 +1525,19 @@ def main(argv: list[str] | None = None) -> int:
             + ", ".join(blocking_preflight)
         )
         exit_code = 1
+    elif preflight_error:
+        plan["error"] = preflight_error
+        exit_code = 1
+    elif len(skipped_preflight) == len(cohort):
+        plan["error"] = (
+            "all selected gateways were skipped_preflight; a live run would fail closed"
+        )
+        exit_code = 1
     elif args.dry_run:
         print(
             "\nDRY RUN: ping and ambit_versions preflight commands were published; "
             "no ambit_ota command was published."
         )
-        if preflight_error:
-            exit_code = 1
-    elif preflight_error:
-        exit_code = 1
     elif reachable == 0:
         plan["error"] = "live deployment has zero preflight-reachable gateways"
         exit_code = 1
@@ -1519,12 +1642,17 @@ def main(argv: list[str] | None = None) -> int:
         f"- Universe {len(universe)} -> matching {len(selected['matching'])} -> "
         f"cohort {len(cohort)} -> preflight reachable {reachable} -> "
         f"present AMBIT channels {present_channels} -> deploying gateways {len(to_deploy)}",
+        f"- Preflight skipped: **{len(skipped_preflight)}**; "
+        f"blocking preflight: **{len(blocking_preflight)}**; "
+        f"deployment failures: **{len(plan['live_failures'])}**",
         "",
         "| gateway | Ambyte fw | decision | skip reason | AMBIT channels before "
         "| overall | verify-by-effect |",
         "|---|---|---|---|---|---|---|",
     ]
     for device in cohort:
+        if device in skipped_preflight:
+            continue
         decision = decisions[device]
         channels = reports.get(device, {}).get("channels", {})
         versions = ", ".join(
@@ -1539,6 +1667,28 @@ def main(argv: list[str] | None = None) -> int:
             f"{decision['action']} | {decision.get('skip_reason') or ''} | "
             f"{versions} | {overall} | {verified} |"
         )
+    if skipped_preflight:
+        summary.extend([
+            "",
+            "### Skipped preflight gateways",
+            "",
+            "| gateway | reason | observed attempts |",
+            "|---|---|---|",
+        ])
+        for device, skipped in skipped_preflight.items():
+            observations = []
+            for attempt in skipped["attempts"]:
+                inventory = ", ".join(
+                    f"{channel}:"
+                    f"{entry.get('version') or ('present/unknown' if entry['present'] else 'absent')}"
+                    for channel, entry in sorted(attempt.get("channels", {}).items())
+                )
+                observations.append(
+                    f"{attempt['attempt']}: {attempt['state']}"
+                    + (f" ({inventory})" if inventory else "")
+                    + (f" (error: {_redact_text(attempt['error'])})" if attempt["error"] else "")
+                )
+            summary.append(f"| {device} | {skipped['reason']} | {'; '.join(observations)} |")
     if plan["error"]:
         summary.extend(["", f"**Deployment error: {_redact_text(plan['error'])}**"])
     fleet.write_summary(summary_path, summary)
