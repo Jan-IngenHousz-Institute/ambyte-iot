@@ -8,6 +8,7 @@
 #include "nvs.h"
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/evp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,14 @@ static const char *path(const char *name, char out[1024])
     return out;
 }
 FILE *__real_fopen(const char *, const char *);
+int __real_open(const char *, int, ...);
+int __wrap_open(const char *name, int flags, ...)
+{
+    /* A2's heap-bounded digest now uses open/read rather than stdio. Keep
+     * exercising that production path against the same isolated littlefs. */
+    assert(flags == O_RDONLY);
+    char mapped[1024]; return __real_open(path(name, mapped), flags);
+}
 FILE *__wrap_fopen(const char *name, const char *mode)
 {
     char mapped[1024]; return __real_fopen(path(name, mapped), mode);

@@ -30,7 +30,7 @@ class ServiceInstallTest(unittest.TestCase):
                str(ROOT / "components/script_update/script_update.c"),
                *(str(p) for p in sorted((ROOT / "components/sched_spec").glob("*.c"))),
                str(ROOT / "components/time_sync/time_sync.c"),
-               *(f"-Wl,--wrap={name}" for name in ("fopen", "stat", "remove", "rename")),
+               *(f"-Wl,--wrap={name}" for name in ("open", "fopen", "stat", "remove", "rename")),
                "-lcrypto", "-lm", "-o", str(cls.binary)]
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode: raise RuntimeError(p.stdout + p.stderr)
