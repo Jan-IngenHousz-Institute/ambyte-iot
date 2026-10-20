@@ -14,6 +14,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 SCENARIOS = (
+    "service_trial_auth_restores",
+    "service_trial_timeout_restores",
+    "service_trial_stale_ip_restores",
+    "service_trial_intent_refusal_restores",
+    "service_trial_prepare_refusal_preserves",
+    "service_trial_owned_ip_saves",
     "classification",
     "delay_schedule",
     "boot_authfail_recovers",
