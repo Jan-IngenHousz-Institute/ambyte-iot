@@ -9,6 +9,105 @@ provisioning, sensors, firmware transfer, export, receipts and radio authorizati
 are outside this contract. The console and service each have version `1`;
 entering service does not change the plain commands described first.
 
+## Overview
+
+The USB port carries two layers. The plain console is what every image has
+had: a prompt, echo and human-readable replies. Service mode is a framed,
+machine-only layer that a client enters with `svc` and leaves with `svc.exit`
+or by idling for 60 seconds. A reset (which opening the port causes on most
+hosts) always lands in the plain console.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Console : boot, reset or port open
+    Console --> Service : "svc" (identity advertises the capability)
+    Service --> Console : "svc.exit" frame
+    Service --> Console : 60 s without input (session_timeout)
+    Service --> Console : reset, ROM output or panic
+    state Console {
+        [*] --> Prompt
+        Prompt --> Prompt : identity, cfg, reboot, schedule …
+    }
+    state Service {
+        [*] --> Ready : correlation-zero ready frame
+        Ready --> Bound : svc.bind <store>
+        Bound --> Bound : p (chunk), schedule.commit, svc.result, svc.wifi.*
+        Bound --> Ready : rx_overrun or store change invalidates the binding
+    }
+```
+
+A durable operation survives the connection that started it. The sequence
+below is the schedule install the GUI and the field app use, including the
+reconnect case that the bench reproduced (the cable pull resets the board, so
+the client rebinds, reads the result by id and resumes at the durable offset).
+
+```mermaid
+sequenceDiagram
+    participant C as Client (flash_gui or phone)
+    participant G as Ambyte
+    C->>G: identity
+    G-->>C: {"capabilities":[…,"svc"]}
+    C->>G: svc
+    G-->>C: 00000000 {"ok":true,"state":"ready"}
+    C->>G: svc.version / svc.bind <store>
+    G-->>C: actions, bounds / {"state":"bound"}
+    C->>G: schedule.begin <op> <size> <sha256> …
+    G-->>C: {"op":…,"state":"staging","offset":0}
+    loop one 144-byte chunk per request, stop-and-wait
+        C->>G: p <op> <offset> <crc32> <base64>
+        G-->>C: {"state":"staging","offset":next}
+    end
+    Note over C,G: cable pulled, board resets, client reopens
+    C->>G: svc, svc.bind <store>, svc.result <op>
+    G-->>C: {"state":"staging","offset":durable}
+    C->>G: p <op> <durable offset> …
+    C->>G: schedule.commit <op>
+    G-->>C: {"state":"committing"}
+    C->>G: svc.result <op>
+    G-->>C: {"state":"succeeded","applied":true}
+    C->>G: svc.exit, then identity / schedule release / schedule status
+    G-->>C: loaded sha256, workbook and release identity agree
+```
+
+Commit swaps the staged program in without a window in which a power loss
+loses the previous one. Boot repairs an interrupted swap.
+
+```mermaid
+flowchart TD
+    A[stage file complete, digest verified] --> B[fsync stage]
+    B --> C[rotate schedule.yaml to schedule.yaml.bak]
+    C --> D[rename stage to schedule.yaml]
+    D --> E[compile and activate, record succeeded]
+    C -. reset here .-> R
+    D -. reset here .-> R
+    R[boot: schedule.yaml missing, .bak present] --> S[restore .bak, run the prior program]
+    S --> T[result reads uncertain / interrupted]
+```
+
+A Wi-Fi join is a trial in RAM first. Credentials are saved only after the
+device owns an IP on the new network, and an interrupted trial reports what it
+can prove rather than guessing.
+
+```mermaid
+flowchart TD
+    J[svc.wifi.join] --> T[trial in RAM, previous config kept]
+    T -->|auth rejected or timeout| F[failed, saved:false, previous config restored]
+    T -->|GOT_IP owned by the trial| P[persist intent recorded in the result store]
+    P --> W[esp_wifi persists the credentials]
+    W --> OK[succeeded, saved:true, connected:true]
+    T -. reset before intent .-> I[interrupted, saved:false, old credentials in effect]
+    P -. reset after intent .-> Q[boot reconciles the stored config fingerprint: saved true, false or null]
+```
+
+Bench captures from the qualification rounds (see `tests/identity_host/bench.yaml`
+for the fixture; credentials are redacted):
+
+![console to service mode](images/usb-service/service-entry.png)
+
+![older image refuses the service contract](images/usb-service/older-image-refusal.png)
+
+![Wi-Fi trial with a wrong password](images/usb-service/wifi-trial.png)
+
 ## Connect and find a response
 
 Use USB-Serial/JTAG at 115200 baud. Deassert DTR and RTS **before opening** the
