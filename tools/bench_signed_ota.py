@@ -24,7 +24,7 @@ THING="ambyte_28:37:2F:FF:E7:04"
 ACCOUNT="084375565727"
 REGION="eu-central-1"
 CASES=("candidate","code-flip","manifest-flip","wrong-key","unsigned","incompatible","missing-manifest","missing-fallback")
-WORKFLOWS=("fleet-deploy.yml","fleet-command.yml")
+WORKFLOWS=("fleet-deploy.yml","fleet-deploy-schedule.yml","fleet-deploy-ambit.yml","fleet-command.yml")
 REPO="Jan-IngenHousz-Institute/ambyte-iot"
 
 
