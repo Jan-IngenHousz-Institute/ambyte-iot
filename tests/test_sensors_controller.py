@@ -1,5 +1,6 @@
 """Whole controller, trace, announcement tracker and NVS adapter against A3 bytes."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,7 @@ class SensorControllerTest(unittest.TestCase):
                       "-Wl,--wrap=gettimeofday", "-include", str(overlay),
                       *(f"-I{p}" for p in includes)]
             sources = [ROOT / "components/sensor_inventory/sensor_inventory.c",
+                       ROOT / "components/sensor_inventory/sensor_json.c",
                        ROOT / "components/ambit_announcement/ambit_announcement.c",
                        ROOT / "components/ambit_announcement_nvs/ambit_announcement_nvs.c",
                        ROOT / "components/payload_codec/payload_v3.c",
@@ -51,6 +53,22 @@ class SensorControllerTest(unittest.TestCase):
                                         str(trace), *(str(s) for s in sources), "-lm", "-o", str(binary)],
                                        capture_output=True, text=True)
                 self.assertEqual(build.returncode, 0, build.stderr)
+                if not reference:
+                    for fw_size, cal_size in ((48,139),(48,0),(47,140)):
+                        with self.subTest(fw_size=fw_size, cal_size=cal_size):
+                            fault = subprocess.run([binary,"legacy-short",str(fw_size),str(cal_size)],
+                                                   capture_output=True, timeout=30)
+                            self.assertEqual(fault.returncode,0,fault.stderr.decode())
+                            port = json.loads(fault.stdout)["ports"][0]
+                            for field in ("calibration", "calibration_digest", "spectral"):
+                                self.assertIsNone(port[field]["value"])
+                                self.assertIsNone(port[field]["source"])
+                            self.assertEqual(port["sensor_id"]["value"] is None,fw_size!=48)
+                    partial = subprocess.run([binary,"partial-trigger"],capture_output=True,timeout=30)
+                    self.assertEqual(partial.returncode,0,partial.stderr.decode())
+                    snapshot = json.loads(partial.stdout)
+                    self.assertEqual([p["state"] for p in snapshot["ports"][:2]],["busy","known"])
+                    self.assertEqual(snapshot["refresh"]["wire_transactions"],[0]*4)
                 run = subprocess.run([binary], capture_output=True, timeout=30)
                 self.assertEqual(run.returncode, 0, run.stderr.decode())
                 if not reference:

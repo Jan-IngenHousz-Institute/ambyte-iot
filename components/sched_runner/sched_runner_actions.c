@@ -241,8 +241,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         snprintf(opts.protocol_ref.tag, sizeof(opts.protocol_ref.tag), "%s", tag);
     }
 
-    const bool prior_cleanup = s_persist_attempted;
-    uint8_t unproven = 0;
     int pending_count = 0;
     int64_t t0[UART_SENSOR_NUM_CHANNELS] = { 0 };
     /* Per channel: one gateway carries AMBITs on different firmware (the
@@ -255,8 +253,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         if (sched_runner_should_stop()) break;
         if (!ch_present(ch)) continue;
         if (sched_runner_should_stop()) break; /* between ping and trigger */
-        s_persist_attempted = true; /* Lost ACK can hide a nonpersistent run too. */
-        unproven |= (uint8_t)(1u << ch);
+        if (opts.persist) s_persist_attempted = true;
         cmd_result_t r = ambit_trace_trigger(ch, segs, (size_t)nseg, &opts, &s_pend[ch]);
         if (r.status == ESP_OK) {
             t0[ch] = esp_timer_get_time() / 1000;
@@ -287,7 +284,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
             if (elapsed < est_ms[ch]) continue;
             uint8_t st = 0xFF;
             cmd_result_t pr = cmd_ambit_poll(ch, &st, TRACE_POLL_TIMEOUT_MS);
-            if (pr.status == ESP_OK && st <= AMBIT_ASYNC_ERROR) unproven &= (uint8_t)~(1u << ch);
             if (sched_runner_should_stop()) break; /* between poll and fetch */
             if (pr.status == ESP_OK && st == AMBIT_ASYNC_DONE) {
                 ambit_trace_result_t res;
@@ -300,7 +296,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                              (long long)res.measure_id, (long long)(elapsed / 1000),
                              (long long)(est_ms[ch] / 1000));
                     fetched++;
-                    unproven &= (uint8_t)~(1u << ch);
                 } else {
                     (void)act_fail(ctx, "ch%u fetch: %s", ch, fr.message);
                     chan_failed++;
@@ -308,7 +303,6 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
                 t0[ch] = 0;
                 pending_count--;
             } else if (pr.status == ESP_OK && st == AMBIT_ASYNC_ERROR) {
-                unproven &= (uint8_t)~(1u << ch);
                 (void)act_fail(ctx, "ch%u: ambit reported run error", ch);
                 t0[ch] = 0;
                 pending_count--;
@@ -327,11 +321,9 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         }
     }
 
-    /* A timed-out/lost-ACK leaf may still be running. Between jobs, recover
-     * using the existing shared-bank cleanup rather than declaring it idle by
-     * an inferred timeout. Stops retain the cleanup obligation until exit. */
-    if (!opts.persist && !prior_cleanup && !unproven) s_persist_attempted = false;
-    if (unproven && !sched_runner_should_stop()) sched_runner_cleanup_lights();
+    /* Preserve acquisition's existing recovery policy. A lost ACK or an
+     * unproven completion keeps its inventory busy bit: refresh must wait for
+     * a later definitive acquisition result or an existing reset owner. */
     if (hold_window) device_commands_measurement_end();
     sensor_inventory_veto_end();
 

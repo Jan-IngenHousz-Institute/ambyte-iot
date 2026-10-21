@@ -10,7 +10,10 @@
 
 static int64_t virtual_us;
 static unsigned events, setters, commits, failed_stores;
-static bool query_fail, fail_store;
+static bool query_fail, fail_store, fetch_success;
+static uint8_t query_fail_mask, poll_byte;
+static size_t fw_bytes = 48, cal_bytes = 140;
+static unsigned fw_queries, cal_queries;
 #ifndef A3_REFERENCE
 static unsigned refresh_reads;
 static bool fail_cal;
@@ -61,12 +64,19 @@ static esp_err_t store(const measurement_event_desc_t *d)
 static esp_err_t query(uint8_t ch,const uint8_t cmd[8],const uint8_t *extra,size_t extra_n,size_t expected,uart_sensor_response_t *r,uint32_t timeout)
 {
     (void)ch;(void)extra;(void)extra_n;(void)timeout;
-    if (query_fail) return ESP_ERR_TIMEOUT;
+    if (query_fail || (query_fail_mask & (1u << ch))) return ESP_ERR_TIMEOUT;
     if (cmd[0]==33) {
-        r->raw=malloc(expected); r->raw_len=expected;
-        memcpy(r->raw,cmd[1]==2 ? fw : cal,expected);
+        size_t n = cmd[1]==2 ? fw_bytes : cal_bytes;
+        if (cmd[1]==2) ++fw_queries; else ++cal_queries;
+        assert(n<=expected);r->raw=malloc(expected);r->raw_len=n;
+        memcpy(r->raw,cmd[1]==2 ? fw : cal,n);
+        if(cmd[1]==2 && n==48) r->raw[8]+=(uint8_t)ch;
+    } else if (cmd[0]==AMBIT_CMD_FETCH && fetch_success) {
+        r->array_count=1;r->arrays[0].index=1;r->arrays[0].length=2;
+        r->arrays[0].data=calloc(2,sizeof(uint32_t));
     } else if (expected != UART_QUERY_ACK_ONLY && expected) {
         r->raw=calloc(1,expected); r->raw_len=expected;
+        if(cmd[0]==AMBIT_CMD_STATUS) r->raw[0]=poll_byte;
     }
     return ESP_OK;
 }
@@ -110,8 +120,15 @@ static void trace(void)
         "arrun 1,0,2,0,3,0,1,0,0,1",&segment,1,&out)==ESP_OK);
     assert(out.points==3 && out.measure_id>0);
 }
-int main(void)
+#ifndef A3_REFERENCE
+static bool output_json(void *ctx,const void *p,size_t n)
+{ (void)ctx;return fwrite(p,1,n,stdout)==n; }
+static void snapshot_json(void)
+{ sensor_snapshot_t s;assert(sensor_inventory_snapshot(&s));assert(sensor_snapshot_json(&s,output_json,NULL));puts(""); }
+#endif
+int main(int argc, char **argv)
 {
+    (void)argc;(void)argv;
     fw[0]=1;fw[1]=4;fw[8]=2;fw[13]=7;fw[28]=3;
     strcpy((char *)cal,"Stable leaf"); float coef=1.25f; memcpy(cal+108,&coef,4);memcpy(cal+136,&coef,4);
     s_initialized=true; s_cfg.uart_query=query;s_cfg.store_event=store;s_cfg.next_id=next_id;
@@ -124,6 +141,39 @@ int main(void)
     assert(boot1.boot_id!=boot2.boot_id);
 #endif
     ambit_device_info_t info;
+#ifndef A3_REFERENCE
+    if(argc==4 && !strcmp(argv[1],"legacy-short")) {
+        fw_bytes=(size_t)strtoul(argv[2],NULL,10);cal_bytes=(size_t)strtoul(argv[3],NULL,10);
+        cmd_result_t result=cmd_ambit_device_info(0,&info);
+        assert(fw_bytes==48 ? result.status==ESP_OK : result.status!=ESP_OK);
+        sensor_snapshot_t observed;assert(sensor_inventory_snapshot(&observed));
+        assert(!observed.ports[0].have_cal && !observed.ports[0].have_spec);
+        assert(!observed.ports[0].identity.ambit_name[0] && observed.ports[0].identity.cal_version==0);
+        assert(!events && !setters && !commits && fw_queries==1);
+        assert(cal_queries==(fw_bytes==48 ? AMBIT_CAL_FETCH_TRIES : 0));
+        if(fw_bytes!=48) assert(!observed.ports[0].identity.valid && !observed.ports[0].generation);
+        snapshot_json();return 0;
+    }
+    if(argc==2 && !strcmp(argv[1],"partial-trigger")) {
+        for(unsigned ch=0;ch<2;++ch) {
+            assert(cmd_ambit_device_info(ch,&info).status==ESP_OK);
+            assert(cmd_ambit_set_gains(ch,1,2,3,4,5,6).status==ESP_OK);
+            assert(cmd_ambit_set_currents(ch,7,8,9).status==ESP_OK);
+        }
+        sensor_snapshot_t before,after;assert(sensor_inventory_snapshot(&before));
+        uint8_t arr[8]={2};query_fail_mask=1;
+        assert(cmd_ambit_trigger(0,arr,1,0,false,100).status==ESP_ERR_TIMEOUT);
+        assert(cmd_ambit_trigger(1,arr,1,0,false,100).status==ESP_OK);
+        fetch_success=true;uart_sensor_response_t response={0};
+        assert(cmd_ambit_fetch(1,&response,100).status==ESP_OK);uart_sensor_response_free(&response);
+        for(unsigned i=0;i<100;++i) sensor_inventory_refresh();
+        assert(sensor_inventory_snapshot(&after) && after.busy==1);
+        assert(!memcmp(before.ports,after.ports,sizeof before.ports));
+        assert(sensor_inventory_wait_ms()==UINT32_MAX);
+        assert(!memcmp(before.refresh.wire_transactions,after.refresh.wire_transactions,sizeof before.refresh.wire_transactions));
+        snapshot_json();return 0;
+    }
+#endif
     /* Failed initial store is retried, then persists only after the actual ack. */
 #ifndef A3_REFERENCE
     fail_store=true;
@@ -158,6 +208,19 @@ int main(void)
     assert(!memcmp(before.ports,after.ports,sizeof before.ports));
     assert(!memcmp(before.refresh.wire_transactions,after.refresh.wire_transactions,sizeof before.refresh.wire_transactions));
     assert(after.ports[0].identity.gains_set && after.ports[0].identity.currents_set);
+    /* A transport-successful garbage status is still unproven. It must not
+     * invalidate measurement provenance or clear the acquisition overlay. */
+    query_fail=false;
+    const uint8_t bad_states[]={3,255};
+    for(unsigned i=0;i<sizeof bad_states;++i) {
+        poll_byte=bad_states[i];
+        assert(cmd_ambit_poll(0,&state,100).status==ESP_OK && state==poll_byte);
+        for(unsigned j=0;j<100;++j) sensor_inventory_refresh();
+        assert(sensor_inventory_snapshot(&after) && after.busy==1);
+        assert(!memcmp(before.ports,after.ports,sizeof before.ports));
+        assert(!memcmp(before.refresh.wire_transactions,after.refresh.wire_transactions,sizeof before.refresh.wire_transactions));
+    }
+    poll_byte=AMBIT_ASYNC_IDLE;
     /* Conservative busy excludes refresh, but cannot deadlock an explicit
      * acquisition retry on that same port after a lost trigger ACK. */
     query_fail=false;
