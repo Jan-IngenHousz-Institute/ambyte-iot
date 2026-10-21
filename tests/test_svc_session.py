@@ -67,12 +67,23 @@ class ServiceSessionTest(unittest.TestCase):
         version = next(r for id, r in responses if id == 9)
         self.assertEqual(version["highest_id"], "0000000000000000")
 
-    def test_partial_timeout_drains_to_lf_then_recovers(self):
-        data = b"00000001 svc.\x1e" + frame(begin()) + frame("svc.version", 2) + frame("svc.exit", 3)
+    def test_partial_timeout_answers_the_first_complete_probe(self):
+        data = b"00000007 svc.vers\x1e" + frame("svc.version", 20) + frame("svc.exit", 21)
+        responses = self.call(data)
+        self.assertEqual([cid for cid, _ in responses], [0, 0, 20, 21])
+        self.assertEqual(responses[1][1]["reason"], "frame_timeout")
+        self.assertEqual(responses[2][1]["highest_id"], "0000000000000000")
+
+    def test_timeout_discards_old_prefix_and_rejects_delayed_tail(self):
+        request = frame(begin(), 8)
+        data = request[:25] + b"\x1e" + request[25:] + frame("svc.version", 20) + frame("svc.exit", 21)
         responses = self.call(data)
         self.assertEqual(responses[1][1]["reason"], "frame_timeout")
-        self.assertEqual(responses[2][0], 2)
-        self.assertEqual(responses[2][1]["highest_id"], "0000000000000000")
+        self.assertEqual(len(responses), 5)
+        self.assertFalse(responses[2][1]["ok"])
+        self.assertIn(responses[2][1]["reason"], ("bad_frame", "bad_crc"))
+        self.assertEqual(responses[3][0], 20)
+        self.assertEqual(responses[3][1]["highest_id"], "0000000000000000")
 
     def test_idle_exit_does_not_abort_durable_staging(self):
         responses = self.call(frame(f"svc.bind {STORE}") + frame(begin(), 2))

@@ -405,7 +405,7 @@ a response by removing a prompt or log prefix. CRLF is invalid in service.
 | Request | 248 bytes total, including LF; 144 raw bytes in a full `p` chunk |
 | Response | 1,024 JSON bytes, 1,043 wire bytes including LF |
 | Requests outstanding | One; stop-and-wait is required |
-| Partial line | 2 seconds from its first byte, then `frame_timeout` and drain |
+| Partial line | 2 seconds from its first byte, then `frame_timeout` and a fresh frame boundary. The first following complete frame is answered. A delayed old suffix must validate as a standalone line or gets a framing error; old prefix bytes never survive. |
 | Session idle | 60 seconds without input, then `session_timeout` and REPL exit |
 | USB response emission | At most 1 second; a failed write does not undo a stored result |
 | Client response wait | 5 seconds; timeout means unknown delivery/outcome |

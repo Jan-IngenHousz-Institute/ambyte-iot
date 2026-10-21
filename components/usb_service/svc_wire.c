@@ -126,8 +126,11 @@ void svc_rx_clear(svc_rx_t *rx)
 const char *svc_rx_timeout(svc_rx_t *rx, int64_t now_ms)
 {
     if (rx->length && now_ms - rx->started_ms >= 2000) {
+        /* Timeout is an explicit fresh-frame boundary. Keeping drain set
+         * would silently eat the client's next complete reconnect probe.
+         * No old byte survives; a late suffix must pass the full correlation,
+         * length and CRC checks as a standalone line or gets its own error. */
         svc_rx_clear(rx);
-        rx->draining = true;
         return "frame_timeout";
     }
     return NULL;
