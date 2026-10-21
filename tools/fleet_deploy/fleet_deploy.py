@@ -427,17 +427,24 @@ def fleet_ota(session, devices, campaign_id, url,
 # -- release asset ------------------------------------------------------------
 
 def verify_firmware_url(url):
-    """Fetch the first bytes and require the ESP32 app-image magic (0xE9).
-    Catches the classic /blob/-URL-serves-HTML failure before the fleet does."""
-    req = urllib.request.Request(url, headers={"Range": "bytes=0-15",
-                                               "User-Agent": "ambyte-fleet-deploy"})
+    """Authenticate the complete release before broadcasting an OTA command.
+
+    Unsigned fleet units cannot protect their own first install. A public
+    bench root here would permanently enroll them into an openly signable
+    trust chain, so transport checks the reviewed root as well as the header.
+    Bench negatives use the separate, dev-only, single-target helper.
+    """
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.check_release_signing import check_release, load_pin
+    from flash_gui.firmware_metadata import MAX_SIGNED_BYTES
+    pin = load_pin()
+    if not url.startswith("https://") or len(url) >= 2048:
+        raise RuntimeError("firmware delivery needs an HTTPS URL shorter than 2048 characters")
+    req = urllib.request.Request(url, headers={"User-Agent": "ambyte-fleet-deploy"})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        head = resp.read(16)
-    if not head or head[0] != 0xE9:
-        raise RuntimeError(
-            f"{url} does not serve an ESP32 app image (first byte "
-            f"{head[:1].hex() or 'none'}, expected e9); use the "
-            "releases/download/<tag>/firmware.bin asset link")
+        data = resp.read(MAX_SIGNED_BYTES)
+    check_release(data, pin)
 
 
 # -- reporting ----------------------------------------------------------------

@@ -36,8 +36,10 @@ git submodule update --init --recursive
 cp .env.example .env && $EDITOR .env          # Wi-Fi creds, MQTT URI, topic root, ...
 #   Drop your AWS IoT thing's PEM bundle into device_certs/<thing-name>/
 
-# 3. Build + flash (host-side NVS pre-pop happens automatically via tools/extra_script.py)
-pio run -e esp32-s3-devkitm-1 -t upload
+# 3. Build the unsigned signing intermediate (the upload guard refuses it)
+pio run -e esp32-s3-devkitm-1
+# Physical development bench only: explicitly sign with the PUBLIC bench key
+python3 tools/bench_flash.py --env esp32-s3-devkitm-1 --port /dev/ttyACM0
 pio device monitor -b 115200
 
 # 4. The firmware embeds schedule/default.yaml. To install another catalog
@@ -589,3 +591,5 @@ Apache-2.0 under its own SPDX header.
 The distributed `flash_gui` executables bundle [esptool](https://github.com/espressif/esptool)
 (GPL-2.0-or-later) and `certifi` (MPL-2.0), so the shipped binaries are covered
 by GPL-3.0 as a combined work.
+
+Signed firmware, the storage compatibility manifest, release key setup and unsigned-to-signed OTA bootstrap are documented in [Signed images](docs/signed-images.md). Field units use the reviewed release signing key; the committed public bench key is never a field root.

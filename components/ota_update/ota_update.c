@@ -1,4 +1,5 @@
 #include "ota_update.h"
+#include "ota_policy.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -283,7 +284,7 @@ static esp_err_t partition_sha256_matches(const esp_partition_t *part, size_t le
 
 static void ota_do_update(const ota_request_t *r)
 {
-    ESP_LOGW(TAG, "OTA requested id=%s url=%s", r->id, r->url);
+    ESP_LOGW(TAG, "OTA requested id=%s url_length=%u", r->id, (unsigned)strlen(r->url));
 
     /* Guard the #1 foot-gun: a github.com *browse* URL (/blob/ or /tree/) serves
      * an HTML page, not the binary — esp_https_ota downloads it and rejects it as
@@ -339,21 +340,8 @@ static void ota_do_update(const ota_request_t *r)
     esp_https_ota_handle_t h = NULL;
     const char *check_detail = NULL;   /* set when a job-path identity check refuses the image */
     char check_buf[128];
+    bool policy_refusal = false;
     esp_err_t err = esp_https_ota_begin(&cfg, &h);
-    if (err == ESP_OK && r->expected_version[0] != '\0') {
-        /* Reads just the image header: a wrong asset is refused before ~3 MB
-         * of download, not after. */
-        esp_app_desc_t incoming = {0};
-        err = esp_https_ota_get_img_desc(h, &incoming);
-        if (err == ESP_OK &&
-            strcmp(strip_v(incoming.version), strip_v(r->expected_version)) != 0) {
-            snprintf(check_buf, sizeof check_buf, "image is %.32s, job expects %.32s",
-                     incoming.version, r->expected_version);
-            check_detail = check_buf;
-            err = ESP_ERR_INVALID_VERSION;
-        }
-        if (err != ESP_OK) esp_https_ota_abort(h);
-    }
     if (err == ESP_OK) {
         do {
             err = esp_https_ota_perform(h);
@@ -361,6 +349,19 @@ static void ota_do_update(const ota_request_t *r)
         } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
         bool complete = (err == ESP_OK) && esp_https_ota_is_complete_data_received(h);
+        if (err == ESP_OK && complete && r->expected_version[0] != '\0') {
+            /* Validate the received descriptor before policy/boot selection. */
+            esp_app_desc_t incoming = {0};
+            err = esp_https_ota_get_img_desc(h, &incoming);
+            if (err == ESP_OK &&
+                strcmp(strip_v(incoming.version), strip_v(r->expected_version)) != 0) {
+                snprintf(check_buf, sizeof check_buf, "image is %.32s, job expects %.32s",
+                         incoming.version, r->expected_version);
+                check_detail = check_buf;
+                err = ESP_ERR_INVALID_VERSION;
+            }
+            if (err != ESP_OK) complete = false;
+        }
         if (err == ESP_OK && complete && r->sha256[0] != '\0') {
             /* Before finish(), which is what switches the boot partition: a
              * digest mismatch must leave the running image selected. */
@@ -377,6 +378,17 @@ static void ota_do_update(const ota_request_t *r)
                 check_detail = "could not read back the image to verify sha256";
             }
             if (err != ESP_OK) complete = false;
+        }
+        if (err == ESP_OK && complete) {
+            const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+            int received = esp_https_ota_get_image_len_read(h);
+            err = ota_image_admit(target, received > 0 ? (size_t)received : 0,
+                                  check_buf, sizeof check_buf);
+            if (err != ESP_OK) {
+                check_detail = check_buf;
+                policy_refusal = true;
+                complete = false;
+            }
         }
         if (err == ESP_OK && complete) {
             err = esp_https_ota_finish(h);   /* validates image + sets boot partition */
@@ -412,6 +424,18 @@ static void ota_do_update(const ota_request_t *r)
     }
     if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
     if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
+    /* Admission has aborted/cleaned the handle before this point. Diagnostic
+     * storage must never hold either resume hostage, and never changes legacy
+     * failure detail strings consumed by deployed tooling. */
+    if (!ota_refusal_save(r->id, r->expected_version[0] ? "jobs" : "https", detail)) {
+        ESP_LOGE(TAG, "refusal_persist_failed: %s", detail);
+        if (policy_refusal) {
+            char original[64];
+            snprintf(original, sizeof original, "%.63s", detail);
+            snprintf(check_buf, sizeof check_buf, "refusal_persist_failed: %s", original);
+            detail = check_buf;
+        }
+    }
     /* Match the confirm-path budget (300 s): a degraded link can take far longer
      * than 60 s to reconnect, and we'd otherwise drop the failure report. */
     if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) {

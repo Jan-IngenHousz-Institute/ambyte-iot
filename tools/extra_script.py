@@ -24,6 +24,19 @@ from pathlib import Path
 
 Import("env")  # noqa: F821 — provided by PlatformIO/SCons
 
+# Every environment inherits this hook, including the diagnostics variants.
+# Never flash a SIGNED_ON_UPDATE application without its own valid root block:
+# it would abort in UNDEFINED state after otadata was reset, with no rollback.
+sys.path.insert(0, str(Path(env["PROJECT_DIR"])))  # noqa: F821
+# SCons owns a top-level `tools` package; use a unique module name instead
+# of resolving our tools directory through that already-loaded namespace.
+import importlib.util
+_guard_spec = importlib.util.spec_from_file_location("ambyte_upload_guard", Path(env["PROJECT_DIR"]) / "tools/upload_guard.py")
+_guard_module = importlib.util.module_from_spec(_guard_spec)
+_guard_spec.loader.exec_module(_guard_module)
+before_upload = _guard_module.before_upload
+env.AddPreAction("upload", before_upload)  # noqa: F821
+
 NVS_OFFSET = "0x9000"  # must match partitions.csv
 
 PROJECT_DIR = Path(env["PROJECT_DIR"])  # noqa: F821

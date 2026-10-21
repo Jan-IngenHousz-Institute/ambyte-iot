@@ -135,17 +135,26 @@ jobs:
             done
           fi
 
-      - name: Publish firmware release
+      # Signing precedes BOTH publishers. Mixed firmware/schedule releases
+      # publish neither unit if the reviewed root/secret is not configured.
+      - name: Setup Python for firmware signing
         if: steps.preview.outputs.firmware-will-release == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx semantic-release
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
-      - name: Publish schedule release
-        if: steps.preview.outputs.schedule-will-release == 'true'
+      - name: Install signing dependency
+        if: steps.preview.outputs.firmware-will-release == 'true'
+        run: python -m pip install 'cryptography>=43,<51'
+
+      - name: Sign assets and publish affected release units
+        if: steps.preview.outputs.any-will-release == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cd schedule && ../node_modules/.bin/semantic-release
+          AMBYTE_FIRMWARE_SIGNING_KEY_PEM: ${{ secrets.AMBYTE_FIRMWARE_SIGNING_KEY_PEM }}
+          FIRMWARE_VERSION: ${{ steps.preview.outputs.firmware-version }}
+          SCHEDULE_WILL_RELEASE: ${{ steps.preview.outputs.schedule-will-release }}
+        run: python tools/publish_release_units.py --assets release-assets --firmware-version "$FIRMWARE_VERSION" --schedule-release "$SCHEDULE_WILL_RELEASE"
 
       - name: Release summary
         if: steps.preview.outputs.any-will-release == 'true'

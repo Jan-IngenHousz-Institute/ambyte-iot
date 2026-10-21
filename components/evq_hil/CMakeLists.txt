@@ -9,5 +9,5 @@ idf_component_register(
     SRCS ${evq_hil_srcs}
     INCLUDE_DIRS "include"
     REQUIRES event_log
-    PRIV_REQUIRES console device_commands sync_runner sd_card sd_logger app_update esp_timer mbedtls nvs_flash spi_flash esp_partition fatfs ambit_flash esp_http_client
+    PRIV_REQUIRES ota_policy console device_commands sync_runner sd_card sd_logger app_update esp_timer mbedtls nvs_flash spi_flash esp_partition fatfs ambit_flash esp_http_client
 )
