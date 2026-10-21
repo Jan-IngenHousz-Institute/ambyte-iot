@@ -23,6 +23,9 @@ extern "C" {
 esp_err_t uart_sensors_init(void);
 sensor_read_result_t uart_sensors_inspect(uint8_t ch, uint8_t type, void *out,
     size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t));
+/* Acquisition-owned completion proof; never a presence/inspection result. */
+sensor_recovery_result_t uart_sensors_recover(uint8_t ch, uint64_t epoch, bool poll, uint32_t timeout_ms,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t));
 
 /* ── AMBIT ROM-flash reset/boot control (host-driven C3 firmware update) ──
  * Force an AMBIT (ESP8685/ESP32-C3) into its ROM serial download mode over the

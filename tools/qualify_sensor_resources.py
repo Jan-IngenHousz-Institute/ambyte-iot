@@ -21,12 +21,13 @@ def main():
     if report["static_ram_delta_from_a3"] > 8192:
         raise ValueError("A4 static RAM delta exceeds F601")
     frames = report["target_function_frames"]
-    for component in ("CLI", "sensor_inventory"):
+    for component in ("CLI", "sensor_inventory", "uart_sensors"):
         for source in sorted((args.build / "components" / component).glob("*.su")):
             for line in source.read_text().splitlines():
                 location, size, kind = line.split("\t")
                 frames.append(dict(location=location, bytes=int(size), kind=kind))
-    for function in ("cli_cmd_sensors", "sensor_snapshot_json", "sensor_inventory_refresh"):
+    for function in ("cli_cmd_sensors", "sensor_snapshot_json", "sensor_inventory_refresh",
+                     "sensor_inventory_tick", "uart_sensors_recover"):
         if not any(row["location"].endswith(":" + function) for row in frames):
             raise ValueError(f"Missing target stack usage: {function}")
     report["runtime_admission_wait_bound_us"] = 1000000

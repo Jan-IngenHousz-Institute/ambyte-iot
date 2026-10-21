@@ -621,6 +621,12 @@ CONFIG_AMBYTE_MQTT_TOPIC_ROOT="ambyte"
 # end of Ambyte MQTT Client
 
 #
+# Sensor inventory qualification
+#
+# CONFIG_AMBYTE_SENSOR_RECOVERY_HIL is not set
+# end of Sensor inventory qualification
+
+#
 # Ambyte USB service benchmark
 #
 # CONFIG_AMBYTE_SVC_BENCH is not set

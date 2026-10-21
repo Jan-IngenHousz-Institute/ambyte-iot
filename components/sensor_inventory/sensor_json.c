@@ -133,7 +133,7 @@ bool sensor_snapshot_json(const sensor_snapshot_t *s, sensor_json_sink_t sink, v
         int64_t age = p->presence_stamp.valid ? s->captured_uptime_ms - p->presence_stamp.uptime_ms : -1;
         if (age < 0 && p->presence_stamp.valid) age = 0;
         const char *reason = !p->seen ? "never_observed" : p->revalidation_failed ? "revalidation_failed" : age > SENSOR_REFRESH_MS ? "age" : NULL;
-        const char *state = (s->busy & (1u << ch)) ? "busy" : p->seen && !p->present ? "absent" : e->valid ? "known" : "unknown";
+        const char *state = (s->stalled & (1u << ch)) ? "stalled" : (s->busy & (1u << ch)) ? "busy" : p->seen && !p->present ? "absent" : e->valid ? "known" : "unknown";
         if (ch) raw(&w, ",");
         number(&w, "{\"port\":%u,\"state\":\"%s\",\"generation\":%lu,\"stale\":%s,\"stale_reason\":",
             ch, state, (unsigned long)p->generation, reason ? "true" : "false");
@@ -157,7 +157,22 @@ bool sensor_snapshot_json(const sensor_snapshot_t *s, sensor_json_sink_t sink, v
         observation_end(&w, &p->spec_stamp, "last_read", p->have_spec);
         raw(&w, "}");
     }
-    raw(&w, "]}"); return w.ok;
+    raw(&w, "],\"acquisition_recovery\":{\"wire_transactions\":[");
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch) {
+        if (ch) raw(&w, ",");
+        number(&w, "%lu", (unsigned long)s->recovery_wire_transactions[ch]);
+    }
+    raw(&w, "],\"discarded_bytes\":[");
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch) {
+        if (ch) raw(&w, ",");
+        number(&w, "%lu", (unsigned long)s->recovery_discarded_bytes[ch]);
+    }
+    raw(&w, "],\"boot_idle\":[");
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch) {
+        if (ch) raw(&w, ",");
+        number(&w, "%lu", (unsigned long)s->recovery_boot_idle[ch]);
+    }
+    raw(&w, "]}}"); return w.ok;
 }
 typedef struct { unsigned char *out; size_t offset, capacity, count, used; } slice_t;
 static bool slice(void *context, const void *data, size_t size)

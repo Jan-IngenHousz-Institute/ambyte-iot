@@ -2906,12 +2906,12 @@ static bool inventory_announce(uint8_t ch, const ambit_device_info_t *e, const v
     ambit_calibration_t cal; memcpy(&cal, raw, sizeof cal);
     return ambit_emit_device_info(ch, e, &cal, true);
 }
-void device_commands_sensors_start(sensor_inspect_fn_t inspect, void (*wake)(void))
+void device_commands_sensors_start(sensor_inspect_fn_t inspect, sensor_recover_fn_t recover, void (*wake)(void))
 {
     const sensor_inventory_ports_t ports = {.now_us = inventory_now, .utc_ms = inventory_utc,
         .clock = inventory_clock, .lock = inventory_lock, .unlock = inventory_unlock,
         .yield_ms = inventory_yield, .wake = wake, .sample = inventory_sample,
-        .inspect = inspect, .announce = inventory_announce};
+        .inspect = inspect, .recover = recover, .announce = inventory_announce};
     uint64_t boot = (uint64_t)esp_random() << 32 | esp_random();
     while (!boot) boot = (uint64_t)esp_random() << 32 | esp_random();
     sensor_inventory_init(&ports, boot);
@@ -2920,9 +2920,9 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
 {
     /* Preserve the legacy lazy discovery path before an acquisition. The
      * bank veto prevents idle refresh from interleaving its three blocks. */
-    if (sensor_inventory_busy()) return ESP_ERR_INVALID_STATE;
+    if (sensor_inventory_blocked(ch)) return ESP_ERR_INVALID_STATE;
     sensor_inventory_veto_begin();
-    if (!sensor_inventory_legacy_read_begin()) { sensor_inventory_veto_end(); return ESP_ERR_INVALID_STATE; }
+    if (!sensor_inventory_legacy_read_begin(ch)) { sensor_inventory_veto_end(); return ESP_ERR_INVALID_STATE; }
     ambit_fw_info_t fw; size_t got = 0;
     cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW, (uint8_t *)&fw, sizeof fw, &got);
     esp_err_t result = r.status;
@@ -2957,6 +2957,23 @@ bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out)
 void cmd_ambit_device_info_invalidate(uint8_t ch)
 { sensor_inventory_invalidate(ch); }
 
+/* This delays acquisition-owned completion checks; it is not a proof that
+ * a faulty leaf has finished. Take the slower normal engine allowances and
+ * the trace runner's default 15s deadline margin. Arm after query return so
+ * UART/ACK waits can only postpone, never advance, a recovery exchange. */
+static uint32_t ambit_run_window_ms(const uint8_t *arr, uint8_t count)
+{
+    uint32_t ms = 15500u + 300u * count;
+    for (unsigned i = 0; i < count; ++i) {
+        const uint8_t *line = arr + i * 8u;
+        uint32_t pulses = (uint32_t)line[2] * 256u + line[3];
+        uint32_t freq = (uint32_t)line[4] * 256u + line[5];
+        if (!freq) freq = 1;
+        ms += (pulses * 1000u + freq - 1u) / freq;
+    }
+    return ms;
+}
+
 /* Cmd 21 — Run an array-mode measurement on the ADPD6100.
  * `run_arr` is a flat byte array of arr_len × 8 bytes. Each 8-byte line
  * encodes: line_type, ir_on, sample_num(H), sample_num(L), freq(H),
@@ -2976,17 +2993,19 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
     if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
         return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
     }
-    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
+    uint64_t epoch = sensor_inventory_acquire_run(ch);
+    if (!epoch) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN, arr_len, led_persist,
                        (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
     memset(response, 0, sizeof(*response));
     esp_err_t err = s_cfg.uart_query(ch, cmd, run_arr, (size_t)arr_len * 8,
                                      0, response, timeout_ms);
     if (err != ESP_OK) {
+        sensor_inventory_run_window(ch, epoch, ambit_run_window_ms(run_arr, arr_len));
         return make_result(err, "AMBIT%u run failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
-    sensor_inventory_complete(ch);
+    sensor_inventory_complete_epoch(ch, epoch);
     /* Frozen cmd 21 has no error byte after CMD_DONE. A triggered abort ends
      * with CMD_END and no arrays; transport success alone is not a measurement.
      * Keep the wire protocol intact while making this visible to every caller. */
@@ -3009,17 +3028,20 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
     if (!s_initialized || s_cfg.uart_query == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
-    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
+    uint64_t epoch = sensor_inventory_acquire_run(ch);
+    if (!epoch) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN_MPF,
                        (uint8_t)(length >> 7), (uint8_t)(length & 0x7F),
                        interval, (uint8_t)(change_act ? 1 : 0), act, 0, 0 };
     memset(response, 0, sizeof(*response));
     esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, 0, response, timeout_ms);
     if (err != ESP_OK) {
+        uint32_t period = (uint32_t)interval * 100u;
+        sensor_inventory_run_window(ch, epoch, 15500u + (uint32_t)length * (period > 100u ? period : 100u));
         return make_result(err, "AMBIT%u run_mpf failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
-    sensor_inventory_complete(ch);
+    sensor_inventory_complete_epoch(ch, epoch);
     return make_result(ESP_OK, "AMBIT%u mpf: %u arrays",
                        ch + 1, response->array_count);
 }
@@ -3044,7 +3066,8 @@ cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_l
     if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
         return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
     }
-    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
+    uint64_t epoch = sensor_inventory_acquire_run(ch);
+    if (!epoch) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN_START, arr_len, led_persist,
                        (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
     uart_sensor_response_t resp;
@@ -3052,6 +3075,7 @@ cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_l
     esp_err_t err = s_cfg.uart_query(ch, cmd, run_arr, (size_t)arr_len * 8,
                                      UART_QUERY_ACK_ONLY, &resp, timeout_ms);
     uart_sensor_response_free(&resp);
+    sensor_inventory_run_window(ch, epoch, ambit_run_window_ms(run_arr, arr_len));
     if (err != ESP_OK) {
         return make_result(err, "AMBIT%u trigger failed: %s", ch + 1, esp_err_to_name(err));
     }
@@ -3068,6 +3092,7 @@ cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms)
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
     if (state) *state = 0xFF;   /* unknown until the ambit answers */
+    uint64_t epoch = sensor_inventory_run_epoch(ch);
     uint8_t cmd[8] = { AMBIT_CMD_STATUS, 0, 0, 0, 0, 0, 0, 0 };
     uart_sensor_response_t resp;
     memset(&resp, 0, sizeof(resp));
@@ -3080,7 +3105,7 @@ cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms)
     }
     if (state) *state = resp.raw[0];
     uint8_t st = resp.raw[0];
-    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE || st == AMBIT_ASYNC_DONE) sensor_inventory_complete(ch);
+    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE || st == AMBIT_ASYNC_DONE) sensor_inventory_complete_epoch(ch, epoch);
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u state=%u", ch + 1, (unsigned)st);
 }
@@ -3094,6 +3119,7 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
     if (!s_initialized || s_cfg.uart_query == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
+    uint64_t epoch = sensor_inventory_run_epoch(ch);
     uint8_t cmd[8] = { AMBIT_CMD_FETCH, 0, 0, 0, 0, 0, 0, 0 };
     memset(response, 0, sizeof(*response));
     esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, 0, response, timeout_ms);
@@ -3103,7 +3129,7 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
     if (response->array_count == 0U) {
         return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u fetch: no retained result", ch + 1);
     }
-    sensor_inventory_complete(ch);
+    sensor_inventory_complete_epoch(ch, epoch);
     return make_result(ESP_OK, "AMBIT%u fetch: %u arrays", ch + 1, response->array_count);
 }
 

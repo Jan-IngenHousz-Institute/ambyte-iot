@@ -231,7 +231,9 @@ static void stream_lock_give(void *lock, void *ctx)
  * not spend that timeout once on the channel mutex and again on shared UART0.
  * The production helper recomputes remaining ticks before each take and rolls
  * the channel mutex back if the shared-bus take cannot finish in time. */
-static esp_err_t channel_acquire_until_state(uint8_t ch, int64_t deadline_us, uart_sensor_state_t *previous)
+static unsigned recovery_drain(uart_port_t port, uint8_t channel);
+static esp_err_t channel_acquire_until_state_mode(uint8_t ch, int64_t deadline_us,
+    uart_sensor_state_t *previous, bool recovery)
 {
     void *shared_lock = s_ch[ch].shared ? (void *)s_uart0_mtx : NULL;
     if (!uart_stream_acquire_until((void *)s_ch_mtx[ch], shared_lock,
@@ -241,16 +243,19 @@ static esp_err_t channel_acquire_until_state(uint8_t ch, int64_t deadline_us, ua
         return ESP_ERR_TIMEOUT;
     }
     if (s_ch[ch].shared) {
-        uart_flush_input(UART_NUM_0);
+        if (recovery) (void)recovery_drain(UART_NUM_0, ch);
+        else uart_flush_input(UART_NUM_0);
         uart_set_pin(UART_NUM_0, s_ch[ch].tx_pin, s_ch[ch].rx_pin,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-        ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
+        if (!recovery) ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
                  ch, s_ch[ch].tx_pin, s_ch[ch].rx_pin);
     }
     if (previous) *previous = s_ch[ch].state;
     s_ch[ch].state = UART_SENSOR_BUSY;
     return ESP_OK;
 }
+static esp_err_t channel_acquire_until_state(uint8_t ch, int64_t deadline_us, uart_sensor_state_t *previous)
+{ return channel_acquire_until_state_mode(ch, deadline_us, previous, false); }
 static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
 { return channel_acquire_until_state(ch, deadline_us, NULL); }
 
@@ -700,6 +705,103 @@ done:
     s_ch[channel].state = previous_state;
     channel_release(channel);
     return result;
+}
+
+static unsigned recovery_drain(uart_port_t port, uint8_t channel)
+{
+    unsigned count = 0;
+    uint8_t byte;
+    while (count < UART_RX_BUF_SIZE && uart_read_bytes(port, &byte, 1, 0) == 1) ++count;
+    uart_flush_input(port);
+    if (count) sensor_inventory_recovery_discard(channel, count);
+    return count;
+}
+
+static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
+    bool poll, bool prime, int64_t *opened, int64_t latest_tx,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t), bool *timing_refused)
+{
+    *opened = now_us();
+    const int64_t until = *opened + (prime ? SENSOR_RECOVERY_PRIME_MS : SENSOR_RECOVERY_WINDOW_MS) * 1000LL;
+    if (!current(channel, epoch)) return false;
+    if (latest_tx && now_us() > latest_tx) { *timing_refused = true; return false; }
+    const uint8_t wake[3] = {AMBIT_WAKE, AMBIT_WAKE, AMBIT_WAKE};
+    int sent = uart_write_bytes(port, wake, sizeof wake);
+    if (sent > 0) started(channel);
+    if (latest_tx && now_us() > latest_tx) { *timing_refused = true; return false; }
+    if (sent != sizeof wake) return false;
+    unsigned received = 0;
+    uint8_t first = 0;
+    bool clean = true;
+    while (!deadline_reached(until)) {
+        if (!current(channel, epoch)) return false;
+        uint32_t ticks = uart_stream_capped_deadline_ticks(now_us(), until, WAKE_READ_MS, portTICK_PERIOD_MS);
+        if (!ticks) break;
+        uint8_t byte;
+        if (uart_read_bytes(port, &byte, 1, (TickType_t)ticks) != 1) continue;
+        if (!current(channel, epoch)) { sensor_inventory_recovery_discard(channel, 1); return false; }
+        bool expected = prime ? (received == 0 ? byte == AMBIT_BOOT_IDLE || byte == AMBIT_ACK :
+                                     received == 1 && first == AMBIT_BOOT_IDLE && byte == AMBIT_ACK) :
+            received == 0 ? byte == AMBIT_ACK :
+            poll && received == 1 ? byte == AMBIT_CMD_DONE :
+            poll && received == 2 ? byte <= 2 :
+            poll && received == 3 ? byte == AMBIT_CMD_END : false;
+        if (!expected) sensor_inventory_recovery_discard(channel, 1);
+        if (prime && byte == AMBIT_BOOT_IDLE) sensor_inventory_recovery_boot_idle(channel);
+        clean &= expected;
+        if (!received) first = byte;
+        if (!received && expected && poll) {
+            const uint8_t cmd[8] = {23}, header = AMBIT_CMD_HEADER;
+            if (uart_write_bytes(port, &header, 1) != 1 || uart_write_bytes(port, cmd, sizeof cmd) != sizeof cmd) clean = false;
+        }
+        ++received;
+        /* Full windows reject extra80/trailingA1 even after a valid prefix. */
+    }
+    return clean && (prime ? received == 1 || received == 2 : received == (poll ? 4u : 1u)) && current(channel, epoch);
+}
+
+sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, bool poll, uint32_t timeout_ms,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t))
+{
+    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || !epoch || !current || !started ||
+        timeout_ms > SENSOR_BLOCK_MS) return SENSOR_RECOVERY_REFUSED;
+    const int64_t deadline = now_us() + timeout_ms * 1000LL;
+    uart_sensor_state_t previous;
+    if (channel_acquire_until_state_mode(channel, deadline, &previous, true) != ESP_OK) return SENSOR_RECOVERY_REFUSED;
+    uart_port_t port = s_ch[channel].uart_num;
+    sensor_recovery_result_t result = SENSOR_RECOVERY_REFUSED;
+    int64_t opened, first_opened;
+    bool timing_refused = false;
+    (void)recovery_drain(port, channel);
+    const int64_t needed = (SENSOR_RECOVERY_PRIME_MS + 2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL;
+    if (!current(channel, epoch) || deadline - now_us() < needed || now_us() < s_ping_fail_cache_not_before_us) goto done;
+    result = SENSOR_RECOVERY_FAILED;
+    /* Idle-loop light sleep eats the waking bytes and emits85. Prime wakes the
+     * router, but its exact {85,80,85+80} grammar NEVER releases ownership. */
+    if (!recovery_exchange(port,channel,epoch,false,true,&opened,0,current,started,&timing_refused)) goto done;
+    if (recovery_drain(port,channel)) goto done;
+    if (deadline - now_us() < (2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL) {
+        timing_refused=true;goto done;
+    }
+    if (!recovery_exchange(port,channel,epoch,false,false,&first_opened,0,current,started,&timing_refused)) goto done;
+    int64_t quiet_until = now_us() + SENSOR_RECOVERY_GAP_MS * 1000LL;
+    while (now_us() < quiet_until) {
+        if (!current(channel,epoch)) goto done;
+        uint32_t ticks = uart_stream_capped_deadline_ticks(now_us(),quiet_until,WAKE_READ_MS,portTICK_PERIOD_MS);
+        if (!ticks) break;
+        vTaskDelay((TickType_t)ticks);
+    }
+    if (recovery_drain(port,channel) || !current(channel,epoch)) goto done;
+    if (deadline - now_us() < SENSOR_RECOVERY_WINDOW_MS * 1000LL) { timing_refused=true;goto done; }
+    /* Before the leaf's500ms re-sleep threshold, even under scheduling jitter.
+     * The post-write check also rejects a task preempted at the TX boundary. */
+    if (recovery_exchange(port,channel,epoch,poll,false,&opened,first_opened+450000,
+            current,started,&timing_refused) && !deadline_reached(deadline) && current(channel,epoch))
+        result = SENSOR_RECOVERY_PROVEN;
+done:
+    (void)recovery_drain(port,channel);
+    s_ch[channel].state=previous;channel_release(channel);
+    return timing_refused ? SENSOR_RECOVERY_REFUSED : result;
 }
 
 static esp_err_t do_query(uint8_t channel,

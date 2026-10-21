@@ -427,8 +427,8 @@ static void app_maint_worker(void *arg)
             }
             job.run(job.arg);
         } else if (ulTaskNotifyTake(pdTRUE, ticks)) {
-            if (sensor_inventory_busy()) sensor_inventory_refresh();
-        } else if (app_service_boot_ready()) sensor_inventory_refresh();
+            if (sensor_inventory_busy()) sensor_inventory_tick();
+        } else if (app_service_boot_ready()) sensor_inventory_tick();
     }
 }
 
@@ -1546,7 +1546,8 @@ void app_main(void)
         .provenance_suppressed  = evlog_replay_covers,
     };
     device_commands_init(&cmd_cfg);
-    device_commands_sensors_start(uart_available ? uart_sensors_inspect : NULL, app_sensors_wake);
+    device_commands_sensors_start(uart_available ? uart_sensors_inspect : NULL,
+        uart_available ? uart_sensors_recover : NULL, app_sensors_wake);
     if (persistence_available) {
         /* SD restore rebuilds event_log's volatile claim window. Clear the peer
          * MQTT latch/queue through a registered callback rather than coupling

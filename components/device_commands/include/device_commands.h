@@ -341,7 +341,7 @@ void cmd_ambit_device_info_invalidate(uint8_t ch);
 /* Compose once after Wi-Fi hardware initialization supplies entropy; no
  * connection or network request is needed. Refresh itself uses the resident
  * maintenance worker, while every console read is cache-only. */
-void device_commands_sensors_start(sensor_inspect_fn_t inspect, void (*wake)(void));
+void device_commands_sensors_start(sensor_inspect_fn_t inspect, sensor_recover_fn_t recover, void (*wake)(void));
 
 /* Measurements (FSM response) */
 cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,

@@ -481,3 +481,11 @@ Diagnostics keeps its connection open for up to 10 s after startup to allow
 attachment observations, within the 45 s total deadline. If no idle window
 occurs, the panel explicitly says that observations have not yet been collected
 since this gateway boot. Unknown ports are never presented as absent.
+
+The Attached sensors diagnostics show **stalled — completion unproven** when
+three bounded acquisition-owned checks could not prove that a leaf finished.
+The last observations remain historical; stalled does not mean absent. Other
+ports can refresh after the expected run window. An explicit new acquisition,
+a definitive normal poll/fetch or existing bank reset clears/restarts this
+state; diagnostics do not reset a sensor. See the [maintenance protocol](../docs/usb-maintenance.md#refresh-exclusion-and-counters)
+for the two-exchange proof and separate acquisition-recovery wire counter.

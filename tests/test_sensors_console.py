@@ -35,7 +35,7 @@ class SensorsConsoleTest(unittest.TestCase):
                 p = subprocess.run([self.binary, case], capture_output=True, timeout=15)
                 self.assertEqual(p.returncode, 0, p.stderr.decode())
                 if case == "full":
-                    self.assertLessEqual(len(p.stdout), 12032)
+                    self.assertLessEqual(len(p.stdout), 12245)
                     self.assertEqual(len(p.stdout.splitlines()), 3)  # separator, JSON, extra CR
                     obj = json.loads(p.stdout.strip())
                     self.assertEqual(len(obj["ports"]), 4)

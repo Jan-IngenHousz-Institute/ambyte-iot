@@ -30,7 +30,7 @@ static bool host_announce(uint8_t ch, const ambit_device_info_t *info, const voi
 static sensor_read_result_t inspect(uint8_t ch, uint8_t type, void *out, size_t size,
     size_t *got, uint32_t timeout, void (*started)(uint8_t))
 {
-    assert(timeout <= 1000); assert(!sensor_inventory_busy());
+    assert(timeout <= 1000); assert(!sensor_inventory_blocked(ch));
     started(ch);
     if (type==4 && spec_failure==2 && attempts[ch][type])
         assert(idle_now_locked()-spec_last_idle[ch]>=SENSOR_SPEC_RETRY_MS);
@@ -48,6 +48,15 @@ static sensor_read_result_t inspect(uint8_t ch, uint8_t type, void *out, size_t 
         memcpy(out, type == 1 ? calibration[ch] : type == 2 ? firmware[ch] : spectral[ch], size); *got = size;
     }
     delay(1); return SENSOR_READ_OK;
+}
+static bool recovery_ok;
+static sensor_recovery_result_t recover(uint8_t ch,uint64_t epoch,bool poll,uint32_t timeout,
+    bool (*current)(uint8_t,uint64_t),void (*started)(uint8_t))
+{
+    (void)poll;assert(timeout==900 && current(ch,epoch));started(ch);delay(200);
+    if(!recovery_ok) return SENSOR_RECOVERY_FAILED;
+    delay(200);started(ch);delay(200);started(ch);delay(100);
+    return current(ch,epoch) ? SENSOR_RECOVERY_PROVEN : SENSOR_RECOVERY_FAILED;
 }
 static bool write_json(void *context, const void *p, size_t n)
 { (void)context; return fwrite(p, 1, n, stdout) == n; }
@@ -70,7 +79,7 @@ static void populate(void)
         for (unsigned i = 4; i <= 128; i += 4) put_f32(spectral[ch]+i, (float)ch + (float)i/4);
     }
     const sensor_inventory_ports_t ports = {.now_us = now, .utc_ms = utc, .clock = clock_source,
-        .lock = host_lock, .unlock = host_unlock, .yield_ms = delay, .inspect = inspect, .announce = host_announce};
+        .lock = host_lock, .unlock = host_unlock, .yield_ms = delay, .inspect = inspect, .recover = recover, .announce = host_announce};
     sensor_inventory_init(&ports, 0x123456789abcdefULL);
 }
 static void fill(void)
@@ -90,6 +99,25 @@ int main(int argc, char **argv)
 {
     assert(argc >= 2); populate();
     const char *scenario = argv[1];
+    if (!strcmp(scenario,"recovery") || !strcmp(scenario,"stalled")) {
+        fill(); sensor_port_snapshot_t original=cache.ports[0];
+        uint64_t epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,epoch,1000);
+        delay(999);sensor_inventory_tick();assert(!cache.recovery_wire_transactions[0]);
+        for(unsigned ch=0;ch<4;++ch) assert(!cache.refresh.wire_transactions[ch]);
+        delay(1);sensor_inventory_tick();assert(cache.busy==1 && cache.recovery_wire_transactions[0]==1);
+        assert(!memcmp(&original,&cache.ports[0],sizeof original));
+        delay(60000);
+        if(!strcmp(scenario,"recovery")) {
+            recovery_ok=true;sensor_inventory_tick();assert(!cache.busy && cache.recovery_wire_transactions[0]==4);
+        } else {
+            sensor_inventory_tick();delay(120000);sensor_inventory_tick();assert(cache.stalled==1 && cache.busy==1);
+            unsigned count=cache.recovery_wire_transactions[0];delay(1000000);
+            for(unsigned i=0;i<16;++i) {sensor_inventory_tick();delay(250);}
+            assert(cache.recovery_wire_transactions[0]==count && !cache.refresh.wire_transactions[0]);
+            assert(cache.refresh.wire_transactions[1]>0 && !memcmp(&original,&cache.ports[0],sizeof original));
+        }
+        output();return 0;
+    }
     if (!strcmp(scenario, "documentation")) {
         for(unsigned ch=0;ch<=2;ch+=2) {
             assert(sensor_inventory_accept(ch,2,firmware[ch],48));

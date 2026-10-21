@@ -9,6 +9,20 @@
 #include "freertos/task.h"
 
 typedef struct { unsigned char bytes[128]; size_t used; int64_t deadline; } output_t;
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+int cli_cmd_sensor_recovery_hil(int argc, char **argv)
+{
+    if (argc != 2 || !argv || !argv[1] || argv[1][0] < '0' || argv[1][0] > '3' || argv[1][1]) {
+        printf("Usage: sensors_recovery_hil <0-3>\r\n"); return 1;
+    }
+    unsigned ch = (unsigned)(argv[1][0] - '0');
+    sensor_recovery_result_t result = sensor_inventory_recovery_hil((uint8_t)ch);
+    printf("{\"port\":%u,\"recovery\":\"%s\",\"proof\":%s}\r\n", ch,
+        result == SENSOR_RECOVERY_PROVEN ? "proven" : result == SENSOR_RECOVERY_FAILED ? "failed" : "refused",
+        result == SENSOR_RECOVERY_PROVEN ? "true" : "false");
+    return result == SENSOR_RECOVERY_PROVEN ? 0 : 1;
+}
+#endif
 static bool flush(output_t *out)
 {
     while (out->used) {

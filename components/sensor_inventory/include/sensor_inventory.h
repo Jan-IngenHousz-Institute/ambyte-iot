@@ -3,6 +3,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
 
 #define SENSOR_PORTS 4u
 #define SENSOR_CAL_BYTES 140u
@@ -11,6 +14,10 @@
 #define SENSOR_REFRESH_MS 60000u
 #define SENSOR_SPEC_RETRY_MS 600000u
 #define SENSOR_BLOCK_MS 900u
+#define SENSOR_RECOVERY_WINDOW_MS 200u
+#define SENSOR_RECOVERY_GAP_MS 200u
+#define SENSOR_RECOVERY_PRIME_MS 100u
+#define SENSOR_RECOVERY_ATTEMPTS 3u
 
 /* This is the existing measurement-facing cache view. Snapshot observation
  * clocks and full blocks are deliberately outside measurement provenance. */
@@ -52,7 +59,10 @@ typedef struct {
 typedef struct {
     uint64_t boot_id;
     int64_t captured_uptime_ms;
-    uint8_t busy;
+    uint8_t busy, stalled;
+    uint32_t recovery_wire_transactions[SENSOR_PORTS];
+    uint32_t recovery_discarded_bytes[SENSOR_PORTS];
+    uint32_t recovery_boot_idle[SENSOR_PORTS];
     sensor_metrics_t refresh;
     sensor_port_snapshot_t ports[SENSOR_PORTS];
 } sensor_snapshot_t;
@@ -63,6 +73,9 @@ typedef enum {
 } sensor_read_result_t;
 typedef sensor_read_result_t (*sensor_inspect_fn_t)(uint8_t ch, uint8_t type, void *out,
     size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t));
+typedef enum { SENSOR_RECOVERY_FAILED, SENSOR_RECOVERY_PROVEN, SENSOR_RECOVERY_REFUSED } sensor_recovery_result_t;
+typedef sensor_recovery_result_t (*sensor_recover_fn_t)(uint8_t ch, uint64_t epoch, bool poll,
+    uint32_t timeout_ms, bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t));
 
 /* inspect(type 0 = wake/presence, 1/2/4 = cmd33 subtype) uses one absolute
  * deadline including mutex acquisition. It invokes started immediately before
@@ -75,6 +88,7 @@ typedef struct {
     void (*lock)(void), (*unlock)(void), (*yield_ms)(uint32_t);
     void (*wake)(void), (*sample)(void);
     sensor_inspect_fn_t inspect;
+    sensor_recover_fn_t recover;
     bool (*announce)(uint8_t ch, const ambit_device_info_t *, const void *cal);
 } sensor_inventory_ports_t;
 
@@ -84,6 +98,8 @@ void sensor_inventory_wake(void);
 /* UINT32_MAX means no safe work is due; ownership release wakes the worker. */
 uint32_t sensor_inventory_wait_ms(void);
 void sensor_inventory_refresh(void);
+/* Resident worker: acquisition recovery has its own wire origin and budgets. */
+void sensor_inventory_tick(void);
 bool sensor_inventory_snapshot(sensor_snapshot_t *out);
 bool sensor_inventory_cached(uint8_t ch, ambit_device_info_t *out);
 bool sensor_inventory_accept(uint8_t ch, uint8_t type, const void *bytes, size_t size);
@@ -92,20 +108,33 @@ void sensor_inventory_config(uint8_t ch, const uint8_t *gains, const uint8_t *cu
 void sensor_inventory_invalidate(uint8_t ch);
 void sensor_inventory_reset(void);
 /* These reservations exclude refresh, not acquisition's own poll/fetch. A
- * timeout after issuing a run keeps its busy bit until completion or reset. */
+ * timeout after issuing a run keeps its busy bit until a definitive result,
+ * epoch-fenced two-exchange recovery proof, or an existing reset owner. */
 bool sensor_inventory_acquire(uint8_t ch);
+uint64_t sensor_inventory_acquire_run(uint8_t ch);
+void sensor_inventory_run_window(uint8_t ch, uint64_t epoch, uint32_t expected_ms);
+uint64_t sensor_inventory_run_epoch(uint8_t ch);
+bool sensor_inventory_run_current(uint8_t ch, uint64_t epoch);
+void sensor_inventory_complete_epoch(uint8_t ch, uint64_t epoch);
+bool sensor_inventory_blocked(uint8_t ch);
 void sensor_inventory_complete(uint8_t ch);
 void sensor_inventory_veto_begin(void);
 /* Whole-job veto with acquisition-admission wait instrumentation. */
 void sensor_inventory_run_begin(void);
 void sensor_inventory_veto_end(void);
-bool sensor_inventory_legacy_read_begin(void);
+bool sensor_inventory_legacy_read_begin(uint8_t ch);
 void sensor_inventory_legacy_read_end(void);
 bool sensor_inventory_busy(void);
 bool sensor_inventory_refresh_owned(void);
 void sensor_inventory_note_stdout(uint32_t us);
 void sensor_inventory_note_pin(uint32_t allocated_bytes);
 void sensor_inventory_note_job_wait(uint32_t us);
+/* Bounded diagnostic discard log; never block on stdout inside a wire lease. */
+void sensor_inventory_recovery_discard(uint8_t ch, uint32_t bytes);
+void sensor_inventory_recovery_boot_idle(uint8_t ch);
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+sensor_recovery_result_t sensor_inventory_recovery_hil(uint8_t ch);
+#endif
 uint32_t sensor_inventory_crc32(const void *bytes, size_t size);
 
 typedef bool (*sensor_json_sink_t)(void *context, const void *bytes, size_t size);

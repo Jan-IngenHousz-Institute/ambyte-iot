@@ -121,6 +121,24 @@ class SensorClientTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             snapshot.ports[0].observations["calibration"].value["actinic_coef"] = 0
 
+    def test_stalled_snapshot_is_distinct_on_diagnostics_widget_seam(self):
+        raw = subprocess.check_output([self.binary, "stalled"])
+        console, serial = self.console(raw=raw)
+        snapshot = console.sensors()
+        self.assertEqual(snapshot.ports[0].state, "stalled")
+        self.assertGreater(snapshot.as_dict()["acquisition_recovery"]["wire_transactions"][0], 0)
+        model = sensor_diagnostics.SensorDiagnostics(snapshot, "observed")
+        app = object.__new__(gui.App)
+        app.sensor_message, app.sensor_tree, app.sensor_details = Mock(), Mock(), Mock()
+        app.sensor_tree.get_children.return_value = ()
+        app.sensor_tree.selection.return_value = ("0",)
+        app._apply_sensor_diagnostics(model)
+        rows = [call.kwargs["values"] for call in app.sensor_tree.insert.call_args_list]
+        self.assertEqual(len(rows), 4)
+        self.assertIn("stalled — completion unproven", rows[0][1])
+        self.assertNotIn("absent", rows[0][1])
+        self.assertIn('"state": "stalled"', sensor_diagnostics.diagnostic_details(model, 0))
+
     def test_no_sensors_token_and_real_250_capture_are_unavailable(self):
         console, port = self.console(identity=identity_bytes(False))
         self.assertIsNone(console.sensors())

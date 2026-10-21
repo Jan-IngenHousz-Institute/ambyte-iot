@@ -64,6 +64,14 @@ class SensorControllerTest(unittest.TestCase):
                                 self.assertIsNone(port[field]["value"])
                                 self.assertIsNone(port[field]["source"])
                             self.assertEqual(port["sensor_id"]["value"] is None,fw_size!=48)
+                    for scenario in ("recovery-jobs", "recovery-stalled"):
+                        with self.subTest(scenario=scenario):
+                            recovery = subprocess.run([binary, scenario], capture_output=True, timeout=30)
+                            self.assertEqual(recovery.returncode, 0, recovery.stderr.decode())
+                            model = json.loads(recovery.stdout)
+                            self.assertEqual(model["ports"][0]["state"], "stalled" if scenario.endswith("stalled") else "known")
+                            self.assertEqual(model["refresh"]["wire_transactions"][0], 0)
+                            self.assertGreater(model["acquisition_recovery"]["wire_transactions"][0], 0)
                     partial = subprocess.run([binary,"partial-trigger"],capture_output=True,timeout=30)
                     self.assertEqual(partial.returncode,0,partial.stderr.decode())
                     snapshot = json.loads(partial.stdout)

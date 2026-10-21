@@ -77,6 +77,7 @@ class SensorsSnapshot:
     captured_uptime_ms: int
     ports: tuple[SensorPort, ...]
     refresh: Mapping
+    acquisition_recovery: Mapping
     _raw: Mapping
 
     def as_dict(self):
@@ -124,7 +125,7 @@ def _calibration(value):
 
 def parse_sensors(obj) -> SensorsSnapshot:
     try:
-        _keys(obj, {"contract", "boot_id", "captured_uptime_ms", "refresh", "ports"})
+        _keys(obj, {"contract", "boot_id", "captured_uptime_ms", "refresh", "ports", "acquisition_recovery"})
         _require(type(obj["contract"]) is int and obj["contract"] == 1)
         _require(isinstance(obj["boot_id"], str) and re.fullmatch(r"[0-9a-f]{16}", obj["boot_id"]) and int(obj["boot_id"], 16) != 0)
         captured = obj["captured_uptime_ms"]
@@ -134,12 +135,16 @@ def parse_sensors(obj) -> SensorsSnapshot:
         _require(isinstance(obj["refresh"]["wire_transactions"], list) and len(obj["refresh"]["wire_transactions"]) == 4)
         _require(all(_integer(v, 0xffffffff) for k, v in obj["refresh"].items() if k != "wire_transactions"))
         _require(all(_integer(v, 0xffffffff) for v in obj["refresh"]["wire_transactions"]))
+        _keys(obj["acquisition_recovery"], {"wire_transactions", "discarded_bytes", "boot_idle"})
+        for recovery in obj["acquisition_recovery"].values():
+            _require(isinstance(recovery, list) and len(recovery) == 4 and
+                     all(_integer(v, 0xffffffff) for v in recovery))
         _require(isinstance(obj["ports"], list) and len(obj["ports"]) == 4)
         ports = []
         for index, port in enumerate(obj["ports"]):
             _keys(port, set(OBSERVATIONS) | {"port", "state", "generation", "stale", "stale_reason", "age_ms"})
             _require(type(port["port"]) is int and port["port"] == index)
-            _require(port["state"] in {"known", "unknown", "absent", "busy"} and _integer(port["generation"], 0xffffffff))
+            _require(port["state"] in {"known", "unknown", "absent", "busy", "stalled"} and _integer(port["generation"], 0xffffffff))
             _require(type(port["stale"]) is bool and port["stale_reason"] in {None, "never_observed", "age", "revalidation_failed"})
             _require(port["stale"] == (port["stale_reason"] is not None))
             _require(port["age_ms"] is None or _integer(port["age_ms"]))
@@ -180,7 +185,8 @@ def parse_sensors(obj) -> SensorsSnapshot:
                     _require(isinstance(spectral[k], list) and len(spectral[k]) == 10 and all(map(_number, spectral[k])))
                 _require(_number(spectral["par_slope"]) and _number(spectral["par_intercept"]))
             ports.append(SensorPort(index, *(port[k] for k in ("state", "generation", "stale", "stale_reason", "age_ms")), MappingProxyType(observations)))
-        return SensorsSnapshot(obj["boot_id"], captured, tuple(ports), _freeze(obj["refresh"]), _freeze(obj))
+        return SensorsSnapshot(obj["boot_id"], captured, tuple(ports), _freeze(obj["refresh"]),
+                               _freeze(obj["acquisition_recovery"]), _freeze(obj))
     except (TypeError, KeyError, UnicodeError, OverflowError) as exc:
         raise SensorsError("Invalid attached-sensor snapshot.") from exc
 

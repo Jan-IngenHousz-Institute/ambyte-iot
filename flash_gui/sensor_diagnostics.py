@@ -64,7 +64,8 @@ def diagnostic_rows(model: SensorDiagnostics):
             value = port.observations[name].value
             return "unavailable" if value is None else str(value)
         age = "unavailable" if port.age_ms is None else f"{port.age_ms / 1000:.1f} s"
-        state = port.state + (f" — stale ({port.stale_reason})" if port.stale else "")
+        state = ("stalled — completion unproven" if port.state == "stalled" else port.state)
+        state += (f" — stale ({port.stale_reason})" if port.stale else "")
         rows.append((port.port, state, observed("sensor_id"), observed("firmware"), observed("hw_rev"), port.generation, age))
     return tuple(rows)
 

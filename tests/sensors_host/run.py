@@ -9,6 +9,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_sensors import build, SCENARIOS
+from test_sensors_uart import build_uart
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -18,6 +19,8 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="sensor-matrix-") as tmp:
         binary = Path(tmp) / "sensor"
         build(binary)
+        uart = Path(tmp) / "uart"
+        build_uart(uart)
         for seed in map(int, args.seeds.split(",")):
             cases = list(SCENARIOS)
             random.Random(seed).shuffle(cases)
@@ -27,3 +30,9 @@ if __name__ == "__main__":
                     sys.stderr.buffer.write(result.stderr)
                     raise SystemExit(f"FAIL seed={seed} case={case}")
                 print(f"PASS seed={seed} case={case}")
+
+            result = subprocess.run([uart], capture_output=True, timeout=30)
+            if result.returncode:
+                sys.stderr.buffer.write(result.stderr)
+                raise SystemExit(f"FAIL seed={seed} case=uart-recovery-sleep")
+            print(f"PASS seed={seed} case=uart-recovery-sleep")

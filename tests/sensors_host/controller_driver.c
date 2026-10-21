@@ -91,6 +91,18 @@ static sensor_read_result_t inspect(uint8_t ch,uint8_t type,void *out,size_t n,s
     if (type) { memcpy(out,type==2 ? fw : cal,n); *got=n; }
     return SENSOR_READ_OK;
 }
+static bool recovery_proof;
+static unsigned recovery_reads;
+static sensor_recovery_result_t recover(uint8_t ch,uint64_t epoch,bool poll,uint32_t timeout,
+    bool (*current)(uint8_t,uint64_t),void (*started)(uint8_t))
+{
+    (void)poll;assert(timeout==900 && current(ch,epoch));
+    ++recovery_reads;started(ch);virtual_us+=200000;
+    if (!recovery_proof) return SENSOR_RECOVERY_FAILED;
+    virtual_us+=200000;started(ch);virtual_us+=200000;
+    started(ch);virtual_us+=100000;
+    return current(ch,epoch) ? SENSOR_RECOVERY_PROVEN : SENSOR_RECOVERY_FAILED;
+}
 static void revalidate(void)
 {
     unsigned before=refresh_reads;
@@ -135,13 +147,65 @@ int main(int argc, char **argv)
     s_ambit_announcement_mutex=xSemaphoreCreateMutex();
     ambit_announcement_init(&s_ambit_announcements,ambit_announcement_nvs_port());
 #ifndef A3_REFERENCE
-    device_commands_sensors_start(inspect,NULL);
+    device_commands_sensors_start(inspect,recover,NULL);
     sensor_snapshot_t boot1,boot2; assert(sensor_inventory_snapshot(&boot1));
-    device_commands_sensors_start(inspect,NULL);assert(sensor_inventory_snapshot(&boot2));
+    device_commands_sensors_start(inspect,recover,NULL);assert(sensor_inventory_snapshot(&boot2));
     assert(boot1.boot_id!=boot2.boot_id);
 #endif
     ambit_device_info_t info;
 #ifndef A3_REFERENCE
+    if(argc==2 && (!strcmp(argv[1],"recovery-jobs") || !strcmp(argv[1],"recovery-stalled"))) {
+        bool stalled=!strcmp(argv[1],"recovery-stalled");
+        assert(cmd_ambit_device_info(0,&info).status==ESP_OK);
+        assert(cmd_ambit_set_gains(0,1,2,3,4,5,6).status==ESP_OK);
+        assert(cmd_ambit_set_currents(0,7,8,9).status==ESP_OK);
+        sensor_snapshot_t original,snapshot;assert(sensor_inventory_snapshot(&original));
+        uint8_t arr[8]={2,0,0,3,0,2}; /* 3/2s, ceil + slow setup/segment */
+        const int64_t expected=17300;
+        query_fail_mask=1;
+        for(unsigned job=0;job<(stalled ? 1u : 2u);++job) {
+            unsigned before=recovery_reads, before_fw=fw_queries;
+            assert(cmd_ambit_trigger(0,arr,1,0,false,100).status==ESP_ERR_TIMEOUT);
+            uint64_t epoch=sensor_inventory_run_epoch(0);
+            assert(epoch>job && sensor_inventory_blocked(1));
+            virtual_us+=(expected-1)*1000;
+            for(unsigned i=0;i<100;++i) sensor_inventory_tick();
+            assert(recovery_reads==before && sensor_inventory_busy());
+            assert(cmd_ambit_device_info(1,&info).status!=ESP_OK && fw_queries==before_fw);
+            assert(sensor_inventory_snapshot(&snapshot));
+            assert(!snapshot.refresh.wire_transactions[0]);
+            virtual_us+=1000;recovery_proof=false;sensor_inventory_tick();
+            assert(recovery_reads==before+1 && sensor_inventory_busy());
+            assert(cmd_ambit_device_info(1,&info).status==ESP_OK && info.valid);
+            assert(sensor_inventory_snapshot(&snapshot) && !memcmp(&original.ports[0],&snapshot.ports[0],sizeof original.ports[0]));
+            if(stalled) {
+                virtual_us+=60000000;sensor_inventory_tick();
+                virtual_us+=120000000;sensor_inventory_tick();
+                assert(sensor_inventory_snapshot(&snapshot) && snapshot.stalled==1 && snapshot.busy==1);
+                sensor_inventory_invalidate(1);unsigned prior_fw=fw_queries;
+                assert(cmd_ambit_device_info(1,&info).status==ESP_OK && info.valid && fw_queries==prior_fw+1);
+                unsigned cap=recovery_reads;virtual_us+=1000000000;
+                for(unsigned i=0;i<20;++i) {sensor_inventory_tick();virtual_us+=250000;}
+                assert(sensor_inventory_snapshot(&snapshot) && recovery_reads==cap && snapshot.stalled==1);
+                assert(!snapshot.refresh.wire_transactions[0] && snapshot.refresh.wire_transactions[1]>0);
+                assert(snapshot.recovery_wire_transactions[0]==3);
+                assert(!memcmp(&original.ports[0],&snapshot.ports[0],sizeof original.ports[0]));
+                snapshot_json();return 0;
+            }
+            /* The old leaf really measures until just before this threshold.
+             * No proof traffic precedes it, and failed checks cannot expire it. */
+            virtual_us+=59999000;sensor_inventory_refresh();assert(recovery_reads==before+1 && sensor_inventory_busy());
+            virtual_us+=1000;recovery_proof=true;sensor_inventory_tick();
+            assert(recovery_reads==before+2 && !sensor_inventory_busy());
+            assert(sensor_inventory_snapshot(&snapshot) && !memcmp(&original.ports[0],&snapshot.ports[0],sizeof original.ports[0]));
+            assert(snapshot.recovery_wire_transactions[0]==4*(job+1));
+            /* Make ch1 uncached again without touching ch0's configuration. */
+            sensor_inventory_invalidate(1);
+
+        }
+        fprintf(stderr,"RECOVERY_CONTROLLER_OK jobs=2 no_time_release=1 other_port_identity=1\n");
+        snapshot_json();return 0;
+    }
     if(argc==4 && !strcmp(argv[1],"legacy-short")) {
         fw_bytes=(size_t)strtoul(argv[2],NULL,10);cal_bytes=(size_t)strtoul(argv[3],NULL,10);
         cmd_result_t result=cmd_ambit_device_info(0,&info);
@@ -169,7 +233,7 @@ int main(int argc, char **argv)
         for(unsigned i=0;i<100;++i) sensor_inventory_refresh();
         assert(sensor_inventory_snapshot(&after) && after.busy==1);
         assert(!memcmp(before.ports,after.ports,sizeof before.ports));
-        assert(sensor_inventory_wait_ms()==UINT32_MAX);
+        assert(sensor_inventory_wait_ms()==15800);
         assert(!memcmp(before.refresh.wire_transactions,after.refresh.wire_transactions,sizeof before.refresh.wire_transactions));
         snapshot_json();return 0;
     }

@@ -6,7 +6,7 @@
 
 static sensor_inventory_ports_t io;
 static sensor_snapshot_t cache;
-static bool initialized, refreshing, legacy_reading;
+static bool initialized, refreshing, recovering, recovery_transmitted, legacy_reading;
 static unsigned vetoes;
 static int64_t next_block_ms, idle_ms, idle_anchor_ms;
 static struct {
@@ -17,16 +17,34 @@ static struct {
     uint32_t announced_crc;
     char announced_id[18], announced_fw[16];
 } work[SENSOR_PORTS];
+static struct run_state {
+    uint64_t epoch;
+    int64_t window_end_ms, due_ms;
+    unsigned attempts;
+    uint32_t refusal_ms;
+} runs[SENSOR_PORTS];
 
 static void lock(void) { if (io.lock) io.lock(); }
 static void unlock(void) { if (io.unlock) io.unlock(); }
 static int64_t now_ms(void) { return io.now_us ? io.now_us() / 1000 : 0; }
+static int64_t bank_until_locked(void)
+{
+    int64_t until = 0;
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch)
+        if ((cache.busy & (1u << ch)) && runs[ch].window_end_ms > until)
+            until = runs[ch].window_end_ms;
+    return until;
+}
+static bool blocked_locked(uint8_t ch)
+{ return (cache.busy & (1u << ch)) || now_ms() < bank_until_locked(); }
 /* Retry/revalidation budgets accumulate only while the bank is available;
  * a ten-minute acquisition cannot consume ten minutes of inspection idle time. */
 static int64_t idle_now_locked(void)
 {
     int64_t real = now_ms();
-    if (!cache.busy && !vetoes && real > idle_anchor_ms) idle_ms += real - idle_anchor_ms;
+    int64_t anchor = bank_until_locked();
+    if (anchor < idle_anchor_ms) anchor = idle_anchor_ms;
+    if (!vetoes && real > anchor) idle_ms += real - anchor;
     idle_anchor_ms = real;
     return idle_ms;
 }
@@ -44,8 +62,9 @@ void sensor_inventory_init(const sensor_inventory_ports_t *ports, uint64_t boot_
     io = *ports;
     memset(&cache, 0, sizeof cache);
     memset(work, 0, sizeof work);
+    memset(runs, 0, sizeof runs);
     cache.boot_id = boot_id;
-    next_block_ms = 0; refreshing = false; legacy_reading = false; vetoes = 0;
+    next_block_ms = 0; refreshing = recovering = false; legacy_reading = false; vetoes = 0;
     idle_ms = 0; idle_anchor_ms = now_ms();
     initialized = boot_id != 0 && io.now_us && io.lock && io.unlock;
     sensor_inventory_wake();
@@ -88,7 +107,11 @@ void sensor_inventory_reset(void)
 {
     lock();
     for (uint8_t ch = 0; ch < SENSOR_PORTS; ++ch) invalidate_locked(ch);
-    (void)idle_now_locked(); cache.busy = 0;
+    (void)idle_now_locked(); cache.busy = cache.stalled = 0;
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch) {
+        if (runs[ch].epoch != UINT64_MAX) ++runs[ch].epoch;
+        runs[ch].due_ms = runs[ch].window_end_ms = INT64_MAX;
+    }
     /* The reset owner's veto remains held through application boot grace. */
     unlock(); sensor_inventory_wake();
 }
@@ -205,7 +228,7 @@ static bool reserve(bool acquisition, uint8_t ch, bool run_admission)
     int64_t started = io.now_us(); bool waited = false;
     for (;;) {
         lock();
-        if (!refreshing && !legacy_reading) {
+        if (!refreshing && !recovering && !legacy_reading) {
             /* Busy excludes inspection. An explicit subsequent acquisition
              * may retry that channel through its existing UART mutex after a
              * lost ACK; the observation guard must not deadlock recovery. */
@@ -217,19 +240,69 @@ static bool reserve(bool acquisition, uint8_t ch, bool run_admission)
             }
             unlock(); sensor_inventory_wake(); return true;
         }
-        waited |= refreshing;
+        waited |= refreshing || recovering;
         unlock();
         if (elapsed_us(started) >= 1000000u || !io.yield_ms) return false;
         io.yield_ms(1);
     }
 }
+uint64_t sensor_inventory_acquire_run(uint8_t ch)
+{
+    if (ch >= SENSOR_PORTS) return 0;
+    if (!initialized) return 1;
+    lock();
+    if (runs[ch].epoch == UINT64_MAX) { unlock(); return 0; }
+    struct run_state previous = runs[ch];
+    uint8_t busy = cache.busy & (1u << ch), stalled = cache.stalled & (1u << ch);
+    (void)idle_now_locked();
+    uint64_t epoch = ++runs[ch].epoch;
+    /* Fence an in-flight old response before waiting for its UART lease.
+     * The new run cannot send until that bounded lease has been released. */
+    runs[ch].due_ms = runs[ch].window_end_ms = INT64_MAX;
+    runs[ch].attempts = 0;
+    runs[ch].refusal_ms = 1000;
+    cache.busy |= (uint8_t)(1u << ch); cache.stalled &= (uint8_t)~(1u << ch);
+    unlock();
+    bool admitted = reserve(true, ch, true);
+    lock();
+    if (!admitted && runs[ch].epoch == epoch) {
+        runs[ch] = previous; runs[ch].epoch = epoch;
+        cache.busy = (cache.busy & (uint8_t)~(1u << ch)) | busy;
+        cache.stalled = (cache.stalled & (uint8_t)~(1u << ch)) | stalled;
+    }
+    bool current = runs[ch].epoch == epoch;
+    unlock(); sensor_inventory_wake();
+    return admitted && current ? epoch : 0;
+}
 bool sensor_inventory_acquire(uint8_t ch)
-{ return ch < SENSOR_PORTS && reserve(true, ch, true); }
-void sensor_inventory_complete(uint8_t ch)
+{ return sensor_inventory_acquire_run(ch) != 0; }
+uint64_t sensor_inventory_run_epoch(uint8_t ch)
+{ lock(); uint64_t epoch = ch < SENSOR_PORTS ? runs[ch].epoch : 0; unlock(); return epoch; }
+bool sensor_inventory_run_current(uint8_t ch, uint64_t epoch)
+{
+    lock(); bool ok = ch < SENSOR_PORTS && epoch && runs[ch].epoch == epoch && (cache.busy & (1u << ch));
+    unlock(); return ok;
+}
+void sensor_inventory_run_window(uint8_t ch, uint64_t epoch, uint32_t expected_ms)
+{
+    lock();
+    if (ch < SENSOR_PORTS && runs[ch].epoch == epoch && (cache.busy & (1u << ch)))
+        runs[ch].due_ms = runs[ch].window_end_ms = now_ms() + expected_ms;
+    unlock(); sensor_inventory_wake();
+}
+void sensor_inventory_complete_epoch(uint8_t ch, uint64_t epoch)
 {
     if (ch >= SENSOR_PORTS) return;
-    lock(); (void)idle_now_locked(); cache.busy &= (uint8_t)~(1u << ch); unlock(); sensor_inventory_wake();
+    lock();
+    if (runs[ch].epoch == epoch) {
+        (void)idle_now_locked();
+        cache.busy &= (uint8_t)~(1u << ch); cache.stalled &= (uint8_t)~(1u << ch);
+        runs[ch].due_ms = INT64_MAX;
+    }
+    unlock(); sensor_inventory_wake();
 }
+void sensor_inventory_complete(uint8_t ch)
+{ sensor_inventory_complete_epoch(ch, sensor_inventory_run_epoch(ch)); }
 void sensor_inventory_veto_begin(void)
 {
     /* Maintenance must wait for the one <=900ms refresh, never proceed with a
@@ -244,10 +317,10 @@ void sensor_inventory_run_begin(void)
 }
 void sensor_inventory_veto_end(void)
 { lock(); (void)idle_now_locked(); if (vetoes) --vetoes; unlock(); sensor_inventory_wake(); }
-bool sensor_inventory_legacy_read_begin(void)
+bool sensor_inventory_legacy_read_begin(uint8_t ch)
 {
     lock();
-    bool ok = !cache.busy && !refreshing && !legacy_reading;
+    bool ok = ch < SENSOR_PORTS && !blocked_locked(ch) && !refreshing && !recovering && !legacy_reading;
     if (ok) legacy_reading = true;
     unlock(); return ok;
 }
@@ -255,23 +328,35 @@ void sensor_inventory_legacy_read_end(void)
 { lock(); legacy_reading = false; unlock(); sensor_inventory_wake(); }
 bool sensor_inventory_busy(void)
 { lock(); bool busy = cache.busy != 0; unlock(); return busy; }
+bool sensor_inventory_blocked(uint8_t ch)
+{ lock(); bool busy = ch >= SENSOR_PORTS || blocked_locked(ch); unlock(); return busy; }
 bool sensor_inventory_refresh_owned(void)
-{ lock(); bool busy = refreshing; unlock(); return busy; }
+{ lock(); bool busy = refreshing || recovering; unlock(); return busy; }
 
 static int64_t due_locked(void)
 {
     int64_t due = INT64_MAX;
     for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch)
-        if (work[ch].due_ms < due) due = work[ch].due_ms;
+        if (!blocked_locked((uint8_t)ch) && work[ch].due_ms < due) due = work[ch].due_ms;
     return due < next_block_ms ? next_block_ms : due;
 }
 uint32_t sensor_inventory_wait_ms(void)
 {
-    if (!initialized || !io.inspect) return UINT32_MAX;
+    if (!initialized || (!io.inspect && !io.recover)) return UINT32_MAX;
     lock();
-    if (cache.busy || vetoes || refreshing || legacy_reading) { unlock(); return UINT32_MAX; }
-    int64_t d = due_locked() - idle_now_locked();
+    if (vetoes || refreshing || recovering || legacy_reading) { unlock(); return UINT32_MAX; }
+    int64_t idle = idle_now_locked(), real = now_ms(), d = INT64_MAX;
+    int64_t due = io.inspect ? due_locked() : INT64_MAX;
+    if (due != INT64_MAX) d = due - idle;
+    /* Wake once when the bank-wide window ends, even when no recovery
+     * adapter is present. Other ports then become eligible independently. */
+    int64_t bank = bank_until_locked();
+    if (bank > real && bank != INT64_MAX && bank - real < d) d = bank - real;
+    if (io.recover) for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch)
+        if ((cache.busy & (1u << ch)) && !(cache.stalled & (1u << ch)) &&
+            runs[ch].due_ms != INT64_MAX && runs[ch].due_ms - real < d) d = runs[ch].due_ms - real;
     unlock();
+    if (d == INT64_MAX) return UINT32_MAX;
     return d <= 0 ? 0 : d > SENSOR_REFRESH_MS ? SENSOR_REFRESH_MS : (uint32_t)d;
 }
 static void started(uint8_t ch)
@@ -290,15 +375,20 @@ void sensor_inventory_refresh(void)
 {
     if (!initialized || !io.inspect) return;
     lock();
-    if (cache.busy || vetoes || refreshing || legacy_reading) {
+    if (vetoes || refreshing || recovering || legacy_reading) {
         if (cache.busy) increment(&cache.refresh.deferred_acquisition);
         unlock(); return;
     }
     int64_t now = idle_now_locked();
-    if (now < due_locked()) { unlock(); return; }
-    unsigned ch = 0;
-    for (unsigned i = 1; i < SENSOR_PORTS; ++i)
-        if (work[i].due_ms < work[ch].due_ms) ch = i;
+    int64_t due = due_locked();
+    if (now < due) {
+        if (cache.busy && due == INT64_MAX) increment(&cache.refresh.deferred_acquisition);
+        unlock(); return;
+    }
+    unsigned ch = SENSOR_PORTS;
+    for (unsigned i = 0; i < SENSOR_PORTS; ++i)
+        if (!blocked_locked((uint8_t)i) && (ch == SENSOR_PORTS || work[i].due_ms < work[ch].due_ms)) ch = i;
+    if (ch == SENSOR_PORTS) { unlock(); return; }
     unsigned phase = work[ch].phase;
     uint8_t type = phase == 0 ? 0 : phase == 1 ? 2 : phase == 2 ? 1 : 4;
     uint32_t generation = cache.ports[ch].generation;
@@ -348,9 +438,119 @@ void sensor_inventory_refresh(void)
      * Refresh never blocks the resident worker behind an event-store fsync. */
     if (io.sample) io.sample();
 }
+static void recovery_started(uint8_t ch)
+{
+    lock();
+    if (recovering && ch < SENSOR_PORTS) {
+        recovery_transmitted = true;
+        increment(&cache.recovery_wire_transactions[ch]);
+    }
+    unlock();
+}
+static bool recovery_poll(const ambit_device_info_t *e)
+{
+    unsigned a = 0, b = 0, c = 0;
+    return e->valid && sscanf(e->fw_version, "%u.%u.%u", &a, &b, &c) == 3 &&
+        (a > 1 || (a == 1 && (b > 1 || (b == 1 && c >= 2))));
+}
+static sensor_recovery_result_t recover_locked(unsigned ch, bool publish)
+{
+    uint64_t epoch = runs[ch].epoch;
+    bool poll = recovery_poll(&cache.ports[ch].identity);
+    recovering = true;
+    recovery_transmitted = false;
+    unlock();
+    int64_t began = io.now_us();
+    if (io.sample) io.sample();
+    uint32_t sampling_us = elapsed_us(began);
+    sensor_recovery_result_t result = sampling_us >= SENSOR_BLOCK_MS * 1000u ? SENSOR_RECOVERY_REFUSED :
+        io.recover((uint8_t)ch, epoch, poll, (SENSOR_BLOCK_MS * 1000u - sampling_us) / 1000u,
+                   sensor_inventory_run_current, recovery_started);
+    if (elapsed_us(began) > SENSOR_BLOCK_MS * 1000u) result = SENSOR_RECOVERY_REFUSED;
+    lock();
+    if (publish && runs[ch].epoch == epoch && (cache.busy & (1u << ch))) {
+        if (!recovery_transmitted || result == SENSOR_RECOVERY_REFUSED) {
+            /* A refused lock/budget/grace is not a failed leaf exchange.
+             * Back off without consuming its bounded on-wire retry budget. */
+            runs[ch].due_ms = now_ms() + runs[ch].refusal_ms;
+            runs[ch].refusal_ms = runs[ch].refusal_ms < 30000 ? runs[ch].refusal_ms * 2u : 60000;
+        } else if (result == SENSOR_RECOVERY_PROVEN) {
+            (void)idle_now_locked();
+            cache.busy &= (uint8_t)~(1u << ch);
+            cache.stalled &= (uint8_t)~(1u << ch);
+            runs[ch].due_ms = INT64_MAX;
+        } else if (++runs[ch].attempts >= SENSOR_RECOVERY_ATTEMPTS) {
+            cache.stalled |= (uint8_t)(1u << ch);
+            runs[ch].due_ms = INT64_MAX;
+        } else {
+            runs[ch].due_ms = now_ms() + (int64_t)60000 * runs[ch].attempts;
+        }
+        if (recovery_transmitted && result != SENSOR_RECOVERY_REFUSED) runs[ch].refusal_ms = 1000;
+        if (runs[ch].due_ms < runs[ch].window_end_ms) runs[ch].due_ms = runs[ch].window_end_ms;
+    }
+    if (runs[ch].epoch != epoch) result = SENSOR_RECOVERY_REFUSED;
+    recovering = false;
+    unlock(); sensor_inventory_wake();
+    if (io.sample) io.sample();
+    return result;
+}
+void sensor_inventory_tick(void)
+{
+    if (!initialized) return;
+    lock();
+    unsigned ch = SENSOR_PORTS;
+    if (io.recover && !vetoes && !refreshing && !recovering && !legacy_reading) {
+        for (unsigned i = 0; i < SENSOR_PORTS; ++i)
+            if ((cache.busy & (1u << i)) && !(cache.stalled & (1u << i)) &&
+                runs[i].due_ms != INT64_MAX && now_ms() >= runs[i].due_ms &&
+                (ch == SENSOR_PORTS || runs[i].due_ms < runs[ch].due_ms)) ch = i;
+    }
+    if (ch == SENSOR_PORTS) { unlock(); sensor_inventory_refresh(); return; }
+    (void)recover_locked(ch, true);
+}
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+sensor_recovery_result_t sensor_inventory_recovery_hil(uint8_t ch)
+{
+    if (ch >= SENSOR_PORTS || !initialized || !io.recover) return SENSOR_RECOVERY_REFUSED;
+    /* Bench-only: deliberately exercise the SAME block on an idle or running
+     * leaf. The live-run case must fail without changing the acquisition.
+     * Ordinary release builds contain neither this entry point nor its CLI. */
+    sensor_inventory_veto_begin();
+    lock(); bool busy = cache.busy & (1u << ch); unlock();
+    uint64_t synthetic_epoch = 0;
+    if (!busy) {
+        uint64_t epoch = sensor_inventory_acquire_run(ch);
+        synthetic_epoch = epoch;
+        if (!epoch) { sensor_inventory_veto_end(); return SENSOR_RECOVERY_REFUSED; }
+        sensor_inventory_run_window(ch,epoch,0);
+    }
+    lock();
+    sensor_recovery_result_t result;
+    if (refreshing || recovering || legacy_reading) { unlock(); result=SENSOR_RECOVERY_REFUSED; }
+    else result=recover_locked(ch, false);
+    /* A synthetic idle test never becomes an orphan acquisition on a failed
+     * block. An existing real run is observe-only: no automatic retry budget,
+     * expected-window or busy-state mutation from a forced bench check. */
+    if (synthetic_epoch) sensor_inventory_complete_epoch(ch, synthetic_epoch);
+    sensor_inventory_veto_end();
+    return result;
+}
+#endif
+
 void sensor_inventory_note_stdout(uint32_t us)
 { lock(); maximum(&cache.refresh.stdout_hold_max_us, us); unlock(); }
 void sensor_inventory_note_pin(uint32_t allocated)
 { lock(); cache.refresh.pin_heap_bytes = allocated; maximum(&cache.refresh.pin_heap_peak_bytes, allocated); unlock(); }
 void sensor_inventory_note_job_wait(uint32_t us)
 { lock(); increment(&cache.refresh.job_start_waits); maximum(&cache.refresh.job_start_wait_max_us, us); unlock(); }
+void sensor_inventory_recovery_discard(uint8_t ch, uint32_t bytes)
+{
+    if (ch >= SENSOR_PORTS) return;
+    lock();
+    uint32_t *total = &cache.recovery_discarded_bytes[ch];
+    *total = bytes > UINT32_MAX - *total ? UINT32_MAX : *total + bytes;
+    unlock();
+}
+
+void sensor_inventory_recovery_boot_idle(uint8_t ch)
+{ if (ch < SENSOR_PORTS) { lock(); increment(&cache.recovery_boot_idle[ch]); unlock(); } }
