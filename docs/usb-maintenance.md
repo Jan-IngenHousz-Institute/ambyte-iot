@@ -114,6 +114,8 @@ for the fixture; credentials are redacted):
 
 ![Wi-Fi trial with a wrong password](images/usb-service/wifi-trial.png)
 
+![service recovery: column-0 notice, svc.active and binding](images/usb-service/service-recovery.png)
+
 ## Connect and find a response
 
 Use USB-Serial/JTAG at 115200 baud. Deassert DTR and RTS **before opening** the
