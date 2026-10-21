@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ("empty", "filled", "stale", "fresh_boundary", "absent", "swap",
              "busy", "veto", "reset", "reconnect", "spec_bare", "spec_silent",
              "stable", "old", "bad_values", "slice", "clocks", "zero_crc",
-             "exhaustion", "epoch", "bad_format", "cal_flap", "seeded", "version_gate")
+             "exhaustion", "epoch", "bad_format", "cal_flap", "seeded", "version_gate", "documentation")
 
 
 def build(binary):
@@ -59,6 +59,18 @@ class SensorsTest(unittest.TestCase):
         zero = self.run_case("zero_crc")[0]["ports"][0]
         self.assertEqual(zero["calibration_digest"]["value"]["hex"], "00000000")
         self.assertIsNotNone(zero["calibration"]["value"])
+
+    def test_documented_populated_example_is_production_serializer_output(self):
+        result = subprocess.run([self.binary,"documentation"],capture_output=True,check=True)
+        docs = (ROOT / "docs/usb-maintenance.md").read_text()
+        example = docs.split("<!-- sensors-populated-example:start -->",1)[1].split(
+            "<!-- sensors-populated-example:end -->",1)[0].split("```json\n",1)[1].split("\n```",1)[0]
+        self.assertEqual(example.encode(), result.stdout.strip())
+        ports = json.loads(example)["ports"]
+        self.assertEqual([p["state"] for p in ports],["known","absent","busy","unknown"])
+        self.assertIsNotNone(ports[0]["calibration"]["value"])
+        self.assertIsNotNone(ports[0]["spectral"]["value"])
+        self.assertEqual(ports[3]["stale_reason"],"never_observed")
 
     def test_exact_calibration_bytes_crc_and_endianness(self):
         snapshot = self.run_case("filled")[0]

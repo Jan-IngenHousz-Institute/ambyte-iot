@@ -476,3 +476,8 @@ is CERN-OHL-S-2.0 instead; the repo root README has the full split.
 The packaged executables bundle esptool (GPL-2.0-or-later), pyserial (BSD),
 tzlocal (MIT) and certifi (MPL-2.0), so the shipped bundle is GPL-3.0 as a
 combined work.
+
+Diagnostics keeps its connection open for up to 10 s after startup to allow
+attachment observations, within the 45 s total deadline. If no idle window
+occurs, the panel explicitly says that observations have not yet been collected
+since this gateway boot. Unknown ports are never presented as absent.

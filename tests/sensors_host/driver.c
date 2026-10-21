@@ -90,6 +90,15 @@ int main(int argc, char **argv)
 {
     assert(argc >= 2); populate();
     const char *scenario = argv[1];
+    if (!strcmp(scenario, "documentation")) {
+        for(unsigned ch=0;ch<=2;ch+=2) {
+            assert(sensor_inventory_accept(ch,2,firmware[ch],48));
+            assert(sensor_inventory_accept(ch,1,calibration[ch],140));
+            assert(sensor_inventory_accept(ch,4,spectral[ch],132));
+        }
+        absent[1]=true;work[1].due_ms=-1;step();
+        assert(sensor_inventory_acquire(2));output();return 0;
+    }
     if (!strcmp(scenario, "version_gate")) {
         const uint8_t versions[][3]={{0,0,0},{0,0,6},{1,1,2},{1,2,0},{1,3,1},{1,4,0}};
         for (unsigned v=0;v<6;++v) {

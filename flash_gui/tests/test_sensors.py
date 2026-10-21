@@ -209,6 +209,38 @@ class SensorClientTest(unittest.TestCase):
             client.sensors(timeout=.2)
         self.assertFalse(client.active)
 
+    def test_diagnostics_waits_on_same_connection_for_post_boot_observations(self):
+        cold = decode_sensors(subprocess.check_output([self.binary,"empty"]).strip())
+        partial = decode_sensors(subprocess.check_output([self.binary,"reconnect"]).splitlines()[-1])
+        ready = decode_sensors(self.raw)
+        scenarios = (((cold,ready),2,0,"Last observed"),
+                     ((cold,),20,0,"No attachments have been observed since this gateway boot"),
+                     ((partial,),20,0,"Some ports still lack identity or calibration observations"),
+                     ((cold,),2,44,"No attachments have been observed since this gateway boot"))
+        for transitions, expected_reads, boot_seconds, message in scenarios:
+            with self.subTest(message=message,boot_seconds=boot_seconds):
+                console, serial = self.console()
+                ticks = [0.0]
+                def sleep(seconds): ticks[0] += seconds
+                def connected(*args,**kwargs):
+                    ticks[0] += boot_seconds
+                    return console
+                reader = Mock(side_effect=list(transitions)) if len(transitions)>1 else Mock(return_value=transitions[0])
+                with patch.object(sensor_diagnostics,"connect_after_boot",side_effect=connected) as connect, \
+                     patch.object(console,"sensors",reader), \
+                     patch.object(sensor_diagnostics.time,"monotonic",side_effect=lambda: ticks[0]), \
+                     patch.object(sensor_diagnostics.time,"sleep",side_effect=sleep):
+                    model = sensor_diagnostics.read_sensor_diagnostics("bench",log=lambda _: None)
+                self.assertTrue(serial.closed)
+                self.assertEqual(connect.call_count,1)
+                self.assertEqual(reader.call_count,expected_reads)
+                self.assertLessEqual(ticks[0],min(boot_seconds+10,45))
+                self.assertIn(message,model.message)
+                if len(transitions)>1:
+                    self.assertIs(model.snapshot,ready)
+                else:
+                    self.assertIn("idle window",model.message)
+
     def test_diagnostics_failure_always_closes_serial(self):
         console, serial = self.console(raw=b"{malformed}")
         with patch.object(sensor_diagnostics, "connect_after_boot", return_value=console):
