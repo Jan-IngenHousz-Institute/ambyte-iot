@@ -12,9 +12,12 @@ def main():
     parser.add_argument("build", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    report = qualify(args.build)
+    report = qualify(args.build, static_ram_baseline=108212)
     report["sprint"] = "A4"
-    report["static_ram_delta_from_a3"] = report["static_ram"] - 108212
+    report["static_ram_baseline"] = 108212
+    report["static_ram_baseline_commit"] = "6a57c2ae155597a81dc1b0a010824c7e9336f0a7"
+    report["static_ram_delta"] = report["static_ram"] - report["static_ram_baseline"]
+    report["static_ram_delta_from_a3"] = report["static_ram_delta"]
     if report["static_ram_delta_from_a3"] > 8192:
         raise ValueError("A4 static RAM delta exceeds F601")
     frames = report["target_function_frames"]
