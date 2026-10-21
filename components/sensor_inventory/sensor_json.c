@@ -199,6 +199,11 @@ bool sensor_snapshot_json(const sensor_snapshot_t *s, sensor_json_sink_t sink, v
         if (ch) raw(&w, ",");
         number(&w, "%lu", (unsigned long)s->recovery_boot_idle[ch]);
     }
+    raw(&w, "],\"prime_notices\":[");
+    for (unsigned ch = 0; ch < SENSOR_PORTS; ++ch) {
+        if (ch) raw(&w, ",");
+        number(&w, "%lu", (unsigned long)s->recovery_prime_notices[ch]);
+    }
     raw(&w, "]}}"); return w.ok;
 }
 typedef struct { unsigned char *out; size_t offset, capacity, count, used; } slice_t;

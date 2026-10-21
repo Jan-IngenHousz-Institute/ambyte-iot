@@ -32,7 +32,7 @@ int cli_cmd_sensor_recovery_hil(int argc, char **argv)
         for(unsigned i=0;i<trace.count[phase] && i<UART_RECOVERY_HIL_BYTES;++i) printf("%02x",trace.bytes[phase][i]);
         printf("\"}");
     }
-    printf("]}\r\n");funlockfile(stdout);
+    printf("],\"prime_notices\":%lu}\r\n",(unsigned long)(have_trace ? trace.prime_notices : 0));funlockfile(stdout);
     return result == SENSOR_RECOVERY_PROVEN ? 0 : 1;
 }
 #endif

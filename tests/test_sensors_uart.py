@@ -30,6 +30,7 @@ class SensorsUartTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertIn(b"shared_bank_race=1", result.stdout)
             self.assertIn(b"RECOVERY_COLD_RX_OK pullups=4 captured_prime_prefixes_rejected=3", result.stdout)
+            self.assertIn(b"RECOVERY_R713_OK exact_cases=16 proof_failures=5", result.stdout)
             self.assertIn(b"RECOVERY_REGRESSION_OK late_refused=4 leaf_failure_budget=3 whole_job_veto=1", result.stdout)
 
 

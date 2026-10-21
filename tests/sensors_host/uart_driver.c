@@ -24,7 +24,11 @@ static int64_t contention_us;
 static bool absent, command_pending, race, checking_veto, run_veto_race, tx_failed;
 static _Atomic bool waiting;
 static pthread_t acquisition;
-static bool recovery_test, recovery_silent, recovery_second_silent, recovery_burst, recovery_bad_poll;
+static bool recovery_test, recovery_silent, recovery_first_silent, recovery_second_silent, recovery_burst, recovery_bad_poll;
+static const uint8_t *recovery_inject;
+static size_t recovery_inject_size;
+static unsigned recovery_inject_phase;
+static bool recovery_poll_notice;
 static unsigned recovery_wakes, recovery_phase, recovery_race_phase, recovery_prime_noise;
 static bool sleep_model, worst_jitter, jitter_done;
 static int64_t leaf_activity, leaf_sleep_ms=500, first_window_tx, gap_end;
@@ -100,7 +104,11 @@ int uart_write_bytes(uart_port_t port, const void *bytes, size_t size)
             recovery_phase=burst==0 ? 0 : burst==1 ? 1 : 3;
             if(recovery_phase==1) first_window_tx=clock_us;
             recovery_race_at(recovery_phase);
-            if (!recovery_silent && !(recovery_second_silent && recovery_phase == 3)) {
+            if (recovery_inject && recovery_phase == recovery_inject_phase) {
+                append_rx(recovery_inject,recovery_inject_size);return (int)size;
+            }
+            if (!recovery_silent && !(recovery_first_silent && recovery_phase == 1) &&
+                !(recovery_second_silent && recovery_phase == 3)) {
                 bool asleep=sleep_model && clock_us-leaf_activity>leaf_sleep_ms*1000;
                 /* Captured cold-leaf prefixes from diag9b_fresh.json. They
                  * must never be promoted to proof by a parser relaxation. */
@@ -120,7 +128,10 @@ int uart_write_bytes(uart_port_t port, const void *bytes, size_t size)
             command_pending = false; assert(p[0] == 23);
             if (!recovery_silent && !recovery_second_silent && !recovery_burst) {
                 const uint8_t answer[] = {0xa1, recovery_bad_poll ? 3 : 1, 0xf0};
-                append_rx(answer, sizeof answer);
+                if (recovery_poll_notice) {
+                    static const uint8_t text[]="\x85" "BAD COMMAND\r\n";
+                    append_rx(text,sizeof text-1);append_rx(answer,sizeof answer);
+                } else append_rx(answer, sizeof answer);
             }
         }
         return (int)size;
@@ -182,6 +193,57 @@ static void recovery_cases(void)
         assert(sensor_inventory_snapshot(&after));assert(!memcmp(before.ports,after.ports,sizeof before.ports));
         assert(after.recovery_wire_transactions[0]==3 && !after.refresh.wire_transactions[0]);
     }
+    /* R713: exact real cold-leaf notices, never a substitute for either
+     * proof. Include near-misses that the agreed exactness mutants accept. */
+    static const struct { const uint8_t *bytes; size_t size; bool valid; } notices[] = {
+#define NOTICE(text,validity) {(const uint8_t *)(text),sizeof(text)-1,(validity)}
+        NOTICE("\x85" "BAD COMMAND\r\n",true),
+        NOTICE("\x85" "BAD COMMAND\r\n" "\x80",true),
+        NOTICE("\x85" "OTHER TEXT\r\n",false),
+        NOTICE("BAD COMMAND\r\n",false),
+        NOTICE("\x85\x85" "BAD COMMAND\r\n",false),
+        NOTICE("\x85\x85\x85" "BAD COMMAND\r\n",false),
+        NOTICE("\x85" "BAD COMMAND\r\n" "\x80\x80",false),
+        NOTICE("\x85" "BAD COMMAN",false),
+        NOTICE("\x85" "BAD COMMAND\r",false),
+        NOTICE("\x85" "BAD COMNAND\r\n",false),
+        NOTICE("x\x85" "BAD COMMAND\r\n",false),
+        NOTICE("\x85" "BAD COMMAND\r\n" "\xa1",false),
+        NOTICE("\x85" "BAD COMMAND\r\n" "\x00",false),
+        NOTICE("\x80" "BAD COMMAND\r\n",false),
+        NOTICE("\x85\x80" "BAD COMMAND\r\n",false),
+        NOTICE("\x85" "BAD COMMAND\r\nBAD COMMAND\r\n",false)
+#undef NOTICE
+    };
+    for(unsigned n=0;n<sizeof notices/sizeof notices[0];++n) {
+        sensor_inventory_init(&ports,123);assert(sensor_inventory_accept(0,2,fw,48));
+        assert(sensor_inventory_accept(0,1,cal,140));sensor_inventory_config(0,gains,currents);
+        assert(sensor_inventory_snapshot(&before));
+        uint64_t epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,epoch,0);
+        recovery_inject=notices[n].bytes;recovery_inject_size=notices[n].size;recovery_inject_phase=0;
+        recovery_wakes=0;int64_t began=clock_us;sensor_inventory_tick();
+        assert(last_recovery_result==(notices[n].valid ? SENSOR_RECOVERY_PROVEN : SENSOR_RECOVERY_FAILED));
+        assert(sensor_inventory_busy()!=notices[n].valid && recovery_wakes==(notices[n].valid ? 3u : 1u));
+        assert(clock_us-began<=900000 && sensor_inventory_snapshot(&after));
+        assert(!memcmp(before.ports,after.ports,sizeof before.ports));
+        assert(after.recovery_wire_transactions[0]==recovery_wakes && !after.refresh.wire_transactions[0]);
+        assert(after.recovery_prime_notices[0]==(notices[n].valid ? 1u : 0u));
+        if (notices[n].valid) assert(after.recovery_discarded_bytes[0]==13);
+    }
+    /* Even a complete valid prime notice cannot prove completion when one
+     * fresh exchange is silent, or excuse that notice in a proof/cmd23. */
+    for(unsigned failure=0;failure<5;++failure) {
+        sensor_inventory_init(&ports,123);assert(sensor_inventory_accept(0,2,fw,48));
+        uint64_t epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,epoch,0);
+        recovery_inject=notices[failure>=2 ? 1 : 0].bytes;recovery_inject_size=notices[failure>=2 ? 1 : 0].size;
+        recovery_inject_phase=failure<2 ? 0 : failure==2 ? 1 : 3;
+        recovery_first_silent=failure==0;recovery_second_silent=failure==1;
+        recovery_poll_notice=failure==4;if(recovery_poll_notice) recovery_inject=NULL;
+        recovery_wakes=0;sensor_inventory_tick();
+        assert(last_recovery_result==SENSOR_RECOVERY_FAILED && sensor_inventory_busy());
+    }
+    recovery_inject=NULL;recovery_first_silent=recovery_second_silent=recovery_poll_notice=false;
+    puts("RECOVERY_R713_OK exact_cases=16 proof_failures=5");
     /* Real idle-loop500/1000ms sleep: prime85 consumes waking bytes,
      * then both proof exchanges complete at the worst admitted450ms boundary. */
     sleep_model=worst_jitter=true;jitter_done=false;gap_end=0;leaf_activity=clock_us-2000000;
@@ -345,6 +407,12 @@ static void recovery_cases(void)
     assert(trace.count[3]==1 && trace.bytes[3][0]==0x80);
     assert(trace.count[5]==4 && trace.bytes[5][0]==0x80 && trace.bytes[5][3]==0xf0);
     assert(!after.refresh.wire_transactions[0] && !memcmp(&before.ports[0],&after.ports[0],sizeof before.ports[0]));
+    recovery_inject=notices[1].bytes;recovery_inject_size=notices[1].size;recovery_inject_phase=0;
+    assert(sensor_inventory_recovery_hil(0)==SENSOR_RECOVERY_PROVEN && !sensor_inventory_busy());
+    assert(sensor_inventory_snapshot(&after) && after.recovery_prime_notices[0]==1 && after.recovery_discarded_bytes[0]==13);
+    assert(uart_sensors_recovery_hil_trace(&trace) && trace.prime_notices==1 && trace.count[1]==15);
+    assert(!memcmp(trace.bytes[1],notices[1].bytes,15));
+    recovery_inject=NULL;
     sleep_model=false;recovery_silent=true;
     assert(sensor_inventory_recovery_hil(0)==SENSOR_RECOVERY_FAILED && !sensor_inventory_busy());
     contention_us=800000;

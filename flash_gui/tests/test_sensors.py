@@ -139,6 +139,17 @@ class SensorClientTest(unittest.TestCase):
         self.assertNotIn("absent", rows[0][1])
         self.assertIn('"state": "stalled"', sensor_diagnostics.diagnostic_details(model, 0))
 
+    def test_prime_notice_counter_is_typed_and_retained(self):
+        obj=json.loads(self.raw)
+        self.assertEqual(obj["acquisition_recovery"]["prime_notices"],[0]*4)
+        obj["acquisition_recovery"]["prime_notices"]=[1,2,3,0xffffffff]
+        self.assertEqual(decode_sensors(json.dumps(obj).encode()).acquisition_recovery["prime_notices"],
+                         (1,2,3,0xffffffff))
+        for bad in ([1,2,3], [True,0,0,0], [-1,0,0,0], [0x100000000,0,0,0], "0,0,0,0"):
+            with self.subTest(counter=bad), self.assertRaises(SensorsError):
+                obj["acquisition_recovery"]["prime_notices"]=bad
+                decode_sensors(json.dumps(obj).encode())
+
     def test_no_sensors_token_and_real_250_capture_are_unavailable(self):
         console, port = self.console(identity=identity_bytes(False))
         self.assertIsNone(console.sensors())

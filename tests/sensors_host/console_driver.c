@@ -75,7 +75,7 @@ int main(int argc, char **argv)
         const char ok[] = "CLI_SENSOR_STALL_OK lock_released=1 bound_us=200000\n";
         assert(write(STDOUT_FILENO, ok, sizeof ok-1) == sizeof ok-1);
     } else {
-        assert(transmitted_size > 10000 && transmitted_size <= 12245);
+        assert(transmitted_size > 10000 && transmitted_size <= 12307);
         assert(write(STDOUT_FILENO, transmitted, transmitted_size) == (ssize_t)transmitted_size);
     }
     return 0;

@@ -63,6 +63,7 @@ typedef struct {
     uint32_t recovery_wire_transactions[SENSOR_PORTS];
     uint32_t recovery_discarded_bytes[SENSOR_PORTS];
     uint32_t recovery_boot_idle[SENSOR_PORTS];
+    uint32_t recovery_prime_notices[SENSOR_PORTS];
     sensor_metrics_t refresh;
     sensor_port_snapshot_t ports[SENSOR_PORTS];
 } sensor_snapshot_t;
@@ -132,6 +133,7 @@ void sensor_inventory_note_job_wait(uint32_t us);
 /* Bounded diagnostic discard log; never block on stdout inside a wire lease. */
 void sensor_inventory_recovery_discard(uint8_t ch, uint32_t bytes);
 void sensor_inventory_recovery_boot_idle(uint8_t ch);
+void sensor_inventory_recovery_prime_notice(uint8_t ch);
 #if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
 sensor_recovery_result_t sensor_inventory_recovery_hil(uint8_t ch);
 #endif

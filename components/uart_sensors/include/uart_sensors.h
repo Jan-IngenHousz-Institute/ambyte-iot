@@ -31,7 +31,7 @@ sensor_recovery_result_t uart_sensors_recover(uint8_t ch, uint64_t epoch, bool p
 #define UART_RECOVERY_HIL_BYTES 64u
 typedef struct {
     uint64_t epoch;
-    uint32_t elapsed_us, count[UART_RECOVERY_HIL_PHASES];
+    uint32_t elapsed_us, prime_notices, count[UART_RECOVERY_HIL_PHASES];
     uint32_t first_us[UART_RECOVERY_HIL_PHASES], last_us[UART_RECOVERY_HIL_PHASES];
     uint8_t channel, phase;
     uint8_t bytes[UART_RECOVERY_HIL_PHASES][UART_RECOVERY_HIL_BYTES];

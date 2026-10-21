@@ -135,7 +135,7 @@ def parse_sensors(obj) -> SensorsSnapshot:
         _require(isinstance(obj["refresh"]["wire_transactions"], list) and len(obj["refresh"]["wire_transactions"]) == 4)
         _require(all(_integer(v, 0xffffffff) for k, v in obj["refresh"].items() if k != "wire_transactions"))
         _require(all(_integer(v, 0xffffffff) for v in obj["refresh"]["wire_transactions"]))
-        _keys(obj["acquisition_recovery"], {"wire_transactions", "discarded_bytes", "boot_idle"})
+        _keys(obj["acquisition_recovery"], {"wire_transactions", "discarded_bytes", "boot_idle", "prime_notices"})
         for recovery in obj["acquisition_recovery"].values():
             _require(isinstance(recovery, list) and len(recovery) == 4 and
                      all(_integer(v, 0xffffffff) for v in recovery))

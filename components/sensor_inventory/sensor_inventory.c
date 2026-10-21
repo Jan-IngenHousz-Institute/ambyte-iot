@@ -554,3 +554,6 @@ void sensor_inventory_recovery_discard(uint8_t ch, uint32_t bytes)
 
 void sensor_inventory_recovery_boot_idle(uint8_t ch)
 { if (ch < SENSOR_PORTS) { lock(); increment(&cache.recovery_boot_idle[ch]); unlock(); } }
+
+void sensor_inventory_recovery_prime_notice(uint8_t ch)
+{ if (ch < SENSOR_PORTS) { lock(); increment(&cache.recovery_prime_notices[ch]); unlock(); } }

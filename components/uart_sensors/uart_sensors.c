@@ -132,6 +132,10 @@ static void recovery_trace_byte(uint8_t byte)
     if(count!=UINT32_MAX) ++s_recovery_hil_trace.count[phase];
     taskEXIT_CRITICAL(&s_recovery_hil_mux);
 }
+static void recovery_trace_notice(void)
+{
+    taskENTER_CRITICAL(&s_recovery_hil_mux);++s_recovery_hil_trace.prime_notices;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
 static void recovery_trace_end(void)
 {
     uint32_t elapsed=(uint32_t)(now_us()-s_recovery_hil_started);
@@ -148,6 +152,7 @@ bool uart_sensors_recovery_hil_trace(uart_recovery_hil_trace_t *out)
 #define recovery_trace_phase(phase) ((void)0)
 #define recovery_trace_byte(byte) ((void)0)
 #define recovery_trace_end() ((void)0)
+#define recovery_trace_notice() ((void)0)
 #endif
 
 /* CHIP_EN is shared, so every reset invalidates every channel. Keeping the
@@ -762,6 +767,24 @@ static unsigned recovery_drain(uart_port_t port, uint8_t channel)
     return count;
 }
 
+/* Only the two captured idle text notices extend priming; proof windows
+ * never call this recognizer. A partial wake can enter the leaf's text router,
+ * which prints BAD COMMAND before a fresh AA re-selects binary mode. This
+ * normalizes the100ms prime only; both later proof exchanges stay mandatory. */
+static const uint8_t recovery_prime_notice[] = "BAD COMMAND\r\n";
+static bool recovery_prime_byte(unsigned position, uint8_t first, uint8_t byte, bool *notice)
+{
+    if (!position) return byte == AMBIT_BOOT_IDLE || byte == AMBIT_ACK;
+    if (first != AMBIT_BOOT_IDLE) return false;
+    if (position == 1) {
+        *notice = byte == recovery_prime_notice[0];
+        return *notice || byte == AMBIT_ACK;
+    }
+    if (!*notice) return false;
+    if (position < sizeof recovery_prime_notice) return byte == recovery_prime_notice[position-1];
+    return position == sizeof recovery_prime_notice && byte == AMBIT_ACK;
+}
+
 static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
     bool poll, bool prime, int64_t *opened, int64_t latest_tx,
     bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t), bool *timing_refused)
@@ -777,7 +800,7 @@ static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
     if (sent != sizeof wake) return false;
     unsigned received = 0;
     uint8_t first = 0;
-    bool clean = true;
+    bool clean = true, notice = false;
     while (!deadline_reached(until)) {
         if (!current(channel, epoch)) return false;
         uint32_t ticks = uart_stream_capped_deadline_ticks(now_us(), until, WAKE_READ_MS, portTICK_PERIOD_MS);
@@ -786,13 +809,13 @@ static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
         if (uart_read_bytes(port, &byte, 1, (TickType_t)ticks) != 1) continue;
         recovery_trace_byte(byte);
         if (!current(channel, epoch)) { sensor_inventory_recovery_discard(channel, 1); return false; }
-        bool expected = prime ? (received == 0 ? byte == AMBIT_BOOT_IDLE || byte == AMBIT_ACK :
-                                     received == 1 && first == AMBIT_BOOT_IDLE && byte == AMBIT_ACK) :
+        bool expected = prime ? recovery_prime_byte(received, first, byte, &notice) :
             received == 0 ? byte == AMBIT_ACK :
             poll && received == 1 ? byte == AMBIT_CMD_DONE :
             poll && received == 2 ? byte <= 2 :
             poll && received == 3 ? byte == AMBIT_CMD_END : false;
-        if (!expected) sensor_inventory_recovery_discard(channel, 1);
+        if (!expected || (prime && notice && received < sizeof recovery_prime_notice))
+            sensor_inventory_recovery_discard(channel, 1);
         if (prime && byte == AMBIT_BOOT_IDLE) sensor_inventory_recovery_boot_idle(channel);
         clean &= expected;
         if (!received) first = byte;
@@ -803,7 +826,15 @@ static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
         ++received;
         /* Full windows reject extra80/trailingA1 even after a valid prefix. */
     }
-    return clean && (prime ? received == 1 || received == 2 : received == (poll ? 4u : 1u)) && current(channel, epoch);
+    bool complete = prime ? (!notice ? received == 1 || received == 2 :
+        received == sizeof recovery_prime_notice || received == sizeof recovery_prime_notice+1) :
+        received == (poll ? 4u : 1u);
+    bool ok = clean && complete && current(channel, epoch);
+    if (ok && prime && notice) {
+        sensor_inventory_recovery_prime_notice(channel);
+        recovery_trace_notice();
+    }
+    return ok;
 }
 
 sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, bool poll, uint32_t timeout_ms,
@@ -823,8 +854,8 @@ sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, b
     const int64_t needed = (SENSOR_RECOVERY_PRIME_MS + 2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL;
     if (!current(channel, epoch) || deadline - now_us() < needed || now_us() < s_ping_fail_cache_not_before_us) goto done;
     result = SENSOR_RECOVERY_FAILED;
-    /* Idle-loop light sleep eats the waking bytes and emits85. Prime wakes the
-     * router, but its exact {85,80,85+80} grammar NEVER releases ownership. */
+    /* Prime wakes the router and normalizes only the exact agreed sequences,
+     * including85+BAD COMMAND CRLF(+80). It NEVER releases ownership. */
     recovery_trace_phase(1);
     if (!recovery_exchange(port,channel,epoch,false,true,&opened,0,current,started,&timing_refused)) goto done;
     recovery_trace_phase(2);
