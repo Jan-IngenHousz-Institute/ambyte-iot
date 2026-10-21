@@ -230,8 +230,10 @@ preserve the bootloader or otadata and cannot qualify this transition.
 The accepted contract gives the full bench sequence. Evaluator first verifies
 there is no conflicting dev fleet workflow or bench-targeted active/scheduled Job. The helper
 rejects active/scheduled Jobs targeting that thing directly or through any
-static/dynamic group or parent group, plus this repository's `fleet-deploy.yml`
-and `fleet-command.yml` runs/schedules. Unrelated dev Jobs do not block. It
+static/dynamic group or parent group, plus this repository's `fleet-deploy.yml`,
+`fleet-deploy-schedule.yml`, `fleet-deploy-ambit.yml` and `fleet-command.yml`
+runs/schedules. A schedule install changes the compared schedule, and AMBIT
+flashing takes the maintenance lock. Unrelated dev Jobs do not block. It
 checks again between trials. It accepts only thing `ambyte_28:37:2F:FF:E7:04` in dev account
 084375565727. An existing dev S3 bucket is explicitly selected; no bucket or
 public access policy is created.

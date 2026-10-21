@@ -49,6 +49,32 @@ class LegacyRolloutTest(unittest.TestCase):
                     fleet.verify_legacy_release(repo,tag,url)
                 self.release=saved
 
+    def test_tag_equal_to_boundary_refuses_an_otherwise_valid_published_asset(self):
+        self.boundary.return_value="2.7.0"
+        # Tag, URL, published metadata and digest all match; equality alone
+        # must refuse. Moving the boundary forward makes the same asset pass.
+        with patch.object(fleet.urllib.request,"urlopen",side_effect=self.open):
+            with self.assertRaisesRegex(RuntimeError,"strictly below"):
+                fleet.verify_legacy_release(REPO,TAG,URL)
+            self.boundary.return_value="2.7.1"
+            fleet.verify_legacy_release(REPO,TAG,URL)
+
+    def test_legacy_asset_must_be_unsigned_and_pre_manifest_with_matching_digest(self):
+        from flash_gui.firmware_metadata import inspect_image, sign_image
+        from tools.check_release_signing import BENCH_KEY, private_key
+        signed=sign_image(self.raw,private_key(BENCH_KEY.read_bytes()),fixture_manifest=True)
+        modern=image("2.7.0",modern=True)
+        for data,has_signature,has_manifest in ((signed,True,False),(modern,False,True)):
+            info=inspect_image(data)
+            self.assertIs(info.signature_present,has_signature)
+            self.assertIs(info.storage is not None,has_manifest)
+            self.raw=data
+            self.release["assets"][0]["digest"]="sha256:"+hashlib.sha256(data).hexdigest()
+            with self.subTest(signed=has_signature,manifest=has_manifest),\
+                 patch.object(fleet.urllib.request,"urlopen",side_effect=self.open),\
+                 self.assertRaisesRegex(RuntimeError,"unsigned pre-manifest"):
+                fleet.verify_legacy_release(REPO,TAG,URL)
+
     def main(self,legacy,signed=False,url=None):
         args=["fleet_deploy.py","--tag",TAG,"--devices",THING,"--stagger","0"]
         if legacy:args.append("--legacy-unsigned-rollout")

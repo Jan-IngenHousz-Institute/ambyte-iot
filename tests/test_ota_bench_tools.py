@@ -112,6 +112,23 @@ class BenchToolsTest(unittest.TestCase):
                     with self.assertRaisesRegex(ImageError,"IoT Job"):bench.preflight(session,self.out)
                 else:bench.preflight(session,self.out)
 
+    def test_preflight_blocks_live_schedule_and_ambit_deploy_workflows(self):
+        for active in ("fleet-deploy-schedule.yml","fleet-deploy-ambit.yml"):
+            def gh(args,**kwargs):
+                if args[1]=="api":
+                    return types.SimpleNamespace(stdout=json.dumps({"content":base64.b64encode(b"on:\n  workflow_dispatch:\n").decode()}))
+                workflow=args[args.index("--workflow")+1]
+                status=args[args.index("--status")+1]
+                runs=[{"databaseId":123,"status":"in_progress","displayTitle":"mutates bench"}] \
+                    if workflow==active and status=="in_progress" else []
+                return types.SimpleNamespace(stdout=json.dumps(runs))
+            session=Mock()
+            session.client.return_value.get_paginator.return_value.paginate.return_value=[]
+            with self.subTest(workflow=active),patch.object(bench.subprocess,"run",side_effect=gh):
+                with self.assertRaisesRegex(ImageError,"workflow"):bench.preflight(session,self.out)
+            evidence=json.loads((self.out/"preflight.json").read_text())
+            self.assertEqual(evidence["workflows"][active][0]["status"],"in_progress")
+
     def test_partial_staging_keeps_owned_object_intent_and_returned_version(self):
         s3=Mock();s3.generate_presigned_url.return_value="https://s3.example/object"
         s3.put_object.side_effect=[{"VersionId":"first-version"},RuntimeError("upload interrupted")]
