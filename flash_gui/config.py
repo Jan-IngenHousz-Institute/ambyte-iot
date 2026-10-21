@@ -133,6 +133,9 @@ CONFIG_DIR = _config_dir()
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # Release zips + unpacked images; safe to delete any time.
 CACHE_DIR = CONFIG_DIR / "cache"
+# Service intent survives cache cleanup and app/process restarts. It contains
+# only nonsecret operation descriptors; never Wi-Fi credential bytes.
+SERVICE_OPERATIONS_DIR = CONFIG_DIR / "service_operations"
 # Show-once credential bundles land here BEFORE any step that can fail:
 # losing a private key means the board must be rotated again.
 CERTS_DIR = CONFIG_DIR / "device_certs"

@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -1472,7 +1473,12 @@ static bool wifi_manager_reboot_needed(void)
     return r;
 }
 
-esp_err_t wifi_manager_connect(const char *ssid, const char *password)
+static bool s_service_trial;
+static unsigned s_config_callers;
+static char s_service_original_ssid[33], s_service_trial_ssid[33];
+
+static esp_err_t connect_impl(const char *ssid, const char *password,
+                              wifi_config_t *exact, unsigned wait_ms)
 {
     if ((ssid == NULL) || (password == NULL)) {
         return ESP_ERR_INVALID_ARG;
@@ -1489,7 +1495,9 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     wifi_manager_lock();
     s_wifi.reconfigure_in_progress = true;
     wifi_manager_unlock();
-    esp_err_t err = wifi_manager_apply_config(ssid, password);
+    esp_err_t err = exact ? esp_wifi_set_config(WIFI_IF_STA, exact)
+                         : wifi_manager_apply_config(ssid, password);
+    if (exact && err == ESP_OK) wifi_manager_refresh_current_ssid();
     if (err != ESP_OK) {
         wifi_manager_lock();
         s_wifi.reconfigure_in_progress = false;   /* nothing was changed */
@@ -1594,7 +1602,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
         WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT,
         pdFALSE,
         pdFALSE,
-        pdMS_TO_TICKS(WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS));
+        pdMS_TO_TICKS(wait_ms));
 
     /* Decide the result from state re-read UNDER the lock, not from the
      * wait's snapshot: GOT_IP / STA_CONNECTED / a rejection can land between
@@ -1636,6 +1644,32 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     return result;
 }
 
+static bool config_enter(void)
+{
+    if (!s_wifi.lock) return true; /* preserve pre-init legacy error path */
+    wifi_manager_lock();
+    bool allowed = !s_service_trial;
+    if (allowed) ++s_config_callers;
+    wifi_manager_unlock();
+    return allowed;
+}
+
+static void config_leave(void)
+{
+    if (!s_wifi.lock) return;
+    wifi_manager_lock();
+    if (s_config_callers) --s_config_callers;
+    wifi_manager_unlock();
+}
+
+esp_err_t wifi_manager_connect(const char *ssid, const char *password)
+{
+    if (!config_enter()) return ESP_ERR_INVALID_STATE;
+    esp_err_t result = connect_impl(ssid, password, NULL, WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS);
+    config_leave();
+    return result;
+}
+
 esp_err_t wifi_manager_connect_configured(void)
 {
     if ((CONFIG_AMBYTE_WIFI_SSID[0] == '\0') ||
@@ -1650,7 +1684,7 @@ esp_err_t wifi_manager_connect_configured(void)
     return wifi_manager_connect(CONFIG_AMBYTE_WIFI_SSID, CONFIG_AMBYTE_WIFI_PASSWORD);
 }
 
-esp_err_t wifi_manager_connect_stored_async(void)
+static esp_err_t connect_stored_async_impl(void)
 {
     if (!s_wifi.initialized || !s_wifi.started) {
         return ESP_ERR_INVALID_STATE;
@@ -1718,6 +1752,14 @@ esp_err_t wifi_manager_connect_stored_async(void)
     return retrying ? ESP_OK : err;
 }
 
+esp_err_t wifi_manager_connect_stored_async(void)
+{
+    if (!config_enter()) return ESP_ERR_INVALID_STATE;
+    esp_err_t result = connect_stored_async_impl();
+    config_leave();
+    return result;
+}
+
 esp_err_t wifi_manager_connect_stored(void)
 {
     esp_err_t err = wifi_manager_connect_stored_async();
@@ -1765,6 +1807,127 @@ bool wifi_manager_is_connected(void)
     }
 
     return (xEventGroupGetBits(s_wifi.event_group) & WIFI_MANAGER_CONNECTED_BIT) != 0;
+}
+
+static void trial_wipe(void *buffer, size_t length)
+{
+    volatile unsigned char *p = buffer;
+    while (length--) *p++ = 0;
+}
+
+esp_err_t wifi_manager_service_status(wifi_manager_service_status_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof *out);
+    if (!s_wifi.lock || !s_wifi.initialized) return ESP_ERR_INVALID_STATE;
+    wifi_manager_lock();
+    out->trial = s_service_trial;
+    if (out->trial) {
+        memcpy(out->configured_ssid, s_service_original_ssid, sizeof out->configured_ssid);
+        memcpy(out->trial_ssid, s_service_trial_ssid, sizeof out->trial_ssid);
+    }
+    wifi_manager_unlock();
+    if (!out->trial) {
+        wifi_config_t config = {0};
+        esp_err_t error = esp_wifi_get_config(WIFI_IF_STA, &config);
+        if (error != ESP_OK) return error;
+        memcpy(out->configured_ssid, config.sta.ssid, sizeof config.sta.ssid);
+        trial_wipe(&config, sizeof config);
+    }
+    out->connected = wifi_manager_is_connected() && wifi_manager_link_is_current();
+    return wifi_manager_is_provisioned(&out->provisioned);
+}
+
+esp_err_t wifi_manager_trial(const char *ssid, const char *password,
+                             wifi_manager_trial_prepare_fn prepare, void *context,
+                             wifi_manager_trial_result_t *out)
+{
+    if (!out || !ssid || !password || !prepare) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof *out);
+    if (!s_wifi.lock || !s_wifi.initialized || !s_wifi.started) {
+        out->result = ESP_ERR_INVALID_STATE; return out->result;
+    }
+    wifi_manager_lock();
+    bool busy = s_service_trial || s_config_callers != 0;
+    if (!busy) s_service_trial = true;
+    wifi_manager_unlock();
+    if (busy) { out->result = ESP_ERR_INVALID_STATE; return out->result; }
+
+    wifi_config_t previous = {0}, requested = {0};
+    char old_ssid[33] = {0}, old_password[65] = {0};
+    bool ram_selected = false, restore = false;
+    esp_err_t error = esp_wifi_get_config(WIFI_IF_STA, &previous);
+    if (error != ESP_OK) goto finished;
+    out->restored = true; /* no trial has changed the running configuration yet */
+    memcpy(old_ssid, previous.sta.ssid, sizeof previous.sta.ssid);
+    memcpy(old_password, previous.sta.password, sizeof previous.sta.password);
+    wifi_manager_lock();
+    memcpy(s_service_original_ssid, old_ssid, sizeof old_ssid);
+    snprintf(s_service_trial_ssid, sizeof s_service_trial_ssid, "%s", ssid);
+    wifi_manager_unlock();
+    if (!prepare(false, old_ssid, old_password, context)) { error = ESP_FAIL; goto finished; }
+    error = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (error != ESP_OK) goto finished;
+    ram_selected = true;
+    restore = true;
+    out->restored = false;
+
+    /* Two eight-second waits plus both bounded driver drain/retry sequences
+     * fit the service's 30 s trial/restoration budget. The legacy path retains
+     * its ten-second initial wait and background retry policy unchanged. */
+    error = connect_impl(ssid, password, NULL, 8000);
+    if (error != ESP_OK || !wifi_manager_is_connected() || !wifi_manager_link_is_current()) {
+        if (error == ESP_OK) error = ESP_ERR_TIMEOUT;
+        goto finished;
+    }
+    if (esp_wifi_get_config(WIFI_IF_STA, &requested) != ESP_OK) { error = ESP_FAIL; goto finished; }
+    if (!prepare(true, NULL, NULL, context)) { error = ESP_FAIL; goto finished; }
+    out->persist_intent = true;
+    /* From this point failure is uncertain; the durable service intent anchors
+     * post-boot comparison to previous/requested fingerprints. Never claim that
+     * a failed cross-store final-result write undid a successful NVS commit. */
+    error = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if (error != ESP_OK) goto finished;
+    ram_selected = false;
+    restore = false;
+    /* Persisting config on an associated station itself drops the link on
+     * IDF 5.5 (reason=1). Reuse the owned reconfigure/drain/new-generation
+     * connect path rather than saving under the old trial association and
+     * racing its disconnect handler. Success requires a fresh owned GOT_IP
+     * after the FLASH write; the lease and maintenance veto remain held.
+     * Trial + persist rejoin use the same two bounded eight-second waits as
+     * trial + restoration. Post-intent errors stay uncertain in the service. */
+    error = connect_impl(ssid, password, &requested, 8000);
+    out->saved = error == ESP_OK;
+
+finished:
+    if (restore) {
+        /* Even an auth rejection leaves background retry owned by the trial.
+         * connect_impl supersedes that generation before reconnecting the exact
+         * previous station config, preventing late trial events from winning. */
+        (void)connect_impl(old_ssid, old_password, &previous, 8000);
+        wifi_config_t restored = {0};
+        if (esp_wifi_get_config(WIFI_IF_STA, &restored) == ESP_OK)
+            out->restored = memcmp(&restored, &previous, sizeof previous) == 0;
+        trial_wipe(&restored, sizeof restored);
+    }
+    if (ram_selected) {
+        esp_err_t storage_error = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+        if (storage_error != ESP_OK && error == ESP_OK) error = storage_error;
+    }
+    out->result = error;
+    out->connected = wifi_manager_is_connected() && wifi_manager_link_is_current();
+    wifi_manager_lock();
+    out->retrying = s_wifi.connect_requested && !out->connected;
+    s_service_trial = false;
+    trial_wipe(s_service_original_ssid, sizeof s_service_original_ssid);
+    trial_wipe(s_service_trial_ssid, sizeof s_service_trial_ssid);
+    wifi_manager_unlock();
+    trial_wipe(&previous, sizeof previous);
+    trial_wipe(&requested, sizeof requested);
+    trial_wipe(old_ssid, sizeof old_ssid);
+    trial_wipe(old_password, sizeof old_password);
+    return error;
 }
 
 /* ── Provisioning state (NVS-backed; host-seeded) ────────────────────── */

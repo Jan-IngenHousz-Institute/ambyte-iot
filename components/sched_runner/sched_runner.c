@@ -40,6 +40,7 @@
  * fragmentation); a stop/start cycle costs only the task/TCB (~9 KB).
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,21 @@ static void sha256_hex(const uint8_t *data, size_t len, char out[65])
 static esp_err_t read_schedule_file(const char *path, char **out_buf, size_t *out_len)
 {
     FILE *f = fopen(path, "rb");
+    if (f == NULL && errno == ENOENT && strcmp(path, SCHED_PATH) == 0) {
+        /* Every installer rotates the validated previous program to .bak
+         * before atomically renaming its staged replacement into place. Each
+         * littlefs rename is durable and atomic, but the pair is not: a USB
+         * reconnect/reset can land between them. Repair that gap BEFORE the
+         * boot/restart path chooses the embedded default. Never replace an
+         * existing active file or promote uncommitted .new/svc staging bytes.
+         * A reset during this single recovery rename leaves either .bak or
+         * the active path intact, so the next boot can repeat the same repair.
+         * No release metadata is invented; digest matching remains required. */
+        if (rename(SCHED_PATH ".bak", SCHED_PATH) == 0) {
+            ESP_LOGW(TAG, "restored %s from interrupted schedule swap", SCHED_PATH);
+            f = fopen(path, "rb");
+        }
+    }
     if (f == NULL) return ESP_ERR_NOT_FOUND;
     char *buf = malloc(SCHED_YAML_MAX_FILE_BYTES + 1);
     if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
@@ -501,6 +517,25 @@ static void drain_dispatch(void)
 
 /* ── the task ────────────────────────────────────────────────────────── */
 
+/* Sample only from the live task itself: retaining a TaskHandle_t for stats
+ * would race vTaskDelete during a service-triggered schedule restart. Cache
+ * the minimum across generations so a restart cannot hide the old margin. */
+static uint32_t s_stack_margin;
+static void sample_stack_margin(void)
+{
+    uint32_t margin = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    taskENTER_CRITICAL(&s_state_mux);
+    if (margin && (!s_stack_margin || margin < s_stack_margin)) s_stack_margin = margin;
+    taskEXIT_CRITICAL(&s_state_mux);
+}
+uint32_t sched_runner_stack_margin(void)
+{
+    taskENTER_CRITICAL(&s_state_mux);
+    uint32_t margin = s_stack_margin;
+    taskEXIT_CRITICAL(&s_state_mux);
+    return margin;
+}
+
 static void sched_runner_task(void *arg)
 {
     const uint32_t generation = (uint32_t)(uintptr_t)arg;
@@ -543,6 +578,7 @@ static void sched_runner_task(void *arg)
     }
 
     for (;;) {
+        sample_stack_margin();
         if (s_should_stop) break;
 
         /* Compare real wall UTC with the wall projected from the last
@@ -565,6 +601,7 @@ static void sched_runner_task(void *arg)
             if (mask & (1u << j)) run_job(j);
         }
         drain_dispatch();
+        sample_stack_margin();
         if (s_should_stop) break;
 
         /* Armed dues and this wait are both monotonic. The 60 s ceiling exists
@@ -586,6 +623,7 @@ static void sched_runner_task(void *arg)
     }
 
     sched_runner_cleanup_lights();
+    sample_stack_margin();
 
     /* Stack high-water at exit: the number that trims SCHED_TASK_STACK after
      * the hardware soak (acceptance criterion 4). */

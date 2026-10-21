@@ -31,6 +31,7 @@ typedef enum {
 typedef enum { WIFI_IF_STA = 0 } wifi_interface_t;
 typedef enum { WIFI_MODE_STA = 1 } wifi_mode_t;
 typedef enum { WIFI_PS_MIN_MODEM = 1 } wifi_ps_type_t;
+typedef enum { WIFI_STORAGE_FLASH, WIFI_STORAGE_RAM } wifi_storage_t;
 typedef enum { WIFI_AUTH_OPEN = 0, WIFI_AUTH_WPA2_PSK = 3 } wifi_auth_mode_t;
 typedef struct {
     uint8_t ssid[32];
@@ -60,6 +61,7 @@ esp_err_t esp_wifi_set_mode(wifi_mode_t mode);
 esp_err_t esp_wifi_start(void);
 esp_err_t esp_wifi_stop(void);
 esp_err_t esp_wifi_set_ps(wifi_ps_type_t type);
+esp_err_t esp_wifi_set_storage(wifi_storage_t storage);
 esp_err_t esp_wifi_set_config(wifi_interface_t iface, wifi_config_t *conf);
 esp_err_t esp_wifi_get_config(wifi_interface_t iface, wifi_config_t *conf);
 esp_err_t esp_wifi_connect(void);

@@ -1,0 +1,11 @@
+menu "Ambyte USB service benchmark"
+
+config AMBYTE_SVC_BENCH
+    bool "Enable the volatile USB checksum-sink benchmark"
+    default n
+    help
+        Bench-only transport measurements (PlatformIO env svc-bench). Enables
+        volatile ingress and egress up to 1 MiB without storing payloads or
+        touching capture, SD, firmware or credentials. Never ship in a release.
+
+endmenu

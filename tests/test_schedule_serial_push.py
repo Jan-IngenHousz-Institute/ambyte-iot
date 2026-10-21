@@ -44,8 +44,10 @@ class SharedInstallTailTest(unittest.TestCase):
     def test_neither_staged_file_worker_swaps_for_itself(self):
         tail = SCRIPT_UPDATE.split("static bool verify_and_swap_staged(", 1)[1]
         tail = tail.split("\n}\n", 1)[0]
-        self.assertIn("rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK)", tail)
-        self.assertIn("rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH)", tail)
+        self.assertIn("swap_validated_path(r, SCHEDULE_PATH_NEW, got, false", tail)
+        shared = SCRIPT_UPDATE.split("static bool swap_validated_path(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK)", shared)
+        self.assertIn("rename(path, SCHEDULE_PATH)", shared)
         # Both staged-file workers must delegate rather than keep a copy.
         # (do_update_impl, the inline MQTT path, legitimately still has its own:
         # it hashes an in-memory string and drives sched_runner_stop/start directly
@@ -58,7 +60,7 @@ class SharedInstallTailTest(unittest.TestCase):
         tail = tail.split("\n}\n", 1)[0]
         mismatch = tail.index("sha256 mismatch")
         syntax = tail.index("schedule compile failed")
-        swap = tail.index("rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK)")
+        swap = tail.index("swap_validated_path(r,")
         # Both rejections happen before anything touches the live script.
         self.assertLess(mismatch, swap)
         self.assertLess(syntax, swap)

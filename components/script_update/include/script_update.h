@@ -108,6 +108,20 @@ esp_err_t script_update_local_request(const char *checksum, const char *id,
  * stored release digest matches the file. Suitable as a script_identity_read_fn. */
 esp_err_t script_update_get_identity(script_identity_t *out);
 
+/* Synchronous service adapter, called only by the existing maintenance worker
+ * while it owns the global maintenance lock. It never submits another job,
+ * publishes MQTT, reboots, or uses the legacy console staging file. Validation
+ * (including compiled workbook equality) precedes workload stop/file rotation.
+ * NULL means conclusive activation; failures are stable service reason tokens.
+ * applied reports whether this call crossed the source-file swap boundary. */
+#define SCRIPT_UPDATE_SERVICE_STAGING_PATH "/littlefs/svc/stage.bin"
+typedef struct {
+    const char *source_path, *sha256, *workbook, *version, *built_fw;
+    size_t size;
+} script_service_descriptor_t;
+const char *script_update_service_apply(const script_service_descriptor_t *descriptor, bool *applied);
+bool script_update_service_matches(const script_service_descriptor_t *descriptor);
+
 #ifdef __cplusplus
 }
 #endif

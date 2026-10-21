@@ -1460,7 +1460,9 @@ esp_err_t sched_compile_text(const char *text, size_t len, sched_program_t *out,
     sched_yaml_doc_t *doc = NULL;
     esp_err_t rc = sched_yaml_parse(text, len, &doc, err, err_cap);
     if (rc != ESP_OK) return rc;
+    sched_resource_sample();
     rc = sched_compile(sched_yaml_root(doc), out, err, err_cap);
+    sched_resource_sample();
     sched_yaml_free(doc); /* transient arena, freed after compile by design */
     return rc;
 }

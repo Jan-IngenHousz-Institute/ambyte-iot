@@ -616,29 +616,56 @@ def _require_network(con, ssid: str, log=print) -> None:
 
 
 def install_schedule_script(ctx: SessionContext, run: DeviceRun,
-                            log=print) -> VerifyItem:
+                            log=print, *, cancelled=lambda: False,
+                            on_service_start=lambda: None, new_request=False) -> VerifyItem:
     """Resolve the session selection and use the shared console installer."""
     source = schedule_source(ctx, log=log)
     def load_blob():
         return release_fetch.script_bytes(ctx.schedule_script, log=log)
     return _install_schedule_source(source, run, wifi_ssid=ctx.wifi_ssid,
-                                    log=log, load_blob=load_blob)
+                                    log=log, load_blob=load_blob, cancelled=cancelled,
+                                    on_service_start=on_service_start, new_request=new_request)
 
 
 def install_schedule_source(source: ScheduleSource, run: DeviceRun, *,
-                            wifi_ssid="", log=print) -> VerifyItem:
+                            wifi_ssid="", log=print, cancelled=lambda: False,
+                            on_service_start=lambda: None, new_request=False) -> VerifyItem:
     """Install supplied bytes/URL and verify activation without a Tk session.
 
     Bench callers provide the exact fixture or restore bytes in source.blob.
     The GUI uses this same implementation for workbook and catalog sources.
     """
-    return _install_schedule_source(source, run, wifi_ssid=wifi_ssid, log=log)
+    return _install_schedule_source(source, run, wifi_ssid=wifi_ssid, log=log,
+                                    cancelled=cancelled, on_service_start=on_service_start,
+                                    new_request=new_request)
 
 
-def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
+def service_recovery_identity(run: DeviceRun, log=print):
+    """Read a stable current tuple for an explicit new-request decision.
+
+    This does not resolve an old outcome. The UI shows the observed state
+    before asking the operator whether to preserve the intent and start anew.
+    """
+    try:
+        with ambyte_serial.connect_after_boot(run.port, deadline_s=45.0, log=log,
+                                               recover_service=True) as con:
+            before, after = con.identity(), con.identity()
+            expected = run.preflight.mac.upper()
+            if (before != after or after.mac != expected or "svc" not in after.capabilities
+                    or after.schedule == ambyte_serial.ScheduleIdentity(None, None, None, None)):
+                raise ConsoleError("Current gateway identity is unavailable or changing; retry readback first.")
+            run.port = con.port
+            return after
+    except ConsoleError as exc:
+        raise ProcedureError("schedule", str(exc)) from exc
+
+
+def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None,
+                             cancelled=lambda: False, on_service_start=lambda: None,
+                             new_request=False):
     try:
         con = ambyte_serial.connect_after_boot(
-            run.port, deadline_s=CONSOLE_BOOT_DEADLINE_S, log=log)
+            run.port, deadline_s=CONSOLE_BOOT_DEADLINE_S, log=log, recover_service=True)
     except ConsoleError as exc:
         raise ProcedureError("schedule", str(exc)) from exc
 
@@ -649,11 +676,13 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
             and status.built_against_fw == source.built_against_fw
             and status.verified
             and status.running
+            and (not service_path or loaded_workbook == source.workbook_version_id)
         )
 
     json_path = False
     capabilities: frozenset[str] | None = None
     loaded_workbook = None
+    expected_service_mac = None
 
     def discover():
         nonlocal json_path, capabilities
@@ -664,6 +693,8 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
             json_path = False
             capabilities = None
         else:
+            if expected_service_mac is not None and discovered.mac != expected_service_mac:
+                raise ProcedureError("schedule", "gateway identity changed during transfer verification")
             run.console_identity = discovered
             capabilities = discovered.capabilities
             json_path = "identity" in capabilities
@@ -673,19 +704,28 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
 
     def read_current(timeout=10.0):
         nonlocal loaded_workbook, capabilities
+        def read_timeout():
+            if not service_path:
+                return timeout
+            remaining = operation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConsoleError("Schedule operation deadline reached")
+            return min(timeout, remaining)
         if not json_path:
             return con.schedule_release(timeout=timeout)
-        before = con.identity(timeout=timeout)
+        before = con.identity(timeout=read_timeout())
         if before.schedule == ambyte_serial.ScheduleIdentity(None, None, None, None):
             return None
         try:
-            release = con.schedule_release(timeout=timeout)
+            release = con.schedule_release(timeout=read_timeout())
         except ConsoleError:
             # No installed file is legitimate for an empty/embedded device.
             if before.schedule.source == "INSTALLED":
                 raise
             release = None
-        after = con.identity(timeout=timeout)
+        after = con.identity(timeout=read_timeout())
+        if expected_service_mac is not None and (before.mac != expected_service_mac or after.mac != expected_service_mac):
+            raise ProcedureError("schedule", "gateway identity changed during activation readback")
         run.console_identity = after
         if (before.schedule != after.schedule or before.capabilities != after.capabilities
                 or "identity" not in after.capabilities
@@ -727,9 +767,19 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
 
     try:
         discover()
+        service_path = capabilities is not None and "svc" in capabilities
+        install_clock = time.monotonic if service_path else time.time
+        operation_deadline = time.monotonic() + SCHEDULE_INSTALL_DEADLINE_S
+        if service_path and (not json_path or run.console_identity.mac is None):
+            raise ProcedureError("schedule", "service transfer requires a valid gateway identity and MAC")
+        if service_path:
+            expected_service_mac = run.console_identity.mac
+            preflight = getattr(run, "preflight", None)
+            if preflight is not None and preflight.mac.upper() != expected_service_mac:
+                raise ProcedureError("schedule", "connected gateway differs from the selected board; transfer refused")
         current = None
-        initial_deadline = time.time() + SCHEDULE_INSTALL_DEADLINE_S
-        while time.time() < initial_deadline:
+        initial_deadline = install_clock() + SCHEDULE_INSTALL_DEADLINE_S
+        while install_clock() < initial_deadline:
             try:
                 current = read_current()
             except ConsoleError as exc:
@@ -745,7 +795,7 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
         else:
             raise ProcedureError("schedule", "loaded Schedule identity did not become consistent")
 
-        if current is not None and matches(current):
+        if current is not None and matches(current) and not service_path:
             log(f"Schedule {source.label} is already active and verified.")
             wb = workbook_check()
             if wb is not None and not wb.passed:
@@ -765,16 +815,38 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
             try:
                 blob = load_blob()
             except ReleaseError as exc:
+                if service_path:
+                    raise ProcedureError("schedule", f"Cannot read verified bytes for {source.label} ({exc}); "
+                                         "download/cache the selected schedule and retry.") from exc
                 log(f"Cannot read {source.label} locally ({exc}); "
                     "falling back to a device-side download.")
 
         push_allowed = (capabilities is None or {
             "schedule.begin", "schedule.put", "schedule.commit", "schedule.abort"
         } <= capabilities)
-        if not push_allowed and source.asset_url is None:
+        if not push_allowed and source.asset_url is None and not service_path:
             raise ProcedureError("schedule", "firmware does not advertise all serial-push capabilities; "
                                  "this workbook schedule has no release URL")
-        if blob is not None and push_allowed:
+        if service_path:
+            if blob is None:
+                raise ProcedureError("schedule", f"Verified bytes for {source.label} are unavailable; "
+                                     "download/cache the selected schedule and retry.")
+            on_service_start()
+            log(f"Transferring {source.label} with durable recovery ({len(blob)} bytes)...")
+            try:
+                result = con.schedule_service_push(
+                    blob, source.sha256, source.script_version, source.built_against_fw,
+                    mac=run.console_identity.mac, workbook=source.workbook_version_id,
+                    cancelled=cancelled, log=log,
+                    new_request=new_request,
+                    deadline_s=max(0, operation_deadline - time.monotonic()))
+            except ConsoleError as exc:
+                raise ProcedureError("schedule", str(exc)) from exc
+            run.port = con.port
+            pushed = True
+            log(f"Device recorded schedule {result['state']} (applied={result['applied']}); "
+                "checking the active running program.")
+        elif blob is not None and push_allowed:
             log(f"Pushing {source.label} ({len(blob)} bytes) over serial...")
             try:
                 con.schedule_push(
@@ -816,9 +888,12 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
             except ConsoleError as exc:
                 raise ProcedureError("schedule", str(exc)) from exc
 
-        deadline = time.time() + SCHEDULE_INSTALL_DEADLINE_S
+        deadline = install_clock() + (max(0, operation_deadline - time.monotonic())
+                                  if service_path else SCHEDULE_INSTALL_DEADLINE_S)
         last_detail = "the previous script is still active"
-        if pushed:
+        if service_path:
+            log("Checking the recorded outcome against loaded identity and release metadata...")
+        elif pushed:
             # The bytes are already staged on the device; what remains is the
             # firmware's local hash + compile check + atomic swap, and our
             # serial read-back of `schedule release`. No network is involved.
@@ -827,21 +902,24 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
         else:
             log(f"Schedule install queued; the device downloads and verifies it over "
                 f"Wi-Fi (up to {SCHEDULE_INSTALL_DEADLINE_S:.0f}s)...")
-        next_progress = time.time() + SCHEDULE_INSTALL_SETTLE_S + SCHEDULE_INSTALL_PROGRESS_S
+        next_progress = install_clock() + SCHEDULE_INSTALL_SETTLE_S + SCHEDULE_INSTALL_PROGRESS_S
 
         def report_progress() -> None:
             nonlocal next_progress
-            now = time.time()
+            now = install_clock()
             if now < next_progress:
                 return
             next_progress = now + SCHEDULE_INSTALL_PROGRESS_S
             log(f"Still waiting for {source.label} "
                 f"({deadline - now:.0f}s left): {last_detail}.")
 
-        time.sleep(SCHEDULE_INSTALL_SETTLE_S)
-        while time.time() < deadline:
+        if not service_path:
+            time.sleep(SCHEDULE_INSTALL_SETTLE_S)
+        while install_clock() < deadline:
+            if service_path and cancelled():
+                raise ProcedureError("schedule", "Stopped activation verification; the recorded operation remains recoverable.")
             try:
-                current = read_current(timeout=20.0)
+                current = read_current(timeout=min(20.0, max(0.1, deadline - install_clock())))
             except ConsoleError as exc:
                 # A busy SD identity read or asynchronous firmware log can make
                 # one command miss its prompt. Keep the same serial handle: a
@@ -855,11 +933,12 @@ def _install_schedule_source(source, run, *, wifi_ssid, log, load_blob=None):
                 # Reconnect only after a real USB I/O failure.
                 con.close()
                 replacement = None
-                while replacement is None and time.time() < deadline:
-                    remaining = deadline - time.time()
+                while replacement is None and install_clock() < deadline:
+                    remaining = deadline - install_clock()
                     try:
                         replacement = ambyte_serial.connect_after_boot(
-                            run.port, deadline_s=min(30.0, remaining), log=log)
+                            run.port, deadline_s=min(30.0, remaining), log=log,
+                            recover_service=service_path)
                     except ConsoleError as reconnect_exc:
                         last_detail = str(reconnect_exc)
                 if replacement is None:

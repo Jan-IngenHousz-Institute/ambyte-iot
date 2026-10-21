@@ -50,6 +50,7 @@
 #include "sd_logger.h"
 #include "sd_diag.h"
 #include "wifi_manager.h"
+#include "usb_service.h"
 
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
 #include "esp_heap_trace.h"
@@ -2211,6 +2212,13 @@ static esp_err_t cli_register_commands(void)
     if (identity_err != ESP_OK) {
         return identity_err;
     }
+
+    static const esp_console_cmd_t service_cmd = {
+        .command = "svc", .help = "enter framed USB maintenance service (no arguments)",
+        .func = usb_service_command,
+    };
+    esp_err_t service_err = esp_console_cmd_register(&service_cmd);
+    if (service_err != ESP_OK) return service_err;
 
     static const esp_console_cmd_t status_cmd = {
         .command = "status",

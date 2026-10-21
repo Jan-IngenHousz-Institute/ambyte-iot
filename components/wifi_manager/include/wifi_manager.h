@@ -47,6 +47,28 @@ const char *wifi_manager_err_to_name(esp_err_t err);
  * NOT_RETRYING or a driver call error nothing retries (a config error saved
  * nothing) and the caller should re-run the join. */
 esp_err_t wifi_manager_connect(const char *ssid, const char *password);
+
+/* The local service trials credentials in RAM. prepare(false) records the
+ * previous credential fingerprint; prepare(true) durably records persist
+ * intent. A false callback return forbids the subsequent configuration write.
+ * FLASH persistence reuses the owned reconfigure/rejoin path because IDF 5.5
+ * drops the associated link on set_config; success includes a new owned GOT_IP.
+ * Password pointers are transient and must never be retained by the callback. */
+typedef bool (*wifi_manager_trial_prepare_fn)(bool persist_intent,
+                                            const char *old_ssid, const char *old_password,
+                                            void *context);
+typedef struct {
+    esp_err_t result;
+    bool saved, connected, retrying, restored, persist_intent;
+} wifi_manager_trial_result_t;
+esp_err_t wifi_manager_trial(const char *ssid, const char *password,
+                             wifi_manager_trial_prepare_fn prepare, void *context,
+                             wifi_manager_trial_result_t *out);
+typedef struct {
+    char configured_ssid[33], trial_ssid[33];
+    bool trial, connected, provisioned;
+} wifi_manager_service_status_t;
+esp_err_t wifi_manager_service_status(wifi_manager_service_status_t *out);
 esp_err_t wifi_manager_connect_configured(void);
 esp_err_t wifi_manager_connect_stored(void);
 /* Same as wifi_manager_connect_stored() but returns as soon as the connect is

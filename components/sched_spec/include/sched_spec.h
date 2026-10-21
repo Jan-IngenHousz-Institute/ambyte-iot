@@ -402,6 +402,12 @@ const sched_job_t *sched_find_job(const sched_program_t *p, const char *name);
 esp_err_t sched_compile(const sched_node_t *root, sched_program_t *out,
                         char *err, size_t err_cap);
 /* Parse + compile in one call; frees the arena before returning. */
+/* Optional nonallocating resource observer. The default weak implementation
+ * is empty; firmware may override it to sample heap at parser allocation and
+ * compile boundaries. It runs on the caller, outside runner state locks, and
+ * must not compile, allocate, log or acquire a service/maintenance mutex. */
+void sched_resource_sample(void);
+
 esp_err_t sched_compile_text(const char *text, size_t len, sched_program_t *out,
                              char *err, size_t err_cap);
 

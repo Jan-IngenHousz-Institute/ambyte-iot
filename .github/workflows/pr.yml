@@ -158,6 +158,10 @@ jobs:
         run: "${RUNNER_TEMP}/platformio/bin/pio pkg install -e esp32-s3-devkitm-1"
 
       - name: Test Python tooling
+        env:
+          # Bootstrap above must install the exact project pin. Missing SDK
+          # coverage is fatal here; local no-SDK runs report explicit skips.
+          AMBYTE_REQUIRE_PINNED_IDF: "1"
         run: python -m unittest discover -s tests -v
 
       - name: Prepare release artifact

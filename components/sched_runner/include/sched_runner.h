@@ -57,6 +57,10 @@
 extern "C" {
 #endif
 
+/* Minimum observed stack margin in bytes across runner generations; 0 means
+ * no live task sample yet. Reading never retains a deletable task handle. */
+uint32_t sched_runner_stack_margin(void);
+
 /* Where the running program came from (design decision 4: fallback is
  * firmware-owned embedded YAML, distinct from the released catalog). */
 typedef enum {

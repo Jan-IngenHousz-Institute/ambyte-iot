@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+__attribute__((weak)) void sched_resource_sample(void) { }
+
 /* ── arena ─────────────────────────────────────────────────────────────── *
  * Bump allocator over a list of heap blocks. Worst case ≈ 512 nodes × 40 B
  * + 8 KiB strings ≈ 28 KiB, bounded by the parser limits; freed wholesale
@@ -46,7 +48,9 @@ static void *arena_alloc(sched_yaml_doc_t *doc, size_t size)
     if (b == NULL || b->used + size > b->cap) {
         size_t cap = (b == NULL) ? 4096 : b->cap * 2;
         while (cap < size) cap *= 2;
+        sched_resource_sample();
         arena_block_t *nb = malloc(sizeof(arena_block_t) + cap);
+        sched_resource_sample();
         if (nb == NULL) return NULL;
         nb->next = doc->blocks;
         nb->used = 0;
@@ -696,7 +700,9 @@ esp_err_t sched_yaml_parse(const char *text, size_t len,
         snprintf(err, err_cap, "1:1: file exceeds %d bytes", SCHED_YAML_MAX_FILE_BYTES);
         return ESP_FAIL;
     }
+    sched_resource_sample();
     sched_yaml_doc_t *doc = calloc(1, sizeof(*doc));
+    sched_resource_sample();
     if (doc == NULL) {
         snprintf(err, err_cap, "1:1: out of memory");
         return ESP_FAIL;
@@ -721,7 +727,9 @@ esp_err_t sched_yaml_parse(const char *text, size_t len,
         }
         if (p.nlines == p.lines_cap) {
             p.lines_cap = p.lines_cap == 0 ? 32 : p.lines_cap * 2;
+            sched_resource_sample();
             line_t *nl = realloc(p.lines, (size_t)p.lines_cap * sizeof(line_t));
+            sched_resource_sample();
             if (nl == NULL) {
                 set_err(&p, p.nlines + 1, 1, "out of memory");
                 goto fail;
@@ -756,12 +764,16 @@ esp_err_t sched_yaml_parse(const char *text, size_t len,
             goto fail;
         }
     }
+    sched_resource_sample();
     free(p.lines);
+    sched_resource_sample();
     *out = doc;
     return ESP_OK;
 
 fail:
+    sched_resource_sample();
     free(p.lines);
+    sched_resource_sample();
     sched_yaml_free(doc);
     return ESP_FAIL;
 }
@@ -777,8 +789,12 @@ void sched_yaml_free(sched_yaml_doc_t *doc)
     arena_block_t *b = doc->blocks;
     while (b != NULL) {
         arena_block_t *next = b->next;
+        sched_resource_sample();
         free(b);
+        sched_resource_sample();
         b = next;
     }
+    sched_resource_sample();
     free(doc);
+    sched_resource_sample();
 }

@@ -1,0 +1,5 @@
+# Transport benchmark only. Production sdkconfig.defaults remains unchanged.
+CONFIG_AMBYTE_SVC_BENCH=y
+# Match the tracked production image's dedicated coredump stack. The IDF
+# default for a fresh env is zero, which would distort F6 comparisons.
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792

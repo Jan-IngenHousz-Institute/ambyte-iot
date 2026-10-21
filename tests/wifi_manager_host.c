@@ -83,6 +83,9 @@ struct wm_stub_netif { int unused; };
 static struct wm_stub_netif g_netif;
 
 static uint8_t g_stored_ssid[32];
+static wifi_config_t g_running_config, g_flash_config;
+static wifi_storage_t g_storage = WIFI_STORAGE_FLASH;
+static unsigned g_flash_writes;
 static int g_connect_calls;
 static esp_err_t g_set_config_err;   /* returned (and nothing saved) if set */
 /* Runs INSIDE the next esp_wifi_connect() call, which then returns
@@ -431,6 +434,12 @@ esp_err_t esp_wifi_stop(void)
     return ESP_OK;
 }
 esp_err_t esp_wifi_set_ps(wifi_ps_type_t t) { (void)t; return ESP_OK; }
+esp_err_t esp_wifi_set_storage(wifi_storage_t storage)
+{
+    CHECK(!g_lock_held);
+    g_storage = storage;
+    return ESP_OK;
+}
 esp_err_t esp_wifi_set_config(wifi_interface_t i, wifi_config_t *c)
 {
     (void)i;
@@ -447,12 +456,14 @@ esp_err_t esp_wifi_set_config(wifi_interface_t i, wifi_config_t *c)
         }
     }
     memcpy(g_stored_ssid, c->sta.ssid, sizeof(g_stored_ssid));
+    g_running_config = *c;
+    if (g_storage == WIFI_STORAGE_FLASH) { g_flash_config = *c; ++g_flash_writes; }
     return ESP_OK;
 }
 esp_err_t esp_wifi_get_config(wifi_interface_t i, wifi_config_t *c)
 {
     (void)i;
-    memset(c, 0, sizeof(*c));
+    *c = g_running_config;
     memcpy(c->sta.ssid, g_stored_ssid, sizeof(g_stored_ssid));
     return ESP_OK;
 }
@@ -680,6 +691,10 @@ static void set_stored_ssid(const char *ssid, size_t len)
 {
     memset(g_stored_ssid, 0, sizeof(g_stored_ssid));
     memcpy(g_stored_ssid, ssid, len);
+    memset(&g_running_config, 0, sizeof g_running_config);
+    memcpy(g_running_config.sta.ssid, ssid, len);
+    memcpy(g_running_config.sta.password, "original-pass", 14);
+    g_flash_config = g_running_config;
 }
 
 static void boot(const char *stored_ssid)
@@ -2495,9 +2510,80 @@ static void scenario_ssid_32_chars(void)
     CHECK(s_wifi.current_ssid[32] == '\0');
 }
 
+static unsigned g_trial_callbacks;
+static unsigned g_trial_deny;
+
+static bool trial_prepare(bool persist, const char *old_ssid, const char *old_password, void *ctx)
+{
+    (void)ctx;
+    ++g_trial_callbacks;
+    CHECK(s_service_trial && g_flash_writes == 0);
+    CHECK(wifi_manager_connect("UnexpectedAP", "never-written") == ESP_ERR_INVALID_STATE);
+    CHECK(wifi_manager_connect_stored_async() == ESP_ERR_INVALID_STATE);
+    wifi_manager_service_status_t status;
+    CHECK(wifi_manager_service_status(&status) == ESP_OK);
+    CHECK(status.trial && strcmp(status.configured_ssid, "OldAP") == 0);
+    CHECK(strcmp(status.trial_ssid, "TrialAP") == 0);
+    if (!persist) {
+        CHECK(strcmp(old_ssid, "OldAP") == 0);
+        CHECK(strcmp(old_password, "original-pass") == 0);
+    } else CHECK(g_storage == WIFI_STORAGE_RAM && wifi_manager_is_connected());
+    return g_trial_callbacks != g_trial_deny;
+}
+
+static void trial_case(int outcome, unsigned deny, bool success)
+{
+    boot("OldAP");
+    wifi_config_t original = g_flash_config;
+    g_trial_deny = deny;
+    g_script[0] = outcome;
+    g_script[1] = SCRIPT_GOT_IP; /* restoration to original AP */
+    g_script_len = 2;
+    wifi_manager_trial_result_t result;
+    esp_err_t error = wifi_manager_trial("TrialAP", "trial-pass", trial_prepare, NULL, &result);
+    CHECK(!s_service_trial && s_config_callers == 0 && g_storage == WIFI_STORAGE_FLASH);
+    CHECK(s_service_original_ssid[0] == 0 && s_service_trial_ssid[0] == 0);
+    if (success) {
+        CHECK(error == ESP_OK && result.persist_intent && result.saved);
+        CHECK(result.connected && !result.retrying && g_associated);
+        CHECK(g_flash_writes == 1);
+        CHECK(strcmp((char *)g_flash_config.sta.ssid, "TrialAP") == 0);
+    } else {
+        CHECK(error != ESP_OK && !result.saved && !result.persist_intent);
+        CHECK(g_flash_writes == 0 && memcmp(&original, &g_flash_config, sizeof original) == 0);
+        CHECK(result.restored && strcmp((char *)g_stored_ssid, "OldAP") == 0);
+    }
+    CHECK(g_now_us < 30000000);
+}
+
+static void scenario_service_trial_auth_restores(void) { trial_case(WIFI_REASON_AUTH_FAIL, 0, false); }
+static void scenario_service_trial_timeout_restores(void) { trial_case(SCRIPT_CONNECTED_ONLY, 0, false); }
+static void scenario_service_trial_stale_ip_restores(void) { trial_case(SCRIPT_GOT_IP_ONLY, 0, false); }
+static void scenario_service_trial_intent_refusal_restores(void) { trial_case(SCRIPT_GOT_IP, 2, false); }
+static void scenario_service_trial_prepare_refusal_preserves(void) { trial_case(SCRIPT_GOT_IP, 1, false); }
+static void scenario_service_trial_owned_ip_saves(void) { trial_case(SCRIPT_GOT_IP, 0, true); }
+static void scenario_service_trial_persist_inline_drop(void)
+{
+    g_set_config_delivers_now = true;
+    g_drop_connect_in_set_config = true;
+    trial_case(SCRIPT_GOT_IP, 0, true);
+    CHECK(wifi_manager_is_connected() && wifi_manager_link_is_current() && g_associated);
+    CHECK(!s_wifi.reconfigure_in_progress && !g_timer_armed);
+    CHECK(log_count('W', "Wi-Fi disconnected (reason=1)") == 0);
+    CHECK(log_count('I', "disconnected for reconfigure (reason=1)") == 1);
+}
+
+
 int main(int argc, char **argv)
 {
     static const struct { const char *name; void (*fn)(void); } k_scenarios[] = {
+        { "service_trial_auth_restores", scenario_service_trial_auth_restores },
+        { "service_trial_timeout_restores", scenario_service_trial_timeout_restores },
+        { "service_trial_stale_ip_restores", scenario_service_trial_stale_ip_restores },
+        { "service_trial_intent_refusal_restores", scenario_service_trial_intent_refusal_restores },
+        { "service_trial_prepare_refusal_preserves", scenario_service_trial_prepare_refusal_preserves },
+        { "service_trial_owned_ip_saves", scenario_service_trial_owned_ip_saves },
+        { "service_trial_persist_inline_drop", scenario_service_trial_persist_inline_drop },
         { "classification", scenario_classification },
         { "delay_schedule", scenario_delay_schedule },
         { "boot_authfail_recovers", scenario_boot_authfail_recovers },

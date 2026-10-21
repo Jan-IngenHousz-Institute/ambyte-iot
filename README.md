@@ -137,10 +137,11 @@ pio run   -e esp32-s3-devkitm-1 -t upload     # build + flash app + NVS image
 pio device monitor -b 115200                  # serial console
 ```
 
-The [USB maintenance contract v1](docs/usb-maintenance.md) documents `identity`,
-destination configuration, reboot/readback and offline schedule staging with
-activation verification. It also gives the console line limits and DTR/RTS
-settings for an attached client.
+The [USB maintenance contract](docs/usb-maintenance.md) documents `identity`,
+destination configuration, reboot/readback and offline schedule staging, plus
+the framed `svc` transactions with durable resume/results and bounded Wi-Fi
+trial writes. It includes activation verification, client recovery, line limits,
+DTR/RTS settings and the bench-only throughput measurements.
 
 Editing `sdkconfig.defaults` alone does **not** re-apply — delete the per-env generated `sdkconfig.esp32-s3-devkitm-1` to regenerate it.
 
