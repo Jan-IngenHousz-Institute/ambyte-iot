@@ -37,4 +37,3 @@ class SensorFormatterFpuTest(unittest.TestCase):
             run=subprocess.run([binary],capture_output=True,timeout=15)
             self.assertEqual(run.returncode,0,run.stderr.decode())
             self.assertIn(b"exact_bits=1 identical_json=1",run.stdout)
-

@@ -1337,7 +1337,8 @@ to observe the newer attachment generation.
 Pins expire after 60 s from capture or on replacement, unbind, session timeout,
 exit or reboot. Old token returns `snapshot_expired`; malformed arguments or
 offset >=size return `invalid_args`, missing provider `sensors_unavailable`,
-allocation failure `no_memory`, stale binding `store_changed`. Errors remain
+allocation failure `no_memory`, missing binding `not_bound`, and a known
+requested/bound store differing from the current store `store_changed`. Errors remain
 correlated and do not mutate durable operations. A failed response is never
 rescued by stripping plain prompt/log prefixes.
 

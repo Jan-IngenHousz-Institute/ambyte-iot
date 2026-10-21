@@ -260,7 +260,7 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     }
     if (!strcmp(a[0], "svc.sensors")) {
         if (n != 1) { error = "invalid_args"; goto done; }
-        if (!p->bound_instance || p->bound_instance != p->store->instance) { error = "store_changed"; goto done; }
+        if ((error = binding_error(p))) goto done;
         if (!p->ports.sensors_capture) { error = "sensors_unavailable"; goto done; }
         uint64_t token_id = 0; size_t size = 0; char sha[65] = {0};
         error = p->ports.sensors_capture(p->ports.context, &token_id, &size, sha);
@@ -273,7 +273,7 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     }
     if (!strcmp(a[0], "svc.sensors.read")) {
         if (n != 3 || !hex(a[1], 16, &id) || !id || !hex(a[2], 8, &offset)) { error = "invalid_args"; goto done; }
-        if (!p->bound_instance || p->bound_instance != p->store->instance) { error = "store_changed"; goto done; }
+        if ((error = binding_error(p))) goto done;
         if (!p->ports.sensors_read) { error = "sensors_unavailable"; goto done; }
         unsigned char data[576]; char encoded[769]; size_t size = 0; bool eof = false;
         error = p->ports.sensors_read(p->ports.context, id, (uint32_t)offset, data, &size, &eof);
