@@ -33,6 +33,7 @@ def compile_peer(binary, *, bench, session):
         "-I" + str(ROOT / "components/usb_service/include"),
         *(str(ROOT / "components/usb_service" / name) for name in names),
         str(ROOT / "tests/svc_host" / ("client_peer.c" if session else "protocol_driver.c")),
+        *([] if session else ["-Wl,--wrap=svc_store_get", "-Wl,--wrap=svc_store_admit"]),
         "-lcrypto", "-o", str(binary)], check=True)
 
 
@@ -77,7 +78,7 @@ class BenchmarkProtocolTest(unittest.TestCase):
         self.assertTrue({"bench.begin", "bench.read", "bench.end", "bench.abort"} <= set(bench["actions"]))
 
     def test_grammar_limits_binding_and_mode_ownership(self):
-        self.assertEqual(self.call("bench.begin rx 00100000 00000090", bind=False)[0]["reason"], "store_changed")
+        self.assertEqual(self.call("bench.begin rx 00100000 00000090", bind=False)[0]["reason"], "not_bound")
         values = self.call("bench.begin rx 00000000 00000090", "bench.begin rx 00100001 00000090",
             "bench.begin rx 00100000 000002be", "bench.begin tx 00100000 000002bf",
             "bench.begin bad 00100000 00000090", "bench.begin rx 00100000 90",
