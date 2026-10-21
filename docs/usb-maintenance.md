@@ -1423,3 +1423,29 @@ USB descriptor:
 
 The Generator builds and hands over both images; flashing and physical checks
 belong to the Evaluator after the Planner releases the bench.
+
+### Service starvation guard
+
+ESP-IDF pins a task to its current core when that task first uses the FPU.
+The console starts without core affinity, but existing commands such as
+`read_env`, `record_env`, `selftest`, AMBIT temperature and PWM can pin it
+before it enters service. The sensor snapshot formatter uses integer IEEE
+conversion and software-double formatting to avoid adding another pinning
+trigger.
+
+At the service loop's lock-free boundary, after at least50 ms since its last
+cooperative pause, the target blocks with `vTaskDelay(1)`. One literal tick is
+a positive blocking request at the production100 Hz tick rate; its elapsed
+time can be less than10 ms depending on the tick phase. This gives lower
+priorities a scheduling opportunity during repeated ready service work. It
+does not feed the watchdog, change its timeout, bound an individual store
+call, or guarantee that other CPU work leaves the idle task runnable.
+
+The host ASan/UBSan scheduling model exercises the production session, engine
+and store with immediately ready traffic and synchronous storage CPU work;
+removing the pause makes that model detect starvation. This is wiring evidence,
+not a simulation of the bench USB traffic. Physical qualification includes
+`read_env` followed by768 sustained service requests on the final image and
+the matching image without this guard. The guard must prevent resets and the
+unguarded control must reproduce the failure. The sensors watchdog checks
+add plain `sensors` before both service traffic variants in the same boot.

@@ -21,7 +21,7 @@ class ServiceRuntimeTest(unittest.TestCase):
                     ROOT / "tests/wifi_manager_stubs"] + list((ROOT / "components").glob("*/include"))
         p = subprocess.run([
             os.environ.get("CC", "cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror",
-            "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g", "-DSVC_HOST",
+            "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g", "-DSVC_HOST", "-DportTICK_PERIOD_MS=10",
             *(f"-I{path}" for path in includes),
             *(str(ROOT / "components/usb_service" / name) for name in
               ("svc_wire.c", "svc_store.c", "svc_protocol.c", "svc_engine.c", "svc_session.c")),
@@ -34,6 +34,14 @@ class ServiceRuntimeTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.build.cleanup()
+
+    def test_ready_traffic_uses_positive_target_delay_at_100_hz(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run=subprocess.run([str(self.binary),"ready_traffic"],capture_output=True,
+                env={**os.environ,"SVC_TEST_ROOT":str(Path(temporary)/"svc")},timeout=15)
+            self.assertEqual(run.returncode,0,run.stderr.decode())
+            self.assertEqual(len(run.stdout.splitlines()),1002)
+            self.assertIn(b"ADAPTER_FAIRNESS_OK frames=1000 positive_delays=1 tick_ms=10",run.stderr)
 
     def test_runtime_outcomes_metrics_and_legacy_filter_release(self):
         for case, state, reason in (("success", "succeeded", ""), ("auth", "failed", "wifi_auth_rejected"),
