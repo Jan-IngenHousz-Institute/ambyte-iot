@@ -13,6 +13,7 @@ static int64_t us;
 static unsigned announcements, attempts[4][5];
 static bool absent[4];
 static unsigned spec_failure, cal_failure;
+static int64_t spec_last_idle[4];
 static bool invalidate_inflight;
 static int64_t utc_base = 1792531200000LL;
 static uint8_t quality = 3;
@@ -30,7 +31,11 @@ static sensor_read_result_t inspect(uint8_t ch, uint8_t type, void *out, size_t 
     size_t *got, uint32_t timeout, void (*started)(uint8_t))
 {
     assert(timeout <= 1000); assert(!sensor_inventory_busy());
-    started(ch); ++attempts[ch][type]; *got = 0;
+    started(ch);
+    if (type==4 && spec_failure==2 && attempts[ch][type])
+        assert(idle_now_locked()-spec_last_idle[ch]>=SENSOR_SPEC_RETRY_MS);
+    if (type==4) spec_last_idle[ch]=idle_now_locked();
+    ++attempts[ch][type]; *got = 0;
     if (absent[ch]) { delay(timeout); return type ? SENSOR_READ_FAILED : SENSOR_READ_ABSENT; }
     if (type == 1 && cal_failure) { delay(timeout); return SENSOR_READ_FAILED; }
     if (invalidate_inflight) { invalidate_inflight = false; sensor_inventory_invalidate(ch); }
@@ -85,6 +90,16 @@ int main(int argc, char **argv)
 {
     assert(argc >= 2); populate();
     const char *scenario = argv[1];
+    if (!strcmp(scenario, "version_gate")) {
+        const uint8_t versions[][3]={{0,0,0},{0,0,6},{1,1,2},{1,2,0},{1,3,1},{1,4,0}};
+        for (unsigned v=0;v<6;++v) {
+            populate(); memset(attempts,0,sizeof attempts);
+            for (unsigned ch=0;ch<4;++ch) memcpy(firmware[ch],versions[v],3);
+            for (unsigned i=0;i<20;++i) step();
+            assert(v<3 ? attempts[0][4]==0 : attempts[0][4]>0);
+        }
+        output(); return 0;
+    }
     if (!strcmp(scenario, "clocks")) {
         for (quality = 0; quality <= 3; ++quality) {
             utc_base = quality ? 1792531200000LL : 100; suspect_clock = quality == 2;

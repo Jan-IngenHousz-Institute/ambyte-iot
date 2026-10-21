@@ -31,7 +31,7 @@ class SensorsServiceTest(unittest.TestCase):
               ("svc_wire.c", "svc_store.c", "svc_protocol.c", "svc_engine.c", "svc_session.c")),
             str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
             str(ROOT / "components/sensor_inventory/sensor_json.c"),
-            str(ROOT / "tests/sensors_host/service_peer.c"), "-Wl,--wrap=svc_store_open",
+            str(ROOT / "tests/sensors_host/service_peer.c"), "-Wl,--wrap=svc_store_open", "-Wl,--wrap=malloc",
             "-lcrypto", "-o", str(cls.binary)], check=True)
 
     @classmethod
@@ -54,6 +54,37 @@ class SensorsServiceTest(unittest.TestCase):
         self.assertEqual(self.client._exchange("svc.version")["highest_id"], "0000000000000000")
         self.client.exit()
         self.assertIn("readonly=1", self.port.close())
+
+    def test_capture_failures_release_old_pin_and_do_not_mutate_storage(self):
+        for fault, reason in ((b"@allocfail\n", "no_memory"),
+                              (b"@hashfail1\n", "sensors_unavailable"),
+                              (b"@hashfail2\n", "sensors_unavailable"),
+                              (b"@hashfail3\n", "sensors_unavailable")):
+            with self.subTest(fault=fault):
+                head = self.client._exchange("svc.sensors")
+                self.port.write(fault)
+                with self.assertRaises(ServiceError) as error:
+                    self.client._exchange("svc.sensors")
+                self.assertEqual(error.exception.reason, reason)
+                self.port.write(b"@assertnopin\n@recover\n")
+                with self.assertRaises(ServiceError):
+                    self.client._exchange(f"svc.sensors.read {head['snapshot']} 00000000")
+                self.assertEqual(len(self.client.sensors().ports), 4)
+        self.assertEqual(self.client._exchange("svc.version")["highest_id"], "0000000000000000")
+
+    def test_rebinding_unbinding_and_token_exhaustion_release_pin(self):
+        head = self.client._exchange("svc.sensors")
+        self.client._exchange(f"svc.bind {self.client.store}")
+        with self.assertRaises(ServiceError):
+            self.client._exchange(f"svc.sensors.read {head['snapshot']} 00000000")
+        self.assertEqual(len(self.client.sensors().ports), 4)
+        self.port.write(b"@unbind\n@assertnopin\n")
+        self.client.connect()
+        self.assertEqual(len(self.client.sensors().ports), 4)
+        self.port.write(b"@exhaust\n")
+        with self.assertRaises(ServiceError):
+            self.client._exchange("svc.sensors")
+        self.port.write(b"@assertnopin\n")
 
     def test_live_swap_cannot_tear_pin_and_new_pin_supersedes_old(self):
         header = self.client._exchange("svc.sensors")

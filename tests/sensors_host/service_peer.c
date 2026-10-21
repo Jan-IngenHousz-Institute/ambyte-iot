@@ -6,7 +6,10 @@
 #include "../svc_host/runtime_driver.c"
 #undef main
 
-static bool inventory_held, initialized_readonly;
+static bool inventory_held, initialized_readonly, fail_pin;
+void *__real_malloc(size_t);
+void *__wrap_malloc(size_t n)
+{ return fail_pin && n==sizeof(sensor_snapshot_t) ? NULL : __real_malloc(n); }
 static void inventory_lock(void) { assert(!inventory_held); inventory_held = true; }
 static void inventory_unlock(void) { assert(inventory_held); inventory_held = false; }
 static int64_t sensor_now(void) { return clock_us; }
@@ -36,6 +39,12 @@ int main(int argc, char **argv)
     initialized_readonly = true;
     svc_rx_t rx = {0}; char line[256];
     while (fgets(line, sizeof line, stdin)) {
+        if (!strcmp(line, "@allocfail\n")) { fail_pin=true; continue; }
+        if (!strncmp(line, "@hashfail", 9)) { sensor_hash_fault=atoi(line+9); continue; }
+        if (!strcmp(line, "@recover\n")) { fail_pin=false;sensor_hash_fault=0;continue; }
+        if (!strcmp(line, "@assertnopin\n")) { assert(!s_sensor_pin && !s_sensor_size);continue; }
+        if (!strcmp(line, "@unbind\n")) { svc_engine_unbind(&s_engine);assert(!s_sensor_pin);continue; }
+        if (!strcmp(line, "@exhaust\n")) { s_sensor_token=UINT64_MAX;continue; }
         if (!strcmp(line, "@advance\n")) { clock_us += 60001000; continue; }
         if (!strcmp(line, "@swap\n")) { fw[8] = 42; assert(sensor_inventory_accept(0, 2, fw, sizeof fw)); continue; }
         for (size_t i = 0; line[i]; ++i) {

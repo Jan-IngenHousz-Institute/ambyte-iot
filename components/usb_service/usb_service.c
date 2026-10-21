@@ -105,6 +105,9 @@ static const char *sensors_capture(void *context, uint64_t *token, size_t *size,
     if (!s_sensor_pin) return "no_memory";
     uint32_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t charge = heap_caps_get_allocated_size(s_sensor_pin);
+    /* The free-heap sample includes allocator metadata and rounding. Other
+     * tasks can allocate between samples, so retain a conservative charge;
+     * it may overcount concurrent activity but must never hide pin growth. */
     if (before > after && before - after > charge) charge = before - after;
     sensor_inventory_note_pin((uint32_t)charge);
     if (!sensor_inventory_snapshot(s_sensor_pin)) { sensors_release(context); return "sensors_unavailable"; }

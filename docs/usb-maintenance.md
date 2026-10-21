@@ -1069,7 +1069,11 @@ maintenance lock, ROM flash/probe/versions, shared reset and runner exit cleanup
 exclude refresh atomically. Parallel-run identity setup finishes before the
 first trigger. An acquisition-time timeout does not erase gains, currents or
 identity. A lost trigger ACK stays busy until completion is proven or an
-explicit existing reset/update recovery ends the run; inspection never resets
+explicit existing reset/update recovery ends the run. Explicit same-port acquisition
+retries remain possible. Schedule jobs retain exclusion across every action and
+recover an unproven abandoned run with shared-bank cleanup, including a stopped
+nonpersistent run. This recovery invalidates all four ports and waits the existing
+5 s boot grace; it is never used to collect an inspection snapshot. Inspection never resets
 it to force progress.
 
 Top-level `refresh` has these saturating uint32 diagnostic counters (ms/us are
@@ -1139,3 +1143,34 @@ inspection. Silence/malformed advertised responses are errors, not empty ports.
 Current fleet tools do not parse the USB identity line; the B2a phone driver is
 the next consumer. Existing attached[] telemetry and ambit.device/1 event shapes
 remain unchanged; these observation fields do not become measurement evidence.
+
+Host qualification runs without a connected gateway:
+
+```sh
+CC=clang python3 -m unittest discover -s tests
+python3 -m pytest flash_gui/tests
+CC=clang python3 tests/sensors_host/run.py --matrix --seeds 1,7
+python3 tools/qualify_sensor_resources.py .pio/build/esp32-s3-devkitm-1 --output /tmp/sensor-resources.json
+```
+
+The default suite includes the real inventory/serializer, complete UART driver,
+console handler and service provider, and the exact resident-worker/maintenance
+admission functions. Matrix seeds drive 4,000 transitions each across swaps,
+absent/reconnected ports, busy/veto windows, failed reads and in-flight
+invalidation; they also exercise clock quality/rollback, zero CRC, generation
+exhaustion and unsupported/silent/malformed spectral replies. The controller
+harness counts actual event admissions and NVS setters/commits through the
+production announcement tracker and NVS adapter over 1,000 stable and 1,000
+flapping calibration revalidations. Ten production trace records are compared
+byte for byte with controller/trace source loaded from A3 `6a57c2a` by `git show`.
+The service harness checks allocator/digest failures, pin replacement, expiry,
+rebind, token exhaustion and cleanup through the real framed Python client.
+These host gates do not replace the same-image device resource and acquisition
+checks in the sprint contract.
+
+The maintenance worker reserves task notification index 0 for queue/refresh wakeups.
+Job handlers must not wait on that index. The pin heap charge takes the larger
+of allocator-reported size and the measured free-heap delta; concurrent allocation
+can increase this conservative sample. Bench pin attribution is measured with
+other allocation bursts quiet, while the isolation bursts use their separate
+free-heap and low-water bounds.

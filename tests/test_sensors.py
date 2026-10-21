@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ("empty", "filled", "stale", "fresh_boundary", "absent", "swap",
              "busy", "veto", "reset", "reconnect", "spec_bare", "spec_silent",
              "stable", "old", "bad_values", "slice", "clocks", "zero_crc",
-             "exhaustion", "epoch", "bad_format", "cal_flap", "seeded")
+             "exhaustion", "epoch", "bad_format", "cal_flap", "seeded", "version_gate")
 
 
 def build(binary):

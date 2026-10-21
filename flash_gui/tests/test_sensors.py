@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import zlib
 
 from flash_gui import ambyte_serial, gui, sensor_diagnostics
@@ -174,6 +174,93 @@ class SensorClientTest(unittest.TestCase):
             client = ServiceClient(Serial(SnapshotDevice(self.raw), clock, mutate=mutate), None, clock=clock, sleep=clock.sleep)
             with self.subTest(field=field), self.assertRaises(ProtocolError):
                 client.sensors()
+
+    def test_descriptor_page_digest_and_transport_faults_invalidate_client(self):
+        faults = (("svc.sensors", "size", 16385), ("svc.sensors", "chunk", True),
+                  ("svc.sensors", "snapshot", "0" * 16),
+                  ("svc.sensors", "sha256", "0" * 64),
+                  ("svc.sensors.read", "data", "!"),
+                  ("svc.sensors.read", "data", ""),
+                  ("svc.sensors.read", "eof", True))
+        for when, field, bad in faults:
+            clock = Clock()
+            def mutate(action, result):
+                if action == when:
+                    result[field] = bad
+                return result
+            client = ServiceClient(Serial(SnapshotDevice(self.raw), clock, mutate=mutate),
+                                   None, clock=clock, sleep=clock.sleep)
+            with self.subTest(when=when, field=field), self.assertRaises(ProtocolError):
+                client.sensors()
+            self.assertFalse(client.active)
+        # An unplug after pinning is a transport failure, never an empty model.
+        clock = Clock()
+        board = SnapshotDevice(self.raw)
+        serial = Serial(board, clock)
+        original = serial.write
+        def disconnect(data):
+            if b"svc.sensors.read" in data:
+                raise OSError("unplugged")
+            return original(data)
+        serial.write = disconnect
+        client = ServiceClient(serial, None, clock=clock, sleep=clock.sleep)
+        from flash_gui.service_client import TransportError
+        with self.assertRaises(TransportError):
+            client.sensors(timeout=.2)
+        self.assertFalse(client.active)
+
+    def test_diagnostics_failure_always_closes_serial(self):
+        console, serial = self.console(raw=b"{malformed}")
+        with patch.object(sensor_diagnostics, "connect_after_boot", return_value=console):
+            with self.assertRaises(ambyte_serial.ConsoleError):
+                sensor_diagnostics.read_sensor_diagnostics("bench", log=lambda _: None)
+        self.assertTrue(serial.closed)
+
+    def test_gui_worker_survives_close_and_reports_errors_on_visible_surface(self):
+        for outcome in ("close_window", "new_window", "close_app", "failure"):
+            with self.subTest(outcome=outcome):
+                app = object.__new__(gui.App)
+                app.busy = False
+                app._sensor_view_generation = 1
+                app.sensor_window = Mock()
+                app.sensor_window.winfo_exists.return_value = True
+                app.sensor_message, app.sensor_details, app.sensor_tree = Mock(), Mock(), Mock()
+                app.sensor_tree.get_children.return_value = ("old",)
+                app.log = Mock()
+                app._selected_port = lambda: "bench"
+                app._open_sensor_panel = Mock()
+                app._apply_sensor_diagnostics = Mock()
+                app._set_busy = lambda busy: setattr(app, "busy", busy)
+                callbacks, jobs = [], []
+                app._post = lambda fn, *args: callbacks.append((fn, args))
+                class Thread:
+                    def __init__(self, *, target, daemon):
+                        self.target = target
+                    def start(self):
+                        jobs.append(self.target)
+                model = sensor_diagnostics.SensorDiagnostics(decode_sensors(self.raw), "observed")
+                with patch.object(gui.threading, "Thread", Thread), patch.object(
+                        sensor_diagnostics, "read_sensor_diagnostics", return_value=model) as reader:
+                    app._read_sensor_diagnostics()
+                    self.assertTrue(app.busy)
+                    if outcome == "close_window":
+                        app.sensor_window.winfo_exists.return_value = False
+                    elif outcome == "new_window":
+                        app._sensor_view_generation += 1
+                    elif outcome == "close_app":
+                        app._post = Mock(side_effect=RuntimeError("destroyed"))
+                    else:
+                        reader.side_effect = OSError("unplugged")
+                    jobs[0]()
+                for fn, args in callbacks:
+                    fn(*args)
+                app._apply_sensor_diagnostics.assert_not_called()
+                if outcome != "close_app":
+                    self.assertFalse(app.busy)
+                if outcome == "failure":
+                    app.sensor_message.set.assert_called_with("Sensor inspection failed: unplugged")
+                    app.sensor_tree.delete.assert_called_with("old")
+                    app.sensor_details.insert.assert_called_with("end", "Sensor inspection failed: unplugged")
 
     def test_diagnostics_callable_closes_serial_and_binds_four_widgets(self):
         console, serial = self.console()

@@ -169,9 +169,15 @@ int main(int argc, char **argv)
 
 size_t heap_caps_get_allocated_size(void *ptr) { return malloc_usable_size(ptr); }
 #ifndef SVC_JOBS_INTEGRATION
+#ifdef SVC_SENSOR_PEER
+static int sensor_hash_fault;
+#define SENSOR_HASH_FAIL(stage) do { if(sensor_hash_fault==(stage)) return -1; } while(0)
+#else
+#define SENSOR_HASH_FAIL(stage) ((void)0)
+#endif
 void mbedtls_sha256_init(mbedtls_sha256_context *c) { c->ctx = EVP_MD_CTX_new(); assert(c->ctx); }
-int mbedtls_sha256_starts(mbedtls_sha256_context *c, int n) { assert(!n); return EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
-int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *b, size_t n) { return EVP_DigestUpdate(c->ctx, b, n) == 1 ? 0 : -1; }
-int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char *b) { unsigned n = 0; return EVP_DigestFinal_ex(c->ctx, b, &n) == 1 && n == 32 ? 0 : -1; }
+int mbedtls_sha256_starts(mbedtls_sha256_context *c, int n) { SENSOR_HASH_FAIL(1); assert(!n); return EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
+int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *b, size_t n) { SENSOR_HASH_FAIL(2); return EVP_DigestUpdate(c->ctx, b, n) == 1 ? 0 : -1; }
+int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char *b) { SENSOR_HASH_FAIL(3); unsigned n = 0; return EVP_DigestFinal_ex(c->ctx, b, &n) == 1 && n == 32 ? 0 : -1; }
 void mbedtls_sha256_free(mbedtls_sha256_context *c) { EVP_MD_CTX_free(c->ctx); c->ctx = NULL; }
 #endif
