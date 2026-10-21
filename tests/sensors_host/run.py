@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Run the production sensor fault scenarios in seeded order."""
+"""Run the production sensor fault scenarios with seeded transition interleavings."""
 import argparse
 from pathlib import Path
 import random

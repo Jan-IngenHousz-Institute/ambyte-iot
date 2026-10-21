@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "sensor_inventory.h"
+/* Include the complete production unit to seed exhaustion, never a copied model. */
+#include "../../components/sensor_inventory/sensor_inventory.c"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -10,15 +12,19 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static int64_t us;
 static unsigned announcements, attempts[4][5];
 static bool absent[4];
-static unsigned spec_failure;
+static unsigned spec_failure, cal_failure;
+static bool invalidate_inflight;
+static int64_t utc_base = 1792531200000LL;
+static uint8_t quality = 3;
+static bool suspect_clock;
 static uint8_t firmware[4][48], calibration[4][140], spectral[4][132];
-static void lock(void) { assert(!pthread_mutex_lock(&mutex)); }
-static void unlock(void) { assert(!pthread_mutex_unlock(&mutex)); }
+static void host_lock(void) { assert(!pthread_mutex_lock(&mutex)); }
+static void host_unlock(void) { assert(!pthread_mutex_unlock(&mutex)); }
 static int64_t now(void) { return us; }
-static int64_t utc(void) { return 1792531200000LL + us / 1000; }
-static uint8_t clock_source(bool *suspect) { *suspect = false; return 3; }
+static int64_t utc(void) { return utc_base + us / 1000; }
+static uint8_t clock_source(bool *suspect) { *suspect = suspect_clock; return quality; }
 static void delay(uint32_t ms) { us += (int64_t)ms * 1000; }
-static bool announce(uint8_t ch, const ambit_device_info_t *info, const void *cal)
+static bool host_announce(uint8_t ch, const ambit_device_info_t *info, const void *cal)
 { (void)ch; assert(info->valid && cal); ++announcements; return true; }
 static sensor_read_result_t inspect(uint8_t ch, uint8_t type, void *out, size_t size,
     size_t *got, uint32_t timeout, void (*started)(uint8_t))
@@ -26,6 +32,8 @@ static sensor_read_result_t inspect(uint8_t ch, uint8_t type, void *out, size_t 
     assert(timeout <= 1000); assert(!sensor_inventory_busy());
     started(ch); ++attempts[ch][type]; *got = 0;
     if (absent[ch]) { delay(timeout); return type ? SENSOR_READ_FAILED : SENSOR_READ_ABSENT; }
+    if (type == 1 && cal_failure) { delay(timeout); return SENSOR_READ_FAILED; }
+    if (invalidate_inflight) { invalidate_inflight = false; sensor_inventory_invalidate(ch); }
     if (type == 4 && spec_failure) {
         delay(timeout);
         return spec_failure == 1 ? SENSOR_READ_UNSUPPORTED : SENSOR_READ_FAILED;
@@ -43,7 +51,7 @@ static void output(void)
     sensor_snapshot_t snapshot; assert(sensor_inventory_snapshot(&snapshot));
     assert(sensor_snapshot_json(&snapshot, write_json, NULL)); puts("");
 }
-static void f32(uint8_t *p, float f) { memcpy(p, &f, 4); }
+static void put_f32(uint8_t *p, float f) { memcpy(p, &f, 4); }
 static void populate(void)
 {
     for (unsigned ch = 0; ch < 4; ++ch) {
@@ -52,12 +60,12 @@ static void populate(void)
         snprintf((char *)calibration[ch], 20, "Sensor %u", ch);
         for (unsigned i = 0; i < 14; ++i) { int32_t value = -(int32_t)(1000*ch + i); memcpy(calibration[ch]+20+4*i, &value, 4); }
         for (unsigned i = 0; i < 6; ++i) { uint32_t value = 100*ch+i; memcpy(calibration[ch]+76+4*i, &value, 4); }
-        for (unsigned i = 100; i <= 136; i += 4) f32(calibration[ch]+i, (float)ch + 0.25f);
+        for (unsigned i = 100; i <= 136; i += 4) put_f32(calibration[ch]+i, (float)ch + 0.25f);
         spectral[ch][0] = 1;
-        for (unsigned i = 4; i <= 128; i += 4) f32(spectral[ch]+i, (float)ch + (float)i/4);
+        for (unsigned i = 4; i <= 128; i += 4) put_f32(spectral[ch]+i, (float)ch + (float)i/4);
     }
     const sensor_inventory_ports_t ports = {.now_us = now, .utc_ms = utc, .clock = clock_source,
-        .lock = lock, .unlock = unlock, .yield_ms = delay, .inspect = inspect, .announce = announce};
+        .lock = host_lock, .unlock = host_unlock, .yield_ms = delay, .inspect = inspect, .announce = host_announce};
     sensor_inventory_init(&ports, 0x123456789abcdefULL);
 }
 static void fill(void)
@@ -77,6 +85,105 @@ int main(int argc, char **argv)
 {
     assert(argc >= 2); populate();
     const char *scenario = argv[1];
+    if (!strcmp(scenario, "clocks")) {
+        for (quality = 0; quality <= 3; ++quality) {
+            utc_base = quality ? 1792531200000LL : 100; suspect_clock = quality == 2;
+            fill(); output(); delay(1000);
+        }
+        /* A wall-clock rollback changes UTC only; observation uptime/age stay monotonic. */
+        utc_base -= 3600000; fill(); output();
+        uint64_t first_boot = cache.boot_id; populate();
+        sensor_inventory_init(&io, first_boot + 1); assert(cache.boot_id != first_boot); return 0;
+    }
+    if (!strcmp(scenario, "zero_crc")) {
+        memset(calibration[0], 0, 140);
+        memcpy(calibration[0]+136, "\x7b\x39\xea\x1a", 4);
+        assert(sensor_inventory_crc32(calibration[0], 140) == 0);
+        fill(); assert(cache.ports[0].have_cal && cache.ports[0].identity.cal_version == 0);
+        unsigned count = announcements;
+        for (unsigned i = 0; i < 100; ++i) { step(); sensor_inventory_announce_pending(0); }
+        assert(announcements == count); output(); return 0;
+    }
+    if (!strcmp(scenario, "exhaustion")) {
+        cache.ports[0].generation = UINT32_MAX - 1;
+        assert(sensor_inventory_accept(0, 2, firmware[0], 48));
+        sensor_inventory_invalidate(0);
+        assert(!sensor_inventory_accept(0, 2, firmware[1], 48));
+        assert(!cache.ports[0].identity.valid && cache.ports[0].generation == UINT32_MAX);
+        output(); return 0;
+    }
+    if (!strcmp(scenario, "epoch")) {
+        fill(); work[0].phase = 1; invalidate_inflight = true;
+        step(); assert(!cache.ports[0].identity.valid && !cache.ports[0].have_cal);
+        assert(cache.ports[0].generation == 1); output(); return 0;
+    }
+    if (!strcmp(scenario, "bad_format")) {
+        spectral[0][0] = 2;
+        for (unsigned i = 0; !attempts[0][4] && i < 20; ++i) step();
+        assert(!cache.ports[0].have_spec && cache.ports[0].identity.valid);
+        unsigned count = attempts[0][4];
+        for (unsigned i = 0; i < 50; ++i) step();
+        assert(attempts[0][4] == count); output(); return 0;
+    }
+    if (!strcmp(scenario, "cal_flap")) {
+        fill(); sensor_port_snapshot_t saved = cache.ports[0];
+        for (unsigned i = 0; i < 2000; ++i) {
+            cal_failure = i % 2;
+            do { step(); } while (work[0].phase != 0);
+            sensor_inventory_announce_pending(0);
+            assert(cache.ports[0].generation == saved.generation);
+            assert(!memcmp(cache.ports[0].calibration, saved.calibration, 140));
+        }
+        assert(announcements == 4); output(); return 0;
+    }
+    if (!strcmp(scenario, "seeded")) {
+        uint32_t seed = argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 10) : 1;
+        unsigned kinds[8] = {0}; fill();
+        for (unsigned i = 0; i < 4000; ++i) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            unsigned ch = (seed >> 5) % 4, action = seed % 8; ++kinds[action];
+            sensor_port_snapshot_t before = cache.ports[ch];
+            if (action == 0) { /* Physical replacement clears calibration/config. */
+                firmware[ch][13] ^= 0x80;
+                assert(sensor_inventory_accept(ch, 2, firmware[ch], 48));
+                assert(cache.ports[ch].generation == before.generation + 1);
+                assert(!cache.ports[ch].have_cal && !cache.ports[ch].identity.gains_set);
+            } else if (action == 1) { /* Failed presence, then same-MAC reconnect. */
+                absent[ch] = true; work[ch].phase = 0; work[ch].due_ms = -1; step();
+                assert(!cache.ports[ch].present && !cache.ports[ch].have_cal);
+                absent[ch] = false; assert(sensor_inventory_accept(ch, 2, firmware[ch], 48));
+                assert(cache.ports[ch].generation == before.generation + 1);
+            } else if (action == 2) {
+                assert(sensor_inventory_acquire(ch));
+                unsigned counts[4][5]; memcpy(counts, attempts, sizeof counts);
+                delay(seed % 10000); sensor_inventory_refresh();
+                assert(!memcmp(counts, attempts, sizeof counts));
+                assert(!memcmp(&before, &cache.ports[ch], sizeof before));
+                sensor_inventory_complete(ch);
+            } else if (action == 3) {
+                sensor_inventory_veto_begin(); sensor_inventory_refresh();
+                assert(sensor_inventory_wait_ms() == UINT32_MAX); sensor_inventory_veto_end();
+            } else if (action == 4) {
+                assert(sensor_inventory_accept(ch, 1, calibration[ch], 140));
+            } else if (action == 5) {
+                sensor_inventory_invalidate(ch); work[ch].phase = 1; work[ch].due_ms = -1;
+                invalidate_inflight = true; step(); assert(!cache.ports[ch].identity.valid);
+                assert(sensor_inventory_accept(ch, 2, firmware[ch], 48));
+            } else if (action == 6) {
+                cal_failure = 1; work[ch].phase = 2; work[ch].due_ms = -1; step(); cal_failure = 0;
+                assert(!memcmp(before.calibration, cache.ports[ch].calibration, 140));
+            } else {
+                uint8_t gains[6] = {1,2,3,4,5,6}; sensor_inventory_config(ch, gains, NULL);
+                assert(cache.ports[ch].identity.gains_set);
+            }
+            for (unsigned p = 0; p < 4; ++p) {
+                assert(cache.ports[p].identity.valid);
+                assert(!cache.ports[p].have_cal || cache.ports[p].identity.cal_version == sensor_inventory_crc32(cache.ports[p].calibration, 140));
+            }
+        }
+        for (unsigned i = 0; i < 8; ++i) assert(kinds[i] > 300);
+        output(); return 0;
+    }
     if (!strcmp(scenario, "empty")) { output(); return 0; }
     if (!strcmp(scenario, "filled")) { fill(); output(); return 0; }
     if (!strcmp(scenario, "stale")) { fill(); delay(60001); output(); return 0; }
@@ -144,7 +251,7 @@ int main(int argc, char **argv)
     }
     if (!strcmp(scenario, "bad_values")) {
         memset(calibration[0], 1, 20); calibration[0][0] = 0xc0;
-        f32(calibration[0]+100, __builtin_nanf("")); f32(spectral[0]+4, __builtin_inff());
+        put_f32(calibration[0]+100, __builtin_nanf("")); put_f32(spectral[0]+4, __builtin_inff());
         fill(); output(); return 0;
     }
     if (!strcmp(scenario, "slice")) {

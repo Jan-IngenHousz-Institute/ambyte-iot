@@ -12,14 +12,14 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ("empty", "filled", "stale", "fresh_boundary", "absent", "swap",
              "busy", "veto", "reset", "reconnect", "spec_bare", "spec_silent",
-             "stable", "old", "bad_values", "slice")
+             "stable", "old", "bad_values", "slice", "clocks", "zero_crc",
+             "exhaustion", "epoch", "bad_format", "cal_flap", "seeded")
 
 
 def build(binary):
     subprocess.run([os.environ.get("CC", "clang"), "-std=c11", "-Wall", "-Wextra", "-Werror",
                     "-g", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     "-I" + str(ROOT / "components/sensor_inventory/include"),
-                    str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
                     str(ROOT / "components/sensor_inventory/sensor_json.c"),
                     str(ROOT / "tests/sensors_host/driver.c"), "-pthread", "-lm", "-o", str(binary)], check=True)
 
@@ -46,6 +46,19 @@ class SensorsTest(unittest.TestCase):
                 for snapshot in self.run_case(name):
                     self.assertEqual(snapshot["contract"], 1)
                     self.assertEqual([p["port"] for p in snapshot["ports"]], list(range(4)))
+
+    def test_observation_clocks_and_rollback(self):
+        snapshots = self.run_case("clocks")
+        for source, snapshot in zip(("unavailable", "rtc", "hwm", "sntp"), snapshots):
+            stamp = snapshot["ports"][0]["sensor_id"]
+            self.assertEqual(stamp["clock"], None if source == "unavailable" else {"source": source, "suspect": source == "hwm"})
+            self.assertEqual(stamp["observed_utc_ms"] is None, source == "unavailable")
+        earlier, rollback = (s["ports"][0]["sensor_id"] for s in snapshots[-2:])
+        self.assertLess(rollback["observed_utc_ms"], earlier["observed_utc_ms"])
+        self.assertGreater(rollback["observed_uptime_ms"], earlier["observed_uptime_ms"])
+        zero = self.run_case("zero_crc")[0]["ports"][0]
+        self.assertEqual(zero["calibration_digest"]["value"]["hex"], "00000000")
+        self.assertIsNotNone(zero["calibration"]["value"])
 
     def test_exact_calibration_bytes_crc_and_endianness(self):
         snapshot = self.run_case("filled")[0]
