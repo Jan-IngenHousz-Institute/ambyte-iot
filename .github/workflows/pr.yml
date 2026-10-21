@@ -191,6 +191,8 @@ jobs:
             --elf .pio/build/esp32-s3-devkitm-1/firmware.elf \
             --bin .pio/build/esp32-s3-devkitm-1/firmware.bin \
             --sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json
+          python tools/check_sensor_no_fpu.py \
+            .pio/build/esp32-s3-devkitm-1/components/sensor_inventory/sensor_json.c.o
 
       - name: Verify version and create flash ZIP
         if: steps.scope.outputs.firmware-build-required == 'true'

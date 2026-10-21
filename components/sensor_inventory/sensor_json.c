@@ -1,6 +1,6 @@
 #include "sensor_inventory.h"
 
-#include <math.h>
+#include <float.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,10 +63,37 @@ static void base64(writer_t *w, const unsigned char *b, size_t n)
 }
 static uint32_t u32(const unsigned char *p)
 { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static double binary32_to_binary64(uint32_t bits)
+{
+    _Static_assert(FLT_RADIX == 2 && FLT_MANT_DIG == 24 && FLT_MAX_EXP == 128 &&
+                   DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024 && sizeof(double) == 8,
+                   "sensor wire values and printf doubles require IEEE binary32/binary64");
+    /* Do not evaluate a float here, including isfinite(float). Xtensa's
+     * first single-precision FPU use permanently pins an unpinned task to its
+     * current core (IDF portasm _frxt_coproc_exc_hook). A plain snapshot used
+     * to pin console_repl to CPU0; subsequent integer-only service traffic
+     * then starved IDLE0. Widen the finite IEEE wire image using integers.
+     * Double formatting remains the existing software-double printf path. */
+    uint32_t fraction = bits & 0x007fffffu;
+    int exponent = (int)((bits >> 23) & 255u);
+    uint64_t wide = (uint64_t)(bits & 0x80000000u) << 32;
+    if (exponent || fraction) {
+        if (!exponent) {
+            exponent = 1;
+            while (!(fraction & 0x00800000u)) { fraction <<= 1; --exponent; }
+        }
+        wide |= (uint64_t)(exponent + (1023 - 127)) << 52;
+        wide |= (uint64_t)(fraction & 0x007fffffu) << (52 - 23);
+    }
+    double value;
+    memcpy(&value, &wide, sizeof value);
+    return value;
+}
 static void floating(writer_t *w, const unsigned char *p)
 {
-    uint32_t bits = u32(p); float value; memcpy(&value, &bits, 4);
-    if (isfinite(value)) number(w, "%.9g", (double)value); else raw(w, "null");
+    uint32_t bits = u32(p);
+    if ((bits & 0x7f800000u) == 0x7f800000u) raw(w, "null");
+    else number(w, "%.9g", binary32_to_binary64(bits));
 }
 static void observation_end(writer_t *w, const sensor_stamp_t *s, const char *source, bool available)
 {
