@@ -253,7 +253,8 @@ continues automatically; no restart needed.
    (works on unflashed chips). The name prompt is pre-filled with the stored
    name, else `AMBYTE_<MAC>`.
 2. **openJII registration + certificate + onboarding** — registers the MAC as
-   an `ambyte` device (or re-uses the existing registration), issues — or
+   an `ambyte` device owned by the **selected experiment's organization** (or
+   re-uses the existing registration, see *Device ownership*), issues — or
    rotates, when a live cert exists — its X.509 credentials, then calls
    `POST /api/v1/devices/{deviceId}/onboard` with the selected experiment. The
    call binds the device and returns the server-owned Thing name, broker
@@ -345,9 +346,27 @@ sequenceDiagram
   fixed UTC offset on the device).
 - openJII auth: the API exposes **no password login and no OAuth device
   flow**; the supported desktop flow is a personal **API key** sent as
-  `x-api-key`. Device-registry endpoints are additionally gated by the
-  `iot-devices` feature flag per user — a 403 means the flag is off for your
-  account.
+  `x-api-key`. The key only authenticates the operator during the run; the
+  board never sees it and delivers with its own certificate, so nobody needs
+  to hand their key over afterwards. The registry used to be gated by the
+  `iot-devices` feature flag; openJII removed that gate on 2026-09-14
+  (open-jii #2082), so a 403 is now an access decision (see below).
+- **Device ownership.** openJII has no route that moves a device between
+  organizations, so the GUI decides ownership at registration: a new device
+  is registered into the organization that owns the selected experiment. A
+  personal-workspace experiment (no organization name) keeps openJII's
+  default, the operator's personal workspace. Consequences:
+  - The operator must be a **member** of that organization, or registration
+    answers 403. A plain member is enough: registering seeds a creator grant,
+    so they can issue the certificate and onboard the board they just added.
+  - A board **someone else** registered into the organization is read-only
+    to a plain member, so certificate issuance answers 403. An organization
+    admin onboards it, or grants the operator admin on that device.
+  - A board already registered elsewhere (e.g. a student's personal
+    workspace) is re-used as-is and the log warns about the mismatch: it
+    still delivers to the experiment, but only its current owners manage it.
+    Delete it on openJII and onboard again to re-home it. A board registered
+    by an account whose devices you cannot see fails with a 409 naming that.
 - The AWS IoT broker endpoint and ingest topic prefix are authoritative values
   from openJII's device-onboarding response. The GUI only appends the
   contract-required `/{sensorVersion}/{sensorId}` suffix because that portion

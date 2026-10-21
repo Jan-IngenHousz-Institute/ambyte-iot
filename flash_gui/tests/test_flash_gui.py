@@ -294,6 +294,129 @@ def test_onboard_device_rejects_config_without_selected_topic(monkeypatch):
         client.onboard_device("device-id", "selected")
 
 
+def test_list_experiments_targets_named_org_only(monkeypatch):
+    client = openjii_client.OpenJIIClient(config.ENVIRONMENTS["dev"], "jii_test")
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: (200, [
+        {"id": "exp-org", "name": "Australia", "status": "active",
+         "organizationId": "org-jii", "organizationName": "JII"},
+        # A personal workspace still has an org id, but no name: another
+        # operator cannot create into it, so it must not become a target.
+        {"id": "exp-personal", "name": "Mine", "status": "active",
+         "organizationId": "org-personal", "organizationName": None},
+    ]))
+
+    org, personal = client.list_experiments()
+
+    assert (org.organization_id, org.organization_name) == ("org-jii", "JII")
+    assert org.device_organization_id == "org-jii"
+    assert personal.organization_id == "org-personal"
+    assert personal.device_organization_id is None
+
+
+def _registry_client(monkeypatch, tmp_path, responses):
+    """A client whose _request answers by (method, path) and records calls."""
+    client = openjii_client.OpenJIIClient(config.ENVIRONMENTS["dev"], "jii_test")
+    calls = []
+
+    def request(method, path, body=None, timeout=60):
+        calls.append((method, path, body))
+        return responses[(method, path)]
+
+    monkeypatch.setattr(client, "_request", request)
+    monkeypatch.setattr(openjii_client, "_write_bundle",
+                        lambda thing, creds, log=print: tmp_path)
+    return client, calls
+
+
+CREDS = {"certificatePem": "cert", "privateKey": "key", "certificateId": "c1"}
+
+
+def test_provision_registers_new_device_into_experiment_org(monkeypatch, tmp_path):
+    client, calls = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, []),
+        ("POST", "/api/v1/devices"): (201, {
+            "id": "dev-1", "thingName": THING, "status": "pending",
+            "organizationId": "org-jii"}),
+        ("POST", "/api/v1/devices/dev-1/credentials"): (201, CREDS),
+    })
+
+    identity = client.provision_device(MAC, "Roof-3", organization_id="org-jii",
+                                       organization_label="JII",
+                                       log=lambda _m: None)
+
+    assert identity.thing_name == THING
+    assert calls[1] == ("POST", "/api/v1/devices", {
+        "serialNumber": MAC, "deviceType": "ambyte", "name": "Roof-3",
+        "organizationId": "org-jii"})
+
+
+def test_provision_without_org_keeps_personal_default(monkeypatch, tmp_path):
+    client, calls = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, []),
+        ("POST", "/api/v1/devices"): (201, {
+            "id": "dev-1", "thingName": THING, "status": "pending"}),
+        ("POST", "/api/v1/devices/dev-1/credentials"): (201, CREDS),
+    })
+
+    client.provision_device(MAC, None, log=lambda _m: None)
+
+    assert "organizationId" not in calls[1][2]
+
+
+def test_register_into_org_as_non_member_names_the_fix(monkeypatch, tmp_path):
+    client, _ = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, []),
+        ("POST", "/api/v1/devices"): (403, {"message": "Forbidden"}),
+    })
+
+    with pytest.raises(OpenJIIError, match="must be a member of it"):
+        client.provision_device(MAC, None, organization_id="org-jii",
+                                organization_label="JII", log=lambda _m: None)
+
+
+def test_register_conflict_with_invisible_device_says_who_holds_it(
+        monkeypatch, tmp_path):
+    client, _ = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, []),
+        ("POST", "/api/v1/devices"): (409, {"message": "already registered"}),
+    })
+
+    with pytest.raises(OpenJIIError, match="cannot see"):
+        client.provision_device(MAC, None, organization_id="org-jii",
+                                log=lambda _m: None)
+
+
+def test_existing_device_in_other_org_is_reused_with_warning(monkeypatch, tmp_path):
+    client, calls = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, [{
+            "id": "dev-1", "thingName": THING, "serialNumber": MAC,
+            "status": "active", "organizationId": "org-personal"}]),
+        ("POST", "/api/v1/devices/dev-1/credentials/rotate"): (201, CREDS),
+    })
+    logs = []
+
+    identity = client.provision_device(MAC, None, organization_id="org-jii",
+                                       organization_label="JII",
+                                       log=logs.append)
+
+    assert identity.rotated
+    assert not any(c[:2] == ("POST", "/api/v1/devices") for c in calls)
+    assert any(m.startswith("WARNING:") and "org-personal" in m for m in logs)
+
+
+def test_issuing_on_a_read_only_device_names_the_fix(monkeypatch, tmp_path):
+    client, _ = _registry_client(monkeypatch, tmp_path, {
+        ("GET", "/api/v1/devices"): (200, [{
+            "id": "dev-1", "thingName": THING, "serialNumber": MAC,
+            "status": "pending", "organizationId": "org-jii"}]),
+        ("POST", "/api/v1/devices/dev-1/credentials"): (403, {"message": "no"}),
+    })
+
+    with pytest.raises(OpenJIIError, match="may not manage it"):
+        client.provision_device(MAC, None, organization_id="org-jii",
+                                log=lambda _m: None)
+
+
 @pytest.mark.parametrize("endpoint,expected", [
     ("example-ats.iot.eu-central-1.amazonaws.com",
      "mqtts://example-ats.iot.eu-central-1.amazonaws.com:8883"),
@@ -331,8 +454,9 @@ def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatc
         def __init__(self):
             self.calls = []
 
-        def provision_device(self, serial, name, log=print):
-            self.calls.append(("provision", serial, name))
+        def provision_device(self, serial, name, organization_id=None,
+                             organization_label="", log=print):
+            self.calls.append(("provision", serial, name, organization_id))
             return identity
 
         def onboard_device(self, device_id, experiment_id):
@@ -355,6 +479,8 @@ def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatc
         timezone="Europe/Amsterdam",
         wifi_ssid="Fionas Garden",
         wifi_password="secret",
+        organization_id="org-jii",
+        organization_label="JII",
     )
     run = DeviceRun(
         port="COM7",
@@ -371,7 +497,7 @@ def test_prepare_provisioning_uses_openjii_endpoint_topic_and_binding(monkeypatc
     procedure.prepare_provisioning(context, run, log=lambda _message: None)
 
     assert client.calls == [
-        ("provision", MAC, "Roof-3"),
+        ("provision", MAC, "Roof-3", "org-jii"),
         ("onboard", "device-id", "experiment-id"),
     ]
     assert run.plan.mqtt_uri == "mqtts://server-owned.iot.example:8883"
