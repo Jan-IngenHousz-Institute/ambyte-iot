@@ -29,6 +29,7 @@ class SensorsUartTest(unittest.TestCase):
             result = subprocess.run([binary], capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertIn(b"shared_bank_race=1", result.stdout)
+            self.assertIn(b"RECOVERY_REGRESSION_OK late_refused=4 leaf_failure_budget=3 whole_job_veto=1", result.stdout)
 
 
 if __name__ == "__main__":

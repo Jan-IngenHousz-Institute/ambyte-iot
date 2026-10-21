@@ -26,6 +26,9 @@ static bool recovery_test, recovery_silent, recovery_second_silent, recovery_bur
 static unsigned recovery_wakes, recovery_phase, recovery_race_phase;
 static bool sleep_model, worst_jitter, jitter_done;
 static int64_t leaf_activity, leaf_sleep_ms=500, first_window_tx, gap_end;
+static int64_t jitter_offset_us=450000;
+static unsigned recovery_blocks;
+static sensor_recovery_result_t last_recovery_result;
 
 static uint8_t recovery_target = 3;
 static _Atomic bool release_waiter;
@@ -40,7 +43,7 @@ static uint8_t quality(bool *suspect) { *suspect = false; return 3; }
 void vTaskDelay(TickType_t ms) { if (checking_veto) { unsigned before=writes; sensor_inventory_refresh(); assert(writes==before && sensor_inventory_wait_ms()==UINT32_MAX); } if (recovery_test && recovery_phase==1 && worst_jitter) {
         if (!gap_end) gap_end=clock_us+200000;
         if (!jitter_done && clock_us+(int64_t)ms*1000>=gap_end) {
-            clock_us=first_window_tx+450000-(int64_t)ms*1000;jitter_done=true;
+            clock_us=first_window_tx+jitter_offset_us-(int64_t)ms*1000;jitter_done=true;
         }
     }
     clock_us += (int64_t)ms * 1000; waiting = true;
@@ -136,10 +139,17 @@ int uart_read_bytes(uart_port_t port, void *out, uint32_t size, TickType_t wait)
     memcpy(out, rx + rx_at, n); rx_at += n; clock_us += 100; return (int)n;
 }
 static void started(uint8_t ch) { assert(ch < 4); ++refresh_starts; }
+static sensor_recovery_result_t tracked_recover(uint8_t ch, uint64_t epoch, bool poll, uint32_t timeout,
+    bool (*current)(uint8_t, uint64_t), void (*wire_started)(uint8_t))
+{
+    ++recovery_blocks;
+    last_recovery_result=uart_sensors_recover(ch,epoch,poll,timeout,current,wire_started);
+    return last_recovery_result;
+}
 static void recovery_cases(void)
 {
     const sensor_inventory_ports_t ports = {.now_us=esp_timer_get_time,.utc_ms=utc,.clock=quality,
-        .lock=lock,.unlock=unlock,.yield_ms=yield,.inspect=uart_sensors_inspect,.recover=uart_sensors_recover};
+        .lock=lock,.unlock=unlock,.yield_ms=yield,.inspect=uart_sensors_inspect,.recover=tracked_recover};
     const uint8_t gains[6]={1,2,3,4,5,6}, currents[3]={7,8,9};
     unsigned char fw[48]={1,4}, cal[140]={0};fw[8]=2;
     sensor_snapshot_t before,after;
@@ -166,7 +176,55 @@ static void recovery_cases(void)
     recovery_wakes=0;sensor_inventory_tick();
     assert(!sensor_inventory_busy() && recovery_wakes==3 && jitter_done);
     assert(sensor_inventory_snapshot(&after) && after.recovery_boot_idle[0]==1);
+    /* R711/T-a: beyond the450ms bound, ex2 must never reach the wire. Four
+     * late blocks are REFUSED, not failed leaf attempts, even though prime
+     * and ex1 transmitted. The full three-failure budget remains afterward. */
+    sensor_inventory_init(&ports,123);assert(sensor_inventory_accept(0,2,fw,48));
+    sleeping_epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,sleeping_epoch,0);
+    jitter_offset_us=520000;
+    for(unsigned late=0;late<4;++late) {
+        jitter_done=false;gap_end=0;leaf_activity=clock_us-2000000;recovery_wakes=0;
+        unsigned blocks_before=recovery_blocks;
+        sensor_inventory_tick();
+        assert(recovery_blocks==blocks_before+1 && last_recovery_result==SENSOR_RECOVERY_REFUSED);
+        assert(jitter_done && recovery_wakes==2);
+        assert(sensor_inventory_snapshot(&after) && after.busy==1 && !after.stalled);
+        assert(after.recovery_wire_transactions[0]==2*(late+1) && !after.refresh.wire_transactions[0]);
+        clock_us+=60000000;
+    }
     sleep_model=worst_jitter=false;gap_end=0;
+    jitter_offset_us=450000;recovery_silent=true;
+    for(unsigned failed=0;failed<3;++failed) {
+        recovery_wakes=0;sensor_inventory_tick();
+        assert(last_recovery_result==SENSOR_RECOVERY_FAILED && recovery_wakes==1);
+        assert(sensor_inventory_snapshot(&after) && after.busy==1);
+        assert(after.stalled==(failed==2 ? 1 : 0));
+        assert(after.recovery_wire_transactions[0]==9+failed);
+        clock_us+=(int64_t)60000000*(failed+1);
+    }
+    recovery_silent=false;
+    /* R702/T-b: a due recovery cannot run inside the runner's whole-job
+     * veto, including long action sleeps. Release the same veto and prove
+     * that the real UART recovery is live and completes the pending run. */
+    sensor_inventory_init(&ports,123);assert(sensor_inventory_accept(0,2,fw,48));
+    sensor_inventory_run_begin();
+    sleeping_epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,sleeping_epoch,1000);
+    clock_us+=1000000;recovery_wakes=0;
+    unsigned veto_blocks_before=recovery_blocks, veto_writes_before=writes;
+    for(unsigned held=0;held<4;++held) {
+        sensor_inventory_tick();
+        assert(recovery_blocks==veto_blocks_before && writes==veto_writes_before && !recovery_wakes);
+        assert(sensor_inventory_snapshot(&after) && after.busy==1 && !after.stalled);
+        for(unsigned ch=0;ch<4;++ch)
+            assert(!after.recovery_wire_transactions[ch] && !after.refresh.wire_transactions[ch]);
+        clock_us+=60000000;
+    }
+    sensor_inventory_veto_end();sensor_inventory_tick();
+    assert(recovery_blocks==veto_blocks_before+1 && last_recovery_result==SENSOR_RECOVERY_PROVEN);
+    assert(recovery_wakes==3 && !sensor_inventory_busy());
+    assert(sensor_inventory_snapshot(&after) && after.recovery_wire_transactions[0]==3);
+    assert(!after.refresh.wire_transactions[0]);
+    puts("RECOVERY_REGRESSION_OK late_refused=4 leaf_failure_budget=3 whole_job_veto=1");
     /* At least5 genuine UART-lock refusals consume no leaf attempt. */
     sensor_inventory_init(&ports,123);sleeping_epoch=sensor_inventory_acquire_run(0);
     sensor_inventory_run_window(0,sleeping_epoch,0);recovery_wakes=0;
