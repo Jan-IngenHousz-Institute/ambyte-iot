@@ -96,6 +96,8 @@ void sensor_inventory_reset(void);
 bool sensor_inventory_acquire(uint8_t ch);
 void sensor_inventory_complete(uint8_t ch);
 void sensor_inventory_veto_begin(void);
+/* Whole-job veto with acquisition-admission wait instrumentation. */
+void sensor_inventory_run_begin(void);
 void sensor_inventory_veto_end(void);
 bool sensor_inventory_legacy_read_begin(void);
 void sensor_inventory_legacy_read_end(void);

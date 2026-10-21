@@ -158,6 +158,13 @@ int main(void)
     assert(!memcmp(before.ports,after.ports,sizeof before.ports));
     assert(!memcmp(before.refresh.wire_transactions,after.refresh.wire_transactions,sizeof before.refresh.wire_transactions));
     assert(after.ports[0].identity.gains_set && after.ports[0].identity.currents_set);
+    /* Conservative busy excludes refresh, but cannot deadlock an explicit
+     * acquisition retry on that same port after a lost trigger ACK. */
+    query_fail=false;
+    assert(cmd_ambit_trigger(0,run_arr,1,0,false,100).status==ESP_OK);
+    assert(cmd_ambit_poll(0,&state,100).status==ESP_OK && state==AMBIT_ASYNC_IDLE);
+    assert(!sensor_inventory_busy());
+    unsigned reads_before=refresh_reads; revalidate();assert(refresh_reads>reads_before);
     fprintf(stderr,"CONTROLLER_OK stable=1000 flapping=1000 events_delta=0 setters_delta=0 commits_delta=0 owned_timeout=1 boots_distinct=1\n");
 #endif
     return 0;

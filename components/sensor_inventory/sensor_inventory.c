@@ -199,17 +199,19 @@ bool sensor_inventory_accept(uint8_t ch, uint8_t type, const void *bytes, size_t
 
 /* Refresh admission shares the metadata lock with every veto/acquisition
  * reservation. Blocking UART and all yielding occur after releasing it. */
-static bool reserve(bool acquisition, uint8_t ch)
+static bool reserve(bool acquisition, uint8_t ch, bool run_admission)
 {
     if (!initialized) return true;
     int64_t started = io.now_us(); bool waited = false;
     for (;;) {
         lock();
         if (!refreshing && !legacy_reading) {
-            if (acquisition && (cache.busy & (1u << ch))) { unlock(); return false; }
+            /* Busy excludes inspection. An explicit subsequent acquisition
+             * may retry that channel through its existing UART mutex after a
+             * lost ACK; the observation guard must not deadlock recovery. */
             (void)idle_now_locked();
             if (acquisition) cache.busy |= (uint8_t)(1u << ch); else ++vetoes;
-            if (acquisition && waited) {
+            if (run_admission && waited) {
                 increment(&cache.refresh.run_start_waits);
                 maximum(&cache.refresh.run_start_wait_max_us, elapsed_us(started));
             }
@@ -222,7 +224,7 @@ static bool reserve(bool acquisition, uint8_t ch)
     }
 }
 bool sensor_inventory_acquire(uint8_t ch)
-{ return ch < SENSOR_PORTS && reserve(true, ch); }
+{ return ch < SENSOR_PORTS && reserve(true, ch, true); }
 void sensor_inventory_complete(uint8_t ch)
 {
     if (ch >= SENSOR_PORTS) return;
@@ -232,7 +234,13 @@ void sensor_inventory_veto_begin(void)
 {
     /* Maintenance must wait for the one <=900ms refresh, never proceed with a
      * failed reservation. A task preemption is not permission to reset a bank. */
-    while (!reserve(false, 0)) if (io.yield_ms) io.yield_ms(1);
+    while (!reserve(false, 0, false)) if (io.yield_ms) io.yield_ms(1);
+}
+void sensor_inventory_run_begin(void)
+{
+    /* The runner reserves the whole job before any leaf is triggered. Count
+     * its admission here, where an already admitted refresh actually delays it. */
+    while (!reserve(false, 0, true)) if (io.yield_ms) io.yield_ms(1);
 }
 void sensor_inventory_veto_end(void)
 { lock(); (void)idle_now_locked(); if (vetoes) --vetoes; unlock(); sensor_inventory_wake(); }

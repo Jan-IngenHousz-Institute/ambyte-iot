@@ -18,6 +18,8 @@ class SensorWorkerTest(unittest.TestCase):
         exact = [app[start:end]] + [function(app, name) for name in (
             "app_maintenance_begin", "app_maintenance_end", "app_maint_submit",
             "app_sensors_wake", "app_maint_worker")]
+        runner = (ROOT / "components/sched_runner/sched_runner.c").read_text()
+        exact.append(function(runner, "sched_runner_exit_cleanup"))
         exact += ["#define s_cfg ambit_cfg", function(ota, "ambit_ota_run"), "#undef s_cfg"]
         with tempfile.TemporaryDirectory(prefix="sensor-worker-") as name:
             tmp = Path(name)

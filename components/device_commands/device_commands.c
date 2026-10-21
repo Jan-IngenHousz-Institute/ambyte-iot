@@ -3080,7 +3080,7 @@ cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms)
     }
     if (state) *state = resp.raw[0];
     uint8_t st = resp.raw[0];
-    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE) sensor_inventory_complete(ch);
+    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE || st == AMBIT_ASYNC_DONE) sensor_inventory_complete(ch);
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u state=%u", ch + 1, (unsigned)st);
 }
@@ -3199,7 +3199,6 @@ static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
                            "AMBIT%u OTA cmd %u: no answer", ch + 1, cmd[0]);
     }
     uint8_t st = resp.raw[0];
-    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE) sensor_inventory_complete(ch);
     if (status) *status = st;
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u OTA cmd %u status=%u", ch + 1, cmd[0], st);

@@ -1709,6 +1709,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
         }
         to = from + 1;
     }
+    sensor_inventory_veto_begin();
     int failures = 0;
     for (int ch = from; ch < to; ch++) {
         ambit_flash_probe_result_t r;
@@ -1722,6 +1723,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
             failures++;
         }
     }
+    sensor_inventory_veto_end();
     return (failures == 0) ? 0 : 1;
 }
 
@@ -2079,6 +2081,7 @@ static int cli_cmd_schedule(int argc, char **argv)
 static int cli_cmd_ambit_versions(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    sensor_inventory_veto_begin();
     printf("AMBIT firmware versions:\r\n");
     for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
         bool connected = false;
@@ -2098,6 +2101,7 @@ static int cli_cmd_ambit_versions(int argc, char **argv)
             printf("  AMBIT%u: present, no version (%s)\r\n", c + 1, esp_err_to_name(r.status));
         }
     }
+    sensor_inventory_veto_end();
     return 0;
 }
 

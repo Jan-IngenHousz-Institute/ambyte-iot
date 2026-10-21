@@ -356,6 +356,8 @@ static void run_job(int j)
     const sched_job_t *job = &s_prog.jobs[j];
     const char *name = sched_pool_str(&s_prog, job->name_off);
     if (s_should_stop) return;
+    /* Covers every action, inter-channel gap and timed actinic sleep. */
+    sensor_inventory_run_begin();
 
     taskENTER_CRITICAL(&s_dispatch_mux);
     s_running_job = j;
@@ -429,6 +431,7 @@ static void run_job(int j)
     taskENTER_CRITICAL(&s_dispatch_mux);
     s_running_job = -1;
     taskEXIT_CRITICAL(&s_dispatch_mux);
+    sensor_inventory_veto_end();
     maybe_run_deferred(j);
 }
 
@@ -537,6 +540,15 @@ uint32_t sched_runner_stack_margin(void)
     return margin;
 }
 
+/* Keep exit ownership as one operation: STOPPING must not expose an idle
+ * refresh gap before reset/light cleanup has completed. */
+static void sched_runner_exit_cleanup(void)
+{
+    sensor_inventory_veto_begin();
+    sched_runner_cleanup_lights();
+    sensor_inventory_veto_end();
+}
+
 static void sched_runner_task(void *arg)
 {
     const uint32_t generation = (uint32_t)(uintptr_t)arg;
@@ -623,9 +635,7 @@ static void sched_runner_task(void *arg)
         }
     }
 
-    sensor_inventory_veto_begin();
-    sched_runner_cleanup_lights();
-    sensor_inventory_veto_end();
+    sched_runner_exit_cleanup();
     sample_stack_margin();
 
     /* Stack high-water at exit: the number that trims SCHED_TASK_STACK after

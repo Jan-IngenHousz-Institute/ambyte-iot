@@ -231,7 +231,7 @@ static void stream_lock_give(void *lock, void *ctx)
  * not spend that timeout once on the channel mutex and again on shared UART0.
  * The production helper recomputes remaining ticks before each take and rolls
  * the channel mutex back if the shared-bus take cannot finish in time. */
-static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
+static esp_err_t channel_acquire_until_state(uint8_t ch, int64_t deadline_us, uart_sensor_state_t *previous)
 {
     void *shared_lock = s_ch[ch].shared ? (void *)s_uart0_mtx : NULL;
     if (!uart_stream_acquire_until((void *)s_ch_mtx[ch], shared_lock,
@@ -247,9 +247,12 @@ static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
         ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
                  ch, s_ch[ch].tx_pin, s_ch[ch].rx_pin);
     }
+    if (previous) *previous = s_ch[ch].state;
     s_ch[ch].state = UART_SENSOR_BUSY;
     return ESP_OK;
 }
+static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
+{ return channel_acquire_until_state(ch, deadline_us, NULL); }
 
 /* ── AMBIT ROM-flash: reset/boot sequencer ──────────────────────────────
  * See the AMBIT_RESET_GPIO block above. Forces one AMBIT into the ESP32-C3
@@ -312,6 +315,8 @@ esp_err_t uart_sensors_flash_session_begin(uint8_t ch, uint32_t wait_ms)
 void uart_sensors_flash_session_end(uint8_t ch)
 {
     if (ch >= UART_SENSOR_NUM_CHANNELS) return;
+    int64_t remaining = s_ping_fail_cache_not_before_us - now_us();
+    if (remaining > 0) vTaskDelay(pdMS_TO_TICKS((uint32_t)((remaining + 999) / 1000)));
     channel_release(ch);   /* leaves the channel DISCONNECTED → re-pinged later */
     sensor_inventory_veto_end();
 }
@@ -346,6 +351,7 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 1);
     ambit_note_shared_app_reset();
     ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_APP_BOOT_GRACE_US / 1000));
     sensor_inventory_veto_end();
     return ESP_OK;
 }
@@ -367,9 +373,7 @@ esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
          * so owning all four excludes transactions on UART0/1/2 without a
          * second shared-bus lock. Never reset while another channel is busy. */
         err = uart_sensors_run_app(0);
-        if (err == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(AMBIT_APP_BOOT_GRACE_US / 1000));
-        }
+
     }
     while (held > 0) xSemaphoreGive(s_ch_mtx[--held]);
     sensor_inventory_veto_end();
@@ -378,7 +382,7 @@ esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
 
 /* ── Ambit wake sequence ───────────────────────────────────────────── */
 
-static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t channel, void (*started)(uint8_t))
+static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t channel, void (*started)(uint8_t), bool *transmitted)
 {
     uart_flush_input(port);
 
@@ -386,6 +390,7 @@ static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t 
         /* Send 3 wake bytes (ambit light-sleep UART threshold = 3 edges) */
         uint8_t wake3[3] = { AMBIT_WAKE, AMBIT_WAKE, AMBIT_WAKE };
         int sent = uart_write_bytes(port, (const char *)wake3, sizeof(wake3));
+        if (sent > 0 && transmitted) *transmitted = true;
         if (sent > 0 && started) { started(channel); started = NULL; }
 
         int64_t retry_deadline = now_us() + (int64_t)WAKE_RETRY_MS * 1000;
@@ -420,7 +425,7 @@ static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t 
 }
 
 static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
-{ return ambit_wake_counted(port, deadline, 0, NULL); }
+{ return ambit_wake_counted(port, deadline, 0, NULL, NULL); }
 
 /* ── Send command (header + 8-byte cmd + optional extra) ───────────── */
 
@@ -662,14 +667,19 @@ sensor_read_result_t uart_sensors_inspect(uint8_t channel, uint8_t type, void *o
         size != (type == 0 ? 0u : type == 1 ? 140u : type == 2 ? 48u : 132u) ||
         (size && !out) || timeout_ms > SENSOR_BLOCK_MS) return SENSOR_READ_FAILED;
     const int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
-    uart_sensor_state_t previous_state = s_ch[channel].state;
-    if (channel_acquire_until(channel, deadline) != ESP_OK) return SENSOR_READ_FAILED;
+    uart_sensor_state_t previous_state;
+    if (channel_acquire_until_state(channel, deadline, &previous_state) != ESP_OK) return SENSOR_READ_FAILED;
+    /* Absence needs a real listening window after lock admission, never a
+     * nearly exhausted mutex budget or a leaf still in reset boot grace. */
+    bool presence_window = deadline - now_us() >= 500000 && now_us() >= s_ping_fail_cache_not_before_us;
     uart_port_t port = s_ch[channel].uart_num;
     sensor_read_result_t result = SENSOR_READ_FAILED;
     /* Count at the wire boundary. Ordinary query/ping/OTA traffic does not
      * pass this callback; acquiring a lock alone is not a wire transaction. */
-    if (ambit_wake_counted(port, deadline, channel, started) != ESP_OK) {
-        result = type == 0 ? SENSOR_READ_ABSENT : SENSOR_READ_FAILED;
+    if (now_us() < s_ping_fail_cache_not_before_us) goto done;
+    bool transmitted = false;
+    if (ambit_wake_counted(port, deadline, channel, started, &transmitted) != ESP_OK) {
+        result = type == 0 && presence_window && transmitted ? SENSOR_READ_ABSENT : SENSOR_READ_FAILED;
         goto done;
     }
     if (!type) { result = SENSOR_READ_OK; goto done; }

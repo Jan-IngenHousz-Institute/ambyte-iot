@@ -22,7 +22,8 @@ static bool led, autonomous, held[4];
 static int s_ch_mtx[4] = {0, 1, 2, 3};
 static int busy_lock = -1, resets, pulses, triggers, fetches, take_count;
 static int64_t clock_us = 1000000;
-static uint8_t last_cmd[8];
+static uint8_t last_cmd[8], poll_state = AMBIT_ASYNC_DONE;
+static bool poll_failure;
 static int64_t now_us(void) { return clock_us; }
 static int64_t esp_timer_get_time(void) { return clock_us; }
 static bool sched_runner_should_stop(void) { return stopped; }
@@ -39,6 +40,7 @@ static esp_err_t uart_sensors_run_app(uint8_t ch)
     assert(ch == 0);
     for (int i = 0; i < 4; i++) assert(held[i]);
     resets++; autonomous = false; led = false;
+    vTaskDelay(AMBIT_APP_BOOT_GRACE_US / 1000);
     return ESP_OK;
 }
 static cmd_result_t ambit_action(uint8_t ch, const uint8_t *cmd,
@@ -81,8 +83,8 @@ cmd_result_t ambit_trace_trigger(uint8_t ch, const ambit_trace_segment_t *segs,
 }
 cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout)
 {
-    (void)ch; (void)timeout; *state = AMBIT_ASYNC_DONE;
-    return (cmd_result_t){.status = ESP_OK};
+    (void)ch; (void)timeout; *state = poll_state;
+    return (cmd_result_t){.status = poll_failure ? ESP_ERR_TIMEOUT : ESP_OK};
 }
 cmd_result_t ambit_trace_fetch(uint8_t ch, ambit_trace_pending_t *pending,
         bool store, uint32_t timeout, ambit_trace_result_t *out)
@@ -149,13 +151,26 @@ int main(void)
     assert(resets == before + 1 && !led);
     for (int i = 0; i < 4; i++) assert(!held[i]);
 
-    /* Fresh nonpersistent generation or absent channels need no bank reset. */
+    /* A stopped nonpersistent run is also unproven until bank cleanup. */
     stopped = false; stop_on_trigger = true;
     trace(false);
-    before = resets; sched_runner_cleanup_lights(); assert(resets == before);
+    before = resets; sched_runner_cleanup_lights(); assert(resets == before + 1);
+    before = resets;
     stopped = false; present = false;
     trace(true);
     sched_runner_cleanup_lights(); assert(resets == before);
+
+    /* Lost trigger ACK, unknown poll state and a poll timeout retain cleanup
+     * even without persistence; the next run can proceed after recovery. */
+    present = true; stopped = stop_on_trigger = false;
+    for (unsigned fault = 0; fault < 3; ++fault) {
+        lost_ack = fault == 0; poll_state = fault == 1 ? 255 : AMBIT_ASYNC_DONE;
+        poll_failure = fault == 2;
+        before = resets; trace(false);
+        assert(resets == before + 1 && !led && !autonomous && !s_persist_attempted);
+    }
+    lost_ack = poll_failure = false; poll_state = AMBIT_ASYNC_DONE;
+    before = fetches; trace(false); assert(fetches == before + 1);
 
     /* Each possible contended channel rolls back without touching hardware;
      * retry succeeds only after all four are owned. */

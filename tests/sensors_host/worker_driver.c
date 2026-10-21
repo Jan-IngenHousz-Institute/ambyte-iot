@@ -21,6 +21,12 @@ typedef void *QueueHandle_t;
 static portMUX_TYPE s_maint_mux;
 static bool s_maint_busy;
 static QueueHandle_t s_maint_q=(void *)1;
+typedef void *TaskHandle_t;
+static TaskHandle_t s_maint_task;
+static unsigned notifications;
+static TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
+static BaseType_t xTaskNotifyGive(TaskHandle_t t) { assert(t);++notifications;return pdTRUE; }
+static uint32_t ulTaskNotifyTake(BaseType_t clear,TickType_t ticks);
 static int64_t clock_us;
 static bool boot_ready=true;
 static int target_type, target_op, jobs_run, reads, reads_at_queue;
@@ -33,6 +39,11 @@ static BaseType_t xQueueSend(QueueHandle_t,const void *,TickType_t);
 static BaseType_t xQueueReceive(QueueHandle_t,void *,TickType_t);
 static unsigned uxQueueMessagesWaiting(QueueHandle_t);
 static void guarded_op(void);
+static void sched_runner_cleanup_lights(void)
+{
+    assert(sensor_inventory_wait_ms()==UINT32_MAX);
+    unsigned before=(unsigned)reads; sensor_inventory_refresh();assert(before==(unsigned)reads);
+}
 typedef struct { unsigned op,channel; char id[8]; } ambit_ota_req_t;
 #define AMBIT_OP_VERSIONS 1
 #define AMBIT_OP_PROBE 2
@@ -51,14 +62,20 @@ static BaseType_t xQueueSend(QueueHandle_t q,const void *item,TickType_t t)
 static unsigned uxQueueMessagesWaiting(QueueHandle_t q) { (void)q;return qcount; }
 static BaseType_t xQueueReceive(QueueHandle_t q,void *out,TickType_t ticks)
 {
-    (void)q;
+    (void)q;assert(ticks==0);
     if(qcount) { *(maint_job_t *)out=queue[0];memmove(queue,queue+1,--qcount*sizeof *queue);return pdTRUE; }
     if(jobs_run==2) {
         assert(sensor_inventory_acquire(3));
         /* The following worker iteration must really block indefinitely. */
         jobs_run++;
-        memset(out,0,sizeof(maint_job_t)); return pdTRUE; /* a zero nudge */
+        return 0;
     }
+    return 0;
+}
+static uint32_t ulTaskNotifyTake(BaseType_t clear,TickType_t ticks)
+{
+    assert(clear);
+    if (notifications) { unsigned n=notifications;notifications=0;return n; }
     if(jobs_run==3 || !boot_ready) { assert(ticks==portMAX_DELAY);longjmp(done,1); }
     assert(ticks!=portMAX_DELAY && ticks<=60000);
     clock_us+=(int64_t)ticks*1000;
@@ -98,7 +115,7 @@ int main(void)
     ambit_cfg.maintenance_begin=app_maintenance_begin;ambit_cfg.maintenance_end=app_maintenance_end;
     const int types[]={0,2,1,4};
     for(unsigned phase=0;phase<4;++phase) for(target_op=0;target_op<4;++target_op) {
-        target_type=types[phase];jobs_run=reads=qcount=0;clock_us=0;
+        target_type=types[phase];jobs_run=reads=qcount=notifications=0;clock_us=0;
         sensor_inventory_ports_t ports={.now_us=esp_timer_get_time,.lock=no_lock,.unlock=no_lock,
             .yield_ms=yield_ms,.wake=app_sensors_wake,.inspect=wire};
         sensor_inventory_init(&ports,123);
@@ -108,7 +125,14 @@ int main(void)
         assert(snapshot.refresh.job_start_wait_max_us==900000);
         sensor_inventory_complete(3);
     }
-    jobs_run=qcount=0;boot_ready=false;
+    sched_runner_exit_cleanup();
+    assert(sensor_inventory_wait_ms()!=UINT32_MAX);
+    /* A notification storm cannot consume even one real job slot. */
+    jobs_run=qcount=0;
+    for(unsigned i=0;i<1000;++i) app_sensors_wake();
+    for(unsigned i=0;i<4;++i) assert(app_maint_submit(service_job,NULL));
+    assert(!app_maint_submit(service_job,NULL));
+    jobs_run=qcount=notifications=0;boot_ready=false;
     if(!setjmp(done)) app_maint_worker(NULL);
     puts("WORKER_OK phases=4 ops=4 priority=1 computed_wait=1 indefinite=1 job_wait_us=900000");
 }

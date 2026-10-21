@@ -18,7 +18,8 @@ static int mutexes[5], mutex_count;
 static unsigned char rx[512], payload[140];
 static size_t rx_at, rx_size;
 static unsigned writes, refresh_starts, mode;
-static bool absent, command_pending, race;
+static int64_t contention_us;
+static bool absent, command_pending, race, checking_veto, run_veto_race, tx_failed;
 static _Atomic bool waiting;
 static pthread_t acquisition;
 static void lock(void) { assert(!pthread_mutex_lock(&inventory_mutex)); }
@@ -26,13 +27,13 @@ static void unlock(void) { assert(!pthread_mutex_unlock(&inventory_mutex)); }
 int64_t esp_timer_get_time(void) { return clock_us; }
 static int64_t utc(void) { return 1792531200000LL; }
 static uint8_t quality(bool *suspect) { *suspect = false; return 3; }
-void vTaskDelay(TickType_t ms) { clock_us += (int64_t)ms * 1000; waiting = true; sched_yield(); }
+void vTaskDelay(TickType_t ms) { if (checking_veto) { unsigned before=writes; sensor_inventory_refresh(); assert(writes==before && sensor_inventory_wait_ms()==UINT32_MAX); } clock_us += (int64_t)ms * 1000; waiting = true; sched_yield(); }
 static void yield(uint32_t ms) { vTaskDelay(ms); }
 void identity_host_enter(portMUX_TYPE *mux) { (void)mux; }
 void identity_host_exit(portMUX_TYPE *mux) { (void)mux; }
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { assert(mutex_count < 5); return &mutexes[mutex_count++]; }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t p, TickType_t wait)
-{ int *held = p; if (*held) { clock_us += (int64_t)wait * 1000; return 0; } *held = 1; return pdTRUE; }
+{ int *held = p; if(contention_us) { clock_us+=contention_us;contention_us=0; } if (*held) { clock_us += (int64_t)wait * 1000; return 0; } *held = 1; return pdTRUE; }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t p) { int *held = p; assert(*held); *held = 0; return pdTRUE; }
 esp_err_t gpio_config(const gpio_config_t *config) { assert(config); return ESP_OK; }
 esp_err_t gpio_set_level(int pin, unsigned value) { (void)pin; (void)value; return ESP_OK; }
@@ -44,10 +45,11 @@ esp_err_t uart_set_pin(uart_port_t port, int tx, int r, int a, int b)
 esp_err_t uart_flush_input(uart_port_t port)
 { assert(port == 0); rx_size = rx_at = 0; return ESP_OK; }
 static void *run(void *unused)
-{ (void)unused; assert(sensor_inventory_acquire(3)); return NULL; }
+{ (void)unused; if(run_veto_race) sensor_inventory_run_begin(); else assert(sensor_inventory_acquire(3)); return NULL; }
 int uart_write_bytes(uart_port_t port, const void *bytes, size_t size)
 {
     assert(port == 0); const unsigned char *p = bytes; ++writes;
+    if(tx_failed) return -1;
     if (p[0] == 0xaa) {
         if (race) {
             race = false; assert(!pthread_create(&acquisition, NULL, run, NULL));
@@ -78,7 +80,7 @@ int uart_read_bytes(uart_port_t port, void *out, uint32_t size, TickType_t wait)
 static void started(uint8_t ch) { assert(ch < 4); ++refresh_starts; }
 int main(void)
 {
-    assert(uart_sensors_init() == ESP_OK); clock_us = 0;
+    assert(uart_sensors_init() == ESP_OK); clock_us = 6000000;
     const sensor_inventory_ports_t ports = {.now_us = esp_timer_get_time, .utc_ms = utc, .clock = quality,
         .lock = lock, .unlock = unlock, .yield_ms = yield, .inspect = uart_sensors_inspect};
     sensor_inventory_init(&ports, 123);
@@ -93,7 +95,13 @@ int main(void)
         assert(uart_sensors_inspect(0, 2, out, 48, &got, 900, started) == SENSOR_READ_OK);
         assert(got == 48 && !memcmp(out, payload, 48)); mode = old_mode;
     }
-    mode = 0; unsigned previous = refresh_starts;
+    mode = 0;
+    absent=true;contention_us=800000;
+    assert(uart_sensors_inspect(0,0,NULL,0,&got,900,started)==SENSOR_READ_FAILED);
+    tx_failed=true;unsigned no_tx_before=refresh_starts;
+    assert(uart_sensors_inspect(0,0,NULL,0,&got,900,started)==SENSOR_READ_FAILED);
+    assert(refresh_starts==no_tx_before);tx_failed=false;absent=false;
+    unsigned previous = refresh_starts;
     uart_sensor_query_fn query = uart_sensors_get_query_fn();
     const unsigned opcodes[] = {20,21,22,23,24,25,26,27,33};
     for (unsigned i = 0; i < sizeof opcodes / sizeof opcodes[0]; ++i) {
@@ -102,8 +110,10 @@ int main(void)
         uart_sensor_response_free(&response); assert(refresh_starts == previous);
     }
     assert(uart_sensors_flash_session_begin(0, 100) == ESP_OK);
+    unsigned before_veto = writes; sensor_inventory_refresh();assert(writes==before_veto);
+    checking_veto = true;
     assert(uart_sensors_enter_download(0) == ESP_OK); assert(uart_sensors_run_app(0) == ESP_OK);
-    uart_sensors_flash_session_end(0); assert(refresh_starts == previous);
+    uart_sensors_flash_session_end(0); checking_veto = false; assert(refresh_starts == previous);
     /* Actual refresh-origin path proves its counter is live. */
     sensor_inventory_refresh(); sensor_snapshot_t snapshot; assert(sensor_inventory_snapshot(&snapshot));
     assert(snapshot.refresh.wire_transactions[0] == 1);
@@ -113,6 +123,36 @@ int main(void)
     assert(snapshot.refresh.run_start_waits == 1 && snapshot.refresh.run_start_wait_max_us <= 1000000);
     assert(snapshot.busy == 8); sensor_inventory_complete(3);
     assert(writes && refresh_starts == previous);
+    /* A real legacy timeout sets the raw driver disconnected while the owned
+     * run retains the full cache and configuration. */
+    assert(sensor_inventory_accept(0, 2, payload, 48));
+    unsigned char cal[140]={0};assert(sensor_inventory_accept(0,1,cal,140));
+    const uint8_t gains[6]={1,2,3,4,5,6}, currents[3]={7,8,9};sensor_inventory_config(0,gains,currents);
+    sensor_snapshot_t saved;assert(sensor_inventory_snapshot(&saved));
+    assert(sensor_inventory_acquire(0));
+    uint8_t cmd[8]={23};uart_sensor_response_t response={0};
+    assert(query(0,cmd,NULL,0,1,&response,900)!=ESP_OK);uart_sensor_response_free(&response);
+    unsigned before_busy=writes; sensor_inventory_refresh();assert(writes==before_busy);
+    assert(sensor_inventory_snapshot(&snapshot));assert(!memcmp(saved.ports,snapshot.ports,sizeof saved.ports));
+    sensor_inventory_complete(0);
+    checking_veto=true;assert(uart_sensors_reset_all(1000)==ESP_OK);checking_veto=false;
+    assert(sensor_inventory_wait_ms()!=UINT32_MAX);
+    /* The actual runner admission waits before triggering. Exercise every
+     * refresh phase so its counter cannot stay zero under whole-job vetoes. */
+    absent=false;run_veto_race=true;
+    for(unsigned phase=0;phase<4;++phase) {
+        sensor_inventory_init(&ports,123);
+        for(unsigned i=0;i<phase*4;++i) {
+            uint32_t wait=sensor_inventory_wait_ms();assert(wait!=UINT32_MAX);
+            clock_us+=(int64_t)wait*1000;sensor_inventory_refresh();
+        }
+        uint32_t wait=sensor_inventory_wait_ms();clock_us+=(int64_t)wait*1000;
+        race=true;waiting=false;sensor_inventory_refresh();assert(!pthread_join(acquisition,NULL));
+        assert(sensor_inventory_snapshot(&snapshot));
+        assert(snapshot.refresh.run_start_waits==1 && snapshot.refresh.run_start_wait_max_us>0);
+        assert(snapshot.refresh.run_start_wait_max_us<=1000000 && sensor_inventory_wait_ms()==UINT32_MAX);
+        sensor_inventory_veto_end();
+    }
     puts("UART_SENSOR_OK strict_frames=1 deadline=1 refresh_origin_only=1 shared_bank_race=1");
     return 0;
 }

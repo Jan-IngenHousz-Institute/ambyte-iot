@@ -387,7 +387,9 @@ static bool app_maint_submit(void (*run)(void *arg), void *arg)
     if (s_maint_q == NULL || run == NULL) return false;
     maint_job_t job = { .run = run, .arg = arg, .queued_us = esp_timer_get_time(),
         .behind_refresh = sensor_inventory_refresh_owned() && uxQueueMessagesWaiting(s_maint_q) == 0 };
-    return xQueueSend(s_maint_q, &job, 0) == pdTRUE;
+    if (xQueueSend(s_maint_q, &job, 0) != pdTRUE) return false;
+    if (s_maint_task) xTaskNotifyGive(s_maint_task);
+    return true;
 }
 
 /* A service Wi-Fi trial occupies this same resident worker. Queuing an update
@@ -404,31 +406,28 @@ static uint32_t app_maint_stack_margin(void)
 static bool app_service_boot_ready(void);
 static void app_sensors_wake(void)
 {
-    if (!s_maint_q || uxQueueMessagesWaiting(s_maint_q)) return;
-    /* A queue item closes the check/receive wake race without a polling task.
-     * If a real job is already queued it will wake the worker itself. */
-    const maint_job_t nudge = {0};
-    (void)xQueueSend(s_maint_q, &nudge, 0);
+    /* Notification counts latch across the check/wait boundary, coalesce
+     * bursts, and consume no slots in the four-job maintenance queue. */
+    if (s_maint_task) xTaskNotifyGive(s_maint_task);
 }
 static void app_maint_worker(void *arg)
 {
     (void)arg;
+    s_maint_task = xTaskGetCurrentTaskHandle();
     ota_update_run_boot_confirm();
     for (;;) {
         uint32_t wait = app_service_boot_ready() ? sensor_inventory_wait_ms() : UINT32_MAX;
         TickType_t ticks = wait == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(wait);
         if (wait && ticks == 0) ticks = 1;
         maint_job_t job;
-        if (xQueueReceive(s_maint_q, &job, ticks) == pdTRUE) {
-            if (!job.run) {
-                if (sensor_inventory_busy()) sensor_inventory_refresh();
-                continue;
-            }
+        if (xQueueReceive(s_maint_q, &job, 0) == pdTRUE) {
             if (job.behind_refresh) {
                 int64_t delay = esp_timer_get_time() - job.queued_us;
                 sensor_inventory_note_job_wait(delay > UINT32_MAX ? UINT32_MAX : (uint32_t)delay);
             }
             job.run(job.arg);
+        } else if (ulTaskNotifyTake(pdTRUE, ticks)) {
+            if (sensor_inventory_busy()) sensor_inventory_refresh();
         } else if (app_service_boot_ready()) sensor_inventory_refresh();
     }
 }
