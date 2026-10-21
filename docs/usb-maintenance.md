@@ -1572,3 +1572,20 @@ not a simulation of the bench USB traffic. Physical qualification includes
 the matching image without this guard. The guard must prevent resets and the
 unguarded control must reproduce the failure. The sensors watchdog checks
 add plain `sensors` before both service traffic variants in the same boot.
+
+## OTA image policy diagnostics
+
+The existing `ota_status` slot lines are retained. Signed images add one `policy: {JSON}` line: schema1, readable storage versions, written version, qualified fallback written version, refusal_state (`available`, `missing`, `corrupt`, `unavailable`) and last_refusal (`id`, `source`, `reason`, or null). Missing/invalid running metadata uses null versions. This read is diagnostic only; it never confirms an image. Older images have no policy line. The GUI parses this optional line and retains its legacy path. See [Signed images](signed-images.md) for format bytes, trust, new refusals and recovery.
+
+Illustrative request and additive response (the existing slot lines also remain):
+
+```text
+ota_status
+policy: {"schema":1,"readable":[1],"written":1,"fallback":1,"refusal_state":"available","last_refusal":{"id":"a5-trial","source":"https","reason":"signature_invalid"}}
+```
+
+Sources are `https`, `jobs`, `clone` or test-only `hil`. A missing record returns
+`refusal_state:"missing",last_refusal:null`; an unreadable or corrupt record uses
+`unavailable` or `corrupt` with null. Values describe historical refusal evidence,
+not the current update's success. Existing discovery/service capabilities stay
+unchanged; A5 adds no local image-upload action.

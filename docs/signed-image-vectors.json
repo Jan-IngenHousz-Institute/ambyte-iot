@@ -1,0 +1,166 @@
+{
+  "decode": [
+    {
+      "hex": "414d425954454d31010020000900000002000000010000000100000000000000",
+      "result": "2,1,1"
+    }
+  ],
+  "decision": [
+    {
+      "name": "legacy-v1-compatible",
+      "input": [
+        2,
+        1,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      "result": "ok"
+    },
+    {
+      "name": "new-reader-still-writes-v1",
+      "input": [
+        2,
+        1,
+        1,
+        6,
+        1,
+        1,
+        2
+      ],
+      "result": "ok"
+    },
+    {
+      "name": "new-writer-before-fallback-reader",
+      "input": [
+        2,
+        1,
+        1,
+        6,
+        2,
+        1,
+        2
+      ],
+      "result": "fallback_cannot_read_written"
+    },
+    {
+      "name": "qualified-reader-can-fallback",
+      "input": [
+        6,
+        1,
+        1,
+        6,
+        2,
+        1,
+        2
+      ],
+      "result": "ok"
+    },
+    {
+      "name": "rollback-left-v2-present",
+      "input": [
+        6,
+        1,
+        1,
+        2,
+        1,
+        1,
+        6
+      ],
+      "result": "candidate_cannot_read_present"
+    },
+    {
+      "name": "unknown-write31",
+      "input": [
+        2,
+        1,
+        1,
+        2147483650,
+        31,
+        1,
+        2
+      ],
+      "result": "fallback_cannot_read_written"
+    },
+    {
+      "name": "missing-fallback",
+      "input": [
+        2,
+        1,
+        1,
+        2,
+        1,
+        0,
+        2
+      ],
+      "result": "candidate_manifest_invalid"
+    },
+    {
+      "name": "wrong-qualified-fallback",
+      "input": [
+        2,
+        1,
+        1,
+        2,
+        1,
+        2,
+        2
+      ],
+      "result": "qualified_fallback_mismatch"
+    },
+    {
+      "name": "missing-running",
+      "input": [
+        0,
+        0,
+        0,
+        2,
+        1,
+        1,
+        2
+      ],
+      "result": "running_manifest_invalid"
+    },
+    {
+      "name": "empty-present",
+      "input": [
+        2,
+        1,
+        1,
+        2,
+        1,
+        1,
+        0
+      ],
+      "result": "present_versions_invalid"
+    },
+    {
+      "name": "safe-downgrade-retains-v2-reader",
+      "input": [
+        6,
+        2,
+        1,
+        6,
+        1,
+        2,
+        6
+      ],
+      "result": "ok"
+    },
+    {
+      "name": "unsafe-downgrade",
+      "input": [
+        6,
+        2,
+        1,
+        2,
+        1,
+        2,
+        6
+      ],
+      "result": "candidate_cannot_read_present"
+    }
+  ]
+}

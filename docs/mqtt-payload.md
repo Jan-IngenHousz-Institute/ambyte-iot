@@ -955,3 +955,17 @@ whether the stored `metadata`/`payload` columns move to the v3 field names is
 an implementation decision of the builder change (documented in
 [components/event_log/include/event_log.h](../components/event_log/include/event_log.h)
 when it lands).
+
+## OTA admission failure details
+
+The existing non-persisted `ota_status` object and Jobs `statusDetails.reason`
+keep their shapes and previous failure strings. Signed-image admission adds:
+`signature_invalid`, `running_manifest_invalid`, `candidate_manifest_invalid`,
+`present_versions_invalid`, `candidate_cannot_read_present`,
+`fallback_cannot_read_written`, and `qualified_fallback_mismatch`.
+A diagnostic persistence failure adds `refusal_persist_failed: <policy reason>`
+for these new failures only; pre-existing failure detail strings are unchanged.
+A failure is reported after the OTA handle is aborted, workload and comms resume,
+and bounded refusal persistence is attempted. It never implies a new boot slot
+or applied-ID latch. Firmware URL query credentials are not diagnostic fields.
+See [Signed images](signed-images.md) for the compatibility rule.
