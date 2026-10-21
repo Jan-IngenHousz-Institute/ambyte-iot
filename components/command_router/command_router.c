@@ -1,4 +1,5 @@
 #include "command_router.h"
+#include "command_router_pong.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -42,14 +43,10 @@ static void publish_reply(const char *json)
 
 static void handle_ping(const char *id)
 {
-    char reply[256];
+    char reply[448];
     const long long up_ms = (long long)(esp_timer_get_time() / 1000);
-    snprintf(reply, sizeof(reply),
-             "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld}",
-             id ? id : "",
-             s_cfg.device_id ? s_cfg.device_id : "",
-             s_cfg.firmware_version ? s_cfg.firmware_version : "",
-             up_ms);
+    if (!command_router_pong_json(reply, sizeof reply, id, s_cfg.device_id,
+                                  s_cfg.firmware_version, up_ms)) return;
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);
 }

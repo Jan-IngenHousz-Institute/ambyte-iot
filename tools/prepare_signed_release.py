@@ -11,11 +11,13 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from flash_gui.firmware_metadata import ImageError, inspect_image, key_id, sign_image
-from tools.check_release_signing import RELEASE_PIN, check_release, load_pin, private_key, reject_private_material
+from tools.check_release_signing import FIRST_SIGNED_RELEASE, RELEASE_PIN, check_release, load_boundary, load_pin, private_key, reject_private_material
 
 
-def prepare(assets: Path, version: str, pem: str, pin_path: Path = RELEASE_PIN) -> None:
+def prepare(assets: Path, version: str, pem: str, pin_path: Path = RELEASE_PIN,
+            boundary_path: Path = FIRST_SIGNED_RELEASE) -> None:
     pin = load_pin(pin_path)
+    boundary = load_boundary(boundary_path)
     if not pem:
         raise ImageError("AMBYTE_FIRMWARE_SIGNING_KEY_PEM is absent; firmware and schedule publication stopped")
     key = private_key(pem.encode())
@@ -26,6 +28,8 @@ def prepare(assets: Path, version: str, pem: str, pin_path: Path = RELEASE_PIN) 
     info = inspect_image(unsigned, require_manifest=True)
     if info.version != version:
         raise ImageError("promoted app version differs from semantic-release preview")
+    if tuple(map(int, version.split("-", 1)[0].split("."))) < tuple(map(int, boundary.split("."))):
+        raise ImageError("signed release version is below the reviewed first signed release boundary")
     bundle_path = assets / f"ambyte-iot-v{version}.zip"
     old_bundle = bundle_path.read_bytes()
     with zipfile.ZipFile(io.BytesIO(old_bundle)) as bundle:

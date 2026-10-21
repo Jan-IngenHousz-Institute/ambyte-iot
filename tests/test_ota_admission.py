@@ -26,18 +26,25 @@ class AdmissionTest(unittest.TestCase):
             "-Wall","-Wextra","-Werror","-Wno-unused-function","-fsanitize=address,undefined","-g","-O1",
             *(f"-I{i}" for i in includes),*map(str,sources),"-o",str(cls.binary)],capture_output=True,text=True)
         if p.returncode:raise RuntimeError(p.stderr)
+        from ota_fixture import image
+        from tools.check_release_signing import BENCH_KEY, private_key
+        from flash_gui.firmware_metadata import inspect_image, sign_image
+        cls.stale=Path(cls.temp.name)/"stale-signed.bin"
+        signed=sign_image(image(),private_key(BENCH_KEY.read_bytes()))
+        assert len(signed)==8192 and inspect_image(signed,require_signed=True).signature_present
+        cls.stale.write_bytes(signed)
 
     @classmethod
     def tearDownClass(cls):cls.temp.cleanup()
 
-    def run_case(self,path,scenario,cycles=1):
-        p=subprocess.run([str(self.binary),path,scenario,str(cycles)],capture_output=True,text=True)
+    def run_case(self,path,scenario,cycles=1,*extra):
+        p=subprocess.run([str(self.binary),path,scenario,str(cycles),*map(str,extra)],capture_output=True,text=True)
         self.assertEqual(p.returncode,0,p.stderr)
         return p.stdout.strip().removeprefix("TRACE=")
 
     def test_real_jobs_and_https_admission_order_and_no_latch_on_refusal(self):
         for path in ("https","jobs"):
-            prefix="PCVHSRM" if path=="jobs" else "PCSRM"
+            prefix="VPCHSRM" if path=="jobs" else "PCSRM"
             with self.subTest(path=path):self.assertEqual(self.run_case(path,"accept"),prefix+"FLX")
             for reason in ("signature","incompatible","persist_fail","incomplete","legacy_error","running_bad","candidate_bad"):
                 with self.subTest(path=path,reason=reason):
@@ -53,3 +60,12 @@ class AdmissionTest(unittest.TestCase):
 
     def test_signed_app_cannot_api_rollback_to_unsigned_forces_restart(self):
         self.assertEqual(self.run_case("health","rollback_error"),"KX")
+
+    def test_received_bound_refuses_valid_signature_in_stale_slot_tail(self):
+        for path in ("https","jobs"):
+            with self.subTest(path=path):
+                trace=self.run_case(path,"stale_tail",1,self.stale)
+                self.assertEqual(trace,("VPCH" if path=="jobs" else "PC")+"SAWNDE"+("B" if path=="jobs" else ""))
+
+    def test_jobs_version_prefilter_aborts_before_any_perform(self):
+        self.assertEqual(self.run_case("jobs","bad_version"),"VAWNDEB")

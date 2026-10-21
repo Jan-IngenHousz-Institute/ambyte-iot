@@ -189,10 +189,13 @@ bootloader, partitions and otadata; it is **not** the bootstrap test below.
 
 Release promotion signs the PR-built intermediate without rebuilding it. Dominik
 supplies secret `AMBYTE_FIRMWARE_SIGNING_KEY_PEM` and commits the reviewed public
-key ID in `tools/keys/release_firmware.keyid`. The committed placeholder
+key ID in `tools/keys/release_firmware.keyid` together with
+`tools/keys/first_signed_release.version`, taken from the final PR semantic-release
+preview. Both files start `UNCONFIGURED`. The boundary is the authoritative line
+for pre-signing releases and is never moved backwards. The committed placeholder
 `UNCONFIGURED` deliberately fails. A GitHub variable cannot silently select a
 different release root. **A5 must not merge until the real key, reviewed pin and
-CI secret exist.** Agents do not create the production key or secret.
+CI secret and reviewed first-signed boundary exist.** Agents do not create the production key or secret.
 
 `tools/publish_release_units.py` prepares and verifies the complete raw image and
 ZIP before either semantic-release call. Missing/placeholder pin, absent secret,
@@ -225,9 +228,11 @@ fingerprints before and after. `AMBYTE_NVS_SKIP=1 pio ... -t upload` does not
 preserve the bootloader or otadata and cannot qualify this transition.
 
 The accepted contract gives the full bench sequence. Evaluator first verifies
-there is no conflicting dev fleet workflow or active/scheduled Job. The helper
-conservatively rejects conflicts, including group Jobs, and monitors between
-trials. It accepts only thing `ambyte_28:37:2F:FF:E7:04` in dev account
+there is no conflicting dev fleet workflow or bench-targeted active/scheduled Job. The helper
+rejects active/scheduled Jobs targeting that thing directly or through any
+static/dynamic group or parent group, plus this repository's `fleet-deploy.yml`
+and `fleet-command.yml` runs/schedules. Unrelated dev Jobs do not block. It
+checks again between trials. It accepts only thing `ambyte_28:37:2F:FF:E7:04` in dev account
 084375565727. An existing dev S3 bucket is explicitly selected; no bucket or
 public access policy is created.
 
@@ -339,3 +344,56 @@ offline revocation. A future old-key-signed transition image built with
 SIGNED_ON_UPDATE disabled could bridge to another root, but it deliberately
 weakens the policy and needs a separate reviewed recovery design. A5 neither
 implements nor releases such an image. Receipt issuer key rotation is separate.
+
+
+## Legacy unsigned fleet recovery during cutover
+
+The 245 unsigned production units need their existing hotfix and rollback route
+until they are bootstrapped. Those images already accept arbitrary OTA; the
+explicit recovery path adds no new device-side capability. Normal
+`fleet_deploy.py` authenticates the pinned signed image and fails closed.
+Only `--legacy-unsigned-rollout` permits an unsigned asset, under all of these
+conditions:
+
+- The release pin **and** first-signed boundary are configured together in a
+  reviewed commit. Either placeholder blocks both deployment paths.
+- The official published `vX.Y.Z` tag is strictly below that boundary. The
+  canonical `firmware.bin` URL matches GitHub release metadata, and the
+  downloaded SHA256 matches GitHub's asset digest. Missing digest, unpublished
+  tag, arbitrary URL or a modern-manifest app is refused.
+- Every target freshly pongs `signed:false`, or sends a legacy pong without
+  that field. An explicit signed target, malformed field or missing reply is
+  refused before OTA publish. This path never forces a signed device back to
+  unsigned firmware. The signed application's own admission still rejects it.
+
+For example, after configuring both reviewed files, preview an explicitly
+selected still-unsigned unit's legacy recovery:
+
+```sh
+python3 tools/fleet_deploy/fleet_deploy.py --tag v2.7.0 --legacy-unsigned-rollout --allow-downgrade --devices "$A5_UNSIGNED_THING" --profile jii-dev-084 --dry-run
+```
+
+The GitHub Fleet deploy workflow exposes the same explicit option and retains
+the existing protected `fleet-deploy-prod` approval environment. Both console
+and workflow summary print **LEGACY UNSIGNED ROLLOUT**. It is a cutover
+exception to the transport guard, not a signing bypass or new OTA API. The
+first-signed boundary stays authoritative during key-loss/compromise recovery;
+never lower it to admit an asset. Signed-unit key recovery still needs the
+physical/trusted-transition procedure above.
+
+`identity` and pong add `signed` and `storage` without changing existing fields.
+The boolean reports the running build's IDF startup/update enforcement: this
+build cannot run without its own signature sector. Storage is the signed
+compiled manifest `{readable:[1],written:1,fallback:1}`, or null when unavailable.
+Absence on an older image means legacy unsigned with no storage claim.
+
+Jobs keeps its original early descriptor-version pre-filter: a mismatch aborts
+before any perform call, with its original detail string. A matching descriptor
+still requires complete download, full SHA, signature and manifest admission.
+No early manifest claim is trusted. Signature-negative fixtures repair ordinary
+XOR checksum and appended SHA after altering code or manifest, retaining the
+original signature sector so the device reaches the signature verifier.
+
+The preflight membership walk uses AWS [ListThingGroupsForThing](https://docs.aws.amazon.com/iot/latest/apireference/API_ListThingGroupsForThing.html)
+and [DescribeThingGroup parent metadata](https://docs.aws.amazon.com/cli/latest/reference/iot/describe-thing-group.html)
+to include direct and inherited group targets. It performs no registry changes.

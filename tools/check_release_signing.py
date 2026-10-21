@@ -13,6 +13,7 @@ from flash_gui.firmware_metadata import ImageError, MAX_SIGNED_BYTES, inspect_im
 
 BENCH_KEY = ROOT / "tools/keys/UNSAFE_BENCH_ONLY_firmware.pem"
 RELEASE_PIN = ROOT / "tools/keys/release_firmware.keyid"
+FIRST_SIGNED_RELEASE = ROOT / "tools/keys/first_signed_release.version"
 
 
 def private_key(data: bytes):
@@ -38,6 +39,15 @@ def load_pin(path: Path = RELEASE_PIN) -> str:
         raise ImageError("public bench key must never become the release root")
     return pin
 
+
+def load_boundary(path: Path = FIRST_SIGNED_RELEASE) -> str:
+    try:
+        version = path.read_text().strip()
+    except OSError as exc:
+        raise ImageError("first signed release boundary absent; configure it with the reviewed key ID") from exc
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version) or version == "0.0.0":
+        raise ImageError("first signed release boundary UNCONFIGURED/invalid; configure it with the reviewed key ID")
+    return version
 
 
 
@@ -65,6 +75,7 @@ def main(argv=None) -> int:
     p.add_argument("--sdkconfig-json", type=Path)
     p.add_argument("--elf", type=Path)
     p.add_argument("--pin", type=Path, default=RELEASE_PIN)
+    p.add_argument("--boundary", type=Path, default=FIRST_SIGNED_RELEASE)
     p.add_argument("--intermediate", action="store_true", help="NOT a release check; padded build input only")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(argv)
@@ -84,6 +95,7 @@ def main(argv=None) -> int:
             padded_intermediate(data)
             reject_private_material(data)
         else:
+            load_boundary(args.boundary)
             check_release(data, load_pin(args.pin))
         if args.elf:
             reject_private_material(args.elf.read_bytes())

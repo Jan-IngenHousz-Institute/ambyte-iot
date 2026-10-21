@@ -126,6 +126,26 @@ def test_malformed_log_line_ignored_before_response(transport):
     assert con.identity() == IDENTITY
 
 
+def test_additive_signature_and_storage_identity_and_legacy_default(transport):
+    obj=json.loads(wire())
+    obj.update(signed=True,storage={"readable":[1,2],"written":1,"fallback":1})
+    con,_=transport([json.dumps(obj).encode()+b"\r\nambyte> "])
+    result=con.identity()
+    assert result.signed is True and result.storage==obj["storage"]
+    con,_=transport([wire()+b"\r\nambyte> "])
+    result=con.identity()
+    assert result.signed is False and result.storage is None
+
+
+@pytest.mark.parametrize("fields", [{"signed":1},{"signed":"false"},
+    {"storage":{"readable":[1],"written":2,"fallback":1}},
+    {"storage":{"readable":[True],"written":1,"fallback":1}}])
+def test_bad_additive_firmware_identity_fails_closed(transport,fields):
+    obj=json.loads(wire());obj.update(fields)
+    con,_=transport([json.dumps(obj).encode()+b"\r\nambyte> "])
+    with pytest.raises(ConsoleError):con.identity()
+
+
 def test_probe_keeps_one_descriptor_through_30s_boot_and_uses_json(transport):
     _, ser = transport([wire() + b"\r\r\nambyte> "], boot=30, open_console=False)
     assert serial_client.PROBE_READY_TIMEOUT_S == 45.0

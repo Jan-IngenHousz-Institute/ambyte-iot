@@ -343,14 +343,9 @@ static void ota_do_update(const ota_request_t *r)
     bool policy_refusal = false;
     esp_err_t err = esp_https_ota_begin(&cfg, &h);
     if (err == ESP_OK) {
-        do {
-            err = esp_https_ota_perform(h);
-            vTaskDelay(1);   /* yield so the idle task feeds the task-WDT */
-        } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
-
-        bool complete = (err == ESP_OK) && esp_https_ota_is_complete_data_received(h);
-        if (err == ESP_OK && complete && r->expected_version[0] != '\0') {
-            /* Validate the received descriptor before policy/boot selection. */
+        if (err == ESP_OK && r->expected_version[0] != '\0') {
+            /* Cheap identity pre-filter before downloading the whole image. Full
+             * SHA, signature and compatibility admission still follow perform. */
             esp_app_desc_t incoming = {0};
             err = esp_https_ota_get_img_desc(h, &incoming);
             if (err == ESP_OK &&
@@ -360,8 +355,13 @@ static void ota_do_update(const ota_request_t *r)
                 check_detail = check_buf;
                 err = ESP_ERR_INVALID_VERSION;
             }
-            if (err != ESP_OK) complete = false;
         }
+        if (err == ESP_OK) do {
+            err = esp_https_ota_perform(h);
+            vTaskDelay(1);   /* yield so the idle task feeds the task-WDT */
+        } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+
+        bool complete = (err == ESP_OK) && esp_https_ota_is_complete_data_received(h);
         if (err == ESP_OK && complete && r->sha256[0] != '\0') {
             /* Before finish(), which is what switches the boot partition: a
              * digest mismatch must leave the running image selected. */
