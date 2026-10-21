@@ -512,6 +512,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 - **Build before you commit:** `pio run -e esp32-s3-devkitm-1` must pass (the single buildable env). Provisioning artifacts (`.env`, `device_certs/`, `flashed_macs.csv`) are gitignored — never commit them.
 - Keep the ports/adapters boundary intact: business logic lives in `device_commands` behind the `domain` port interfaces; drivers are adapters wired in `main/app_main.c`. Do not let `sched_runner` or the CLI reach past `device_commands`.
 - Much of the roadmap below is code-complete but **awaiting hardware verification** — note HW-test status in the PR when a change touches those paths.
+- Every PR uses `.github/pull_request_template.md`. A change to a device contract, protocol, storage layout, update path or fleet tool includes Mermaid diagrams of the mechanism (state, sequence, failure recovery) in the PR and in the matching `docs/` page, and terminal-style images rendered from the real bench captures of its qualification run, committed under `docs/images/<topic>/` with credentials redacted. See `docs/usb-maintenance.md` for the shape.
 
 ---
 
