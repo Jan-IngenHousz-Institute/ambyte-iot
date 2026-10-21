@@ -23,6 +23,7 @@ static bool cuts_enabled;
 static sched_identity_t loaded;
 typedef struct { char sha[65], version[32], fw[32], installed[32]; } metadata_t;
 static metadata_t metadata, pending_metadata;
+esp_err_t install_boot_read(char **bytes, size_t *length);
 
 static void cut(void)
 {
@@ -123,10 +124,11 @@ static void resume(void)
 {
     ++resumed; cut();
     if (!strcmp(scenario, "stale_loaded")) { running = true; return; }
-    char mapped[1024], text[SCHED_YAML_MAX_FILE_BYTES + 1], error[160];
-    FILE *f = __real_fopen(path("/littlefs/schedule.yaml", mapped), "rb");
-    if (!f) { running = false; memset(&loaded, 0, sizeof loaded); return; }
-    size_t n = fread(text, 1, sizeof text, f); assert(!fclose(f));
+    char *text = NULL, error[160]; size_t n = 0;
+    if (install_boot_read(&text, &n) != ESP_OK) {
+        running = true; memset(&loaded, 0, sizeof loaded);
+        loaded.kind = SCHED_SOURCE_EMBEDDED_DEFAULT; return;
+    }
     sched_program_t *program = malloc(sizeof *program); assert(program);
     if (sched_compile_text(text, n, program, error, sizeof error) != ESP_OK) {
         loaded.kind = SCHED_SOURCE_EMBEDDED_FALLBACK; running = true;
@@ -141,7 +143,7 @@ static void resume(void)
         running = true;
         if (!strcmp(scenario, "fallback")) loaded.kind = SCHED_SOURCE_EMBEDDED_FALLBACK;
     }
-    free(program); cut();
+    free(program); free(text); cut();
 }
 bool sched_runner_is_running(void) { return running; }
 esp_err_t sched_runner_identity(sched_identity_t *out) { *out = loaded; return ESP_OK; }
@@ -158,14 +160,16 @@ int main(int argc, char **argv)
         .sha256 = argv[3], .size = strtoul(argv[4], NULL, 10), .workbook = argv[5],
         .version = "a3", .built_fw = "test"};
     /* Establish a real compiled loaded-program boundary before install. */
+    cuts_enabled = !strcmp(scenario, "boot_cut");
     const char *saved_scenario = scenario; scenario = "initial"; resume(); scenario = saved_scenario;
     resumed = 0; cut_counter = 0; cuts_enabled = true;
     if (!strcmp(scenario, "already_active")) {
         strcpy(metadata.sha, d.sha256); strcpy(metadata.version, d.version); strcpy(metadata.fw, d.built_fw);
     }
     bool applied = false;
-    const char *error = !strcmp(scenario, "check") ? NULL : script_update_service_apply(&d, &applied);
-    printf("{\"reason\":\"%s\",\"applied\":%s,\"verified\":%s,\"suspended\":%u,\"resumed\":%u,\"renames\":%u,\"writes\":%u}\n",
+    const char *error = !strcmp(scenario, "check") || !strcmp(scenario, "boot_cut") ? NULL : script_update_service_apply(&d, &applied);
+    printf("{\"reason\":\"%s\",\"applied\":%s,\"verified\":%s,\"suspended\":%u,\"resumed\":%u,\"renames\":%u,\"writes\":%u,\"loaded_source\":\"%s\",\"loaded_sha\":\"%s\"}\n",
            error ? error : "", applied ? "true" : "false", script_update_service_matches(&d) ? "true" : "false",
-           suspended, resumed, renames, writes);
+           suspended, resumed, renames, writes,
+           loaded.kind == SCHED_SOURCE_INSTALLED ? "INSTALLED" : "EMBEDDED_DEFAULT", loaded.sha256);
 }

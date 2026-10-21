@@ -604,8 +604,9 @@ static void do_update_impl(const script_req_t *r)
         return;
     }
 
-    /* Swap: the previous schedule survives as schedule.yaml.bak. rename() is
-     * atomic on littlefs; a missing active file on first install is fine. */
+    /* Each rename is atomic on littlefs. A reset between rotation and install
+     * is repaired by the runner's boot read, which restores schedule.yaml.bak
+     * before selecting the embedded default. A first install has no prior. */
     remove(SCHEDULE_PATH_BAK);
     (void)rename(SCHEDULE_PATH, SCHEDULE_PATH_BAK);
     if (rename(SCHEDULE_PATH_NEW, SCHEDULE_PATH) != 0) {
@@ -664,7 +665,8 @@ static void do_update_url(const script_req_t *r)
  * compile, rotate .bak, swap atomically, record provenance. Shared by the
  * URL worker and the serial-push worker so the ONLY difference between them is
  * how schedule.yaml.new got written; the dangerous half has exactly one
- * implementation. Leaves schedule.yaml untouched on every failure path. */
+ * implementation. The previous program stays in .bak across the two-rename
+ * gap; the runner restores it if a reset leaves the active path missing. */
 static bool swap_validated_path(const script_req_t *r, const char *path, const char *got,
                                  bool strict, char *detail, size_t detail_cap)
 {
@@ -679,6 +681,8 @@ static bool swap_validated_path(const script_req_t *r, const char *path, const c
     if (strict && rotated != 0 && errno != ENOENT) {
         snprintf(detail, detail_cap, "backup rename failed"); return false;
     }
+    /* Crash boundary: the runner's boot read restores .bak if the following
+     * atomic rename has not landed. Never consume .bak before this point. */
     if (rename(path, SCHEDULE_PATH) != 0) {
         ESP_LOGE(TAG, "rename to %s failed", SCHEDULE_PATH);
         int restored = rename(SCHEDULE_PATH_BAK, SCHEDULE_PATH);

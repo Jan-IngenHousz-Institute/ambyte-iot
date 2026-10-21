@@ -40,6 +40,7 @@
  * fragmentation); a stop/start cycle costs only the task/TCB (~9 KB).
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,21 @@ static void sha256_hex(const uint8_t *data, size_t len, char out[65])
 static esp_err_t read_schedule_file(const char *path, char **out_buf, size_t *out_len)
 {
     FILE *f = fopen(path, "rb");
+    if (f == NULL && errno == ENOENT && strcmp(path, SCHED_PATH) == 0) {
+        /* Every installer rotates the validated previous program to .bak
+         * before atomically renaming its staged replacement into place. Each
+         * littlefs rename is durable and atomic, but the pair is not: a USB
+         * reconnect/reset can land between them. Repair that gap BEFORE the
+         * boot/restart path chooses the embedded default. Never replace an
+         * existing active file or promote uncommitted .new/svc staging bytes.
+         * A reset during this single recovery rename leaves either .bak or
+         * the active path intact, so the next boot can repeat the same repair.
+         * No release metadata is invented; digest matching remains required. */
+        if (rename(SCHED_PATH ".bak", SCHED_PATH) == 0) {
+            ESP_LOGW(TAG, "restored %s from interrupted schedule swap", SCHED_PATH);
+            f = fopen(path, "rb");
+        }
+    }
     if (f == NULL) return ESP_ERR_NOT_FOUND;
     char *buf = malloc(SCHED_YAML_MAX_FILE_BYTES + 1);
     if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }

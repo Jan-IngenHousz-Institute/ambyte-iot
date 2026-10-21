@@ -22,11 +22,16 @@ class ServiceInstallTest(unittest.TestCase):
         cls.binary = Path(cls.build.name) / "install"
         includes = [ROOT / "tests/identity_host/include", ROOT / "tests/host_stubs"]
         includes += list((ROOT / "components").glob("*/include"))
+        includes += [ROOT / "components/sched_runner", Path(cls.build.name)]
+        (Path(cls.build.name) / "default_yaml_embed.h").write_text(
+            'static const char default_yaml_start[] = "";\n'
+            'static const unsigned default_yaml_size = 0;\n')
         cmd = [os.environ.get("CC", "cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g",
                "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-fsanitize=address,undefined",
                "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                *(f"-I{path}" for path in includes),
                str(ROOT / "tests/svc_host/install_driver.c"),
+               str(ROOT / "tests/svc_host/install_boot.c"),
                str(ROOT / "components/script_update/script_update.c"),
                *(str(p) for p in sorted((ROOT / "components/sched_spec").glob("*.c"))),
                str(ROOT / "components/time_sync/time_sync.c"),
@@ -113,17 +118,57 @@ class ServiceInstallTest(unittest.TestCase):
             source = self.root / name
             if source.is_dir(): shutil.copytree(source, snapshot / name)
             else: shutil.copy2(source, snapshot / name)
+        (snapshot / "schedule.yaml.bak").write_bytes(OLD.replace(b"previous-schedule", b"older-schedule"))
         observed = set()
         for cut in range(1, 12):
             case = self.root / f"cut-{cut}"; shutil.copytree(snapshot, case)
-            self.run_case(cut=cut, root=case)
+            interrupted = self.run_case(cut=cut, root=case)
+            if cut <= 10: self.assertIsNone(interrupted, f"cut {cut} was not reached")
             result = self.run_case("check", root=case)
             exact = ((case / "schedule.yaml").exists() and
                      (case / "schedule.yaml").read_bytes() == FIXTURE and (case / "metadata").exists())
             self.assertEqual(result["verified"], exact, cut)
             observed.add(result["verified"])
-            self.assertTrue((case / "schedule.yaml.bak").exists() or (case / "schedule.yaml").exists())
+            # A backup alone is not recovery: the actual runner must boot the
+            # previous or complete new program, never its embedded default.
+            self.assertTrue((case / "schedule.yaml").exists(), f"cut {cut}: installed schedule missing at boot")
+            current = (case / "schedule.yaml").read_bytes()
+            self.assertIn(current, (OLD, FIXTURE), cut)
+            self.assertEqual(result["loaded_source"], "INSTALLED", cut)
+            self.assertEqual(result["loaded_sha"], hashlib.sha256(current).hexdigest(), cut)
         self.assertEqual(observed, {False, True})
+
+    def test_reset_during_backup_recovery_is_repeatable_and_preserves_staging(self):
+        for cut in (1, 2):  # before and after the atomic recovery rename
+            with self.subTest(cut=cut):
+                case = self.root / f"boot-cut-{cut}"
+                case.mkdir(); (case / "svc").mkdir()
+                (case / "schedule.yaml.bak").write_bytes(OLD)
+                (case / "svc/stage.bin").write_bytes(FIXTURE)
+                (case / "schedule.yaml.new").write_bytes(b"legacy staged bytes")
+                self.assertIsNone(self.run_case("boot_cut", cut=cut, root=case))
+                result = self.run_case("check", root=case)
+                self.assertEqual((case / "schedule.yaml").read_bytes(), OLD)
+                self.assertEqual(result["loaded_source"], "INSTALLED")
+                self.assertEqual(result["loaded_sha"], hashlib.sha256(OLD).hexdigest())
+                self.assertFalse(result["verified"])
+                self.assertEqual((case / "svc/stage.bin").read_bytes(), FIXTURE)
+
+    def test_existing_active_is_never_replaced_by_backup_at_boot(self):
+        (self.root / "schedule.yaml").write_bytes(FIXTURE)
+        (self.root / "schedule.yaml.bak").write_bytes(OLD)
+        result = self.run_case("check")
+        self.assertEqual((self.root / "schedule.yaml").read_bytes(), FIXTURE)
+        self.assertEqual((self.root / "schedule.yaml.bak").read_bytes(), OLD)
+        self.assertEqual(result["loaded_sha"], hashlib.sha256(FIXTURE).hexdigest())
+
+    def test_fresh_boot_does_not_promote_uncommitted_staging(self):
+        (self.root / "schedule.yaml").unlink()
+        result = self.run_case("check")
+        self.assertEqual(result["loaded_source"], "EMBEDDED_DEFAULT")
+        self.assertFalse((self.root / "schedule.yaml").exists())
+        self.assertEqual((self.root / "svc/stage.bin").read_bytes(), FIXTURE)
+        self.assertFalse(result["verified"])
 
 
 if __name__ == "__main__":

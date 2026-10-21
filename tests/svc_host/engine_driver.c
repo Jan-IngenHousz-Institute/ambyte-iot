@@ -75,6 +75,7 @@ static const char *apply(void *context, const svc_record_t *r, svc_truth_t *appl
     assert(!svc_engine_tick(&engine));
     assert(strstr(dispatch("svc.result 0000000000000001"), "\"timed_out\":true"));
     assert(strstr(dispatch("svc.result 0000000000000001"), "committing"));
+    assert(strstr(dispatch("svc.result 0000000000000001"), "\"reason\":\"activation_unverified\""));
     if (!strcmp(scenario, "apply_error")) return "workbook_mismatch";
     if (!lie) match = true;
     *applied = !strcmp(scenario, "already_active") ? SVC_FALSE : SVC_TRUE;

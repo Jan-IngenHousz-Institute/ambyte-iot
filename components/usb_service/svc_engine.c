@@ -171,7 +171,7 @@ const char *svc_engine_tick(svc_engine_t *e)
             bool matched = e->ports.schedule_matches && e->ports.schedule_matches(e->ports.context, &r);
             r.state = matched ? SVC_SUCCEEDED : SVC_UNCERTAIN;
             r.applied = SVC_UNKNOWN;
-            reason(&r, matched ? "" : "activation_unverified");
+            reason(&r, matched ? "" : "interrupted");
         } else {
             r.saved = SVC_FALSE;
             reason(&r, "interrupted");

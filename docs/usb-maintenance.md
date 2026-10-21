@@ -583,10 +583,25 @@ once ownership ends. The client may stop polling while keeping its intent.
 
 After reboot, staging resumes. A prior committing schedule is reconciled only
 after runner startup: the complete loaded/file/release tuple yields succeeded,
-with `applied:null` if attribution is unknown; otherwise uncertain. It is never
+with `applied:null` if attribution is unknown; otherwise
+`state:"uncertain",reason:"interrupted"`. The `activation_unverified` reason
+continues to identify an unverified live activation or the 120-second progress
+deadline, rather than a reboot. It is never
 automatically reinstalled. Current success evidence requires the activation
 conditions in the plain-console verification section above. Independently read
 identity/release after service exit; a fallback or stopped runner cannot pass.
+
+The installer keeps the previous validated program in `schedule.yaml.bak`
+before renaming the validated stage to `schedule.yaml`. Each littlefs rename
+is atomic, but a reset can fall between the two. Before selecting a boot or
+restart program, the runner restores `.bak` if and only if the active path is
+missing. A reset during recovery can repeat that single atomic rename. Thus
+every reset boundary with an installed prior boots either the prior program
+or the complete new program; uncommitted service or legacy staging files are
+never promoted by boot recovery. An existing active file always wins over
+`.bak`. Recovery does not manufacture provenance: the loaded digest must still
+match the persisted release tuple, and an interrupted service result remains
+uncertain unless the full activation tuple is proven.
 
 ## Wi-Fi trial, persistence and credential handling
 

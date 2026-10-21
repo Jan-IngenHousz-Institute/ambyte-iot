@@ -100,6 +100,7 @@ class ServiceEngineTest(unittest.TestCase):
             result = self.run_case(case, root=root)
             self.assertEqual(result["state"], state)
             self.assertIsNone(result["applied"])
+            self.assertEqual(result["reason"], "" if state == "succeeded" else "interrupted")
 
 
 if __name__ == "__main__":
