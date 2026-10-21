@@ -76,6 +76,8 @@ static const char *apply(void *context, const svc_record_t *r, svc_truth_t *appl
     assert(strstr(dispatch("svc.result 0000000000000001"), "\"timed_out\":true"));
     assert(strstr(dispatch("svc.result 0000000000000001"), "committing"));
     assert(strstr(dispatch("svc.result 0000000000000001"), "\"reason\":\"activation_unverified\""));
+    assert(strstr(dispatch("svc.active"), "\"state\":\"committing\""));
+    assert(!strstr(dispatch("svc.active"), "timed_out"));
     if (!strcmp(scenario, "apply_error")) return "workbook_mismatch";
     if (!lie) match = true;
     *applied = !strcmp(scenario, "already_active") ? SVC_FALSE : SVC_TRUE;
@@ -100,6 +102,7 @@ static void trial(void *context, const char *ssid, const char *password,
     }
     assert(prepare(true, NULL, NULL, prepare_context));
     assert(!svc_store_get(&store, 1, &r) && r.state == SVC_PERSISTING);
+    assert(strstr(dispatch("svc.active"), "\"state\":\"persisting\""));
     if (!strcmp(scenario, "cut_persist")) _exit(86);
     out->persist_intent = true; out->connected = true;
     if (!strcmp(scenario, "save_error")) { out->reason = "wifi_failed"; return; }
@@ -141,6 +144,7 @@ int main(int argc, char **argv)
     if (!strncmp(scenario, "recover_", 8)) {
         assert(!svc_store_get(&store, 1, &r));
         svc_state_t before = r.state;
+        assert(strstr(dispatch("svc.active"), svc_terminal(before) ? "\"active\":null" : svc_state_name(before)));
         assert(!svc_engine_tick(&engine));
         assert(!svc_store_get(&store, 1, &r) && r.state == before); /* boot gate */
         boot_ready = true; match = !strcmp(scenario, "recover_schedule_match");
@@ -149,6 +153,7 @@ int main(int argc, char **argv)
         if (!strcmp(scenario, "recover_other")) { fingerprint_known = true; memset(current_fingerprint, 0x7f, 32); }
         assert(!svc_engine_tick(&engine));
         assert(!svc_store_get(&store, 1, &r));
+        assert(strstr(dispatch("svc.active"), "\"active\":null"));
         assert(!submissions && !applications && !ends);
     } else {
         boot_ready = strcmp(scenario, "not_ready") != 0;

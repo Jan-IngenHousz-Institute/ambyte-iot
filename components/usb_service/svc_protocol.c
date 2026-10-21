@@ -164,6 +164,11 @@ void svc_protocol_unbind(svc_protocol_t *p)
     svc_wipe(&p->bench, sizeof p->bench);
 #endif
 }
+void svc_protocol_reset_session(svc_protocol_t *p)
+{
+    svc_protocol_unbind(p);
+    p->expected_instance = 0;
+}
 
 static const char *queue(svc_protocol_t *p, svc_record_t *r, const char *password)
 {
@@ -171,6 +176,12 @@ static const char *queue(svc_protocol_t *p, svc_record_t *r, const char *passwor
     r->state = SVC_FAILED;
     strcpy(r->reason, "busy");
     return svc_store_save(p->store, r);
+}
+
+static const char *binding_error(const svc_protocol_t *p)
+{
+    if (p->expected_instance && p->expected_instance != p->store->instance) return "store_changed";
+    return p->bound_instance == p->store->instance && p->bound_instance ? NULL : "not_bound";
 }
 
 bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
@@ -189,7 +200,7 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     if (!strcmp(a[0], "svc.version")) {
         if (n != 1) { error = "invalid_args"; goto done; }
         prefix(p, &j, true);
-        append(&j, ",\"service\":1,\"actions\":[\"svc.version\",\"svc.bind\",\"svc.result\",\"svc.stats\",\"schedule.begin\",\"p\",\"schedule.commit\",\"svc.abort\",\"svc.wifi.join\",\"svc.wifi.status\",\"svc.exit\""
+        append(&j, ",\"service\":1,\"actions\":[\"svc.version\",\"svc.bind\",\"svc.result\",\"svc.stats\",\"schedule.begin\",\"p\",\"schedule.commit\",\"svc.abort\",\"svc.wifi.join\",\"svc.wifi.status\",\"svc.exit\",\"svc.active\""
 #if CONFIG_AMBYTE_SVC_BENCH
                ",\"bench.begin\",\"bench.read\",\"bench.end\",\"bench.abort\""
 #endif
@@ -199,14 +210,25 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     if (!strcmp(a[0], "svc.bind")) {
         if (n != 2 || !hex(a[1], 16, &id) || !id) { error = "invalid_args"; goto done; }
         svc_protocol_unbind(p);
+        p->expected_instance = id;
         if (id != p->store->instance) { error = "store_changed"; goto done; }
         p->bound_instance = id;
         prefix(p, &j, true); append(&j, ",\"state\":\"bound\""); finish(p, &j); goto done;
     }
     if (!strcmp(a[0], "svc.exit")) {
         if (n != 1) { error = "invalid_args"; goto done; }
-        svc_protocol_unbind(p);
+        svc_protocol_reset_session(p);
         prefix(p, &j, true); append(&j, ",\"state\":\"exit\""); finish(p, &j); exit = true; goto done;
+    }
+    if (!strcmp(a[0], "svc.active")) {
+        if (n != 1) { error = "invalid_args"; goto done; }
+        error = svc_store_active(p->store, &r);
+        if (error && strcmp(error, "not_found")) goto done;
+        prefix(p, &j, true); append(&j, ",\"active\":");
+        if (error) append(&j, "null");
+        else append(&j, "{\"op\":\"%016llx\",\"kind\":\"%s\",\"state\":\"%s\"}",
+                    (unsigned long long)r.id, r.kind == SVC_SCHEDULE ? "schedule" : "wifi", svc_state_name(r.state));
+        error = NULL; finish(p, &j); goto done;
     }
     if (!strcmp(a[0], "svc.stats")) {
         if (n != 1) { error = "invalid_args"; goto done; }
@@ -237,8 +259,8 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     bool abort = !strcmp(a[0], "svc.abort"), result = !strcmp(a[0], "svc.result");
 #if CONFIG_AMBYTE_SVC_BENCH
     if (!strncmp(a[0], "bench.", 6) || (put && n >= 2 && !strcmp(a[1], "0000000000000000"))) {
-        if (!p->bound_instance || p->bound_instance != p->store->instance) error = "store_changed";
-        else error = svc_bench_dispatch(&p->bench, p->store, a, n, out);
+        error = binding_error(p);
+        if (!error) error = svc_bench_dispatch(&p->bench, p->store, a, n, out);
         goto done;
     }
     if (p->bench.active && (begin || put || join || commit || abort)) { error = "busy"; goto done; }
@@ -246,7 +268,7 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     if (!begin && !put && !join && !commit && !abort && !result) { error = "unsupported"; goto done; }
     unsigned wanted = begin ? 7 : put ? 5 : join ? 4 : 2;
     if (n != wanted || !hex(a[1], 16, &id) || !id) { error = "invalid_args"; goto done; }
-    if (!p->bound_instance || p->bound_instance != p->store->instance) { error = "store_changed"; goto done; }
+    if ((error = binding_error(p))) goto done;
     if (begin) {
         if (!hex(a[2], 8, &offset) || !offset || !digest(a[3]) || !token(a[4]) || !token(a[5]) || !workbook(a[6])) { error = "invalid_args"; goto done; }
         if (offset > SVC_DATA_MAX) { error = "size_limit"; goto done; }

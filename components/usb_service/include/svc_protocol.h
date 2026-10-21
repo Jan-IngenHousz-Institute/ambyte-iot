@@ -39,6 +39,9 @@ typedef struct {
     svc_store_t *store;
     svc_protocol_ports_t ports;
     uint64_t bound_instance;
+    /* Last explicit bind attempt survives in-session unbind only. Session
+     * entry/exit clears it; clients compare journaled instances anew. */
+    uint64_t expected_instance;
 #if CONFIG_AMBYTE_SVC_BENCH
     svc_bench_t bench;
 #endif
@@ -47,6 +50,9 @@ typedef struct {
 void svc_protocol_init(svc_protocol_t *protocol, svc_store_t *store,
                        const svc_protocol_ports_t *ports);
 void svc_protocol_unbind(svc_protocol_t *protocol);
+/* Session boundaries forget both authority and the last attempted instance.
+ * In-session overflow uses unbind instead, retaining store-change evidence. */
+void svc_protocol_reset_session(svc_protocol_t *protocol);
 /* body is a CRC-verified mutable ASCII request without the frame wrapper. It
  * is always wiped, including credentials and token separators, before return.
  * json must have SVC_JSON_MAX+1 bytes. true requests mode exit after emission. */

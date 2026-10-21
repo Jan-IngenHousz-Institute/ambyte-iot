@@ -124,9 +124,22 @@ class ServiceClient:
         self.invalidate()
         raise TransportError("Service response timed out; the device outcome may still be pending.")
 
-    def _receive(self, correlation, *, allow_plain=False):
+    def _receive(self, correlation, *, allow_plain=False, probe=None):
         try:
-            identifier, result = decode_frame(self._line(self._limit()))
+            deadline, setup_bytes = self._limit(), 0
+            while True:
+                line = self._line(deadline)
+                setup_bytes += len(line)
+                if allow_plain and setup_bytes > 8192:
+                    raise ProtocolError("Too much plain service discovery output.")
+                if allow_plain and probe is not None and line in {probe, probe[:-1] + b"\r\n"}:
+                    continue  # exact nonsecret request echo on older firmware
+                if allow_plain and line in {b"Unrecognized command\n", b"Unrecognized command\r\n"}:
+                    raise ServiceError("unsupported")
+                if allow_plain and line in {b"\n", b"\r\n", b"ambyte> \r\n", b"ambyte> \n"}:
+                    continue
+                identifier, result = decode_frame(line)
+                break
             if identifier == 0 and result.get("reason"):
                 _keys(result, {"ok", "store", "reason"})
                 if result["ok"] or not _reason(result["reason"]):
@@ -142,6 +155,11 @@ class ServiceClient:
                 _keys(result, {"ok", "store", "reason"})
                 if not _reason(result["reason"]) or not result["reason"]:
                     raise ProtocolError("Invalid service error reason.")
+                if result["reason"] == "not_bound":
+                    self.invalidate()
+                    raise ProtocolError("Service session is not bound; rebind and reconcile the saved operation.")
+                if result["reason"] == "store_changed":
+                    raise UnknownOutcome("Device service store changed; verify the saved operation before a new request.")
                 raise ServiceError(result["reason"])
             return result
         except (TransportError, UnknownOutcome):
@@ -163,19 +181,28 @@ class ServiceClient:
         frame = encode_frame(self.correlation, body)
         start = self.clock()
         self._write(frame)
-        result = self._receive(self.correlation, allow_plain=discovery)
+        result = self._receive(self.correlation, allow_plain=discovery, probe=frame if discovery else None)
         self.round_trips.append(self.clock() - start)
         return result
 
     def command(self, body):
         """Bounded read-only diagnostics; mutations use the journaled APIs."""
-        if body not in {"svc.stats", "svc.wifi.status"}:
+        if body not in {"svc.stats", "svc.wifi.status", "svc.active"}:
             raise ServiceClientError("Use the journaled operation API for service mutations.")
         if not self.active:
             raise ProtocolError("A fresh service binding is required.")
         try:
             result = self._exchange(body)
-            if body == "svc.stats":
+            if body == "svc.active":
+                _keys(result, {"ok", "store", "active"})
+                active = result["active"]
+                if active is not None:
+                    _keys(active, {"op", "kind", "state"})
+                    if (not _hex(active["op"], False) or not isinstance(active["kind"], str) or
+                            not isinstance(active["state"], str) or active["kind"] not in {"schedule", "wifi"} or
+                            active["state"] not in ({"staging", "committing"} if active["kind"] == "schedule" else {"connecting", "persisting"})):
+                        raise ProtocolError("Invalid active operation metadata.")
+            elif body == "svc.stats":
                 counters = {"free_heap", "largest_block", "min_heap", "cli_stack", "worker_stack", "runner_stack",
                             "dropped_bytes", "dropped_calls", "logical_bytes", "records", "log_buffer_bytes"}
                 extra = {"min_free_heap", "min_largest_block", "samples", "fs_total", "fs_used"}
@@ -209,7 +236,7 @@ class ServiceClient:
         self.store, self.highest = result["store"], int(result["highest_id"], 16)
         self.actions = frozenset(result["actions"])
 
-    def connect(self):
+    def connect(self, *, new_request=False):
         self._configure_transport()
         self.invalidate()
         self.store = None
@@ -242,6 +269,11 @@ class ServiceClient:
                 if ready["store"] != version["store"]:
                     raise ProtocolError("Store changed during service entry.")
             self._version(version)
+            # Session RAM can be empty after reboot/reformat. Do not bind the
+            # newly discovered instance on behalf of a previous-store intent.
+            pending = self.journal.load() if self.journal is not None else None
+            if pending and pending["phase"] != "complete" and pending["store"] != self.store and not new_request:
+                raise UnknownOutcome("Device service store changed; verify the saved operation before a new request.")
             bound = self._exchange(f"svc.bind {self.store}")
             _keys(bound, {"ok", "store", "state"})
             if bound["state"] != "bound":
@@ -319,6 +351,17 @@ class ServiceClient:
         return result
 
     def _foreign(self):
+        if "svc.active" in self.actions:
+            active = self.command("svc.active")["active"]
+            if active is not None:
+                result = self.result(active["op"])
+                if (result["kind"], result["state"]) != (active["kind"], active["state"]):
+                    # Work may finish between the two read-only exchanges.
+                    if result["kind"] != active["kind"] or result["state"] not in TERMINAL:
+                        raise ProtocolError("Active operation and result disagree.")
+                if result["state"] not in TERMINAL:
+                    raise BusyOperation(result["kind"], result["state"], result["op"])
+            return
         if self.highest:
             try:
                 latest = self.result(f"{self.highest:016x}")
@@ -383,12 +426,12 @@ class ServiceClient:
             raise ServiceError(result["reason"] or result["state"])
         return result
 
-    def _recover(self, run):
+    def _recover(self, run, *, new_request=False):
         attempts = 0
         while self.clock() < self._deadline:
             try:
                 if not self.active:
-                    self.connect()
+                    self.connect(new_request=new_request)
                 return run()
             except TransportError:
                 self.invalidate()
@@ -514,7 +557,7 @@ class ServiceClient:
             return self._poll(entry, cancelled)
 
         try:
-            return self._recover(transfer)
+            return self._recover(transfer, new_request=new_request)
         finally:
             try:
                 self.exit()
@@ -537,7 +580,7 @@ class ServiceClient:
         try:
             # No automatic credential retry, including a second invocation with
             # a different password while an earlier outcome remains unresolved.
-            self.connect()
+            self.connect(new_request=new_request)
             previous = self.journal.load()
             if previous and previous["phase"] != "complete" and not new_request:
                 raise UnknownOutcome("A saved operation must be recovered by ID before another credential attempt.")

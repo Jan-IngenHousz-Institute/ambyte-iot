@@ -95,8 +95,49 @@ class ServiceSessionTest(unittest.TestCase):
         data = frame(f"svc.bind {STORE}") + b"\x1f" + frame(begin(), 2) * 20 + b"\x1e"
         data += frame(begin(), 3) + frame(f"svc.bind {STORE}", 4) + frame("svc.version", 5) + frame("svc.exit", 6)
         responses = self.call(data)
-        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]], ["rx_overrun", "store_changed"])
+        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]], ["rx_overrun", "not_bound"])
         self.assertEqual(next(r for id, r in responses if id == 5)["highest_id"], "0000000000000000")
+
+    def test_entry_forgets_a_previous_sessions_failed_bind(self):
+        data = frame("svc.result 0000000000000001", 1) + frame("svc.exit", 2)
+        responses = self.call(data, env={"SVC_STALE_SESSION": "1"})
+        self.assertEqual(responses[1][1]["reason"], "not_bound")
+
+    def test_overrun_retains_a_wrong_instance_only_until_session_exit(self):
+        data = frame("svc.bind 2222222222222222", 1)
+        data += b"\x1f" + frame("svc.version", 2) + b"\x1e"
+        data += frame("svc.result 0000000000000001", 3) + frame("svc.exit", 4)
+        responses = self.call(data)
+        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]],
+                         ["store_changed", "rx_overrun", "store_changed"])
+
+    def test_every_exit_path_forgets_the_attempted_instance(self):
+        wrong_bind = frame("svc.bind 2222222222222222", 1)
+        with self.subTest(exit="idle timeout"):
+            responses = self.call(wrong_bind)
+            self.assertEqual(responses[-1][1]["reason"], "session_timeout")
+        with self.subTest(exit="transport failure"):
+            self.call(wrong_bind, env={"SVC_TX_FAIL": "2"}, raw=True)
+        with self.subTest(exit="entry failure"):
+            self.assertEqual(self.call(b"", env={"SVC_ENTER_FAIL": "1", "SVC_STALE_SESSION": "1"}, raw=True), b"")
+
+    def test_fresh_active_discovery_and_overrun_rebind_preserve_durable_prefix(self):
+        self.call(frame(f"svc.bind {STORE}") + frame(begin(), 2) + frame(put(1, 0, b"abc"), 3) + frame("svc.exit", 4))
+        data = frame("svc.active", 10) + frame("svc.result 0000000000000001", 11)
+        data += frame(f"svc.bind {STORE}", 12) + b"\x1f" + frame(begin(op=2), 13) + b"\x1e"
+        data += frame("svc.result 0000000000000001", 14) + frame(f"svc.bind {STORE}", 15)
+        data += frame("svc.result 0000000000000001", 16) + frame("svc.exit", 17)
+        values = dict(self.call(data))
+        self.assertEqual(values[10]["active"], dict(op="0000000000000001", kind="schedule", state="staging"))
+        self.assertEqual(values[11]["reason"], "not_bound")
+        self.assertEqual(values[14]["reason"], "not_bound")
+        self.assertEqual(values[16]["offset"], 3)
+        self.assertEqual((self.root / "stage.bin").read_bytes(), b"abc")
+
+    def test_active_requests_use_the_ordinary_idle_timeout(self):
+        values = self.call(frame("svc.active", 8))
+        self.assertIsNone(values[1][1]["active"])
+        self.assertEqual(values[-1][1]["reason"], "session_timeout")
 
     def test_tx_failure_ends_mode_without_losing_the_admitted_operation(self):
         data = frame(f"svc.bind {STORE}") + frame(begin(), 2)

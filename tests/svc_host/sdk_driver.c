@@ -125,6 +125,7 @@ void usb_serial_jtag_ll_phy_set_defaults(void) {}
 esp_err_t esp_vfs_register_fs(const char *path,const esp_vfs_fs_ops_t *ops,int flags,void *ctx)
 { (void)path;(void)ops;(void)flags;(void)ctx; return ESP_OK; }
 void linenoiseSetReadFunction(linenoise_read_bytes_fn fn) { (void)fn; }
+bool linenoiseIsDumbMode(void) { return false; }
 static void inject(const void *bytes,size_t n)
 {
     const unsigned char *p=bytes;

@@ -483,3 +483,22 @@ def test_new_request_ui_reads_current_identity_before_explicit_choice(monkeypatc
     app._retry_new_schedule()
     assert done.wait(3)
     assert order == ["readback", "choice"] + (["admission"] if approved else [])
+
+
+def test_plain_notice_then_prompt_and_identity_work_on_same_open_port(bench, monkeypatch):
+    board = GuiDevice()
+    port = GuiSerial(board, bench.clock)
+    monkeypatch.setattr(ambyte_serial.serial, 'Serial', lambda: port)
+    con = ambyte_serial.AmbyteConsole('bench')
+    from flash_gui.service_client import encode_frame, decode_frame
+    port.write_timeout = 5
+    port.write(encode_frame(1, 'svc.version'))
+    notice = port.read(4096)
+    assert notice.startswith(b'ambyte> \r\n00000000 ')
+    lines = notice.splitlines(keepends=True)
+    frame = next(line for line in lines if line.startswith(b'00000000 '))
+    assert decode_frame(frame)[1]['reason'] == 'mode_required'
+    assert con.wait_prompt(timeout=2)
+    assert con.identity().mac == MAC
+    assert not board.mode
+    con.close()

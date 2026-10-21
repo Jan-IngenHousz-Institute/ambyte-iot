@@ -27,12 +27,15 @@ stateDiagram-v2
     state Console {
         [*] --> Prompt
         Prompt --> Prompt : identity, cfg, reboot, schedule …
+        Prompt --> Prompt : framed probe / CRLF, mode_required, fresh prompt
     }
     state Service {
-        [*] --> Ready : correlation-zero ready frame
+        [*] --> Ready : clear prior binding/attempt, correlation-zero ready frame
+        Ready --> Ready : svc.active, or unbound operation / not_bound
+        Ready --> Ready : bind wrong store / store_changed
         Ready --> Bound : svc.bind <store>
         Bound --> Bound : p (chunk), schedule.commit, svc.result, svc.wifi.*
-        Bound --> Ready : rx_overrun or store change invalidates the binding
+        Bound --> Ready : rx_overrun invalidates binding / rebind required
     }
 ```
 
@@ -49,7 +52,10 @@ sequenceDiagram
     G-->>C: {"capabilities":[…,"svc"]}
     C->>G: svc
     G-->>C: 00000000 {"ok":true,"state":"ready"}
-    C->>G: svc.version / svc.bind <store>
+    C->>G: svc.version / svc.active (read-only, before bind)
+    G-->>C: store, actions, active op/kind/state or null
+    Note over C: Compare pending journal store before binding
+    C->>G: svc.bind <journaled or verified store>
     G-->>C: actions, bounds / {"state":"bound"}
     C->>G: schedule.begin <op> <size> <sha256> …
     G-->>C: {"op":…,"state":"staging","offset":0}
@@ -107,6 +113,8 @@ for the fixture; credentials are redacted):
 ![older image refuses the service contract](images/usb-service/older-image-refusal.png)
 
 ![Wi-Fi trial with a wrong password](images/usb-service/wifi-trial.png)
+
+![service recovery: column-0 notice, svc.active and binding](images/usb-service/service-recovery.png)
 
 ## Connect and find a response
 
@@ -532,6 +540,14 @@ stray text or incomplete terminal escapes; it does not depend on the editor's
 line-start state. At a fresh line the eight-hex/space prefix is reserved. Inside
 ordinary input it keeps a bounded suffix (at most 249 bytes), filters complete
 CRC frames and credential frames with a damaged CRC, and returns `mode_required`.
+Outside-mode notices first emit CRLF, then a complete correlation-zero frame
+at column zero. The separator is ordinary-console output, not part of the
+CRC frame; established service mode still emits frames only. Ordinary USB
+writes are gated during the entire notice so they cannot split its bytes;
+the SD tee continues unchanged. The discarded editor line is cancelled,
+without history insertion, and the REPL prints its normal prompt again.
+The next plain `identity` command or prompt wait works on the same open port.
+
 The private join header through its correlation, operation and SSID tokens is
 reserved even inside pasted text: it starts draining before the first password
 byte, including if the request is cancelled, malformed or oversized.
@@ -551,15 +567,47 @@ or null if unavailable). Errors add only a fixed nonsecret `reason`. Read
 `svc.version` before trusting capabilities or sending a write:
 
 ```json
-{"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}
+{"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}
 ```
 
 `service`, limits and slot count are integers; actions are unique strings.
 Production advertises exactly those actions. `svc.bind <store>` must then
 confirm `{"ok":true,"store":"…","state":"bound"}` for the discovered store.
 Every new connection requires a new probe/bind. A wrong binding clears the old
-binding and returns `store_changed`. Version, diagnostics and exit are usable
-without binding; mutations and result lookups require it.
+binding and returns `store_changed`. Version, diagnostics, `svc.active` and exit
+are usable without binding; mutations and result lookups require it.
+
+A missing binding returns `not_bound`; a known requested/bound instance
+differing from the current store returns `store_changed`. Overflow clears
+binding authority while retaining the last attempted instance in session RAM,
+so a same-instance recovery needs a rebind, not a new operation. Every session
+entry and exit (explicit exit, idle timeout or transport failure) clears both
+binding authority and the last attempted instance. A failed bind in an earlier
+session cannot make the next session report `store_changed` before its own bind.
+Reboot or reformat also loses that RAM: **not_bound never proves the store is unchanged**.
+A recovering client compares version.store with its pending journal and binds
+with the journaled id. On mismatch it reports an unknown outcome and does not
+bind the new instance to replay or resume an old operation. The existing
+explicit new-request action after operator state verification may preserve
+that old journal and create a distinct intent; automatic recovery may not.
+
+`svc.active` returns exactly `{"ok":true,"store":"…","active":null}` when
+no nonterminal operation exists; otherwise `active` has exactly a nonzero
+16-hex `op`, `kind` (`schedule` or `wifi`) and its stored `state`. Schedule
+states are `staging`/`committing`; Wi-Fi states are `connecting`/`persisting`.
+A timed-out, still-owned commit remains `committing`; `timed_out` is omitted
+from this summary and available in `svc.result`. After boot reconciliation
+makes an operation terminal, active is immediately null. Corrupt stores
+return `corrupt_store`, never a false null. Queries count as ordinary input
+for the existing60s idle timeout, with no separate keepalive policy.
+
+Do not guess active IDs from `highest_id`. A client that lost its journal can
+read active.op, bind, then inspect the full nonsecret descriptor with
+`svc.result`. Recovery requires verifying its own bytes/descriptor and an
+explicit choice; discovery never automatically adopts, aborts or commits
+another client's work. The GUI reports busy with that op id, kind and state.
+Older service images without this additive action retain the prior bounded
+discovery path; no-svc firmware keeps the legacy console path.
 
 The nonzero store instance is created randomly and persisted when a fresh
 service store initializes. A changed instance voids **all earlier IDs and
@@ -601,6 +649,7 @@ Base64 is canonical, padded, without whitespace.
 | `p <op> <offset> <chunk_crc> <base64>` | 1..144 decoded bytes; separate eight-hex CRC over decoded bytes. Reply `op,state:"staging",offset` only after data fsync and durable offset update. Full request is exactly 248 bytes. |
 | `schedule.commit <op>` | Complete prefix required. Persists `committing` before queueing; replies with the full result schema below. Hash, compile and declared/header workbook equality are checked before installation. Both absent is a match. Checks actual loaded source/digest/workbook/running plus verified release version/built_fw after activation. |
 | `svc.abort <op>` | Own staging only: durably records `aborted` before private data cleanup. Reply `op,state:"aborted",reason:"aborted"`. Repeated abort reads that record. Cannot cancel admitted commit or another client's work. |
+| `svc.active` | Read-only, no binding required. Returns `active:null` or `active:{op,kind,state}` for the durable nonterminal slot. Uses no ID/result slot and changes no stored bytes. |
 | `svc.result <op>` | Full nonsecret retained descriptor, state and evidence. Never retries the action. |
 | `svc.wifi.join <op> <ssid_base64> <password_base64-or-dash>` | Distinct bounded credential write. Immediate `connecting` result after durable admission; outcome below. SSID 1..31 UTF-8 bytes, no NUL. Password empty (`-`) or 8..63 printable ASCII bytes. No truncation, enterprise credentials or certificate inputs. |
 | `svc.wifi.status` | `configured_ssid,trial_ssid,trial,connected,provisioned`; current RAM/connection read, not NVS proof. Original/configured SSID remains separate from the trial SSID (`null` outside trial). A current IP can belong to the trial while `trial:true`. |
@@ -776,7 +825,8 @@ abort have the documented nonempty reasons. Every shipped reason is listed:
 | bad_frame, bad_crc, line_too_long, frame_timeout | Discard rejected line; no action. Drain/reprobe if framing is uncertain. |
 | session_timeout, mode_required, rx_overrun | Session/binding unavailable. Fresh probe/bind; reconcile all unconfirmed IDs. |
 | invalid_args, unsupported | Invalid grammar/metadata or absent action. Do not silently downgrade a service write to legacy mutation. |
-| store_changed | Binding/instance differs. Preserve old client evidence; verify current device state. |
+| not_bound | Session has no binding authority. Probe and bind the journaled store, then reconcile by ID. Never infer an unchanged store from this reason alone. |
+| store_changed | Known requested/bound instance differs. Preserve old client evidence; verify current device state. Never replay into the new instance. |
 | not_found, expired, id_exhausted | ID lookup/admission semantics above; expired is unknown, exhausted cannot wrap. |
 | request_conflict, busy | Descriptor differs or another operation/worker owns admission. Read nonsecret kind/state; never take over foreign work. |
 | no_space, storage_error, corrupt_store | Durable boundary was not confirmed. Read retained ID; preserve files, do not clear a store to make room. |
@@ -839,7 +889,7 @@ device. The `abc` staging descriptor is not a valid schedule to commit.
 
 ```text
 00000001 svc.version*e97c2d53
-00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*bdef35cc
+00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*7215c2b2
 00000008 svc.bind 0123456789abcdef*b9f19b5f
 00000008 {"ok":true,"store":"0123456789abcdef","state":"bound"}*10bdf71d
 00000005 p 0000000000000001 00000000 352441c2 YWJj*5ca3bfdd
@@ -912,4 +962,17 @@ Record build-side F6 evidence for each image with:
 ```sh
 python3 tools/qualify_svc_resources.py .pio/build/esp32-s3-devkitm-1 --output /tmp/svc-release-resources.json
 python3 tools/qualify_svc_resources.py .pio/build/svc-bench --output /tmp/svc-bench-resources.json
+```
+
+### Revision-4 discovery examples
+
+These are complete LF-terminated CRC frames. Outside mode, a `mode_required`
+notice is preceded by CR LF to terminate any displayed prompt; the separator
+is not included in its CRC. No separator is added inside service.
+
+```text
+0000000c svc.active*48648ba4
+0000000c {"ok":true,"store":"0123456789abcdef","active":null}*5a689237
+0000000d {"ok":true,"store":"0123456789abcdef","active":{"op":"0000000000000001","kind":"schedule","state":"staging"}}*14455baf
+0000000e {"ok":false,"store":"0123456789abcdef","reason":"not_bound"}*c14a3047
 ```

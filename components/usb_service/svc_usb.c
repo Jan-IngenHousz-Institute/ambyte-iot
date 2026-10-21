@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "driver/usb_serial_jtag.h"
 #include "esp_attr.h"
@@ -20,6 +21,7 @@
 static RingbufHandle_t s_usb_rx;
 static TaskHandle_t s_install_task;
 static bool s_active;
+static bool s_notice_active;
 static bool s_overrun;
 static uint32_t s_dropped_calls, s_dropped_bytes;
 static unsigned s_passthrough_writers;
@@ -98,7 +100,7 @@ void __wrap_vRingbufferReturnItem(RingbufHandle_t ring, void *item)
 int __wrap_usb_serial_jtag_write_bytes(const void *data, size_t length, TickType_t wait)
 {
     portENTER_CRITICAL(&s_mux);
-    if (!s_active) {
+    if (!s_active && !s_notice_active) {
         ++s_passthrough_writers;
         portEXIT_CRITICAL(&s_mux);
         int result = __real_usb_serial_jtag_write_bytes(data, length, wait);
@@ -131,7 +133,21 @@ static ssize_t editor_read(int fd, void *buffer, size_t capacity)
         s_pending_length = svc_editor_byte(&s_filter, byte, s_pending, &dropped);
         s_pending_at = 0;
         byte = 0;
-        if (dropped && s_notice) s_notice("mode_required");
+        if (dropped) {
+            if (s_notice) s_notice("mode_required");
+            /* Cancel the entire edit so stray preceding input cannot become
+             * a command or history entry. The real REPL prints a new prompt.
+             * Dumb mode propagates read errors; raw mode handles Ctrl-C. */
+            svc_wipe(s_pending, sizeof s_pending);
+            s_pending_at = s_pending_length = 0;
+            if (linenoiseIsDumbMode()) { errno = EAGAIN; return -1; }
+            /* Pinned linenoise treats even Ctrl-C as a pasted character if
+             * read returns within 30 ms. Cross its paste interval so cancel
+             * reaches the control-key path instead of the edit/history. */
+            vTaskDelay(pdMS_TO_TICKS(40));
+            ((unsigned char *)buffer)[0] = 3;
+            return 1;
+        }
         /* A zero read ends a linenoise edit. Keep waiting rather than exposing
          * a partial withheld prefix as EOF, a prompt, or command history. */
     }
@@ -211,14 +227,13 @@ int svc_usb_read(void *buffer, size_t length, unsigned timeout_ms)
     return usb_serial_jtag_read_bytes(buffer, (uint32_t)length, pdMS_TO_TICKS(timeout_ms));
 }
 
-bool svc_usb_write(const void *buffer, size_t length)
+static bool write_until(const void *buffer, size_t length, int64_t deadline)
 {
     /* The CLI is the only framed writer. Ordinary driver writers are already
      * gated, and entry drained every admitted predecessor before ready. Do
      * not hold a libc stream lock across a stalled USB transfer: runner/log
      * producers must be able to reach the drop gate without waiting for it. */
     const unsigned char *p = buffer;
-    int64_t deadline = esp_timer_get_time() + 1000000;
     while (length) {
         size_t n = length > 64 ? 64 : length;
         int64_t remaining = deadline - esp_timer_get_time();
@@ -230,5 +245,31 @@ bool svc_usb_write(const void *buffer, size_t length)
     }
     int64_t remaining = deadline - esp_timer_get_time();
     bool ok = remaining > 0 && usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS((remaining + 999) / 1000)) == ESP_OK;
+    return ok;
+}
+
+bool svc_usb_write(const void *buffer, size_t length)
+{
+    return write_until(buffer, length, esp_timer_get_time() + 1000000);
+}
+
+bool svc_usb_notice_write(const void *buffer, size_t length)
+{
+    if (svc_usb_active()) return svc_usb_write(buffer, length);
+    /* Suppress ordinary USB writers only while the separated notice is sent.
+     * Drain admitted predecessors first; never lock stdio over a USB wait.
+     * RX/filter state and the actual mode are unchanged. The SD tee still
+     * receives ordinary writes, and mode-only transcripts gain no separator. */
+    portENTER_CRITICAL(&s_mux); s_notice_active = true; portEXIT_CRITICAL(&s_mux);
+    bool ok = true;
+    int64_t deadline = esp_timer_get_time() + 1000000;
+    for (;;) {
+        portENTER_CRITICAL(&s_mux); unsigned writers = s_passthrough_writers; portEXIT_CRITICAL(&s_mux);
+        if (!writers) break;
+        if (esp_timer_get_time() >= deadline) { ok = false; break; }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (ok) ok = write_until("\r\n", 2, deadline) && write_until(buffer, length, deadline);
+    portENTER_CRITICAL(&s_mux); s_notice_active = false; portEXIT_CRITICAL(&s_mux);
     return ok;
 }

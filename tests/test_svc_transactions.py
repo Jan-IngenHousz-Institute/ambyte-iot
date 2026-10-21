@@ -45,7 +45,8 @@ class ServiceTransactionsTest(unittest.TestCase):
             "-I" + str(ROOT / "components/usb_service/include"),
             *(str(ROOT / "components/usb_service" / name) for name in
               ("svc_wire.c", "svc_store.c", "svc_protocol.c")),
-            str(ROOT / "tests/svc_host/protocol_driver.c"), "-lcrypto", "-o", str(cls.binary),
+            str(ROOT / "tests/svc_host/protocol_driver.c"), "-Wl,--wrap=svc_store_get",
+            "-Wl,--wrap=svc_store_admit", "-lcrypto", "-o", str(cls.binary),
         ], check=True)
 
     @classmethod
@@ -83,7 +84,7 @@ class ServiceTransactionsTest(unittest.TestCase):
 
     def test_golden_wire_and_discovery(self):
         lines = self.call("svc.version", bind=False, raw=True)
-        self.assertEqual(lines, [b'00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*bdef35cc\n'])
+        self.assertEqual(lines, [b'00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*7215c2b2\n'])
         self.call(begin())
         lines = self.call(frame(put(1, 0, b"abc"), 5), frame("svc.abort 0000000000000001", 6),
                           frame("svc.result 0000000000000001", 9), raw=True)
@@ -94,9 +95,10 @@ class ServiceTransactionsTest(unittest.TestCase):
     def test_binding_is_scoped_and_wrong_instance_clears_it(self):
         responses = self.call(begin(), f"svc.bind {STORE}", begin(), "@unbind", put(1, 0, b"abc"),
                               "svc.bind 1111111111111111", "svc.result 0000000000000001", bind=False)
-        self.reason(responses[0], "store_changed")
+        self.reason(responses[0], "not_bound")
         self.assertEqual(responses[2]["state"], "staging")
-        for response in responses[3:]: self.reason(response, "store_changed")
+        self.reason(responses[3], "not_bound")
+        for response in responses[4:]: self.reason(response, "store_changed")
         self.assertEqual(self.call("svc.version")[0]["highest_id"], "0000000000000001")
 
     def test_descriptor_replay_conflict_and_busy(self):
@@ -109,6 +111,45 @@ class ServiceTransactionsTest(unittest.TestCase):
         self.reason(responses[9], "busy")
         self.assertEqual(responses[10]["sha256"], SHA)
         self.assertIsNone(responses[10]["workbook"])
+
+    def test_active_is_unbound_read_only_and_survives_restart(self):
+        self.assertIsNone(self.call("svc.active", bind=False)[0]["active"])
+        self.call(begin())
+        before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+        for value in self.call(*(["svc.active"] * 20), bind=False):
+            self.assertEqual(value, dict(ok=True, store=STORE, active=dict(op="0000000000000001", kind="schedule", state="staging")))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
+        self.call("svc.abort 0000000000000001")
+        self.assertIsNone(self.call("svc.active", bind=False)[0]["active"])
+        value = self.call(join(op=2), "svc.active")[1]
+        self.assertEqual(value["active"], dict(op="0000000000000002", kind="wifi", state="connecting"))
+        self.reason(self.call("svc.active extra", bind=False)[0], "invalid_args")
+
+    def test_active_does_not_guess_from_the_highest_watermark(self):
+        values = self.call(begin(), "@highest 0000000000000005", "svc.version", "svc.active")
+        self.assertEqual(values[1]["highest_id"], "0000000000000005")
+        self.assertEqual(values[2]["active"]["op"], "0000000000000001")
+
+    def test_known_store_mismatch_survives_unbind_but_not_fresh_session(self):
+        other = "1111111111111111"
+        values = self.call("@instance " + other, "@unbind", begin(), "svc.bind " + other, begin(), "svc.active")
+        self.assertEqual(values[0], dict(ok=False, store=other, reason="store_changed"))
+        self.assertEqual(values[1]["state"], "bound")
+        self.assertEqual(values[2]["state"], "staging")
+        self.assertEqual(values[3]["active"]["op"], "0000000000000001")
+
+    def test_unbound_mutations_have_no_admission_or_worker_side_effect(self):
+        bodies = [begin(), put(1, 0, b"abc"), "schedule.commit 0000000000000001",
+                  "svc.abort 0000000000000001", join(), "svc.result 0000000000000001"]
+        for value in self.call(*bodies, bind=False, env={"SVC_DENY_ACCESS": "1"}):
+            self.reason(value, "not_bound")
+        self.assertEqual(self.call("svc.version")[0]["highest_id"], "0000000000000000")
+        self.assertFalse((self.root / "stage.bin").exists())
+
+    def test_active_does_not_hide_corrupt_store_as_empty(self):
+        self.call(begin())
+        (self.root / "store").write_bytes(b"corrupt")
+        self.assertEqual(self.call("svc.active", bind=False)[0], dict(ok=False, store=None, reason="corrupt_store"))
 
     def test_strict_grammar_does_not_consume_ids(self):
         bodies = ["", " svc.version", "svc.version ", "svc.version  extra",

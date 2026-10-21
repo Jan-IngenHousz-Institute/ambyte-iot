@@ -21,7 +21,7 @@ REASONS = {"", "bad_frame", "bad_crc", "line_too_long", "frame_timeout", "sessio
            "activation_unverified", "aborted", "commit_started", "interrupted", "wifi_auth_rejected",
            "wifi_timeout", "wifi_failed", "wifi_not_retrying", "wifi_driver_unresolved",
            "wifi_invalid_credentials", "wifi_unavailable", "mode_required", "rx_overrun",
-           "store_changed", "operation_complete", "invalid_sequence", "workbook_mismatch",
+           "store_changed", "not_bound", "operation_complete", "invalid_sequence", "workbook_mismatch",
            "already_active", "unprovable"}
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -60,9 +60,10 @@ class TransferCancelled(ServiceClientError):
 
 
 class BusyOperation(ServiceClientError):
-    def __init__(self, kind: str, state: str):
-        self.kind, self.state = kind, state
-        super().__init__(f"Device busy with another client's {kind} operation ({state}); nothing was changed.")
+    def __init__(self, kind: str, state: str, operation: str | None = None):
+        self.kind, self.state, self.operation = kind, state, operation
+        suffix = f", id {operation}" if operation else ""
+        super().__init__(f"Device busy with another client's {kind} operation ({state}{suffix}); nothing was changed.")
 
 
 def _object(pairs):
@@ -141,14 +142,14 @@ def encode_frame(correlation: int, body: str) -> bytes:
 
 
 def decode_frame(line: bytes) -> tuple[int, dict]:
+    # Only whole ordinary console lines classify as plain. Never recognize a
+    # prompt/log substring within a malformed or prefixed service frame.
+    if re.fullmatch(rb"(?:ambyte> ?|Unrecognized command|svc)(?:\r?\n)?", line):
+        raise PlainConsole("Device is answering through the plain console.")
     if len(line) > FRAME_MAX or not line.endswith(b"\n") or b"\r" in line or b"\0" in line:
         raise ProtocolError("Invalid service frame boundary.")
     match = re.fullmatch(rb"([0-9a-f]{8}) (.{1,1024})\*([0-9a-f]{8})\n", line)
     if not match:
-        # Used only during nonsecret mode discovery. Established sessions never
-        # treat this as a usable response or extract JSON from inside the line.
-        if any(token in line for token in (b"ambyte>", b"Unrecognized command", b"svc.version", b"svc\r\n")):
-            raise PlainConsole("Device is answering through the plain console.")
         raise ProtocolError("Invalid service frame.")
     prefix = line[:-10]
     if zlib.crc32(prefix) != int(match[3], 16):
