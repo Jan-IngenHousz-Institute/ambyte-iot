@@ -28,7 +28,7 @@ static void *s_borrowed;
 static size_t s_borrowed_length;
 static linenoise_read_bytes_fn s_editor_read;
 static svc_editor_filter_t s_filter;
-static unsigned char s_pending[9];
+static unsigned char s_pending[SVC_EDITOR_OUTPUT_MAX];
 static size_t s_pending_at, s_pending_length;
 static void (*s_notice)(const char *);
 

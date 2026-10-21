@@ -427,13 +427,23 @@ exit. The GUI schedule installer recognizes a valid framed notice, performs a
 fresh read-only service probe/bind/exit, then resumes typed identity discovery.
 Repeated plain nudges count as input and can keep service mode alive.
 
-Outside service, a pre-editor filter withholds eight lowercase hex digits and
-the following space, drains framed input and answers `mode_required` without
-echoing it or adding history. Withheld bytes are released as soon as a byte
-rules out that prefix, never merely on idle. A human typing a pure-hex prefix
-therefore sees its echo late; ordinary commands and terminal escape/probe
-sequences pass through unchanged. Older images lack this protection: only a
-nonsecret version probe may be sent before fresh mode confirmation.
+Outside service, a pre-editor filter shields framed input from echo/history.
+It recognizes frames at every input offset, including after Ctrl-C, erased edits,
+stray text or incomplete terminal escapes; it does not depend on the editor's
+line-start state. At a fresh line the eight-hex/space prefix is reserved. Inside
+ordinary input it keeps a bounded suffix (at most 249 bytes), filters complete
+CRC frames and credential frames with a damaged CRC, and returns `mode_required`.
+The private join header through its correlation, operation and SSID tokens is
+reserved even inside pasted text: it starts draining before the first password
+byte, including if the request is cancelled, malformed or oversized.
+This preserves legacy SHA/release arguments and quoted values containing service
+names. Partial hex prefixes and potential frames can echo late; withheld bytes
+are never released just because input is idle. Bytes that rule out a prefix are
+released immediately; a potential complete frame is resolved at its terminator.
+All production GUI console templates and terminal escape/probe sequences pass
+through byte for byte. fleet_deploy uses MQTT and has no serial console writer.
+Older images lack this protection: only a nonsecret version probe may be sent
+before fresh mode confirmation.
 
 ## Discover, bind and identify a durable operation
 

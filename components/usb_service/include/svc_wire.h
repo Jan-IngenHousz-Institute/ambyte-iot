@@ -31,14 +31,17 @@ const char *svc_rx_byte(svc_rx_t *rx, unsigned char byte, int64_t now_ms,
 const char *svc_rx_timeout(svc_rx_t *rx, int64_t now_ms);
 void svc_rx_clear(svc_rx_t *rx);
 
+#define SVC_EDITOR_OUTPUT_MAX (SVC_LINE_MAX + 1u)
 typedef struct {
-    unsigned char prefix[9];
+    unsigned char prefix[SVC_EDITOR_OUTPUT_MAX];
     size_t length;
     bool draining;
     bool passthrough;
-    unsigned escape;
+    bool candidate;
 } svc_editor_filter_t;
 
-/* Output is at most nine bytes. dropped becomes true only at a drained LF. */
+/* Recognized service headers are protected at EVERY input offset, independent
+ * of the editor's control keys, cursor or history state. Output is at most
+ * SVC_EDITOR_OUTPUT_MAX bytes. dropped is set at the drained line terminator. */
 size_t svc_editor_byte(svc_editor_filter_t *filter, unsigned char byte,
-                       unsigned char output[9], bool *dropped);
+                       unsigned char output[SVC_EDITOR_OUTPUT_MAX], bool *dropped);

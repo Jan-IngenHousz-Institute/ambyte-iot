@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Production framing/codec/editor filter under ASan and UBSan."""
+import ast
 import base64
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 import zlib
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,6 +102,88 @@ class ServiceWireTest(unittest.TestCase):
         request = frame("00000001 svc.wifi.join 0000000000000001 YQ== c2VjcmV0")
         self.assertEqual(self.run_wire("filter", request + b"identity\n").strip(), b"identity\n".hex())
         self.assertEqual(self.run_wire("filter", b"\x1b[0n" + request).strip(), b"\x1b[0n".hex())
+
+    def test_filter_never_exposes_credentials_after_editor_input(self):
+        request = frame("00000001 svc.wifi.join 0000000000000001 YQ== c2VudGluZWwtcGFzc3dvcmQ=")
+        for prefix in (b"\x03", b"ab\x7f\x7f", b"x", b" ", b"\x15", b"identity\n", b"\x1b[0n", b"\x1b", b"\x1b[", b"a", b"deadbeef ", b"x deadbeef stray ", b"9" * 40):
+            with self.subTest(prefix=prefix):
+                result = bytes.fromhex(self.run_wire("filter", prefix + request + b"identity\n").strip())
+                expected_prefix = b"" if prefix == b"deadbeef " else prefix
+                self.assertEqual(result, expected_prefix + b"identity\n")
+
+    def test_filter_nested_window_and_damaged_credential_crc(self):
+        body = b"00000001 svc.wifi.join 0000000000000001 " + base64.b64encode(b"s" * 31) + b" " + base64.b64encode(b"password" * 7)
+        request = frame(body)
+        prefix = b"x deadbeef stray " * 100
+        for value in (request, request[:-9] + b"00000000\n"):
+            result = bytes.fromhex(self.run_wire("filter", prefix + value + b"identity\n").strip())
+            self.assertEqual(result, prefix + b"identity\n")
+            self.assertNotIn(base64.b64encode(b"password" * 7), result)
+
+    def test_filter_never_releases_partial_or_oversized_credential_input(self):
+        header = b"x00000001 svc.wifi.join 0000000000000001 YQ== "
+        for tail in (b"c2VjcmV0\x03\n", b"c2VjcmV0" * 100 + b"\n", b"c2VjcmV0*invalid!\n"):
+            result = bytes.fromhex(self.run_wire("filter", header + tail + b"identity\n").strip())
+            self.assertEqual(result, b"xidentity\n")
+
+    def test_every_plain_gui_command_template_passes_byte_identical(self):
+        from flash_gui.ambyte_serial import AmbyteConsole, ConsoleError
+        con = object.__new__(AmbyteConsole)
+        captured = []
+        staged = 0
+        def command(line, *args, **kwargs):
+            nonlocal staged
+            captured.append(line)
+            if line == "schedule begin": staged = 0; return "schedule begin: ready"
+            if line.startswith("schedule put "):
+                staged += len(base64.b64decode(line.split()[-1]))
+                return f"schedule put: {staged} bytes"
+            if line.startswith("schedule commit "): return "schedule commit queued: fixture"
+            if line.startswith("schedule install "): return "schedule install queued: fixture"
+            return "(reboot to apply)"
+        con.command = command
+        con._write_line = lambda line: captured.append(line)
+        operations = [con.identity, con.status, con.rtc_read, lambda: con.rtc_set(1790000000),
+                      con.schedule_release, con.schedule_status_workbook, con._schedule_abort_quietly,
+                      lambda: con.schedule_install("https://example.test/schedule.yaml", "a" * 64, "deadbeef", "a3", "test"),
+                      lambda: con.schedule_push(bytes(range(256)) * 2, "0123456789abcdef" * 4, "deadbeef", "a3", "test")]
+        for key in ("device_name", "timezone", "mqtt_client_id"):
+            operations += [lambda k=key: con.cfg_get(k), lambda k=key: con.cfg_set(k, "deadbeef example"),
+                           lambda k=key: con.cfg_set(k, "12345678"),
+                           lambda k=key: con.cfg_set(k, "deadbeef svc.weekly"),
+                           lambda k=key: con.cfg_set(k, "deadbeef svc.wifi.join literal")]
+        for operation in operations:
+            try: operation()
+            except ConsoleError: pass  # only response parsing fails; emitted command is captured
+        with patch("flash_gui.ambyte_serial.time.sleep"):
+            con.reboot()
+        # Inventory every actual console emission site. A new dynamic template
+        # fails here until a real serializer exercise above covers its shape.
+        for source in sorted((ROOT / "flash_gui").glob("*.py")):
+            if source.name.startswith("service_"): continue  # framed clients bypass the editor
+            for call in ast.walk(ast.parse(source.read_text())):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                        and call.func.attr in {"command", "_write_line"} and call.args): continue
+                arg = call.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str): captured.append(arg.value)
+                elif isinstance(arg, ast.JoinedStr):
+                    pattern = "".join(re.escape(v.value) if isinstance(v, ast.Constant) else ".*" for v in arg.values)
+                    self.assertTrue(any(re.fullmatch(pattern, line) for line in captured), (source, ast.unparse(arg)))
+                elif isinstance(arg, ast.Name) and arg.id == "cmd":
+                    self.assertEqual(source.name, "ambyte_serial.py")
+                elif isinstance(arg, ast.BinOp):
+                    self.assertTrue(ast.unparse(arg).startswith("'schedule commit ' +"))
+                    self.assertTrue(any(line.startswith("schedule commit ") for line in captured))
+                else: self.fail(f"Unexercised console template {source}: {ast.unparse(arg)}")
+        # fleet_deploy sends MQTT payloads and has no serial console writer.
+        for source in sorted((ROOT / "tools/fleet_deploy").glob("*.py")):
+            for call in ast.walk(ast.parse(source.read_text())):
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
+                    self.assertNotIn(call.func.attr, {"command", "_write_line", "Serial"}, source)
+        self.assertGreater(len(captured), 30)
+        for ending in ("\n", "\r\n"):
+            stream = "".join(line + ending for line in captured).encode()
+            self.assertEqual(bytes.fromhex(self.run_wire("filter", stream).strip()), stream)
 
     def test_utf8(self):
         for data in (b"abc", "🌱é网络".encode(), b"\xf4\x8f\xbf\xbf"):

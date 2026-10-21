@@ -32,9 +32,13 @@ int main(int argc, char **argv)
     } else if (!strcmp(argv[1], "filter") || !strcmp(argv[1], "trace")) {
         svc_editor_filter_t filter = {0};
         for (size_t i = 0; i < length; ++i) {
-            unsigned char out[9] = {0};
+            unsigned char out[SVC_EDITOR_OUTPUT_MAX] = {0};
             bool dropped;
             size_t n = svc_editor_byte(&filter, data[i], out, &dropped);
+            if (dropped) {
+                assert(filter.length == 0 && !filter.candidate);
+                for (size_t k = 0; k < sizeof filter.prefix; ++k) assert(!filter.prefix[k]);
+            }
             dump(out, n);
             if (!strcmp(argv[1], "trace")) printf("%s\n", dropped ? ":dropped" : "");
         }
