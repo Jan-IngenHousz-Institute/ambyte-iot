@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Execute the production inventory and serializer, with only hardware ports fake."""
+import base64
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+import zlib
+
+ROOT = Path(__file__).resolve().parents[1]
+SCENARIOS = ("empty", "filled", "stale", "fresh_boundary", "absent", "swap",
+             "busy", "veto", "reset", "reconnect", "spec_bare", "spec_silent",
+             "stable", "old", "bad_values", "slice")
+
+
+def build(binary):
+    subprocess.run([os.environ.get("CC", "clang"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    "-g", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                    "-I" + str(ROOT / "components/sensor_inventory/include"),
+                    str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
+                    str(ROOT / "components/sensor_inventory/sensor_json.c"),
+                    str(ROOT / "tests/sensors_host/driver.c"), "-pthread", "-lm", "-o", str(binary)], check=True)
+
+
+class SensorsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="sensors-host-")
+        cls.binary = Path(cls.temp.name) / "sensors"
+        build(cls.binary)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def run_case(self, name):
+        result = subprocess.run([self.binary, name], capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def test_all_production_state_scenarios(self):
+        for name in SCENARIOS:
+            with self.subTest(name=name):
+                for snapshot in self.run_case(name):
+                    self.assertEqual(snapshot["contract"], 1)
+                    self.assertEqual([p["port"] for p in snapshot["ports"]], list(range(4)))
+
+    def test_exact_calibration_bytes_crc_and_endianness(self):
+        snapshot = self.run_case("filled")[0]
+        for ch, port in enumerate(snapshot["ports"]):
+            self.assertEqual(port["hw_rev"]["value"], 7)
+            cal = port["calibration"]["value"]
+            raw = base64.b64decode(cal["raw_base64"], validate=True)
+            self.assertEqual(len(raw), 140)
+            self.assertEqual(port["calibration_digest"]["value"]["hex"], f"{zlib.crc32(raw):08x}")
+            self.assertEqual(cal["mlx_coef"], [-1000*ch-i for i in range(14)])
+            self.assertEqual(cal["actinic_coef"], ch + .25)
+            self.assertEqual(port["spectral"]["value"]["par_intercept"], ch + 32)
+            self.assertEqual(port["calibration"]["source"], "last_read")
+            self.assertEqual(port["sensor_id"]["clock"], {"source": "sntp", "suspect": False})
+
+    def test_unknown_absence_busy_and_stale_are_distinct(self):
+        self.assertEqual(self.run_case("empty")[0]["ports"][0]["stale_reason"], "never_observed")
+        self.assertFalse(self.run_case("fresh_boundary")[0]["ports"][0]["stale"])
+        self.assertEqual(self.run_case("stale")[0]["ports"][0]["stale_reason"], "age")
+        self.assertEqual(self.run_case("busy")[0]["ports"][0]["state"], "busy")
+        absent = self.run_case("absent")[0]["ports"][0]
+        self.assertEqual(absent["state"], "absent")
+        self.assertIsNone(absent["sensor_id"]["value"])
+
+    def test_bad_float_and_utf8_are_unknown_not_repaired(self):
+        port = self.run_case("bad_values")[0]["ports"][0]
+        self.assertIsNone(port["calibration"]["value"]["ambit_name"])
+        self.assertIsNone(port["calibration"]["value"]["temp_offset"])
+        self.assertIsNone(port["spectral"]["value"]["spec_offset"][0])
+
+    def test_reconnect_drops_entire_old_block_and_increments_generation(self):
+        invalid, reconnect = self.run_case("reconnect")
+        self.assertIsNone(invalid["ports"][0]["calibration"]["value"])
+        self.assertEqual(reconnect["ports"][0]["generation"], 2)
+        self.assertIsNone(reconnect["ports"][0]["calibration"]["value"])
+
+
+if __name__ == "__main__":
+    unittest.main()

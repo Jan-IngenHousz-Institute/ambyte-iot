@@ -32,6 +32,10 @@ typedef struct {
     bool (*submit)(void *context, const svc_record_t *record, const char *password);
     void (*metrics)(void *context, svc_metrics_t *out);
     bool (*wifi_status)(void *context, svc_wifi_status_t *out);
+    const char *(*sensors_capture)(void *context, uint64_t *token, size_t *size, char sha[65]);
+    const char *(*sensors_read)(void *context, uint64_t token, uint32_t offset,
+                              unsigned char data[576], size_t *size, bool *eof);
+    void (*sensors_release)(void *context);
     void *context;
 } svc_protocol_ports_t;
 

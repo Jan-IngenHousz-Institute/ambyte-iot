@@ -3,6 +3,7 @@
 
 #include "esp_err.h"
 #include "uart_sensor_port.h"
+#include "sensor_inventory.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,8 @@ extern "C" {
  * Must be called once from app_main before any query/ping.
  */
 esp_err_t uart_sensors_init(void);
+sensor_read_result_t uart_sensors_inspect(uint8_t ch, uint8_t type, void *out,
+    size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t));
 
 /* ── AMBIT ROM-flash reset/boot control (host-driven C3 firmware update) ──
  * Force an AMBIT (ESP8685/ESP32-C3) into its ROM serial download mode over the

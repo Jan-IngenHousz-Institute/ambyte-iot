@@ -6,3 +6,5 @@ typedef int esp_err_t;
 typedef struct { int rx_buffer_size, tx_buffer_size; } usb_serial_jtag_driver_config_t;
 int usb_serial_jtag_read_bytes(void *data, uint32_t length, TickType_t wait);
 esp_err_t usb_serial_jtag_wait_tx_done(TickType_t wait);
+
+int usb_serial_jtag_write_bytes(const void *data, size_t length, TickType_t wait);

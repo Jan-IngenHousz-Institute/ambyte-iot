@@ -38,6 +38,7 @@
 #include "esp_pm.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "sched_runner.h"
@@ -296,11 +297,13 @@ static bool         s_maint_busy = false;
 
 static bool app_maintenance_begin(void)
 {
+    sensor_inventory_veto_begin();
     bool acquired;
     taskENTER_CRITICAL(&s_maint_mux);
     acquired = !s_maint_busy;
     if (acquired) s_maint_busy = true;
     taskEXIT_CRITICAL(&s_maint_mux);
+    if (!acquired) sensor_inventory_veto_end();
     return acquired;
 }
 
@@ -309,6 +312,7 @@ static void app_maintenance_end(void)
     taskENTER_CRITICAL(&s_maint_mux);
     s_maint_busy = false;
     taskEXIT_CRITICAL(&s_maint_mux);
+    sensor_inventory_veto_end();
 }
 
 /* Registered with sync_runner as the all-reboot maintenance veto. This is the
@@ -368,6 +372,8 @@ static void app_comms_resume(void)
 typedef struct {
     void (*run)(void *arg);   /* the component's op handler; must free(arg) */
     void  *arg;               /* heap-owned request copy */
+    int64_t queued_us;
+    bool behind_refresh;
 } maint_job_t;
 
 static QueueHandle_t s_maint_q;
@@ -379,7 +385,8 @@ static TaskHandle_t s_maint_task;
 static bool app_maint_submit(void (*run)(void *arg), void *arg)
 {
     if (s_maint_q == NULL || run == NULL) return false;
-    maint_job_t job = { .run = run, .arg = arg };
+    maint_job_t job = { .run = run, .arg = arg, .queued_us = esp_timer_get_time(),
+        .behind_refresh = sensor_inventory_refresh_owned() && uxQueueMessagesWaiting(s_maint_q) == 0 };
     return xQueueSend(s_maint_q, &job, 0) == pdTRUE;
 }
 
@@ -394,19 +401,35 @@ static uint32_t app_maint_stack_margin(void)
     return s_maint_task ? uxTaskGetStackHighWaterMark(s_maint_task) * sizeof(StackType_t) : 0;
 }
 
+static bool app_service_boot_ready(void);
+static void app_sensors_wake(void)
+{
+    if (!s_maint_q || uxQueueMessagesWaiting(s_maint_q)) return;
+    /* A queue item closes the check/receive wake race without a polling task.
+     * If a real job is already queued it will wake the worker itself. */
+    const maint_job_t nudge = {0};
+    (void)xQueueSend(s_maint_q, &nudge, 0);
+}
 static void app_maint_worker(void *arg)
 {
     (void)arg;
-    /* Confirm (or roll back) a just-applied self-OTA image before serving any
-     * request. This ran in ota_update's own task before; it now lives here since
-     * this is the single maintenance task. No-op fast return on a normal boot. */
     ota_update_run_boot_confirm();
-
-    maint_job_t job;
     for (;;) {
-        if (xQueueReceive(s_maint_q, &job, portMAX_DELAY) == pdTRUE) {
-            job.run(job.arg);   /* runs the op to completion; OTA success/rollback reboots */
-        }
+        uint32_t wait = app_service_boot_ready() ? sensor_inventory_wait_ms() : UINT32_MAX;
+        TickType_t ticks = wait == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(wait);
+        if (wait && ticks == 0) ticks = 1;
+        maint_job_t job;
+        if (xQueueReceive(s_maint_q, &job, ticks) == pdTRUE) {
+            if (!job.run) {
+                if (sensor_inventory_busy()) sensor_inventory_refresh();
+                continue;
+            }
+            if (job.behind_refresh) {
+                int64_t delay = esp_timer_get_time() - job.queued_us;
+                sensor_inventory_note_job_wait(delay > UINT32_MAX ? UINT32_MAX : (uint32_t)delay);
+            }
+            job.run(job.arg);
+        } else if (app_service_boot_ready()) sensor_inventory_refresh();
     }
 }
 
@@ -456,6 +479,7 @@ static void app_open_boot_gate(void)
     }
     sync_runner_boot_complete();
     usb_service_boot_ready();
+    app_sensors_wake();
 }
 
 static esp_err_t app_init_i2c_and_sensors(void)
@@ -1523,6 +1547,7 @@ void app_main(void)
         .provenance_suppressed  = evlog_replay_covers,
     };
     device_commands_init(&cmd_cfg);
+    device_commands_sensors_start(uart_available ? uart_sensors_inspect : NULL, app_sensors_wake);
     if (persistence_available) {
         /* SD restore rebuilds event_log's volatile claim window. Clear the peer
          * MQTT latch/queue through a registered callback rather than coupling

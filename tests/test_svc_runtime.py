@@ -25,6 +25,8 @@ class ServiceRuntimeTest(unittest.TestCase):
             *(f"-I{path}" for path in includes),
             *(str(ROOT / "components/usb_service" / name) for name in
               ("svc_wire.c", "svc_store.c", "svc_protocol.c", "svc_engine.c", "svc_session.c")),
+            str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
+            str(ROOT / "components/sensor_inventory/sensor_json.c"),
             str(ROOT / "tests/svc_host/runtime_driver.c"), "-Wl,--wrap=svc_store_open", "-lcrypto", "-o", str(cls.binary),
         ], capture_output=True, text=True)
         if p.returncode: raise RuntimeError(p.stdout + p.stderr)

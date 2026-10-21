@@ -57,6 +57,7 @@
 
 #include "ambit_trace.h"
 #include "device_commands.h"
+#include "sensor_inventory.h"
 #include "device_config.h"
 #include "sched_runner.h"
 #include "sched_runner_priv.h"
@@ -622,7 +623,9 @@ static void sched_runner_task(void *arg)
         }
     }
 
+    sensor_inventory_veto_begin();
     sched_runner_cleanup_lights();
+    sensor_inventory_veto_end();
     sample_stack_margin();
 
     /* Stack high-water at exit: the number that trims SCHED_TASK_STACK after

@@ -110,6 +110,7 @@ static inline int64_t now_us(void) { return esp_timer_get_time(); }
  * connected/absent decision from surviving a ROM probe, OTA exit, or host boot. */
 static void ambit_note_shared_app_reset(void)
 {
+    sensor_inventory_reset();
     s_ping_fail_cache_not_before_us = now_us() + AMBIT_APP_BOOT_GRACE_US;
     for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++) {
         s_ch[channel].state = UART_SENSOR_DISCONNECTED;
@@ -302,13 +303,17 @@ esp_err_t uart_sensors_flash_session_begin(uint8_t ch, uint32_t wait_ms)
     if (!s_inited)                      return ESP_ERR_INVALID_STATE;
     if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
     /* Owns the shared bus + remaps UART0 to `ch` for the whole flash session. */
-    return channel_acquire(ch, pdMS_TO_TICKS(wait_ms));
+    sensor_inventory_veto_begin();
+    esp_err_t result = channel_acquire(ch, pdMS_TO_TICKS(wait_ms));
+    if (result != ESP_OK) sensor_inventory_veto_end();
+    return result;
 }
 
 void uart_sensors_flash_session_end(uint8_t ch)
 {
     if (ch >= UART_SENSOR_NUM_CHANNELS) return;
     channel_release(ch);   /* leaves the channel DISCONNECTED → re-pinged later */
+    sensor_inventory_veto_end();
 }
 
 esp_err_t uart_sensors_enter_download(uint8_t ch)
@@ -321,6 +326,7 @@ esp_err_t uart_sensors_enter_download(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge cap */
     gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp */
+    ambit_note_shared_app_reset();
     vTaskDelay(pdMS_TO_TICKS(AMBIT_BOOT_HOLD_MS));       /* hold strap across the rise */
     gpio_set_level(s_ch[ch].boot_pin, 1);               /* release strap */
     uart_flush_input(UART_NUM_0);                        /* drop reset-time line noise */
@@ -331,6 +337,7 @@ esp_err_t uart_sensors_enter_download(uint8_t ch)
 esp_err_t uart_sensors_run_app(uint8_t ch)
 {
     if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
+    sensor_inventory_veto_begin();
     for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
         gpio_set_level(s_ch[i].boot_pin, 1);   /* all straps released → normal boot */
     }
@@ -339,12 +346,14 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 1);
     ambit_note_shared_app_reset();
     ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
+    sensor_inventory_veto_end();
     return ESP_OK;
 }
 
 esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
+    sensor_inventory_veto_begin();
     const int64_t deadline = now_us() + (int64_t)wait_ms * 1000;
     uint8_t held = 0;
     for (; held < UART_SENSOR_NUM_CHANNELS; held++) {
@@ -363,19 +372,21 @@ esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
         }
     }
     while (held > 0) xSemaphoreGive(s_ch_mtx[--held]);
+    sensor_inventory_veto_end();
     return err;
 }
 
 /* ── Ambit wake sequence ───────────────────────────────────────────── */
 
-static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
+static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t channel, void (*started)(uint8_t))
 {
     uart_flush_input(port);
 
     for (int attempt = 0; attempt < WAKE_RETRIES && !deadline_reached(deadline); attempt++) {
         /* Send 3 wake bytes (ambit light-sleep UART threshold = 3 edges) */
         uint8_t wake3[3] = { AMBIT_WAKE, AMBIT_WAKE, AMBIT_WAKE };
-        uart_write_bytes(port, (const char *)wake3, sizeof(wake3));
+        int sent = uart_write_bytes(port, (const char *)wake3, sizeof(wake3));
+        if (sent > 0 && started) { started(channel); started = NULL; }
 
         int64_t retry_deadline = now_us() + (int64_t)WAKE_RETRY_MS * 1000;
         if (retry_deadline > deadline) {
@@ -407,6 +418,9 @@ static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
     }
     return ESP_ERR_TIMEOUT;
 }
+
+static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
+{ return ambit_wake_counted(port, deadline, 0, NULL); }
 
 /* ── Send command (header + 8-byte cmd + optional extra) ───────────── */
 
@@ -638,6 +652,45 @@ static esp_err_t receive_raw_response(uart_port_t port,
 }
 
 /* ── Public: full query (wake → cmd → response) ───────────────────── */
+
+sensor_read_result_t uart_sensors_inspect(uint8_t channel, uint8_t type, void *out,
+    size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t))
+{
+    if (got) *got = 0;
+    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || !got ||
+        (type != 0 && type != 1 && type != 2 && type != 4) ||
+        size != (type == 0 ? 0u : type == 1 ? 140u : type == 2 ? 48u : 132u) ||
+        (size && !out) || timeout_ms > SENSOR_BLOCK_MS) return SENSOR_READ_FAILED;
+    const int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+    uart_sensor_state_t previous_state = s_ch[channel].state;
+    if (channel_acquire_until(channel, deadline) != ESP_OK) return SENSOR_READ_FAILED;
+    uart_port_t port = s_ch[channel].uart_num;
+    sensor_read_result_t result = SENSOR_READ_FAILED;
+    /* Count at the wire boundary. Ordinary query/ping/OTA traffic does not
+     * pass this callback; acquiring a lock alone is not a wire transaction. */
+    if (ambit_wake_counted(port, deadline, channel, started) != ESP_OK) {
+        result = type == 0 ? SENSOR_READ_ABSENT : SENSOR_READ_FAILED;
+        goto done;
+    }
+    if (!type) { result = SENSOR_READ_OK; goto done; }
+    uint8_t cmd[8] = {33, type};
+    if (deadline_reached(deadline) || ambit_send_cmd(port, cmd, NULL, 0) != ESP_OK) goto done;
+    uint8_t marker;
+    if (uart_read_exact(port, &marker, 1, deadline) != ESP_OK) goto done;
+    if (marker == AMBIT_CMD_END) { result = SENSOR_READ_UNSUPPORTED; goto done; }
+    if (marker != AMBIT_CMD_DONE || uart_read_exact(port, out, size, deadline) != ESP_OK) goto done;
+    /* Unlike the frozen legacy path, no scanning past extra bytes to find a
+     * plausible END: an oversized/truncated block cannot become calibration. */
+    if (uart_read_exact(port, &marker, 1, deadline) != ESP_OK || marker != AMBIT_CMD_END) goto done;
+    *got = size; result = SENSOR_READ_OK;
+done:
+    uart_flush_input(port);
+    /* Diagnostic failure never turns driver DISCONNECTED into attachment
+     * evidence. The inventory owns presence and acquisition provenance. */
+    s_ch[channel].state = previous_state;
+    channel_release(channel);
+    return result;
+}
 
 static esp_err_t do_query(uint8_t channel,
                           const uint8_t cmd[8],

@@ -12,6 +12,7 @@
 
 #include "CLI.h"
 #include "cli_identity.h"
+#include "cli_sensors.h"
 #include "driver/i2c.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -2208,6 +2209,12 @@ static esp_err_t cli_register_commands(void)
         .help = "read gateway identity and maintenance contract v1 as one JSON line",
         .func = cli_cmd_identity,
     };
+    const esp_console_cmd_t sensors_cmd = {
+        .command = "sensors", .help = "read cached attachment observations as one JSON line",
+        .func = cli_cmd_sensors,
+    };
+    esp_err_t sensors_err = esp_console_cmd_register(&sensors_cmd);
+    if (sensors_err != ESP_OK) return sensors_err;
     esp_err_t identity_err = esp_console_cmd_register(&identity_cmd);
     if (identity_err != ESP_OK) {
         return identity_err;

@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
 #include "esp_wifi.h"
@@ -2498,7 +2499,7 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
  * at set-time. Written from the single measurement task, so no lock as long as
  * that stays the only writer. */
 #define AMBIT_INFO_NUM_CH 4
-static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
+
 
 /* Inventory announcements are keyed by stable sensor identity, not channel.
  * Persist four last-delivered tuples so a transient UART reconnect, reboot, or
@@ -2523,8 +2524,9 @@ static int ambit_announce_slot(const ambit_device_info_t *info, bool *unchanged)
     snprintf(candidate.sensor_id, sizeof candidate.sensor_id, "%s", info->device_id);
     snprintf(candidate.firmware, sizeof candidate.firmware, "%s", info->fw_version);
     const char *attached[AMBIT_ANNOUNCE_SLOTS] = {0};
+    ambit_device_info_t identities[AMBIT_ANNOUNCE_SLOTS];
     for (size_t i = 0; i < AMBIT_ANNOUNCE_SLOTS; ++i) {
-        if (s_ambit_info[i].valid) attached[i] = s_ambit_info[i].device_id;
+        if (cmd_ambit_device_info_cached((uint8_t)i, &identities[i])) attached[i] = identities[i].device_id;
     }
     if (s_ambit_announcement_mutex == NULL ||
         xSemaphoreTake(s_ambit_announcement_mutex,
@@ -2554,24 +2556,10 @@ static esp_err_t ambit_announce_stage(int slot, const ambit_device_info_t *info,
     return err;
 }
 
-/* Calibration-read retry state (2026-08-03 field defect): the AMBIT's human
- * name lives in the calibration blob, and the identity fetch used to treat a
- * failed calibration read as final — caching valid=true with an empty name, so
- * every measurement was labeled the generic "ambit" until the next reconnect or
- * reboot. After the v1.4.1 fleet OTA, 11 Ambits latched that way at once (the
- * post-reboot fetch races the AMBIT's own settling). Two-layer cure:
- *   1. retry the calibration read a few times inside the fetch itself;
- *   2. if it still fails, mark it pending here and keep re-trying on later
- *      lookups, rate-limited so a truly nameless/legacy AMBIT can't turn every
- *      measurement into a UART round-trip.
- * Same single-writer story as s_ambit_info (measurement task), so no lock. */
-#define AMBIT_CAL_FETCH_TRIES     3      /* attempts inside one identity fetch */
-#define AMBIT_CAL_RETRY_DELAY_MS  150    /* pause between those attempts */
-#define AMBIT_CAL_RETRY_PERIOD_MS 60000  /* floor between later re-attempts */
-static struct {
-    bool    pending;          /* identity cached but calibration (name) unread */
-    int64_t next_attempt_ms;  /* earliest time for the next re-attempt */
-} s_ambit_cal_retry[AMBIT_INFO_NUM_CH];
+/* Missing calibration is retried by the idle inventory worker. A cache lookup
+ * during another leaf's acquisition must never attempt a late UART read. */
+#define AMBIT_CAL_FETCH_TRIES 3
+#define AMBIT_CAL_RETRY_DELAY_MS 150
 
 /* Cmd 1 — Set photodetector gains on the ADPD6100.
  * Values 1-6 map to gain levels (0 = skip / keep current).
@@ -2586,10 +2574,8 @@ cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
     /* Track at set-time — the AMBIT has no read-back, and we're the only setter,
      * so this stays authoritative for the event metadata. */
     if (r.status == ESP_OK && ch < AMBIT_INFO_NUM_CH) {
-        s_ambit_info[ch].gains[0] = fluo;    s_ambit_info[ch].gains[1] = fluoref;
-        s_ambit_info[ch].gains[2] = ir;      s_ambit_info[ch].gains[3] = irref;
-        s_ambit_info[ch].gains[4] = sun;     s_ambit_info[ch].gains[5] = leaf;
-        s_ambit_info[ch].gains_set = true;
+        const uint8_t gains[6] = {fluo, fluoref, ir, irref, sun, leaf};
+        sensor_inventory_config(ch, gains, NULL);
     }
     return r;
 }
@@ -2604,9 +2590,8 @@ cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
     uint8_t cmd[8] = { AMBIT_CMD_SET_CURRENTS, i620, i720, ir, 0, 0, 0, 0 };
     cmd_result_t r = ambit_ack_only(ch, cmd);
     if (r.status == ESP_OK && ch < AMBIT_INFO_NUM_CH) {
-        s_ambit_info[ch].currents[0] = i620; s_ambit_info[ch].currents[1] = i720;
-        s_ambit_info[ch].currents[2] = ir;
-        s_ambit_info[ch].currents_set = true;
+        const uint8_t currents[3] = {i620, i720, ir};
+        sensor_inventory_config(ch, NULL, currents);
     }
     return r;
 }
@@ -2825,17 +2810,17 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
  * complete identity and calibration only when the persisted stable tuple
  * changes. Best-effort: a store failure must not fail the identity fetch. */
 #define AMBIT_DEVICE_PAYLOAD_CAP 1536U
-static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
+static bool ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
                                    const ambit_calibration_t *cal, bool have_cal)
 {
     if (s_cfg.store_event == NULL || s_cfg.next_id == NULL || !have_cal || cal == NULL)
-        return; /* ambit.device/1 never permits a partial calibration object. */
+        return false; /* ambit.device/1 never permits a partial calibration object. */
     bool unchanged = false;
     const int announce_slot = ambit_announce_slot(e, &unchanged);
-    if (unchanged) return;
+    if (unchanged) return true;
 
     int64_t mid = 0;
-    if (s_cfg.next_id(&mid) != ESP_OK) return;
+    if (s_cfg.next_id(&mid) != ESP_OK) return false;
     char chan[12];
     snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
     const int64_t observed = now_ms();
@@ -2867,14 +2852,14 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
     char *payload = malloc(AMBIT_DEVICE_PAYLOAD_CAP);
     if (payload == NULL) {
         ESP_LOGW(TAG, "AMBIT%u device object allocation failed", ch + 1);
-        return;
+        return false;
     }
     char build_error[96];
     if (!payload_v3_build_device(payload, AMBIT_DEVICE_PAYLOAD_CAP, &input,
                                  build_error, sizeof build_error)) {
         ESP_LOGW(TAG, "AMBIT%u device object build failed: %s", ch + 1, build_error);
         free(payload);
-        return;
+        return false;
     }
     measurement_event_desc_t d = {
         .measure_id   = mid,
@@ -2898,132 +2883,79 @@ static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
         ESP_LOGI(TAG, "AMBIT%u ambit.device/1 stored (%s cal=%08lx)",
                  ch + 1, e->ambit_name, (unsigned long)e->cal_version);
     }
+    return stored;
 }
 
-/* One calibration-read attempt: on success fill the cal-derived fields of *e
- * (cal_version, actinic_coef, ambit_name) and return true, leaving *cal for the
- * DEVICE_INFO emit. On failure *e is untouched. */
-static bool ambit_cal_read(uint8_t ch, ambit_device_info_t *e, ambit_calibration_t *cal)
+_Static_assert(sizeof(ambit_calibration_t) == SENSOR_CAL_BYTES, "frozen calibration layout");
+_Static_assert(sizeof(ambit_fw_info_t) == 48, "frozen firmware layout");
+static portMUX_TYPE s_sensor_cache_mux = portMUX_INITIALIZER_UNLOCKED;
+static void inventory_lock(void) { portENTER_CRITICAL(&s_sensor_cache_mux); }
+static void inventory_unlock(void) { portEXIT_CRITICAL(&s_sensor_cache_mux); }
+static int64_t inventory_now(void) { return esp_timer_get_time(); }
+static int64_t inventory_utc(void) { return now_ms(); }
+static void inventory_yield(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms) ? pdMS_TO_TICKS(ms) : 1); }
+static uint8_t inventory_clock(bool *suspect)
 {
-    size_t cgot = 0;
-    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION,
-                                         (uint8_t *)cal, sizeof *cal, &cgot);
-    if (cr.status != ESP_OK || cgot < sizeof *cal) return false;
-    e->cal_version  = esp_rom_crc32_le(0, (const uint8_t *)cal, sizeof *cal);
-    e->actinic_coef = cal->actinic_coef;
-    e->tick_factor  = cal->tick_factor;
-    memset(e->ambit_name, 0, sizeof e->ambit_name);
-    memcpy(e->ambit_name, cal->ambit_name, sizeof e->ambit_name - 1);
-    return true;
+    const char *source = NULL; clock_trust_get_status(&source, suspect);
+    return source && !strcmp(source, "rtc") ? 1 : source && !strcmp(source, "hwm") ? 2 : source && !strcmp(source, "sntp") ? 3 : 0;
 }
-
+extern void sched_resource_sample(void) __attribute__((weak));
+static void inventory_sample(void) { if (sched_resource_sample) sched_resource_sample(); }
+static bool inventory_announce(uint8_t ch, const ambit_device_info_t *e, const void *raw)
+{
+    ambit_calibration_t cal; memcpy(&cal, raw, sizeof cal);
+    return ambit_emit_device_info(ch, e, &cal, true);
+}
+void device_commands_sensors_start(sensor_inspect_fn_t inspect, void (*wake)(void))
+{
+    const sensor_inventory_ports_t ports = {.now_us = inventory_now, .utc_ms = inventory_utc,
+        .clock = inventory_clock, .lock = inventory_lock, .unlock = inventory_unlock,
+        .yield_ms = inventory_yield, .wake = wake, .sample = inventory_sample,
+        .inspect = inspect, .announce = inventory_announce};
+    uint64_t boot = (uint64_t)esp_random() << 32 | esp_random();
+    while (!boot) boot = (uint64_t)esp_random() << 32 | esp_random();
+    sensor_inventory_init(&ports, boot);
+}
 static esp_err_t ambit_info_fetch(uint8_t ch)
 {
-    /* FW info (MAC + version) is mandatory; calibration (→ cal_version) best-effort. */
-    ambit_fw_info_t fw;
-    size_t got = 0;
+    /* Preserve the legacy lazy discovery path before an acquisition. The
+     * bank veto prevents idle refresh from interleaving its three blocks. */
+    if (sensor_inventory_busy()) return ESP_ERR_INVALID_STATE;
+    sensor_inventory_veto_begin();
+    if (!sensor_inventory_legacy_read_begin()) { sensor_inventory_veto_end(); return ESP_ERR_INVALID_STATE; }
+    ambit_fw_info_t fw; size_t got = 0;
     cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW, (uint8_t *)&fw, sizeof fw, &got);
-    if (r.status != ESP_OK || got < sizeof fw) {
-        return (r.status != ESP_OK) ? r.status : ESP_FAIL;
+    esp_err_t result = r.status;
+    if (result == ESP_OK && !sensor_inventory_accept(ch, 2, &fw, got)) result = ESP_FAIL;
+    if (result == ESP_OK) {
+        for (int attempt = 0; attempt < AMBIT_CAL_FETCH_TRIES; ++attempt) {
+            if (attempt) vTaskDelay(pdMS_TO_TICKS(AMBIT_CAL_RETRY_DELAY_MS));
+            ambit_calibration_t cal; got = 0;
+            r = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &got);
+            if (r.status == ESP_OK && sensor_inventory_accept(ch, 1, &cal, got)) break;
+        }
     }
-
-    ambit_device_info_t e;
-    memset(&e, 0, sizeof e);
-    /* getEfuseMac() packs the 6-byte MAC little-endian (byte0 = low 8 bits). */
-    uint64_t m = fw.mac;
-    snprintf(e.device_id, sizeof e.device_id, "%02X:%02X:%02X:%02X:%02X:%02X",
-             (unsigned)(m & 0xFF), (unsigned)((m >> 8) & 0xFF), (unsigned)((m >> 16) & 0xFF),
-             (unsigned)((m >> 24) & 0xFF), (unsigned)((m >> 32) & 0xFF), (unsigned)((m >> 40) & 0xFF));
-    snprintf(e.fw_version, sizeof e.fw_version, "%u.%u.%u",
-             (unsigned)fw.major, (unsigned)fw.minor, (unsigned)fw.batch);
-    e.hw_rev = fw.hw_rev;   /* 0 on pre-0.1.0 images (they never wrote the byte) */
-
-    /* cal_version = CRC32 of the calibration struct → changes whenever the sensor
-     * is recalibrated. The struct has no native version field.
-     * Retried: the name lives in this blob, and a single boot-time timeout here
-     * used to stick the channel with the generic "ambit" label for hours (see
-     * s_ambit_cal_retry above). */
-    ambit_calibration_t cal;
-    bool have_cal = false;
-    for (int attempt = 0; attempt < AMBIT_CAL_FETCH_TRIES && !have_cal; attempt++) {
-        if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(AMBIT_CAL_RETRY_DELAY_MS));
-        have_cal = ambit_cal_read(ch, &e, &cal);
-    }
-    /* Never latch a missing calibration as final: keep the identity usable
-     * (fw/MAC below) but leave the name pending so later lookups re-try. */
-    s_ambit_cal_retry[ch].pending         = !have_cal;
-    s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
-
-    /* Preserve gains/currents tracked since the last (re)connect — the identity
-     * fetch must not clobber them (they live in the same cache struct). */
-    e.gains_set     = s_ambit_info[ch].gains_set;
-    memcpy(e.gains, s_ambit_info[ch].gains, sizeof e.gains);
-    e.currents_set  = s_ambit_info[ch].currents_set;
-    memcpy(e.currents, s_ambit_info[ch].currents, sizeof e.currents);
-
-    e.valid = true;
-    s_ambit_info[ch] = e;
-
-    /* Stable-tuple persistence suppresses unchanged reconnect announcements. */
-    ambit_emit_device_info(ch, &e, &cal, have_cal);
-    return ESP_OK;
+    sensor_inventory_legacy_read_end();
+    sensor_inventory_veto_end();
+    return result;
 }
-
 cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
 {
-    if (ch >= AMBIT_INFO_NUM_CH || out == NULL) {
-        return make_result(ESP_ERR_INVALID_ARG, "device_info: bad channel/arg");
-    }
-    if (!s_ambit_info[ch].valid) {
-        esp_err_t err = ambit_info_fetch(ch);
-        if (err != ESP_OK) {
+    if (ch >= AMBIT_INFO_NUM_CH || out == NULL) return make_result(ESP_ERR_INVALID_ARG, "device_info: bad channel/arg");
+    if (!sensor_inventory_cached(ch, out)) {
+        esp_err_t error = ambit_info_fetch(ch);
+        if (error != ESP_OK || !sensor_inventory_cached(ch, out)) {
             memset(out, 0, sizeof *out);
-            return make_result(err, "AMBIT%u device_info fetch failed", ch + 1);
-        }
-    } else if (s_ambit_cal_retry[ch].pending &&
-               now_ms() >= s_ambit_cal_retry[ch].next_attempt_ms) {
-        /* Identity is cached but the calibration (and with it the name) never
-         * arrived — measurements are going out labeled "ambit". Re-try on the
-         * lookups that normal measurement traffic already makes, at most once
-         * per AMBIT_CAL_RETRY_PERIOD_MS, and re-announce identity once the name
-         * finally lands so the platform can correct itself. */
-        s_ambit_cal_retry[ch].next_attempt_ms = now_ms() + AMBIT_CAL_RETRY_PERIOD_MS;
-        ambit_calibration_t cal;
-        if (ambit_cal_read(ch, &s_ambit_info[ch], &cal)) {
-            s_ambit_cal_retry[ch].pending = false;
-            ambit_emit_device_info(ch, &s_ambit_info[ch], &cal, true);
-            ESP_LOGW(TAG, "AMBIT%u name recovered late: %s", ch + 1,
-                     s_ambit_info[ch].ambit_name);
+            return make_result(error != ESP_OK ? error : ESP_FAIL, "AMBIT%u device_info fetch failed", ch + 1);
         }
     }
-    *out = s_ambit_info[ch];
-    return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx",
-                       ch + 1, out->device_id, out->fw_version, (unsigned long)out->cal_version);
+    sensor_inventory_announce_pending(ch);
+    return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx", ch + 1, out->device_id, out->fw_version, (unsigned long)out->cal_version);
 }
-
 bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out)
-{
-    if (ch >= AMBIT_INFO_NUM_CH || out == NULL || !s_ambit_info[ch].valid) {
-        return false;
-    }
-    *out = s_ambit_info[ch];
-    return true;
-}
-
+{ return sensor_inventory_cached(ch, out); }
 void cmd_ambit_device_info_invalidate(uint8_t ch)
-{
-    if (ch < AMBIT_INFO_NUM_CH) {
-        /* Drop identity (re-fetch + re-announce next use) AND tracked gains/
-         * currents — the reconnected AMBIT booted with its own defaults, unknown
-         * to us until the script sets them again. */
-        s_ambit_info[ch].valid        = false;
-        s_ambit_info[ch].gains_set    = false;
-        s_ambit_info[ch].currents_set = false;
-        /* The next fetch owns its own calibration retries. */
-        s_ambit_cal_retry[ch].pending         = false;
-        s_ambit_cal_retry[ch].next_attempt_ms = 0;
-    }
-}
+{ sensor_inventory_invalidate(ch); }
 
 /* Cmd 21 — Run an array-mode measurement on the ADPD6100.
  * `run_arr` is a flat byte array of arr_len × 8 bytes. Each 8-byte line
@@ -3044,6 +2976,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
     if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
         return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
     }
+    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN, arr_len, led_persist,
                        (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
     memset(response, 0, sizeof(*response));
@@ -3053,6 +2986,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
         return make_result(err, "AMBIT%u run failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
+    sensor_inventory_complete(ch);
     /* Frozen cmd 21 has no error byte after CMD_DONE. A triggered abort ends
      * with CMD_END and no arrays; transport success alone is not a measurement.
      * Keep the wire protocol intact while making this visible to every caller. */
@@ -3075,6 +3009,7 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
     if (!s_initialized || s_cfg.uart_query == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
+    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN_MPF,
                        (uint8_t)(length >> 7), (uint8_t)(length & 0x7F),
                        interval, (uint8_t)(change_act ? 1 : 0), act, 0, 0 };
@@ -3084,6 +3019,7 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
         return make_result(err, "AMBIT%u run_mpf failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
+    sensor_inventory_complete(ch);
     return make_result(ESP_OK, "AMBIT%u mpf: %u arrays",
                        ch + 1, response->array_count);
 }
@@ -3108,6 +3044,7 @@ cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_l
     if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
         return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
     }
+    if (!sensor_inventory_acquire(ch)) return make_result(ESP_ERR_INVALID_STATE, "AMBIT%u acquisition busy", ch + 1);
     uint8_t cmd[8] = { AMBIT_CMD_RUN_START, arr_len, led_persist,
                        (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
     uart_sensor_response_t resp;
@@ -3143,6 +3080,7 @@ cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms)
     }
     if (state) *state = resp.raw[0];
     uint8_t st = resp.raw[0];
+    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE) sensor_inventory_complete(ch);
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u state=%u", ch + 1, (unsigned)st);
 }
@@ -3165,6 +3103,7 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
     if (response->array_count == 0U) {
         return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u fetch: no retained result", ch + 1);
     }
+    sensor_inventory_complete(ch);
     return make_result(ESP_OK, "AMBIT%u fetch: %u arrays", ch + 1, response->array_count);
 }
 
@@ -3260,6 +3199,7 @@ static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
                            "AMBIT%u OTA cmd %u: no answer", ch + 1, cmd[0]);
     }
     uint8_t st = resp.raw[0];
+    if (st == AMBIT_ASYNC_ERROR || st == AMBIT_ASYNC_IDLE) sensor_inventory_complete(ch);
     if (status) *status = st;
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u OTA cmd %u status=%u", ch + 1, cmd[0], st);

@@ -168,6 +168,27 @@ join for service consumers and bench tools, with fresh same-port confirmation,
 readback by ID and no automatic credential retransmission. Passwords are absent
 from service journals and service progress/error messages.
 
+### Attached-sensor diagnostics
+
+Select the serial port and click **Diagnostics / Read sensors**. The visible
+**Attached sensors** window shows all four ports, last observed state, eFuse MAC,
+firmware, hardware revision, generation and age. Select a row for exact
+calibration values, spectral vectors, calibration CRC, gateway observation times
+and clock quality. Busy/stale values are historical; unknown is not absent, and
+observed coefficients do not certify a calibration or a successful measurement.
+
+This read needs neither API sign-in nor Wi-Fi. It runs off the Tk thread through
+`flash_gui.sensor_diagnostics.read_sensor_diagnostics(port, *, log=print)`, also
+usable on the bench. Every serial open may reset the gateway, so the existing
+45 s console-readiness allowance applies; the descriptor stays open during the
+read. Advertised sensors uses JSON; older supported images show unavailable.
+Malformed new snapshots and connection failures are explicit errors.
+
+The shared `ServiceClient.sensors()` exposes the same model over bounded framed
+pages, validates every CRC and the reassembled SHA, and never writes an operation
+journal or changes a schedule. The device's full contract, retry/clock/generation
+semantics and errors are in [USB maintenance](../docs/usb-maintenance.md).
+
 ### GitHub rate limits
 
 The GUI reads the repo's release list to find the firmware, the Schedule catalog and

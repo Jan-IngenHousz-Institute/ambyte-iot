@@ -60,6 +60,7 @@ PRODUCTION_SOURCES = [
     "components/event_log/evq_index.c",
     "components/event_log/evq_render.c",
     "components/device_commands/device_commands.c",
+    "components/sensor_inventory/sensor_inventory.c",
     "components/device_commands/envelope_provenance.c",
     "components/device_commands/telemetry_publish.c",
     "components/payload_codec/payload_v3.c",
@@ -73,7 +74,7 @@ IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "t
 INCLUDES = [
     "tests/evq_integ/stubs", "tests/evq_integ",
     "components/event_log/include", "components/event_log",
-    "components/device_commands/include", "components/payload_codec/include",
+    "components/sensor_inventory/include", "components/device_commands/include", "components/payload_codec/include",
     "components/domain/include", "components/sync_runner/include", "components/sync_runner",
     "components/sd_card", "components/clock_trust/include", "components/fleet_jitter/include",
     "components/timezone/include", "components/ota_update/include",

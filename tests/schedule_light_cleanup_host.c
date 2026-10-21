@@ -58,6 +58,8 @@ cmd_result_t cmd_uart_ping(uint8_t ch, bool *connected)
     *connected = present && ch == 0;
     return (cmd_result_t){.status = ESP_OK};
 }
+cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
+{ (void)ch; memset(out, 0, sizeof *out); return (cmd_result_t){.status = ESP_OK}; }
 void device_commands_measurement_begin(void) {}
 void device_commands_measurement_end(void) {}
 /* No cached identity → the action resolves the paced engine; a 1 ms estimate

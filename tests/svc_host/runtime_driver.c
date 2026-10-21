@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <openssl/evp.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 #include "../../components/usb_service/usb_service.c"
@@ -107,7 +108,9 @@ bool svc_usb_write(const void *bytes, size_t n)
 { assert(gate); return fwrite(bytes, 1, n, stdout) == n; }
 bool svc_usb_notice_write(const void *bytes, size_t n)
 { assert(!gate); return fwrite("\r\n", 1, 2, stdout) == 2 && fwrite(bytes, 1, n, stdout) == n; }
+#ifndef SVC_SENSOR_PEER
 void svc_store_fault(const char *point) { (void)point; }
+#endif
 const char *__real_svc_store_open(svc_store_t *, const char *, uint64_t, size_t (*)(void *), void *);
 const char *__wrap_svc_store_open(svc_store_t *s, const char *path, uint64_t id, size_t (*free)(void *), void *context)
 {
@@ -163,3 +166,12 @@ int main(int argc, char **argv)
     assert(!gate && !mutex_held && !critical);
     return 0;
 }
+
+size_t heap_caps_get_allocated_size(void *ptr) { return malloc_usable_size(ptr); }
+#ifndef SVC_JOBS_INTEGRATION
+void mbedtls_sha256_init(mbedtls_sha256_context *c) { c->ctx = EVP_MD_CTX_new(); assert(c->ctx); }
+int mbedtls_sha256_starts(mbedtls_sha256_context *c, int n) { assert(!n); return EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
+int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *b, size_t n) { return EVP_DigestUpdate(c->ctx, b, n) == 1 ? 0 : -1; }
+int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char *b) { unsigned n = 0; return EVP_DigestFinal_ex(c->ctx, b, &n) == 1 && n == 32 ? 0 : -1; }
+void mbedtls_sha256_free(mbedtls_sha256_context *c) { EVP_MD_CTX_free(c->ctx); c->ctx = NULL; }
+#endif

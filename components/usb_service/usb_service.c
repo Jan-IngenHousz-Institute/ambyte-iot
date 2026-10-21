@@ -4,7 +4,9 @@
 #include "svc_usb.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "sensor_inventory.h"
 #include "esp_heap_caps.h"
 #include "esp_littlefs.h"
 #include "esp_random.h"
@@ -27,6 +29,10 @@ static portMUX_TYPE s_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
 static unsigned char s_boot_fingerprint[32];
 static bool s_boot_fingerprint_known;
 static bool s_initialized;
+static sensor_snapshot_t *s_sensor_pin;
+static uint64_t s_sensor_token;
+static int64_t s_sensor_pinned_ms;
+static size_t s_sensor_size;
 
 static void lock(void *context) { (void)context; xSemaphoreTake(s_mutex, portMAX_DELAY); }
 static void unlock(void *context) { (void)context; xSemaphoreGive(s_mutex); }
@@ -76,6 +82,55 @@ static bool sha256(void *context, const void *bytes, size_t n, unsigned char out
 {
     sample(context);
     return mbedtls_sha256(bytes, n, out, 0) == 0;
+}
+typedef struct { mbedtls_sha256_context hash; size_t size; } sensor_digest_t;
+static bool sensor_digest(void *context, const void *bytes, size_t size)
+{
+    sensor_digest_t *digest = context; digest->size += size;
+    return mbedtls_sha256_update(&digest->hash, bytes, size) == 0;
+}
+static void sensors_release(void *context)
+{
+    sample(context);
+    free(s_sensor_pin); s_sensor_pin = NULL; s_sensor_size = 0;
+    sensor_inventory_note_pin(0); sample(context);
+}
+static const char *sensors_capture(void *context, uint64_t *token, size_t *size, char sha[65])
+{
+    if (!sensor_inventory_ready()) return "sensors_unavailable";
+    sensors_release(context);
+    uint32_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_sensor_pin = malloc(sizeof *s_sensor_pin);
+    sample(context);
+    if (!s_sensor_pin) return "no_memory";
+    uint32_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t charge = heap_caps_get_allocated_size(s_sensor_pin);
+    if (before > after && before - after > charge) charge = before - after;
+    sensor_inventory_note_pin((uint32_t)charge);
+    if (!sensor_inventory_snapshot(s_sensor_pin)) { sensors_release(context); return "sensors_unavailable"; }
+    sensor_digest_t digest = {0}; unsigned char hash[32];
+    mbedtls_sha256_init(&digest.hash);
+    bool ok = mbedtls_sha256_starts(&digest.hash, 0) == 0 &&
+        sensor_snapshot_json(s_sensor_pin, sensor_digest, &digest) && mbedtls_sha256_finish(&digest.hash, hash) == 0;
+    mbedtls_sha256_free(&digest.hash);
+    if (!ok || !digest.size || digest.size > SENSOR_SNAPSHOT_MAX) { sensors_release(context); return "sensors_unavailable"; }
+    if (!s_sensor_token) do esp_fill_random(&s_sensor_token, sizeof s_sensor_token); while (!s_sensor_token);
+    if (s_sensor_token == UINT64_MAX) { sensors_release(context); return "sensors_unavailable"; }
+    ++s_sensor_token; *token = s_sensor_token; *size = s_sensor_size = digest.size;
+    s_sensor_pinned_ms = now(NULL);
+    for (unsigned i = 0; i < 32; ++i) snprintf(sha + 2*i, 3, "%02x", hash[i]);
+    sample(context); return NULL;
+}
+static const char *sensors_read(void *context, uint64_t token, uint32_t offset,
+                                unsigned char data[576], size_t *size, bool *eof)
+{
+    if (!s_sensor_pin || token != s_sensor_token) return "snapshot_expired";
+    if (now(NULL) - s_sensor_pinned_ms >= 60000) { sensors_release(context); return "snapshot_expired"; }
+    if (offset >= s_sensor_size) return "invalid_args";
+    *size = sensor_snapshot_slice(s_sensor_pin, offset, data, 576, NULL);
+    if (!*size) return "sensors_unavailable";
+    *eof = offset + *size == s_sensor_size;
+    sample(context); return NULL;
 }
 static bool submit(void *context, void (*run)(void *), void *arg)
 {
@@ -170,7 +225,8 @@ esp_err_t usb_service_init(const usb_service_config_t *config)
     do esp_fill_random(&fresh, sizeof fresh); while (!fresh);
     const char *error = svc_store_open(&s_store, "/littlefs/svc", fresh, free_bytes, NULL);
     if (error) s_store.corrupt = true;
-    svc_engine_ports_t ports = {.protocol = {.sha256 = sha256, .metrics = metrics, .wifi_status = wifi_status},
+    svc_engine_ports_t ports = {.protocol = {.sha256 = sha256, .metrics = metrics, .wifi_status = wifi_status,
+        .sensors_capture = sensors_capture, .sensors_read = sensors_read, .sensors_release = sensors_release},
         .lock = lock, .unlock = unlock, .submit = submit, .maintenance_begin = maintenance_begin,
         .maintenance_end = maintenance_end, .boot_ready = ready, .now_ms = now,
         .schedule_apply = schedule_apply, .schedule_matches = schedule_matches,
