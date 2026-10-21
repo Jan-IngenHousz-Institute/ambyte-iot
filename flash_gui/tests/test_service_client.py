@@ -318,3 +318,87 @@ def test_sampled_budget_counters_are_typed_and_preserved(tmp_path, monkeypatch):
     c.active = True
     del counters["min_largest_block"]
     with pytest.raises(svc.ProtocolError): c.command("svc.stats")
+
+@pytest.mark.parametrize('kind', ['schedule', 'wifi'])
+def test_pending_old_store_never_binds_a_reformatted_instance(tmp_path, kind):
+    c, board, clock = client(tmp_path)
+    if kind == 'schedule':
+        c.transport.cut = ('p', 1, 'before')
+        with pytest.raises(svc.TransportError): upload(c)
+    else:
+        c.transport.cut = ('svc.wifi.join', 1, 'after')
+        with pytest.raises(svc.TransportError): c.join_wifi('A3Bench', 'wrongpass')
+    journal = c.journal.path.read_bytes()
+    board.store, board.mode, board.bound = '2222222222222222', False, False
+    board.records.clear(); board.highest = 0
+    resumed, _, _ = client(tmp_path, board, clock)
+    with pytest.raises(svc.UnknownOutcome, match='store changed'):
+        resumed.connect()
+    assert resumed.journal.path.read_bytes() == journal
+    assert not any(b'svc.bind ' in line or b'svc.wifi.join ' in line or b'schedule.begin ' in line for line in resumed.transport.sent)
+
+
+@pytest.mark.parametrize('active', [False, {}, {'op': '0' * 16, 'kind': 'schedule', 'state': 'staging'},
+    {'op': '1' * 16, 'kind': 'schedule', 'state': 'persisting'},
+    {'op': '1' * 16, 'kind': [], 'state': 'staging'},
+    {'op': '1' * 16, 'kind': 'wifi', 'state': []},
+    {'op': '1' * 16, 'kind': 'wifi', 'state': 'succeeded'},
+    {'op': '1' * 16, 'kind': 'wifi', 'state': 'connecting', 'secret': 'synthetic'}])
+def test_active_metadata_is_strict_and_does_not_allocate_intent(tmp_path, active):
+    def mutate(action, value):
+        if action == 'svc.active': value['active'] = active
+        return value
+    c, board, _ = client(tmp_path, mutate=mutate)
+    with pytest.raises(svc.ProtocolError): upload(c)
+    assert board.highest == 0 and not c.journal.path.exists()
+
+
+def test_active_lookup_finds_foreign_op_below_watermark(tmp_path):
+    owner, board, clock = client(tmp_path / 'owner', cut=('p', 1, 'before'))
+    with pytest.raises(svc.TransportError): upload(owner)
+    board.highest = 9
+    other, _, _ = client(tmp_path / 'other', board, clock)
+    with pytest.raises(svc.BusyOperation) as error: upload(other)
+    assert error.value.operation == '0000000000000001'
+    assert board.commits == board.aborts == 0 and not other.journal.path.exists()
+
+
+def test_not_bound_invalidates_session_and_preserves_pending_journal(tmp_path):
+    c, board, _ = client(tmp_path, cut=('p', 1, 'before'))
+    with pytest.raises(svc.TransportError): upload(c)
+    saved = c.journal.path.read_bytes()
+    c.transport.is_open = True; c.transport.cut = None
+    c.connect()
+    c.transport.mutate = lambda a, v: dict(ok=False, store=STORE, reason='not_bound') if a == 'svc.result' else v
+    with pytest.raises(svc.ProtocolError, match='not bound'): c.result(c.journal.load()['op'])
+    assert not c.active and c._permission is None and c.journal.path.read_bytes() == saved
+
+
+@pytest.mark.parametrize('name', ['b01_a2_svc_framed.raw', 'r4_v270_svc_framed.raw',
+                                'b01_a2_svc_plain.raw', 'r4_v270_svc_plain.raw'])
+def test_captured_older_probe_echo_is_unsupported_not_malformed(tmp_path, name):
+    capture = (Path(__file__).parent / 'fixtures' / name).read_bytes()
+    c, _, _ = client(tmp_path, raw=lambda a, value: capture)
+    with pytest.raises(svc.ServiceError) as error:
+        if name.endswith('_plain.raw'):
+            c.transport.output.extend(capture)
+            c._receive(1, allow_plain=True, probe=b'svc\n')
+        else:
+            c.connect()
+    assert error.value.reason == 'unsupported'
+    assert c.transport.sent == ([] if name.endswith('_plain.raw') else [svc.encode_frame(1, 'svc.version')])
+
+
+def test_prompt_prefixed_frame_is_not_classified_as_plain_console():
+    line = b'ambyte> ' + response(0, dict(ok=False, store=STORE, reason='mode_required'))
+    with pytest.raises(svc.ProtocolError) as error: svc.decode_frame(line)
+    assert type(error.value) is svc.ProtocolError
+
+
+def test_older_service_without_active_keeps_existing_bounded_discovery(tmp_path):
+    def old_version(action, value):
+        if action == 'svc.version': value['actions'].remove('svc.active')
+        return value
+    c, board, _ = client(tmp_path, mutate=old_version)
+    assert upload(c)['state'] == 'succeeded'
+    assert not any(b' svc.active*' in line for line in c.transport.sent)

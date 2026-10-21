@@ -7,7 +7,9 @@ import unittest
 VERSION = "3.50500.0"
 SOURCES = ("components/json/cJSON/cJSON.c",
            "components/esp_driver_usb_serial_jtag/src/usb_serial_jtag.c",
-           "components/esp_driver_usb_serial_jtag/src/usb_serial_jtag_vfs.c")
+           "components/esp_driver_usb_serial_jtag/src/usb_serial_jtag_vfs.c",
+           "components/console/linenoise/linenoise.c",
+           "components/console/linenoise/linenoise.h")
 
 
 def pinned_idf():

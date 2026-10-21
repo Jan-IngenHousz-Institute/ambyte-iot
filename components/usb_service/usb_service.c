@@ -155,7 +155,7 @@ static void notice(const char *reason)
     char json[SVC_JSON_MAX + 1], frame[SVC_FRAME_MAX + 1];
     svc_protocol_error(&s_engine.protocol, reason, json);
     size_t n = svc_frame(frame, sizeof frame, 0, json);
-    if (n) (void)svc_usb_write(frame, n);
+    if (n) (void)svc_usb_notice_write(frame, n);
     svc_wipe(json, sizeof json); svc_wipe(frame, sizeof frame);
 }
 esp_err_t usb_service_init(const usb_service_config_t *config)

@@ -40,8 +40,11 @@ class Device:
         action = a[0]
         result = dict(ok=True, store=self.store)
         if action == "svc.version":
-            return dict(result, service=1, actions=list(ACTION_LIST), max_line=248, chunk=144, result_slots=8,
+            return dict(result, service=1, actions=list(ACTION_LIST) + ["svc.active"], max_line=248, chunk=144, result_slots=8,
                         highest_id=f"{self.highest:016x}")
+        if action == "svc.active":
+            r = next((r for r in self.records.values() if r["state"] in {"staging", "committing", "connecting", "persisting"}), None)
+            return dict(result, active={k: r[k] for k in ("op", "kind", "state")} if r else None)
         if action == "svc.bind":
             self.bound = a[1] == self.store
             return dict(result, state="bound") if self.bound else dict(result, ok=False, reason="store_changed")
@@ -141,7 +144,7 @@ class Serial:
             raise OSError("lost before device receive")
         if not self.device.mode:
             value = dict(ok=False, store=self.device.store, reason="mode_required")
-            encoded = b"ambyte> " + response(0, value)
+            encoded = b"ambyte> \r\n" + response(0, value) + b"ambyte> "
         else:
             value = self.device.answer(body)
             if self.mutate: value = self.mutate(action, value)

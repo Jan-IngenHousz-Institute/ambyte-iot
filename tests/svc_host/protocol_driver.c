@@ -10,6 +10,13 @@
 static svc_record_t queued;
 static char secret[64];
 static unsigned submissions;
+static bool deny_access;
+const char *__real_svc_store_get(svc_store_t *, uint64_t, svc_record_t *);
+const char *__wrap_svc_store_get(svc_store_t *s, uint64_t id, svc_record_t *r)
+{ assert(!deny_access); return __real_svc_store_get(s, id, r); }
+const char *__real_svc_store_admit(svc_store_t *, svc_record_t *, bool *);
+const char *__wrap_svc_store_admit(svc_store_t *s, svc_record_t *r, bool *reused)
+{ assert(!deny_access); return __real_svc_store_admit(s, r, reused); }
 static bool hash(void *context, const void *bytes, size_t n, unsigned char out[32])
 {
     (void)context;
@@ -19,6 +26,7 @@ static bool hash(void *context, const void *bytes, size_t n, unsigned char out[3
 }
 static bool submit(void *context, const svc_record_t *record, const char *password)
 {
+    assert(!deny_access);
     (void)context;
     if (getenv("SVC_REJECT")) return false;
     ++submissions; queued = *record;
@@ -44,7 +52,7 @@ static size_t free_bytes(void *context)
     (void)context;
     return getenv("SVC_NO_SPACE") ? 0 : 1024 * 1024;
 }
-void svc_store_fault(const char *point) { (void)point; }
+void svc_store_fault(const char *point) { (void)point; assert(!deny_access); }
 
 int main(int argc, char **argv)
 {
@@ -56,8 +64,11 @@ int main(int argc, char **argv)
     svc_protocol_ports_t ports = {.sha256 = hash, .submit = submit, .metrics = metrics, .wifi_status = status};
     svc_protocol_t protocol;
     svc_protocol_init(&protocol, &store, &ports);
+    deny_access = getenv("SVC_DENY_ACCESS") != NULL;
     char line[2048], json[SVC_JSON_MAX + 1], frame[SVC_FRAME_MAX + 1];
     while (fgets(line, sizeof line, stdin)) {
+        if (!strncmp(line, "@instance ", 10)) { store.instance = strtoull(line + 10, NULL, 16); continue; }
+        if (!strncmp(line, "@highest ", 9)) { store.highest = strtoull(line + 9, NULL, 16); continue; }
         if (!strcmp(line, "@finish\n")) {
             assert(queued.id);
             queued.state = SVC_SUCCEEDED;

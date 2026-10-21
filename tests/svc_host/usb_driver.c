@@ -21,6 +21,9 @@ TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
 int64_t esp_timer_get_time(void) { return ++now * 1000; }
 void vTaskDelay(TickType_t ticks)
 {
+#ifdef SVC_REAL_EDITOR
+    usleep(ticks * 1000);  /* real editor uses wall time to detect pastes */
+#endif
     now += ticks;
     if (release_writer) {
         assert(s_passthrough_writers == 1);
@@ -64,7 +67,15 @@ void __real_vRingbufferReturnItem(RingbufHandle_t ring, void *item)
 int __real_usb_serial_jtag_write_bytes(const void *bytes, size_t length, TickType_t wait)
 {
     (void)wait; assert(!critical && length <= sizeof output - output_length);
+    if (s_notice_active) {
+        size_t before = output_length;
+        assert(__wrap_usb_serial_jtag_write_bytes("unframed producer", 17, 0) == 17);
+        assert(output_length == before);
+    }
     memcpy(output + output_length, bytes, length); output_length += length;
+#ifdef SVC_REAL_EDITOR
+    assert(fwrite(bytes, 1, length, stdout) == length);
+#endif
     return (int)length;
 }
 esp_err_t usb_serial_jtag_wait_tx_done(TickType_t wait) { (void)wait; return ESP_OK; }
@@ -79,9 +90,13 @@ int usb_serial_jtag_read_bytes(void *buffer, uint32_t maximum, TickType_t wait)
     __wrap_vRingbufferReturnItem(s_usb_rx, data);
     return (int)n;
 }
+#ifndef SVC_REAL_EDITOR
 void linenoiseSetReadFunction(linenoise_read_bytes_fn function) { editor = function; }
+bool linenoiseIsDumbMode(void) { return false; }
+#endif
 static void notice(const char *reason) { assert(!strcmp(reason, "mode_required")); ++notices; }
 
+#ifndef SVC_REAL_EDITOR
 int main(void)
 {
     usb_serial_jtag_driver_config_t config = {256,256};
@@ -134,8 +149,9 @@ int main(void)
     linenoiseSetReadCharacteristics();
     char received[32] = {0}; size_t length = 0;
     while (editor(STDIN_FILENO, received + length, 1) > 0) ++length;
-    assert(length == strlen("identity\n") && !memcmp(received, "identity\n", length));
+    assert(length == 1 + strlen("identity\n") && received[0] == 3 && !memcmp(received + 1, "identity\n", length - 1));
     assert(notices == 1 && critical == 0);
     for (size_t i = 0; i < sizeof s_pending; ++i) assert(s_pending[i] == 0);
     puts("USB adapter boundaries and four UART rings PASS");
 }
+#endif

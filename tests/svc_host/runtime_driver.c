@@ -105,6 +105,8 @@ int svc_usb_read(void *out, size_t maximum, unsigned wait)
 }
 bool svc_usb_write(const void *bytes, size_t n)
 { assert(gate); return fwrite(bytes, 1, n, stdout) == n; }
+bool svc_usb_notice_write(const void *bytes, size_t n)
+{ assert(!gate); return fwrite("\r\n", 1, 2, stdout) == 2 && fwrite(bytes, 1, n, stdout) == n; }
 void svc_store_fault(const char *point) { (void)point; }
 const char *__real_svc_store_open(svc_store_t *, const char *, uint64_t, size_t (*)(void *), void *);
 const char *__wrap_svc_store_open(svc_store_t *s, const char *path, uint64_t id, size_t (*free)(void *), void *context)
@@ -124,6 +126,9 @@ int main(int argc, char **argv)
         .maintenance_end = backend_end, .boot_ready = backend_ready, .worker_stack = backend_stack, .runner_stack = runner_stack};
     assert(usb_service_init(&config) == ESP_OK);
     assert(s_boot_fingerprint_known);
+    if (!strcmp(case_name, "plain_notice")) {
+        fputs("ambyte> ", stdout); notice("mode_required"); return 0;
+    }
     unsigned char expected[32];
     assert(svc_wifi_fingerprint(&s_engine.protocol.ports, "original", "original-password", expected));
     assert(!memcmp(expected, s_boot_fingerprint, 32));

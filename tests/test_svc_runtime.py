@@ -67,6 +67,18 @@ class ServiceRuntimeTest(unittest.TestCase):
         service = re.search(r"usb_service_config_t\s+\w+\s*=\s*\{(.*?)\n    \};", source, re.S).group(1)
         self.assertRegex(service, r"\.submit\s*=\s*app_maint_submit\b")
 
+    def test_plain_notice_has_a_separate_column_zero_frame(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            p = subprocess.run([str(self.binary), "plain_notice"], capture_output=True,
+                               env={**os.environ, "SVC_TEST_ROOT": str(Path(temporary) / "svc")})
+            self.assertEqual(p.returncode, 0, p.stderr.decode())
+            prompt, line = p.stdout.split(b"\r\n", 1)
+            self.assertEqual(prompt, b"ambyte> ")
+            body, crc = line[:-1].rsplit(b"*", 1)
+            self.assertEqual(int(crc, 16), zlib.crc32(body))
+            self.assertEqual(body[:9], b"00000000 ")
+            self.assertEqual(json.loads(body[9:])["reason"], "mode_required")
+
 
 if __name__ == "__main__":
     unittest.main()

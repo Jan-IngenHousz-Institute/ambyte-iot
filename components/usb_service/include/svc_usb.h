@@ -12,3 +12,5 @@ bool svc_usb_take_overrun(void);
 void svc_usb_counters(uint32_t *calls, uint32_t *bytes);
 int svc_usb_read(void *buffer, size_t length, unsigned timeout_ms);
 bool svc_usb_write(const void *buffer, size_t length);
+/* Column-zero notice outside service, without resetting RX/editor state. */
+bool svc_usb_notice_write(const void *buffer, size_t length);

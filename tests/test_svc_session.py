@@ -95,8 +95,26 @@ class ServiceSessionTest(unittest.TestCase):
         data = frame(f"svc.bind {STORE}") + b"\x1f" + frame(begin(), 2) * 20 + b"\x1e"
         data += frame(begin(), 3) + frame(f"svc.bind {STORE}", 4) + frame("svc.version", 5) + frame("svc.exit", 6)
         responses = self.call(data)
-        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]], ["rx_overrun", "store_changed"])
+        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]], ["rx_overrun", "not_bound"])
         self.assertEqual(next(r for id, r in responses if id == 5)["highest_id"], "0000000000000000")
+
+    def test_fresh_active_discovery_and_overrun_rebind_preserve_durable_prefix(self):
+        self.call(frame(f"svc.bind {STORE}") + frame(begin(), 2) + frame(put(1, 0, b"abc"), 3) + frame("svc.exit", 4))
+        data = frame("svc.active", 10) + frame("svc.result 0000000000000001", 11)
+        data += frame(f"svc.bind {STORE}", 12) + b"\x1f" + frame(begin(op=2), 13) + b"\x1e"
+        data += frame("svc.result 0000000000000001", 14) + frame(f"svc.bind {STORE}", 15)
+        data += frame("svc.result 0000000000000001", 16) + frame("svc.exit", 17)
+        values = dict(self.call(data))
+        self.assertEqual(values[10]["active"], dict(op="0000000000000001", kind="schedule", state="staging"))
+        self.assertEqual(values[11]["reason"], "not_bound")
+        self.assertEqual(values[14]["reason"], "not_bound")
+        self.assertEqual(values[16]["offset"], 3)
+        self.assertEqual((self.root / "stage.bin").read_bytes(), b"abc")
+
+    def test_active_requests_use_the_ordinary_idle_timeout(self):
+        values = self.call(frame("svc.active", 8))
+        self.assertIsNone(values[1][1]["active"])
+        self.assertEqual(values[-1][1]["reason"], "session_timeout")
 
     def test_tx_failure_ends_mode_without_losing_the_admitted_operation(self):
         data = frame(f"svc.bind {STORE}") + frame(begin(), 2)

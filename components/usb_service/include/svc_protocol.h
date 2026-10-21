@@ -39,6 +39,9 @@ typedef struct {
     svc_store_t *store;
     svc_protocol_ports_t ports;
     uint64_t bound_instance;
+    /* Last explicit bind attempt survives unbind, but never reboot. Clients
+     * must also compare journaled instances across new sessions. */
+    uint64_t expected_instance;
 #if CONFIG_AMBYTE_SVC_BENCH
     svc_bench_t bench;
 #endif
