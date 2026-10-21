@@ -5,7 +5,7 @@ already provisioned Ambyte. It works without network, SD card or an unlock.
 Physical access grants authority to the existing write commands. This document
 covers the existing console subset and the explicit framed `svc` mode for
 durable schedule transactions and bounded Wi-Fi credential writes. Certificate
-provisioning, sensors, firmware transfer, export, receipts and radio authorization
+provisioning, firmware transfer, export, receipts and radio authorization
 are outside this contract. The console and service each have version `1`;
 entering service does not change the plain commands described first.
 
@@ -979,6 +979,127 @@ is not included in its CRC. No separator is added inside service.
 
 
 ## Inspect attached sensors without interrupting acquisition
+
+### Overview
+
+The gateway keeps the latest observed identity, calibration and supported
+spectral vectors for each of its four ports. The resident maintenance worker
+refreshes them between jobs; reading a snapshot copies the cache and sends no
+sensor UART traffic. Every value carries its own source, observation time and
+clock quality. Unobserved values remain null, and an attachment observation
+does not identify the sensor that produced a measurement.
+
+An attachment generation belongs to one port within one gateway boot. Clearing
+an attachment drops all its old values; the next verified identity increments
+the retained generation, even if the returning sensor has the same MAC.
+Ordinary revalidation keeps that generation. The invalidated state below is
+also the internal step before accepting a changed MAC.
+
+```mermaid
+stateDiagram-v2
+    state "unknown: never observed" as Unknown
+    state "known: verified identity" as Known
+    state "absent: failed idle presence check" as Absent
+    state "unknown: attachment invalidated" as Invalidated
+    [*] --> Unknown : new boot_id, generation = 0
+    Unknown --> Known : valid identity, generation += 1
+    Unknown --> Absent : idle presence check finds no reply
+    Known --> Known : same MAC revalidated, generation unchanged
+    Known --> Known : acquisition timeout or block read failure, keep history
+    Known --> Absent : idle presence check fails, clear old values
+    Known --> Invalidated : MAC change, shared reset or update exit
+    Absent --> Known : valid returning identity, generation += 1
+    Invalidated --> Known : valid identity, generation += 1
+    Invalidated --> Absent : idle presence check finds no reply
+    note right of Invalidated
+        Clearing values retains the generation counter.
+        Reboot starts a new boot_id and resets the counter.
+    end note
+    note right of Known
+        busy and stalled are acquisition overlays.
+        They retain historical values and generation.
+        A reconnect entirely between checks is not observable.
+    end note
+```
+
+A missing trigger ACK leaves the port busy because the leaf may still be
+measuring. Time alone never releases it. Once the conservative expected run
+window has passed and job/maintenance vetoes allow it, recovery uses the proof
+below. Each exchange must pass before the next is attempted; all locks,
+priming, windows and delays share one 900 ms deadline. These acquisition-owned
+exchanges have their own counter, separate from inspection refresh traffic.
+
+```mermaid
+sequenceDiagram
+    participant A as Acquisition path
+    participant I as Inventory
+    participant W as Maintenance worker / UART adapter
+    participant L as AMBIT leaf
+    A->>I: Reserve run epoch, set busy
+    A->>L: Trigger measurement
+    Note over A,L: ACK missing, leaf may still be measuring
+    A->>I: Arm expected window after UART call returns
+    Note over I,W: Inside the window, no recovery or inspection on any port
+    W->>I: Admit due recovery when job and maintenance vetoes are clear
+    I-->>W: Current run epoch, hold exclusive channel / UART ownership
+    W->>L: Priming wake: three 0xAA bytes
+    L-->>W: Exact 0x85, 0x80 or 0x85/0x80 within 100 ms
+    Note over W,L: Prime never proves idle, drain RX
+    W->>L: First fresh proof wake
+    L-->>W: Exactly one 0x80 in the full 200 ms window
+    Note over W,L: 200 ms quiet gap, any byte fails, drain RX
+    Note over W,L: Second TX must start within 450 ms of first proof window opening
+    W->>L: Second fresh proof wake
+    L-->>W: Exactly one 0x80
+    opt Verified numeric firmware at least 1.1.2
+        W->>L: cmd 23 poll
+        L-->>W: Exact 0xA1, state 0/1/2, 0xF0
+    end
+    Note over W,L: Listen through the full second 200 ms window, extra bytes fail
+    alt Both proofs clean and run epoch unchanged
+        W->>I: Clear busy, retain attachment and configuration
+    else Refused lock, budget or timing admission
+        W->>I: Keep busy, no failure attempt spent, back off 1 to 60 s
+    else Silence, stale burst or other failed proof
+        W->>I: Keep busy, retry after 60 s then 120 s
+        Note over I,W: Third failed block sets stalled, no further automatic attempts
+    end
+```
+
+An extra `0x80` or trailing `0xA1` cannot become completion evidence. A new run
+epoch invalidates every earlier window. After the expected window, an unproven
+or stalled port excludes only itself, so other ports can refresh between jobs.
+Recovery never resets the bank or changes attachment generations, gains or
+currents. A new explicit acquisition, a recognized normal poll, a successful
+fetch or an existing reset owner can clear the exclusion.
+
+Both read paths below return four-port observations from the same inventory.
+The plain response is one JSON line; framed reads pin one immutable copy and
+page it, so a refresh or swap cannot mix two attachment generations in a
+response. The visible GUI diagnostics use the shared strict parser and display
+`stalled` distinctly. An older image without the capability reports inspection
+unavailable instead of trying a sensor probe.
+
+```mermaid
+flowchart TD
+    Host[Client or GUI diagnostics] --> Discovery[Fresh identity on the same open USB handle]
+    Discovery --> Capability{Advertises sensors?}
+    Capability -->|no| Unavailable[Show inspection unavailable]
+    Capability -->|yes| Path{Read path}
+    Worker[Between-job maintenance worker] -->|bounded presence / cmd 33 reads| Leaf[AMBIT ports]
+    Leaf -->|validated blocks with gateway timestamps| Cache[Four-port inventory cache]
+    Path -->|plain console| Plain[sensors: atomic cache copy]
+    Cache --> Plain
+    Plain --> Line[One JSON line]
+    Path -->|framed service| Bind[svc.version and bind current store]
+    Bind --> Pin[svc.sensors: immutable session pin]
+    Cache --> Pin
+    Pin --> Pages[svc.sensors.read: up to 576 bytes per page]
+    Pages --> Integrity[Check token, store, offset, CRC and complete SHA-256]
+    Line --> Schema[Validate snapshot schema]
+    Integrity --> Schema
+    Schema --> Display[Four rows: known, unknown, absent, busy or stalled]
+```
 
 Discover the `sensors` capability with a fresh `identity` on the same open
 connection. Send `sensors` with no arguments. The response is one JSON line,
