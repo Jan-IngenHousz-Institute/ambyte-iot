@@ -27,12 +27,15 @@ stateDiagram-v2
     state Console {
         [*] --> Prompt
         Prompt --> Prompt : identity, cfg, reboot, schedule …
+        Prompt --> Prompt : framed probe / CRLF, mode_required, fresh prompt
     }
     state Service {
         [*] --> Ready : correlation-zero ready frame
+        Ready --> Ready : svc.active, or unbound operation / not_bound
+        Ready --> Ready : bind wrong store / store_changed
         Ready --> Bound : svc.bind <store>
         Bound --> Bound : p (chunk), schedule.commit, svc.result, svc.wifi.*
-        Bound --> Ready : rx_overrun or store change invalidates the binding
+        Bound --> Ready : rx_overrun invalidates binding / rebind required
     }
 ```
 
@@ -49,7 +52,10 @@ sequenceDiagram
     G-->>C: {"capabilities":[…,"svc"]}
     C->>G: svc
     G-->>C: 00000000 {"ok":true,"state":"ready"}
-    C->>G: svc.version / svc.bind <store>
+    C->>G: svc.version / svc.active (read-only, before bind)
+    G-->>C: store, actions, active op/kind/state or null
+    Note over C: Compare pending journal store before binding
+    C->>G: svc.bind <journaled or verified store>
     G-->>C: actions, bounds / {"state":"bound"}
     C->>G: schedule.begin <op> <size> <sha256> …
     G-->>C: {"op":…,"state":"staging","offset":0}
