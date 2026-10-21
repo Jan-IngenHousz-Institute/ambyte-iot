@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "sched_runner.h"
 #include "script_update.h"
+#include "ota_identity.h"
 
 static const char *s_thing_name;
 
@@ -168,7 +169,12 @@ int cli_cmd_identity(int argc, char **argv)
     json_schedule(&w);
     json_raw(&w, ",\"capabilities\":[\"identity\",\"cfg.get\",\"cfg.set\",\"reboot\","
                  "\"schedule.status\",\"schedule.release\",\"schedule.begin\","
-                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\",\"sensors\"]}");
+                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\",\"sensors\"]");
+    char firmware_identity[192];
+    if (!ota_running_identity_json(firmware_identity, sizeof firmware_identity)) return 1;
+    json_raw(&w, ",");
+    json_raw(&w, firmware_identity);
+    json_raw(&w, "}");
     if (w.overflow) {
         printf("identity: response exceeds buffer\r\n");
         return 1;

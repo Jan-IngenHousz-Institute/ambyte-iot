@@ -127,6 +127,8 @@ class ConsoleIdentity:
     contract: int
     schedule: ScheduleIdentity
     capabilities: frozenset[str]
+    signed: bool = False
+    storage: dict | None = None
 
 
 def _identity_object(obj: dict) -> ConsoleIdentity:
@@ -156,11 +158,24 @@ def _identity_object(obj: dict) -> ConsoleIdentity:
         raise ValueError("invalid capabilities")
     for cap in caps:
         cap.encode("utf-8", "strict")
+    signed = obj.get("signed", False)
+    if type(signed) is not bool:
+        raise ValueError("signed must be a boolean")
+    storage = obj.get("storage")
+    if storage is not None:
+        if not isinstance(storage, dict) or set(storage) != {"readable", "written", "fallback"}:
+            raise ValueError("invalid storage manifest")
+        readable, written, fallback = storage["readable"], storage["written"], storage["fallback"]
+        if (not isinstance(readable, list) or not readable or
+                any(type(v) is not int or not 1 <= v <= 31 for v in readable) or
+                readable != sorted(set(readable)) or type(written) is not int or written not in readable or
+                type(fallback) is not int or not 1 <= fallback <= 31):
+            raise ValueError("invalid storage versions")
     return ConsoleIdentity(mac.upper() if mac else None,
         nullable(obj["thing_name"]), nullable(obj["fw"]), 1,
         ScheduleIdentity(source, sha.lower() if sha else None,
                          nullable(schedule["workbookVersionId"]),
-                         nullable(schedule["script_version"])), frozenset(caps))
+                         nullable(schedule["script_version"])), frozenset(caps), signed, storage)
 
 
 @dataclass(frozen=True)

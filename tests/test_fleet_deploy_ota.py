@@ -63,7 +63,7 @@ class DeviceCasingTest(unittest.TestCase):
                     "experiment/data_ingest/v1/x/ambyte/v1.0/"
                     + self.UPPER
                     + "/status",
-                    json.dumps({"type": "pong", "id": ping["id"], "fw": "1.6.6"}).encode(),
+                    json.dumps({"type": "pong", "id": ping["id"], "fw": "1.6.6", **holder.get("extra",{})}).encode(),
                     False,
                     qos,
                     False,
@@ -88,6 +88,15 @@ class DeviceCasingTest(unittest.TestCase):
             holder["connection"].topics,
             [fleet_deploy.COMMAND_TOPIC_FMT.format(device=self.LOWER)],
         )
+        for extra,signed in (({},False),({"signed":True,"storage":{"readable":[1],"written":1,"fallback":1}},True),
+                             ({"signed":"false"},None)):
+            holder["extra"]=extra
+            with self.subTest(extra=extra),mock.patch.object(fleet_deploy,"mqtt_connection",side_effect=connection),\
+                 mock.patch.dict(sys.modules,{"awscrt":types.SimpleNamespace(mqtt=fake_mqtt)}):
+                metadata=fleet_deploy.fleet_ping(object(),[self.LOWER],1,include_metadata=True)
+                self.assertIs(metadata[self.LOWER]["signed"],signed)
+                self.assertEqual(metadata[self.LOWER]["fw"],"1.6.6")
+                self.assertEqual(metadata[self.LOWER]["storage"],extra.get("storage"))
 
 
 class TerminalProofTest(unittest.TestCase):

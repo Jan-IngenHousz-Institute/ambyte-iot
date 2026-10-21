@@ -17,14 +17,14 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 sys.path.insert(0,str(ROOT/"tools/fleet_deploy"))
 from flash_gui.firmware_metadata import (ImageError, MANIFEST, MANIFEST_V1, app_layout,
-    inspect_image, rewrite_fixture, sign_image)
+    inspect_image, repair_fixture_checksums, rewrite_fixture, sign_image)
 from tools.check_release_signing import BENCH_KEY, bench_id, key_id, private_key
 
 THING="ambyte_28:37:2F:FF:E7:04"
 ACCOUNT="084375565727"
 REGION="eu-central-1"
 CASES=("candidate","code-flip","manifest-flip","wrong-key","unsigned","incompatible","missing-manifest","missing-fallback")
-WORKFLOWS=("fleet-deploy.yml","fleet-deploy-schedule.yml","fleet-deploy-ambit.yml","fleet-command.yml")
+WORKFLOWS=("fleet-deploy.yml","fleet-command.yml")
 REPO="Jan-IngenHousz-Institute/ambyte-iot"
 
 
@@ -82,6 +82,8 @@ def fixtures(unsigned,key_path,out,candidate_version="2.8.0-a5-r1"):
                 offset+=8+length
             if code is None:raise ImageError("fixture image has no executable code segment")
             data=bytearray(payload);data[code]^=1;payload=bytes(data)
+        if case in ("code-flip","manifest-flip"):
+            payload=repair_fixture_checksums(payload)
         file=out/f"{case}.bin";file.write_bytes(payload)
         _,raw_size=app_layout(ordinary)
         records[case]={"file":file.name,"version":version,"sha256":hashlib.sha256(payload).hexdigest(),
@@ -107,15 +109,24 @@ def preflight(session,out):
         if re.search(r"^  schedule:",source,re.M) or any(r["status"]!="completed" for r in runs):
             save(out/"preflight.json",evidence)
             raise ImageError("conflicting or scheduled fleet workflow; bench qualification refused")
-    # Conservatively reject any active/scheduled dev-account Job. This also
-    # covers future group targets before they create a thing execution.
+    # Include static/dynamic memberships and inherited parent group targets.
     iot=session.client("iot")
+    bench_targets={f"arn:aws:iot:{REGION}:{ACCOUNT}:thing/{THING}"}
+    for page in iot.get_paginator("list_thing_groups_for_thing").paginate(thingName=THING):
+        for group in page.get("thingGroups",[]):
+            bench_targets.add(group["groupArn"])
+            description=iot.describe_thing_group(thingGroupName=group["groupName"])
+            for parent in description.get("thingGroupMetadata",{}).get("rootToParentThingGroups",[]):
+                bench_targets.add(parent["groupArn"])
     state_path=out/"delivery.json"
     owned=set(json.loads(state_path.read_text()).get("jobs",[])) if state_path.exists() else set()
     pages=iot.get_paginator("list_jobs").paginate()
     for page in pages:
         for job in page.get("jobs",[]):
             if job.get("status") not in ("COMPLETED","CANCELED","DELETION_IN_PROGRESS"):
+                detail=iot.describe_job(jobId=job["jobId"])["job"]
+                if not bench_targets.intersection(detail.get("targets",[])):
+                    continue
                 if job["jobId"] in owned:
                     execution=iot.describe_job_execution(jobId=job["jobId"],thingName=THING)["execution"]
                     if execution["status"] in ("SUCCEEDED","FAILED","REJECTED","CANCELED","TIMED_OUT","REMOVED"):

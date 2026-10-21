@@ -207,6 +207,17 @@ def rewrite_fixture(data: bytes, *, version: str, manifest: bytes | None = None)
         if len(manifest) != 32:
             raise ImageError("fixture manifest length")
         output[MANIFEST_OFFSET:MANIFEST_OFFSET + 32] = manifest
+    return repair_fixture_checksums(bytes(output))
+
+
+def repair_fixture_checksums(data: bytes) -> bytes:
+    """Bench mutations only: repair public checksums, preserving any signature.
+
+    A signature-negative fixture must reach the signature check on IDF, whose
+    ordinary image checksum check runs first. This never repairs or re-signs
+    the signature sector, padding or its digest.
+    """
+    output = bytearray(data)
     checksum, end = app_layout(output)
     value, off = 0xEF, 24
     for _ in range(output[1]):

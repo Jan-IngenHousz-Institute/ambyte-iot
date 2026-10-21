@@ -31,7 +31,7 @@ class IdentityTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="identity-host-")
         cls.out = Path(cls.temp.name)
-        includes = [HOST / "include", ROOT / "tests/host_stubs"]
+        includes = [HOST / "include", ROOT / "tests/host_stubs", ROOT / "tests/ota_host/include"]
         includes += list((ROOT / "components").glob("*/include"))
         includes += [ROOT / "components/sched_runner"]
         # sched_runner includes its generated default even though these tests
@@ -49,7 +49,10 @@ class IdentityTest(unittest.TestCase):
             *(f"-I{p}" for p in includes),
         ]
         builds = {
+            "pong": [HOST / "pong.c", ROOT / "components/command_router/command_router_pong.c",
+                     ROOT / "components/ota_policy/ota_identity.c", ROOT / "components/ota_policy/ota_manifest.c"],
             "handler": [HOST / "handler.c", ROOT / "components/CLI/cli_identity.c",
+                        ROOT / "components/ota_policy/ota_identity.c", ROOT / "components/ota_policy/ota_manifest.c",
                         "-Wl,--wrap=fwrite", "-pthread"],
             "runner": [HOST / "runner.c", ROOT / "components/sensor_inventory/sensor_inventory.c", *sorted((ROOT / "components/sched_spec").glob("*.c")),
                        ROOT / "components/time_sync/time_sync.c", "-Wl,--wrap=sched_pool_str", "-lm"],
@@ -74,6 +77,13 @@ class IdentityTest(unittest.TestCase):
         self.assertIn(b"IDENTITY_HOST_OK", run.stderr)
         return run.stdout
 
+    def test_pong_preserves_existing_fields_and_adds_running_signature_and_storage(self):
+        run=subprocess.run([self.out/"pong"],capture_output=True,text=True)
+        self.assertEqual(run.returncode,0,run.stderr)
+        result=json.loads(run.stdout)
+        self.assertEqual(result,{"type":"pong","id":"ping-test","device_id":"device","fw":"2.8.0",
+            "uptime_ms":42,"signed":True,"storage":{"readable":[1],"written":1,"fallback":1}})
+
     def response(self, scenario, *args):
         raw = self.invoke(scenario, *args)
         physical = raw.split(b"\n")
@@ -83,7 +93,9 @@ class IdentityTest(unittest.TestCase):
         self.assertTrue(line.endswith(b"}"))
         self.assertTrue(all(c >= 32 for c in line))
         result = json.loads(line.decode("utf-8"))
-        self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities"})
+        self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities", "signed", "storage"})
+        self.assertIs(result["signed"], True)
+        self.assertEqual(result["storage"], {"readable":[1],"written":1,"fallback":1})
         self.assertIs(type(result["contract"]), int)
         self.assertEqual(result["contract"], 1)
         self.assertEqual(set(result["schedule"]), {"source", "sha256", "workbookVersionId", "script_version"})

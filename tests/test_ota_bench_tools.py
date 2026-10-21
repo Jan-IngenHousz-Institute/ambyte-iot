@@ -13,7 +13,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from tools import bench_signed_ota as bench
 from tools.check_release_signing import BENCH_KEY, bench_id, check_release
-from flash_gui.firmware_metadata import ImageError, inspect_image, verify_signature
+from flash_gui.firmware_metadata import ImageError, _check_image, inspect_image, verify_signature
 from ota_fixture import image
 
 
@@ -59,6 +59,14 @@ class BenchToolsTest(unittest.TestCase):
                 self.assertEqual(set(lengths.values()),{n})
                 self.assertNotIn("https://",(self.out/"url-lengths.json").read_text())
 
+    def test_altered_fixtures_pass_image_checksums_but_fail_signature(self):
+        for case in ("code-flip","manifest-flip"):
+            with self.subTest(case=case):
+                data=(self.out/f"{case}.bin").read_bytes()
+                self.assertEqual(_check_image(data)[1],self.records[case]["raw_size"])
+                with self.assertRaisesRegex(ImageError,"signature image digest"):
+                    verify_signature(data,self.records[case]["padded_size"])
+
     def test_target_and_group_refusals(self):
         for target in ("", "arn:aws:iot:eu-central-1:084375565727:thinggroup/dev", "one,two", "ambyte_00:00:00:00:00:00"):
             with self.subTest(target=target),self.assertRaises(ImageError):bench.require_target(target)
@@ -78,9 +86,31 @@ class BenchToolsTest(unittest.TestCase):
                 return types.SimpleNamespace(stdout=json.dumps({"content":base64.b64encode(b"on:\n  workflow_dispatch:\n").decode()}))
             return types.SimpleNamespace(stdout="[]")
         session=Mock()
-        session.client.return_value.get_paginator.return_value.paginate.return_value=[{"jobs":[{"jobId":"group-rollout","status":"SCHEDULED"}]}]
+        iot=session.client.return_value
+        group=f"arn:aws:iot:{bench.REGION}:{bench.ACCOUNT}:thinggroup/bench-parent"
+        member=f"arn:aws:iot:{bench.REGION}:{bench.ACCOUNT}:thinggroup/bench-child"
+        iot.get_paginator.return_value.paginate.side_effect=[
+            [{"thingGroups":[{"groupName":"bench-child","groupArn":member}]}],
+            [{"jobs":[{"jobId":"group-rollout","status":"SCHEDULED"}]}]]
+        iot.describe_thing_group.return_value={"thingGroupMetadata":{"rootToParentThingGroups":[{"groupArn":group}]}}
+        iot.describe_job.return_value={"job":{"targets":[group]}}
         with patch.object(bench.subprocess,"run",side_effect=quiet):
             with self.assertRaisesRegex(ImageError,"IoT Job"):bench.preflight(session,self.out)
+
+    def test_preflight_ignores_unrelated_jobs_and_blocks_direct_bench_target(self):
+        def quiet(args,**kwargs):
+            return types.SimpleNamespace(stdout=json.dumps({"content":base64.b64encode(b"on:\n  workflow_dispatch:\n").decode()})
+                if args[1]=="api" else "[]")
+        iot=Mock();session=Mock();session.client.return_value=iot
+        for targets,blocked in ((["arn:aws:iot:eu-central-1:084375565727:thing/another"],False),
+                ([f"arn:aws:iot:{bench.REGION}:{bench.ACCOUNT}:thing/{bench.THING}"],True)):
+            iot.get_paginator.return_value.paginate.side_effect=[
+                [{"thingGroups":[]}],[{"jobs":[{"jobId":"active-job","status":"IN_PROGRESS"}]}]]
+            iot.describe_job.return_value={"job":{"targets":targets}}
+            with self.subTest(blocked=blocked),patch.object(bench.subprocess,"run",side_effect=quiet):
+                if blocked:
+                    with self.assertRaisesRegex(ImageError,"IoT Job"):bench.preflight(session,self.out)
+                else:bench.preflight(session,self.out)
 
     def test_partial_staging_keeps_owned_object_intent_and_returned_version(self):
         s3=Mock();s3.generate_presigned_url.return_value="https://s3.example/object"

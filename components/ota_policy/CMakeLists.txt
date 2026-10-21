@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "ota_manifest.c" "ota_policy.c" "ota_refusal.c"
+    SRCS "ota_manifest.c" "ota_policy.c" "ota_refusal.c" "ota_identity.c"
     INCLUDE_DIRS "include"
     PRIV_REQUIRES app_update bootloader_support esp_partition esp_app_format littlefs heap
 )

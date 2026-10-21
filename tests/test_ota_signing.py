@@ -112,6 +112,7 @@ class SigningTest(unittest.TestCase):
         for data,accepted in ((self.signed,True),(self.raw,False),(sign_image(self.raw,self.bench),False),
                               (sign_image(self.raw,self.other),False)):
             with self.subTest(accepted=accepted),patch("tools.check_release_signing.load_pin",return_value=self.pin),\
+                 patch("tools.check_release_signing.load_boundary",return_value="2.0.0"),\
                  patch.object(fleet_deploy.urllib.request,"urlopen",return_value=io.BytesIO(data)):
                 if accepted:fleet_deploy.verify_firmware_url("https://example.test/release.bin")
                 else:
@@ -137,7 +138,8 @@ class SigningTest(unittest.TestCase):
             root = Path(td); bundle = self._bundle(root)
             with zipfile.ZipFile(bundle) as z: before = {n: z.read(n) for n in z.namelist()}
             pin = root / "pin"; pin.write_text(self.pin)
-            prepare(root, "2.8.0-test", self._pem(), pin)
+            boundary = root / "boundary"; boundary.write_text("2.8.0")
+            prepare(root, "2.8.0-test", self._pem(), pin, boundary)
             published = (root / "firmware.bin").read_bytes()
             check_release(published, self.pin)
             with zipfile.ZipFile(bundle) as z:
@@ -151,10 +153,11 @@ class SigningTest(unittest.TestCase):
                 root = Path(td); bundle = self._bundle(root, b"wrong" if case == "mismatch" else None)
                 if case == "resign": self._bundle(root, self.signed); (root / "firmware.bin").write_bytes(self.signed)
                 pin = root / "pin"; pin.write_text("UNCONFIGURED" if case == "placeholder" else self.pin)
+                boundary = root / "boundary"; boundary.write_text("2.8.0")
                 before = (root / "firmware.bin").read_bytes(), bundle.read_bytes()
                 with self.assertRaises(ImageError):
                     prepare(root, "wrong" if case == "wrong_version" else "2.8.0-test",
-                            "" if case == "absent" else self._pem(self.other if case == "wrong_key" else self.key), pin)
+                            "" if case == "absent" else self._pem(self.other if case == "wrong_key" else self.key), pin, boundary)
                 self.assertEqual(((root / "firmware.bin").read_bytes(), bundle.read_bytes()), before)
 
     def test_every_environment_has_one_guard_and_unsigned_upload_is_refused(self):

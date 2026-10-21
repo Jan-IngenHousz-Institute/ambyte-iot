@@ -52,7 +52,17 @@ esp_err_t esp_partition_read(const esp_partition_t *p,size_t off,void *out,size_
 }
 esp_err_t esp_image_verify(int mode,const esp_partition_pos_t *p,esp_image_metadata_t *m)
 {
-    (void)mode;assert(p->offset==next.address&&p->size==8192);event('S');
+    (void)mode;assert(p->offset==next.address);event('S');
+    if(!strcmp(scenario,"stale_tail")) {
+        /* A genuinely signed 8KiB fixture remains in the slot. Only its first
+         * 4KiB arrived this time. Model the pinned SDK's signature-sector bound:
+         * using the whole slot would validate stale signature bytes. */
+        assert(next_bytes[4096]==0xe7&&next_bytes[4097]==2);
+        m->image_len=8192;
+        if(p->size<8192){++rejected;return ESP_FAIL;}
+        return ESP_OK;
+    }
+    assert(p->size==8192);
     m->image_len=8192;
     if(!strcmp(scenario,"signature")){++rejected;return ESP_FAIL;}
     return ESP_OK;
@@ -64,7 +74,8 @@ esp_err_t esp_https_ota_perform(esp_https_ota_handle_t h)
 {assert(h);event('P');return !strcmp(scenario,"legacy_error")?ESP_ERR_INVALID_VERSION:ESP_OK;}
 bool esp_https_ota_is_complete_data_received(esp_https_ota_handle_t h)
 {assert(h);event('C');return strcmp(scenario,"incomplete")!=0;}
-int esp_https_ota_get_image_len_read(esp_https_ota_handle_t h){assert(h);return 8192;}
+int esp_https_ota_get_image_len_read(esp_https_ota_handle_t h)
+{assert(h);return !strcmp(scenario,"stale_tail")?4096:8192;}
 esp_err_t esp_https_ota_get_img_desc(esp_https_ota_handle_t h,esp_app_desc_t *d)
 {assert(h);event('V');snprintf(d->version,sizeof d->version,"%s",!strcmp(scenario,"bad_version")?"wrong":"2.8.0-next");return ESP_OK;}
 esp_err_t esp_https_ota_finish(esp_https_ota_handle_t h){assert(h);event('F');++selections;return ESP_OK;}
@@ -112,8 +123,13 @@ static void image(uint8_t *p)
 
 int main(int argc,char **argv)
 {
-    assert(argc==3||argc==4);scenario=argv[2];unsigned cycles=argc==4?(unsigned)atoi(argv[3]):1;assert(cycles>0&&cycles<=20);health=!strcmp(argv[1],"health");
+    assert(argc>=3&&argc<=5);scenario=argv[2];unsigned cycles=argc>=4?(unsigned)atoi(argv[3]):1;assert(cycles>0&&cycles<=20);health=!strcmp(argv[1],"health");
     image(run_bytes);image(next_bytes);
+    if(!strcmp(scenario,"stale_tail")) {
+        assert(argc==5);FILE *f=fopen(argv[4],"rb");assert(f);
+        assert(fread(next_bytes,1,sizeof next_bytes,f)==sizeof next_bytes);
+        assert(fgetc(f)==EOF);assert(fclose(f)==0);
+    }
     if(!strcmp(scenario,"incompatible")){next_bytes[0x120+16]=6;next_bytes[0x120+20]=2;}
     if(!strcmp(scenario,"running_bad"))run_bytes[0x120]=0;
     if(!strcmp(scenario,"candidate_bad"))next_bytes[0x120]=0;
@@ -148,6 +164,11 @@ int main(int argc,char **argv)
         assert(strstr(trace,"AWNDE"));
         if(!strcmp(argv[1],"jobs"))assert(strstr(trace,"AWNDEB"));
         if(!strcmp(scenario,"signature"))assert(rejected==1&&!strchr(trace,'R')&&!strchr(trace,'M'));
+        if(!strcmp(scenario,"stale_tail")) {
+            assert(rejected==1&&!strchr(trace,'R')&&!strchr(trace,'M'));
+            assert(strstr(last_report,"signature_invalid"));
+        }
+        if(!strcmp(scenario,"bad_version"))assert(!strchr(trace,'P')&&!strchr(trace,'H')&&!strchr(trace,'S'));
         if(!strcmp(scenario,"bad_version"))assert(strstr(last_report,"image is wrong, job expects 2.8.0-next"));
         if(!strcmp(scenario,"bad_hash"))assert(strstr(last_report,"sha256 mismatch: downloaded image is not the released one"));
         if(!strcmp(scenario,"legacy_error"))assert(strstr(last_report,"not_an_image: URL served non-firmware (HTML?)"));
