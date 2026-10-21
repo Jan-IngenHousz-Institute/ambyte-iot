@@ -9,7 +9,9 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 const char *esp_err_to_name(esp_err_t error) { (void)error; return "test_error"; }
 static _Atomic int64_t clock_us;
@@ -53,7 +55,9 @@ void vTaskDelay(TickType_t ms) { if (checking_veto) { unsigned before=writes; se
         }
     }
     clock_us += (int64_t)ms * 1000; waiting = true;
-    if (recovery_test && hold_waiter && pthread_equal(pthread_self(), acquisition))
+    /* The UART owner advances simulated elapsed time while this task waits.
+     * Repeated sched_yield calls must not add a second concurrent clock. */
+    if (hold_waiter && pthread_equal(pthread_self(), acquisition))
         while (!release_waiter) sched_yield();
     if (recovery_test && recovery_phase == 1) recovery_race_at(2);
     sched_yield(); }
@@ -138,8 +142,13 @@ int uart_write_bytes(uart_port_t port, const void *bytes, size_t size)
     }
     if (p[0] == 0xaa) {
         if (race) {
-            race = false; assert(!pthread_create(&acquisition, NULL, run, NULL));
+            race = false; waiting = release_waiter = false; hold_waiter = true;
+            assert(!pthread_create(&acquisition, NULL, run, NULL));
             while (!waiting) sched_yield();
+            if (getenv("SENSOR_HOST_DELAY_OWNER")) {
+                const struct timespec pause = {.tv_nsec = 20000000};
+                assert(!nanosleep(&pause, NULL));
+            }
         }
         if (!absent) { rx[0] = 0x80; rx_at = 0; rx_size = 1; }
     } else if (size == 1 && p[0] == 0xa0) command_pending = true;
@@ -472,7 +481,8 @@ int main(void)
     sensor_inventory_refresh(); sensor_snapshot_t snapshot; assert(sensor_inventory_snapshot(&snapshot));
     assert(snapshot.refresh.wire_transactions[0] == 1);
     absent = true; race = true; waiting = false; clock_us += 250000;
-    sensor_inventory_refresh(); assert(!pthread_join(acquisition, NULL));
+    sensor_inventory_refresh(); release_waiter = true;
+    assert(!pthread_join(acquisition, NULL)); hold_waiter = false;
     assert(sensor_inventory_snapshot(&snapshot));
     assert(snapshot.refresh.run_start_waits == 1 && snapshot.refresh.run_start_wait_max_us <= 1000000);
     assert(snapshot.busy == 8); sensor_inventory_complete(3);
@@ -501,7 +511,8 @@ int main(void)
             clock_us+=(int64_t)wait*1000;sensor_inventory_refresh();
         }
         uint32_t wait=sensor_inventory_wait_ms();clock_us+=(int64_t)wait*1000;
-        race=true;waiting=false;sensor_inventory_refresh();assert(!pthread_join(acquisition,NULL));
+        race=true;waiting=false;sensor_inventory_refresh();release_waiter=true;
+        assert(!pthread_join(acquisition,NULL));hold_waiter=false;
         assert(sensor_inventory_snapshot(&snapshot));
         assert(snapshot.refresh.run_start_waits==1 && snapshot.refresh.run_start_wait_max_us>0);
         assert(snapshot.refresh.run_start_wait_max_us<=1000000 && sensor_inventory_wait_ms()==UINT32_MAX);
