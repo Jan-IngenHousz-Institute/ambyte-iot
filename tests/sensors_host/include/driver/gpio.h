@@ -8,3 +8,4 @@ typedef struct { uint64_t pin_bit_mask; int mode, pull_up_en, pull_down_en, intr
 #define GPIO_INTR_DISABLE 0
 esp_err_t gpio_config(const gpio_config_t *config);
 esp_err_t gpio_set_level(int pin, unsigned level);
+esp_err_t gpio_pullup_en(int pin);

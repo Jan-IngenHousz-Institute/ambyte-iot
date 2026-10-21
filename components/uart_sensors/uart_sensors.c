@@ -1018,6 +1018,16 @@ esp_err_t uart_sensors_init(void)
     s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .boot_pin = 6, .shared = true };
     s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .boot_pin = 5, .shared = true };
 
+    /* A leaf's light-sleep TX can be undriven. Without a high idle bias the
+     * remapped host RX floats, accumulating garbage and even coupling our AA
+     * wake burst into RX before the real85 reply (cold-leaf bench capture).
+     * IDF uart_set_pin enables input but leaves pull configuration unchanged;
+     * bias every receive pad once, so remapping cannot park on a floating RX.
+     * Do not compensate by accepting garbage in either idle-proof exchange. */
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; ++i) {
+        ESP_RETURN_ON_ERROR(gpio_pullup_en(s_ch[i].rx_pin), TAG, "AMBIT RX pullup");
+    }
+
     /* AMBIT reset/boot straps (open-drain) for host-driven C3 ROM flashing. */
     ESP_RETURN_ON_ERROR(ambit_boot_gpio_init(), TAG, "AMBIT boot/reset GPIO");
 

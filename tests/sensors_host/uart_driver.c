@@ -18,12 +18,14 @@ static int mutexes[5], mutex_count;
 static unsigned char rx[512], payload[140];
 static size_t rx_at, rx_size;
 static unsigned writes, refresh_starts, mode;
+static uint64_t rx_pullups;
+static unsigned rx_pullup_calls;
 static int64_t contention_us;
 static bool absent, command_pending, race, checking_veto, run_veto_race, tx_failed;
 static _Atomic bool waiting;
 static pthread_t acquisition;
 static bool recovery_test, recovery_silent, recovery_second_silent, recovery_burst, recovery_bad_poll;
-static unsigned recovery_wakes, recovery_phase, recovery_race_phase;
+static unsigned recovery_wakes, recovery_phase, recovery_race_phase, recovery_prime_noise;
 static bool sleep_model, worst_jitter, jitter_done;
 static int64_t leaf_activity, leaf_sleep_ms=500, first_window_tx, gap_end;
 static int64_t jitter_offset_us=450000;
@@ -60,6 +62,11 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t p, TickType_t wait)
 BaseType_t xSemaphoreGive(SemaphoreHandle_t p) { int *held = p; assert(*held); *held = 0; return pdTRUE; }
 esp_err_t gpio_config(const gpio_config_t *config) { assert(config); return ESP_OK; }
 esp_err_t gpio_set_level(int pin, unsigned value) { (void)pin; (void)value; return ESP_OK; }
+esp_err_t gpio_pullup_en(int pin)
+{
+    assert(pin == 3 || pin == 17 || pin == 47 || pin == 40);
+    rx_pullups |= UINT64_C(1) << pin; ++rx_pullup_calls; return ESP_OK;
+}
 esp_err_t uart_param_config(uart_port_t port, const uart_config_t *config) { assert(port == 0 && config); return ESP_OK; }
 esp_err_t uart_driver_install(uart_port_t port, int r, int t, int q, void *h, int flags)
 { (void)r; (void)t; (void)q; (void)h; (void)flags; assert(port == 0); return ESP_OK; }
@@ -95,6 +102,13 @@ int uart_write_bytes(uart_port_t port, const void *bytes, size_t size)
             recovery_race_at(recovery_phase);
             if (!recovery_silent && !(recovery_second_silent && recovery_phase == 3)) {
                 bool asleep=sleep_model && clock_us-leaf_activity>leaf_sleep_ms*1000;
+                /* Captured cold-leaf prefixes from diag9b_fresh.json. They
+                 * must never be promoted to proof by a parser relaxation. */
+                if (recovery_phase == 0 && recovery_prime_noise) {
+                    const uint8_t echo[] = {0xaa,0xaa,0xaa}, zeros[] = {0,0,0};
+                    append_rx(recovery_prime_noise == 1 ? echo : zeros,
+                              recovery_prime_noise == 2 ? 1 : 3);
+                }
                 const uint8_t ack=asleep ? 0x85 : 0x80;append_rx(&ack,1);
                 leaf_activity=clock_us;leaf_sleep_ms=asleep ? 1000 : 500;
                 if (recovery_burst && recovery_phase == 3) {
@@ -176,6 +190,24 @@ static void recovery_cases(void)
     recovery_wakes=0;sensor_inventory_tick();
     assert(!sensor_inventory_busy() && recovery_wakes==3 && jitter_done);
     assert(sensor_inventory_snapshot(&after) && after.recovery_boot_idle[0]==1);
+    /* Actual fresh-boot diagnostic captures (HIL3145c5f): aaaaaa85,
+     * 0085 and00000085 failed prime; no run was active. Preserve exact grammar
+     * and retained cache/config, even when a real85 follows line garbage. */
+    worst_jitter=false;
+    for (recovery_prime_noise=1; recovery_prime_noise<=3; ++recovery_prime_noise) {
+        sensor_inventory_init(&ports,123);assert(sensor_inventory_accept(0,2,fw,48));
+        assert(sensor_inventory_accept(0,1,cal,140));sensor_inventory_config(0,gains,currents);
+        assert(sensor_inventory_snapshot(&before));
+        leaf_activity=clock_us-2000000;
+        sleeping_epoch=sensor_inventory_acquire_run(0);sensor_inventory_run_window(0,sleeping_epoch,0);
+        recovery_wakes=0;sensor_inventory_tick();
+        assert(last_recovery_result==SENSOR_RECOVERY_FAILED && recovery_wakes==1 && sensor_inventory_busy());
+        assert(sensor_inventory_snapshot(&after) && !after.stalled && after.recovery_discarded_bytes[0]>0);
+        assert(!memcmp(before.ports,after.ports,sizeof before.ports));
+        assert(after.recovery_wire_transactions[0]==1 && !after.refresh.wire_transactions[0]);
+    }
+    recovery_prime_noise=0;worst_jitter=true;
+    puts("RECOVERY_COLD_RX_OK pullups=4 captured_prime_prefixes_rejected=3");
     /* R711/T-a: beyond the450ms bound, ex2 must never reach the wire. Four
      * late blocks are REFUSED, not failed leaf attempts, even though prime
      * and ex1 transmitted. The full three-failure budget remains afterward. */
@@ -330,6 +362,11 @@ static void recovery_cases(void)
 int main(void)
 {
     assert(uart_sensors_init() == ESP_OK); clock_us = 6000000;
+    /* IDF uart_set_pin enables input, but deliberately leaves pulls unchanged.
+     * All four remapped receive pads need an idle-high bias when a sleeping
+     * leaf's TX is undriven. Validate the production initialization boundary. */
+    assert(rx_pullups == ((UINT64_C(1)<<3)|(UINT64_C(1)<<17)|(UINT64_C(1)<<47)|(UINT64_C(1)<<40)));
+    assert(rx_pullup_calls == 4);
     const sensor_inventory_ports_t ports = {.now_us = esp_timer_get_time, .utc_ms = utc, .clock = quality,
         .lock = lock, .unlock = unlock, .yield_ms = yield, .inspect = uart_sensors_inspect};
     sensor_inventory_init(&ports, 123);

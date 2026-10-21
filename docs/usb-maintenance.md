@@ -1293,6 +1293,15 @@ Output is streamed from a coherent compact snapshot, with no full-line heap
 allocation. A stalled USB reader can cause a partial rejected line; it cannot
 hold the stdout lock indefinitely. The next attempt starts on a fresh line.
 
+The gateway enables weak pull-ups on each AMBIT receive pad (GPIO3,17,47,40)
+at UART initialization. The shared UART remaps its input among these pads;
+IDF's remap enables input without changing pulls. A sleeping leaf can leave
+its TX undriven, so an unbiased RX can collect garbage or a coupled copy of
+the gateway's wake burst before the leaf's0x85 reply. The pull-up supplies
+UART's high idle level. It does not transmit a command or relax either
+completion-proof exchange. Physical qualification checks cold leaves before
+any run as well as leaves after a completed run.
+
 ### Framed snapshot paging
 
 Service v1 adds `svc.sensors` and `svc.sensors.read` to svc.version.actions.
@@ -1393,7 +1402,13 @@ exists only to exercise the physical completion-proof timing on demand.
 
 The bench command is `sensors_recovery_hil <0-3>`. It invokes exactly one
 production recovery block on the selected leaf, with JSON fields `port`,
-`recovery:"proven"|"failed"|"refused"`, and `proof:boolean`. It deliberately
+`recovery:"proven"|"failed"|"refused"`, and `proof:boolean`. Diagnostic fields
+`cli_affinity_before/after` report task affinity; `rx[7]` gives each phase's
+byte count, first/last relative microseconds and the first64 received bytes
+as hex. Phases0–6 are pre-drain, prime, post-prime drain, first proof, quiet
+gap drain, second proof and final drain. These bounded buffers and fields
+exist only in the HIL build and are printed after UART ownership is released.
+It deliberately
 bypasses the automatic expected-window/job-veto admission only in this build,
 while keeping channel ownership, reply validation and epoch fencing. An idle
 port gets a temporary run epoch; a running port keeps its existing epoch and
