@@ -164,6 +164,11 @@ void svc_protocol_unbind(svc_protocol_t *p)
     svc_wipe(&p->bench, sizeof p->bench);
 #endif
 }
+void svc_protocol_reset_session(svc_protocol_t *p)
+{
+    svc_protocol_unbind(p);
+    p->expected_instance = 0;
+}
 
 static const char *queue(svc_protocol_t *p, svc_record_t *r, const char *password)
 {
@@ -212,7 +217,7 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     }
     if (!strcmp(a[0], "svc.exit")) {
         if (n != 1) { error = "invalid_args"; goto done; }
-        svc_protocol_unbind(p);
+        svc_protocol_reset_session(p);
         prefix(p, &j, true); append(&j, ",\"state\":\"exit\""); finish(p, &j); exit = true; goto done;
     }
     if (!strcmp(a[0], "svc.active")) {

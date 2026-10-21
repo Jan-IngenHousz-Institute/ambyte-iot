@@ -7,10 +7,12 @@ import subprocess
 import sys
 import json
 import tempfile
+import time
 import unittest
 
 from flash_gui.service_client import (OperationJournal, ServiceClient, TransportError,
                                      TransferCancelled)
+from flash_gui.service_wire import decode_frame, encode_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOB = bytes(range(256)) * 64
@@ -83,6 +85,39 @@ class ServicePythonClientTest(unittest.TestCase):
         port = PipeSerial(self.binary, self.root / "device", **kwargs)
         self.addCleanup(port.close)
         return ServiceClient(port, self.journal), port
+
+    def test_failed_bind_does_not_leak_into_the_next_session_on_the_same_port(self):
+        _, port = self.peer()
+
+        def receive(correlation):
+            line = bytearray()
+            deadline = time.monotonic() + 5
+            while not line.endswith(b"\n") and time.monotonic() < deadline:
+                line.extend(port.read(1))
+            actual, response = decode_frame(bytes(line))
+            self.assertEqual(actual, correlation)
+            return response
+
+        def request(correlation, body):
+            port.write(encode_frame(correlation, body))
+            return receive(correlation)
+
+        port.write(b"svc\n")
+        self.assertEqual(receive(0)["state"], "ready")
+        self.assertEqual(request(1, "svc.bind 2222222222222222")["reason"], "store_changed")
+        self.assertEqual(request(2, "svc.result 0000000000000001")["reason"], "store_changed")
+        self.assertEqual(request(3, "svc.exit")["state"], "exit")
+        port.write(b"svc\n")
+        ready = receive(0)
+        self.assertEqual(ready["state"], "ready")
+        for correlation, body in enumerate(("svc.result 0000000000000001",
+                                             "svc.abort 0000000000000001",
+                                             "svc.wifi.join 0000000000000001 QTNK b25seXN5bnRoZXRpYw=="), 4):
+            self.assertEqual(request(correlation, body)["reason"], "not_bound")
+        self.assertEqual(request(7, f"svc.bind {ready['store']}")["state"], "bound")
+        self.assertEqual(request(8, "svc.result 0000000000000001")["reason"], "not_found")
+        self.assertEqual(request(9, "svc.exit")["state"], "exit")
+        self.assertIn("apply_count=0", port.close())
 
     def test_maximum_real_store_upload_and_exact_schema(self):
         client, port = self.peer()

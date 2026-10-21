@@ -148,6 +148,10 @@ void svc_engine_unbind(svc_engine_t *e)
 {
     lock(e); svc_protocol_unbind(&e->protocol); unlock(e);
 }
+void svc_engine_reset_session(svc_engine_t *e)
+{
+    lock(e); svc_protocol_reset_session(&e->protocol); unlock(e);
+}
 const char *svc_engine_tick(svc_engine_t *e)
 {
     lock(e);

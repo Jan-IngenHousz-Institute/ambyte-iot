@@ -30,7 +30,7 @@ stateDiagram-v2
         Prompt --> Prompt : framed probe / CRLF, mode_required, fresh prompt
     }
     state Service {
-        [*] --> Ready : correlation-zero ready frame
+        [*] --> Ready : clear prior binding/attempt, correlation-zero ready frame
         Ready --> Ready : svc.active, or unbound operation / not_bound
         Ready --> Ready : bind wrong store / store_changed
         Ready --> Bound : svc.bind <store>
@@ -578,8 +578,11 @@ are usable without binding; mutations and result lookups require it.
 A missing binding returns `not_bound`; a known requested/bound instance
 differing from the current store returns `store_changed`. Overflow clears
 binding authority while retaining the last attempted instance in session RAM,
-so a same-instance recovery needs a rebind, not a new operation. Reboot or
-reformat loses that RAM: **not_bound never proves the store is unchanged**.
+so a same-instance recovery needs a rebind, not a new operation. Every session
+entry and exit (explicit exit, idle timeout or transport failure) clears both
+binding authority and the last attempted instance. A failed bind in an earlier
+session cannot make the next session report `store_changed` before its own bind.
+Reboot or reformat also loses that RAM: **not_bound never proves the store is unchanged**.
 A recovering client compares version.store with its pending journal and binds
 with the journaled id. On mismatch it reports an unknown outcome and does not
 bind the new instance to replay or resume an old operation. The existing

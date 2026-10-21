@@ -98,6 +98,29 @@ class ServiceSessionTest(unittest.TestCase):
         self.assertEqual([r["reason"] for _, r in responses if not r["ok"]], ["rx_overrun", "not_bound"])
         self.assertEqual(next(r for id, r in responses if id == 5)["highest_id"], "0000000000000000")
 
+    def test_entry_forgets_a_previous_sessions_failed_bind(self):
+        data = frame("svc.result 0000000000000001", 1) + frame("svc.exit", 2)
+        responses = self.call(data, env={"SVC_STALE_SESSION": "1"})
+        self.assertEqual(responses[1][1]["reason"], "not_bound")
+
+    def test_overrun_retains_a_wrong_instance_only_until_session_exit(self):
+        data = frame("svc.bind 2222222222222222", 1)
+        data += b"\x1f" + frame("svc.version", 2) + b"\x1e"
+        data += frame("svc.result 0000000000000001", 3) + frame("svc.exit", 4)
+        responses = self.call(data)
+        self.assertEqual([r["reason"] for _, r in responses if not r["ok"]],
+                         ["store_changed", "rx_overrun", "store_changed"])
+
+    def test_every_exit_path_forgets_the_attempted_instance(self):
+        wrong_bind = frame("svc.bind 2222222222222222", 1)
+        with self.subTest(exit="idle timeout"):
+            responses = self.call(wrong_bind)
+            self.assertEqual(responses[-1][1]["reason"], "session_timeout")
+        with self.subTest(exit="transport failure"):
+            self.call(wrong_bind, env={"SVC_TX_FAIL": "2"}, raw=True)
+        with self.subTest(exit="entry failure"):
+            self.assertEqual(self.call(b"", env={"SVC_ENTER_FAIL": "1", "SVC_STALE_SESSION": "1"}, raw=True), b"")
+
     def test_fresh_active_discovery_and_overrun_rebind_preserve_durable_prefix(self):
         self.call(frame(f"svc.bind {STORE}") + frame(begin(), 2) + frame(put(1, 0, b"abc"), 3) + frame("svc.exit", 4))
         data = frame("svc.active", 10) + frame("svc.result 0000000000000001", 11)

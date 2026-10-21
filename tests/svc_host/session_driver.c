@@ -63,9 +63,11 @@ int main(int argc, char **argv)
     svc_engine_ports_t engine_ports = {.protocol = {.sha256 = hash}, .lock = lock, .unlock = unlock,
                                        .boot_ready = ready, .now_ms = now};
     svc_engine_t engine; svc_engine_init(&engine, &store, &engine_ports);
+    if (getenv("SVC_STALE_SESSION")) engine.protocol.expected_instance = UINT64_C(0x2222222222222222);
     svc_session_ports_t ports = {.enter = enter, .leave = leave, .read = read_bytes, .write = write_frame,
                                   .overrun = overrun, .now_ms = now};
     (void)svc_session_run(&engine, &ports);
     assert(!active && !held && enters == 1 && leaves == 1 && !engine.protocol.bound_instance);
+    assert(!engine.protocol.expected_instance);
     svc_wipe(input, sizeof input);
 }

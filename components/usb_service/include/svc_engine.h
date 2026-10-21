@@ -41,10 +41,12 @@ typedef struct {
 } svc_engine_t;
 
 void svc_engine_init(svc_engine_t *engine, svc_store_t *store, const svc_engine_ports_t *ports);
-/* All three calls below take the engine mutex. tick also reconciles interrupted
+/* These calls take the engine mutex. tick also reconciles interrupted
  * operations only after boot_ready, when installed identity and boot Wi-Fi
  * config are authoritative. It never retries an interrupted action. */
 bool svc_engine_dispatch(svc_engine_t *engine, char *body, char *json);
 const char *svc_engine_tick(svc_engine_t *engine);
 bool svc_engine_wifi_busy(svc_engine_t *engine);
 void svc_engine_unbind(svc_engine_t *engine);
+/* Unlike an in-session unbind, also forgets the attempted store instance. */
+void svc_engine_reset_session(svc_engine_t *engine);

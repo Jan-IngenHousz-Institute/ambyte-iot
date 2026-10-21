@@ -22,7 +22,7 @@ bool svc_session_run(svc_engine_t *e, const svc_session_ports_t *p)
     unsigned char raw[64] = {0};
     char json[SVC_JSON_MAX + 1] = {0};
     bool ok = p->enter(p->context);
-    svc_engine_unbind(e);
+    svc_engine_reset_session(e);
     if (!ok) goto done;
     /* The store field follows the universal response envelope. A damaged or
      * unavailable store still permits discovery/exit and legacy recovery. */
@@ -90,7 +90,7 @@ bool svc_session_run(svc_engine_t *e, const svc_session_ports_t *p)
         if (!ok || exit) break;
     }
 done:
-    svc_engine_unbind(e);
+    svc_engine_reset_session(e);
     svc_rx_clear(&rx); svc_wipe(raw, sizeof raw); svc_wipe(json, sizeof json);
     if (p->sample) p->sample(p->context);
     p->leave(p->context);
