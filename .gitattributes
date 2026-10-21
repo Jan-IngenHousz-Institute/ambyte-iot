@@ -1,3 +1,6 @@
 # Hash-bound test baselines (tests/pinned_revs.py): byte-exact - no EOL conversion, and
 # patch context lines of blank source lines legitimately end in a space.
 tests/fixtures/pinned_base/*.patch -text -whitespace
+
+# Captured console bytes from firmware 2.5.0: byte-exact, CRLF pairs and trailing spaces are the data.
+flash_gui/tests/fixtures/*.raw -text -whitespace

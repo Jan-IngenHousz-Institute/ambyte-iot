@@ -14,14 +14,16 @@ Console facts this module is built on (components/CLI/CLI.c):
     answers `device_name = AMBYTE_{MAC}`, and the firmware expands the {MAC}
     token at boot, in RAM only
   * `rtc set <epoch>` (UTC seconds) applies immediately; `rtc` reads UTC
-  * opening the port must not assert DTR/RTS: esptool drives those lines to
-    reset/bootloader-trip the chip, so leaving them deasserted means merely
-    opening the port never disturbs the running app
+  * set DTR/RTS false before opening. An open can still reset the app on
+    some hosts; wait for the REPL before discovery and keep that descriptor
+    open through boot polling
 """
 
 from __future__ import annotations
 
 import base64
+import codecs
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -32,6 +34,7 @@ from serial.tools import list_ports
 from .config import USB_JTAG_VID
 
 PROMPT = "ambyte> "
+PROBE_READY_TIMEOUT_S = 45.0
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _STATUS_MAC_RE = re.compile(r"-\s*MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -102,6 +105,59 @@ class ProbeResult:
     mac: str | None = None
     device_name: str | None = None      # raw NVS value ({MAC} un-expanded)
     raw: str = field(default="", repr=False)
+    identity: ConsoleIdentity | None = None
+
+
+@dataclass(frozen=True)
+class ScheduleIdentity:
+    source: str | None
+    sha256: str | None
+    workbook_version_id: str | None
+    script_version: str | None
+
+
+@dataclass(frozen=True)
+class ConsoleIdentity:
+    mac: str | None
+    thing_name: str | None
+    fw: str | None
+    contract: int
+    schedule: ScheduleIdentity
+    capabilities: frozenset[str]
+
+
+def _identity_object(obj: dict) -> ConsoleIdentity:
+    """Validate v1 before exposing metadata to provisioning or write gates."""
+    def nullable(value):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError("expected nonempty string or null")
+        if value is not None:
+            value.encode("utf-8", "strict")
+        return value
+
+    if obj["contract"] != 1 or type(obj["contract"]) is not int:
+        raise ValueError("unsupported identity contract")
+    mac = nullable(obj["mac"])
+    if mac is not None and _MAC_RE.fullmatch(mac) is None:
+        raise ValueError("invalid MAC")
+    schedule = obj["schedule"]
+    source = nullable(schedule["source"])
+    if source not in (None, "NONE", "INSTALLED", "EMBEDDED_DEFAULT", "EMBEDDED_FALLBACK"):
+        raise ValueError("invalid loaded source")
+    sha = nullable(schedule["sha256"])
+    if sha is not None and re.fullmatch(r"[0-9a-fA-F]{64}", sha) is None:
+        raise ValueError("invalid schedule digest")
+    caps = obj["capabilities"]
+    if (not isinstance(caps, list) or any(not isinstance(c, str) or not c for c in caps)
+            or len(set(caps)) != len(caps)):
+        raise ValueError("invalid capabilities")
+    for cap in caps:
+        cap.encode("utf-8", "strict")
+    return ConsoleIdentity(mac.upper() if mac else None,
+        nullable(obj["thing_name"]), nullable(obj["fw"]), 1,
+        ScheduleIdentity(source, sha.lower() if sha else None,
+                         nullable(schedule["workbookVersionId"]),
+                         nullable(schedule["script_version"])), frozenset(caps))
 
 
 @dataclass(frozen=True)
@@ -128,6 +184,7 @@ class AmbyteConsole:
         ser.open()
         self._ser = ser
         self._timeout = timeout
+        self._decoder = codecs.getincrementaldecoder("utf-8")("surrogateescape")
 
     def close(self) -> None:
         try:
@@ -147,7 +204,7 @@ class AmbyteConsole:
             chunk = self._ser.read(4096)
         except (OSError, serial.SerialException) as exc:
             raise ConsoleError(f"port {self.port} went away: {exc}") from exc
-        return chunk.decode("utf-8", "replace") if chunk else ""
+        return self._decoder.decode(chunk) if chunk else ""
 
     def wait_prompt(self, timeout: float | None = None) -> bool:
         """Nudge with empty lines until the `ambyte> ` prompt shows up.
@@ -158,6 +215,7 @@ class AmbyteConsole:
         deadline = time.time() + (timeout or self._timeout)
         buf = ""
         self._ser.reset_input_buffer()
+        self._decoder.reset()
         self._write_line("")
         last_nudge = time.time()
         while time.time() < deadline:
@@ -187,6 +245,7 @@ class AmbyteConsole:
         "parked" after ~10 s of true silence instead of waiting out a full
         console deadline (see factory_test.connect_console)."""
         self._ser.reset_input_buffer()
+        self._decoder.reset()
         self._write_line("")
         deadline = time.time() + seconds
         buf = ""
@@ -200,13 +259,15 @@ class AmbyteConsole:
                     return True, seen
         return False, seen
 
-    def command(self, cmd: str, timeout: float = 5.0) -> str:
+    def command(self, cmd: str, timeout: float = 5.0, *, strip_ansi: bool = True) -> str:
         """Send one command, return the ANSI-stripped reply text.
 
-        The reply is everything up to the re-printed prompt. Raises on the
-        REPL's non-zero-exit marker; per-command parsing is the caller's job.
+        The reply includes the re-printed prompt. Per-command parsing and the
+        REPL's non-zero-exit marker are the caller's responsibility. Discovery
+        keeps raw physical lines; other commands strip linenoise ANSI escapes.
         """
         self._ser.reset_input_buffer()
+        self._decoder.reset()
         self._write_line(cmd)
         deadline = time.time() + timeout
         buf = ""
@@ -217,10 +278,39 @@ class AmbyteConsole:
             # AFTER the command output, i.e. following at least one newline.
             tail = plain.rfind(PROMPT)
             if tail > 0 and "\n" in plain[:tail]:
-                return plain
+                return plain if strip_ansi else buf
         raise ConsoleError(f"'{cmd}' got no prompt back within {timeout:.0f}s")
 
     # ── commands ─────────────────────────────────────────────────────────
+    def identity(self, timeout: float = 5.0) -> ConsoleIdentity:
+        """First physical JSON-object line with an integer contract is the reply.
+
+        Logs/malformed lines are ignored. Only an explicit old-image reply
+        permits legacy discovery; silence and invalid v1 metadata fail closed.
+        """
+        reply = self.command("identity", timeout, strip_ansi=False)
+        unsupported = False
+        for line in reply.split("\n"):
+            line = line.rstrip("\r")
+            if line == "Unrecognized command":
+                unsupported = True
+            if not line.startswith("{") or not line.endswith("}"):
+                continue
+            try:
+                line.encode("utf-8", "strict")
+                obj = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(obj, dict) or type(obj.get("contract")) is not int:
+                continue
+            try:
+                return _identity_object(obj)
+            except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+                raise ConsoleError(f"Invalid identity response: {exc}") from exc
+        if unsupported:
+            raise UnsupportedConsoleCommand("identity: Unrecognized command")
+        raise ConsoleError("identity returned no valid JSON response")
+
     def status(self, timeout: float = 5.0) -> str:
         return self.command("status", timeout)
 
@@ -397,33 +487,42 @@ class AmbyteConsole:
 
 
 # ── high-level helpers ──────────────────────────────────────────────────────
-def probe_device(port: str, timeout: float = 2.0, retries: int = 1) -> ProbeResult:
-    """Pre-flash check: is a live ambyte console on this port, and what name
-    does it carry? Short timeout by design: an unflashed/foreign board simply
-    times out and the caller falls back to esptool for the MAC."""
+def probe_device(port: str, timeout: float = PROBE_READY_TIMEOUT_S,
+                 retries: int = 1) -> ProbeResult:
+    """Keep one handle through boot, then prefer the versioned JSON contract.
+
+    Only explicit `Unrecognized command` selects the old status parser. A
+    ready console with corrupt discovery must be reported to the operator.
+    `retries` remains accepted for callers; boot polling owns the time budget.
+    """
     result = ProbeResult()
-    for _ in range(1 + retries):
+    try:
+        con = AmbyteConsole(port)
+    except (OSError, serial.SerialException):
+        return result
+    try:
+        # Preflight is bound to the selected port; scanning unrelated boards
+        # here could associate their MAC with the port later flashed by the GUI.
         try:
-            with AmbyteConsole(port) as con:
-                if not con.wait_prompt(timeout):
-                    continue
-                result.is_ambyte = True
-                try:
-                    status = con.status()
-                    result.raw = status
-                    m = _STATUS_MAC_RE.search(status)
-                    if m:
-                        result.mac = m.group(1).upper()
-                except ConsoleError:
-                    pass
-                try:
-                    result.device_name = con.cfg_get("device_name")
-                except ConsoleError:
-                    pass
+            if not con.wait_prompt(timeout):
                 return result
-        except (ConsoleError, OSError, serial.SerialException):
-            continue
-    return result
+        except ConsoleError:
+            return result
+        result.is_ambyte = True
+        try:
+            result.identity = con.identity()
+            result.mac = result.identity.mac
+        except UnsupportedConsoleCommand:
+            result.raw = con.status()
+            match = _STATUS_MAC_RE.search(result.raw)
+            result.mac = match.group(1).upper() if match else None
+        try:
+            result.device_name = con.cfg_get("device_name")
+        except ConsoleError:
+            pass
+        return result
+    finally:
+        con.close()
 
 
 def connect_after_boot(preferred_port: str | None, deadline_s: float = 180.0,

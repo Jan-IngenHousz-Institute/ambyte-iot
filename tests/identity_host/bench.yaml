@@ -1,0 +1,14 @@
+schema: jii.ambyte-schedule/v1-draft
+id: urn:jii:schedule:a2-identity-bench
+version: 0.1.0
+name: a2-identity-bench
+description: Test workbook and quiet log-only job; no acquisition or event storage.
+workbookVersionId: 11111111-2222-4333-8444-555555555555
+jobs:
+  quiet:
+    schedule:
+      cron: 0 0 1 1 *
+    steps:
+      - uses: device/log
+        with:
+          message: a2-identity-bench

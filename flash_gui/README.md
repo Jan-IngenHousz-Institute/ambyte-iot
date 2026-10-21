@@ -243,8 +243,13 @@ continues automatically; no restart needed.
 
 ## What one procedure does
 
-1. **Pre-flash check** — 2 s console probe (one retry) for a running ambyte
-   firmware and its stored name; falls back to reading the MAC with esptool
+1. **Pre-flash check** — waits up to 45 s for the REPL, keeping one descriptor
+   open through boot. Opening USB can reset the board even with DTR/RTS false.
+   Discovery uses the versioned `identity` JSON for MAC, effective MQTT thing
+   name, compiled firmware, loaded schedule and capabilities; `cfg get` reads
+   the stored device name separately. Only an explicit `Unrecognized command`
+   selects the older `status` probe. Malformed replies and silence are errors.
+   If no console becomes ready, falls back to reading the MAC with esptool
    (works on unflashed chips). The name prompt is pre-filled with the stored
    name, else `AMBYTE_<MAC>`.
 2. **openJII registration + certificate + onboarding** — registers the MAC as
@@ -284,9 +289,16 @@ continues automatically; no restart needed.
    firmware without the push commands it falls back to the firmware's URL
    downloader (the only path that needs the board online). Verification keeps
    the same serial connection open while this asynchronous operation
-   completes.
+   completes. On images advertising `identity`, verification reads identity,
+   then `schedule release`, then identity again: the two loaded tuples must
+   agree with the installed release SHA/version, and the runner must be running
+   with verified metadata and the expected build. Reload snapshots keep polling.
+   Workbook provenance comes from JSON; older images retain release/status
+   verification. Advertised capabilities gate all serial-push writes.
 7. **Verify** — reads back `cfg get device_name`, `cfg get timezone`, `rtc`,
-   and the active Schedule file identity, then reports PASS/FAIL per item. SD card
+   and the active Schedule file identity, then reports PASS/FAIL per item.
+   New images also verify the discovered MAC, effective thing and compiled
+   firmware against the provisioning plan and selected release. SD card
    presence is reported for information only — it is not required: the event
    store and schedule.yaml are internal; a card serves archive/logs/AMBIT OTA only.
    On failure, **Retry provisioning** repairs name/timezone and retries the

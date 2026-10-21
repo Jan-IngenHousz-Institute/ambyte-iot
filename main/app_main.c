@@ -1082,6 +1082,7 @@ void app_main(void)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     subst_token(mqtt_client_id, sizeof(mqtt_client_id), "{MAC}", mac_str);
     subst_token(topic_root,     sizeof(topic_root),     "{MAC}", mac_str);
+    cli_set_thing_name(mqtt_client_id);
     ESP_LOGI(APP_TAG, "MQTT identity: client_id=%s", mqtt_client_id);
     if (device_config_get_device_id(device_id, sizeof(device_id)) != ESP_OK) {
         strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);

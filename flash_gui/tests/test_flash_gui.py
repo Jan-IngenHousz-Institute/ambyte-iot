@@ -761,6 +761,9 @@ def test_onboarding_installs_selected_script_when_sd_has_no_identity(monkeypatch
     )
 
     class FakeConsole:
+        def identity(self, timeout=5.0):
+            raise procedure.ambyte_serial.UnsupportedConsoleCommand("identity: Unrecognized command")
+
         def __init__(self):
             self.status_reads = 0
             self.install_args = None
