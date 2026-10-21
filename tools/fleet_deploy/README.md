@@ -392,7 +392,7 @@ Differences from a catalog release:
   workbook version for a newer firmware is a new id and the device's NVS latch
   does not swallow it.
 - **Credentials.** The run needs a personal openJII API key with collaborator
-  access to the experiment (and the `iot-devices` flag) in the environment
+  access to the experiment in the environment
   secret `OPENJII_API_KEY` of `fleet-deploy-dev` / `fleet-deploy-prod`. The
   openJII environment is always the same selector as the AWS environment.
 - `release_tag` and `script` are ignored in this mode (the shared action still

@@ -173,6 +173,12 @@ class SessionContext:
     # workbook schedule and the catalog `schedule_script` is only the explicit
     # operator override/fallback.
     programming: WorkbookProgramming | None = None
+    # Where a NEW device registration lands: the selected experiment's
+    # organization (Experiment.device_organization_id). None keeps openJII's
+    # default, the operator's personal org. Devices cannot be moved between
+    # organizations afterwards, so this is decided here or not at all.
+    organization_id: str | None = None
+    organization_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -370,7 +376,11 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
 
     log("Requesting device identity, certificate, and onboarding config from openJII...")
     try:
-        identity = ctx.client.provision_device(run.preflight.mac, name, log=log)
+        identity = ctx.client.provision_device(
+            run.preflight.mac, name,
+            organization_id=ctx.organization_id,
+            organization_label=ctx.organization_label,
+            log=log)
         onboarding = ctx.client.onboard_device(identity.device_id,
                                                ctx.experiment_id)
     except Exception as exc:

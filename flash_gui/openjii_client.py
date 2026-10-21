@@ -18,7 +18,7 @@ Endpoints (packages/api/src/domains/... upstream)
 -------------------------------------------------
   GET  /api/v1/auth/get-session                 200 + {user,...} | 200 + null
   GET  /api/v1/experiments?filter=member&status=active
-  GET  /api/v1/devices                          this owner's devices
+  GET  /api/v1/devices                          devices the caller may read
   POST /api/v1/devices                          register → Thing, status=pending
   POST /api/v1/devices/{id}/credentials         issue → SHOW-ONCE cert bundle
   POST /api/v1/devices/{id}/credentials/rotate  re-issue for a live device
@@ -28,8 +28,23 @@ Issuance is refused while a certificate is live (status active/rotating) —
 those go down the /rotate path. The returned private key is show-once: the
 caller must write it to disk before any step that can fail.
 
-All handlers are gated by the PostHog feature flag `iot-devices` per user; a
-403 here almost always means that flag is off for the account.
+Ownership
+---------
+A device is owned by an organization, and openJII has NO route that moves a
+device between organizations. So the organization is chosen once, at
+registration: the GUI registers into the selected experiment's organization,
+which keeps the hardware with the lab that owns the data instead of in the
+personal workspace of whichever student held the USB cable (2026-10: devices
+onboarded under students' personal orgs had to be moved by hand with their
+API keys). The caller must be a member of that organization (403 otherwise).
+A plain `member` is read-only on the org's devices, but registering one seeds
+a creator grant, so the student can still issue its certificate and onboard
+it. A device someone else registered into the org is a different matter: a
+plain member can see it but not manage it, so issuance answers 403.
+
+The registry used to sit behind the PostHog flag `iot-devices`; openJII
+removed that gate on 2026-09-14 (open-jii #2082). The flag key now only hides
+calibration, so a 403 here is an access decision, not a flag.
 """
 
 from __future__ import annotations
@@ -62,6 +77,22 @@ class Experiment:
     id: str
     name: str
     status: str
+    # Every experiment has an owning organization id, including one in a
+    # personal workspace; openJII marks the personal case with a null
+    # organizationName. Only a named organization is a device home.
+    organization_id: str | None = None
+    organization_name: str | None = None
+
+    @property
+    def device_organization_id(self) -> str | None:
+        """The organization new devices for this experiment register into.
+
+        None for a personal-workspace experiment: its organization is the
+        experiment owner's personal org, which another operator cannot
+        create into, so registration keeps openJII's default (the operator's
+        own personal org) exactly as before org ownership existed.
+        """
+        return self.organization_id if self.organization_name else None
 
 
 @dataclass(frozen=True)
@@ -220,19 +251,18 @@ class OpenJIIClient:
         out = []
         for exp in payload:
             if isinstance(exp, dict) and exp.get("id"):
-                out.append(Experiment(id=exp["id"],
-                                      name=exp.get("name") or exp["id"],
-                                      status=exp.get("status") or ""))
+                out.append(Experiment(
+                    id=exp["id"],
+                    name=exp.get("name") or exp["id"],
+                    status=exp.get("status") or "",
+                    organization_id=_optional_str(exp.get("organizationId")),
+                    organization_name=_optional_str(
+                        exp.get("organizationName"))))
         return out
 
     # ── device registry ──────────────────────────────────────────────────
     def find_device(self, serial: str) -> dict | None:
         status, payload = self._request("GET", "/api/v1/devices")
-        if status == 403:
-            raise OpenJIIError(
-                "openJII refused the device registry (403). The `iot-devices` "
-                "feature flag is probably off for your account: "
-                f"{self._error_text(payload)}")
         if status != 200 or not isinstance(payload, list):
             raise OpenJIIError(f"listing devices failed ({status}): "
                                f"{self._error_text(payload)}")
@@ -241,18 +271,35 @@ class OpenJIIClient:
                 return dev
         return None
 
-    def register_device(self, serial: str, name: str | None) -> dict:
+    def register_device(self, serial: str, name: str | None,
+                        organization_id: str | None = None,
+                        organization_label: str = "") -> dict:
         body: dict = {"serialNumber": serial, "deviceType": OPENJII_DEVICE_TYPE}
         if name:
             body["name"] = name
+        if organization_id:
+            body["organizationId"] = organization_id
         status, payload = self._request("POST", "/api/v1/devices", body)
         if status == 201 and isinstance(payload, dict):
             return payload
+        if status == 403 and organization_id:
+            raise OpenJIIError(
+                f"openJII refused to register {serial} into the organization "
+                f"{organization_label or organization_id} (403). Devices are "
+                "registered into the organization that owns the selected "
+                "experiment, so the signed-in account must be a member of it. "
+                "Ask an admin of that organization to add you, then retry: "
+                f"{self._error_text(payload)}")
         if status == 409:
             # Raced with another station, or the pre-check missed it.
             existing = self.find_device(serial)
             if existing:
                 return existing
+            raise OpenJIIError(
+                f"{serial} is already registered on openJII by an account "
+                "whose devices you cannot see (typically someone's personal "
+                "workspace). Ask its owner to delete it or share it with "
+                f"you, then retry: {self._error_text(payload)}")
         raise OpenJIIError(f"registering {serial} failed ({status}): "
                            f"{self._error_text(payload)}")
 
@@ -266,6 +313,17 @@ class OpenJIIClient:
         status, payload = self._request("POST", path)
         if status == 201 and isinstance(payload, dict):
             return payload
+        if status == 403:
+            # find_device saw it, so the caller can read it but not manage it:
+            # an org member's read-only view of a device someone else
+            # registered into the org.
+            raise OpenJIIError(
+                f"you can see {device.get('thingName') or device_id} on "
+                "openJII but may not manage it (403): it was registered by "
+                "someone else, and a plain organization member is read-only "
+                "on other people's devices. Have an organization admin "
+                "onboard this board, or grant you admin on the device: "
+                f"{self._error_text(payload)}")
         raise OpenJIIError(f"issuing credentials failed ({status}): "
                            f"{self._error_text(payload)}")
 
@@ -332,7 +390,7 @@ class OpenJIIClient:
         if status == 403:
             raise OpenJIIError(
                 f"openJII refused the device list of {experiment_id} (403): "
-                "you need collaborator access and the `iot-devices` flag: "
+                "you need collaborator access to the experiment: "
                 f"{self._error_text(payload)}")
         overview = isinstance(payload, dict)
         entries = payload.get("devices") if overview else payload
@@ -493,16 +551,37 @@ class OpenJIIClient:
 
     # ── the full provisioning round ──────────────────────────────────────
     def provision_device(self, serial: str, name: str | None,
+                         organization_id: str | None = None,
+                         organization_label: str = "",
                          log=print) -> DeviceIdentity:
         """Register `serial` if needed, issue/rotate its cert, persist the
-        show-once bundle to disk BEFORE returning."""
+        show-once bundle to disk BEFORE returning.
+
+        `organization_id` is where a NEW registration lands (the experiment's
+        organization; None = openJII's default, the caller's personal org).
+        An existing registration is reused wherever it lives: openJII cannot
+        move a device between organizations, and refusing would strand a
+        board its owner can still onboard. The mismatch is logged instead.
+        """
+        org_label = organization_label or organization_id or ""
         device = self.find_device(serial)
         if device:
             log(f"openJII: {serial} already registered as "
                 f"{device.get('thingName')}.")
+            owner = device.get("organizationId")
+            if organization_id and owner != organization_id:
+                log(f"WARNING: {device.get('thingName')} is owned by another "
+                    f"organization ({owner or 'unknown'}), not {org_label}, "
+                    "which owns this experiment. openJII cannot move a device "
+                    "between organizations: the board will be onboarded and "
+                    "will deliver data, but only its current owners can manage "
+                    "it. To re-home it, delete it on openJII and onboard again.")
         else:
-            device = self.register_device(serial, name)
-            log(f"openJII: registered {serial} as {device.get('thingName')}.")
+            device = self.register_device(serial, name, organization_id,
+                                          org_label)
+            where = f" in {org_label}" if organization_id else ""
+            log(f"openJII: registered {serial} as "
+                f"{device.get('thingName')}{where}.")
 
         rotated = device.get("status") in LIVE_STATES
         if rotated:
@@ -527,6 +606,11 @@ class OpenJIIClient:
                               private_key_pem=key,
                               bundle_dir=bundle,
                               rotated=rotated)
+
+
+def _optional_str(value) -> str | None:
+    """A non-empty string field from the API, else None."""
+    return value.strip() or None if isinstance(value, str) else None
 
 
 def _compile_macro_routing(branch_cells: list[dict],

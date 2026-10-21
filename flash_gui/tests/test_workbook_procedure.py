@@ -289,7 +289,7 @@ def test_prepare_provisioning_bakes_workbook_provenance(monkeypatch, tmp_path):
         endpoint="server-owned.iot.example",
         topic_prefix="experiment/data_ingest/v1/experiment-id/ambyte")
     client = SimpleNamespace(
-        provision_device=lambda serial, name, log=print: identity,
+        provision_device=lambda serial, name, log=print, **_org: identity,
         onboard_device=lambda device_id, experiment_id: onboarding)
     ctx = SessionContext(
         env=ENVIRONMENTS["dev"], client=client,

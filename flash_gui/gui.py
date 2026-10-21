@@ -802,6 +802,8 @@ class App(ttk.Frame):
             wifi_ssid=self.settings.wifi_ssid,
             wifi_password=self.settings.wifi_password,
             programming=programming,
+            organization_id=experiment.device_organization_id,
+            organization_label=experiment.organization_name or "",
         )
 
     def _onboard(self) -> None:
