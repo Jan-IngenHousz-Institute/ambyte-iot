@@ -10,16 +10,29 @@
 
 typedef struct { unsigned char bytes[128]; size_t used; int64_t deadline; } output_t;
 #if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+#include "uart_sensors.h"
 int cli_cmd_sensor_recovery_hil(int argc, char **argv)
 {
     if (argc != 2 || !argv || !argv[1] || argv[1][0] < '0' || argv[1][0] > '3' || argv[1][1]) {
         printf("Usage: sensors_recovery_hil <0-3>\r\n"); return 1;
     }
     unsigned ch = (unsigned)(argv[1][0] - '0');
+    BaseType_t affinity_before=xTaskGetCoreID(NULL);
     sensor_recovery_result_t result = sensor_inventory_recovery_hil((uint8_t)ch);
-    printf("{\"port\":%u,\"recovery\":\"%s\",\"proof\":%s}\r\n", ch,
+    BaseType_t affinity_after=xTaskGetCoreID(NULL);
+    uart_recovery_hil_trace_t trace;
+    bool have_trace=uart_sensors_recovery_hil_trace(&trace) && trace.channel==ch;
+    flockfile(stdout);
+    printf("{\"port\":%u,\"recovery\":\"%s\",\"proof\":%s,\"cli_affinity_before\":%ld,\"cli_affinity_after\":%ld,\"rx\":[", ch,
         result == SENSOR_RECOVERY_PROVEN ? "proven" : result == SENSOR_RECOVERY_FAILED ? "failed" : "refused",
-        result == SENSOR_RECOVERY_PROVEN ? "true" : "false");
+        result == SENSOR_RECOVERY_PROVEN ? "true" : "false",(long)affinity_before,(long)affinity_after);
+    if(have_trace) for(unsigned phase=0;phase<UART_RECOVERY_HIL_PHASES;++phase) {
+        printf("%s{\"phase\":%u,\"count\":%lu,\"first_us\":%lu,\"last_us\":%lu,\"hex\":\"",phase ? "," : "",phase,
+            (unsigned long)trace.count[phase],(unsigned long)trace.first_us[phase],(unsigned long)trace.last_us[phase]);
+        for(unsigned i=0;i<trace.count[phase] && i<UART_RECOVERY_HIL_BYTES;++i) printf("%02x",trace.bytes[phase][i]);
+        printf("\"}");
+    }
+    printf("]}\r\n");funlockfile(stdout);
     return result == SENSOR_RECOVERY_PROVEN ? 0 : 1;
 }
 #endif

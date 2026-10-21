@@ -24,8 +24,11 @@ class SensorRecoveryHilTest(unittest.TestCase):
             self.assertIn(b"RECOVERY_HIL_OK idle_blocks=20 boot_idle=20 active_silent=1", run.stdout)
             names = {name for name, _ in elf_symbols(str(binary))}
             self.assertIn("sensor_inventory_recovery_hil", names)
+            self.assertIn("uart_sensors_recovery_hil_trace", names)
             build_uart(binary)
-            self.assertNotIn("sensor_inventory_recovery_hil", {name for name, _ in elf_symbols(str(binary))})
+            release_names={name for name, _ in elf_symbols(str(binary))}
+            self.assertNotIn("sensor_inventory_recovery_hil", release_names)
+            self.assertNotIn("uart_sensors_recovery_hil_trace", release_names)
         elf = ROOT / ".pio/build/esp32-s3-devkitm-1/firmware.elf"
         if elf.exists():
             for symbol in ("sensor_inventory_recovery_hil", "cli_cmd_sensor_recovery_hil"):

@@ -307,6 +307,11 @@ static void recovery_cases(void)
         assert(sensor_inventory_recovery_hil(0)==SENSOR_RECOVERY_PROVEN && !sensor_inventory_busy());
     }
     assert(sensor_inventory_snapshot(&after) && after.recovery_boot_idle[0]==20 && after.recovery_wire_transactions[0]==60);
+    uart_recovery_hil_trace_t trace;
+    assert(uart_sensors_recovery_hil_trace(&trace) && trace.channel==0 && trace.epoch);
+    assert(trace.count[1]==1 && trace.bytes[1][0]==0x85);
+    assert(trace.count[3]==1 && trace.bytes[3][0]==0x80);
+    assert(trace.count[5]==4 && trace.bytes[5][0]==0x80 && trace.bytes[5][3]==0xf0);
     assert(!after.refresh.wire_transactions[0] && !memcmp(&before.ports[0],&after.ports[0],sizeof before.ports[0]));
     sleep_model=false;recovery_silent=true;
     assert(sensor_inventory_recovery_hil(0)==SENSOR_RECOVERY_FAILED && !sensor_inventory_busy());

@@ -104,6 +104,51 @@ static int64_t s_ping_fail_cache_not_before_us;
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
 static inline int64_t now_us(void) { return esp_timer_get_time(); }
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+static uart_recovery_hil_trace_t s_recovery_hil_trace;
+static int64_t s_recovery_hil_started;
+static portMUX_TYPE s_recovery_hil_mux = portMUX_INITIALIZER_UNLOCKED;
+static void recovery_trace_begin(uint8_t ch, uint64_t epoch)
+{
+    int64_t began=now_us();
+    taskENTER_CRITICAL(&s_recovery_hil_mux);
+    memset(&s_recovery_hil_trace,0,sizeof s_recovery_hil_trace);
+    s_recovery_hil_trace.channel=ch;s_recovery_hil_trace.epoch=epoch;s_recovery_hil_started=began;
+    taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_phase(uint8_t phase)
+{
+    taskENTER_CRITICAL(&s_recovery_hil_mux);s_recovery_hil_trace.phase=phase;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_byte(uint8_t byte)
+{
+    uint32_t elapsed=(uint32_t)(now_us()-s_recovery_hil_started);
+    taskENTER_CRITICAL(&s_recovery_hil_mux);
+    unsigned phase=s_recovery_hil_trace.phase;
+    uint32_t count=s_recovery_hil_trace.count[phase];
+    if(!count) s_recovery_hil_trace.first_us[phase]=elapsed;
+    s_recovery_hil_trace.last_us[phase]=elapsed;
+    if(count<UART_RECOVERY_HIL_BYTES) s_recovery_hil_trace.bytes[phase][count]=byte;
+    if(count!=UINT32_MAX) ++s_recovery_hil_trace.count[phase];
+    taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_end(void)
+{
+    uint32_t elapsed=(uint32_t)(now_us()-s_recovery_hil_started);
+    taskENTER_CRITICAL(&s_recovery_hil_mux);s_recovery_hil_trace.elapsed_us=elapsed;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+bool uart_sensors_recovery_hil_trace(uart_recovery_hil_trace_t *out)
+{
+    if(!out) return false;
+    taskENTER_CRITICAL(&s_recovery_hil_mux);*out=s_recovery_hil_trace;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+    return out->epoch!=0;
+}
+#else
+#define recovery_trace_begin(ch,epoch) ((void)0)
+#define recovery_trace_phase(phase) ((void)0)
+#define recovery_trace_byte(byte) ((void)0)
+#define recovery_trace_end() ((void)0)
+#endif
 
 /* CHIP_EN is shared, so every reset invalidates every channel. Keeping the
  * volatile state transition next to the physical reset prevents a stale
@@ -711,7 +756,7 @@ static unsigned recovery_drain(uart_port_t port, uint8_t channel)
 {
     unsigned count = 0;
     uint8_t byte;
-    while (count < UART_RX_BUF_SIZE && uart_read_bytes(port, &byte, 1, 0) == 1) ++count;
+    while (count < UART_RX_BUF_SIZE && uart_read_bytes(port, &byte, 1, 0) == 1) { recovery_trace_byte(byte);++count; }
     uart_flush_input(port);
     if (count) sensor_inventory_recovery_discard(channel, count);
     return count;
@@ -739,6 +784,7 @@ static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
         if (!ticks) break;
         uint8_t byte;
         if (uart_read_bytes(port, &byte, 1, (TickType_t)ticks) != 1) continue;
+        recovery_trace_byte(byte);
         if (!current(channel, epoch)) { sensor_inventory_recovery_discard(channel, 1); return false; }
         bool expected = prime ? (received == 0 ? byte == AMBIT_BOOT_IDLE || byte == AMBIT_ACK :
                                      received == 1 && first == AMBIT_BOOT_IDLE && byte == AMBIT_ACK) :
@@ -765,6 +811,7 @@ sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, b
 {
     if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || !epoch || !current || !started ||
         timeout_ms > SENSOR_BLOCK_MS) return SENSOR_RECOVERY_REFUSED;
+    recovery_trace_begin(channel,epoch);
     const int64_t deadline = now_us() + timeout_ms * 1000LL;
     uart_sensor_state_t previous;
     if (channel_acquire_until_state_mode(channel, deadline, &previous, true) != ESP_OK) return SENSOR_RECOVERY_REFUSED;
@@ -778,12 +825,16 @@ sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, b
     result = SENSOR_RECOVERY_FAILED;
     /* Idle-loop light sleep eats the waking bytes and emits85. Prime wakes the
      * router, but its exact {85,80,85+80} grammar NEVER releases ownership. */
+    recovery_trace_phase(1);
     if (!recovery_exchange(port,channel,epoch,false,true,&opened,0,current,started,&timing_refused)) goto done;
+    recovery_trace_phase(2);
     if (recovery_drain(port,channel)) goto done;
     if (deadline - now_us() < (2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL) {
         timing_refused=true;goto done;
     }
+    recovery_trace_phase(3);
     if (!recovery_exchange(port,channel,epoch,false,false,&first_opened,0,current,started,&timing_refused)) goto done;
+    recovery_trace_phase(4);
     int64_t quiet_until = now_us() + SENSOR_RECOVERY_GAP_MS * 1000LL;
     while (now_us() < quiet_until) {
         if (!current(channel,epoch)) goto done;
@@ -795,12 +846,15 @@ sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, b
     if (deadline - now_us() < SENSOR_RECOVERY_WINDOW_MS * 1000LL) { timing_refused=true;goto done; }
     /* Before the leaf's500ms re-sleep threshold, even under scheduling jitter.
      * The post-write check also rejects a task preempted at the TX boundary. */
+    recovery_trace_phase(5);
     if (recovery_exchange(port,channel,epoch,poll,false,&opened,first_opened+450000,
             current,started,&timing_refused) && !deadline_reached(deadline) && current(channel,epoch))
         result = SENSOR_RECOVERY_PROVEN;
 done:
+    recovery_trace_phase(6);
     (void)recovery_drain(port,channel);
     s_ch[channel].state=previous;channel_release(channel);
+    recovery_trace_end();
     return timing_refused ? SENSOR_RECOVERY_REFUSED : result;
 }
 
