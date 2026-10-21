@@ -10,12 +10,6 @@ typedef struct {
     bool (*overrun)(void *context);
     int64_t (*now_ms)(void *context);
     void (*sample)(void *context);
-    /* Positive blocking delay, outside engine/stdio locks. Ready RX/TX and
-     * synchronous flash work otherwise need not give the CPU's idle task a
-     * turn. The target adapter must request a positive tick-count delay;
-     * vTaskDelay(1) can last less than one complete tick period. This hook
-     * does not bound a single backend call or other tasks' CPU demand. */
-    void (*cooperate)(void *context);
     void *context;
 } svc_session_ports_t;
 

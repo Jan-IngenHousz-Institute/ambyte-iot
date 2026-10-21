@@ -9,10 +9,7 @@ typedef int portMUX_TYPE;
 #define pdFALSE 0
 #define pdTRUE 1
 #define portMAX_DELAY UINT32_MAX
-#ifndef portTICK_PERIOD_MS
-#define portTICK_PERIOD_MS 1
-#endif
-#define pdMS_TO_TICKS(n) ((TickType_t)((n) / portTICK_PERIOD_MS))
+#define pdMS_TO_TICKS(n) ((TickType_t)(n))
 void svc_test_enter(void);
 void svc_test_exit(void);
 #define portENTER_CRITICAL(m) ((void)(m),svc_test_enter())

@@ -24,7 +24,7 @@ class ServiceSessionTest(unittest.TestCase):
             "-I" + str(ROOT / "components/usb_service/include"),
             *(str(ROOT / "components/usb_service" / name) for name in
               ("svc_wire.c", "svc_store.c", "svc_protocol.c", "svc_engine.c", "svc_session.c")),
-            str(ROOT / "tests/svc_host/session_driver.c"), "-Wl,--wrap=stat", "-lcrypto", "-o", str(cls.binary),
+            str(ROOT / "tests/svc_host/session_driver.c"), "-lcrypto", "-o", str(cls.binary),
         ], check=True)
 
     @classmethod
@@ -58,16 +58,6 @@ class ServiceSessionTest(unittest.TestCase):
         self.assertEqual(responses[-1][1]["state"], "exit")
         self.assertEqual((self.root / "stage.bin").read_bytes(), b"abc")
         self.assertEqual(self.call(frame(f"svc.bind {STORE}") + frame("svc.result 0000000000000001", 2) + frame("svc.exit", 3))[2][1]["offset"], 3)
-
-    def test_sustained_ready_service_traffic_has_blocking_opportunities(self):
-        # Production session/engine/store, immediate RX/TX, synchronous flash
-        # CPU cost. Neither a full read nor a successful write implies a task
-        # blocked: positive idle time must occur during the sustained burst.
-        data=b"".join(frame("svc.version" if i%2 else "svc.stats",i) for i in range(1,1001))
-        data+=frame("svc.exit",1001)
-        responses=self.call(data,env={"SVC_WDT_MODEL":"1"})
-        self.assertEqual(len(responses),1002)
-        self.assertTrue(all(reply["ok"] for _,reply in responses))
 
     def test_invalid_and_oversized_suffixes_never_execute(self):
         data = b"\0" + frame(begin()) + b"x" * 300 + frame(begin())

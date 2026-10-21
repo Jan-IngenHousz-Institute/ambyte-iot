@@ -208,13 +208,6 @@ static int read_bytes(void *context, void *bytes, size_t n, unsigned wait)
 static bool write_bytes(void *context, const void *bytes, size_t n)
 { (void)context; return svc_usb_write(bytes, n); }
 static bool overrun(void *context) { (void)context; return svc_usb_take_overrun(); }
-static void cooperate(void *context)
-{
-    (void)context;
-    /* One literal tick is positive at both100Hz and1000Hz. pdMS_TO_TICKS(1)
-     * would round down to a non-blocking yield in the production100Hz build. */
-    vTaskDelay(1);
-}
 static void notice(const char *reason)
 {
     char json[SVC_JSON_MAX + 1], frame[SVC_FRAME_MAX + 1];
@@ -262,8 +255,7 @@ int usb_service_command(int argc, char **argv)
     if (!s_initialized) { printf("svc: unavailable\r\n"); return 1; }
     portENTER_CRITICAL(&s_metrics_mux); s_cli_task = xTaskGetCurrentTaskHandle(); portEXIT_CRITICAL(&s_metrics_mux);
     const svc_session_ports_t ports = {.enter = enter, .leave = leave, .read = read_bytes,
-        .write = write_bytes, .overrun = overrun, .now_ms = now, .sample = sample,
-        .cooperate = cooperate};
+        .write = write_bytes, .overrun = overrun, .now_ms = now, .sample = sample};
     /* Never let the REPL print a command-error marker after a failed frame
      * emission. The client detects the transport loss and recovers by ID. */
     (void)svc_session_run(&s_engine, &ports);
