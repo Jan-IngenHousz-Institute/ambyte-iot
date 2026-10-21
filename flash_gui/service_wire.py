@@ -161,5 +161,3 @@ def decode_frame(line: bytes) -> tuple[int, dict]:
             (result.get("store") is not None and not _hex(result.get("store"), False)) or "store" not in result):
         raise ProtocolError("Invalid service response envelope.")
     return int(match[1], 16), result
-
-

@@ -142,5 +142,3 @@ class OperationJournal:
                 os.replace(self.path, self.path.with_suffix(".previous.json"))
         except OSError:
             raise ServiceClientError("Cannot preserve the previous transfer intent.") from None
-
-
