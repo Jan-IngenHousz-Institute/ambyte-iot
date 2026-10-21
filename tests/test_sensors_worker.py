@@ -24,14 +24,16 @@ class SensorWorkerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sensor-worker-") as name:
             tmp = Path(name)
             (tmp / "worker-production.inc").write_text("\n".join(exact))
-            binary = tmp / "worker"
-            build = subprocess.run([os.environ.get("CC", "clang"), "-std=c11", "-Wall", "-Wextra",
-                "-Werror", "-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-                f"-I{tmp}", f"-I{ROOT / 'components/sensor_inventory/include'}",
-                str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
-                str(ROOT / "tests/sensors_host/worker_driver.c"), "-o", str(binary)],
-                capture_output=True, text=True)
-            self.assertEqual(build.returncode, 0, build.stderr)
-            run = subprocess.run([binary], capture_output=True, timeout=15)
-            self.assertEqual(run.returncode, 0, run.stderr.decode())
-            self.assertIn(b"job_wait_us=900000", run.stdout)
+            for period in (1, 10):
+                binary = tmp / f"worker-{period}"
+                build = subprocess.run([os.environ.get("CC", "clang"), "-std=c11", "-Wall", "-Wextra",
+                    "-Werror", f"-DHOST_TICK_MS={period}", "-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                    f"-I{tmp}", f"-I{ROOT / 'components/sensor_inventory/include'}",
+                    str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
+                    str(ROOT / "tests/sensors_host/worker_driver.c"), "-o", str(binary)],
+                    capture_output=True, text=True)
+                self.assertEqual(build.returncode, 0, build.stderr)
+                run = subprocess.run([binary], capture_output=True, timeout=15)
+                self.assertEqual(run.returncode, 0, run.stderr.decode())
+                self.assertIn(b"job_wait_us=900000", run.stdout)
+                self.assertIn(b"WORKER_FAIRNESS_OK minutes=10 present=1 absent=1", run.stdout)

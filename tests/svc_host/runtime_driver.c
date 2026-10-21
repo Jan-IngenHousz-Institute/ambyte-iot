@@ -11,10 +11,11 @@
 static unsigned critical, manager_calls, raw_submissions, legacy_submissions, maintenance_ends;
 static bool mutex_held, gate, maintenance, reject;
 static int64_t clock_us;
+static unsigned cooperative_delays;
 static bool resource_trough;
 static void (*pending_worker)(void *);
 static void *worker_arg;
-static char input[2048];
+static char input[65536];
 static size_t input_at, input_length;
 static const char *case_name;
 #ifdef SVC_JOBS_INTEGRATION
@@ -30,6 +31,9 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait)
 BaseType_t xSemaphoreGive(SemaphoreHandle_t mutex)
 { assert(mutex == (void *)1 && mutex_held); mutex_held = false; return pdTRUE; }
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
+#ifndef SVC_JOBS_INTEGRATION
+void vTaskDelay(TickType_t ticks) { assert(ticks>0 && !mutex_held && !critical);clock_us+=(int64_t)ticks*portTICK_PERIOD_MS*1000;++cooperative_delays; }
+#endif
 UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) { assert(task == (void *)1); return 8888; }
 int64_t esp_timer_get_time(void) { clock_us += 1000; return clock_us; }
 size_t heap_caps_get_free_size(unsigned caps) { assert(caps == 3); return resource_trough ? 12000 : 64000; }
@@ -128,6 +132,18 @@ int main(int argc, char **argv)
     usb_service_config_t config = {.submit = app_maint_submit, .maintenance_begin = backend_begin,
         .maintenance_end = backend_end, .boot_ready = backend_ready, .worker_stack = backend_stack, .runner_stack = runner_stack};
     assert(usb_service_init(&config) == ESP_OK);
+    unsigned before_cooperate=cooperative_delays;
+    cooperate(NULL);
+    assert(cooperative_delays==before_cooperate+1);
+    if(!strcmp(case_name,"ready_traffic")) {
+        unsigned before=cooperative_delays;
+        for(unsigned id=1;id<=1000;++id) add_request(id%2 ? "svc.version" : "svc.stats",id);
+        add_request("svc.exit",1001);
+        assert(usb_service_command(1,NULL)==0);
+        assert(cooperative_delays-before>10 && !gate && !mutex_held && !critical);
+        fputs("ADAPTER_FAIRNESS_OK frames=1000 positive_delays=1 tick_ms=10\n",stderr);
+        return 0;
+    }
     assert(s_boot_fingerprint_known);
     if (!strcmp(case_name, "plain_notice")) {
         fputs("ambyte> ", stdout); notice("mode_required"); return 0;

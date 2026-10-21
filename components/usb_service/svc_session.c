@@ -32,9 +32,20 @@ bool svc_session_run(svc_engine_t *e, const svc_session_ports_t *p)
     else strcpy(json, "{\"ok\":true,\"store\":null,\"service\":1,\"state\":\"ready\"}");
     if (!(ok = emit(p, 0, json))) goto done;
     int64_t last_input = p->now_ms(p->context), next_sample = last_input;
+    int64_t next_cooperate = last_input + 50;
     bool draining = false;
     for (;;) {
         int64_t now = p->now_ms(p->context);
+        /* A reading/writing host can keep both USB rings immediately ready.
+         * Neither that traffic nor a synchronous littlefs scan blocks this
+         * task. Under CPU0 co-load, merely yielding to equal priorities leaves
+         * IDLE0 starved. Give lower priorities a real blocking opportunity at
+         * this lock-free boundary, including malformed/overrun drain loops. */
+        if (p->cooperate && now >= next_cooperate) {
+            p->cooperate(p->context);
+            now = p->now_ms(p->context);
+            next_cooperate = now + 50;
+        }
         if (now >= next_sample) {
             if (p->sample) p->sample(p->context);
             (void)svc_engine_tick(e);
