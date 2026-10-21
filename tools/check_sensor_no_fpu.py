@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject FPU instructions in the target snapshot formatter (task-affinity safety)."""
+"""Reject coprocessor instructions in console inspection objects (affinity safety)."""
 import argparse
 from pathlib import Path
 import re
@@ -14,7 +14,8 @@ def fpu_instructions(disassembly):
         if match and ((match[1].endswith(".s") or match[1] in {
                 "lsi", "lsip", "lsiu", "lsx", "lsxp", "ssi", "ssip", "ssiu", "ssx", "ssxp", "rfr", "wfr"}) and
                 re.search(r"\bf(?:[0-9]|1[0-5])\b", match[2]) or
-                match[1] in {"rur.fcr", "wur.fcr", "rur.fsr", "wur.fsr"}):
+                match[1] in {"rur.fcr", "wur.fcr", "rur.fsr", "wur.fsr"} or
+                match[1].startswith("ee.")):
             found.append(line.strip())
     return found
 
@@ -35,10 +36,12 @@ def check_object(path, objdump=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("object", type=Path)
+    parser.add_argument("objects", type=Path, nargs="+")
     parser.add_argument("--objdump")
     args = parser.parse_args()
-    found = check_object(args.object, args.objdump)
+    found = []
+    for path in args.objects:
+        found.extend(f"{path}: {line}" for line in check_object(path, args.objdump))
     if found:
-        raise SystemExit("FPU CHECK FAIL: snapshot formatting can pin its caller\n" + "\n".join(found))
-    print("FPU CHECK PASS: snapshot formatter uses no FPU instructions")
+        raise SystemExit("FPU CHECK FAIL: console inspection can pin its caller\n" + "\n".join(found))
+    print(f"FPU CHECK PASS: {len(args.objects)} console inspection objects use no coprocessor instructions")

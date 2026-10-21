@@ -17,9 +17,15 @@ class SensorFormatterFpuTest(unittest.TestCase):
                          ["0: 030103 lsi f0, a1, 12", "3: fa1010 abs.s f1, f0"])
         self.assertEqual(fpu_instructions("0: 002136 entry a1, 16\n3: 0228 l32i.n a2, a2, 0"), [])
         self.assertEqual(fpu_instructions("0: 00c256 beqz a2, f1 <string+0xf1>"), [])
-        obj = ROOT / ".pio/build/esp32-s3-devkitm-1/components/sensor_inventory/sensor_json.c.o"
-        if obj.exists():
-            self.assertEqual(check_object(obj), [], "snapshot formatting must not pin the console task")
+        pie = "0: 1c0401 ee.vld.128.ip q0, a1, 16"
+        self.assertEqual(fpu_instructions(pie), [pie])
+        build = ROOT / ".pio/build/esp32-s3-devkitm-1/components"
+        objects = [build / "sensor_inventory/sensor_json.c.o", build / "sensor_inventory/sensor_inventory.c.o",
+                   build / "CLI/cli_sensors.c.o", *sorted((build / "usb_service").glob("*.o"))]
+        for obj in objects:
+            if obj.exists():
+                with self.subTest(object=obj.name):
+                    self.assertEqual(check_object(obj), [], "inspection must not pin the console task")
 
     def test_wire_float_widening_preserves_bits_and_existing_decimal_json(self):
         with tempfile.TemporaryDirectory() as tmp:
