@@ -134,6 +134,11 @@ holds bench boards.
 - Commits: Conventional Commits for every commit message and PR title —
   `type(scope): description` (e.g. `feat(evlog): …`, `fix(rtc): …`, `docs: …`,
   `test(bench): …`). No Claude co-author trailers.
+- Every PR follows `.github/pull_request_template.md`. A change to a device contract, protocol,
+  storage layout, update path or fleet tool carries Mermaid diagrams of the mechanism (state,
+  sequence, failure recovery) in the PR body **and** in the matching `docs/` page, plus
+  terminal-style images rendered from the real bench captures of its qualification run under
+  `docs/images/<topic>/` (credentials redacted). `docs/usb-maintenance.md` is the reference.
 - Fleet realities: prod devices each have their own X.509 cert (245 as of Sept 2026); dev bench
   boards share one;
   client ids are `AMBYTE_<MAC>`; ~500 devices/site is the target scale.
