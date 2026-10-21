@@ -4,14 +4,15 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pinned_idf import pinned_idf
 
 ROOT = Path(__file__).resolve().parents[1]
-IDF = Path.home() / ".platformio/packages/framework-espidf@3.50500.0"
 
 
 class ServiceJobsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        IDF = pinned_idf()
         cls.build = tempfile.TemporaryDirectory()
         cls.binary = Path(cls.build.name) / "jobs"
         includes = [ROOT / "tests/svc_host/jobs_include", ROOT / "tests/svc_host/include",

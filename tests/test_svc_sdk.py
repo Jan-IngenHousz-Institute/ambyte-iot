@@ -6,13 +6,14 @@ import subprocess
 import tempfile
 import unittest
 import zlib
+from pinned_idf import pinned_idf
 
 ROOT = Path(__file__).resolve().parents[1]
-IDF = Path.home() / ".platformio/packages/framework-espidf@3.50500.0"
 
 
 class ServicePinnedSdkTest(unittest.TestCase):
     def test_real_driver_vfs_stdout_sd_tee_uart_rings_and_pipelined_overrun(self):
+        IDF = pinned_idf()
         with tempfile.TemporaryDirectory() as temporary:
             build = Path(temporary)
             base = [os.environ.get("CC", "cc"), "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror",
