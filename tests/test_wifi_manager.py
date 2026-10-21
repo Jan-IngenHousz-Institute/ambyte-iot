@@ -20,6 +20,7 @@ SCENARIOS = (
     "service_trial_intent_refusal_restores",
     "service_trial_prepare_refusal_preserves",
     "service_trial_owned_ip_saves",
+    "service_trial_persist_inline_drop",
     "classification",
     "delay_schedule",
     "boot_authfail_recovers",

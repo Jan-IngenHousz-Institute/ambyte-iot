@@ -51,6 +51,8 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password);
 /* The local service trials credentials in RAM. prepare(false) records the
  * previous credential fingerprint; prepare(true) durably records persist
  * intent. A false callback return forbids the subsequent configuration write.
+ * FLASH persistence reuses the owned reconfigure/rejoin path because IDF 5.5
+ * drops the associated link on set_config; success includes a new owned GOT_IP.
  * Password pointers are transient and must never be retained by the callback. */
 typedef bool (*wifi_manager_trial_prepare_fn)(bool persist_intent,
                                             const char *old_ssid, const char *old_password,

@@ -2545,6 +2545,7 @@ static void trial_case(int outcome, unsigned deny, bool success)
     CHECK(s_service_original_ssid[0] == 0 && s_service_trial_ssid[0] == 0);
     if (success) {
         CHECK(error == ESP_OK && result.persist_intent && result.saved);
+        CHECK(result.connected && !result.retrying && g_associated);
         CHECK(g_flash_writes == 1);
         CHECK(strcmp((char *)g_flash_config.sta.ssid, "TrialAP") == 0);
     } else {
@@ -2561,6 +2562,17 @@ static void scenario_service_trial_stale_ip_restores(void) { trial_case(SCRIPT_G
 static void scenario_service_trial_intent_refusal_restores(void) { trial_case(SCRIPT_GOT_IP, 2, false); }
 static void scenario_service_trial_prepare_refusal_preserves(void) { trial_case(SCRIPT_GOT_IP, 1, false); }
 static void scenario_service_trial_owned_ip_saves(void) { trial_case(SCRIPT_GOT_IP, 0, true); }
+static void scenario_service_trial_persist_inline_drop(void)
+{
+    g_set_config_delivers_now = true;
+    g_drop_connect_in_set_config = true;
+    trial_case(SCRIPT_GOT_IP, 0, true);
+    CHECK(wifi_manager_is_connected() && wifi_manager_link_is_current() && g_associated);
+    CHECK(!s_wifi.reconfigure_in_progress && !g_timer_armed);
+    CHECK(log_count('W', "Wi-Fi disconnected (reason=1)") == 0);
+    CHECK(log_count('I', "disconnected for reconfigure (reason=1)") == 1);
+}
+
 
 int main(int argc, char **argv)
 {
@@ -2571,6 +2583,7 @@ int main(int argc, char **argv)
         { "service_trial_intent_refusal_restores", scenario_service_trial_intent_refusal_restores },
         { "service_trial_prepare_refusal_preserves", scenario_service_trial_prepare_refusal_preserves },
         { "service_trial_owned_ip_saves", scenario_service_trial_owned_ip_saves },
+        { "service_trial_persist_inline_drop", scenario_service_trial_persist_inline_drop },
         { "classification", scenario_classification },
         { "delay_schedule", scenario_delay_schedule },
         { "boot_authfail_recovers", scenario_boot_authfail_recovers },

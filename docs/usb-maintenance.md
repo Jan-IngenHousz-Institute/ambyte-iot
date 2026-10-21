@@ -607,7 +607,12 @@ stored credentials and later reports uncertain/interrupted, `saved:false` and
 
 After owned GOT_IP, the service first commits a **persist-intent marker** anchored
 to previous/requested config fingerprints, then selects FLASH storage and saves
-the successful config. The wifi_prov/wifi_creds namespaces are untouched.
+the successful config. Because IDF 5.5 drops an associated link inside
+`esp_wifi_set_config`, persistence uses the owned reconfigure/drain/rejoin
+flow and waits for a new owned GOT_IP after that write. The service lease and
+maintenance veto span both waits. Trial plus rejoin (or trial plus restoration)
+keeps the same 30-second bound; each connection wait is at most eight seconds.
+The wifi_prov/wifi_creds namespaces are untouched.
 Littlefs and esp_wifi NVS cannot commit atomically. After a reboot in this
 window, the boot config fingerprint is compared with requested and previous
 fingerprints: requested means saved:true, previous saved:false, neither or an

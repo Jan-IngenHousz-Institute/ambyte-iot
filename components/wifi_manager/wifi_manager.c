@@ -1890,7 +1890,14 @@ esp_err_t wifi_manager_trial(const char *ssid, const char *password,
     if (error != ESP_OK) goto finished;
     ram_selected = false;
     restore = false;
-    error = esp_wifi_set_config(WIFI_IF_STA, &requested);
+    /* Persisting config on an associated station itself drops the link on
+     * IDF 5.5 (reason=1). Reuse the owned reconfigure/drain/new-generation
+     * connect path rather than saving under the old trial association and
+     * racing its disconnect handler. Success requires a fresh owned GOT_IP
+     * after the FLASH write; the lease and maintenance veto remain held.
+     * Trial + persist rejoin use the same two bounded eight-second waits as
+     * trial + restoration. Post-intent errors stay uncertain in the service. */
+    error = connect_impl(ssid, password, &requested, 8000);
     out->saved = error == ESP_OK;
 
 finished:
