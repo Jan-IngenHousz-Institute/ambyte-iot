@@ -293,7 +293,6 @@ static void ota_do_update(const ota_request_t *r)
      * /releases/download/ URLs are fine and not matched here.) */
     if (strstr(r->url, "/blob/") != NULL || strstr(r->url, "/tree/") != NULL) {
         ESP_LOGE(TAG, "URL is a GitHub web page (/blob/ or /tree/), not a downloadable file:");
-        ESP_LOGE(TAG, "  %s", r->url);
         ESP_LOGE(TAG, "use a RELEASE ASSET url — no /blob/ or /tree/, no branch name:");
         ESP_LOGE(TAG, "  https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin");
         ESP_LOGE(TAG, "  (Releases page -> right-click the asset -> Copy link address)");

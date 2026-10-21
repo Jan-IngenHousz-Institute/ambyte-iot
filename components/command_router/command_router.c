@@ -275,7 +275,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "ota_update id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ota_update id=%s dispatched (url=%s)", id ? id : "", url);
+                ESP_LOGW(TAG, "ota_update id=%s dispatched (url_length=%u)",
+                         id ? id : "", (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_ota") == 0) {
@@ -306,7 +307,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ambit_ota id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url=%s)", id ? id : "", ch, url);
+                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url_length=%u)",
+                         id ? id : "", ch, (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_probe") == 0) {

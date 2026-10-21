@@ -399,3 +399,13 @@ original signature sector so the device reaches the signature verifier.
 The preflight membership walk uses AWS [ListThingGroupsForThing](https://docs.aws.amazon.com/iot/latest/apireference/API_ListThingGroupsForThing.html)
 and [DescribeThingGroup parent metadata](https://docs.aws.amazon.com/cli/latest/reference/iot/describe-thing-group.html)
 to include direct and inherited group targets. It performs no registry changes.
+
+
+### OTA URL logging
+
+Application OTA/AMBIT request and dispatch logs expose the request ID, channel
+where relevant, and `url_length`; they never print the supplied URL path or
+query. Invalid browse-URL errors and AMBIT flash requests follow the same rule.
+Presigned queries can contain temporary credentials. The old unsigned v2.7.0
+bootstrap image predates this redaction: keep its raw bench captures private
+and redact credential-bearing URLs from published evidence.
