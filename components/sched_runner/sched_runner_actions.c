@@ -220,6 +220,14 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
     }
     const uint8_t mask = channels_mask(step, prog);
 
+    /* Reserve setup across ALL channels before triggering the first leaf.
+     * Missing identity on a later parallel channel cannot cause cmd33 reads
+     * while an earlier one is already measuring. */
+    sensor_inventory_veto_begin();
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ++ch) {
+        if (!(mask & (1u << ch)) || sched_runner_should_stop()) continue;
+        if (ch_present(ch)) { ambit_device_info_t info; (void)cmd_ambit_device_info(ch, &info); }
+    }
     if (hold_window) device_commands_measurement_begin();
 
     ambit_trace_options_t opts = {
@@ -313,7 +321,11 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
         }
     }
 
+    /* Preserve acquisition's existing recovery policy. A lost ACK or an
+     * unproven completion keeps its inventory busy bit: refresh must wait for
+     * a later definitive acquisition result or an existing reset owner. */
     if (hold_window) device_commands_measurement_end();
+    sensor_inventory_veto_end();
 
     /* Failure accounting: "no AMBIT responded" and "every triggered channel
      * failed" are job failures; a partial round (one of two channels stored)

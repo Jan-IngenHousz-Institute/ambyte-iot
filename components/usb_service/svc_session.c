@@ -32,9 +32,22 @@ bool svc_session_run(svc_engine_t *e, const svc_session_ports_t *p)
     else strcpy(json, "{\"ok\":true,\"store\":null,\"service\":1,\"state\":\"ready\"}");
     if (!(ok = emit(p, 0, json))) goto done;
     int64_t last_input = p->now_ms(p->context), next_sample = last_input;
+    int64_t next_cooperate = last_input + 50;
     bool draining = false;
     for (;;) {
         int64_t now = p->now_ms(p->context);
+        /* The ESP-IDF first-FPU exception permanently pins an unpinned task.
+         * Legacy commands (read_env, selftest, PWM, AMBIT temperature) can leave
+         * this priority-6 console pinned before it enters service. Repeated
+         * synchronous store work must then give lower priorities a blocking
+         * opportunity even when USB read/write happens to return immediately.
+         * This lock-free boundary also covers malformed/overrun drain loops.
+         * It does not bound one backend call or other tasks' CPU demand. */
+        if (p->cooperate && now >= next_cooperate) {
+            p->cooperate(p->context);
+            now = p->now_ms(p->context);
+            next_cooperate = now + 50;
+        }
         if (now >= next_sample) {
             if (p->sample) p->sample(p->context);
             (void)svc_engine_tick(e);

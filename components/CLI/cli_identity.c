@@ -168,7 +168,7 @@ int cli_cmd_identity(int argc, char **argv)
     json_schedule(&w);
     json_raw(&w, ",\"capabilities\":[\"identity\",\"cfg.get\",\"cfg.set\",\"reboot\","
                  "\"schedule.status\",\"schedule.release\",\"schedule.begin\","
-                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\"]}");
+                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\",\"sensors\"]}");
     if (w.overflow) {
         printf("identity: response exceeds buffer\r\n");
         return 1;

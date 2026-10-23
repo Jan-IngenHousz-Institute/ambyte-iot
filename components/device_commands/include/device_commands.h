@@ -15,6 +15,7 @@
 #include "sensing_port.h"
 #include "script_identity_port.h"
 #include "uart_sensor_port.h"
+#include "sensor_inventory.h"
 #include "ambit_protocol.h"   /* ambit_spec_raw_t (cmd 35 frame) */
 
 #ifdef __cplusplus
@@ -324,20 +325,7 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
  *    the AMBIT has no read-back). Tracked at set-time, so they're known without
  *    a query. Reset to "unset" on (re)connect (the AMBIT booted with its own
  *    defaults, unknown to us, until a set_gains/set_currents). */
-typedef struct {
-    bool     valid;
-    char     device_id[18];   /* "AA:BB:CC:DD:EE:FF" from the AMBIT efuse MAC */
-    char     fw_version[16];   /* "major.minor.batch" */
-    uint8_t  hw_rev;           /* AMBIT hardware revision (0 = unknown / pre-0.1.0 fw) */
-    uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
-    char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
-    float    actinic_coef;     /* PAR(µmol)→DAC byte = actinic_coef × PAR; 0 if cal unread */
-    float    tick_factor;      /* true AMBIT sample-period scale; 0 if cal unread */
-    bool     gains_set;        /* true once the ambyte has set gains this connection */
-    uint8_t  gains[6];         /* fluo, fluoref, ir, irref, sun, leaf (cmd 1 order) */
-    bool     currents_set;     /* true once the ambyte has set currents this connection */
-    uint8_t  currents[3];      /* i620, i720, ir (cmd 2 order) */
-} ambit_device_info_t;
+
 
 /* Return cached identity+config for `ch`, lazily fetching identity on first use
  * (one-time UART cost, then free). *out is zeroed + valid=false on a fetch
@@ -350,6 +338,10 @@ bool cmd_ambit_device_info_cached(uint8_t ch, ambit_device_info_t *out);
 /* Drop a channel's identity cache AND tracked gains/currents so the next read
  * re-fetches. Stable-tuple persistence decides whether inventory changed. */
 void cmd_ambit_device_info_invalidate(uint8_t ch);
+/* Compose once after Wi-Fi hardware initialization supplies entropy; no
+ * connection or network request is needed. Refresh itself uses the resident
+ * maintenance worker, while every console read is cache-only. */
+void device_commands_sensors_start(sensor_inspect_fn_t inspect, sensor_recover_fn_t recover, void (*wake)(void));
 
 /* Measurements (FSM response) */
 cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,

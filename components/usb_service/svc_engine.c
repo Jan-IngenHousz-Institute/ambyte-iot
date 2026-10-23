@@ -28,6 +28,22 @@ static bool status(void *context, svc_wifi_status_t *out)
     svc_engine_t *e = context;
     return e->ports.protocol.wifi_status && e->ports.protocol.wifi_status(e->ports.protocol.context, out);
 }
+static const char *sensors_capture(void *context, uint64_t *token, size_t *size, char sha[65])
+{
+    svc_engine_t *e = context;
+    return e->ports.protocol.sensors_capture(e->ports.protocol.context, token, size, sha);
+}
+static const char *sensors_read(void *context, uint64_t token, uint32_t offset,
+                                unsigned char data[576], size_t *size, bool *eof)
+{
+    svc_engine_t *e = context;
+    return e->ports.protocol.sensors_read(e->ports.protocol.context, token, offset, data, size, eof);
+}
+static void sensors_release(void *context)
+{
+    svc_engine_t *e = context;
+    e->ports.protocol.sensors_release(e->ports.protocol.context);
+}
 
 typedef struct { svc_engine_t *engine; svc_record_t *record; const char *error; } prepare_t;
 static bool prepare(bool intent, const char *old_ssid, const char *old_password, void *context)
@@ -124,7 +140,10 @@ void svc_engine_init(svc_engine_t *e, svc_store_t *store, const svc_engine_ports
 {
     memset(e, 0, sizeof *e); e->ports = *ports;
     svc_protocol_ports_t protocol = {.sha256 = hash, .submit = submit, .metrics = metrics,
-                                      .wifi_status = status, .context = e};
+        .wifi_status = status, .context = e,
+        .sensors_capture = ports->protocol.sensors_capture ? sensors_capture : NULL,
+        .sensors_read = ports->protocol.sensors_read ? sensors_read : NULL,
+        .sensors_release = ports->protocol.sensors_release ? sensors_release : NULL};
     svc_protocol_init(&e->protocol, store, &protocol);
     svc_record_t active;
     if (!svc_store_active(store, &active)) e->recovery_id = active.id;

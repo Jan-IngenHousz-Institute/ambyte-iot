@@ -286,7 +286,7 @@ class AmbyteConsole:
                     return True, seen
         return False, seen
 
-    def command(self, cmd: str, timeout: float = 5.0, *, strip_ansi: bool = True) -> str:
+    def command(self, cmd: str, timeout: float = 5.0, *, strip_ansi: bool = True, max_reply_bytes: int | None = None) -> str:
         """Send one command, return the ANSI-stripped reply text.
 
         The reply includes the re-printed prompt. Per-command parsing and the
@@ -300,6 +300,8 @@ class AmbyteConsole:
         buf = ""
         while time.time() < deadline:
             buf += self._read_available()
+            if max_reply_bytes is not None and len(buf.encode("utf-8", "surrogateescape")) > max_reply_bytes:
+                raise ConsoleError("Console response exceeded its byte limit")
             plain = _ANSI_RE.sub("", buf)
             # The echo arrives first; the prompt we want is the one printed
             # AFTER the command output, i.e. following at least one newline.
@@ -337,6 +339,32 @@ class AmbyteConsole:
         if unsupported:
             raise UnsupportedConsoleCommand("identity: Unrecognized command")
         raise ConsoleError("identity returned no valid JSON response")
+
+    def sensors(self, timeout: float = 5.0):
+        """Fresh capability discovery and a cache-only attachment snapshot.
+
+        Unsupported older firmware is explicitly unavailable (None). A failed
+        advertised command, malformed snapshot or silence is an error.
+        """
+        from .sensors import decode_sensors, SensorsError
+        try:
+            identity = self.identity(timeout=timeout)
+        except UnsupportedConsoleCommand:
+            if self.status_mac() is None:
+                raise ConsoleError("Older firmware did not provide a gateway MAC")
+            return None
+        if "sensors" not in identity.capabilities:
+            return None
+        reply = self.command("sensors", timeout, strip_ansi=False, max_reply_bytes=65536)
+        for line in reply.split("\n"):
+            line = line.rstrip("\r")
+            if not line.startswith("{"):
+                continue
+            try:
+                return decode_sensors(line)
+            except SensorsError as exc:
+                raise ConsoleError(str(exc)) from exc
+        raise ConsoleError("sensors returned no valid JSON response")
 
     def status(self, timeout: float = 5.0) -> str:
         return self.command("status", timeout)

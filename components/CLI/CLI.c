@@ -12,6 +12,7 @@
 
 #include "CLI.h"
 #include "cli_identity.h"
+#include "cli_sensors.h"
 #include "driver/i2c.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -1708,6 +1709,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
         }
         to = from + 1;
     }
+    sensor_inventory_veto_begin();
     int failures = 0;
     for (int ch = from; ch < to; ch++) {
         ambit_flash_probe_result_t r;
@@ -1721,6 +1723,7 @@ static int cli_cmd_ambit_probe(int argc, char **argv)
             failures++;
         }
     }
+    sensor_inventory_veto_end();
     return (failures == 0) ? 0 : 1;
 }
 
@@ -2078,6 +2081,7 @@ static int cli_cmd_schedule(int argc, char **argv)
 static int cli_cmd_ambit_versions(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    sensor_inventory_veto_begin();
     printf("AMBIT firmware versions:\r\n");
     for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
         bool connected = false;
@@ -2097,6 +2101,7 @@ static int cli_cmd_ambit_versions(int argc, char **argv)
             printf("  AMBIT%u: present, no version (%s)\r\n", c + 1, esp_err_to_name(r.status));
         }
     }
+    sensor_inventory_veto_end();
     return 0;
 }
 
@@ -2208,6 +2213,20 @@ static esp_err_t cli_register_commands(void)
         .help = "read gateway identity and maintenance contract v1 as one JSON line",
         .func = cli_cmd_identity,
     };
+    const esp_console_cmd_t sensors_cmd = {
+        .command = "sensors", .help = "read cached attachment observations as one JSON line",
+        .func = cli_cmd_sensors,
+    };
+    esp_err_t sensors_err = esp_console_cmd_register(&sensors_cmd);
+    if (sensors_err != ESP_OK) return sensors_err;
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+    const esp_console_cmd_t recovery_hil_cmd = {
+        .command = "sensors_recovery_hil", .help = "BENCH ONLY: force one acquisition-owned completion proof block",
+        .func = cli_cmd_sensor_recovery_hil,
+    };
+    esp_err_t recovery_err = esp_console_cmd_register(&recovery_hil_cmd);
+    if (recovery_err != ESP_OK) return recovery_err;
+#endif
     esp_err_t identity_err = esp_console_cmd_register(&identity_cmd);
     if (identity_err != ESP_OK) {
         return identity_err;

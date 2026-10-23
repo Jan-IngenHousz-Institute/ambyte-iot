@@ -4,3 +4,7 @@ tests/fixtures/pinned_base/*.patch -text -whitespace
 
 # Captured console bytes from firmware 2.5.0: byte-exact, CRLF pairs and trailing spaces are the data.
 flash_gui/tests/fixtures/*.raw -text -whitespace
+
+# Released parser and A3 reference sources: SHA256 guards require exact bytes on every host.
+flash_gui/tests/fixtures/released/ambyte_serial_6b86c8e.py -text
+tests/fixtures/sensors/a3_6a57c2a/*.c -text

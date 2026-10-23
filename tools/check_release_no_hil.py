@@ -55,7 +55,7 @@ FORBIDDEN_SYMBOL_PARTS = ("evq_hil", "evq_arm", "evq_tr_",
                           # this substring scan binds the whole HIL surface - including the
                           # generic single-token trace labels (P, POP, WR, ...) that a string
                           # scan cannot ban, because they are only emitted from such functions.
-                          "hil_sdl", "sdl_hil", "slt_", "sd_logger_hil", "svc_bench")
+                          "hil_sdl", "sdl_hil", "slt_", "sd_logger_hil", "svc_bench", "recovery_hil")
 # Sprint 1 strings, then the Sprint 2 commands and markers (§2.2). The SDL_*/SLT_*
 # markers are also covered by the prefix ban below; they stay listed so a hit names
 # the marker instead of only the prefix.
@@ -64,7 +64,7 @@ FORBIDDEN_BIN_STRINGS = (b"HIL_FAULT", b"evq_hil", b"fault io", b"power_cut", b"
                          b"SDL_BEGIN", b"SDL_END", b"SDL_FF", b"SDL_FL", b"SDL_STATE", b"SDL_MORE",
                          b"SDL_INVALID", b"SDL_TIMEOUT", b"SDL_B64", b"SDL_DUMP_END", b"SDL_Q",
                          b"SLT_HDR", b"SLT_DRAIN", b"SLT_WM", b"SLT_ERR",
-                         b"bench.begin", b"bench.read", b"bench.end", b"bench.abort")
+                         b"bench.begin", b"bench.read", b"bench.end", b"bench.abort", b"sensors_recovery_hil")
 # Byte prefixes banned ANYWHERE in the release image (naming rule, §2.2 ISO-NAMES).
 # A clean release build at 4ec9cef has no occurrence (checked against the Sprint 1
 # evidence run's build_rel/firmware.bin); if a future production string ever needed
@@ -82,7 +82,8 @@ REQUIRED_HIL_STRINGS = (b"HIL_FAULT", b"slot=", b"sdlog_emit", b"sdlog_inv", b"s
                         b"SDL_MORE", b"SDL_INVALID", b"SDL_TIMEOUT", b"SDL_B64", b"SDL_DUMP_END", b"SDL_Q",
                         b"SLT_HDR", b"SLT_DRAIN", b"SLT_WM", b"SLT_ERR")
 HIL_CONFIG_KEYS = ("AMBYTE_EVQ_HIL", "CONFIG_AMBYTE_EVQ_HIL",
-                   "AMBYTE_SVC_BENCH", "CONFIG_AMBYTE_SVC_BENCH")
+                   "AMBYTE_SVC_BENCH", "CONFIG_AMBYTE_SVC_BENCH",
+                   "AMBYTE_SENSOR_RECOVERY_HIL", "CONFIG_AMBYTE_SENSOR_RECOVERY_HIL")
 # The three new SD writers that must be wrapped in the evq-hil image (§1 W2..W4).
 WRAPPED_OBJECTS = ("sd_logger.c", "ambit_stage.c", "ambit_flash_preflight.c")
 OBJ_SUFFIXES = (".obj", ".o")
@@ -387,7 +388,8 @@ def self_test() -> list[tuple[bool, str]]:
         expect("evq_hil_fopen symbol", check_release(dirty_elf, clean_bin, cfg_off), False)
         expect("HIL_FAULT in bin", check_release(clean_elf, dirty_bin, cfg_off), False)
         expect("AMBYTE_EVQ_HIL true", check_release(clean_elf, clean_bin, cfg_on), False)
-        for key in ("AMBYTE_SVC_BENCH", "CONFIG_AMBYTE_SVC_BENCH"):
+        for key in ("AMBYTE_SVC_BENCH", "CONFIG_AMBYTE_SVC_BENCH",
+                   "AMBYTE_SENSOR_RECOVERY_HIL", "CONFIG_AMBYTE_SENSOR_RECOVERY_HIL"):
             for value in (True, 1, "y", None):
                 dirty_cfg = w("svc-on.json", json.dumps({key: value}))
                 expect(f"{key}={value!r}", check_release(clean_elf, clean_bin, dirty_cfg), False)

@@ -37,7 +37,7 @@ class LightCleanupTest(unittest.TestCase):
         # Lifecycle wiring matters: even idle/between-action stops must clean up
         # before completion allows a replacement schedule to start.
         task = function(runner, "sched_runner_task")
-        self.assertLess(task.index("sched_runner_cleanup_lights();"),
+        self.assertLess(task.index("sched_runner_exit_cleanup();"),
                         task.index("sched_lifecycle_complete("))
         extracted = [function(uart, "uart_sensors_reset_all"),
                      function(commands, "cmd_ambit_actinic")]
@@ -55,6 +55,7 @@ class LightCleanupTest(unittest.TestCase):
             includes += list((ROOT / "components").glob("*/include"))
             sources = list((ROOT / "components/sched_spec").glob("*.c")) + [
                 ROOT / "components/time_sync/time_sync.c",
+                ROOT / "components/sensor_inventory/sensor_inventory.c",
                 ROOT / "components/uart_stream/uart_stream_support.c"]
             subprocess.run([
                 os.environ.get("CC", shutil.which("clang") or "cc"),
