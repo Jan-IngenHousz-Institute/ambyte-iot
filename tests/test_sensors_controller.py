@@ -1,4 +1,5 @@
 """Whole controller, trace, announcement tracker and NVS adapter against A3 bytes."""
+import hashlib
 import os
 import json
 from pathlib import Path
@@ -7,7 +8,13 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = "6a57c2ae155597a81dc1b0a010824c7e9336f0a7"
+# Exact A3 candidate sources; provenance is recorded beside these fixtures.
+# The candidate was squash-merged, so its original commit is absent in CI.
+A3_REFERENCE = ROOT / "tests/fixtures/sensors/a3_6a57c2a"
+A3_SHA256 = {
+    "device_commands.c": "0b6d99b90a7d24f672d3e37190358d3c0d66d4e57036486e7408c33dd003f8b5",
+    "ambit_trace.c": "8f9c6628c9468d1edc92e37d75a888d0601a4a77a474536e86d2ce8f96ccac5b",
+}
 
 
 class SensorControllerTest(unittest.TestCase):
@@ -42,10 +49,13 @@ class SensorControllerTest(unittest.TestCase):
                 flags = []
                 if reference:
                     flags = ["-DA3_REFERENCE"]
-                    for part, path in (("commands", "components/device_commands/device_commands.c"),
-                                       ("trace", "components/ambit_trace/ambit_trace.c")):
+                    for part, path in (("commands", "device_commands.c"),
+                                       ("trace", "ambit_trace.c")):
                         target = tmp / f"a3-{part}.c"
-                        target.write_bytes(subprocess.check_output(["git", "show", f"{BASE}:{path}"], cwd=ROOT))
+                        source = (A3_REFERENCE / path).read_bytes()
+                        self.assertEqual(hashlib.sha256(source).hexdigest(), A3_SHA256[path],
+                                         f"A3 reference fixture bytes changed: {path}")
+                        target.write_bytes(source)
                     flags.append(f'-DCOMMANDS_SOURCE="{tmp / "a3-commands.c"}"')
                     trace = tmp / "a3-trace.c"
                 binary = tmp / ("baseline" if reference else "candidate")

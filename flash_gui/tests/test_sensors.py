@@ -353,9 +353,12 @@ class SensorClientTest(unittest.TestCase):
         self.assertEqual(app.sensor_details.value, "unavailable")
 
     def test_released_a2_parser_accepts_both_additive_tokens(self):
-        source = subprocess.check_output(["git", "show", "6b86c8e33fc19149f4c5661545143653aa919705:flash_gui/ambyte_serial.py"], cwd=ROOT)
-        path = Path(self.temp.name) / "released.py"
-        path.write_bytes(source)
+        # Exact released bytes, including in a shallow checkout with no A2 ref.
+        # Provenance and the recorded digest live beside the fixture.
+        path = ROOT / "flash_gui/tests/fixtures/released/ambyte_serial_6b86c8e.py"
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),
+                         "eb8c527c4eac21d28cd84e5998e89fff39e5334e4e95fce3903b3d462e2bc0c3",
+                         "Released A2 parser fixture bytes changed")
         spec = importlib.util.spec_from_file_location("flash_gui._released_a2_serial", path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
