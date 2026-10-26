@@ -1,0 +1,20 @@
+[013.199s] Waiting for the board's console (it starts ~20-35 s after boot; the USB port may re-enumerate)...
+[014.201s] Console up on /dev/ttyACM0.
+[014.402s] IDENTITY {"capabilities": ["reboot", "identity", "schedule.status", "schedule.begin", "schedule.abort", "sensors", "schedule.release", "schedule.put", "cfg.get", "svc", "schedule.commit", "cfg.set"], "contract": 1, "fw": "2.10.1-startup-qual.1", "mac": "28:37:2F:FF:E7:04", "schedule": {"script_version": null, "sha256": null, "source": "NONE", "workbook_version_id": null}, "thing_name": "ambyte_28:37:2F:FF:E7:04"}
+[015.349s] RX svc.result: {"applied": false, "built_fw": "2.10.1-startup-qual.1", "kind": "schedule", "offset": 2002, "ok": true, "op": "0000000000000019", "reason": "", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "size": 2002, "state": "staging", "store": "b43fe702a1a0bed2", "version": "pr87-early", "workbook": "11111111-2222-4333-8444-555555555555"}
+[015.349s] Resuming verified schedule at 2002/2002 durable bytes.
+[015.678s] RX schedule.commit: booting
+[015.678s] Device startup is still running; waiting to commit the staged schedule...
+[016.309s] RX schedule.commit: booting
+[016.638s] RX schedule.commit: booting
+[016.958s] RX schedule.commit: booting
+[017.279s] RX schedule.commit: booting
+[017.601s] RX schedule.commit: booting
+[019.173s] RX schedule.commit: {"applied": false, "built_fw": "2.10.1-startup-qual.1", "kind": "schedule", "offset": 2002, "ok": true, "op": "0000000000000019", "reason": "", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "size": 2002, "state": "committing", "store": "b43fe702a1a0bed2", "version": "pr87-early", "workbook": "11111111-2222-4333-8444-555555555555"}
+[019.761s] RX svc.result: {"applied": false, "built_fw": "2.10.1-startup-qual.1", "kind": "schedule", "offset": 2002, "ok": true, "op": "0000000000000019", "reason": "", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "size": 2002, "state": "committing", "store": "b43fe702a1a0bed2", "version": "pr87-early", "workbook": "11111111-2222-4333-8444-555555555555"}
+[022.728s] RX svc.result: {"applied": true, "built_fw": "2.10.1-startup-qual.1", "kind": "schedule", "offset": 2002, "ok": true, "op": "0000000000000019", "reason": "", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "size": 2002, "state": "succeeded", "store": "b43fe702a1a0bed2", "version": "pr87-early", "workbook": "11111111-2222-4333-8444-555555555555"}
+[023.037s] TERMINAL {"applied": true, "built_fw": "2.10.1-startup-qual.1", "kind": "schedule", "offset": 2002, "ok": true, "op": "0000000000000019", "reason": "", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "size": 2002, "state": "succeeded", "store": "b43fe702a1a0bed2", "version": "pr87-early", "workbook": "11111111-2222-4333-8444-555555555555"}
+[023.438s] AFTER IDENTITY {"capabilities": ["reboot", "identity", "schedule.status", "schedule.begin", "schedule.abort", "sensors", "schedule.release", "schedule.put", "cfg.get", "svc", "schedule.commit", "cfg.set"], "contract": 1, "fw": "2.10.1-startup-qual.1", "mac": "28:37:2F:FF:E7:04", "schedule": {"script_version": "pr87-early", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "source": "INSTALLED", "workbook_version_id": "11111111-2222-4333-8444-555555555555"}, "thing_name": "ambyte_28:37:2F:FF:E7:04"}
+[023.438s] AFTER RELEASE {"built_against_fw": "2.10.1-startup-qual.1", "installed_on_fw": "2.10.1-startup-qual.1", "running": true, "script_version": "pr87-early", "sha256": "a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184", "verified": true}
+[023.639s] SCHEDULE STATUS id=urn:jii:schedule:a2-identity-bench version=0.1.0 workbook=11111111-2222-4333-8444-555555555555 name=a2-identity-bench
+[023.642s] PASS install

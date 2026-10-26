@@ -4,7 +4,11 @@
 
 static void lock(svc_engine_t *e) { e->ports.lock(e->ports.context); }
 static void unlock(svc_engine_t *e) { e->ports.unlock(e->ports.context); }
-static bool ready(svc_engine_t *e) { return e->ports.boot_ready && e->ports.boot_ready(e->ports.context); }
+static bool ready(void *context)
+{
+    svc_engine_t *e = context;
+    return e->ports.boot_ready && e->ports.boot_ready(e->ports.context);
+}
 static int64_t now(svc_engine_t *e) { return e->ports.now_ms(e->ports.context); }
 static void reason(svc_record_t *r, const char *text)
 {
@@ -139,7 +143,7 @@ static bool submit(void *context, const svc_record_t *r, const char *password)
 void svc_engine_init(svc_engine_t *e, svc_store_t *store, const svc_engine_ports_t *ports)
 {
     memset(e, 0, sizeof *e); e->ports = *ports;
-    svc_protocol_ports_t protocol = {.sha256 = hash, .submit = submit, .metrics = metrics,
+    svc_protocol_ports_t protocol = {.sha256 = hash, .submit = submit, .boot_ready = ready, .metrics = metrics,
         .wifi_status = status, .context = e,
         .sensors_capture = ports->protocol.sensors_capture ? sensors_capture : NULL,
         .sensors_read = ports->protocol.sensors_read ? sensors_read : NULL,

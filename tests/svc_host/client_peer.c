@@ -18,9 +18,18 @@ static void *pending_arg;
 static uint64_t applied_id;
 static unsigned applies;
 static bool initialized;
+static unsigned boot_checks_remaining;
 static void lock(void *context) { (void)context; assert(!held); held = true; }
 static void unlock(void *context) { (void)context; assert(held); held = false; }
-static bool ready(void *context) { (void)context; return true; }
+static bool ready(void *context)
+{
+    (void)context;
+    if (!boot_checks_remaining) return true;
+    svc_record_t record;
+    if (!svc_store_active(&store, &record) && record.kind == SVC_SCHEDULE && record.offset == record.size)
+        --boot_checks_remaining;
+    return false;
+}
 static int64_t now(void *context)
 {
     (void)context; struct timespec time; assert(!clock_gettime(CLOCK_MONOTONIC, &time));
@@ -77,7 +86,8 @@ static int read_bytes(void *context, void *bytes, size_t capacity, unsigned wait
 }
 int main(int argc, char **argv)
 {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
+    if (argc == 3) boot_checks_remaining = (unsigned)strtoul(argv[2], NULL, 10);
     assert(!svc_store_open(&store, argv[1], UINT64_C(0x0123456789abcdef), free_bytes, NULL));
     svc_engine_ports_t e = {.protocol = {.sha256 = hash}, .lock = lock, .unlock = unlock,
         .boot_ready = ready, .now_ms = now, .submit = submit,

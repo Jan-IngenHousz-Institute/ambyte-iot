@@ -15,7 +15,7 @@ ACTION_LIST = ("svc.version", "svc.bind", "svc.result", "svc.stats", "schedule.b
 STATES = {"staging", "connecting", "committing", "persisting", "succeeded", "failed", "aborted", "uncertain"}
 TERMINAL = {"succeeded", "failed", "aborted", "uncertain"}
 REASONS = {"", "bad_frame", "bad_crc", "line_too_long", "frame_timeout", "session_timeout",
-           "invalid_args", "unsupported", "not_found", "expired", "request_conflict", "busy",
+           "invalid_args", "unsupported", "not_found", "expired", "request_conflict", "busy", "booting",
            "id_exhausted", "no_space", "storage_error", "corrupt_store", "chunk_crc", "offset_conflict",
            "offset_gap", "size_limit", "incomplete", "checksum_mismatch", "compile_failed",
            "activation_unverified", "aborted", "commit_started", "interrupted", "wifi_auth_rejected",

@@ -354,6 +354,11 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
     if (r.kind != SVC_SCHEDULE) { error = "invalid_sequence"; goto done; }
     if (r.state != SVC_STAGING) { error = "invalid_sequence"; goto done; }
     if (r.offset != r.size) { error = "incomplete"; goto done; }
+    /* CLI/service entry precedes AMBIT boot sync and runner startup. Refuse
+     * before the durable committing transition so the same ID/prefix remains
+     * resumable and abortable. Queue/maintenance refusals after admission keep
+     * their existing terminal busy semantics; those are not startup retries. */
+    if (p->ports.boot_ready && !p->ports.boot_ready(p->ports.context)) { error = "booting"; goto done; }
     r.state = SVC_COMMITTING;
     if ((error = svc_store_save(p->store, &r))) goto done;
     error = queue(p, &r, NULL);

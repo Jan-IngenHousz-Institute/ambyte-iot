@@ -647,7 +647,7 @@ Base64 is canonical, padded, without whitespace.
 | --- | --- |
 | `schedule.begin <op> <size> <sha256> <version> <built_fw> <workbook>` | 1..16,384 exact YAML bytes. Persists descriptor/private empty staging before ACK. Reply `op,state,offset`, initially `staging,0`; identical replay returns existing state/offset. Never truncates legacy `.new`. |
 | `p <op> <offset> <chunk_crc> <base64>` | 1..144 decoded bytes; separate eight-hex CRC over decoded bytes. Reply `op,state:"staging",offset` only after data fsync and durable offset update. Full request is exactly 248 bytes. |
-| `schedule.commit <op>` | Complete prefix required. Persists `committing` before queueing; replies with the full result schema below. Hash, compile and declared/header workbook equality are checked before installation. Both absent is a match. Checks actual loaded source/digest/workbook/running plus verified release version/built_fw after activation. |
+| `schedule.commit <op>` | Complete prefix required. While application startup is incomplete, replies `ok:false,reason:"booting"` and leaves the complete prefix in `staging`. Once ready, persists `committing` before queueing; replies with the full result schema below. Hash, compile and declared/header workbook equality are checked before installation. Both absent is a match. Checks actual loaded source/digest/workbook/running plus verified release version/built_fw after activation. |
 | `svc.abort <op>` | Own staging only: durably records `aborted` before private data cleanup. Reply `op,state:"aborted",reason:"aborted"`. Repeated abort reads that record. Cannot cancel admitted commit or another client's work. |
 | `svc.active` | Read-only, no binding required. Returns `active:null` or `active:{op,kind,state}` for the durable nonterminal slot. Uses no ID/result slot and changes no stored bytes. |
 | `svc.result <op>` | Full nonsecret retained descriptor, state and evidence. Never retries the action. |
@@ -682,7 +682,7 @@ does not assert the device is still connected or still runs that program now.
 
 | Existing schedule state | `p` | `schedule.commit` | `svc.abort` |
 | --- | --- | --- | --- |
-| staging | Validate/write/replay | Require complete bytes, admit commit | Persist aborted |
+| staging | Validate/write/replay | Require complete bytes; booting leaves staging, otherwise admit commit | Persist aborted |
 | committing | commit_started | Read same current result | commit_started |
 | succeeded/failed | operation_complete | Read same terminal result | operation_complete |
 | aborted | operation_complete | operation_complete | Read same aborted result |
@@ -690,6 +690,90 @@ does not assert the device is still connected or still runs that program now.
 Wrong action kind on a nonterminal Wi-Fi operation is `invalid_sequence`.
 Matching terminal commit/result reads never start another worker. Unknown IDs
 retain `not_found/expired` semantics rather than masquerading as terminal ones.
+
+### Committing during application startup
+
+The console and service session start before AMBIT boot sync and schedule-runner
+startup finish. The session's `ready` frame confirms framed I/O, not completion
+of application startup. A full upload may therefore reach its last durable byte
+while the application's boot latch is still closed. The engine exposes that
+same monotonic latch to the protocol; the commit check runs under the engine
+mutex **before** saving `committing` or submitting a worker. A `booting` refusal
+changes neither the record nor the bytes and does not start an install timer.
+The existing submit-time readiness guard remains in place for other operations.
+
+On `booting` only, the GUI waits 200 ms and retries `schedule.commit` with the
+same store, operation ID and exact prefix. It logs the startup wait once and
+keeps the original six-minute operation deadline, including discovery and
+upload time. Cancellation during this wait still aborts staging. Expiring the
+wait preserves the journal and prefix for **Retry provisioning**. Queue-full,
+maintenance and other terminal `busy` failures are not retried as startup.
+Reconnecting first reads the retained result: only a verified `staging` record
+can reach this wait again; a pending/terminal commit follows normal readback.
+
+```mermaid
+stateDiagram-v2
+    [*] --> staging: begin and durable chunks
+    staging --> staging: complete prefix + commit before boot complete / booting
+    staging --> aborted: cancel while waiting for startup
+    staging --> committing: complete prefix + boot complete / persist then submit
+    committing --> succeeded: exact activation verified
+    committing --> failed: queue or maintenance refused / busy
+    committing --> uncertain: activation not provable
+```
+
+```mermaid
+sequenceDiagram
+    participant C as GUI service client
+    participant G as USB service
+    participant B as Application startup
+    B->>G: Open console (boot incomplete)
+    C->>G: begin + chunks with one operation ID
+    G-->>C: Complete durable prefix
+    C->>G: schedule.commit same ID
+    G-->>C: booting (record stays staging)
+    C->>C: Log startup wait; sleep within original deadline
+    B->>B: Finish AMBIT sync; start runner; open boot gate
+    C->>G: schedule.commit same ID
+    G->>G: Persist committing; submit worker once
+    G-->>C: Full committing result
+    C->>G: svc.result same ID
+    G-->>C: Verified terminal result
+```
+
+```mermaid
+flowchart TD
+    R[Commit response] --> K{Explicit booting?}
+    K -->|yes| W{Cancelled or deadline reached?}
+    W -->|cancelled| A[Abort owned staging]
+    W -->|deadline| S[Keep intent and prefix for resume]
+    W -->|neither| T[Wait then retry same commit ID]
+    K -->|no| O[Normal result validation; never reinterpret busy]
+    T --> R
+    L[USB response lost] --> D[Reconnect and read retained result]
+    D --> P{Verified staging?}
+    P -->|yes| T
+    P -->|no| O
+```
+
+The startup-wait regression is exercised by the production Python client
+against the production C session/protocol/store/engine in
+`tests/test_svc_python_client.py`, with the boot latch injected at the hardware
+boundary and the installer substituted. `tests/test_svc_engine.py` additionally
+checks repeated early commits, cancellation, session re-entry and one worker
+submission; service-client tests cover deadline, disconnect and terminal-busy
+behavior, and a GUI/procedure test checks waiting through verified activation.
+These are host checks. The [PR #87 physical qualification](bench/startup-commit/README.md)
+additionally records six early-commit `booting` refusals followed by successful
+activation of the same retained 2,002-byte upload, cancellation during startup,
+and restoration of the bench's released firmware and exact original schedule.
+Its [activation capture](images/usb-service/startup-install.png) and
+[cancellation capture](images/usb-service/startup-cancel.png) are rendered from
+the recorded physical responses and timed event logs, with image/source attribution.
+
+Updated clients continue to report terminal `busy` on older firmware that lacks
+this refusal. Updated firmware safely leaves staging intact if an older client
+does not recognize `booting`, but automatic waiting requires the updated GUI.
 
 ## Durable chunk and commit boundaries
 
@@ -829,6 +913,7 @@ abort have the documented nonempty reasons. Every shipped reason is listed:
 | store_changed | Known requested/bound instance differs. Preserve old client evidence; verify current device state. Never replay into the new instance. |
 | not_found, expired, id_exhausted | ID lookup/admission semantics above; expired is unknown, exhausted cannot wrap. |
 | request_conflict, busy | Descriptor differs or another operation/worker owns admission. Read nonsecret kind/state; never take over foreign work. |
+| booting | A complete staged schedule cannot commit until application startup finishes. No commit intent or worker was admitted. Keep the same store/ID/prefix and retry within the original deadline; staging remains abortable. Never infer this from terminal busy. |
 | no_space, storage_error, corrupt_store | Durable boundary was not confirmed. Read retained ID; preserve files, do not clear a store to make room. |
 | chunk_crc, offset_conflict, offset_gap, size_limit, incomplete | Chunk integrity/sequence/bound or missing declared bytes. Resume only from a verified result offset. |
 | checksum_mismatch, compile_failed, workbook_mismatch | Exact digest/YAML/header mismatch rejected before install side effects. |
