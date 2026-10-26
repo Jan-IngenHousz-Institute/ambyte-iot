@@ -416,8 +416,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "script_update(url) id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (%s, %s)",
-                         id ? id : "", url, reboot ? "reboot" : "in-place");
+                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (url_length=%u, %s)",
+                         id ? id : "", (unsigned)strlen(url), reboot ? "reboot" : "in-place");
             }
         } else if (script == NULL || script[0] == '\0') {
             ESP_LOGW(TAG, "script_update id=%s missing 'script'/'url' — ignoring", id ? id : "");

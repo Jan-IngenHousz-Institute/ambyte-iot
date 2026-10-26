@@ -65,9 +65,28 @@ stateDiagram-v2
     BenchRecovery --> Legacy: exact v2.7.0 app and selecting otadata restored
 ```
 
-The Evaluator's real bench transcripts and terminal-style images will be added
-under `docs/images/signed-images/` after hardware qualification. Host results do
-not establish bootstrap, retained-data or device-memory qualification.
+The Evaluator qualified source `05cfd21` on 2026-10-26 with signed candidate
+`af79798e…` (`2.8.0-a5-r1`) and control `0802f602…` (`2.8.0-a5-r2`), under the
+unchanged v2.7.0 release bootloader. The following images render selected real
+console lines; request IDs and the MAC are redacted. Source line numbers and
+digests are retained in the [capture notes](images/signed-images/README.md).
+They document that bench image, before its subsequent main rebase and the
+schedule-URL logging fix; host re-gating does not establish a device run of
+the later binary.
+
+![The signed candidate cannot API-rollback to unsigned v2.7.0; the forced restart lets the existing bootloader fall back](images/signed-images/bootstrap-rollback.png)
+
+![Signature and storage incompatibility refusals followed by the accepted signed control and factory selftest](images/signed-images/admission-control.png)
+
+Both HTTPS and Jobs refused code/manifest tampering, wrong-key and unsigned
+images. Rollback and re-upgrade preserved the store, schedule, configuration
+and certificates. Free internal heap stayed at least46,919 bytes and the
+largest block11,764 bytes; twelve consecutive hardware refusals lost48 bytes
+of heap. The qualification re-took its baseline after a lost temporary capture,
+superseded an earlier bootstrap, and used an approved certificate window for
+the pending-image reset. The twelve hardware cycles supplement the twenty-cycle
+host test. Original inactive-slot 2.5.2 bytes were lost; physical recovery left
+v2.7.0 selected and an unselected bench-signed r2 clone in the other slot.
 
 ## Toolchain and trust
 
@@ -401,11 +420,12 @@ and [DescribeThingGroup parent metadata](https://docs.aws.amazon.com/cli/latest/
 to include direct and inherited group targets. It performs no registry changes.
 
 
-### OTA URL logging
+### Update URL logging
 
-Application OTA/AMBIT request and dispatch logs expose the request ID, channel
-where relevant, and `url_length`; they never print the supplied URL path or
-query. Invalid browse-URL errors and AMBIT flash requests follow the same rule.
+Application OTA/AMBIT and schedule URL request and dispatch logs expose the
+request ID, channel where relevant, and `url_length`; they never print the
+supplied URL path or query. Invalid browse-URL errors and AMBIT flash requests
+follow the same rule.
 Presigned queries can contain temporary credentials. The old unsigned v2.7.0
 bootstrap image predates this redaction: keep its raw bench captures private
 and redact credential-bearing URLs from published evidence.
