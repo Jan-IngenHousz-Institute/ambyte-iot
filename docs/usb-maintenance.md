@@ -1157,6 +1157,14 @@ completely between observations cannot be counted; a changed MAC on the next
 identity confirmation invalidates old blocks before the replacement becomes
 known. No insertion detector is claimed.
 
+Read-only capture on the bench gateway with the schedule running and two Ambits
+attached: `identity`, `uart_status` and `sensors` on the sensors image. Ports 0
+and 2 are `busy` with their retained identity, firmware and calibration digest,
+ports 1 and 3 are `absent`, and the acquisition-recovery counters stay at zero.
+The calibration struct and spectral vectors are elided in the picture.
+
+![identity, uart_status and an abridged sensors snapshot](images/usb-service/sensors-snapshot.png)
+
 ### Full calibration and spectral blocks
 
 Calibration value keys are `raw_base64` (canonical base64 of exactly 140 bytes),
