@@ -1,4 +1,5 @@
 #include "command_router.h"
+#include "command_router_pong.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -42,14 +43,10 @@ static void publish_reply(const char *json)
 
 static void handle_ping(const char *id)
 {
-    char reply[256];
+    char reply[448];
     const long long up_ms = (long long)(esp_timer_get_time() / 1000);
-    snprintf(reply, sizeof(reply),
-             "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld}",
-             id ? id : "",
-             s_cfg.device_id ? s_cfg.device_id : "",
-             s_cfg.firmware_version ? s_cfg.firmware_version : "",
-             up_ms);
+    if (!command_router_pong_json(reply, sizeof reply, id, s_cfg.device_id,
+                                  s_cfg.firmware_version, up_ms)) return;
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);
 }
@@ -278,7 +275,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "ota_update id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ota_update id=%s dispatched (url=%s)", id ? id : "", url);
+                ESP_LOGW(TAG, "ota_update id=%s dispatched (url_length=%u)",
+                         id ? id : "", (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_ota") == 0) {
@@ -309,7 +307,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ambit_ota id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url=%s)", id ? id : "", ch, url);
+                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url_length=%u)",
+                         id ? id : "", ch, (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_probe") == 0) {
@@ -417,8 +416,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "script_update(url) id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (%s, %s)",
-                         id ? id : "", url, reboot ? "reboot" : "in-place");
+                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (url_length=%u, %s)",
+                         id ? id : "", (unsigned)strlen(url), reboot ? "reboot" : "in-place");
             }
         } else if (script == NULL || script[0] == '\0') {
             ESP_LOGW(TAG, "script_update id=%s missing 'script'/'url' — ignoring", id ? id : "");

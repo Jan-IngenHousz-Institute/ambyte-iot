@@ -955,3 +955,37 @@ whether the stored `metadata`/`payload` columns move to the v3 field names is
 an implementation decision of the builder change (documented in
 [components/event_log/include/event_log.h](../components/event_log/include/event_log.h)
 when it lands).
+
+## OTA admission failure details
+
+The existing non-persisted `ota_status` object and Jobs `statusDetails.reason`
+keep their shapes and previous failure strings. Signed-image admission adds:
+`signature_invalid`, `running_manifest_invalid`, `candidate_manifest_invalid`,
+`present_versions_invalid`, `candidate_cannot_read_present`,
+`fallback_cannot_read_written`, and `qualified_fallback_mismatch`.
+A diagnostic persistence failure adds `refusal_persist_failed: <policy reason>`
+for these new failures only; pre-existing failure detail strings are unchanged.
+A failure is reported after the OTA handle is aborted, workload and comms resume,
+and bounded refusal persistence is attempted. It never implies a new boot slot
+or applied-ID latch. Firmware URL query credentials are not diagnostic fields.
+See [Signed images](signed-images.md) for the compatibility rule.
+
+
+### Running-image metadata in pong (A5 additive)
+
+The existing pong `type`, `id`, `device_id`, `fw` and `uptime_ms` fields keep
+their values and encodings. A5 appends:
+
+```json
+{"signed":true,"storage":{"readable":[1],"written":1,"fallback":1}}
+```
+
+These are members of the pong object, not an envelope. `signed` is a boolean
+reporting this running build's signed-app startup/update policy. `storage`
+contains its signed compiled manifest versions, or null if unavailable.
+USB `identity` carries the same two fields. A pre-A5 pong with no `signed`
+field counts as unsigned; a silent device or malformed field is not proof.
+The explicit legacy fleet rollout flag requires a fresh unsigned reply plus
+a published pre-signing asset strictly below the reviewed boundary and its
+GitHub asset digest. Normal fleet deployment requires the pinned signed root.
+This does not change stored events, publisher envelopes or OTA report fields.

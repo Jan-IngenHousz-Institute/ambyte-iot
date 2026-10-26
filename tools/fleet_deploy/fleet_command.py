@@ -25,9 +25,10 @@ import queue
 import sys
 import time
 
-from awscrt import mqtt
-
-import fleet_deploy
+try:
+    import fleet_deploy
+except ImportError:
+    from . import fleet_deploy
 
 READ_ONLY_MODES = ("count", "status")
 WINDOW_KEYS = ("from_id", "to_id", "from_ms", "to_ms")
@@ -95,7 +96,8 @@ def summarise(dev, reply):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ping", "inventory", "replay"])
+    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota"])
+    ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
     ap.add_argument("--devices", default="", help="exact client ids or MACs, comma/space separated; empty = discover")
     ap.add_argument("--window-minutes", type=int, default=1440, help="discovery lookback when --devices is empty")
     ap.add_argument("--mode", default="status", choices=["count", "run", "cancel", "status"])
@@ -112,6 +114,30 @@ def main(argv=None):
     ap.add_argument("--results-json", default=None)
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the payload, publish nothing")
     args = ap.parse_args(argv)
+
+    if args.cmd == "ota":
+        # No discovery and no profile-name trust: resolve STS before publishing.
+        devices = parse_devices(args.devices)
+        if len(devices) != 1 or not args.devices.strip():
+            ap.error("dev-bench OTA requires exactly one explicit --devices target")
+        if not args.url.startswith("https://") or len(args.url) >= 2048:
+            ap.error("OTA URL must be HTTPS and shorter than 2048 characters")
+        if not args.token or len(args.token) >= 72:
+            ap.error("dev-bench OTA needs a unique --token shorter than 72 characters")
+        session = fleet_deploy.boto_session(args.profile, args.region)
+        if session.client("sts").get_caller_identity()["Account"] != "084375565727":
+            ap.error("OTA transport is dev-bench only; production accounts are refused")
+        print(f"dev-bench OTA: target={devices[0]} id={args.token} url_length={len(args.url)}")
+        if args.dry_run:
+            return 0
+        results, error, _ = fleet_deploy.fleet_ota(session, devices, args.token, args.url,
+                                                90, args.wait, 1, 0)
+        report = {"results": results, "error": error}
+        if args.results_json:
+            # No URL or credentials in durable diagnostics.
+            with open(args.results_json, "w") as output:
+                json.dump(report, output, indent=2)
+        return 0 if not error and all(r.get("state") == "success" for r in results.values()) else 1
 
     session = fleet_deploy.boto_session(args.profile, args.region)
     if args.devices.strip():
@@ -131,6 +157,10 @@ def main(argv=None):
         for d in devices:
             print("  ", d)
         return 0
+
+    # Payload building, bench admission checks and mocked transports need no
+    # AWS SDK. Match fleet_deploy's lazy dependency boundary for live MQTT.
+    from awscrt import mqtt
 
     by_identity = fleet_deploy.device_index(devices)
     q = queue.Queue()

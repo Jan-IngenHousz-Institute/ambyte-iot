@@ -55,6 +55,10 @@ inputs:
     description: AMBIT only; permit an explicitly selected prerelease tag
     required: false
     default: "false"
+  legacy-unsigned-rollout:
+    description: OTA only; explicitly permit published pre-signing firmware on unsigned targets
+    required: false
+    default: "false"
   force-reflash:
     description: AMBIT only; reapply an already-current numeric version (explicit devices only)
     required: false
@@ -184,6 +188,7 @@ runs:
 
     - name: Run targeted fleet deploy
       env:
+        GH_TOKEN: ${{ inputs.github-token }}
         KIND: ${{ inputs.kind }}
         REPO: ${{ inputs.repository }}
         TAG: ${{ steps.release.outputs.tag }}
@@ -194,6 +199,7 @@ runs:
         WINDOW_MINUTES: ${{ inputs.discovery-window-minutes }}
         DRY_RUN: ${{ inputs.dry-run }}
         ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
+        LEGACY_UNSIGNED_ROLLOUT: ${{ inputs.legacy-unsigned-rollout }}
         ALLOW_PRERELEASE: ${{ inputs.allow-prerelease }}
         FORCE_REFLASH: ${{ inputs.force-reflash }}
         AMBIT_FINAL_SECONDS: ${{ inputs.ambit-final-seconds }}
@@ -224,6 +230,7 @@ runs:
         case "${KIND}" in
           ota)
             [[ "${ALLOW_DOWNGRADE}" == "true" ]] && ARGS+=(--allow-downgrade)
+            [[ "${LEGACY_UNSIGNED_ROLLOUT}" == "true" ]] && ARGS+=(--legacy-unsigned-rollout)
             python tools/fleet_deploy/fleet_deploy.py "${ARGS[@]}"
             ;;
           schedule)

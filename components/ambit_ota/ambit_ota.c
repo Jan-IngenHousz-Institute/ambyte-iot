@@ -506,15 +506,15 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
     const char *url = r->url;
     const bool  all = (r->channel == AMBIT_OTA_CH_ALL);
     if (all) {
-        ESP_LOGW(TAG, "AMBIT OTA requested: ch=all id=%s url=%s", r->id[0] ? r->id : "(none)", url);
+        ESP_LOGW(TAG, "AMBIT OTA requested: ch=all id=%s url_length=%u",
+                 r->id[0] ? r->id : "(none)", (unsigned)strlen(url));
     } else {
-        ESP_LOGW(TAG, "AMBIT OTA requested: ch=%u id=%s url=%s",
-                 r->channel, r->id[0] ? r->id : "(none)", url);
+        ESP_LOGW(TAG, "AMBIT OTA requested: ch=%u id=%s url_length=%u",
+                 r->channel, r->id[0] ? r->id : "(none)", (unsigned)strlen(url));
     }
 
     if (strstr(url, "/blob/") != NULL || strstr(url, "/tree/") != NULL) {
         ESP_LOGE(TAG, "URL is a GitHub web page (/blob/ or /tree/), not a file:");
-        ESP_LOGE(TAG, "  %s", url);
         ESP_LOGE(TAG, "use a direct .bin — raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>");
         report_detail("failed", r->channel, r->id,
                       "bad_url: use a direct .bin, not a /blob//tree/ web url");
@@ -786,8 +786,8 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         ESP_LOGI(TAG, "ambit_flash id=%s already applied — skipping queued duplicate", r->id);
         return;
     }
-    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s dir=%s id=%s",
-             all ? "all" : "one", dir, r->id[0] ? r->id : "(none)");
+    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s url_length=%u id=%s",
+             all ? "all" : "one", (unsigned)strlen(dir), r->id[0] ? r->id : "(none)");
 
     /* Per-channel outcome, reported after comms resume. */
     enum { FL_SKIP = -1, FL_FAIL = 0, FL_OK = 1, FL_ABSENT = 2, FL_BUSY = 3 };

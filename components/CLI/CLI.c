@@ -1,3 +1,4 @@
+#include "ota_policy.h"
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -1542,6 +1543,7 @@ static int cli_cmd_ota_status(int argc, char **argv)
     if (boot) printf("boot:    %-7s @ 0x%06lx\r\n", boot->label, (unsigned long)boot->address);
     if (next) printf("next:    %-7s @ 0x%06lx  (ota_selftest clone target)\r\n",
                      next->label, (unsigned long)next->address);
+    ota_policy_print(stdout);
     return 0;
 }
 
@@ -1583,6 +1585,12 @@ static int cli_cmd_ota_selftest(int argc, char **argv)
     }
     if ((err = esp_ota_end(h)) != ESP_OK) {
         printf("ota_end (image validate): %s\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    char policy_reason[64];
+    if ((err = ota_image_admit(next, run->size, policy_reason, sizeof policy_reason)) != ESP_OK) {
+        bool saved = ota_refusal_save("ota_selftest", "clone", policy_reason);
+        printf("OTA policy: %s%s\r\n", saved ? "" : "refusal_persist_failed: ", policy_reason);
         return 1;
     }
     if ((err = esp_ota_set_boot_partition(next)) != ESP_OK) {

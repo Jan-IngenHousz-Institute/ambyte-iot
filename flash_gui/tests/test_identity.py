@@ -58,7 +58,7 @@ class Transport:
         if not cmd:
             if self.clock.now >= self.boot:
                 self.pending = [b"ambyte> "]
-        elif cmd == "identity": self.pending = list(self.reply)
+        elif cmd in ("identity", "ota_status"): self.pending = list(self.reply)
         elif cmd == "status": self.pending = [f" - MAC: {MAC}\r\nambyte> ".encode()]
         elif cmd == "cfg get device_name": self.pending = [b"device_name = raw_{MAC}\r\nambyte> "]
         else: raise AssertionError(cmd)
@@ -124,6 +124,26 @@ def test_bad_schema_rejected(transport, field, value):
 def test_malformed_log_line_ignored_before_response(transport):
     con, _ = transport([b'{not json}\r\n{"log":1}\r\n' + wire() + b"\r\r\nambyte> "])
     assert con.identity() == IDENTITY
+
+
+def test_additive_signature_and_storage_identity_and_legacy_default(transport):
+    obj=json.loads(wire())
+    obj.update(signed=True,storage={"readable":[1,2],"written":1,"fallback":1})
+    con,_=transport([json.dumps(obj).encode()+b"\r\nambyte> "])
+    result=con.identity()
+    assert result.signed is True and result.storage==obj["storage"]
+    con,_=transport([wire()+b"\r\nambyte> "])
+    result=con.identity()
+    assert result.signed is False and result.storage is None
+
+
+@pytest.mark.parametrize("fields", [{"signed":1},{"signed":"false"},
+    {"storage":{"readable":[1],"written":2,"fallback":1}},
+    {"storage":{"readable":[True],"written":1,"fallback":1}}])
+def test_bad_additive_firmware_identity_fails_closed(transport,fields):
+    obj=json.loads(wire());obj.update(fields)
+    con,_=transport([json.dumps(obj).encode()+b"\r\nambyte> "])
+    with pytest.raises(ConsoleError):con.identity()
 
 
 def test_probe_keeps_one_descriptor_through_30s_boot_and_uses_json(transport):
@@ -361,3 +381,28 @@ def test_preflight_probe_never_scans_another_board(transport, monkeypatch):
     monkeypatch.setattr(serial_client, "esp_jtag_ports", lambda: ["other-board"])
     assert serial_client.probe_device("bench").mac == MAC
     assert ser.port == "bench" and ser.opens == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_ota_policy_uses_real_serial_parser_split_lines_and_legacy_fallback(transport, legacy):
+    policy = {"schema": 1, "readable": [1], "written": 1, "fallback": 1,
+              "refusal_state": "available", "last_refusal": {
+                  "id": "a5-1", "source": "jobs", "reason": "signature_invalid"}}
+    record = ("policy: " + json.dumps(policy)).encode()
+    old = b"running: ota_0 @ 0x10000 state=VALID\r\r\n"
+    reply = [old, b"ambyte> "] if legacy else [old, record[:42], record[42:] + b"\r\r\nambyte> "]
+    con, ser = transport(reply)
+    assert con.ota_policy() == (None if legacy else policy)
+    assert ser.commands == ["ota_status"]
+
+
+@pytest.mark.parametrize("change", [{"schema": True}, {"readable": [True]},
+    {"written": 2}, {"fallback": 0}, {"refusal_state": "invented"},
+    {"last_refusal": {"id": "a", "source": "jobs"}}])
+def test_malformed_ota_policy_fails_explicitly(transport, change):
+    policy = {"schema": 1, "readable": [1], "written": 1, "fallback": 1,
+              "refusal_state": "available", "last_refusal": {
+                  "id": "a5-1", "source": "jobs", "reason": "signature_invalid"}}
+    policy.update(change)
+    con, _ = transport([("policy: " + json.dumps(policy)).encode() + b"\r\nambyte> "])
+    with pytest.raises(ConsoleError, match="Invalid OTA policy"): con.ota_policy()

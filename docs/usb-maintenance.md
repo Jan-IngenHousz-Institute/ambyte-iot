@@ -215,6 +215,8 @@ Illustrative response, on one physical line:
 | `schedule.workbookVersionId` | Workbook from the loaded program, or null when absent/unavailable. Never an empty string or the human CLI's `-` sentinel. |
 | `schedule.script_version` | Release provenance only when the loaded INSTALLED digest equals the installed-file digest and verified persisted release metadata. Null for embedded programs, stale/missing/incomplete metadata or a file being renamed/unavailable. Not the YAML header `version`. |
 | `capabilities` | Unique implemented v1 tokens below; ordering has no meaning. |
+| `signed` | Additive boolean: running build enforces signed startup/update. Missing on pre-A5 firmware means unsigned. |
+| `storage` | Additive signed manifest object: `readable` sorted unique versions1..31, `written` included in readable, `fallback` version1..31; null/missing means unavailable. |
 
 The snapshot includes source, digest and workbook from one program generation.
 A reload spanning the release-metadata read makes all four schedule fields
@@ -1572,3 +1574,28 @@ not a simulation of the bench USB traffic. Physical qualification includes
 the matching image without this guard. The guard must prevent resets and the
 unguarded control must reproduce the failure. The sensors watchdog checks
 add plain `sensors` before both service traffic variants in the same boot.
+
+## OTA image policy diagnostics
+
+The existing `ota_status` slot lines are retained. Signed images add one `policy: {JSON}` line: schema1, readable storage versions, written version, qualified fallback written version, refusal_state (`available`, `missing`, `corrupt`, `unavailable`) and last_refusal (`id`, `source`, `reason`, or null). Missing/invalid running metadata uses null versions. This read is diagnostic only; it never confirms an image. Older images have no policy line. The GUI parses this optional line and retains its legacy path. See [Signed images](signed-images.md) for format bytes, trust, new refusals and recovery.
+
+Illustrative request and additive response (the existing slot lines also remain):
+
+```text
+ota_status
+policy: {"schema":1,"readable":[1],"written":1,"fallback":1,"refusal_state":"available","last_refusal":{"id":"a5-trial","source":"https","reason":"signature_invalid"}}
+```
+
+Sources are `https`, `jobs`, `clone` or test-only `hil`. A missing record returns
+`refusal_state:"missing",last_refusal:null`; an unreadable or corrupt record uses
+`unavailable` or `corrupt` with null. Values describe historical refusal evidence,
+not the current update's success. Existing discovery/service capabilities stay
+unchanged; A5 adds no local image-upload action.
+
+
+A5 adds `"signed":true,"storage":{"readable":[1],"written":1,"fallback":1}`
+to `identity`; all earlier fields and capabilities retain their values.
+flash_gui accepts old responses without these fields (unsigned/unavailable),
+validates new booleans and version lists, and refuses malformed metadata. Pong
+carries the same additions for fleet rollout filtering. See
+[Signed images](signed-images.md#legacy-unsigned-fleet-recovery-during-cutover).

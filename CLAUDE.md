@@ -9,7 +9,7 @@ holds bench boards.
 ## Commands
 
 - Build: `pio run -e esp32-s3-devkitm-1` (ESP-IDF 5.5 via PlatformIO)
-- Flash without touching device NVS/identity: `AMBYTE_NVS_SKIP=1 pio run -e esp32-s3-devkitm-1 -t upload`
+- Physical development-bench flash (public bench root, preserves NVS): `python3 tools/bench_flash.py --env esp32-s3-devkitm-1 --port /dev/ttyACM0`. For field signing, OTA bootstrap and recovery read `docs/signed-images.md`; a normal build is an unsigned intermediate and the upload guard refuses it.
 - Bench diagnostics build: `pio run -e bench` (+ `bench-spiram-internal`, `bench-wifi-ps-none`,
   `bench-pm-none` single-toggle bisect envs) — see `docs/bench/RUNBOOK.md`
 - If littlefs is missing at CMake: `git submodule update --init --recursive components/littlefs`

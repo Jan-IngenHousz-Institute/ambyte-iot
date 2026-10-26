@@ -277,7 +277,7 @@ def device_from_status_topic(topic):
 
 # -- fleet operations (single connection, subscribe-before-publish) ----------
 
-def fleet_ping(session, devices, wait_seconds):
+def fleet_ping(session, devices, wait_seconds, *, include_metadata=False):
     """-> {clientId: fw_string_or_None}; devices absent = silent."""
     from awscrt import mqtt
 
@@ -313,7 +313,13 @@ def fleet_ping(session, devices, wait_seconds):
                 continue
             dev = requested_device_from_status_topic(topic, devices_by_identity)
             if dev is not None and dev not in alive:
-                alive[dev] = data.get("fw")
+                if include_metadata:
+                    signed = data.get("signed", False)
+                    alive[dev] = {"fw":data.get("fw"),
+                                  "signed":signed if type(signed) is bool else None,
+                                  "storage":data.get("storage")}
+                else:
+                    alive[dev] = data.get("fw")
                 print(f"  pong  {dev}  fw={data.get('fw')}")
     finally:
         conn.disconnect().result()
@@ -427,17 +433,74 @@ def fleet_ota(session, devices, campaign_id, url,
 # -- release asset ------------------------------------------------------------
 
 def verify_firmware_url(url):
-    """Fetch the first bytes and require the ESP32 app-image magic (0xE9).
-    Catches the classic /blob/-URL-serves-HTML failure before the fleet does."""
-    req = urllib.request.Request(url, headers={"Range": "bytes=0-15",
-                                               "User-Agent": "ambyte-fleet-deploy"})
+    """Authenticate the complete release before broadcasting an OTA command.
+
+    Unsigned fleet units cannot protect their own first install. A public
+    bench root here would permanently enroll them into an openly signable
+    trust chain, so transport checks the reviewed root as well as the header.
+    Bench negatives use the separate, dev-only, single-target helper.
+    """
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.check_release_signing import check_release, load_boundary, load_pin
+    from flash_gui.firmware_metadata import MAX_SIGNED_BYTES
+    pin = load_pin()
+    load_boundary()
+    if not url.startswith("https://") or len(url) >= 2048:
+        raise RuntimeError("firmware delivery needs an HTTPS URL shorter than 2048 characters")
+    req = urllib.request.Request(url, headers={"User-Agent": "ambyte-fleet-deploy"})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        head = resp.read(16)
-    if not head or head[0] != 0xE9:
-        raise RuntimeError(
-            f"{url} does not serve an ESP32 app image (first byte "
-            f"{head[:1].hex() or 'none'}, expected e9); use the "
-            "releases/download/<tag>/firmware.bin asset link")
+        data = resp.read(MAX_SIGNED_BYTES)
+    check_release(data, pin)
+
+
+def verify_legacy_release(repo, tag, url):
+    """Only the official published pre-signing asset, with GitHub's digest.
+
+    This opt-in is for still-unsigned units during cutover. A configured root
+    and reviewed boundary are required even though this artifact is unsigned.
+    """
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.check_release_signing import load_boundary, load_pin
+    from flash_gui.firmware_metadata import MAX_SIGNED_BYTES, inspect_image
+    load_pin()
+    boundary = parse_version(load_boundary())
+    official = "Jan-IngenHousz-Institute/ambyte-iot"
+    if repo.casefold() != official.casefold() or not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
+        raise RuntimeError("legacy rollout requires an exact official published firmware tag")
+    if cmp_version(parse_version(tag), boundary) >= 0:
+        raise RuntimeError("legacy tag must be strictly below the first signed release boundary")
+    expected = f"https://github.com/{repo}/releases/download/{tag}/firmware.bin"
+    if url != expected:
+        raise RuntimeError("legacy rollout refuses arbitrary URLs; use the published tag's firmware.bin")
+    headers = {"User-Agent":"ambyte-fleet-deploy", "Accept":"application/vnd.github+json"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/tags/{tag}", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        release = json.load(response)
+    if release.get("tag_name") != tag or release.get("draft") is not False or not release.get("published_at"):
+        raise RuntimeError("legacy release is unpublished or does not match the requested tag")
+    assets = [a for a in release.get("assets", []) if a.get("name") == "firmware.bin"]
+    if (len(assets) != 1 or assets[0].get("browser_download_url") != expected or
+            not re.fullmatch(r"sha256:[0-9a-f]{64}", assets[0].get("digest") or "")):
+        raise RuntimeError("published firmware asset needs an unambiguous GitHub SHA256 digest")
+    with urllib.request.urlopen(urllib.request.Request(expected, headers={"User-Agent":"ambyte-fleet-deploy"}), timeout=30) as response:
+        data = response.read(MAX_SIGNED_BYTES + 1)
+    if len(data) >= MAX_SIGNED_BYTES or "sha256:" + hashlib.sha256(data).hexdigest() != assets[0]["digest"]:
+        raise RuntimeError("legacy asset digest mismatch or oversized image")
+    info = inspect_image(data)
+    if info.signature_present or info.storage is not None:
+        raise RuntimeError("legacy rollout requires an unsigned pre-manifest application")
+    return {"tag":tag,"sha256":hashlib.sha256(data).hexdigest(),"boundary":load_boundary()}
+
+
+def require_unsigned_targets(devices, reports):
+    refused = [d for d in devices if reports.get(d, {}).get("signed") is not False]
+    if refused:
+        raise RuntimeError("legacy rollout refuses signed, silent or malformed targets: " + ", ".join(refused))
 
 
 # -- reporting ----------------------------------------------------------------
@@ -580,6 +643,8 @@ def main():
                     help="also command devices whose reported fw is NEWER "
                          "than the release (skipped by default: the firmware "
                          "applies any image it is given)")
+    ap.add_argument("--legacy-unsigned-rollout", action="store_true",
+                    help="explicit cutover path: published pre-signing release to freshly proven unsigned units only")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan, publish nothing")
     ap.add_argument("--results-json", default=None)
@@ -628,7 +693,8 @@ def main():
     # 2) versions via fleet ping (also a liveness check)
     print(f"Pinging {len(universe)} device(s) "
           f"(up to {args.ping_wait}s) ...")
-    fw_map = fleet_ping(session, universe, args.ping_wait)
+    reports = fleet_ping(session, universe, args.ping_wait, include_metadata=True) if args.legacy_unsigned_rollout else {}
+    fw_map = {d:r.get("fw") for d,r in reports.items()} if args.legacy_unsigned_rollout else fleet_ping(session, universe, args.ping_wait)
     silent = [d for d in universe if d not in fw_map]
 
     # 3) version predicate. With 'any', silent devices stay in: the publish
@@ -684,6 +750,7 @@ def main():
         print(f"    {d}  fw={fw_map.get(d) or 'silent'}")
 
     plan = {
+        "legacy_unsigned_rollout":args.legacy_unsigned_rollout,
         "tag": args.tag, "campaign_id": campaign_id, "url": url,
         "version_op": args.version_op, "version": args.version,
         "percentage": args.percentage, "dry_run": args.dry_run,
@@ -701,10 +768,15 @@ def main():
     }
 
     failed = []
+    if args.legacy_unsigned_rollout:
+        print("\nLEGACY UNSIGNED ROLLOUT: published pre-signing firmware; freshly unsigned targets only.")
+        require_unsigned_targets(to_deploy, reports)
+        plan["legacy_asset"] = verify_legacy_release(args.repo, args.tag, url)
     if args.dry_run:
         print("\nDRY RUN: nothing published.")
     elif to_deploy:
-        verify_firmware_url(url)
+        if not args.legacy_unsigned_rollout:
+            verify_firmware_url(url)
         print(f"\nDeploying to {len(to_deploy)} device(s) ...")
         results, error, final_deadline = fleet_ota(
             session, to_deploy, campaign_id, url,
@@ -744,6 +816,7 @@ def main():
         with open(args.results_json, "w", encoding="utf-8") as f:
             json.dump(plan, f, indent=2, sort_keys=True)
     lines = [
+        "**LEGACY UNSIGNED ROLLOUT: published pre-signing firmware to freshly unsigned targets only.**" if args.legacy_unsigned_rollout else "Pinned signed firmware rollout.",
         f"## Fleet deploy: {args.tag} "
         f"({'dry run' if args.dry_run else 'live'})",
         "",

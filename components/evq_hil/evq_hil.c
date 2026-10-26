@@ -1,3 +1,4 @@
+#include "ota_policy.h"
 /* `evq_hil` — on-device SD-overflow verification controls
  * (CONFIG_AMBYTE_EVQ_HIL only; docs/evq-sd-overflow-hil-contract.md).
  *
@@ -450,7 +451,13 @@ static int evq_hil_cmd(int argc, char **argv)
                                    : ESP_PARTITION_SUBTYPE_ANY;
         if (st == ESP_PARTITION_SUBTYPE_ANY) { usage(); return 1; }
         const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_APP, st, NULL);
-        esp_err_t e = p ? esp_ota_set_boot_partition(p) : ESP_ERR_NOT_FOUND;
+        char policy_reason[64];
+        esp_err_t e = p ? ota_image_admit(p, p->size, policy_reason, sizeof policy_reason) : ESP_ERR_NOT_FOUND;
+        if (e == ESP_OK) e = esp_ota_set_boot_partition(p);
+        else if (p) {
+            bool saved = ota_refusal_save("boot_slot", "hil", policy_reason);
+            printf("HIL_ERR policy %s%s\n", saved ? "" : "refusal_persist_failed: ", policy_reason);
+        }
         printf("HIL_%s boot_slot %s %s\n", e == ESP_OK ? "OK" : "ERR", argv[2], esp_err_to_name(e));
         return e == ESP_OK ? 0 : 1;
     }

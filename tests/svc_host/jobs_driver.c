@@ -149,3 +149,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "JOBS_OK queue_untouched=1 retry_us=600000000 reports_during_valid_trial=0 timers=%u\n", timer_arms);
     return 0;
 }
+
+/* This admission-only legacy test never executes download/policy. */
+esp_err_t ota_image_admit(const esp_partition_t *p, size_t n, char *s, size_t c)
+{ (void)p; (void)n; (void)s; (void)c; abort(); }
+bool ota_refusal_save(const char *id, const char *source, const char *reason)
+{ (void)id; (void)source; (void)reason; abort(); }
