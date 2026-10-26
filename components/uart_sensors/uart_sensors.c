@@ -104,12 +104,63 @@ static int64_t s_ping_fail_cache_not_before_us;
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
 static inline int64_t now_us(void) { return esp_timer_get_time(); }
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+static uart_recovery_hil_trace_t s_recovery_hil_trace;
+static int64_t s_recovery_hil_started;
+static portMUX_TYPE s_recovery_hil_mux = portMUX_INITIALIZER_UNLOCKED;
+static void recovery_trace_begin(uint8_t ch, uint64_t epoch)
+{
+    int64_t began=now_us();
+    taskENTER_CRITICAL(&s_recovery_hil_mux);
+    memset(&s_recovery_hil_trace,0,sizeof s_recovery_hil_trace);
+    s_recovery_hil_trace.channel=ch;s_recovery_hil_trace.epoch=epoch;s_recovery_hil_started=began;
+    taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_phase(uint8_t phase)
+{
+    taskENTER_CRITICAL(&s_recovery_hil_mux);s_recovery_hil_trace.phase=phase;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_byte(uint8_t byte)
+{
+    uint32_t elapsed=(uint32_t)(now_us()-s_recovery_hil_started);
+    taskENTER_CRITICAL(&s_recovery_hil_mux);
+    unsigned phase=s_recovery_hil_trace.phase;
+    uint32_t count=s_recovery_hil_trace.count[phase];
+    if(!count) s_recovery_hil_trace.first_us[phase]=elapsed;
+    s_recovery_hil_trace.last_us[phase]=elapsed;
+    if(count<UART_RECOVERY_HIL_BYTES) s_recovery_hil_trace.bytes[phase][count]=byte;
+    if(count!=UINT32_MAX) ++s_recovery_hil_trace.count[phase];
+    taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_notice(void)
+{
+    taskENTER_CRITICAL(&s_recovery_hil_mux);++s_recovery_hil_trace.prime_notices;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+static void recovery_trace_end(void)
+{
+    uint32_t elapsed=(uint32_t)(now_us()-s_recovery_hil_started);
+    taskENTER_CRITICAL(&s_recovery_hil_mux);s_recovery_hil_trace.elapsed_us=elapsed;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+}
+bool uart_sensors_recovery_hil_trace(uart_recovery_hil_trace_t *out)
+{
+    if(!out) return false;
+    taskENTER_CRITICAL(&s_recovery_hil_mux);*out=s_recovery_hil_trace;taskEXIT_CRITICAL(&s_recovery_hil_mux);
+    return out->epoch!=0;
+}
+#else
+#define recovery_trace_begin(ch,epoch) ((void)0)
+#define recovery_trace_phase(phase) ((void)0)
+#define recovery_trace_byte(byte) ((void)0)
+#define recovery_trace_end() ((void)0)
+#define recovery_trace_notice() ((void)0)
+#endif
 
 /* CHIP_EN is shared, so every reset invalidates every channel. Keeping the
  * volatile state transition next to the physical reset prevents a stale
  * connected/absent decision from surviving a ROM probe, OTA exit, or host boot. */
 static void ambit_note_shared_app_reset(void)
 {
+    sensor_inventory_reset();
     s_ping_fail_cache_not_before_us = now_us() + AMBIT_APP_BOOT_GRACE_US;
     for (uint8_t channel = 0; channel < UART_SENSOR_NUM_CHANNELS; channel++) {
         s_ch[channel].state = UART_SENSOR_DISCONNECTED;
@@ -230,7 +281,9 @@ static void stream_lock_give(void *lock, void *ctx)
  * not spend that timeout once on the channel mutex and again on shared UART0.
  * The production helper recomputes remaining ticks before each take and rolls
  * the channel mutex back if the shared-bus take cannot finish in time. */
-static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
+static unsigned recovery_drain(uart_port_t port, uint8_t channel);
+static esp_err_t channel_acquire_until_state_mode(uint8_t ch, int64_t deadline_us,
+    uart_sensor_state_t *previous, bool recovery)
 {
     void *shared_lock = s_ch[ch].shared ? (void *)s_uart0_mtx : NULL;
     if (!uart_stream_acquire_until((void *)s_ch_mtx[ch], shared_lock,
@@ -240,15 +293,21 @@ static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
         return ESP_ERR_TIMEOUT;
     }
     if (s_ch[ch].shared) {
-        uart_flush_input(UART_NUM_0);
+        if (recovery) (void)recovery_drain(UART_NUM_0, ch);
+        else uart_flush_input(UART_NUM_0);
         uart_set_pin(UART_NUM_0, s_ch[ch].tx_pin, s_ch[ch].rx_pin,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-        ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
+        if (!recovery) ESP_LOGD(TAG, "UART0 remapped to ch%u (TX=%d RX=%d)",
                  ch, s_ch[ch].tx_pin, s_ch[ch].rx_pin);
     }
+    if (previous) *previous = s_ch[ch].state;
     s_ch[ch].state = UART_SENSOR_BUSY;
     return ESP_OK;
 }
+static esp_err_t channel_acquire_until_state(uint8_t ch, int64_t deadline_us, uart_sensor_state_t *previous)
+{ return channel_acquire_until_state_mode(ch, deadline_us, previous, false); }
+static esp_err_t channel_acquire_until(uint8_t ch, int64_t deadline_us)
+{ return channel_acquire_until_state(ch, deadline_us, NULL); }
 
 /* ── AMBIT ROM-flash: reset/boot sequencer ──────────────────────────────
  * See the AMBIT_RESET_GPIO block above. Forces one AMBIT into the ESP32-C3
@@ -302,13 +361,19 @@ esp_err_t uart_sensors_flash_session_begin(uint8_t ch, uint32_t wait_ms)
     if (!s_inited)                      return ESP_ERR_INVALID_STATE;
     if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
     /* Owns the shared bus + remaps UART0 to `ch` for the whole flash session. */
-    return channel_acquire(ch, pdMS_TO_TICKS(wait_ms));
+    sensor_inventory_veto_begin();
+    esp_err_t result = channel_acquire(ch, pdMS_TO_TICKS(wait_ms));
+    if (result != ESP_OK) sensor_inventory_veto_end();
+    return result;
 }
 
 void uart_sensors_flash_session_end(uint8_t ch)
 {
     if (ch >= UART_SENSOR_NUM_CHANNELS) return;
+    int64_t remaining = s_ping_fail_cache_not_before_us - now_us();
+    if (remaining > 0) vTaskDelay(pdMS_TO_TICKS((uint32_t)((remaining + 999) / 1000)));
     channel_release(ch);   /* leaves the channel DISCONNECTED → re-pinged later */
+    sensor_inventory_veto_end();
 }
 
 esp_err_t uart_sensors_enter_download(uint8_t ch)
@@ -321,6 +386,7 @@ esp_err_t uart_sensors_enter_download(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 0);                 /* assert reset  */
     vTaskDelay(pdMS_TO_TICKS(AMBIT_EN_LOW_HOLD_MS));     /* discharge cap */
     gpio_set_level(AMBIT_RESET_GPIO, 1);                 /* release; RC ramp */
+    ambit_note_shared_app_reset();
     vTaskDelay(pdMS_TO_TICKS(AMBIT_BOOT_HOLD_MS));       /* hold strap across the rise */
     gpio_set_level(s_ch[ch].boot_pin, 1);               /* release strap */
     uart_flush_input(UART_NUM_0);                        /* drop reset-time line noise */
@@ -331,6 +397,7 @@ esp_err_t uart_sensors_enter_download(uint8_t ch)
 esp_err_t uart_sensors_run_app(uint8_t ch)
 {
     if (ch >= UART_SENSOR_NUM_CHANNELS) return ESP_ERR_INVALID_ARG;
+    sensor_inventory_veto_begin();
     for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; i++) {
         gpio_set_level(s_ch[i].boot_pin, 1);   /* all straps released → normal boot */
     }
@@ -339,12 +406,15 @@ esp_err_t uart_sensors_run_app(uint8_t ch)
     gpio_set_level(AMBIT_RESET_GPIO, 1);
     ambit_note_shared_app_reset();
     ESP_LOGI(TAG, "ch%u: AMBIT reset to run application", ch);
+    vTaskDelay(pdMS_TO_TICKS(AMBIT_APP_BOOT_GRACE_US / 1000));
+    sensor_inventory_veto_end();
     return ESP_OK;
 }
 
 esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
+    sensor_inventory_veto_begin();
     const int64_t deadline = now_us() + (int64_t)wait_ms * 1000;
     uint8_t held = 0;
     for (; held < UART_SENSOR_NUM_CHANNELS; held++) {
@@ -358,24 +428,25 @@ esp_err_t uart_sensors_reset_all(uint32_t wait_ms)
          * so owning all four excludes transactions on UART0/1/2 without a
          * second shared-bus lock. Never reset while another channel is busy. */
         err = uart_sensors_run_app(0);
-        if (err == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(AMBIT_APP_BOOT_GRACE_US / 1000));
-        }
+
     }
     while (held > 0) xSemaphoreGive(s_ch_mtx[--held]);
+    sensor_inventory_veto_end();
     return err;
 }
 
 /* ── Ambit wake sequence ───────────────────────────────────────────── */
 
-static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
+static esp_err_t ambit_wake_counted(uart_port_t port, int64_t deadline, uint8_t channel, void (*started)(uint8_t), bool *transmitted)
 {
     uart_flush_input(port);
 
     for (int attempt = 0; attempt < WAKE_RETRIES && !deadline_reached(deadline); attempt++) {
         /* Send 3 wake bytes (ambit light-sleep UART threshold = 3 edges) */
         uint8_t wake3[3] = { AMBIT_WAKE, AMBIT_WAKE, AMBIT_WAKE };
-        uart_write_bytes(port, (const char *)wake3, sizeof(wake3));
+        int sent = uart_write_bytes(port, (const char *)wake3, sizeof(wake3));
+        if (sent > 0 && transmitted) *transmitted = true;
+        if (sent > 0 && started) { started(channel); started = NULL; }
 
         int64_t retry_deadline = now_us() + (int64_t)WAKE_RETRY_MS * 1000;
         if (retry_deadline > deadline) {
@@ -407,6 +478,9 @@ static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
     }
     return ESP_ERR_TIMEOUT;
 }
+
+static esp_err_t ambit_wake(uart_port_t port, int64_t deadline)
+{ return ambit_wake_counted(port, deadline, 0, NULL, NULL); }
 
 /* ── Send command (header + 8-byte cmd + optional extra) ───────────── */
 
@@ -639,6 +713,182 @@ static esp_err_t receive_raw_response(uart_port_t port,
 
 /* ── Public: full query (wake → cmd → response) ───────────────────── */
 
+sensor_read_result_t uart_sensors_inspect(uint8_t channel, uint8_t type, void *out,
+    size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t))
+{
+    if (got) *got = 0;
+    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || !got ||
+        (type != 0 && type != 1 && type != 2 && type != 4) ||
+        size != (type == 0 ? 0u : type == 1 ? 140u : type == 2 ? 48u : 132u) ||
+        (size && !out) || timeout_ms > SENSOR_BLOCK_MS) return SENSOR_READ_FAILED;
+    const int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+    uart_sensor_state_t previous_state;
+    if (channel_acquire_until_state(channel, deadline, &previous_state) != ESP_OK) return SENSOR_READ_FAILED;
+    /* Absence needs a real listening window after lock admission, never a
+     * nearly exhausted mutex budget or a leaf still in reset boot grace. */
+    bool presence_window = deadline - now_us() >= 500000 && now_us() >= s_ping_fail_cache_not_before_us;
+    uart_port_t port = s_ch[channel].uart_num;
+    sensor_read_result_t result = SENSOR_READ_FAILED;
+    /* Count at the wire boundary. Ordinary query/ping/OTA traffic does not
+     * pass this callback; acquiring a lock alone is not a wire transaction. */
+    if (now_us() < s_ping_fail_cache_not_before_us) goto done;
+    bool transmitted = false;
+    if (ambit_wake_counted(port, deadline, channel, started, &transmitted) != ESP_OK) {
+        result = type == 0 && presence_window && transmitted ? SENSOR_READ_ABSENT : SENSOR_READ_FAILED;
+        goto done;
+    }
+    if (!type) { result = SENSOR_READ_OK; goto done; }
+    uint8_t cmd[8] = {33, type};
+    if (deadline_reached(deadline) || ambit_send_cmd(port, cmd, NULL, 0) != ESP_OK) goto done;
+    uint8_t marker;
+    if (uart_read_exact(port, &marker, 1, deadline) != ESP_OK) goto done;
+    if (marker == AMBIT_CMD_END) { result = SENSOR_READ_UNSUPPORTED; goto done; }
+    if (marker != AMBIT_CMD_DONE || uart_read_exact(port, out, size, deadline) != ESP_OK) goto done;
+    /* Unlike the frozen legacy path, no scanning past extra bytes to find a
+     * plausible END: an oversized/truncated block cannot become calibration. */
+    if (uart_read_exact(port, &marker, 1, deadline) != ESP_OK || marker != AMBIT_CMD_END) goto done;
+    *got = size; result = SENSOR_READ_OK;
+done:
+    uart_flush_input(port);
+    /* Diagnostic failure never turns driver DISCONNECTED into attachment
+     * evidence. The inventory owns presence and acquisition provenance. */
+    s_ch[channel].state = previous_state;
+    channel_release(channel);
+    return result;
+}
+
+static unsigned recovery_drain(uart_port_t port, uint8_t channel)
+{
+    unsigned count = 0;
+    uint8_t byte;
+    while (count < UART_RX_BUF_SIZE && uart_read_bytes(port, &byte, 1, 0) == 1) { recovery_trace_byte(byte);++count; }
+    uart_flush_input(port);
+    if (count) sensor_inventory_recovery_discard(channel, count);
+    return count;
+}
+
+/* Only the two captured idle text notices extend priming; proof windows
+ * never call this recognizer. A partial wake can enter the leaf's text router,
+ * which prints BAD COMMAND before a fresh AA re-selects binary mode. This
+ * normalizes the100ms prime only; both later proof exchanges stay mandatory. */
+static const uint8_t recovery_prime_notice[] = "BAD COMMAND\r\n";
+static bool recovery_prime_byte(unsigned position, uint8_t first, uint8_t byte, bool *notice)
+{
+    if (!position) return byte == AMBIT_BOOT_IDLE || byte == AMBIT_ACK;
+    if (first != AMBIT_BOOT_IDLE) return false;
+    if (position == 1) {
+        *notice = byte == recovery_prime_notice[0];
+        return *notice || byte == AMBIT_ACK;
+    }
+    if (!*notice) return false;
+    if (position < sizeof recovery_prime_notice) return byte == recovery_prime_notice[position-1];
+    return position == sizeof recovery_prime_notice && byte == AMBIT_ACK;
+}
+
+static bool recovery_exchange(uart_port_t port, uint8_t channel, uint64_t epoch,
+    bool poll, bool prime, int64_t *opened, int64_t latest_tx,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t), bool *timing_refused)
+{
+    *opened = now_us();
+    const int64_t until = *opened + (prime ? SENSOR_RECOVERY_PRIME_MS : SENSOR_RECOVERY_WINDOW_MS) * 1000LL;
+    if (!current(channel, epoch)) return false;
+    if (latest_tx && now_us() > latest_tx) { *timing_refused = true; return false; }
+    const uint8_t wake[3] = {AMBIT_WAKE, AMBIT_WAKE, AMBIT_WAKE};
+    int sent = uart_write_bytes(port, wake, sizeof wake);
+    if (sent > 0) started(channel);
+    if (latest_tx && now_us() > latest_tx) { *timing_refused = true; return false; }
+    if (sent != sizeof wake) return false;
+    unsigned received = 0;
+    uint8_t first = 0;
+    bool clean = true, notice = false;
+    while (!deadline_reached(until)) {
+        if (!current(channel, epoch)) return false;
+        uint32_t ticks = uart_stream_capped_deadline_ticks(now_us(), until, WAKE_READ_MS, portTICK_PERIOD_MS);
+        if (!ticks) break;
+        uint8_t byte;
+        if (uart_read_bytes(port, &byte, 1, (TickType_t)ticks) != 1) continue;
+        recovery_trace_byte(byte);
+        if (!current(channel, epoch)) { sensor_inventory_recovery_discard(channel, 1); return false; }
+        bool expected = prime ? recovery_prime_byte(received, first, byte, &notice) :
+            received == 0 ? byte == AMBIT_ACK :
+            poll && received == 1 ? byte == AMBIT_CMD_DONE :
+            poll && received == 2 ? byte <= 2 :
+            poll && received == 3 ? byte == AMBIT_CMD_END : false;
+        if (!expected || (prime && notice && received < sizeof recovery_prime_notice))
+            sensor_inventory_recovery_discard(channel, 1);
+        if (prime && byte == AMBIT_BOOT_IDLE) sensor_inventory_recovery_boot_idle(channel);
+        clean &= expected;
+        if (!received) first = byte;
+        if (!received && expected && poll) {
+            const uint8_t cmd[8] = {23}, header = AMBIT_CMD_HEADER;
+            if (uart_write_bytes(port, &header, 1) != 1 || uart_write_bytes(port, cmd, sizeof cmd) != sizeof cmd) clean = false;
+        }
+        ++received;
+        /* Full windows reject extra80/trailingA1 even after a valid prefix. */
+    }
+    bool complete = prime ? (!notice ? received == 1 || received == 2 :
+        received == sizeof recovery_prime_notice || received == sizeof recovery_prime_notice+1) :
+        received == (poll ? 4u : 1u);
+    bool ok = clean && complete && current(channel, epoch);
+    if (ok && prime && notice) {
+        sensor_inventory_recovery_prime_notice(channel);
+        recovery_trace_notice();
+    }
+    return ok;
+}
+
+sensor_recovery_result_t uart_sensors_recover(uint8_t channel, uint64_t epoch, bool poll, uint32_t timeout_ms,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t))
+{
+    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS || !epoch || !current || !started ||
+        timeout_ms > SENSOR_BLOCK_MS) return SENSOR_RECOVERY_REFUSED;
+    recovery_trace_begin(channel,epoch);
+    const int64_t deadline = now_us() + timeout_ms * 1000LL;
+    uart_sensor_state_t previous;
+    if (channel_acquire_until_state_mode(channel, deadline, &previous, true) != ESP_OK) return SENSOR_RECOVERY_REFUSED;
+    uart_port_t port = s_ch[channel].uart_num;
+    sensor_recovery_result_t result = SENSOR_RECOVERY_REFUSED;
+    int64_t opened, first_opened;
+    bool timing_refused = false;
+    (void)recovery_drain(port, channel);
+    const int64_t needed = (SENSOR_RECOVERY_PRIME_MS + 2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL;
+    if (!current(channel, epoch) || deadline - now_us() < needed || now_us() < s_ping_fail_cache_not_before_us) goto done;
+    result = SENSOR_RECOVERY_FAILED;
+    /* Prime wakes the router and normalizes only the exact agreed sequences,
+     * including85+BAD COMMAND CRLF(+80). It NEVER releases ownership. */
+    recovery_trace_phase(1);
+    if (!recovery_exchange(port,channel,epoch,false,true,&opened,0,current,started,&timing_refused)) goto done;
+    recovery_trace_phase(2);
+    if (recovery_drain(port,channel)) goto done;
+    if (deadline - now_us() < (2 * SENSOR_RECOVERY_WINDOW_MS + SENSOR_RECOVERY_GAP_MS) * 1000LL) {
+        timing_refused=true;goto done;
+    }
+    recovery_trace_phase(3);
+    if (!recovery_exchange(port,channel,epoch,false,false,&first_opened,0,current,started,&timing_refused)) goto done;
+    recovery_trace_phase(4);
+    int64_t quiet_until = now_us() + SENSOR_RECOVERY_GAP_MS * 1000LL;
+    while (now_us() < quiet_until) {
+        if (!current(channel,epoch)) goto done;
+        uint32_t ticks = uart_stream_capped_deadline_ticks(now_us(),quiet_until,WAKE_READ_MS,portTICK_PERIOD_MS);
+        if (!ticks) break;
+        vTaskDelay((TickType_t)ticks);
+    }
+    if (recovery_drain(port,channel) || !current(channel,epoch)) goto done;
+    if (deadline - now_us() < SENSOR_RECOVERY_WINDOW_MS * 1000LL) { timing_refused=true;goto done; }
+    /* Before the leaf's500ms re-sleep threshold, even under scheduling jitter.
+     * The post-write check also rejects a task preempted at the TX boundary. */
+    recovery_trace_phase(5);
+    if (recovery_exchange(port,channel,epoch,poll,false,&opened,first_opened+450000,
+            current,started,&timing_refused) && !deadline_reached(deadline) && current(channel,epoch))
+        result = SENSOR_RECOVERY_PROVEN;
+done:
+    recovery_trace_phase(6);
+    (void)recovery_drain(port,channel);
+    s_ch[channel].state=previous;channel_release(channel);
+    recovery_trace_end();
+    return timing_refused ? SENSOR_RECOVERY_REFUSED : result;
+}
+
 static esp_err_t do_query(uint8_t channel,
                           const uint8_t cmd[8],
                           const uint8_t *extra, size_t extra_len,
@@ -798,6 +1048,16 @@ esp_err_t uart_sensors_init(void)
     s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .boot_pin = 7, .shared = true };
     s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .boot_pin = 6, .shared = true };
     s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .boot_pin = 5, .shared = true };
+
+    /* A leaf's light-sleep TX can be undriven. Without a high idle bias the
+     * remapped host RX floats, accumulating garbage and even coupling our AA
+     * wake burst into RX before the real85 reply (cold-leaf bench capture).
+     * IDF uart_set_pin enables input but leaves pull configuration unchanged;
+     * bias every receive pad once, so remapping cannot park on a floating RX.
+     * Do not compensate by accepting garbage in either idle-proof exchange. */
+    for (int i = 0; i < UART_SENSOR_NUM_CHANNELS; ++i) {
+        ESP_RETURN_ON_ERROR(gpio_pullup_en(s_ch[i].rx_pin), TAG, "AMBIT RX pullup");
+    }
 
     /* AMBIT reset/boot straps (open-drain) for host-driven C3 ROM flashing. */
     ESP_RETURN_ON_ERROR(ambit_boot_gpio_init(), TAG, "AMBIT boot/reset GPIO");

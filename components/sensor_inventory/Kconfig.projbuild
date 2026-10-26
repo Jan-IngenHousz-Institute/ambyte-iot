@@ -1,0 +1,8 @@
+menu "Sensor inventory qualification"
+    config AMBYTE_SENSOR_RECOVERY_HIL
+        bool "Enable bench-only acquisition recovery trigger"
+        default n
+        help
+            Adds sensors_recovery_hil for physical qualification of the same
+            recovery block while idle or acquiring. Never enable in release.
+endmenu

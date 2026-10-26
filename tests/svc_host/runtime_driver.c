@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <openssl/evp.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 #include "../../components/usb_service/usb_service.c"
@@ -10,10 +11,11 @@
 static unsigned critical, manager_calls, raw_submissions, legacy_submissions, maintenance_ends;
 static bool mutex_held, gate, maintenance, reject;
 static int64_t clock_us;
+static unsigned cooperative_delays;
 static bool resource_trough;
 static void (*pending_worker)(void *);
 static void *worker_arg;
-static char input[2048];
+static char input[65536];
 static size_t input_at, input_length;
 static const char *case_name;
 #ifdef SVC_JOBS_INTEGRATION
@@ -29,6 +31,9 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait)
 BaseType_t xSemaphoreGive(SemaphoreHandle_t mutex)
 { assert(mutex == (void *)1 && mutex_held); mutex_held = false; return pdTRUE; }
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (void *)1; }
+#ifndef SVC_JOBS_INTEGRATION
+void vTaskDelay(TickType_t ticks) { assert(ticks>0 && !mutex_held && !critical);clock_us+=(int64_t)ticks*portTICK_PERIOD_MS*1000;++cooperative_delays; }
+#endif
 UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) { assert(task == (void *)1); return 8888; }
 int64_t esp_timer_get_time(void) { clock_us += 1000; return clock_us; }
 size_t heap_caps_get_free_size(unsigned caps) { assert(caps == 3); return resource_trough ? 12000 : 64000; }
@@ -107,7 +112,9 @@ bool svc_usb_write(const void *bytes, size_t n)
 { assert(gate); return fwrite(bytes, 1, n, stdout) == n; }
 bool svc_usb_notice_write(const void *bytes, size_t n)
 { assert(!gate); return fwrite("\r\n", 1, 2, stdout) == 2 && fwrite(bytes, 1, n, stdout) == n; }
+#ifndef SVC_SENSOR_PEER
 void svc_store_fault(const char *point) { (void)point; }
+#endif
 const char *__real_svc_store_open(svc_store_t *, const char *, uint64_t, size_t (*)(void *), void *);
 const char *__wrap_svc_store_open(svc_store_t *s, const char *path, uint64_t id, size_t (*free)(void *), void *context)
 {
@@ -125,6 +132,18 @@ int main(int argc, char **argv)
     usb_service_config_t config = {.submit = app_maint_submit, .maintenance_begin = backend_begin,
         .maintenance_end = backend_end, .boot_ready = backend_ready, .worker_stack = backend_stack, .runner_stack = runner_stack};
     assert(usb_service_init(&config) == ESP_OK);
+    unsigned before_cooperate=cooperative_delays;
+    cooperate(NULL);
+    assert(cooperative_delays==before_cooperate+1);
+    if(!strcmp(case_name,"ready_traffic")) {
+        unsigned before=cooperative_delays;
+        for(unsigned id=1;id<=1000;++id) add_request(id%2 ? "svc.version" : "svc.stats",id);
+        add_request("svc.exit",1001);
+        assert(usb_service_command(1,NULL)==0);
+        assert(cooperative_delays-before>10 && !gate && !mutex_held && !critical);
+        fputs("ADAPTER_FAIRNESS_OK frames=1000 positive_delays=1 tick_ms=10\n",stderr);
+        return 0;
+    }
     assert(s_boot_fingerprint_known);
     if (!strcmp(case_name, "plain_notice")) {
         fputs("ambyte> ", stdout); notice("mode_required"); return 0;
@@ -163,3 +182,18 @@ int main(int argc, char **argv)
     assert(!gate && !mutex_held && !critical);
     return 0;
 }
+
+size_t heap_caps_get_allocated_size(void *ptr) { return malloc_usable_size(ptr); }
+#ifndef SVC_JOBS_INTEGRATION
+#ifdef SVC_SENSOR_PEER
+static int sensor_hash_fault;
+#define SENSOR_HASH_FAIL(stage) do { if(sensor_hash_fault==(stage)) return -1; } while(0)
+#else
+#define SENSOR_HASH_FAIL(stage) ((void)0)
+#endif
+void mbedtls_sha256_init(mbedtls_sha256_context *c) { c->ctx = EVP_MD_CTX_new(); assert(c->ctx); }
+int mbedtls_sha256_starts(mbedtls_sha256_context *c, int n) { SENSOR_HASH_FAIL(1); assert(!n); return EVP_DigestInit_ex(c->ctx, EVP_sha256(), NULL) == 1 ? 0 : -1; }
+int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *b, size_t n) { SENSOR_HASH_FAIL(2); return EVP_DigestUpdate(c->ctx, b, n) == 1 ? 0 : -1; }
+int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char *b) { SENSOR_HASH_FAIL(3); unsigned n = 0; return EVP_DigestFinal_ex(c->ctx, b, &n) == 1 && n == 32 ? 0 : -1; }
+void mbedtls_sha256_free(mbedtls_sha256_context *c) { EVP_MD_CTX_free(c->ctx); c->ctx = NULL; }
+#endif

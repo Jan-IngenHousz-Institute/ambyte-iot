@@ -1,0 +1,4 @@
+# Physical recovery qualification only. Absent from release defaults.
+CONFIG_AMBYTE_SENSOR_RECOVERY_HIL=y
+# Match the production diagnostic scratch stack (same as svc-bench).
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792

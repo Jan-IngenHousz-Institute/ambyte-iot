@@ -168,6 +168,27 @@ join for service consumers and bench tools, with fresh same-port confirmation,
 readback by ID and no automatic credential retransmission. Passwords are absent
 from service journals and service progress/error messages.
 
+### Attached-sensor diagnostics
+
+Select the serial port and click **Diagnostics / Read sensors**. The visible
+**Attached sensors** window shows all four ports, last observed state, eFuse MAC,
+firmware, hardware revision, generation and age. Select a row for exact
+calibration values, spectral vectors, calibration CRC, gateway observation times
+and clock quality. Busy/stale values are historical; unknown is not absent, and
+observed coefficients do not certify a calibration or a successful measurement.
+
+This read needs neither API sign-in nor Wi-Fi. It runs off the Tk thread through
+`flash_gui.sensor_diagnostics.read_sensor_diagnostics(port, *, log=print)`, also
+usable on the bench. Every serial open may reset the gateway, so the existing
+45 s console-readiness allowance applies; the descriptor stays open during the
+read. Advertised sensors uses JSON; older supported images show unavailable.
+Malformed new snapshots and connection failures are explicit errors.
+
+The shared `ServiceClient.sensors()` exposes the same model over bounded framed
+pages, validates every CRC and the reassembled SHA, and never writes an operation
+journal or changes a schedule. The device's full contract, retry/clock/generation
+semantics and errors are in [USB maintenance](../docs/usb-maintenance.md).
+
 ### GitHub rate limits
 
 The GUI reads the repo's release list to find the firmware, the Schedule catalog and
@@ -455,3 +476,16 @@ is CERN-OHL-S-2.0 instead; the repo root README has the full split.
 The packaged executables bundle esptool (GPL-2.0-or-later), pyserial (BSD),
 tzlocal (MIT) and certifi (MPL-2.0), so the shipped bundle is GPL-3.0 as a
 combined work.
+
+Diagnostics keeps its connection open for up to 10 s after startup to allow
+attachment observations, within the 45 s total deadline. If no idle window
+occurs, the panel explicitly says that observations have not yet been collected
+since this gateway boot. Unknown ports are never presented as absent.
+
+The Attached sensors diagnostics show **stalled — completion unproven** when
+three bounded acquisition-owned checks could not prove that a leaf finished.
+The last observations remain historical; stalled does not mean absent. Other
+ports can refresh after the expected run window. An explicit new acquisition,
+a definitive normal poll/fetch or existing bank reset clears/restarts this
+state; diagnostics do not reset a sensor. See the [maintenance protocol](../docs/usb-maintenance.md#refresh-exclusion-and-counters)
+for the two-exchange proof and separate acquisition-recovery wire counter.

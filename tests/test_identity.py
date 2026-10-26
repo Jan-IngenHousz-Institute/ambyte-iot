@@ -21,7 +21,7 @@ HOST = ROOT / "tests/identity_host"
 CAPABILITIES = {
     "identity", "cfg.get", "cfg.set", "reboot", "schedule.status",
     "schedule.release", "schedule.begin", "schedule.put", "schedule.commit", "schedule.abort",
-    "svc",
+    "svc", "sensors",
 }
 WORKBOOK = "11111111-2222-4333-8444-555555555555"
 
@@ -51,7 +51,7 @@ class IdentityTest(unittest.TestCase):
         builds = {
             "handler": [HOST / "handler.c", ROOT / "components/CLI/cli_identity.c",
                         "-Wl,--wrap=fwrite", "-pthread"],
-            "runner": [HOST / "runner.c", *sorted((ROOT / "components/sched_spec").glob("*.c")),
+            "runner": [HOST / "runner.c", ROOT / "components/sensor_inventory/sensor_inventory.c", *sorted((ROOT / "components/sched_spec").glob("*.c")),
                        ROOT / "components/time_sync/time_sync.c", "-Wl,--wrap=sched_pool_str", "-lm"],
             "provider": [HOST / "provider.c", ROOT / "components/script_update/script_update.c",
                          "-Wl,--wrap=open", "-Wl,--wrap=read", "-Wl,--wrap=close",

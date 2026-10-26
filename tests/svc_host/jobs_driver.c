@@ -32,7 +32,8 @@ void nvs_close(nvs_handle_t h) { (void)h; abort(); }
 const esp_app_desc_t *esp_app_get_description(void)
 { static const esp_app_desc_t d = {.version = "test-firmware"}; return &d; }
 const char *esp_err_to_name(esp_err_t e) { (void)e; return "stub-error"; }
-void vTaskDelay(TickType_t ticks) { clock_us += (int64_t)ticks * 1000; }
+void vTaskDelay(TickType_t ticks)
+{ assert(ticks > 0 && !mutex_held && !critical); clock_us += (int64_t)ticks * portTICK_PERIOD_MS * 1000; ++cooperative_delays; }
 void esp_restart(void) { abort(); }
 esp_err_t fleet_jitter_slot_for_sta_mac(uint32_t slots, uint32_t *out)
 { (void)slots; (void)out; abort(); }

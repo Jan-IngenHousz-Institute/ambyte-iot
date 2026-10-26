@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "svc_wire.c" "svc_store.c" "svc_protocol.c" "svc_engine.c" "svc_session.c" "svc_usb.c" "usb_service.c"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES console driver esp_timer heap littlefs esp_wifi esp_hw_support mbedtls script_update wifi_manager
+    PRIV_REQUIRES console driver esp_timer heap littlefs esp_wifi esp_hw_support mbedtls script_update wifi_manager sensor_inventory
 )
 
 if(CONFIG_AMBYTE_SVC_BENCH)

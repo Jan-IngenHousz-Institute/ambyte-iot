@@ -159,6 +159,7 @@ void svc_protocol_init(svc_protocol_t *p, svc_store_t *s, const svc_protocol_por
 }
 void svc_protocol_unbind(svc_protocol_t *p)
 {
+    if (p->ports.sensors_release) p->ports.sensors_release(p->ports.context);
     p->bound_instance = 0;
 #if CONFIG_AMBYTE_SVC_BENCH
     svc_wipe(&p->bench, sizeof p->bench);
@@ -204,7 +205,10 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
 #if CONFIG_AMBYTE_SVC_BENCH
                ",\"bench.begin\",\"bench.read\",\"bench.end\",\"bench.abort\""
 #endif
-               "],\"max_line\":248,\"chunk\":144,\"result_slots\":8,\"highest_id\":\"%016llx\"", (unsigned long long)p->store->highest);
+               );
+        if (p->ports.sensors_capture && p->ports.sensors_read)
+            append(&j, ",\"svc.sensors\",\"svc.sensors.read\"");
+        append(&j, "],\"max_line\":248,\"chunk\":144,\"result_slots\":8,\"highest_id\":\"%016llx\"", (unsigned long long)p->store->highest);
         finish(p, &j); goto done;
     }
     if (!strcmp(a[0], "svc.bind")) {
@@ -252,6 +256,33 @@ bool svc_protocol_dispatch(svc_protocol_t *p, char *body, char *out)
         prefix(p, &j, true); append(&j, ",\"configured_ssid\":"); quoted(&j, status.configured_ssid);
         append(&j, ",\"trial_ssid\":"); if (status.trial) quoted(&j, status.trial_ssid); else append(&j, "null");
         append(&j, ",\"trial\":%s,\"connected\":%s,\"provisioned\":%s", status.trial ? "true" : "false", status.connected ? "true" : "false", status.provisioned ? "true" : "false");
+        finish(p, &j); goto done;
+    }
+    if (!strcmp(a[0], "svc.sensors")) {
+        if (n != 1) { error = "invalid_args"; goto done; }
+        if ((error = binding_error(p))) goto done;
+        if (!p->ports.sensors_capture) { error = "sensors_unavailable"; goto done; }
+        uint64_t token_id = 0; size_t size = 0; char sha[65] = {0};
+        error = p->ports.sensors_capture(p->ports.context, &token_id, &size, sha);
+        if (error) goto done;
+        if (!token_id || !size || size > 16384 || !digest(sha)) { error = "sensors_unavailable"; goto done; }
+        prefix(p, &j, true);
+        append(&j, ",\"snapshot\":\"%016llx\",\"size\":%u,\"sha256\":\"%s\",\"chunk\":576",
+            (unsigned long long)token_id, (unsigned)size, sha);
+        finish(p, &j); goto done;
+    }
+    if (!strcmp(a[0], "svc.sensors.read")) {
+        if (n != 3 || !hex(a[1], 16, &id) || !id || !hex(a[2], 8, &offset)) { error = "invalid_args"; goto done; }
+        if ((error = binding_error(p))) goto done;
+        if (!p->ports.sensors_read) { error = "sensors_unavailable"; goto done; }
+        unsigned char data[576]; char encoded[769]; size_t size = 0; bool eof = false;
+        error = p->ports.sensors_read(p->ports.context, id, (uint32_t)offset, data, &size, &eof);
+        if (error) goto done;
+        if (!size || size > sizeof data) { error = "sensors_unavailable"; goto done; }
+        svc_base64_encode(data, size, encoded);
+        prefix(p, &j, true);
+        append(&j, ",\"snapshot\":\"%016llx\",\"offset\":\"%08lx\",\"crc32\":\"%08lx\",\"data\":\"%s\",\"eof\":%s",
+            (unsigned long long)id, (unsigned long)offset, (unsigned long)svc_crc32(0, data, size), encoded, eof ? "true" : "false");
         finish(p, &j); goto done;
     }
     bool begin = !strcmp(a[0], "schedule.begin"), put = !strcmp(a[0], "p");

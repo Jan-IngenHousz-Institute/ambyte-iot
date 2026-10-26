@@ -21,7 +21,7 @@ from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from tkinter import font as tkfont
 
-from . import app_update, esptool_ops, procedure, release_fetch, timezones
+from . import app_update, esptool_ops, procedure, release_fetch, timezones, sensor_diagnostics
 from .config import ENVIRONMENTS, Settings
 from .openjii_client import OpenJIIClient, OpenJIIError, WorkbookProgramming
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
@@ -103,6 +103,9 @@ class App(ttk.Frame):
         self.experiments: list = []
         self.current_run: DeviceRun | None = None
         self.busy = False
+        self.sensor_window = None
+        self._sensor_view_generation = 0
+        self._sensor_model = None
         self._schedule_cancel = threading.Event()
         self.local_tz = timezones.local_iana_zone()
         self.gui_release_url = app_update.RELEASES_PAGE
@@ -279,6 +282,10 @@ class App(ttk.Frame):
                                       command=self._onboard)
         self.onboard_btn.grid(row=0, column=3, padx=(8, 0))
 
+        self.sensors_btn = ttk.Button(frame, text="Diagnostics / Read sensors",
+                                      command=self._read_sensor_diagnostics)
+        self.sensors_btn.grid(row=0, column=4, padx=(8, 0))
+
         steps_row = ttk.Frame(frame)
         steps_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.step_labels: dict[str, ttk.Label] = {}
@@ -317,6 +324,95 @@ class App(ttk.Frame):
         self.log_text.grid(row=4, column=0, columnspan=4, sticky="nsew",
                            pady=(8, 0))
         frame.rowconfigure(4, weight=1)
+
+    def _open_sensor_panel(self):
+        if self.sensor_window is not None and self.sensor_window.winfo_exists():
+            self.sensor_window.deiconify()
+            self.sensor_window.lift()
+            return
+        self._sensor_view_generation += 1
+        window = self.sensor_window = tk.Toplevel(self)
+        window.title("Attached sensors")
+        window.geometry("1060x620")
+        self.sensor_message = tk.StringVar(value="Read observations from the selected gateway.")
+        ttk.Label(window, textvariable=self.sensor_message, wraplength=1000).pack(fill="x", padx=10, pady=8)
+        columns = ("port", "state", "sensor", "firmware", "hardware", "generation", "age")
+        self.sensor_tree = ttk.Treeview(window, columns=columns, show="headings", height=4)
+        for name, title, width in zip(columns,
+                ("Port", "Observed state", "Sensor eFuse MAC", "Firmware", "HW revision", "Generation", "Age"),
+                (45, 230, 180, 90, 90, 90, 100)):
+            self.sensor_tree.heading(name, text=title)
+            self.sensor_tree.column(name, width=width)
+        self.sensor_tree.pack(fill="x", padx=10)
+        self.sensor_tree.bind("<<TreeviewSelect>>", self._show_sensor_details)
+        ttk.Label(window, text="Selected port: observation sources, gateway time/clock, calibration and vectors").pack(anchor="w", padx=10, pady=(10, 0))
+        self.sensor_details = scrolledtext.ScrolledText(window, height=20, state="disabled", font="TkFixedFont")
+        self.sensor_details.pack(fill="both", expand=True, padx=10, pady=8)
+
+    def _read_sensor_diagnostics(self):
+        if self.busy:
+            return
+        port = self._selected_port()
+        if not port:
+            messagebox.showinfo("Attached sensors", "Select a serial port first.")
+            return
+        self._open_sensor_panel()
+        generation = self._sensor_view_generation
+        self.sensor_message.set("Reading cached observations…")
+        self.busy = True
+        self._set_busy(True)
+        def finish(model, error):
+            self._set_busy(False)
+            if generation != self._sensor_view_generation or not self.sensor_window.winfo_exists():
+                return
+            if error:
+                self.sensor_message.set(error)
+                for row in self.sensor_tree.get_children():
+                    self.sensor_tree.delete(row)
+                self.sensor_details.configure(state="normal")
+                self.sensor_details.delete("1.0", "end")
+                self.sensor_details.insert("end", error)
+                self.sensor_details.configure(state="disabled")
+            else:
+                self._apply_sensor_diagnostics(model)
+        def work():
+            try:
+                model = sensor_diagnostics.read_sensor_diagnostics(port, log=self.log)
+                error = None
+            except Exception as exc:
+                model, error = None, f"Sensor inspection failed: {exc}"
+            try:
+                self._post(finish, model, error)
+            except (RuntimeError, tk.TclError):
+                pass  # Closing the app is allowed; the callable already closed serial.
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_sensor_diagnostics(self, model):
+        self._sensor_model = model
+        self.sensor_message.set(model.message)
+        for row in self.sensor_tree.get_children():
+            self.sensor_tree.delete(row)
+        for row in sensor_diagnostics.diagnostic_rows(model):
+            self.sensor_tree.insert("", "end", iid=str(row[0]), values=row)
+        if model.snapshot is not None:
+            self.sensor_tree.selection_set("0")
+            self._show_sensor_details()
+        else:
+            self.sensor_details.configure(state="normal")
+            self.sensor_details.delete("1.0", "end")
+            self.sensor_details.insert("end", model.message)
+            self.sensor_details.configure(state="disabled")
+
+    def _show_sensor_details(self, event=None):
+        del event
+        selection = self.sensor_tree.selection()
+        if not selection or self._sensor_model is None:
+            return
+        text = sensor_diagnostics.diagnostic_details(self._sensor_model, int(selection[0]))
+        self.sensor_details.configure(state="normal")
+        self.sensor_details.delete("1.0", "end")
+        self.sensor_details.insert("end", text)
+        self.sensor_details.configure(state="disabled")
 
     # ── thread-safe UI helpers ───────────────────────────────────────────
     def _post(self, fn, *args) -> None:
@@ -358,6 +454,8 @@ class App(ttk.Frame):
             self.busy = busy
             self.onboard_btn.configure(
                 state="disabled" if busy else "normal")
+            if hasattr(self, "sensors_btn"):
+                self.sensors_btn.configure(state="disabled" if busy else "normal")
             self.schedule_script_box.configure(
                 state="disabled" if busy or self.schedule_catalog is None
                 else "readonly")

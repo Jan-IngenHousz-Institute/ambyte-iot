@@ -22,7 +22,7 @@ REASONS = {"", "bad_frame", "bad_crc", "line_too_long", "frame_timeout", "sessio
            "wifi_timeout", "wifi_failed", "wifi_not_retrying", "wifi_driver_unresolved",
            "wifi_invalid_credentials", "wifi_unavailable", "mode_required", "rx_overrun",
            "store_changed", "not_bound", "operation_complete", "invalid_sequence", "workbook_mismatch",
-           "already_active", "unprovable"}
+           "already_active", "unprovable", "snapshot_expired", "sensors_unavailable", "no_memory"}
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_.+-]{1,31}\Z")

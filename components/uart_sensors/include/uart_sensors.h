@@ -3,6 +3,7 @@
 
 #include "esp_err.h"
 #include "uart_sensor_port.h"
+#include "sensor_inventory.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,25 @@ extern "C" {
  * Must be called once from app_main before any query/ping.
  */
 esp_err_t uart_sensors_init(void);
+sensor_read_result_t uart_sensors_inspect(uint8_t ch, uint8_t type, void *out,
+    size_t size, size_t *got, uint32_t timeout_ms, void (*started)(uint8_t));
+/* Acquisition-owned completion proof; never a presence/inspection result. */
+sensor_recovery_result_t uart_sensors_recover(uint8_t ch, uint64_t epoch, bool poll, uint32_t timeout_ms,
+    bool (*current)(uint8_t, uint64_t), void (*started)(uint8_t));
+#if CONFIG_AMBYTE_SENSOR_RECOVERY_HIL
+#define UART_RECOVERY_HIL_PHASES 7u
+#define UART_RECOVERY_HIL_BYTES 64u
+typedef struct {
+    uint64_t epoch;
+    uint32_t elapsed_us, prime_notices, count[UART_RECOVERY_HIL_PHASES];
+    uint32_t first_us[UART_RECOVERY_HIL_PHASES], last_us[UART_RECOVERY_HIL_PHASES];
+    uint8_t channel, phase;
+    uint8_t bytes[UART_RECOVERY_HIL_PHASES][UART_RECOVERY_HIL_BYTES];
+} uart_recovery_hil_trace_t;
+/* Bench-only bounded last-block bytes: pre/prime/post-prime/first/gap/second/post.
+ * No raw capture, symbol or storage exists in a release build. */
+bool uart_sensors_recovery_hil_trace(uart_recovery_hil_trace_t *out);
+#endif
 
 /* ── AMBIT ROM-flash reset/boot control (host-driven C3 firmware update) ──
  * Force an AMBIT (ESP8685/ESP32-C3) into its ROM serial download mode over the

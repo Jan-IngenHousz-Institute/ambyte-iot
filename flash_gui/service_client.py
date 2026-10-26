@@ -10,6 +10,7 @@ after any ambiguous exchange the device's result is the only offset authority.
 from __future__ import annotations
 
 import base64
+import hashlib
 from collections import deque
 from functools import wraps
 import re
@@ -222,6 +223,53 @@ class ServiceClient:
         except (TransportError, UnicodeError):
             self.invalidate()
             raise ProtocolError("Invalid service diagnostic response.") from None
+
+    def sensors(self, timeout=45.0):
+        """Reassemble one immutable read-only pin; no operation journal write."""
+        from .sensors import decode_sensors, SensorsError
+        previous = self._deadline
+        self._deadline = min(self.clock() + min(45.0, max(0.1, timeout)), previous if previous is not None else float("inf"))
+        try:
+            if not self.active:
+                self.connect()
+            if not {"svc.sensors", "svc.sensors.read"} <= self.actions:
+                raise ServiceClientError("Attached-sensor inspection is unavailable on this firmware.")
+            head = self._exchange("svc.sensors")
+            _keys(head, {"ok", "store", "snapshot", "size", "sha256", "chunk"})
+            if (not _hex(head["snapshot"], False) or not _integer(head["size"], 1, 16384) or
+                    type(head["chunk"]) is not int or head["chunk"] != 576 or
+                    not isinstance(head["sha256"], str) or not SHA.fullmatch(head["sha256"])):
+                raise ProtocolError("Invalid sensor snapshot descriptor.")
+            data = bytearray()
+            while len(data) < head["size"]:
+                offset = len(data)
+                page = self._exchange(f"svc.sensors.read {head['snapshot']} {offset:08x}")
+                _keys(page, {"ok", "store", "snapshot", "offset", "crc32", "data", "eof"})
+                if (page["snapshot"] != head["snapshot"] or page["offset"] != f"{offset:08x}" or
+                        type(page["eof"]) is not bool or not isinstance(page["data"], str) or
+                        len(page["data"]) > 768 or not isinstance(page["crc32"], str) or
+                        not re.fullmatch(r"[0-9a-f]{8}", page["crc32"])):
+                    raise ProtocolError("Invalid sensor snapshot page.")
+                try:
+                    chunk = base64.b64decode(page["data"], validate=True)
+                except ValueError:
+                    raise ProtocolError("Invalid sensor snapshot bytes.") from None
+                count = min(576, head["size"] - offset)
+                if (len(chunk) != count or base64.b64encode(chunk).decode() != page["data"] or
+                        zlib.crc32(chunk) != int(page["crc32"], 16) or page["eof"] != (offset + count == head["size"])):
+                    raise ProtocolError("Sensor snapshot page integrity check failed.")
+                data.extend(chunk)
+            if hashlib.sha256(data).hexdigest() != head["sha256"]:
+                raise ProtocolError("Sensor snapshot digest mismatch.")
+            try:
+                return decode_sensors(bytes(data))
+            except SensorsError as exc:
+                raise ProtocolError(str(exc)) from exc
+        except ServiceClientError:
+            self.invalidate()
+            raise
+        finally:
+            self._deadline = previous
 
     def _version(self, result):
         _keys(result, {"ok", "store", "service", "actions", "max_line", "chunk", "result_slots", "highest_id"})

@@ -26,6 +26,8 @@ class ServiceJobsTest(unittest.TestCase):
               ("svc_wire.c", "svc_store.c", "svc_protocol.c", "svc_engine.c", "svc_session.c")),
             str(ROOT / "components/iot_jobs/iot_jobs.c"), str(ROOT / "components/iot_jobs/iot_jobs_plan.c"),
             str(ROOT / "components/ota_update/ota_update.c"), str(IDF / "components/json/cJSON/cJSON.c"),
+            str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
+            str(ROOT / "components/sensor_inventory/sensor_json.c"),
             str(ROOT / "tests/svc_host/jobs_driver.c"), "-Wl,--wrap=svc_store_open", "-lcrypto", "-o", str(cls.binary)],
             capture_output=True, text=True)
         if p.returncode: raise RuntimeError(p.stdout + p.stderr)

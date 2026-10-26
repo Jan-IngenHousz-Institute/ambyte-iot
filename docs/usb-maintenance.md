@@ -5,7 +5,7 @@ already provisioned Ambyte. It works without network, SD card or an unlock.
 Physical access grants authority to the existing write commands. This document
 covers the existing console subset and the explicit framed `svc` mode for
 durable schedule transactions and bounded Wi-Fi credential writes. Certificate
-provisioning, sensors, firmware transfer, export, receipts and radio authorization
+provisioning, firmware transfer, export, receipts and radio authorization
 are outside this contract. The console and service each have version `1`;
 entering service does not change the plain commands described first.
 
@@ -242,8 +242,8 @@ schedule.begin schedule.put schedule.commit schedule.abort
 These tokens identify the existing space-separated commands; `cfg.get` is
 invoked as `cfg get`, for example. A3 adds only the additive `svc` token;
 its implemented actions are discovered through `svc.version`. A2 has no `svc`
-token. No export, receipt, firmware-update, sensor or radio capabilities are
-advertised. `identity unexpected` produces
+token. A4 adds `sensors` for the cache-only attachment read below. No export,
+receipt, firmware-update or radio capabilities are advertised. `identity unexpected` produces
 `Usage: identity` and the existing nonzero diagnostic, with no identity object.
 
 After each response has been flushed and its stdout lock released, one normal
@@ -567,7 +567,7 @@ or null if unavailable). Errors add only a fixed nonsecret `reason`. Read
 `svc.version` before trusting capabilities or sending a write:
 
 ```json
-{"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}
+{"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active","svc.sensors","svc.sensors.read"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}
 ```
 
 `service`, limits and slot count are integers; actions are unique strings.
@@ -889,7 +889,7 @@ device. The `abc` staging descriptor is not a valid schedule to commit.
 
 ```text
 00000001 svc.version*e97c2d53
-00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*7215c2b2
+00000001 {"ok":true,"store":"0123456789abcdef","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active","svc.sensors","svc.sensors.read"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"0000000000000000"}*348d0fb2
 00000008 svc.bind 0123456789abcdef*b9f19b5f
 00000008 {"ok":true,"store":"0123456789abcdef","state":"bound"}*10bdf71d
 00000005 p 0000000000000001 00000000 352441c2 YWJj*5ca3bfdd
@@ -976,3 +976,506 @@ is not included in its CRC. No separator is added inside service.
 0000000d {"ok":true,"store":"0123456789abcdef","active":{"op":"0000000000000001","kind":"schedule","state":"staging"}}*14455baf
 0000000e {"ok":false,"store":"0123456789abcdef","reason":"not_bound"}*c14a3047
 ```
+
+
+## Inspect attached sensors without interrupting acquisition
+
+### Overview
+
+The gateway keeps the latest observed identity, calibration and supported
+spectral vectors for each of its four ports. The resident maintenance worker
+refreshes them between jobs; reading a snapshot copies the cache and sends no
+sensor UART traffic. Every value carries its own source, observation time and
+clock quality. Unobserved values remain null, and an attachment observation
+does not identify the sensor that produced a measurement.
+
+An attachment generation belongs to one port within one gateway boot. Clearing
+an attachment drops all its old values; the next verified identity increments
+the retained generation, even if the returning sensor has the same MAC.
+Ordinary revalidation keeps that generation. The invalidated state below is
+also the internal step before accepting a changed MAC.
+
+```mermaid
+stateDiagram-v2
+    state "unknown: never observed" as Unknown
+    state "known: verified identity" as Known
+    state "absent: failed idle presence check" as Absent
+    state "unknown: attachment invalidated" as Invalidated
+    [*] --> Unknown : new boot_id, generation = 0
+    Unknown --> Known : valid identity, generation += 1
+    Unknown --> Absent : idle presence check finds no reply
+    Known --> Known : same MAC revalidated, generation unchanged
+    Known --> Known : acquisition timeout or block read failure, keep history
+    Known --> Absent : idle presence check fails, clear old values
+    Known --> Invalidated : MAC change, shared reset or update exit
+    Absent --> Known : valid returning identity, generation += 1
+    Invalidated --> Known : valid identity, generation += 1
+    Invalidated --> Absent : idle presence check finds no reply
+    note right of Invalidated
+        Clearing values retains the generation counter.
+        Reboot starts a new boot_id and resets the counter.
+    end note
+    note right of Known
+        busy and stalled are acquisition overlays.
+        They retain historical values and generation.
+        A reconnect entirely between checks is not observable.
+    end note
+```
+
+A missing trigger ACK leaves the port busy because the leaf may still be
+measuring. Time alone never releases it. Once the conservative expected run
+window has passed and job/maintenance vetoes allow it, recovery uses the proof
+below. Each exchange must pass before the next is attempted; all locks,
+priming, windows and delays share one 900 ms deadline. These acquisition-owned
+exchanges have their own counter, separate from inspection refresh traffic.
+
+```mermaid
+sequenceDiagram
+    participant A as Acquisition path
+    participant I as Inventory
+    participant W as Maintenance worker / UART adapter
+    participant L as AMBIT leaf
+    A->>I: Reserve run epoch, set busy
+    A->>L: Trigger measurement
+    Note over A,L: ACK missing, leaf may still be measuring
+    A->>I: Arm expected window after UART call returns
+    Note over I,W: Inside the window, no recovery or inspection on any port
+    W->>I: Admit due recovery when job and maintenance vetoes are clear
+    I-->>W: Current run epoch, hold exclusive channel / UART ownership
+    W->>L: Priming wake: three 0xAA bytes
+    L-->>W: Exact prime sequence within 100 ms
+    Note over W,L: Also accept85 + exact BAD COMMAND CRLF, optional single80
+    Note over W,L: Prime never proves idle, drain RX
+    W->>L: First fresh proof wake
+    L-->>W: Exactly one 0x80 in the full 200 ms window
+    Note over W,L: 200 ms quiet gap, any byte fails, drain RX
+    Note over W,L: Second TX must start within 450 ms of first proof window opening
+    W->>L: Second fresh proof wake
+    L-->>W: Exactly one 0x80
+    opt Verified numeric firmware at least 1.1.2
+        W->>L: cmd 23 poll
+        L-->>W: Exact 0xA1, state 0/1/2, 0xF0
+    end
+    Note over W,L: Listen through the full second 200 ms window, extra bytes fail
+    alt Both proofs clean and run epoch unchanged
+        W->>I: Clear busy, retain attachment and configuration
+    else Refused lock, budget or timing admission
+        W->>I: Keep busy, no failure attempt spent, back off 1 to 60 s
+    else Silence, stale burst or other failed proof
+        W->>I: Keep busy, retry after 60 s then 120 s
+        Note over I,W: Third failed block sets stalled, no further automatic attempts
+    end
+```
+
+An extra `0x80` or trailing `0xA1` cannot become completion evidence. A new run
+epoch invalidates every earlier window. After the expected window, an unproven
+or stalled port excludes only itself, so other ports can refresh between jobs.
+Recovery never resets the bank or changes attachment generations, gains or
+currents. A new explicit acquisition, a recognized normal poll, a successful
+fetch or an existing reset owner can clear the exclusion.
+
+Both read paths below return four-port observations from the same inventory.
+The plain response is one JSON line; framed reads pin one immutable copy and
+page it, so a refresh or swap cannot mix two attachment generations in a
+response. The visible GUI diagnostics use the shared strict parser and display
+`stalled` distinctly. An older image without the capability reports inspection
+unavailable instead of trying a sensor probe.
+
+```mermaid
+flowchart TD
+    Host[Client or GUI diagnostics] --> Discovery[Fresh identity on the same open USB handle]
+    Discovery --> Capability{Advertises sensors?}
+    Capability -->|no| Unavailable[Show inspection unavailable]
+    Capability -->|yes| Path{Read path}
+    Worker[Between-job maintenance worker] -->|bounded presence / cmd 33 reads| Leaf[AMBIT ports]
+    Leaf -->|validated blocks with gateway timestamps| Cache[Four-port inventory cache]
+    Path -->|plain console| Plain[sensors: atomic cache copy]
+    Cache --> Plain
+    Plain --> Line[One JSON line]
+    Path -->|framed service| Bind[svc.version and bind current store]
+    Bind --> Pin[svc.sensors: immutable session pin]
+    Cache --> Pin
+    Pin --> Pages[svc.sensors.read: up to 576 bytes per page]
+    Pages --> Integrity[Check token, store, offset, CRC and complete SHA-256]
+    Line --> Schema[Validate snapshot schema]
+    Integrity --> Schema
+    Schema --> Display[Four rows: known, unknown, absent, busy or stalled]
+```
+
+Discover the `sensors` capability with a fresh `identity` on the same open
+connection. Send `sensors` with no arguments. The response is one JSON line,
+physical column zero, followed only by CR/LF; strip all trailing CR/LF as for
+identity. `sensors x` prints `Usage: sensors` and the existing command-error
+marker. Inspection is cache-only, needs neither Wi-Fi nor SD, and never probes,
+resets, stops the schedule or sends any byte to an acquiring leaf.
+
+This complete example is generated by the production C serializer with no
+observations yet. **Unknown is not absent.** Every reply always has four ports:
+
+```json
+{"contract":1,"boot_id":"0123456789abcdef","captured_uptime_ms":0,"refresh":{"wire_transactions":[0,0,0,0],"deferred_acquisition":0,"run_start_waits":0,"run_start_wait_max_us":0,"stdout_hold_max_us":0,"pin_heap_bytes":0,"pin_heap_peak_bytes":0,"job_start_waits":0,"job_start_wait_max_us":0},"ports":[{"port":0,"state":"unknown","generation":0,"stale":true,"stale_reason":"never_observed","age_ms":null,"presence":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}},{"port":1,"state":"unknown","generation":0,"stale":true,"stale_reason":"never_observed","age_ms":null,"presence":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}},{"port":2,"state":"unknown","generation":0,"stale":true,"stale_reason":"never_observed","age_ms":null,"presence":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}},{"port":3,"state":"unknown","generation":0,"stale":true,"stale_reason":"never_observed","age_ms":null,"presence":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}}],"acquisition_recovery":{"wire_transactions":[0,0,0,0],"discarded_bytes":[0,0,0,0],"boot_idle":[0,0,0,0]}}
+```
+
+A second complete example uses the matrix's populated input and the same
+production serializer (`documentation` case). It contains a known port with all
+140 calibration bytes and the spectral vectors, an absent port, a busy port
+retaining its historical observations, and a never-observed port. This is host
+fixture output, not a bench capture; the bench round will supply device evidence.
+
+<!-- sensors-populated-example:start -->
+```json
+{"contract":1,"boot_id":"0123456789abcdef","captured_uptime_ms":900,"refresh":{"wire_transactions":[0,1,0,0],"deferred_acquisition":0,"run_start_waits":0,"run_start_wait_max_us":0,"stdout_hold_max_us":0,"pin_heap_bytes":0,"pin_heap_peak_bytes":0,"job_start_waits":0,"job_start_wait_max_us":0},"ports":[{"port":0,"state":"known","generation":1,"stale":false,"stale_reason":null,"age_ms":900,"presence":{"value":true,"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"sensor_id":{"value":"08:09:0A:0B:0C:0D","source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"firmware":{"value":"1.4.0","source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"hw_rev":{"value":7,"source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"calibration_digest":{"value":{"algorithm":"crc32-ieee","scope":"calibration_140","hex":"d404c6ab"},"source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"calibration":{"value":{"raw_base64":"U2Vuc29yIDAAAAAAAAAAAAAAAAAAAAAA//////7////9/////P////v////6////+f////j////3////9v////X////0////8////wAAAAABAAAAAgAAAAMAAAAEAAAABQAAAAAAgD4AAIA+AACAPgAAgD4AAIA+AACAPgAAgD4AAIA+AACAPgAAgD4=","ambit_name":"Sensor 0","mlx_coef":[0,-1,-2,-3,-4,-5,-6,-7,-8,-9,-10,-11,-12,-13],"adpd":[0,1,2,3,4,5],"temp_offset":0.25,"temp_slope":0.25,"actinic_coef":0.25,"spec_coef":0.25,"act_50":0,"act_100":16000,"act_150":0,"act_200":16000,"act_250":0,"mlx_emissivity":0.25,"sun_coef":0.25,"tick_factor":0.25},"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"spectral":{"value":{"format":1,"spec_offset":[1,2,3,4,5,6,7,8,9,10],"spec_sens":[11,12,13,14,15,16,17,18,19,20],"par_weight":[21,22,23,24,25,26,27,28,29,30],"par_slope":31,"par_intercept":32},"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}}},{"port":1,"state":"absent","generation":0,"stale":false,"stale_reason":null,"age_ms":0,"presence":{"value":false,"source":"last_read","observed_uptime_ms":900,"observed_utc_ms":1792531200900,"clock":{"source":"sntp","suspect":false}},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}},{"port":2,"state":"busy","generation":1,"stale":false,"stale_reason":null,"age_ms":900,"presence":{"value":true,"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"sensor_id":{"value":"28:29:2A:2B:2C:2D","source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"firmware":{"value":"1.4.0","source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"hw_rev":{"value":7,"source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"calibration_digest":{"value":{"algorithm":"crc32-ieee","scope":"calibration_140","hex":"70057862"},"source":"identity_cache","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"calibration":{"value":{"raw_base64":"U2Vuc29yIDIAAAAAAAAAAAAAAAAw+P//L/j//y74//8t+P//LPj//yv4//8q+P//Kfj//yj4//8n+P//Jvj//yX4//8k+P//I/j//8gAAADJAAAAygAAAMsAAADMAAAAzQAAAAAAEEAAABBAAAAQQAAAEEAAABBAAAAQQAAAEEAAABBAAAAQQAAAEEA=","ambit_name":"Sensor 2","mlx_coef":[-2000,-2001,-2002,-2003,-2004,-2005,-2006,-2007,-2008,-2009,-2010,-2011,-2012,-2013],"adpd":[200,201,202,203,204,205],"temp_offset":2.25,"temp_slope":2.25,"actinic_coef":2.25,"spec_coef":2.25,"act_50":0,"act_100":16400,"act_150":0,"act_200":16400,"act_250":0,"mlx_emissivity":2.25,"sun_coef":2.25,"tick_factor":2.25},"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}},"spectral":{"value":{"format":1,"spec_offset":[3,4,5,6,7,8,9,10,11,12],"spec_sens":[13,14,15,16,17,18,19,20,21,22],"par_weight":[23,24,25,26,27,28,29,30,31,32],"par_slope":33,"par_intercept":34},"source":"last_read","observed_uptime_ms":0,"observed_utc_ms":1792531200000,"clock":{"source":"sntp","suspect":false}}},{"port":3,"state":"unknown","generation":0,"stale":true,"stale_reason":"never_observed","age_ms":null,"presence":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"sensor_id":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"firmware":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"hw_rev":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration_digest":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"calibration":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null},"spectral":{"value":null,"source":null,"observed_uptime_ms":null,"observed_utc_ms":null,"clock":null}}],"acquisition_recovery":{"wire_transactions":[0,0,0,0],"discarded_bytes":[0,0,0,0],"boot_idle":[0,0,0,0],"prime_notices":[0,0,0,0]}}
+```
+<!-- sensors-populated-example:end -->
+
+| Field | Contract v1 meaning |
+| --- | --- |
+| `contract`, `boot_id`, `captured_uptime_ms` | Integer 1, nonzero random 16-lowercase-hex gateway boot id, monotonic capture time in ms. Boot id is generated after hardware entropy initialization; no network association is required. |
+| `ports` | Four objects ordered by zero-based port 0..3, matching uart_0..uart_3. Human AMBIT1..4 labels are one-based. |
+| `state` | `known`: observed eFuse identity; `unknown`: no verified identity; `absent`: between-run failed presence observation; `busy`: gateway owns an actual or possibly active acquisition on that port; `stalled`: three acquisition-owned completion checks failed and automatic recovery stopped. Both override the historical observed attachment state. Stalled never means idle or absent. |
+| `generation` | Per-port uint32 attachment generation within boot_id. Positive on discovery, higher after reconnect (even same MAC), MAC change or reset/update followed by rediscovery. Busy never increments it. Counter exhaustion fails closed until reboot. |
+| `age_ms`, `stale`, `stale_reason` | Monotonic age of latest completed presence/identity confirmation, or null. Stale after 60,000 ms (60,000 itself is fresh), failed required revalidation, or never observed. Reason is null / `age` / `revalidation_failed` / `never_observed`, with never-observed then failure then age precedence. Busy and stale are independent. |
+| `presence` | Observation of true/false, not a guarantee of continuous physical presence. Unknown until a check. |
+| `sensor_id`, `firmware`, `hw_rev` | Observed eFuse MAC, three-component numeric binary firmware version, and hardware revision. Wire hardware revision 0 is unknown/null. A numeric 0.0.0 remains an observation, not a release identity. |
+| `calibration_digest` | Observation of `{algorithm:"crc32-ieee",scope:"calibration_140",hex:"8 lowercase hex"}`. IEEE/zlib CRC32 of exactly the 140 wire bytes, including padding; genuine CRC zero is valid. This does not cover spectral vectors. |
+| `calibration`, `spectral` | Observed blocks defined below, or null. Blocks and descendants inherit their single read's source/time/clock. No inferred calibrator, written/default/validity flag or calibration certification. |
+
+Each of the seven observation fields is an object with exactly
+`value,source,observed_uptime_ms,observed_utc_ms,clock`. Unavailable observations
+have **all five values null**. Identity/firmware/hardware/digest use source
+`identity_cache`; presence/calibration/spectral use `last_read`. These describe
+where the value came from, not a fresh UART read caused by inspection.
+`clock` is the quality at that observation: `{source:"rtc"|"hwm"|"sntp",
+suspect:boolean}`, or null if unavailable. UTC before 2024-01-01 is null;
+monotonic time can still be available. A suspect clock retains its suspect flag.
+Clock corrections never rewrite old stamps and never make age negative.
+
+Busy and stale snapshots retain historical values with their original stamps
+and generation. These are last observed attachments, not evidence of which
+sensor produced a measurement or where it was placed. A physical reconnect
+completely between observations cannot be counted; a changed MAC on the next
+identity confirmation invalidates old blocks before the replacement becomes
+known. No insertion detector is claimed.
+
+### Full calibration and spectral blocks
+
+Calibration value keys are `raw_base64` (canonical base64 of exactly 140 bytes),
+`ambit_name` (up to 20 UTF-8 bytes), `mlx_coef` (14 int32), `adpd` (6 uint32),
+`temp_offset,temp_slope,actinic_coef,spec_coef`, `act_50,act_100,act_150,act_200,
+act_250` (uint16), `mlx_emissivity,sun_coef,tick_factor`. Nonfinite float cells
+and invalid UTF-8 names are null individually; exact raw bytes and digest remain
+available. There is no validity/default inference from a zero coefficient.
+
+The 140-byte LE layout is name[20] at 0, mlx[14] at 20, adpd[6] at 76,
+four float32 at 100/104/108/112, five uint16 at 116..124, padding at 126..127,
+and float32 emissivity/sun/tick_factor at 128/132/136.
+
+Spectral value keys are `format:1`, `spec_offset,spec_sens,par_weight` (10
+float cells each), and `par_slope,par_intercept`. Wire subtype33/4 is exactly
+132 bytes: format/reserved at 0..3, LE float32 vectors at 4/44/84 and scalars
+at 124/128. Unknown format, wrong length or failed read never supplies invented
+vectors. Numeric firmware >=1.2.0 allows a bounded read attempt; lower/unknown
+versions, including 0.0.0 and JII0.0.6, do not. Binary numeric firmware cannot
+distinguish dev or stale tags, so only a validated 132-byte format1 response
+establishes observed spectral vectors.
+
+A bare CMD_END means unsupported for the attachment generation: no more
+spectral attempts until it changes. Timeout/garbage retries at most once per
+600,000 ms of available idle time per generation. Every failed spectral read
+leaves presence, identity, firmware, calibration, generation, state and stale
+unchanged; it never invalidates the attachment or becomes absence.
+
+### Refresh, exclusion and counters
+
+The existing resident maintenance worker drives automatic refresh, including
+while the schedule is stopped. Its queue wait follows the next due action,
+up to the 60 s revalidation interval, and is indefinite when no safe work is
+due. Between blocks the minimum spacing is 250 ms; there is no fixed 4 Hz
+polling loop. Retry/revalidation budgets accumulate only while the bank is
+available. Present/absent ports revalidate within 60 s of available idle time;
+without an idle window historical observations can become explicitly stale.
+
+Each refresh admits one bounded presence or cmd33 block. One absolute deadline
+covers locks, UART0 remapping, wake retries and response bytes; the 900 ms wire
+budget leaves scheduling margin under the 1,000 ms admission bound. A run's expected window excludes inspection across all four ports. After that
+window, a still-unproven or stalled port excludes only itself; other ports can
+refresh and identify between jobs. UART0 remapping and exclusive channel locks
+still serialize physical access. Maintenance lock, ROM flash/probe/versions,
+shared reset and runner exit cleanup veto all refresh atomically. Parallel-run
+identity setup finishes before the first trigger. Schedule jobs retain their
+veto across every action. Acquisition timeouts preserve historical identity,
+gains, currents and attachment generation. No acquisition failure introduces a
+shared-bank reset; the existing persistent-light cleanup policy is unchanged.
+
+A lost trigger ACK is treated as possibly running. Passing time alone never
+releases that port. Every typed run starts a separate monotonic uint64 run epoch
+(attachment generation is unchanged). The initial recovery delay, armed after
+the UART call returns, is `15,500 + 300*n + sum(ceil(pulses*1000/max(freq,1)))`
+ms for an array, or `15,500 + length*max(interval*100,100)` ms for MPF. This
+includes the slower normal engine allowances and a 15 s margin. It is an
+expected window, not a bound on faulty leaf execution: the free-run FIFO loop
+can stall indefinitely. No recovery wake or inspection is sent inside it.
+
+After that delay the resident worker may admit one acquisition-owned proof
+block with a 900 ms absolute deadline including channel/UART0 locks. First it sends a counted three-byte priming wake and listens for 100 ms,
+accepting exactly0x85,0x80,or0x85/0x80, plus exactly0x85 followed by the13-byte
+ASCII `BAD COMMAND\r\n`, optionally followed by one0x80. No other text,
+truncated notice, prefix, extra ACK or trailing byte is accepted. An idle
+sleeping leaf emits0x85 and usually consumes the waking bytes. IDF documents
+loss of the waking character and possibly following characters; a stray wake
+byte can reach the leaf's text router, which emits its unknown-command notice.
+The leaf remains unchanged at1.4.0 `18ebf07` (`ambit-1.ino`, `serial.cpp`,
+`do_command.h`). Priming never proves completion. After a
+drain it sends a new three-byte 0xAA burst and listens for a full 200 ms window. Exactly one
+0x80 is provisional. An extra 0x80, trailing 0xA1 or any other byte fails the
+window. After a 200 ms quiet gap and RX drain, it performs a second fresh
+exchange with another full 200 ms window. Verified numeric firmware >=1.1.2
+must answer the second fresh wake and cmd23 with exactly
+`0x80,0xA1,(0|1|2),0xF0`; older/unknown firmware uses a second clean wake only,
+without an unsupported opcode. Both proof exchanges must succeed cleanly in the same run epoch. The second
+exchange's first byte must be sent within 450 ms of the first proof window
+opening, enforced before and after transmission. This leaves 50 ms before the
+leaf's 500 ms re-sleep threshold (1,000 ms just after UART wake). A missed
+scheduling/budget deadline refuses the block without consuming a leaf-failure
+attempt; any bytes actually sent remain counted. Recovery never sends cmd33 and never resets or invalidates a
+port, increments attachment generation or changes gains/currents.
+
+The frozen wake response has no nonce. The accepted wire assumption is that
+the leaf emits 0x80 in its idle main loop, while mid-run bytes are consumed
+without a reply. A late ACK within one epoch is therefore only provisional
+idle evidence. A buffered wake plus a buffered next trigger can emit
+`0x80,0x80,0xA1` and start another run. The full windows reject that burst;
+the quiet gap (longer than the leaf's 5 ms flush and 100 ms header scan) and
+second fresh exchange reject a leaf that became busy again. A new run on the
+channel invalidates every earlier response window. Exclusive channel
+ownership, run-epoch checks before/during/after the proof, and pre/post-window
+RX drains discard superseded or out-of-window bytes with diagnostic logging.
+
+A refused lock, budget, boot grace or scheduling admission never consumes a
+leaf-failure attempt. Refusals re-arm after 1 s, doubling to a 60 s cap, so there
+is no fixed polling loop. A failed on-wire block keeps the port busy. Its
+retries wait at least 60 s, then 120 s,
+after the respective failure. After 3 failed blocks, `state:"stalled"` retains
+that port's exclusion with no further automatic recovery attempts. Other
+ports still refresh and satisfy uncached identity lookups. An explicit new
+acquisition starts a new epoch and retry budget; a recognized normal poll,
+successful fetch or an existing reset owner can clear the exclusion. Removing
+a leaf during a run can produce stalled, so this state is never claimed to be
+an observation of absence. The GUI labels it **stalled — completion unproven**.
+
+Top-level `refresh` has these saturating uint32 diagnostic counters (ms/us are
+monotonic, independent of wall-clock trust):
+
+| Key | Meaning |
+| --- | --- |
+| `wire_transactions[4]` | Inspection-refresh-origin transactions that actually transmitted their first wake byte, per port. Acquisition poll/fetch/run, OTA, versions and probe traffic do not increment it. |
+| `deferred_acquisition` | Refresh ticks actually refused because acquisition excludes all eligible ports or a job veto is active. Successful other-port refresh during a stall does not increment it. |
+| `run_start_waits`, `run_start_wait_max_us` | Run admission delays caused by an admitted refresh or recovery block, count and measured maximum. Bound 1,000,000 us. |
+| `job_start_waits`, `job_start_wait_max_us` | Queued maintenance/service jobs waiting behind one admitted refresh or recovery block, count and measured maximum. Bound 1,000,000 us; queued jobs take priority over another refresh. |
+| `stdout_hold_max_us` | Maximum actual plain-snapshot stdout FILE-lock hold. Bound 250,000 us, including a stalled reader; the deadline-aware USB sink stops after 200 ms emission budget. |
+| `pin_heap_bytes`, `pin_heap_peak_bytes` | Instrumented current/peak allocation charge for the volatile compact service pin. Bound 4,096 bytes. Allocation/free boundaries also sample internal heap. |
+
+Top-level `acquisition_recovery.wire_transactions[4]` counts each actual fresh
+recovery exchange at its wire origin (including failures), separately from
+`refresh.wire_transactions`. A clean block adds 3 (prime plus two proof exchanges); a silent prime adds 1. Waiting, a refusal before transmission or time passage adds 0. Both counters
+saturate at uint32 max and reset only on gateway boot. The three budgeted blocks can add at most 9 fresh exchanges. A scheduling
+refusal after transmission can add honestly counted bytes without spending a
+leaf-failure attempt; the refusal backoff still applies. Inspection counters for a stalled port
+remain fixed until an explicit acquisition/completion/reset changes its state.
+
+`acquisition_recovery.discarded_bytes[4]` is the saturating boot-local discard
+log for bytes rejected outside a valid reply window, by its exact grammar, or
+after its run epoch changed. It is machine-readable in every snapshot. The
+wire path records these counts without potentially blocking on stdout while
+holding the admission lease. It creates no measurement, event-store or NVS
+record. A shared-UART pre-remap drain is attributed to the attempted port.
+
+`acquisition_recovery.boot_idle[4]` counts actual 0x85 bytes seen by the priming
+window, saturated per boot. This lets hardware qualification prove that the
+sleep-wake priming path was exercised, alongside the two wire-origin counters.
+
+`acquisition_recovery.prime_notices[4]` counts accepted exact prime notices,
+per port, saturated per boot. The13 ASCII notice bytes also count in
+`discarded_bytes`; they are normalization observations, never acquisition
+proof. The HIL result has a per-block `prime_notices` count and preserves the
+notice in phase1's bounded hex trace. Both fresh proof exchanges remain
+mandatory even after a valid notice.
+
+The complete current schema has a conservative 12,302 JSON-byte maximum
+(12,307 physical bytes including separators), below the 16,384 parser cap.
+Output is streamed from a coherent compact snapshot, with no full-line heap
+allocation. A stalled USB reader can cause a partial rejected line; it cannot
+hold the stdout lock indefinitely. The next attempt starts on a fresh line.
+
+The gateway enables weak pull-ups on each AMBIT receive pad (GPIO3,17,47,40)
+at UART initialization. The shared UART remaps its input among these pads;
+IDF's remap enables input without changing pulls. A sleeping leaf can leave
+its TX undriven, so an unbiased RX can collect garbage or a coupled copy of
+the gateway's wake burst before the leaf's0x85 reply. The pull-up supplies
+UART's high idle level. It does not transmit a command or relax either
+completion-proof exchange. Physical qualification checks cold leaves before
+any run as well as leaves after a completed run.
+
+### Framed snapshot paging
+
+Service v1 adds `svc.sensors` and `svc.sensors.read` to svc.version.actions.
+Both require the current store binding. No operation ID is allocated, no
+highest_id changes, and no result/attachment file or NVS key is written.
+
+| Request body | Fields after existing ok/store |
+| --- | --- |
+| `svc.sensors` | `snapshot` nonzero 16-hex volatile token, `size` integer <=16,384, `sha256` digest of the exact JSON bytes with no newline, `chunk:576`. Replaces this session's prior pin. |
+| `svc.sensors.read <snapshot> <offset>` | `snapshot`, `offset` quoted eight lowercase hex, `crc32` eight lowercase hex over decoded bytes, `data` canonical base64, `eof` boolean. 576 decoded bytes except final short page; repeated offset is byte-identical. |
+
+For example, body `svc.sensors.read 0123456789abcdef 00000000` is wrapped in
+the existing nonzero correlation/CRC frame. Each response remains <=1,024 JSON
+and 1,043 wire bytes. Reassemble stop-and-wait, verify token/store/offset,
+per-page CRC/count/eof, final size and SHA, then strict JSON schema. A refresh,
+clock step or swap during paging cannot alter pinned bytes; obtain a new pin
+to observe the newer attachment generation.
+
+Pins expire after 60 s from capture or on replacement, unbind, session timeout,
+exit or reboot. Old token returns `snapshot_expired`; malformed arguments or
+offset >=size return `invalid_args`, missing provider `sensors_unavailable`,
+allocation failure `no_memory`, missing binding `not_bound`, and a known
+requested/bound store differing from the current store `store_changed`. Errors remain
+correlated and do not mutate durable operations. A failed response is never
+rescued by stripping plain prompt/log prefixes.
+
+Production client examples (same serial handle for every exchange):
+
+```python
+from flash_gui.ambyte_serial import connect_after_boot
+from flash_gui.service_client import ServiceClient
+from flash_gui.sensor_diagnostics import read_sensor_diagnostics
+
+model = read_sensor_diagnostics("/dev/ttyACM0")  # same callable as visible GUI diagnostics
+with connect_after_boot("/dev/ttyACM0", recover_service=True) as console:
+    observed = console.sensors()              # fresh identity capability check
+    session = ServiceClient(console._ser, None)  # read-only: no journal writes
+    try:
+        framed = session.sensors()           # fresh version/bind, CRC/digest/schema checks
+    finally:
+        session.exit()
+```
+
+Older valid identities without sensors produce a visible unavailable result,
+without unsafe ambit_info/probe/versions fallback. The real 2.5.0 unsupported
+identity response uses existing status MAC discovery, then unavailable sensor
+inspection. Silence/malformed advertised responses are errors, not empty ports.
+Current fleet tools do not parse the USB identity line; the B2a phone driver is
+the next consumer. Existing attached[] telemetry and ambit.device/1 event shapes
+remain unchanged; these observation fields do not become measurement evidence.
+
+Host qualification runs without a connected gateway:
+
+```sh
+CC=clang python3 -m unittest discover -s tests
+python3 -m pytest flash_gui/tests
+CC=clang python3 tests/sensors_host/run.py --matrix --seeds 1,7
+python3 tools/qualify_sensor_resources.py .pio/build/esp32-s3-devkitm-1 --output /tmp/sensor-resources.json
+```
+
+The default suite includes the real inventory/serializer, complete UART driver,
+console handler and service provider, and the exact resident-worker/maintenance
+admission functions. Matrix seeds drive 4,000 transitions each across swaps,
+absent/reconnected ports, busy/veto windows, failed reads and in-flight
+invalidation; they also exercise clock quality/rollback, zero CRC, generation
+exhaustion and unsupported/silent/malformed spectral replies. The controller
+harness counts actual event admissions and NVS setters/commits through the
+production announcement tracker and NVS adapter over 1,000 stable and 1,000
+flapping calibration revalidations. Ten production trace records are compared
+byte for byte with controller/trace source loaded from A3 `6a57c2a` by `git show`.
+The service harness checks allocator/digest failures, pin replacement, expiry,
+rebind, token exhaustion and cleanup through the real framed Python client.
+These host gates do not replace the same-image device resource and acquisition
+checks in the sprint contract.
+
+The maintenance worker reserves task notification index 0 for queue/refresh wakeups.
+Job handlers must not wait on that index. The pin heap charge takes the larger
+of allocator-reported size and the measured free-heap delta; concurrent allocation
+can increase this conservative sample. Bench pin attribution is measured with
+other allocation bursts quiet, while the isolation bursts use their separate
+free-heap and low-water bounds.
+
+Opening diagnostics can restart the gateway. The diagnostics callable keeps the
+same connection open and waits up to 10 s for identity/calibration observations,
+within its existing 45 s total startup/read deadline. If measurements leave no
+idle window, the panel says explicitly that no attachments have been observed
+since this gateway boot, or that some ports still await observations. It never
+reports never-observed ports as absent. Spectral data stays optional.
+
+### Bench-only recovery qualification
+
+Build `pio run -e sensors-recovery-hil` and record the SHA256 of its
+`firmware.bin` separately from the production `esp32-s3-devkitm-1` image.
+`CONFIG_AMBYTE_SENSOR_RECOVERY_HIL` is default-off and absent from release
+sdkconfig defaults. The existing PR `check_release_no_hil.py` gate rejects the
+bench symbol, command string or enabled effective config in a release image.
+The production image remains the image graded for F1/F6; this separate image
+exists only to exercise the physical completion-proof timing on demand.
+
+The bench command is `sensors_recovery_hil <0-3>`. It invokes exactly one
+production recovery block on the selected leaf, with JSON fields `port`,
+`recovery:"proven"|"failed"|"refused"`, and `proof:boolean`. Diagnostic fields
+`cli_affinity_before/after` report task affinity; `rx[7]` gives each phase's
+byte count, first/last relative microseconds and the first64 received bytes
+as hex. Phases0–6 are pre-drain, prime, post-prime drain, first proof, quiet
+gap drain, second proof and final drain. These bounded buffers and fields
+exist only in the HIL build and are printed after UART ownership is released.
+It deliberately
+bypasses the automatic expected-window/job-veto admission only in this build,
+while keeping channel ownership, reply validation and epoch fencing. An idle
+port gets a temporary run epoch; a running port keeps its existing epoch and
+acquisition. Idle synthetic epochs are cleared even on failure/refusal; a
+forced check on a real run is observe-only and does not spend its automatic
+retry budget, alter its expected window or clear its busy state. Manual HIL
+exchanges are additional honestly counted traffic, separate from the automatic
+three-block budget. This path adds no shared-bank reset or invalidation.
+
+With the bench released by the Planner, record these checks on the same open
+USB descriptor:
+
+1. Record both image digests, `identity`, `uart_status`, `sensors`, the exact
+   attached ports and schedule state. Wait for actual acquisitions to finish.
+2. For each attached leaf, issue at least20 consecutive
+   `sensors_recovery_hil <port>` calls, separated by at least1.2 s so the idle
+   light-sleep path is exercised. Every block must report `proven`:0 failed,
+   0 refused and0 stalled. Record `sensors` before/after, including inspection
+   and acquisition-recovery wire counters and the priming `boot_idle` count.
+3. Run a real trace job once as control. Repeat it and, during an actual
+   acquisition on the selected leaf, issue one recovery-HIL block. It must
+   report `failed` because that leaf is silent, keep the acquisition busy,
+   and leave inspection's active-window wire delta0. Stored trace point counts
+   per channel must equal the control with no error/interrupted marker.
+4. Return to the recorded production image for its F1/F6/F8 qualification;
+   attach the separate bench image's timing/counter evidence and digest.
+
+The Generator builds and hands over both images; flashing and physical checks
+belong to the Evaluator after the Planner releases the bench.
+
+### Service starvation guard
+
+ESP-IDF pins a task to its current core when that task first uses the FPU.
+The console starts without core affinity, but existing commands such as
+`read_env`, `record_env`, `selftest`, AMBIT temperature and PWM can pin it
+before it enters service. The sensor snapshot formatter uses integer IEEE
+conversion and software-double formatting to avoid adding another pinning
+trigger.
+
+At the service loop's lock-free boundary, after at least50 ms since its last
+cooperative pause, the target blocks with `vTaskDelay(1)`. One literal tick is
+a positive blocking request at the production100 Hz tick rate; its elapsed
+time can be less than10 ms depending on the tick phase. This gives lower
+priorities a scheduling opportunity during repeated ready service work. It
+does not feed the watchdog, change its timeout, bound an individual store
+call, or guarantee that other CPU work leaves the idle task runnable.
+
+The host ASan/UBSan scheduling model exercises the production session, engine
+and store with immediately ready traffic and synchronous storage CPU work;
+removing the pause makes that model detect starvation. This is wiring evidence,
+not a simulation of the bench USB traffic. Physical qualification includes
+`read_env` followed by768 sustained service requests on the final image and
+the matching image without this guard. The guard must prevent resets and the
+unguarded control must reproduce the failure. The sensors watchdog checks
+add plain `sensors` before both service traffic variants in the same boot.
