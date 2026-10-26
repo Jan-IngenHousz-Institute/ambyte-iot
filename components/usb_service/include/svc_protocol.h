@@ -30,6 +30,10 @@ typedef struct {
 typedef struct {
     bool (*sha256)(void *context, const void *bytes, size_t length, unsigned char out[32]);
     bool (*submit)(void *context, const svc_record_t *record, const char *password);
+    /* The engine supplies the monotonic application boot latch. A complete
+     * upload stays staging until this is true; no commit intent is persisted
+     * merely because the console started before the schedule runner. */
+    bool (*boot_ready)(void *context);
     void (*metrics)(void *context, svc_metrics_t *out);
     bool (*wifi_status)(void *context, svc_wifi_status_t *out);
     const char *(*sensors_capture)(void *context, uint64_t *token, size_t *size, char sha[65]);

@@ -138,6 +138,72 @@ def test_cancel_after_commit_preserves_intent_for_next_client(tmp_path):
     assert board.applies == board.commits == 1
 
 
+def test_startup_wait_reuses_staged_operation_until_ready(tmp_path):
+    c, board, clock = client(tmp_path)
+    board.boot_checks_remaining = 3
+    messages = []
+    assert upload(c, log=messages.append)["state"] == "succeeded"
+    assert len(board.records) == 1 and board.applies == 1
+    assert board.commits == 4 and clock() >= .6
+    assert sum("startup" in message.lower() for message in messages) == 1
+
+
+def test_startup_wait_deadline_preserves_full_staging_for_resume(tmp_path):
+    c, board, clock = client(tmp_path)
+    board.boot_checks_remaining = 100
+    with pytest.raises(svc.ServiceClientError, match="startup"):
+        upload(c, deadline_s=.5)
+    entry = c.journal.load()
+    assert entry["phase"] != "complete"
+    assert board.records[entry["op"]]["state"] == "staging"
+    assert board.data == BLOB and board.applies == board.aborts == 0
+    board.boot_checks_remaining = 0
+    resumed, _, _ = client(tmp_path, board, clock)
+    assert upload(resumed)["op"] == entry["op"]
+    assert len(board.records) == 1 and board.applies == 1
+
+
+def test_deadline_after_last_ack_does_not_blame_startup(tmp_path):
+    c, board, clock = client(tmp_path)
+    def slow_progress(message):
+        if f"Pushed {len(BLOB)}/{len(BLOB)}" in message:
+            clock.sleep(.5)
+    with pytest.raises(svc.UnknownOutcome, match="Transfer deadline reached"):
+        upload(c, deadline_s=.5, log=slow_progress)
+    assert board.commits == board.applies == 0 and board.data == BLOB
+    assert c.journal.load()["phase"] != "complete"
+
+
+def test_cancel_while_waiting_for_boot_aborts_staging(tmp_path):
+    c, board, _ = client(tmp_path)
+    board.boot_checks_remaining = 100
+    with pytest.raises(svc.TransferCancelled, match="before commit"):
+        upload(c, cancelled=lambda: board.commits > 0)
+    assert board.applies == 0 and board.aborts == 1
+    assert c.journal.load()["phase"] == "complete"
+
+
+def test_disconnect_while_booting_reconciles_same_complete_prefix(tmp_path):
+    board, clock = Device(), Clock()
+    board.boot_checks_remaining = 3
+    def reconnect(_remaining):
+        board.mode = board.bound = False
+        return Serial(board, clock)
+    c, _, _ = client(tmp_path, board, clock, reconnect=reconnect, cut=("schedule.commit", 1, "after"))
+    assert upload(c)["state"] == "succeeded"
+    assert len(board.records) == 1 and board.applies == 1 and board.data == BLOB
+    assert c.transport.counts.get("p", 0) == 0  # reconnect reads the full prefix
+
+
+def test_terminal_busy_is_not_retried_as_startup(tmp_path):
+    c, board, _ = client(tmp_path)
+    board.outcome, board.error_reason = "failed", "busy"
+    with pytest.raises(svc.ServiceError, match="busy"):
+        upload(c)
+    assert board.commits == 1 and len(board.records) == 1
+    assert c.journal.load()["phase"] == "complete"
+
+
 @pytest.mark.parametrize("state", ["failed", "aborted", "uncertain"])
 def test_terminal_nonsuccess_never_becomes_gui_success(tmp_path, state):
     c, board, _ = client(tmp_path)

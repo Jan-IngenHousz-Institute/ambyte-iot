@@ -34,6 +34,7 @@ class Device:
         self.before_admit = None
         self.outcome = "succeeded"
         self.error_reason = "compile_failed"
+        self.boot_checks_remaining = 0
 
     def answer(self, body):
         a = body.split(" ")
@@ -100,6 +101,9 @@ class Device:
             return dict(result, op=op, state="staging", offset=len(self.data))
         if action == "schedule.commit":
             self.commits += 1
+            if existing["state"] == "staging" and self.boot_checks_remaining:
+                self.boot_checks_remaining -= 1
+                return dict(result, ok=False, reason="booting")
             if existing["state"] == "staging":
                 self.applies += 1
                 existing["state"] = "committing"

@@ -54,9 +54,21 @@ class ServiceEngineTest(unittest.TestCase):
             if case == "already_active": self.assertFalse(result["applied"])
 
     def test_queue_and_maintenance_admission_failures_release_every_path(self):
-        for case in ("queue_full", "maintenance_busy", "not_ready"):
+        for case in ("queue_full", "maintenance_busy"):
             result = self.run_case(case, root=Path(self.temp.name) / case)
             self.assertEqual((result["state"], result["reason"]), ("failed", "busy"))
+
+    def test_early_commit_remains_staged_until_boot_then_applies_once(self):
+        result = self.run_case("boot_wait")
+        self.assertEqual((result["state"], result["applied"], result["offset"]), ("succeeded", True, 3))
+
+    def test_early_commit_can_be_aborted_without_a_worker(self):
+        result = self.run_case("boot_abort")
+        self.assertEqual((result["state"], result["reason"]), ("aborted", "aborted"))
+
+    def test_not_ready_never_turns_staging_into_terminal_busy(self):
+        result = self.run_case("not_ready")
+        self.assertEqual((result["state"], result["reason"], result["offset"]), ("staging", "", 3))
 
     def test_wifi_success_and_failure_describe_distinct_restoration(self):
         result = self.run_case("wifi_success")

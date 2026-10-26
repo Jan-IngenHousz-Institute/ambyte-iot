@@ -540,9 +540,10 @@ class ServiceClient:
         descriptor = schedule_descriptor(blob, sha256, version, built_fw, workbook)
         self._deadline = self.clock() + deadline_s
         entry = None
+        startup_seen = False
 
         def transfer():
-            nonlocal entry
+            nonlocal entry, startup_seen
             if entry is None:
                 entry = self._intent(descriptor, new_request=new_request)
             result = self._read_intent(entry)
@@ -599,10 +600,32 @@ class ServiceClient:
                     raise ProtocolError("Staging measurement cleanup is not confirmed.")
                 return result
             self._phase(entry, "committing")
-            # The immediate reply is not completion evidence. Read the complete
-            # stored result even when commit itself returned a terminal result.
-            self._result(self._exchange(f"schedule.commit {entry['op']}"), entry["op"])
-            return self._poll(entry, cancelled)
+            while self.clock() < self._deadline:
+                if cancelled():
+                    self.abort(entry)
+                    raise TransferCancelled("Schedule transfer cancelled before commit.")
+                try:
+                    ack = self._exchange(f"schedule.commit {entry['op']}")
+                except ServiceError as error:
+                    if error.reason != "booting":
+                        raise
+                    # This explicit refusal guarantees the operation is still
+                    # staging. Keep its ID, bytes and original deadline; never
+                    # reinterpret a terminal busy or transport loss as booting.
+                    if not startup_seen:
+                        if log:
+                            log("Device startup is still running; waiting to commit the staged schedule...")
+                        startup_seen = True
+                    self.sleep(min(0.2, max(0, self._deadline - self.clock())))
+                    continue
+                # The immediate reply is not completion evidence. Read the full
+                # stored result even when commit returned a terminal result.
+                self._result(ack, entry["op"])
+                return self._poll(entry, cancelled)
+            if startup_seen:
+                raise ServiceClientError("Device startup did not finish before the transfer deadline; "
+                                         "the staged schedule is saved and can be resumed after startup.")
+            raise UnknownOutcome("Transfer deadline reached; the saved operation can be read after reconnecting.")
 
         try:
             return self._recover(transfer, new_request=new_request)

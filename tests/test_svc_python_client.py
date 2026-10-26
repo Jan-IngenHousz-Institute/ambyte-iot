@@ -23,8 +23,9 @@ class PipeSerial:
     timeout = 0.1
     write_timeout = 5.0
 
-    def __init__(self, binary, root, drop_put=None):
-        self.process = subprocess.Popen([str(binary), str(root)], stdin=subprocess.PIPE,
+    def __init__(self, binary, root, drop_put=None, boot_checks=None):
+        args = [str(binary), str(root)] + ([] if boot_checks is None else [str(boot_checks)])
+        self.process = subprocess.Popen(args, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         self.is_open = True
         self.drop_put, self.puts, self.commits = drop_put, 0, 0
@@ -125,6 +126,18 @@ class ServicePythonClientTest(unittest.TestCase):
         self.assertEqual((result["state"], result["offset"], result["sha256"], result["applied"]), ("succeeded", 16384, SHA, True))
         self.assertEqual((self.root / "device/stage.bin").read_bytes(), BLOB)
         self.assertEqual(port.puts, 114)
+        self.assertIn("apply_count=1", port.close())
+
+    def test_full_upload_during_boot_waits_and_commits_the_same_id_once(self):
+        client, port = self.peer(boot_checks=5)
+        blob = b"x" * 2002
+        messages = []
+        result = client.upload_schedule(blob, hashlib.sha256(blob).hexdigest(), "1.3.0", "v2.9.0", log=messages.append)
+        self.assertEqual((result["state"], result["offset"], result["applied"]), ("succeeded", 2002, True))
+        self.assertEqual(result["op"], "0000000000000001")
+        self.assertTrue(any("startup" in message.lower() for message in messages))
+        self.assertEqual(port.puts, 14)
+        self.assertGreater(port.commits, 1)  # only explicit booting refusals are retried
         self.assertIn("apply_count=1", port.close())
 
     def test_new_device_and_client_process_resume_durable_prefix(self):

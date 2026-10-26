@@ -165,6 +165,16 @@ def test_gui_service_selects_real_client_and_checks_json_after_exit(bench):
     assert all(not ser.is_open for ser in bench.handles)
 
 
+def test_gui_waits_for_startup_before_activating_staged_schedule(bench):
+    device = GuiDevice()
+    device.boot_checks_remaining = 3
+    result, device, _ = bench.run(device)
+    assert result.passed and device.applies == 1 and len(device.records) == 1
+    assert device.data == BLOB
+    assert any("startup" in message.lower() for message in bench.logs)
+    assert device.plain[-3:] == ["identity", "schedule release", "identity"]
+
+
 @pytest.mark.parametrize("identity", [True, False])
 def test_gui_no_svc_uses_existing_legacy_push(bench, identity):
     result, device, _ = bench.run(GuiDevice(svc=False, identity=identity))

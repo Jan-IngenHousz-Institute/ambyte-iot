@@ -141,7 +141,33 @@ int main(int argc, char **argv)
     svc_engine_init(&engine, &store, &ports);
     dispatch("svc.bind 0000000000000001");
     svc_record_t r;
-    if (!strncmp(scenario, "recover_", 8)) {
+    if (!strncmp(scenario, "boot_", 5)) {
+        dispatch("schedule.begin 0000000000000001 00000003 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad a3 test -");
+        dispatch("p 0000000000000001 00000000 352441c2 YWJj");
+        for (unsigned i = 0; i < 3; ++i) {
+            assert(strstr(dispatch("schedule.commit 0000000000000001"), "\"reason\":\"booting\""));
+            assert(!svc_store_get(&store, 1, &r));
+            assert(r.state == SVC_STAGING && r.offset == r.size && !r.reason[0]);
+            assert(!engine.worker_owned && !pending && !submissions && !applications);
+            assert(!svc_engine_tick(&engine));
+        }
+        if (!strcmp(scenario, "boot_abort")) {
+            assert(strstr(dispatch("svc.abort 0000000000000001"), "aborted"));
+            boot_ready = true;
+            assert(strstr(dispatch("schedule.commit 0000000000000001"), "operation_complete"));
+            assert(!pending && !submissions);
+        } else {
+            /* Session loss/re-entry must leave the complete staging available. */
+            svc_engine_reset_session(&engine);
+            dispatch("svc.bind 0000000000000001");
+            boot_ready = true;
+            assert(strstr(dispatch("schedule.commit 0000000000000001"), "committing"));
+            assert(strstr(dispatch("schedule.commit 0000000000000001"), "committing"));
+            assert(submissions == 1);
+            run_pending();
+        }
+        assert(!svc_store_get(&store, 1, &r));
+    } else if (!strncmp(scenario, "recover_", 8)) {
         assert(!svc_store_get(&store, 1, &r));
         svc_state_t before = r.state;
         assert(strstr(dispatch("svc.active"), svc_terminal(before) ? "\"active\":null" : svc_state_name(before)));

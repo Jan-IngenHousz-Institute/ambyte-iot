@@ -129,6 +129,14 @@ permits at most two automatic reconnects within the six-minute transfer budget.
 Opening a port keeps DTR and RTS deasserted; a board that resets on USB reopen is
 allowed to boot before recovery. A fresh identity must prove the same gateway.
 
+The console can appear while AMBIT startup is still running. On firmware that
+reports `booting` for an early schedule commit, the GUI keeps the complete
+upload staged, logs that it is waiting for startup, and retries the same commit
+within the original six-minute budget. You can cancel while it is still staged.
+If startup outlasts the budget, **Retry provisioning** resumes the saved upload.
+Older firmware's terminal `busy` result still reports a failure and needs an
+explicit retry after startup; automatic waiting requires updated firmware and GUI.
+
 Success requires a durable successful result for the exact descriptor. After
 exiting service mode, the GUI independently checks identity JSON for the loaded
 source, digest, workbook and version, plus release metadata for verified/running
