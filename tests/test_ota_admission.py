@@ -3,18 +3,15 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pinned_idf import pinned_idf
 
 ROOT=Path(__file__).resolve().parents[1]
-IDF=Path.home()/".platformio/packages/framework-espidf@3.50500.0"
-if not IDF.exists():
-    IDF=Path.home()/".platformio/packages/framework-espidf"
-if not (IDF/"version.txt").exists() or (IDF/"version.txt").read_text().strip()!="5.5.0":
-    raise RuntimeError("Install the pinned espressif32@6.12.0 / IDF5.5.0 packages before host tests")
 
 
 class AdmissionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        IDF = pinned_idf()
         cls.temp=tempfile.TemporaryDirectory();cls.binary=Path(cls.temp.name)/"admission"
         includes=[ROOT/"tests/ota_host/include",ROOT/"tests/svc_host/jobs_include",ROOT/"tests/svc_host/include",
                   ROOT/"tests/identity_host/include",ROOT/"tests/wifi_manager_stubs",IDF/"components/json/cJSON"]

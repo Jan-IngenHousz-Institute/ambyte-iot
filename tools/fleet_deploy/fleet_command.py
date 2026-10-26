@@ -25,8 +25,6 @@ import queue
 import sys
 import time
 
-from awscrt import mqtt
-
 try:
     import fleet_deploy
 except ImportError:
@@ -159,6 +157,10 @@ def main(argv=None):
         for d in devices:
             print("  ", d)
         return 0
+
+    # Payload building, bench admission checks and mocked transports need no
+    # AWS SDK. Match fleet_deploy's lazy dependency boundary for live MQTT.
+    from awscrt import mqtt
 
     by_identity = fleet_deploy.device_index(devices)
     q = queue.Queue()

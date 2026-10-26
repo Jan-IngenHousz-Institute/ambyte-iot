@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from pinned_idf import pinned_idf
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -13,10 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class TelemetryPublishTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cjson = pinned_idf() / "components/json/cJSON/cJSON.c"
         cls.tmp = tempfile.TemporaryDirectory()
         cls.binary = Path(cls.tmp.name) / "telemetry_publish"
-        packages = Path(os.environ.get("PLATFORMIO_CORE_DIR", str(Path.home() / ".platformio"))) / "packages"
-        cjson = sorted(packages.glob("framework-espidf*/components/json/cJSON/cJSON.c"))[0]
         subprocess.run([
             os.environ.get("CC", shutil.which("clang") or "cc"),
             "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror",

@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pinned_idf import pinned_idf
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,13 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class UartStreamBridgeTest(unittest.TestCase):
     def test_production_scanner_sink_deadline_and_json_helpers(self):
-        platformio_home = Path(
-            os.environ.get("PLATFORMIO_CORE_DIR", Path.home() / ".platformio")
-        )
-        cjson_dir = (
-            platformio_home
-            / "packages/framework-espidf/components/json/cJSON"
-        )
+        cjson_dir = pinned_idf() / "components/json/cJSON"
         cjson_source = cjson_dir / "cJSON.c"
         self.assertTrue(
             cjson_source.is_file(),
