@@ -1,0 +1,9 @@
+L2648: W (260457) iot_jobs: job [request] -> FAILED (signature_invalid)
+L2784: W (469827) iot_jobs: job [request] -> FAILED (signature_invalid)
+L2935: W (675787) iot_jobs: job [request] -> FAILED (signature_invalid)
+L3050: W (883727) iot_jobs: job [request] -> FAILED (signature_invalid)
+L3216: W (1094537) iot_jobs: job [request] -> FAILED (fallback_cannot_read_written)
+L3279: W (1168487) iot_jobs: job [request] -> FAILED (candidate_manifest_invalid)
+L3886: W (20197) ota_update: image confirmed valid (MQTT + persistence healthy)
+L3892: W (20297) iot_jobs: job [request] -> SUCCEEDED (running this version)
+L4032: SELFTEST PASS passed=10 failed=0 fw=2.8.0-a5-r2 mac=[MAC]

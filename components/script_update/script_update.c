@@ -765,7 +765,7 @@ const char *script_update_service_apply(const script_service_descriptor_t *d, bo
 
 static void do_update_url_impl(const script_req_t *r)
 {
-    ESP_LOGW(TAG, "script_update(url) id=%s: %s", r->id[0] ? r->id : "(none)", r->text);
+    ESP_LOGW(TAG, "script_update(url) id=%s url_length=%u", r->id[0] ? r->id : "(none)", (unsigned)strlen(r->text));
     char detail[192] = "";
 
     if (s_cfg.workload_suspend == NULL || s_cfg.workload_resume == NULL) {
