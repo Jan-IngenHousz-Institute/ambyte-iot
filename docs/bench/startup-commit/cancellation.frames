@@ -1,0 +1,15 @@
+00000000 {"ok":false,"store":"b43fe702a1a0bed2","reason":"mode_required"}*b232d57f
+00000000 {"ok":true,"store":"b43fe702a1a0bed2","service":1,"state":"ready"}*defeaf52
+00000002 {"ok":true,"store":"b43fe702a1a0bed2","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active","svc.sensors","svc.sensors.read"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"000000000000001a"}*67c95b10
+00000003 {"ok":true,"store":"b43fe702a1a0bed2","state":"bound"}*33212386
+00000004 {"ok":true,"store":"b43fe702a1a0bed2","op":"000000000000001a","kind":"schedule","state":"staging","reason":"","offset":2002,"size":2002,"sha256":"a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184","workbook":"11111111-2222-4333-8444-555555555555","version":"pr87-cancel","built_fw":"2.10.1-startup-qual.1","applied":false}*facfca13
+00000005 {"ok":false,"store":"b43fe702a1a0bed2","reason":"booting"}*27ebc109
+00000006 {"ok":true,"store":"b43fe702a1a0bed2","op":"000000000000001a","kind":"schedule","state":"staging","reason":"","offset":2002,"size":2002,"sha256":"a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184","workbook":"11111111-2222-4333-8444-555555555555","version":"pr87-cancel","built_fw":"2.10.1-startup-qual.1","applied":false}*82cab218
+00000007 {"ok":true,"store":"b43fe702a1a0bed2","op":"000000000000001a","state":"aborted","reason":"aborted"}*80150dbd
+00000008 {"ok":true,"store":"b43fe702a1a0bed2","state":"exit"}*1970498a
+00000000 {"ok":false,"store":"b43fe702a1a0bed2","reason":"mode_required"}*b232d57f
+00000000 {"ok":true,"store":"b43fe702a1a0bed2","service":1,"state":"ready"}*defeaf52
+0000000a {"ok":true,"store":"b43fe702a1a0bed2","service":1,"actions":["svc.version","svc.bind","svc.result","svc.stats","schedule.begin","p","schedule.commit","svc.abort","svc.wifi.join","svc.wifi.status","svc.exit","svc.active","svc.sensors","svc.sensors.read"],"max_line":248,"chunk":144,"result_slots":8,"highest_id":"000000000000001a"}*95c0f81d
+0000000b {"ok":true,"store":"b43fe702a1a0bed2","state":"bound"}*2414e7a4
+0000000c {"ok":true,"store":"b43fe702a1a0bed2","op":"000000000000001a","kind":"schedule","state":"aborted","reason":"aborted","offset":2002,"size":2002,"sha256":"a83a61749727bb9160cf4dd4c7b514b8ed38f54f795f9d15d65200f4651b1184","workbook":"11111111-2222-4333-8444-555555555555","version":"pr87-cancel","built_fw":"2.10.1-startup-qual.1","applied":false}*6ff22b46
+0000000d {"ok":true,"store":"b43fe702a1a0bed2","state":"exit"}*fa6bc985

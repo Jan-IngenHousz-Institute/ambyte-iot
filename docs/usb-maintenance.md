@@ -763,8 +763,13 @@ boundary and the installer substituted. `tests/test_svc_engine.py` additionally
 checks repeated early commits, cancellation, session re-entry and one worker
 submission; service-client tests cover deadline, disconnect and terminal-busy
 behavior, and a GUI/procedure test checks waiting through verified activation.
-These are host checks. A physical-device boot/schedule-install capture is still
-required for hardware qualification; no hardware capture is claimed here.
+These are host checks. The [PR #87 physical qualification](bench/startup-commit/README.md)
+additionally records six early-commit `booting` refusals followed by successful
+activation of the same retained 2,002-byte upload, cancellation during startup,
+and restoration of the bench's released firmware and exact original schedule.
+Its [activation capture](images/usb-service/startup-install.png) and
+[cancellation capture](images/usb-service/startup-cancel.png) are rendered from
+the recorded physical responses and timed event logs, with image/source attribution.
 
 Updated clients continue to report terminal `busy` on older firmware that lacks
 this refusal. Updated firmware safely leaves staging intact if an older client
