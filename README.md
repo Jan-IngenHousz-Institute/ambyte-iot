@@ -149,7 +149,7 @@ AMBYTE_REQUIRE_PINNED_IDF=1 uv run --locked --group test pytest \
 
 Python statement/branch coverage covers first-party `tools/` and `flash_gui/`,
 including Python CLI subprocesses and multiprocessing workers. It excludes GUI
-test helpers and the generated timezone table, and does not measure firmware C
+test helpers, bundled vendor code, and the generated timezone table, and does not measure firmware C
 coverage. The production C harnesses retain their ASan/UBSan checks, fault
 injection, seeds, and repetitions. CI uploads XML/HTML coverage separately from
 release candidates; no minimum percentage is imposed. Without the pinned SDK,

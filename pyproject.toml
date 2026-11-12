@@ -24,7 +24,7 @@ pythonpath = [".", "tests"]
 [tool.coverage.run]
 branch = true
 source = ["tools", "flash_gui"]
-omit = ["flash_gui/tests/*", "flash_gui/tz_zone_table.py"]
+omit = ["flash_gui/tests/*", "flash_gui/tz_zone_table.py", "*/vendor/*"]
 relative_files = true
 # Preserve first-party Python coverage from forked workers and Python CLI
 # subprocesses. C harnesses still run with their own ASan/UBSan instrumentation;
@@ -35,6 +35,7 @@ patch = ["subprocess"]
 
 [tool.coverage.report]
 include_namespace_packages = true
+omit = ["*/vendor/*"]
 
 [dependency-groups]
 test = [
