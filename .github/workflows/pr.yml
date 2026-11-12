@@ -172,8 +172,10 @@ jobs:
           AMBYTE_REQUIRE_PINNED_IDF: "1"
         run: >-
           uv run --locked --group test pytest
+          -n 2 --dist=loadfile --max-worker-restart=0
           --cov --cov-report=term-missing:skip-covered
           --cov-report=xml:coverage.xml --cov-report=html:htmlcov
+          --junitxml=python-tooling-junit.xml
           --durations=20 -ra
 
       - name: Upload Python tooling coverage
@@ -184,6 +186,8 @@ jobs:
           path: |
             coverage.xml
             htmlcov/
+            python-tooling-junit.xml
+            python-tooling-timings.json
           if-no-files-found: error
           retention-days: 30
 
@@ -223,8 +227,8 @@ jobs:
       - name: Check unsigned signing intermediate and recovery config
         if: steps.scope.outputs.firmware-build-required == 'true'
         run: |
-          python tools/check_release_signing.py --self-test
-          python tools/check_release_signing.py --intermediate \
+          uv run --locked --group test python tools/check_release_signing.py --self-test
+          uv run --locked --group test python tools/check_release_signing.py --intermediate \
             --elf .pio/build/esp32-s3-devkitm-1/firmware.elf \
             --bin .pio/build/esp32-s3-devkitm-1/firmware.bin \
             --sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json

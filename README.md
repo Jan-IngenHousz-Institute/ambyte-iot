@@ -143,8 +143,10 @@ support for the existing unittest cases, module/class fixtures, and subtests:
 uv sync --locked --group test
 pio pkg install -e esp32-s3-devkitm-1  # install the qualified SDK before testing
 AMBYTE_REQUIRE_PINNED_IDF=1 uv run --locked --group test pytest \
+  -n 2 --dist=loadfile --max-worker-restart=0 \
   --cov --cov-report=term-missing:skip-covered \
-  --cov-report=xml:coverage.xml --cov-report=html:htmlcov --durations=20 -ra
+  --cov-report=xml:coverage.xml --cov-report=html:htmlcov \
+  --junitxml=python-tooling-junit.xml --durations=20 -ra
 ```
 
 Python statement/branch coverage covers first-party `tools/` and `flash_gui/`,
@@ -154,6 +156,12 @@ measure firmware C coverage. The production C harnesses retain their ASan/UBSan 
 injection, seeds, and repetitions. CI uploads XML/HTML coverage separately from
 release candidates; no minimum percentage is imposed. Without the pinned SDK,
 the command above fails instead of silently skipping its coverage.
+
+Two pytest processes schedule whole files, preserving each unittest module/class
+fixture once per file. The nested storage pool is capped and leaves a CPU for
+the other worker. Inclusive setup/call/teardown module timings and the storage
+prebuild, pool, child CPU and all scenario timings are saved in
+`python-tooling-timings.json`; JUnit and coverage reports accompany it in CI.
 
 ## Build, flash, monitor
 
