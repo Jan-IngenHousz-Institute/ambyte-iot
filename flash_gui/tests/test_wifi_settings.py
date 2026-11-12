@@ -420,7 +420,7 @@ def test_deployment_save_reports_post_save_connection_failure_separately(usb, re
     assert not device.joins
 
 
-@pytest.mark.parametrize("result", ["ESP_FAIL", "ESP_ERR_INVALID_STATE", "WIFI_MANAGER_ERR_DRIVER_UNRESOLVED"])
+@pytest.mark.parametrize("result", ["ESP_FAIL", "ESP_ERR_INVALID_STATE", "WIFI_MANAGER_ERR_DRIVER_UNRESOLVED", "ESP_ERR_WIFI_STATE"])
 def test_unconfirmed_save_never_claims_credentials_stored_or_exposes_password(usb, result):
     device, _, _ = usb
     device.legacy_result = result
@@ -428,6 +428,8 @@ def test_unconfirmed_save_never_claims_credentials_stored_or_exposes_password(us
     with pytest.raises(wifi_settings.WifiSettingsError, match="could not be confirmed") as error:
         wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
     assert error.value.uncertain and "synthetic-password" not in str(error.value)
+    if result == "ESP_ERR_WIFI_STATE":
+        assert "busy trying to connect" in str(error.value) and "same credentials is safe" in str(error.value)
     assert len([c for c in device.plain if c.startswith("wifi_join ")]) == 1
 
 

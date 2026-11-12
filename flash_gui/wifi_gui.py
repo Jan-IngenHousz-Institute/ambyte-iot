@@ -161,7 +161,7 @@ class WifiDialog(tk.Toplevel):
                 self.message.set(f"Wi-Fi saved and connection confirmed for {result.ssid} on {info.mac}.")
             else:
                 self.message.set(f"Wi-Fi saved for {result.ssid} on {info.mac}. Connection not confirmed; "
-                                 "the Ambyte will retry when the hub is available.")
+                                 "power-cycle at deployment if it does not connect when the hub is available.")
         action = (lambda: wifi_settings.update_wifi(info, ssid, password, new_request=new_request)) if test_connection else (
             lambda: wifi_settings.save_wifi(info, ssid, password))
         self._start(action, apply,

@@ -191,7 +191,8 @@ internet connection on the computer is required.
    SSIDs accept 1–31 UTF-8 bytes and passwords 8–63 printable ASCII characters.
 4. Wait for **Wi-Fi saved** before disconnecting USB. A separate message says
    whether the connection was confirmed. Without a reachable hub, the credentials
-   stay saved for deployment and the board retries in the field. Service firmware
+   stay saved for deployment. Power-cycle at deployment if the board does not
+   connect when the hub is available. Service firmware
    may need up to three minutes for startup first. USB errors and unexpected
    firmware results are reported as unconfirmed, never retried automatically.
    Existing MQTT certificates, registration, firmware and schedule remain intact.

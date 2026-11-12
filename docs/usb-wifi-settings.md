@@ -40,6 +40,7 @@ writes the credentials before waiting for a connection, so the destination hub
 can be absent while boards are prepared. The message separates **saved** from
 **connection confirmed**. This deliberately overwrites the previous network,
 including when a password is mistyped. Check the password before saving.
+Power-cycle at deployment if the board does not connect when its hub is available: newer firmware bounds retries, and older firmware may stop retrying sooner.
 
 **Test & save** is optional on service-capable firmware (v2.9.0+). It uses
 `svc.wifi.join`: try credentials in RAM, save after getting an IP, otherwise
@@ -80,15 +81,25 @@ sequenceDiagram
 For a persistent save, only `ESP_OK`, `ESP_ERR_TIMEOUT`, and
 `WIFI_MANAGER_ERR_AUTH_REJECTED` are recognized as post-save results. Only
 `ESP_OK` confirms an IP connection. Other errors can arise before persistence,
-so they report an unconfirmed save and no automatic retry. The command and its
+so they report an unconfirmed save and no automatic retry. `ESP_ERR_WIFI_STATE`
+can mean the driver was busy trying the old network. Wait a few seconds and
+explicitly save the same credentials again; repeating them is safe. The command and its
 password-bearing echo never leave the backend. A lost reply has no operation ID;
 **Check saved result** describes earlier service operations, not this console
-save. The operator must inspect the device before explicitly sending again.
+save. Read the device again to confirm its identity, then explicitly save the same
+credentials again if needed. A device read does not expose its stored password
+or prove a previous save.
 
 Before a persistent save, the MAC-keyed journal lease blocks every unresolved
 host operation. On service firmware, a read-only service check also refuses
 another active operation before returning to the console and rechecking the MAC.
 These checks never archive or cancel another operation to make a save proceed.
+An interrupted service Wi-Fi trial must still be resolved before Save: check its
+result, or explicitly start a new trial. An expired result may therefore need an
+explicit terminal trial (even a failed one) before offline Save is available.
+CLI saves do not take the firmware maintenance lock. Wait for any remotely
+started firmware update to finish before changing Wi-Fi, to avoid dropping its
+network connection.
 
 ## Recovery and failures
 
@@ -98,7 +109,7 @@ flowchart TD
     Choice -->|Save Wi-Fi| Guards[Check identity and unresolved work]
     Guards -->|Clear| Save[Send persistent command once]
     Save -->|Known post-save reply| Saved[Saved, connection state reported separately]
-    Save -->|Lost or ambiguous reply| Unknown[Save unconfirmed, inspect device before retry]
+    Save -->|Lost or ambiguous reply| Unknown[Save unconfirmed, check identity and explicitly retry]
     Choice -->|Test and save| Trial[Journaled service trial]
     Trial -->|Reply lost| Recover[Check saved result by operation ID]
     Trial -->|Definite result| Evidence[Report saved and restoration evidence]
@@ -174,3 +185,35 @@ two images, not qualification of every firmware release or cloud ingestion.
 The final host suite passed 485 tests and 29 subtests; the additional production
 C framing/editor filter suite passed all 11 tests with ASan/UBSan.
 That first qualification did not include a real Tk desktop session.
+
+
+### Offline-save qualification (GUI correction)
+
+The default persistent save was exercised on the same physical Ambyte with
+firmware 2.13.0 and an installed workbook. The synthetic destination hub was
+absent. **Save Wi-Fi** returned `connected=False`, then a reboot and private NVS
+readback verified the exact SSID and password were stored. CA, device certificate
+and private-key fingerprints matched the original baseline.
+
+Restoration through fresh public-API sessions hit `ESP_ERR_WIFI_STATE` while the
+old network was unavailable. The result remained unconfirmed. An explicit bench
+restore using the same persistent command on one descriptor succeeded, and the
+original network connected after reboot. Its SSID/password, certificate
+fingerprints and MQTT/config keys matched the private baseline; firmware and the
+installed schedule SHA were unchanged. The private backup was removed. This is
+also why the GUI gives a specific wait-and-explicitly-save-again hint for that
+error rather than claiming success or retrying silently.
+
+A real Tk desktop lifecycle check used a synthetic device-read fixture and
+verified modal construction, worker completion, both action labels, grab release
+and the app busy gate on close. It did not send credentials. The updated GUI
+suite passes **502 tests and 29 subtests**; the production C wire/filter suite
+passes **11 tests and 13 subtests** under ASan/UBSan with `CC=clang`. Both new
+Mermaid diagrams were rendered with mermaid-cli.
+
+![Offline save, reboot persistence and original-network restoration](images/offline-wifi-save/offline-save-2.13.png)
+
+[Redacted qualification transcript](images/offline-wifi-save/qualification.txt).
+The production GUI never reads passwords or certificates back; private NVS
+readback was used only to qualify persistence. This run qualifies the 2.13.0
+image, with host coverage for older firmware, rather than every firmware image.

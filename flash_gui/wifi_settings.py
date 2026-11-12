@@ -201,8 +201,14 @@ def _legacy_join(console, ssid, password, *, require_connection=True):
         return WifiResult(ssid, False)
     if match[1] != "ESP_OK":
         if not require_connection:
+            if match[1] == "ESP_ERR_WIFI_STATE":
+                raise WifiSettingsError(
+                    "Wi-Fi save could not be confirmed (ESP_ERR_WIFI_STATE). The Ambyte was busy trying to connect. "
+                    "Wait a few seconds and explicitly Save Wi-Fi again; resending the same credentials is safe.",
+                    uncertain=True)
             raise WifiSettingsError(
-                f"Wi-Fi save could not be confirmed ({match[1]}). The credentials may have changed; read the device before another attempt.",
+                f"Wi-Fi save could not be confirmed ({match[1]}). The credentials may have changed. "
+                "Read the device again to check its identity, then explicitly Save Wi-Fi again with the same credentials if needed.",
                 uncertain=True)
         raise WifiSettingsError(
             f"Wi-Fi connection failed ({match[1]}). Older firmware may have saved the new credentials and may keep retrying; check the hub and password.")

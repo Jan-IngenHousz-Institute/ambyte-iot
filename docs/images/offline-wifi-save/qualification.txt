@@ -1,0 +1,26 @@
+Offline Wi-Fi save qualification — physical USB, 2026-11-12
+Board 28:37:2F:FF:E7:04, firmware 2.13.0, installed schedule INSTALLED
+PASS original credentials privately backed up; no credentials emitted
+PASS default save returned saved with connection unconfirmed for an unavailable test hub
+PASS after reboot: test SSID AND password persisted without a successful connection
+PASS CA, device certificate and private-key fingerprints unchanged
+BENCH FAILED: WifiSettingsError (raw error suppressed to protect credentials)
+Recovery: restoring original network after an unconfirmed save reply
+Restore attempt 1: unconfirmed, code=ESP_ERR_WIFI_STATE; no raw reply emitted
+Restore attempt 2: unconfirmed, code=ESP_ERR_WIFI_STATE; no raw reply emitted
+Recovery: restoring original network after an unconfirmed save reply
+Same-descriptor restore attempt 1: save confirmed, connected=True
+PASS original Wi-Fi connected after reboot; MAC, firmware and installed schedule SHA unchanged
+PASS restored SSID/password, unchanged MQTT/config keys and certificate fingerprints verified from NVS
+PASS private backup and credentials removed
+
+Synthetic test SSID: Ambyte-offline-test-FF-E7-04
+NVS password equality was asserted privately; password is omitted.
+The failed public-API restore used fresh sessions and hit ESP_ERR_WIFI_STATE.
+Explicit bench restoration then used persistent wifi_join on one descriptor.
+No automatic GUI resend was added.
+PASS real Tk modal lifecycle with a synthetic device-read fixture: constructor, worker callback, both actions, grab release and busy release
+PASS GUI host suite: 502 tests and 29 subtests
+PASS production C wire/filter suite with ASan/UBSan (CC=clang): 11 tests and 13 subtests
+PASS both documentation Mermaid diagrams rendered with mermaid-cli
+Bench NVS reads were qualification-only; production Save uses USB console commands and never reads secrets back.
