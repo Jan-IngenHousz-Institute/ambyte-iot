@@ -2,6 +2,7 @@
 import argparse
 import importlib
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -54,10 +55,49 @@ class BuildMessage(unittest.TestCase):
             self.assertNotIn("from_id", msg)
             self.assertEqual(msg["mode"], mode)
 
+    def test_ambit_flash_with_manifest_url(self):
+        url = "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.4.0/manifest.json"
+        msg = self.fc.build_message(_args(cmd="ambit-flash", version="1.4.0", channel="0", manifest_url=url), "r")
+        self.assertEqual(msg, {"type": "ambit_flash", "id": "r", "version": "1.4.0", "channel": 0,
+                               "manifest_url": url})
+        msg = self.fc.build_message(_args(cmd="ambit-flash", version="1.4.0", channel="all", manifest_url=""), "r")
+        self.assertEqual(msg, {"type": "ambit_flash", "id": "r", "version": "1.4.0", "channel": "all"})
+
+    def test_ambit_flash_refuses_bad_input(self):
+        for kw in (dict(version="1.4", channel="0", manifest_url=""),
+                   dict(version="1.4.0", channel="4", manifest_url=""),
+                   dict(version="1.4.0", channel="0", manifest_url="http://x/manifest.json"),
+                   dict(version="1.4.0", channel="0", manifest_url="https://x/" + "a" * 250)):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="ambit-flash", **kw), "r")
+
+    def test_ambit_versions(self):
+        self.assertEqual(self.fc.build_message(_args(cmd="ambit-versions"), "r"),
+                         {"type": "ambit_versions", "id": "r"})
+
     def test_devices_keep_case(self):
         devs = self.fc.parse_devices("ambyte_28:37:2F:FF:FC:80, 28:37:2F:FF:E7:50")
         self.assertIn("ambyte_28:37:2F:FF:FC:80", devs)
         self.assertIn("AMBYTE_28:37:2F:FF:E7:50", devs)
+
+
+class OptionalAwsDependencies(unittest.TestCase):
+    def test_command_and_bench_helpers_import_without_aws_packages(self):
+        # Fresh interpreter: an earlier test's cached SDK import cannot hide
+        # an eager dependency. These pure/mocked paths never open a transport.
+        script = """
+import argparse
+import sys
+sys.modules.update(awscrt=None, awsiot=None, boto3=None)
+sys.path.insert(0, sys.argv[1])
+import fleet_command
+from tools import bench_signed_ota
+assert fleet_command.build_message(argparse.Namespace(cmd='ping'), 'id') == {'type': 'ping', 'id': 'id'}
+assert bench_signed_ota.exact_url('https://example.test/app') == 'https://example.test/app'
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(TOOLS)],
+                                cwd=TOOLS.parents[1], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@
 #include "clock_trust.h"
 #include "ota_update.h"
 #include "iot_jobs.h"
+#include "ambit_attach_gate.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
 #include "ambit_announcement_nvs.h"
@@ -1296,6 +1297,9 @@ void app_main(void)
     if (ambit_ota_init(&ambit_ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
     }
+    /* Attach-time firmware gate: the schedule holds an AMBIT until this check
+     * cleared (or updated) its firmware against the SD target. */
+    ambit_attach_gate_set_kick(ambit_ota_request_attach_check);
 
     /* MQTT script_update replaces /littlefs/schedule.yaml (compiled with the
      * runner's validator, .bak kept) and restarts the schedule runner. */

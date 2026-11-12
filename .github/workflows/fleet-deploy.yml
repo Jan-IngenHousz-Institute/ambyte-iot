@@ -55,6 +55,10 @@ on:
         description: "Also command devices reporting a NEWER fw than the release (default: skip them)"
         type: boolean
         default: false
+      legacy_unsigned_rollout:
+        description: "Explicit cutover recovery: published pre-signing release to unsigned devices only"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,5 +98,6 @@ jobs:
           discovery-window-minutes: ${{ inputs.discovery_window_minutes }}
           dry-run: ${{ inputs.dry_run }}
           allow-downgrade: ${{ inputs.allow_downgrade }}
+          legacy-unsigned-rollout: ${{ inputs.legacy_unsigned_rollout }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           aws-role-arn: ${{ secrets.AWS_FLEET_DEPLOY_ROLE_ARN }}

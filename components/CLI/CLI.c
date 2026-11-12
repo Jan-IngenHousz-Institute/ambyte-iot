@@ -1,3 +1,4 @@
+#include "ota_policy.h"
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -1542,6 +1543,7 @@ static int cli_cmd_ota_status(int argc, char **argv)
     if (boot) printf("boot:    %-7s @ 0x%06lx\r\n", boot->label, (unsigned long)boot->address);
     if (next) printf("next:    %-7s @ 0x%06lx  (ota_selftest clone target)\r\n",
                      next->label, (unsigned long)next->address);
+    ota_policy_print(stdout);
     return 0;
 }
 
@@ -1583,6 +1585,12 @@ static int cli_cmd_ota_selftest(int argc, char **argv)
     }
     if ((err = esp_ota_end(h)) != ESP_OK) {
         printf("ota_end (image validate): %s\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    char policy_reason[64];
+    if ((err = ota_image_admit(next, run->size, policy_reason, sizeof policy_reason)) != ESP_OK) {
+        bool saved = ota_refusal_save("ota_selftest", "clone", policy_reason);
+        printf("OTA policy: %s%s\r\n", saved ? "" : "refusal_persist_failed: ", policy_reason);
         return 1;
     }
     if ((err = esp_ota_set_boot_partition(next)) != ESP_OK) {
@@ -1738,6 +1746,9 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
         printf("  version X  => /sdcard/ambit_fw/X/{bootloader,partitions,boot_app0,app}.bin\r\n");
         printf("  all        => queue a background sweep of every ROM-answering channel\r\n");
         printf("                (version form only; watch the log, confirm with ambit_versions)\r\n");
+        printf("  ambit_flash all <version> https://.../manifest.json\r\n");
+        printf("                => download + SHA-256-verify that release into /sdcard/ambit_fw/<version>\r\n");
+        printf("                   first, then sweep (same path as the MQTT manifest_url)\r\n");
         printf("  Writes the 4 code regions over the C3 ROM; preserves NVS. Stop schedule first.\r\n");
         return 1;
     }
@@ -1746,7 +1757,8 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
             printf("'all' takes a version (e.g. 1.0.0), not a directory\r\n");
             return 1;
         }
-        if (argc == 4) {
+        const char *manifest_url = (argc == 4 && strncmp(argv[3], "https://", 8) == 0) ? argv[3] : NULL;
+        if (argc == 4 && manifest_url == NULL) {
             /* Don't silently drop it — the single-channel form honours baud. */
             printf("'all' does not take a baud (the sweep uses the 460800 default);\r\n"
                    "  use the single-channel form to override the link speed.\r\n");
@@ -1756,13 +1768,14 @@ static int cli_cmd_ambit_flash(int argc, char **argv)
          * measurement + MQTT itself and sweeps every channel whose ROM answers — a 4-
          * channel sweep can take minutes, too long to block the console. NULL id:
          * operator-initiated, never deduped. */
-        esp_err_t err = ambit_ota_request_flash(AMBIT_OTA_CH_ALL, argv[2], NULL);
+        esp_err_t err = ambit_ota_request_flash(AMBIT_OTA_CH_ALL, argv[2], NULL, manifest_url);
         if (err != ESP_OK) {
             printf("queue failed: %s%s\r\n", esp_err_to_name(err),
                    (err == ESP_ERR_INVALID_ARG) ? " (version must be <major>.<minor>.<batch>)" :
                    (err == ESP_ERR_NO_MEM)      ? " (an AMBIT op is already running)" : "");
             return 1;
         }
+        if (manifest_url != NULL) printf("queued: fetch %s first\r\n", manifest_url);
         printf("queued: flash all ROM-answering channels from /sdcard/ambit_fw/%s\r\n"
                "  (~10-60 s per channel; measurement+MQTT pause during the sweep)\r\n"
                "  watch the log; confirm afterward with `ambit_versions`.\r\n", argv[2]);
@@ -2351,7 +2364,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t ambit_flash_cmd = {
         .command = "ambit_flash",
-        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud]  full ROM flash from SD (4 regions, preserves NVS; stop schedule first)",
+        .help    = "ambit_flash <0-3|all> <version|/sdcard/dir> [baud|https://…/manifest.json (all)]  full ROM flash from SD (4 regions, preserves NVS; stop schedule first)",
         .func    = cli_cmd_ambit_flash,
     };
     static const esp_console_cmd_t ambit_check_cmd = {

@@ -507,6 +507,14 @@ def provision_and_verify(ctx: SessionContext, run: DeviceRun,
         con.rtc_set(now)
 
         results: list[VerifyItem] = []
+        read_policy = getattr(con, "ota_policy", None)
+        if callable(read_policy):
+            policy = read_policy()
+            if policy is None:
+                log("OTA storage policy: unavailable on legacy firmware.")
+            else:
+                log(f"OTA storage policy: readable {policy['readable']}, written {policy['written']}, fallback {policy['fallback']}")
+                log(f"Last OTA refusal: {policy['last_refusal']}; diagnostic state {policy['refusal_state']}")
         discovered = run.console_identity
         if discovered is not None:
             expected_fw = ctx.release.version.removeprefix("v")

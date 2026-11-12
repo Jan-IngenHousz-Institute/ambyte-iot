@@ -4,12 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ambit_attach_gate.h"
 #include "ambit_flash.h"
+#include "ambit_fw_fetch.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "fleet_jitter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -65,16 +68,20 @@
 #define AMBIT_OP_VERSIONS  1
 #define AMBIT_OP_PROBE     2          /* ROM-bootloader probe (chip + MAC report) */
 #define AMBIT_OP_FLASH     3          /* full 4-region ROM flash from an SD folder */
+#define AMBIT_OP_ATTACH    4          /* attach-time firmware check of held channels */
 
 typedef struct {
     uint8_t op;                       /* AMBIT_OP_* */
     uint8_t channel;
     bool    fleet_spread;             /* remote URL OTA only; local CLI stays immediate */
+    uint8_t ver[3];                   /* FLASH: parsed <major>.<minor>.<batch> */
     char    url[AMBIT_OTA_URL_MAX];   /* OTA: download URL; FLASH: /sdcard/ambit_fw/<ver> dir */
+    char    manifest_url[AMBIT_OTA_URL_MAX];  /* FLASH: release manifest to fetch first ("" = SD only) */
     char    id[AMBIT_OTA_ID_MAX];
 } ambit_ota_req_t;
 
 static ambit_ota_config_t s_cfg;
+static int8_t             res_attach[UART_SENSOR_NUM_CHANNELS] = { -1, -1, -1, -1 };
 static bool               s_ready;    /* init done; dispatch via the shared worker (s_cfg.submit) */
 
 /* ── dedupe latch (NVS) ──────────────────────────────────────────────────
@@ -259,7 +266,10 @@ static int http_stage_read(void *ctx, uint8_t *buf, size_t cap)
     return r;
 }
 
-__attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st)
+/* GET `url` up to a final 200, following redirects. NULL on any failure; on
+ * success the caller reads the body and calls http_close(). Shared by the OTA
+ * stage download and the ambit_flash release fetch (ambit_fw_fetch.h). */
+__attribute__((cold)) static esp_http_client_handle_t http_open_followed(const char *url, int64_t *clen_out)
 {
     esp_http_client_config_t cfg = {
         .url               = url,
@@ -270,12 +280,13 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         .buffer_size_tx    = 4096,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) return ESP_FAIL;
+    if (c == NULL) return NULL;
 
     esp_err_t err = esp_http_client_open(c, 0);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP open failed (%s)", esp_err_to_name(err));
         esp_http_client_cleanup(c);
-        return err;
+        return NULL;
     }
 
     int64_t clen   = esp_http_client_fetch_headers(c);
@@ -295,8 +306,9 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         esp_http_client_close(c);
         err = esp_http_client_open(c, 0);
         if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP open after redirect failed (%s)", esp_err_to_name(err));
             esp_http_client_cleanup(c);
-            return err;
+            return NULL;
         }
         clen   = esp_http_client_fetch_headers(c);
         status = esp_http_client_get_status_code(c);
@@ -305,14 +317,29 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         ESP_LOGE(TAG, "HTTP status %d (expected 200 after redirects)", status);
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
-        return ESP_FAIL;
+        return NULL;
     }
+    if (clen_out) *clen_out = clen;
+    return c;
+}
 
+static void http_close(esp_http_client_handle_t c)
+{
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+}
+
+__attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st)
+{
+    int64_t clen = -1;
+    esp_http_client_handle_t c = http_open_followed(url, &clen);
+    if (c == NULL) return ESP_FAIL;
+
+    esp_err_t err;
     ambit_stage_why_t why = AMBIT_STAGE_OK;
     ambit_stage_cleanup_t cl = { 0 };
     err = ambit_stage_download(SD_MOUNT_POINT, http_stage_read, c, clen > 0 ? clen : 0, st, &why, &cl);
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
+    http_close(c);
     if (err != ESP_OK || cl.stale_removed || cl.stale_remove_err) {
         ESP_LOGW(TAG, "stage %s (%s), stale %u removed/%u failed", ambit_stage_why_name(why),
                  st->path[0] ? st->path : "-", cl.stale_removed, cl.stale_remove_err);
@@ -320,6 +347,28 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
     if (err != ESP_OK) return ESP_FAIL;
     return ESP_OK;
 }
+
+/* esp_http_client behind the ambit_fw_fetch transport callbacks. */
+static void *fetch_open(void *ctx, const char *url, int64_t *clen)
+{
+    (void)ctx;
+    ESP_LOGW(TAG, "fetch GET url_length=%u", (unsigned)strlen(url));   /* URLs may be presigned: never logged */
+    return http_open_followed(url, clen);
+}
+
+static int fetch_read(void *h, uint8_t *buf, size_t cap)
+{
+    return http_stage_read(h, buf, cap);
+}
+
+static void fetch_close(void *h)
+{
+    http_close((esp_http_client_handle_t)h);
+}
+
+static const ambit_fw_http_t s_fetch_http = {
+    .ctx = NULL, .open = fetch_open, .read = fetch_read, .close = fetch_close,
+};
 
 /* ── version read (cmd 33/2) — pre/post-OTA confirmation ─────────────────── */
 
@@ -506,15 +555,15 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
     const char *url = r->url;
     const bool  all = (r->channel == AMBIT_OTA_CH_ALL);
     if (all) {
-        ESP_LOGW(TAG, "AMBIT OTA requested: ch=all id=%s url=%s", r->id[0] ? r->id : "(none)", url);
+        ESP_LOGW(TAG, "AMBIT OTA requested: ch=all id=%s url_length=%u",
+                 r->id[0] ? r->id : "(none)", (unsigned)strlen(url));
     } else {
-        ESP_LOGW(TAG, "AMBIT OTA requested: ch=%u id=%s url=%s",
-                 r->channel, r->id[0] ? r->id : "(none)", url);
+        ESP_LOGW(TAG, "AMBIT OTA requested: ch=%u id=%s url_length=%u",
+                 r->channel, r->id[0] ? r->id : "(none)", (unsigned)strlen(url));
     }
 
     if (strstr(url, "/blob/") != NULL || strstr(url, "/tree/") != NULL) {
         ESP_LOGE(TAG, "URL is a GitHub web page (/blob/ or /tree/), not a file:");
-        ESP_LOGE(TAG, "  %s", url);
         ESP_LOGE(TAG, "use a direct .bin — raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>");
         report_detail("failed", r->channel, r->id,
                       "bad_url: use a direct .bin, not a /blob//tree/ web url");
@@ -786,8 +835,9 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         ESP_LOGI(TAG, "ambit_flash id=%s already applied — skipping queued duplicate", r->id);
         return;
     }
-    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s dir=%s id=%s",
-             all ? "all" : "one", dir, r->id[0] ? r->id : "(none)");
+    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s url_length=%u id=%s manifest_url_length=%u",
+             all ? "all" : "one", (unsigned)strlen(dir), r->id[0] ? r->id : "(none)",
+             (unsigned)strlen(r->manifest_url));
 
     /* Per-channel outcome, reported after comms resume. */
     enum { FL_SKIP = -1, FL_FAIL = 0, FL_OK = 1, FL_ABSENT = 2, FL_BUSY = 3 };
@@ -804,8 +854,34 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
     vTaskDelay(pdMS_TO_TICKS(500));
 
     bool ok = false;
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+    const bool sd_ok = sdcard_is_mounted() || sdcard_mount() == ESP_OK;
+    bool fetch_ok = true;
+    char fetch_detail[112] = "";
+    const char *detail = NULL;
+    if (!sd_ok) {
         ESP_LOGE(TAG, "SD not available — no region images to flash");
+        detail = "sd_unavailable";
+    } else if (r->manifest_url[0] != '\0') {
+        /* Remote release fetch (ambit_fw_fetch.h): runs inside the MQTT blackout
+         * because the board cannot hold the broker's TLS session and a download's
+         * at once, and BEFORE any AMBIT is reset. A failed fetch flashes nothing;
+         * whatever it left in the folder is rejected by the manifest gate. */
+        ambit_fw_fetch_result_t fr;
+        esp_err_t fe = ambit_fw_fetch("/sdcard/ambit_fw", r->manifest_url, r->ver[0], r->ver[1], r->ver[2],
+                                      &s_fetch_http, &fr);
+        fetch_ok = (fe == ESP_OK);
+        snprintf(fetch_detail, sizeof fetch_detail, "%s downloaded=%u reused=%u removed=%u bytes=%lu", fr.why,
+                 fr.downloaded, fr.reused, fr.removed, (unsigned long)fr.bytes);
+        if (fetch_ok) {
+            ESP_LOGW(TAG, "release fetched (%s)", fetch_detail);
+        } else {
+            ESP_LOGE(TAG, "release fetch FAILED (%s); no AMBIT touched", fetch_detail);
+            detail = "fetch_failed";
+        }
+    }
+
+    if (!sd_ok || !fetch_ok) {
+        /* Nothing to flash from: every AMBIT is left exactly as it was. */
     } else if (all) {
         int attempted = 0, ok_count = 0;
         for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
@@ -873,6 +949,9 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
                           "(verify by effect: ambit_versions)");
         }
     }
+    if (r->manifest_url[0] != '\0' && fetch_detail[0] != '\0') {
+        report_as("ambit_flash_status", fetch_ok ? "fetched" : "fetch_failed", r->channel, r->id, fetch_detail);
+    }
     for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
         if (res[c] == FL_SKIP) continue;
         report_as("ambit_flash_status",
@@ -887,8 +966,114 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         report_as("ambit_flash_status", "success", r->channel, r->id, NULL);
     } else {
         ESP_LOGE(TAG, "AMBIT FLASH FAILED (id=%s)", r->id[0] ? r->id : "(none)");
-        report_as("ambit_flash_status", "failed", r->channel, r->id, NULL);
+        report_as("ambit_flash_status", "failed", r->channel, r->id, detail);
     }
+}
+
+/* ── attach-time firmware check (ambit_attach_gate.h) ──────────────────────
+ * The schedule holds every channel whose (MAC, firmware) it has not seen cleared
+ * and wakes this pass. Deciding needs only the cached firmware string and the SD
+ * target, so an up-to-date AMBIT is cleared without stopping anything. Only an
+ * out-of-date one with enough power (charger input, or battery >= 3.7 V) pauses
+ * measurement + MQTT for the ROM flash, like ambit_do_flash. */
+static void attach_report(const char *state, uint8_t ch, const char *fw, const ambit_flash_target_t *tgt)
+{
+    char detail[64];
+    if (tgt != NULL && tgt->dir[0] != '\0') {
+        snprintf(detail, sizeof detail, "fw=%s target=%u.%u.%u", fw ? fw : "?", tgt->major, tgt->minor, tgt->batch);
+    } else {
+        snprintf(detail, sizeof detail, "fw=%s", fw ? fw : "?");
+    }
+    report_as("ambit_attach_status", state, ch, NULL, detail);
+}
+
+static void ambit_do_attach(void)
+{
+    const uint8_t pend = ambit_attach_gate_pending();
+    bool quiesced = false;
+    int64_t now_ms;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (!(pend & (1u << ch))) continue;
+        now_ms = esp_timer_get_time() / 1000;
+        ambit_device_info_t inf;
+        if (!cmd_ambit_device_info_cached(ch, &inf) || !inf.valid) {
+            ambit_attach_gate_forget(ch);   /* gone since it was held: the next gate call starts over */
+            continue;
+        }
+        ambit_flash_target_t tgt;
+        ambit_attach_decision_t d = ambit_flash_attach_decide(ch, inf.fw_version, &tgt);
+        switch (d) {
+        case AMBIT_ATTACH_DECIDE_CURRENT:
+        case AMBIT_ATTACH_DECIDE_NEWER:
+        case AMBIT_ATTACH_DECIDE_NO_TARGET:
+        case AMBIT_ATTACH_DECIDE_UNREADABLE:
+            ESP_LOGI(TAG, "attach: AMBIT%u %s fw %s cleared (%s)", ch + 1, inf.device_id, inf.fw_version,
+                     d == AMBIT_ATTACH_DECIDE_CURRENT ? "current" : d == AMBIT_ATTACH_DECIDE_NEWER ? "newer than target"
+                     : d == AMBIT_ATTACH_DECIDE_NO_TARGET ? "no SD target" : "version not M.m.b");
+            ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_CLEAR, now_ms);
+            if (d != AMBIT_ATTACH_DECIDE_CURRENT) {
+                attach_report(d == AMBIT_ATTACH_DECIDE_NEWER ? "newer" : d == AMBIT_ATTACH_DECIDE_NO_TARGET
+                              ? "no_target" : "unreadable", ch, inf.fw_version, &tgt);
+            }
+            break;
+        case AMBIT_ATTACH_DECIDE_SD_UNAVAILABLE:
+            /* A parked or missing card must not stop measurement: measure, re-check later. */
+            ESP_LOGW(TAG, "attach: AMBIT%u SD unavailable, measuring and re-checking later", ch + 1);
+            ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_CLEAR_RECHECK, now_ms);
+            break;
+        case AMBIT_ATTACH_DECIDE_GAVE_UP:
+            /* Three failed flashes for this target: measure with what it has rather
+             * than silence the channel; the report says it needs attention. */
+            ESP_LOGE(TAG, "attach: AMBIT%u fw %s: flashing to v%u.%u.%u reached the fail cap, "
+                          "measuring on its current firmware", ch + 1, inf.fw_version, tgt.major, tgt.minor, tgt.batch);
+            ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_CLEAR, now_ms);
+            attach_report("gave_up", ch, inf.fw_version, &tgt);
+            break;
+        case AMBIT_ATTACH_DECIDE_STALE: {
+            power_reading_t p;
+            const bool power = cmd_read_power(&p).status == ESP_OK && ambit_attach_power_ok(&p);
+            if (!power) {
+                ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but power is too low "
+                              "(input %s, battery %u mV, system %u mV); held, re-checking in 10 min",
+                         ch + 1, inf.fw_version, tgt.major, tgt.minor, tgt.batch,
+                         p.input_present ? "on" : "off", p.battery_mv, p.system_mv);
+                ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_RETRY, now_ms);
+                attach_report("waiting_power", ch, inf.fw_version, &tgt);
+                break;
+            }
+            if (!quiesced) {
+                attach_report("updating", ch, inf.fw_version, &tgt);
+                vTaskDelay(pdMS_TO_TICKS(500));   /* flush the report before MQTT drops */
+                if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
+                if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                quiesced = true;
+            }
+            esp_err_t e = ambit_flash_attach_flash(ch, &tgt);
+            /* Either way the identity changed or must be re-read: the next gate
+             * call checks the AMBIT as it is now (normally CLEAR after a success;
+             * after a failure it retries until the shared fail cap gives up). */
+            ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_FLASHED,
+                                      esp_timer_get_time() / 1000);
+            if (e == ESP_OK) cmd_ambit_device_info_invalidate(ch);
+            res_attach[ch] = (e == ESP_OK) ? 1 : 0;
+            break;
+        }
+        }
+    }
+    if (quiesced) {
+        if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
+        if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
+        if (s_cfg.is_connected != NULL) {
+            for (int i = 0; i < 60 && !s_cfg.is_connected(); i++) vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+            if (res_attach[ch] < 0) continue;
+            report_as("ambit_attach_status", res_attach[ch] ? "updated" : "update_failed", ch, NULL, NULL);
+            res_attach[ch] = -1;
+        }
+    }
+    ambit_attach_gate_checker_done();
 }
 
 /* Run one queued AMBIT op in the shared maintenance worker (fix #3). Owns and
@@ -906,7 +1091,11 @@ static void ambit_ota_run(void *arg)
     if (s_cfg.maintenance_begin != NULL && !s_cfg.maintenance_begin()) {
         ESP_LOGW(TAG, "another maintenance op in progress — ambit op=%u id=%s dropped",
                  r->op, r->id[0] ? r->id : "");
-        report_busy(r);
+        if (r->op == AMBIT_OP_ATTACH) {
+            ambit_attach_gate_checker_done();   /* the next gate call queues it again */
+        } else {
+            report_busy(r);
+        }
         free(r);
         return;
     }
@@ -914,6 +1103,7 @@ static void ambit_ota_run(void *arg)
     case AMBIT_OP_VERSIONS: ambit_do_versions(r->id); break;
     case AMBIT_OP_PROBE:    ambit_do_probe(r);        break;
     case AMBIT_OP_FLASH:    ambit_do_flash(r);        break;
+    case AMBIT_OP_ATTACH:   ambit_do_attach();        break;
     default:                ambit_do_ota(r);          break;
     }
     if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
@@ -921,7 +1111,7 @@ static void ambit_ota_run(void *arg)
 }
 
 /* Hand a request to the shared maintenance worker. The heap copy is small
- * (~330 B), so it allocates even on a fragmented heap. */
+ * (~600 B with the manifest URL), so it allocates even on a fragmented heap. */
 static esp_err_t ambit_ota_enqueue(const ambit_ota_req_t *r)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
@@ -1000,7 +1190,8 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id)
     return ambit_ota_enqueue(&r);   /* identity read: never deduped */
 }
 
-esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id)
+esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id,
+                                  const char *manifest_url)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
@@ -1020,6 +1211,13 @@ esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const ch
     if (id != NULL && strlen(id) >= AMBIT_OTA_ID_MAX) {
         return ESP_ERR_INVALID_ARG;   /* would truncate — the latch could never match it */
     }
+    /* The manifest's SHA-256s are what every downloaded byte is checked against,
+     * and they arrive over the same connection: only TLS (cert bundle) makes them
+     * trustworthy, so plain http:// is refused. */
+    if (manifest_url != NULL && manifest_url[0] != '\0' &&
+        (strncmp(manifest_url, "https://", 8) != 0 || strlen(manifest_url) >= AMBIT_OTA_URL_MAX)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (already_applied(KEY_APPLIED_FLASH, id)) {
         ESP_LOGI(TAG, "ambit_flash id=%s already applied — ignoring", id);
         return ESP_OK;
@@ -1034,7 +1232,20 @@ esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const ch
     memset(&r, 0, sizeof r);
     r.op      = AMBIT_OP_FLASH;
     r.channel = channel;
+    r.ver[0]  = (uint8_t)mj;
+    r.ver[1]  = (uint8_t)mn;
+    r.ver[2]  = (uint8_t)bt;
     snprintf(r.url, sizeof r.url, "/sdcard/ambit_fw/%u.%u.%u", mj, mn, bt);
+    if (manifest_url != NULL) strncpy(r.manifest_url, manifest_url, sizeof r.manifest_url - 1);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     return ambit_ota_enqueue(&r);
+}
+
+bool ambit_ota_request_attach_check(void)
+{
+    if (!s_ready) return false;
+    ambit_ota_req_t r;
+    memset(&r, 0, sizeof r);
+    r.op = AMBIT_OP_ATTACH;
+    return ambit_ota_enqueue(&r) == ESP_OK;
 }

@@ -127,6 +127,8 @@ class ConsoleIdentity:
     contract: int
     schedule: ScheduleIdentity
     capabilities: frozenset[str]
+    signed: bool = False
+    storage: dict | None = None
 
 
 def _identity_object(obj: dict) -> ConsoleIdentity:
@@ -156,11 +158,24 @@ def _identity_object(obj: dict) -> ConsoleIdentity:
         raise ValueError("invalid capabilities")
     for cap in caps:
         cap.encode("utf-8", "strict")
+    signed = obj.get("signed", False)
+    if type(signed) is not bool:
+        raise ValueError("signed must be a boolean")
+    storage = obj.get("storage")
+    if storage is not None:
+        if not isinstance(storage, dict) or set(storage) != {"readable", "written", "fallback"}:
+            raise ValueError("invalid storage manifest")
+        readable, written, fallback = storage["readable"], storage["written"], storage["fallback"]
+        if (not isinstance(readable, list) or not readable or
+                any(type(v) is not int or not 1 <= v <= 31 for v in readable) or
+                readable != sorted(set(readable)) or type(written) is not int or written not in readable or
+                type(fallback) is not int or not 1 <= fallback <= 31):
+            raise ValueError("invalid storage versions")
     return ConsoleIdentity(mac.upper() if mac else None,
         nullable(obj["thing_name"]), nullable(obj["fw"]), 1,
         ScheduleIdentity(source, sha.lower() if sha else None,
                          nullable(schedule["workbookVersionId"]),
-                         nullable(schedule["script_version"])), frozenset(caps))
+                         nullable(schedule["script_version"])), frozenset(caps), signed, storage)
 
 
 @dataclass(frozen=True)
@@ -311,6 +326,42 @@ class AmbyteConsole:
         raise ConsoleError(f"'{cmd}' got no prompt back within {timeout:.0f}s")
 
     # ── commands ─────────────────────────────────────────────────────────
+    def ota_policy(self, timeout: float = 5.0) -> dict | None:
+        """Additive OTA diagnostic; an older ota_status response returns None."""
+        reply = self.command("ota_status", timeout, strip_ansi=False, max_reply_bytes=2048)
+        for line in reply.split("\n"):
+            line = line.rstrip("\r")
+            if not line.startswith("policy: "):
+                continue
+            try:
+                line.encode("utf-8", "strict")
+                obj = json.loads(line[8:])
+                if (not isinstance(obj, dict) or type(obj.get("schema")) is not int or obj["schema"] != 1
+                        or not {"schema", "readable", "written", "fallback", "refusal_state", "last_refusal"}.issubset(obj)
+                        or obj.get("refusal_state") not in ("available", "missing", "unavailable", "corrupt")):
+                    raise ValueError("invalid policy schema")
+                readable, written, fallback = obj.get("readable"), obj.get("written"), obj.get("fallback")
+                if readable is None:
+                    if written is not None or fallback is not None:
+                        raise ValueError("inconsistent unavailable manifest")
+                elif (not isinstance(readable, list) or not readable or
+                      any(type(v) is not int or not 1 <= v <= 31 for v in readable) or
+                      readable != sorted(set(readable)) or type(written) is not int or written not in readable or
+                      type(fallback) is not int or not 1 <= fallback <= 31):
+                    raise ValueError("invalid storage versions")
+                refusal = obj.get("last_refusal")
+                if obj["refusal_state"] == "available":
+                    if not isinstance(refusal, dict) or any(not isinstance(refusal.get(k), str) for k in ("id", "source", "reason")):
+                        raise ValueError("invalid persisted refusal")
+                    if len(refusal["id"]) > 71 or len(refusal["source"]) > 11 or len(refusal["reason"]) > 63:
+                        raise ValueError("oversized persisted refusal")
+                elif refusal is not None:
+                    raise ValueError("unavailable refusal must be null")
+                return obj
+            except (ValueError, TypeError) as exc:
+                raise ConsoleError(f"Invalid OTA policy diagnostic: {exc}") from exc
+        return None
+
     def identity(self, timeout: float = 5.0) -> ConsoleIdentity:
         """First physical JSON-object line with an integer contract is the reply.
 

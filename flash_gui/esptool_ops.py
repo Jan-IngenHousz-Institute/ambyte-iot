@@ -173,6 +173,32 @@ def flash_images(port: str, images: list[tuple[int, Path]],
                  flash_settings: dict[str, str], log=None) -> None:
     """Write all images (offset asc). Writes only these regions — no chip
     erase — so field data in coredump/littlefs/storage survives a re-flash."""
+    # All callers (including factory/local bundles) cross this boundary before
+    # opening a port. Unsigned modern apps abort at startup with no fallback
+    # when a physical flash also resets otadata.
+    from .firmware_metadata import ImageError, inspect_image
+    for _, path in images:
+        if not Path(path).is_file():
+            raise EsptoolError(f"image missing: {path}")
+        try:
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            raise EsptoolError(f"image unreadable: {path}") from exc
+        if len(data) >= 36 and data[0] == 0xE9 and data[32:36] == bytes.fromhex("3254cdab"):
+            try:
+                metadata = inspect_image(data)
+                if metadata.storage and not metadata.signature_present:
+                    raise ImageError("modern image is unsigned; sign the intermediate before flashing")
+            except ImageError as exc:
+                raise EsptoolError(f"Firmware refused before flash: {exc}") from exc
+            if log:
+                signature = "present (embedded-key consistency checked)" if metadata.signature_present else "absent"
+                log(f"Firmware signature: {signature}; key ID: {metadata.key_id or 'unavailable'}")
+                if metadata.storage:
+                    storage = metadata.storage
+                    log(f"Storage versions: readable {list(storage.readable)}, written {storage.written}, fallback {storage.fallback}")
+                else:
+                    log("Storage manifest: unavailable on legacy firmware")
     _write(port, images, flash_settings, log)
 
 

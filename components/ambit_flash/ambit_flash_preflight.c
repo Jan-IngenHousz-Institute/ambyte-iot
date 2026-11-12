@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
+#include "ambit_fw_manifest.h"
 #include "esp_log.h"
 #include "sd_card.h"
 #include "sd_diag.h"
@@ -57,6 +58,24 @@ esp_err_t ambit_flash_preflight(const char *root, const char *dir, const char *c
                 ESP_LOGE(TAG, "missing/empty %s/%s — need all %u region files", dir, fnames[i], (unsigned)n);
                 rc = ESP_ERR_NOT_FOUND;
                 break;
+            }
+        }
+        /* Release-manifest gate (ambit_fw_manifest.h): a folder carrying
+         * manifest.json (every folder the remote fetch writes) is flashed only
+         * when each region's size and SHA-256 match it, so a download cut short by a
+         * reset can never put a truncated image on the chip. Legacy hand-staged
+         * folders (no manifest) keep the present-and-non-empty rule above. */
+        if (rc == ESP_OK) {
+            const char *why = NULL;
+            ambit_fw_dir_t g = ambit_fw_dir_check(dir, true, &why);
+            if (g == AMBIT_FW_DIR_REJECTED) {
+                ESP_LOGE(TAG, "%s fails its manifest.json (%s); target untouched", dir, why);
+                rc = ESP_ERR_INVALID_CRC;
+            } else if (g == AMBIT_FW_DIR_UNREADABLE) {
+                ESP_LOGE(TAG, "%s: SD read error verifying manifest.json (%s); target untouched", dir, why);
+                rc = ESP_FAIL;
+            } else if (g == AMBIT_FW_DIR_VERIFIED) {
+                ESP_LOGW(TAG, "%s matches its manifest.json (size + SHA-256)", dir);
             }
         }
     }

@@ -43,6 +43,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "ambit_attach_gate.h"
 #include "ambit_protocol.h"   /* AMBIT_ASYNC_* run-state constants */
 #include "ambit_trace.h"
 #include "device_commands.h"
@@ -120,11 +121,41 @@ static uint8_t channels_mask(const sched_step_t *step, const sched_program_t *pr
     return mask;
 }
 
-static bool ch_present(uint8_t ch)
+static bool ch_ping(uint8_t ch)
 {
     bool connected = false;
     cmd_result_t r = cmd_uart_ping(ch, &connected);
     return r.status == ESP_OK && connected;
+}
+
+/* Present AND cleared by the attach-time firmware gate (ambit_attach_gate.h): an
+ * AMBIT whose (MAC, firmware) has not been checked against the SD target is not
+ * measured; the check runs on the maintenance worker and updates it first if it
+ * is older. An identity that cannot be read is never held (it cannot be
+ * auto-updated). `may_fetch` false = identity from the cache only, for loops that
+ * run while another channel is already measuring (no cmd33 on the wire then; the
+ * caller prefetched identities before its first trigger). */
+static bool ch_gate(uint8_t ch, bool may_fetch)
+{
+    if (!ch_ping(ch)) return false;
+    ambit_device_info_t inf;
+    const bool known = may_fetch ? (cmd_ambit_device_info(ch, &inf).status == ESP_OK && inf.valid)
+                                 : (cmd_ambit_device_info_cached(ch, &inf) && inf.valid);
+    const bool was_held = ambit_attach_gate_held(ch);
+    const bool allow = ambit_attach_gate_allow(ch, known ? inf.device_id : NULL, known ? inf.fw_version : NULL,
+                                               esp_timer_get_time() / 1000);
+    if (!allow && !was_held) {
+        ESP_LOGW(TAG, "AMBIT%u %s fw %s: holding measurement until its firmware is checked "
+                      "against the SD target", ch + 1, inf.device_id, inf.fw_version);
+    } else if (allow && was_held) {
+        ESP_LOGW(TAG, "AMBIT%u %s fw %s: firmware check passed, measuring", ch + 1, inf.device_id, inf.fw_version);
+    }
+    return allow;
+}
+
+static bool ch_present(uint8_t ch)
+{
+    return ch_gate(ch, true);
 }
 
 /* Record a routine failure's context for run_job's throttled log line and
@@ -226,7 +257,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
     sensor_inventory_veto_begin();
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ++ch) {
         if (!(mask & (1u << ch)) || sched_runner_should_stop()) continue;
-        if (ch_present(ch)) { ambit_device_info_t info; (void)cmd_ambit_device_info(ch, &info); }
+        if (ch_ping(ch)) { ambit_device_info_t info; (void)cmd_ambit_device_info(ch, &info); }
     }
     if (hold_window) device_commands_measurement_begin();
 
@@ -251,7 +282,7 @@ static esp_err_t act_ambit_trace(void *vctx, const sched_step_t *step,
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
         if (!(mask & (1u << ch))) continue;
         if (sched_runner_should_stop()) break;
-        if (!ch_present(ch)) continue;
+        if (!ch_gate(ch, false)) continue;   /* identities prefetched above */
         if (sched_runner_should_stop()) break; /* between ping and trigger */
         if (opts.persist) s_persist_attempted = true;
         cmd_result_t r = ambit_trace_trigger(ch, segs, (size_t)nseg, &opts, &s_pend[ch]);

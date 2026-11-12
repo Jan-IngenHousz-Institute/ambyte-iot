@@ -1,4 +1,5 @@
 #include "command_router.h"
+#include "command_router_pong.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -42,14 +43,10 @@ static void publish_reply(const char *json)
 
 static void handle_ping(const char *id)
 {
-    char reply[256];
+    char reply[448];
     const long long up_ms = (long long)(esp_timer_get_time() / 1000);
-    snprintf(reply, sizeof(reply),
-             "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld}",
-             id ? id : "",
-             s_cfg.device_id ? s_cfg.device_id : "",
-             s_cfg.firmware_version ? s_cfg.firmware_version : "",
-             up_ms);
+    if (!command_router_pong_json(reply, sizeof reply, id, s_cfg.device_id,
+                                  s_cfg.firmware_version, up_ms)) return;
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);
 }
@@ -278,7 +275,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "ota_update id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ota_update id=%s dispatched (url=%s)", id ? id : "", url);
+                ESP_LOGW(TAG, "ota_update id=%s dispatched (url_length=%u)",
+                         id ? id : "", (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_ota") == 0) {
@@ -309,7 +307,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ambit_ota id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url=%s)", id ? id : "", ch, url);
+                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url_length=%u)",
+                         id ? id : "", ch, (unsigned)strlen(url));
             }
         }
     } else if (strcmp(type, "ambit_probe") == 0) {
@@ -344,11 +343,17 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     } else if (strcmp(type, "ambit_flash") == 0) {
         /* Full 4-region ROM flash from /sdcard/ambit_fw/<version>/ (Strategy A —
          * revives bricked/pre-OTA units; AMBIT NVS/calibration preserved).
-         * {version:"M.m.b", channel: 0-3 | "all" | negative}; absent channel =
-         * all ROM-answering channels. The SD must already hold the folder —
-         * this path does not download. ambit_ota owns the id dedupe latch. */
+         * {version:"M.m.b", channel: 0-3 | "all" | negative, manifest_url?};
+         * absent channel = all ROM-answering channels. Without manifest_url the
+         * SD must already hold the folder; with it (an https:// ambit-iot release
+         * manifest.json) the worker downloads + verifies the release into the
+         * folder first (ambit_fw_fetch.h): the remote path for pre-1.0 AMBITs.
+         * ambit_ota owns the id dedupe latch. */
         const cJSON *jver = cJSON_GetObjectItemCaseSensitive(root, "version");
         const char *version = cJSON_IsString(jver) ? jver->valuestring : NULL;
+        const cJSON *jman = cJSON_GetObjectItemCaseSensitive(root, "manifest_url");
+        const char *manifest_url = cJSON_IsString(jman) ? jman->valuestring : NULL;
+        const bool man_ok = (jman == NULL || cJSON_IsNull(jman) || manifest_url != NULL);
         uint8_t ch = AMBIT_OTA_CH_ALL;
         const cJSON *jch = cJSON_GetObjectItemCaseSensitive(root, "channel");
         bool ch_ok = true;
@@ -367,14 +372,19 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         } else if (!ch_ok) {
             ESP_LOGW(TAG, "ambit_flash id=%s bad 'channel' (0-3 or \"all\") — ignoring",
                      id ? id : "");
+        } else if (!man_ok) {
+            /* A typed-but-wrong manifest_url must not silently become an
+             * SD-only flash of whatever happens to be on the card. */
+            ESP_LOGW(TAG, "ambit_flash id=%s 'manifest_url' must be a string; ignoring", id ? id : "");
         } else {
-            esp_err_t err = ambit_ota_request_flash(ch, version, id);
+            esp_err_t err = ambit_ota_request_flash(ch, version, id, manifest_url);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "ambit_flash id=%s dispatch failed: %s",
-                         id ? id : "", esp_err_to_name(err));
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatch failed: %s%s",
+                         id ? id : "", esp_err_to_name(err),
+                         (err == ESP_ERR_INVALID_ARG && manifest_url) ? " (manifest_url must be https://, < 256 chars)" : "");
             } else {
-                ESP_LOGW(TAG, "ambit_flash id=%s dispatched (ch=%u ver=%s)",
-                         id ? id : "", ch, version);
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatched (ch=%u ver=%s%s)",
+                         id ? id : "", ch, version, manifest_url ? " +fetch" : "");
             }
         }
     } else if (strcmp(type, "ambit_versions") == 0) {
@@ -417,8 +427,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 ESP_LOGW(TAG, "script_update(url) id=%s dispatch failed: %s",
                          id ? id : "", esp_err_to_name(err));
             } else {
-                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (%s, %s)",
-                         id ? id : "", url, reboot ? "reboot" : "in-place");
+                ESP_LOGW(TAG, "script_update(url) id=%s dispatched (url_length=%u, %s)",
+                         id ? id : "", (unsigned)strlen(url), reboot ? "reboot" : "in-place");
             }
         } else if (script == NULL || script[0] == '\0') {
             ESP_LOGW(TAG, "script_update id=%s missing 'script'/'url' — ignoring", id ? id : "");

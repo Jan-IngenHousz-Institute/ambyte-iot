@@ -6,3 +6,6 @@ awsiotsdk>=1.21
 # --experiment mode reuses the flash GUI's openJII client, whose TLS helper
 # validates api.openjii.org against certifi's bundle.
 certifi>=2024.7.4
+
+# Authenticate the complete release before enrolling an unsigned fleet unit.
+cryptography>=43,<51

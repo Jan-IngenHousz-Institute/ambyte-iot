@@ -63,6 +63,11 @@ cmd_result_t cmd_uart_ping(uint8_t ch, bool *connected)
     *connected = present && (present_mask & (1u << ch));
     return (cmd_result_t){.status = ESP_OK};
 }
+/* The attach-time firmware gate has its own tests (test_ambit_attach.py); light
+ * cleanup runs with every AMBIT already cleared. */
+bool ambit_attach_gate_allow(uint8_t ch, const char *device_id, const char *fw, int64_t now_ms)
+{ (void)ch; (void)device_id; (void)fw; (void)now_ms; return true; }
+bool ambit_attach_gate_held(uint8_t ch) { (void)ch; return false; }
 cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
 { memset(out, 0, sizeof *out); (void)sensor_inventory_cached(ch, out); return (cmd_result_t){.status = ESP_OK}; }
 void device_commands_measurement_begin(void) {}
