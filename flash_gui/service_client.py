@@ -471,7 +471,7 @@ class ServiceClient:
         if result["state"] != "succeeded":
             if result["state"] == "uncertain":
                 raise UnknownOutcome(f"Device outcome is uncertain ({result['reason'] or 'unprovable'}); verify device state.")
-            raise ServiceError(result["reason"] or result["state"])
+            raise ServiceError(result["reason"] or result["state"], result=result)
         return result
 
     def _recover(self, run, *, new_request=False):

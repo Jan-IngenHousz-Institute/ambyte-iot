@@ -81,6 +81,7 @@ class _Tee(io.StringIO):
         super().__init__()
         self._log = log
         self._buf = ""
+        self._output = sys.stdout
 
     def write(self, s: str) -> int:
         n = super().write(s)
@@ -91,7 +92,11 @@ class _Tee(io.StringIO):
                 line = line.strip()
                 # Drop intermediate progress frames; keep only landmark lines.
                 if line and not line.startswith("Writing at"):
-                    self._log(line)
+                    # A CLI consumer can use print as its logger. esptool is
+                    # running under redirect_stdout(self); forwarding there
+                    # would recursively capture/log the same line forever.
+                    with redirect_stdout(self._output):
+                        self._log(line)
         return n
 
     def tail(self, lines: int = 12) -> str:
@@ -170,7 +175,9 @@ def read_mac(port: str, log=None) -> str:
 
 
 def flash_images(port: str, images: list[tuple[int, Path]],
-                 flash_settings: dict[str, str], log=None) -> None:
+                 flash_settings: dict[str, str], log=None, *,
+                 expected_mac: str | None = None,
+                 expected_partition_table: bytes | None = None) -> None:
     """Write all images (offset asc). Writes only these regions — no chip
     erase — so field data in coredump/littlefs/storage survives a re-flash."""
     # All callers (including factory/local bundles) cross this boundary before
@@ -199,7 +206,11 @@ def flash_images(port: str, images: list[tuple[int, Path]],
                     log(f"Storage versions: readable {list(storage.readable)}, written {storage.written}, fallback {storage.fallback}")
                 else:
                     log("Storage manifest: unavailable on legacy firmware")
-    _write(port, images, flash_settings, log)
+    if expected_mac is None and expected_partition_table is None:
+        _write(port, images, flash_settings, log)
+    else:
+        _write(port, images, flash_settings, log, expected_mac=expected_mac,
+               expected_partition_table=expected_partition_table)
 
 
 def write_nvs(port: str, nvs_offset: int, nvs_path: Path, log=None) -> None:
@@ -211,7 +222,8 @@ def write_nvs(port: str, nvs_offset: int, nvs_path: Path, log=None) -> None:
 
 
 def _write(port: str, images: list[tuple[int, Path]],
-           flash_settings: dict[str, str], log=None) -> None:
+           flash_settings: dict[str, str], log=None, *, expected_mac=None,
+           expected_partition_table=None) -> None:
     for _, path in images:
         if not Path(path).is_file():
             raise EsptoolError(f"image missing: {path}")
@@ -221,6 +233,14 @@ def _write(port: str, images: list[tuple[int, Path]],
             esp = _session(port, FLASH_BAUD)
             try:
                 attach_flash(esp)
+                if expected_mac is not None:
+                    actual_mac = ":".join(f"{b:02X}" for b in esp.read_mac("BASE_MAC"))
+                    if actual_mac != expected_mac.upper():
+                        raise EsptoolError("Connected Ambyte changed before flashing; no images were written.")
+                if expected_partition_table is not None:
+                    actual = esp.read_flash(0x8000, len(expected_partition_table))
+                    if actual != expected_partition_table:
+                        raise EsptoolError("Partition layout differs from this release; preserving device settings and data cannot be guaranteed. No images were written.")
                 addr_data = [(off, open(path, "rb")) for off, path in images]
                 try:
                     write_flash(

@@ -1,8 +1,11 @@
-# ambyte on-boarding GUI
+# Ambyte setup and maintenance GUI
 
 Cross-platform (Windows / Linux / macOS) Tkinter tool that flashes and
 provisions ambyte boards in one click per device. It replaces the manual
-`flash/flash.cmd` bundle flow for operator on-boarding sessions.
+`flash/flash.cmd` bundle flow for operator on-boarding sessions. The primary
+**Update firmware (keep settings)** action preserves an existing board's identity,
+certificates, Wi-Fi, topics, installed schedule and data. Firmware and Wi-Fi
+maintenance work over USB without openJII sign-in or another provisioning round.
 
 ```
 python -m pip install -r flash_gui/requirements.txt
@@ -170,11 +173,92 @@ in service mode after disconnect can send framed errors to ordinary console
 clients for up to 60 seconds; the schedule installer performs read-only mode
 recovery before identity discovery.
 
-The GUI has no live Wi-Fi join control. Its existing onboarding credentials
-remain part of the NVS image. The shared service client offers a distinct bounded
-join for service consumers and bench tools, with fresh same-port confirmation,
-readback by ID and no automatic credential retransmission. Passwords are absent
-from service journals and service progress/error messages.
+### Update Wi-Fi on an existing Ambyte
+
+Use **Wi-Fi settings (USB)…** when only the network
+has changed. This works even if openJII says the board is already registered to
+another account or organization. No API key, experiment, cached release or
+internet connection on the computer is required.
+
+1. Connect the Ambyte by USB, select its **Serial port**, then click
+   **Wi-Fi settings (USB)…**. Close any other serial monitor first.
+2. Check the displayed **device name and MAC** against the board you intend to
+   update. The MAC is the stable identifier to record alongside its assigned
+   Wi-Fi hub. Sensor bag labels do not identify the Ambyte gateway.
+3. Enter that hub's exact **SSID** and **password**, then click **Update Wi-Fi**.
+   Leave the password empty for an open network. The tool accepts SSIDs up to
+   31 UTF-8 bytes and passwords of 8–63 printable ASCII characters; it rejects
+   values the current firmware would truncate or interpret as console controls.
+   **On service-capable firmware, keep the destination hub powered on and in
+   range during the USB session.** It saves the new credentials only after a
+   successful connection; this flow cannot preload credentials for an
+   unreachable hub. A failed trial attempts to restore the previous network,
+   and the displayed result says whether restoration was confirmed.
+4. Wait for **Wi-Fi saved and connection confirmed** before disconnecting USB.
+   Service firmware may need up to three minutes for startup first. If another
+   maintenance task is still busy, wait and retry; credentials are not sent again
+   automatically.
+   Success confirms the Wi-Fi join, not end-to-end cloud delivery. Existing
+   MQTT certificates, device registration, firmware and schedule remain intact.
+5. For the next board, use **Read device again** and check its MAC before writing.
+   If the USB port name changes, close the window, refresh the main port list
+   and select the new port. Choose the appropriate hub for each board.
+
+Credentials entered in this window stay in memory and are not saved to session
+settings or logs. The password clears when the window closes. On service-capable
+firmware, **Check saved result** recovers an interrupted update by its operation
+ID without resending credentials. If that result is uncertain or expired,
+**Start new Wi-Fi attempt…** explicitly starts another attempt after operator
+confirmation; active operations are never displaced. **Check saved result** also
+reconciles a saved schedule after an app restart without signing in or starting
+onboarding. Terminal results are marked resolved, with active-workbook verification
+reported as unchecked. An owned staging transfer can be explicitly cancelled;
+uncertain/expired/changed-store records can be explicitly archived while no
+operation is active. The journal keeps one `.previous.json` archive; a later archive replaces it.
+
+Older firmware uses its existing persistent `wifi_join` command. A failed legacy
+join may already have stored the new credentials and may continue retrying;
+check the password and hub rather than interpreting a timeout as a successful
+connection. The GUI asks for confirmation before this older firmware overwrites
+the saved network, because it does not roll back a failed join. Firmware lacking
+both service support and `wifi_join` cannot use
+this flow. The GUI never flashes it as a fallback.
+
+See [USB Wi-Fi maintenance](../docs/usb-wifi-settings.md) for the selection and
+recovery mechanism. Full onboarding still writes its Wi-Fi settings into the
+NVS image as before.
+
+### Update firmware while keeping the existing identity
+
+Connect the board, select its USB port, and click **Update firmware (keep
+settings)**. This is the primary action for existing devices. It does not use
+the API key, experiment selection, workbook, timezone or Wi-Fi form fields.
+There are no registration, onboarding or certificate requests, and no private
+key is read from the device. If the selected firmware is already installed, the
+tool skips flashing.
+
+The updater verifies the release image's version, the pinned signer for signed
+releases, storage compatibility, and the selected device's MAC. On the actual
+writing connection it compares the board's partition table with the release's
+table before writing any image. It writes only the release's bootloader,
+partition table, OTA selection and application images, preserving NVS, littlefs
+and the event store. Settings, device identity and schedule are checked again
+after boot. The preserved littlefs includes the installed schedule and service
+recovery store; maintenance never replaces it with an onboarding image.
+
+Identity-capable firmware is required for firmware-only verification. Downgrades,
+different partition layouts and unqualified storage-format changes are refused.
+Firmware does not expose certificate presence or validity offline: the GUI reports
+only that MQTT configuration is present. A connectivity failure never triggers
+registration or certificate rotation. An installed schedule that fails to load
+under the new firmware is reported as needing attention; it is not replaced
+automatically. Embedded defaults belong to the new firmware image.
+
+**Initial setup / replace identity…** remains a separate, explicit action for
+first provisioning or credential replacement, and retains the complete setup
+form and its openJII permissions. Use it only when replacing those settings is
+intended. See [identity-preserving firmware updates](../docs/usb-firmware-maintenance.md)
+for the checks and qualification evidence.
 
 ### Attached-sensor diagnostics
 
@@ -246,8 +330,7 @@ Once per session:
    instead of the workbook's schedule.
 5. Enter the **Wi-Fi SSID/password** the boards should join.
 
-Per board: plug it in via USB-C → **Refresh** → pick the port → **On-board
-device** → confirm/edit the name in the prompt. Everything else is automatic,
+Per board: plug it in via USB-C → **Refresh** → pick the port → **Initial setup / replace identity…** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
 RTC, installed schedule — including its stamped workbook id when installed
 from a workbook).
@@ -403,7 +486,8 @@ sequenceDiagram
 - The GUI provisions certificates and Wi-Fi credentials through NVS baking at
   0x9000 (`0x6000` bytes, matches `partitions.csv`). The certificate setters are
   dead code; legacy `wifi_join` does not set the provisioned flag. The bounded
-  service join is a separate credential write and does not change this flow. The NVS generator is vendored
+  service join and the local **Wi-Fi settings (USB)** action are separate
+  credential writes and do not change the onboarding flow. The NVS generator is vendored
   (`vendor/nvs_partition_gen.py`, from ESP-IDF), so no IDF install is needed.
 - `cfg get` returns **raw NVS strings**: a fleet-default board answers
   `device_name = AMBYTE_{MAC}` — the tool expands the token before comparing.
@@ -437,6 +521,11 @@ sequenceDiagram
     still delivers to the experiment, but only its current owners manage it.
     Delete it on openJII and onboard again to re-home it. A board registered
     by an account whose devices you cannot see fails with a 409 naming that.
+    **Changing only Wi-Fi does not require re-homing or onboarding:** use the
+    local USB Wi-Fi action. The Ambyte can report its own MAC and name, but
+    cannot tell you which openJII user registered it. The registry listing is
+    scoped to the signed-in account's access; an administrator with access to
+    the owning organization must investigate ownership using the MAC.
 - The AWS IoT broker endpoint and ingest topic prefix are authoritative values
   from openJII's device-onboarding response. The GUI only appends the
   contract-required `/{sensorVersion}/{sensorId}` suffix because that portion
@@ -452,7 +541,8 @@ sequenceDiagram
 ```
 flash_gui/
   __main__.py        python -m flash_gui
-  gui.py             Tkinter app (worker threads, never blocks the UI)
+  gui.py             Tkinter app (maintenance primary, initial setup explicit)
+  firmware_update.py identity-preserving, signed firmware maintenance over USB
   procedure.py       the per-board state machine + retry paths
   config.py          environments, topic conventions, persisted settings
   release_fetch.py   firmware download/cache + latest Schedule catalog validation
@@ -463,6 +553,8 @@ flash_gui/
   service_wire.py    strict CRC/JSON codec and nonsecret result validation
   service_benchmark.py bench measurement adapters over the shared client
   service_journal.py per-gateway durable intent and process ownership
+  wifi_settings.py  local USB discovery, persistent Wi-Fi update and result recovery
+  wifi_gui.py       Wi-Fi settings window (no cloud account or flashing)
   openjii_client.py  API-key auth, experiments, device registry, credentials
   timezones.py       host IANA zone + the firmware's supported-zone table
   vendor/            vendored ESP-IDF nvs_partition_gen.py

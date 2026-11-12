@@ -278,9 +278,9 @@ class App(ttk.Frame):
         ttk.Button(frame, text="Refresh",
                    command=self._refresh_ports).grid(row=0, column=2,
                                                      padx=(8, 0))
-        self.onboard_btn = ttk.Button(frame, text="On-board device",
-                                      command=self._onboard)
-        self.onboard_btn.grid(row=0, column=3, padx=(8, 0))
+        self.firmware_btn = ttk.Button(frame, text="Update firmware (keep settings)",
+                                       command=self._update_firmware)
+        self.firmware_btn.grid(row=0, column=3, padx=(8, 0))
 
         self.sensors_btn = ttk.Button(frame, text="Diagnostics / Read sensors",
                                       command=self._read_sensor_diagnostics)
@@ -306,6 +306,12 @@ class App(ttk.Frame):
         self.retry_prov_btn.pack(side="left", padx=(8, 0))
         transfer_row = ttk.Frame(frame)
         transfer_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.onboard_btn = ttk.Button(
+            transfer_row, text="Initial setup / replace identity…", command=self._onboard)
+        self.onboard_btn.pack(side="left", padx=(0, 8))
+        self.wifi_btn = ttk.Button(
+            transfer_row, text="Wi-Fi settings (USB)…", command=self._open_wifi_settings)
+        self.wifi_btn.pack(side="left", padx=(0, 8))
         self.cancel_schedule_btn = ttk.Button(
             transfer_row, text="Cancel schedule transfer", command=self._cancel_schedule,
             state="disabled")
@@ -324,6 +330,58 @@ class App(ttk.Frame):
         self.log_text.grid(row=4, column=0, columnspan=4, sticky="nsew",
                            pady=(8, 0))
         frame.rowconfigure(4, weight=1)
+
+    def _open_wifi_settings(self):
+        if self.busy:
+            return
+        port = self._selected_port()
+        if not port:
+            messagebox.showinfo("Wi-Fi settings", "Select a serial port first.")
+            return
+        from .wifi_gui import WifiDialog
+        self.busy = True
+        self._set_busy(True)
+        try:
+            WifiDialog(self, port)
+        except Exception:
+            self._set_busy(False)
+            raise
+
+    def _update_firmware(self):
+        """The normal existing-device action has no provisioning context."""
+        if self.busy:
+            return
+        port, release = self._selected_port(), self.release
+        if not port or release is None:
+            messagebox.showinfo("Firmware update", "Select a serial port and wait for the firmware release to finish loading.")
+            return
+        from .firmware_update import update_firmware
+        self._reset_steps()
+        self.current_run = None
+        self.busy = True
+        self._set_busy(True)
+        self.result_var.set("Updating firmware; keeping existing settings…")
+        def finish(result, error):
+            self._set_busy(False)
+            if error:
+                self.result_var.set("Firmware update needs attention.")
+                self.log(error)
+                messagebox.showerror("Firmware update", error)
+            else:
+                message = (f"Updated to {result.firmware}; settings preserved."
+                           if result.changed else f"Already on {result.firmware}; no flash needed.")
+                self.result_var.set(message)
+                self.log(message)
+        def work():
+            try:
+                result, error = update_firmware(port, release, log=self.log), None
+            except Exception as exc:
+                result, error = None, str(exc)
+            try:
+                self._post(finish, result, error)
+            except (RuntimeError, tk.TclError):
+                pass
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_sensor_panel(self):
         if self.sensor_window is not None and self.sensor_window.winfo_exists():
@@ -454,8 +512,12 @@ class App(ttk.Frame):
             self.busy = busy
             self.onboard_btn.configure(
                 state="disabled" if busy else "normal")
+            if hasattr(self, "firmware_btn"):
+                self.firmware_btn.configure(state="disabled" if busy else "normal")
             if hasattr(self, "sensors_btn"):
                 self.sensors_btn.configure(state="disabled" if busy else "normal")
+            if hasattr(self, "wifi_btn"):
+                self.wifi_btn.configure(state="disabled" if busy else "normal")
             self.schedule_script_box.configure(
                 state="disabled" if busy or self.schedule_catalog is None
                 else "readonly")
