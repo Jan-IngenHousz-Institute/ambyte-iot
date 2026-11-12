@@ -25,6 +25,7 @@
 #include "esp_loader.h"
 #include "uart_sensors.h"
 #include "ambit_flash_preflight.h"
+#include "ambit_fw_manifest.h"
 #include "sd_card.h"
 #include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
 #include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
@@ -480,7 +481,13 @@ static bool dir_has_all_regions(const char *dir)
             return false;
         }
     }
-    return true;
+    /* A folder carrying manifest.json (every remotely fetched one) is a target
+     * only once each region has the size it promises: a download interrupted
+     * mid-file leaves a short file, and boot sync must not pick that folder and
+     * auto-flash it. Sizes only here (this runs on every boot); the full SHA-256
+     * check runs in the preflight before the chip is touched. */
+    const ambit_fw_dir_t g = ambit_fw_dir_check(dir, false, NULL);
+    return g == AMBIT_FW_DIR_LEGACY || g == AMBIT_FW_DIR_VERIFIED;
 }
 
 esp_err_t ambit_flash_find_target(ambit_flash_target_t *out)

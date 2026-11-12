@@ -108,8 +108,19 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id);
  * The worker creates a missing canonical root/version directory before its
  * file preflight, so operators can stage a recovery bundle on older SD cards.
  * It still fails before touching the AMBIT unless all 4 region files are
- * present and non-empty; this path does not download them. */
-esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id);
+ * present and non-empty and, when the folder holds a release manifest.json,
+ * match its sizes and SHA-256s (ambit_fw_manifest.h).
+ *
+ * `manifest_url` (NULL/"" = SD only, the original behaviour): an https:// link to
+ * an ambit-iot release's manifest.json. The worker first downloads that release
+ * into /sdcard/ambit_fw/<version>/ (ambit_fw_fetch.h: manifest version must equal
+ * `version`; each region is verified against the manifest's size + SHA-256), and
+ * flashes only when the whole folder verified. This is how a pre-1.0 AMBIT, which
+ * has no app-level OTA receiver, is updated with no one touching the SD card.
+ * A failed fetch touches no AMBIT and counts as a failed attempt for the retry cap.
+ * Non-https URLs or URLs ≥ 256 chars are ESP_ERR_INVALID_ARG. */
+esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id,
+                                  const char *manifest_url);
 
 #ifdef __cplusplus
 }

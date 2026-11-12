@@ -12,16 +12,24 @@ client-id spelling rules: `ambyte_` and `AMBYTE_` are different MQTT routes.
     fleet_command.py replay --mode status --devices ... --token sep16-fffc80
     fleet_command.py replay --mode count --devices ... --token t --from-id A --to-id B
     fleet_command.py replay --mode run   --devices ... --token t --from-id A --to-id B --chunk 64
+    fleet_command.py ambit-versions --devices ambyte_10:00:3B:72:22:38
+    fleet_command.py ambit-flash --devices ... --version 1.4.0 --channel 0 \
+        --manifest-url https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.4.0/manifest.json
 
 Replies are written to --results-json (per device) and summarised on stdout.
 Exit status: 0 when every targeted device replied (and, for ping with
 --expect-fw, every reply carries that firmware); 1 otherwise; 2 on bad input.
 Never publishes retained messages. `replay --mode run` and `cancel` change
-device state; everything else is read-only.
+device state, and `ambit-flash` rewrites AMBIT firmware (the ROM-bootloader path,
+the only one a pre-1.0 AMBIT has; with --manifest-url the Ambyte first downloads
+and SHA-256-verifies that ambit-iot release onto its SD card). Everything else is
+read-only. An ambit-flash pauses measurement and MQTT on the device for the
+download plus ~10-60 s per channel; replies wait for its terminal report.
 """
 import argparse
 import json
 import queue
+import re
 import sys
 import time
 
@@ -66,7 +74,28 @@ def build_message(args, req_id):
             if args.mode == "run":
                 msg["chunk"] = args.chunk
         return msg
+    if args.cmd == "ambit-versions":
+        return {"type": "ambit_versions", "id": req_id}
+    if args.cmd == "ambit-flash":
+        if not re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}", args.version or ""):
+            raise SystemExit("ambit-flash needs --version M.m.b")
+        msg = {"type": "ambit_flash", "id": req_id, "version": args.version}
+        if args.channel != "all":
+            if not args.channel.isdigit() or int(args.channel) > 3:
+                raise SystemExit("--channel must be 0-3 or all")
+            msg["channel"] = int(args.channel)
+        else:
+            msg["channel"] = "all"
+        if args.manifest_url:
+            if not args.manifest_url.startswith("https://") or len(args.manifest_url) >= 256:
+                raise SystemExit("--manifest-url must be https:// and shorter than 256 characters")
+            msg["manifest_url"] = args.manifest_url
+        return msg
     raise SystemExit(f"unknown command {args.cmd}")
+
+
+# ambit_flash_status states that end a request (accepted/fetched/flash_ok/... are progress).
+AMBIT_FLASH_TERMINAL = ("success", "failed", "busy")
 
 
 def version_tuple(s):
@@ -90,12 +119,23 @@ def summarise(dev, reply):
         return (f"replay mode={reply.get('mode')} ok={reply.get('ok')} state={reply.get('state')} "
                 f"detail={reply.get('detail')} matched={reply.get('matched')} appended={reply.get('appended')} "
                 f"next_id={reply.get('next_id')}")
+    if t == "ambit_flash_status":
+        return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
+                + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
+    if t == "ambit_versions":
+        chans = " ".join(f"ch{c.get('ch')}={c.get('version', 'present' if c.get('present') else 'absent')}"
+                         for c in reply.get("channels", []))
+        return f"ambit_versions {chans}"
     return f"{t} {json.dumps(reply)[:160]}"
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ping", "inventory", "replay"])
+    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ambit-versions", "ambit-flash"])
+    ap.add_argument("--version", default="", help="ambit-flash: AMBIT release version M.m.b")
+    ap.add_argument("--channel", default="all", help="ambit-flash: 0-3 or all (default)")
+    ap.add_argument("--manifest-url", dest="manifest_url", default="",
+                    help="ambit-flash: https:// ambit-iot release manifest.json to download first")
     ap.add_argument("--devices", default="", help="exact client ids or MACs, comma/space separated; empty = discover")
     ap.add_argument("--window-minutes", type=int, default=1440, help="discovery lookback when --devices is empty")
     ap.add_argument("--mode", default="status", choices=["count", "run", "cancel", "status"])
@@ -106,12 +146,17 @@ def main(argv=None):
     ap.add_argument("--to-ms", dest="to_ms", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--expect-fw", default="", help="ping only: fail unless every reply reports this firmware")
-    ap.add_argument("--wait", type=int, default=60, help="seconds to wait for replies")
+    ap.add_argument("--wait", type=int, default=0,
+                    help="seconds to wait for replies (default 60; ambit-versions 150, ambit-flash 900)")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--region", default="eu-central-1")
     ap.add_argument("--results-json", default=None)
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the payload, publish nothing")
     args = ap.parse_args(argv)
+    if args.wait <= 0:
+        # ambit-versions quiesces 65 s before sweeping; ambit-flash adds the
+        # release download, ~10-60 s per channel and the MQTT reconnect.
+        args.wait = {"ambit-versions": 150, "ambit-flash": 900}.get(args.cmd, 60)
 
     session = fleet_deploy.boto_session(args.profile, args.region)
     if args.devices.strip():
@@ -122,7 +167,7 @@ def main(argv=None):
         raise SystemExit("no target devices")
     req_id = f"fc-{args.cmd}-{args.mode if args.cmd == 'replay' else 'x'}-{int(time.time())}"
     payload = build_message(args, req_id)
-    mutating = args.cmd == "replay" and args.mode not in READ_ONLY_MODES
+    mutating = (args.cmd == "replay" and args.mode not in READ_ONLY_MODES) or args.cmd == "ambit-flash"
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
           f"request id {req_id}{' (MUTATING)' if mutating else ''}")
@@ -140,6 +185,7 @@ def main(argv=None):
                                         lambda topic, payload, **kw: q.put((time.time(), topic, payload)),
                                         client_id="fleet-deploy-command")
     replies = {}
+    progress = {}
     try:
         for dev in devices:
             fut, _ = conn.publish(topic=fleet_deploy.COMMAND_TOPIC_FMT.format(device=dev),
@@ -162,10 +208,20 @@ def main(argv=None):
             if dev is None:
                 continue
             data["_received"] = ts
+            print(f"  {dev}: {summarise(dev, data)}", flush=True)
+            if args.cmd == "ambit-flash":
+                # accepted -> (fetched|fetch_failed) -> per-channel -> success|failed
+                progress.setdefault(dev, []).append(data)
+                if data.get("state") in AMBIT_FLASH_TERMINAL:
+                    replies[dev] = data
+                    if len(replies) >= len(devices):
+                        # AWS IoT does not preserve order: per-channel reports
+                        # published just before the terminal one can land after it.
+                        deadline = min(deadline, time.monotonic() + 5)
+                continue
             # keep the first terminal-looking reply; progress replies of a run keep coming
             if dev not in replies or data.get("detail") not in ("progress",):
                 replies[dev] = data
-            print(f"  {dev}: {summarise(dev, data)}", flush=True)
             if len(replies) >= len(devices) and not (args.cmd == "replay" and args.mode == "run"):
                 break
     finally:
@@ -173,6 +229,10 @@ def main(argv=None):
 
     missing = [d for d in devices if d not in replies]
     bad_fw = []
+    flash_failed = [d for d, r in replies.items()
+                    if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
+    if flash_failed:
+        print(f"ambit_flash did not succeed on: {flash_failed}")
     if args.cmd == "ping" and args.expect_fw:
         want = version_tuple(args.expect_fw)
         bad_fw = [d for d, r in replies.items() if version_tuple(r.get("fw")) != want]
@@ -198,8 +258,9 @@ def main(argv=None):
             json.dump({"command": args.cmd, "mode": args.mode if args.cmd == "replay" else None,
                        "request_id": req_id, "payload": payload, "devices": devices,
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
-                       "firmware": fw_hist, "replay_states": states}, fh, indent=1, sort_keys=True)
-    return 1 if (missing or bad_fw) else 0
+                       "firmware": fw_hist, "replay_states": states, "progress": progress},
+                      fh, indent=1, sort_keys=True)
+    return 1 if (missing or bad_fw or flash_failed) else 0
 
 
 if __name__ == "__main__":
