@@ -8,10 +8,43 @@ license = "GPL-3.0-only"
 authors = [
     { name = "dominikvrbic", email = "dominik.vrbic@jii.org" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "bleak>=3.0.1",
     "cryptography>=46.0.7",
     "paho-mqtt>=2.1.0",
     "protobuf>=7.34.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test*.py"]
+pythonpath = [".", "tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["tools", "flash_gui"]
+omit = ["flash_gui/tests/*", "flash_gui/tz_zone_table.py", "*/vendor/*"]
+relative_files = true
+# Preserve first-party Python coverage from forked workers and Python CLI
+# subprocesses. C harnesses still run with their own ASan/UBSan instrumentation;
+# these Python reports do not claim C coverage.
+concurrency = ["multiprocessing"]
+parallel = true
+patch = ["subprocess"]
+
+[tool.coverage.report]
+include_namespace_packages = true
+omit = ["*/vendor/*"]
+
+[dependency-groups]
+test = [
+    "certifi>=2024.7.4",
+    "esptool>=5.0",
+    "littlefs-python>=0.19",
+    "pyserial>=3.5",
+    "pytest>=9,<10",
+    "pytest-cov>=7,<8",
+    "pytest-xdist>=3.8,<4",
+    "tzlocal>=5.0",
 ]

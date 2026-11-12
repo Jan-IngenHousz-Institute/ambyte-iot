@@ -13,6 +13,7 @@ import concurrent.futures as cf
 import multiprocessing as mp
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -24,15 +25,31 @@ import scenarios as S  # noqa: E402
 SEEDS = [int(x) for x in os.environ.get("EVQ_SEEDS", "1,7,1337").split(",") if x]
 NAMES = [n for g, ns in R.GROUPS.items() for n in ns if n != "A1"]
 RESULTS: dict = {}
+TIMINGS: dict = {}
 
 
 def setUpModule() -> None:
+    started = time.perf_counter()
     R._prebuild()
+    TIMINGS["prebuild_seconds"] = time.perf_counter() - started
     tasks = [(n, s) for n in NAMES for s in SEEDS]
-    jobs = max(1, (os.cpu_count() or 2) - 2)
+    # Files can run in independent pytest workers. Bound this nested pool even
+    # on large hosts, and honor taskset/cpuset limits in profiling and CI.
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 2)
+    # Leave a CPU for the other pytest worker's client/deadline tests.
+    budget = cpus - 1 if os.environ.get("PYTEST_XDIST_WORKER_COUNT") else cpus
+    jobs = max(1, min(4, budget))
+    TIMINGS["workers"] = jobs
+    before = os.times()
+    started = time.perf_counter()
     with cf.ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork")) as ex:
         for r in ex.map(R._one, *zip(*tasks)):
             RESULTS[(r["name"], r["seed"])] = r
+    after = os.times()
+    TIMINGS["pool_seconds"] = time.perf_counter() - started
+    TIMINGS["pool_child_cpu_seconds"] = (after.children_user + after.children_system -
+                                         before.children_user - before.children_system)
+    TIMINGS["scenarios"] = [{k: r[k] for k in ("name", "seed", "secs", "ok")} for r in RESULTS.values()]
 
 
 class EvqStorageContract(unittest.TestCase):

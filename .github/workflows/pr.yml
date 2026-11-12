@@ -146,8 +146,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.9.28"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
       - name: Install Python tooling dependencies
-        run: python -m pip install --disable-pip-version-check -r flash_gui/requirements.txt
+        run: uv sync --locked --group test
 
       - name: Install PlatformIO
         run: |
@@ -162,7 +170,26 @@ jobs:
           # Bootstrap above must install the exact project pin. Missing SDK
           # coverage is fatal here; local no-SDK runs report explicit skips.
           AMBYTE_REQUIRE_PINNED_IDF: "1"
-        run: python -m unittest discover -s tests -v
+        run: >-
+          uv run --locked --group test pytest
+          -n 2 --dist=loadfile --max-worker-restart=0
+          --cov --cov-report=term-missing:skip-covered
+          --cov-report=xml:coverage.xml --cov-report=html:htmlcov
+          --junitxml=python-tooling-junit.xml
+          --durations=20 -ra
+
+      - name: Upload Python tooling coverage
+        if: ${{ always() && hashFiles('coverage.xml') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-tooling-coverage-${{ github.event.pull_request.head.sha }}
+          path: |
+            coverage.xml
+            htmlcov/
+            python-tooling-junit.xml
+            python-tooling-timings.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Test sensor inventory fault matrix
         env:
@@ -200,8 +227,8 @@ jobs:
       - name: Check unsigned signing intermediate and recovery config
         if: steps.scope.outputs.firmware-build-required == 'true'
         run: |
-          python tools/check_release_signing.py --self-test
-          python tools/check_release_signing.py --intermediate \
+          uv run --locked --group test python tools/check_release_signing.py --self-test
+          uv run --locked --group test python tools/check_release_signing.py --intermediate \
             --elf .pio/build/esp32-s3-devkitm-1/firmware.elf \
             --bin .pio/build/esp32-s3-devkitm-1/firmware.bin \
             --sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json

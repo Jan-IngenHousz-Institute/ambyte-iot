@@ -2,6 +2,12 @@
 !.github/
 .env
 __pycache__/
+.coverage
+.coverage.*
+/coverage.xml
+/htmlcov/
+/python-tooling-timings.json
+/python-tooling-junit.xml
 build/
 /dist/
 /node_modules/
