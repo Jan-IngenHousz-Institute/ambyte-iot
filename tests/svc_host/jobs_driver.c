@@ -57,7 +57,7 @@ esp_err_t esp_https_ota_abort(esp_https_ota_handle_t h) { (void)h; abort(); }
 void mbedtls_sha256_init(mbedtls_sha256_context *c) { (void)c; abort(); }
 int mbedtls_sha256_starts(mbedtls_sha256_context *c, int n) { (void)c; (void)n; abort(); }
 int mbedtls_sha256_update(mbedtls_sha256_context *c, const unsigned char *b, size_t n) { (void)c; (void)b; (void)n; abort(); }
-int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char *b) { (void)c; (void)b; abort(); }
+int mbedtls_sha256_finish(mbedtls_sha256_context *c, unsigned char b[32]) { (void)c; (void)b; abort(); }
 void mbedtls_sha256_free(mbedtls_sha256_context *c) { (void)c; abort(); }
 
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out)

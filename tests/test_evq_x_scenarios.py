@@ -127,6 +127,7 @@ class ShimAndScenarios(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls._saved_cc = os.environ.get("CC")
         os.environ.setdefault("CC", "clang")
         cls.out = Path(tempfile.mkdtemp(prefix="evqx-", dir=os.environ.get("EVQ_TMPDIR")))
         cls._saved_out = os.environ.get("EVQ_OUT")
@@ -134,6 +135,11 @@ class ShimAndScenarios(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # File scheduling must not change later harnesses' compiler selection.
+        if cls._saved_cc is None:
+            os.environ.pop("CC", None)
+        else:
+            os.environ["CC"] = cls._saved_cc
         if cls._saved_out is None:
             os.environ.pop("EVQ_OUT", None)
         else:
