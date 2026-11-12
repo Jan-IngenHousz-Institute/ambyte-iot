@@ -28,6 +28,23 @@ RESULTS: dict = {}
 TIMINGS: dict = {}
 
 
+def _init_harness_worker() -> None:
+    # R._one runs only tests/evq_host Python oracles and native C drivers. None
+    # of it is in the tools/ + flash_gui/ coverage scope, but the inherited
+    # tracer still pays for millions of oracle calls. Stop it in these children
+    # only; parent tests, first-party Python and Python CLI coverage stay active.
+    # Native ASan/UBSan instrumentation and every oracle/assertion are unchanged.
+    if mp.parent_process() is None:
+        return
+    try:
+        from coverage import Coverage
+    except ImportError:  # plain unittest runs need not install coverage
+        return
+    cov = Coverage.current()
+    if cov is not None:
+        cov.stop()
+
+
 def setUpModule() -> None:
     started = time.perf_counter()
     R._prebuild()
@@ -42,7 +59,8 @@ def setUpModule() -> None:
     TIMINGS["workers"] = jobs
     before = os.times()
     started = time.perf_counter()
-    with cf.ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork")) as ex:
+    with cf.ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork"),
+                                initializer=_init_harness_worker) as ex:
         for r in ex.map(R._one, *zip(*tasks)):
             RESULTS[(r["name"], r["seed"])] = r
     after = os.times()

@@ -75,7 +75,8 @@ BaseType_t xRingbufferSend(RingbufHandle_t r,const void *p,size_t n,TickType_t t
 void *xRingbufferReceiveUpTo(RingbufHandle_t r,size_t *n,TickType_t t,size_t max)
 {
     (void)t; assert(!critical && !r->borrowed); *n=r->used;
-    if (*n>r->cap-r->tail) *n=r->cap-r->tail; if (*n>max) *n=max;
+    if (*n>r->cap-r->tail) *n=r->cap-r->tail;
+    if (*n>max) *n=max;
     r->borrowed=*n; return *n?r->data+r->tail:NULL;
 }
 void *xRingbufferReceiveUpToFromISR(RingbufHandle_t r,size_t *n,size_t max)
@@ -97,7 +98,8 @@ esp_err_t esp_intr_alloc(int source,int flags,void (*fn)(void *),void *arg,intr_
 void esp_intr_free(intr_handle_t h) { assert(h==(void *)1); }
 static void pump(void)
 {
-    if(pumping || !isr) return; pumping=true;
+    if(pumping || !isr) return;
+    pumping=true;
     while(enabled&USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY) { status|=USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY; isr(isr_arg); }
     pumping=false;
 }
