@@ -125,9 +125,9 @@ class ScheduleWorkflowTest(unittest.TestCase):
         package_bootstrap = PR_WORKFLOW.index(
             'pio pkg install -e esp32-s3-devkitm-1'
         )
-        host_tests = PR_WORKFLOW.index("python -m unittest discover -s tests -v")
+        host_tests = PR_WORKFLOW.index("uv run --locked --group test pytest")
         self.assertLess(package_bootstrap, host_tests)
-        self.assertIn("python -m unittest discover -s tests -v", PR_WORKFLOW)
+        self.assertIn("uv run --locked --group test pytest", PR_WORKFLOW)
         self.assertIn("cp release-preview.md dist/release-preview.md", PR_WORKFLOW)
 
 

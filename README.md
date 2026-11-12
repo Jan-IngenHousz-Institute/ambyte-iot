@@ -134,6 +134,27 @@ uv pip install --python ~/.platformio/penv/.espidf-5.5.0/bin/python -r ~/.platfo
 
 ---
 
+## Host Python tooling tests
+
+The locked `test` dependency group uses Python 3.13+ and pytest 9+, including
+support for the existing unittest cases, module/class fixtures, and subtests:
+
+```bash
+uv sync --locked --group test
+pio pkg install -e esp32-s3-devkitm-1  # install the qualified SDK before testing
+AMBYTE_REQUIRE_PINNED_IDF=1 uv run --locked --group test pytest \
+  --cov --cov-report=term-missing:skip-covered \
+  --cov-report=xml:coverage.xml --cov-report=html:htmlcov --durations=20 -ra
+```
+
+Python statement/branch coverage covers first-party `tools/` and `flash_gui/`,
+including Python CLI subprocesses and multiprocessing workers. It excludes GUI
+test helpers and the generated timezone table, and does not measure firmware C
+coverage. The production C harnesses retain their ASan/UBSan checks, fault
+injection, seeds, and repetitions. CI uploads XML/HTML coverage separately from
+release candidates; no minimum percentage is imposed. Without the pinned SDK,
+the command above fails instead of silently skipping its coverage.
+
 ## Build, flash, monitor
 
 ```sh

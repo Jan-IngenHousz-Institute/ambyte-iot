@@ -5,13 +5,13 @@ from pathlib import Path
 import unittest
 
 
-def load_tests(loader, tests, pattern):
-    del tests, pattern
-    path = Path(__file__).resolve().parents[1] / "flash_gui/tests/test_sensors.py"
-    spec = importlib.util.spec_from_file_location("_sensor_gui_contract", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return loader.loadTestsFromModule(module)
+# Both unittest and pytest collect this same TestCase. pytest does not implement
+# unittest's load_tests hook, so hiding the class behind that hook loses coverage.
+path = Path(__file__).resolve().parents[1] / "flash_gui/tests/test_sensors.py"
+spec = importlib.util.spec_from_file_location("_sensor_gui_contract", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+SensorClientTest = module.SensorClientTest
 
 
 if __name__ == "__main__":

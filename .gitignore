@@ -2,6 +2,10 @@
 !.github/
 .env
 __pycache__/
+.coverage
+.coverage.*
+/coverage.xml
+/htmlcov/
 build/
 /dist/
 /node_modules/

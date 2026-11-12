@@ -23,14 +23,11 @@ class ReleaseVersioningContractTest(unittest.TestCase):
         self.assertNotIn("version.txt", CMAKE)
 
     def test_pr_installs_imported_tooling_dependencies_before_tests(self) -> None:
-        dependency_install = (
-            "python -m pip install --disable-pip-version-check "
-            "-r flash_gui/requirements.txt"
-        )
+        dependency_install = "uv sync --locked --group test"
         self.assertIn(dependency_install, PR_WORKFLOW)
         self.assertLess(
             PR_WORKFLOW.index(dependency_install),
-            PR_WORKFLOW.index("python -m unittest discover -s tests -v"),
+            PR_WORKFLOW.index("uv run --locked --group test pytest"),
         )
 
     def test_pr_build_injects_semantic_release_preview(self) -> None:
