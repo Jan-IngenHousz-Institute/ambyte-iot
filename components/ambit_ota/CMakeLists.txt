@@ -4,7 +4,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS "."
     REQUIRES domain device_commands
     # event_log: only for evq_hil_io_w.h (verification-build fault wrappers).
-    PRIV_REQUIRES esp_http_client mbedtls esp_system sd_card nvs_flash ambit_flash fleet_jitter event_log
+    PRIV_REQUIRES esp_http_client mbedtls esp_system esp_timer sd_card nvs_flash ambit_flash fleet_jitter event_log
 )
 # Cold SD-fault/diagnostic paths: compiled for size, not the project's -Og
 # (keeps the write-integrity release inside its flash budget).

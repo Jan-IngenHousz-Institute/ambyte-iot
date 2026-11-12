@@ -93,6 +93,25 @@ int ambit_flash_check(void);
  * the target version, or -1 if no SD target image is present. */
 int ambit_flash_boot_sync(void);
 
+/* Attach-time check of one channel (ambit_attach_gate.h): compare the AMBIT's
+ * firmware string `fw` (from the identity cache, no UART traffic) with the
+ * highest verified SD target. *tgt is filled when a target exists. */
+typedef enum {
+    AMBIT_ATTACH_DECIDE_CURRENT = 0,     /* equals the target */
+    AMBIT_ATTACH_DECIDE_NEWER,           /* newer than the target: never downgraded */
+    AMBIT_ATTACH_DECIDE_NO_TARGET,       /* no verified /sdcard/ambit_fw/<ver>/ */
+    AMBIT_ATTACH_DECIDE_SD_UNAVAILABLE,  /* card absent/parked: target unknown now */
+    AMBIT_ATTACH_DECIDE_UNREADABLE,      /* firmware string not M.m.b */
+    AMBIT_ATTACH_DECIDE_STALE,           /* older: flash it */
+    AMBIT_ATTACH_DECIDE_GAVE_UP,         /* older, but BOOT_FAIL_MAX attempts already failed */
+} ambit_attach_decision_t;
+ambit_attach_decision_t ambit_flash_attach_decide(uint8_t ch, const char *fw, ambit_flash_target_t *tgt);
+
+/* Flash `ch` to `tgt` and verify the running version (shares boot sync's
+ * per-channel fail counter). Caller has quiesced measurement. ESP_OK only when
+ * the AMBIT reports the target version afterwards. */
+esp_err_t ambit_flash_attach_flash(uint8_t ch, const ambit_flash_target_t *tgt);
+
 #if defined(CONFIG_AMBYTE_EVQ_HIL) && CONFIG_AMBYTE_EVQ_HIL
 /* Verification build only (Sprint 2 replacement amendment A6); see ambit_flash.c. */
 bool      evq_hil_ambit_sync_held(void);

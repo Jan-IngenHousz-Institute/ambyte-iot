@@ -1039,3 +1039,73 @@ int ambit_flash_boot_sync(void)
     ESP_LOGW(TAG, "boot sync: %d/%d channel(s) flashed to v%s", flashed, n_need, ver);
     return flashed;
 }
+
+/* ── attach-time check + flash (one channel, while the Ambyte runs) ───────
+ * The schedule holds an AMBIT whose (MAC, firmware) was not yet checked
+ * (ambit_attach_gate.h); the ambit_ota worker calls these two. The decision uses
+ * the firmware string the identity cache already holds, so the common case (up
+ * to date, or no SD target) costs an SD directory scan and no UART traffic. The
+ * flash shares boot sync's per-channel, per-target fail counter, so attach and
+ * boot attempts together are capped at BOOT_FAIL_MAX. */
+ambit_attach_decision_t ambit_flash_attach_decide(uint8_t ch, const char *fw, ambit_flash_target_t *tgt)
+{
+    memset(tgt, 0, sizeof *tgt);
+    if (ch >= UART_SENSOR_NUM_CHANNELS || fw == NULL) return AMBIT_ATTACH_DECIDE_UNREADABLE;
+    unsigned a = 0, b = 0, c = 0;
+    char tail = 0;
+    if (sscanf(fw, "%u.%u.%u%c", &a, &b, &c, &tail) != 3 || a > 255 || b > 255 || c > 255) {
+        return AMBIT_ATTACH_DECIDE_UNREADABLE;
+    }
+    esp_err_t e = ambit_flash_find_target(tgt);
+    if (e == ESP_ERR_NOT_FOUND) return AMBIT_ATTACH_DECIDE_NO_TARGET;
+    if (e != ESP_OK) return AMBIT_ATTACH_DECIDE_SD_UNAVAILABLE;
+    if (a == tgt->major && b == tgt->minor && c == tgt->batch) return AMBIT_ATTACH_DECIDE_CURRENT;
+    if (ver_gt((uint8_t)a, (uint8_t)b, (uint8_t)c, tgt->major, tgt->minor, tgt->batch)) {
+        return AMBIT_ATTACH_DECIDE_NEWER;   /* a recovery image never rolls a unit back */
+    }
+    char ver[16];
+    snprintf(ver, sizeof ver, "%u.%u.%u", tgt->major, tgt->minor, tgt->batch);
+    if (boot_fail_count(ch, ver) >= BOOT_FAIL_MAX) return AMBIT_ATTACH_DECIDE_GAVE_UP;
+    return AMBIT_ATTACH_DECIDE_STALE;
+}
+
+esp_err_t ambit_flash_attach_flash(uint8_t ch, const ambit_flash_target_t *tgt)
+{
+    if (ch >= UART_SENSOR_NUM_CHANNELS || tgt == NULL) return ESP_ERR_INVALID_ARG;
+    char ver[16];
+    snprintf(ver, sizeof ver, "%u.%u.%u", tgt->major, tgt->minor, tgt->batch);
+    const int fails = boot_fail_count(ch, ver);
+    /* Count the attempt BEFORE touching the chip (see boot sync (b)): a reset
+     * mid-flash must still count towards the cap. */
+    boot_fail_bump(ch, ver, fails);
+    ESP_LOGW(TAG, "attach: flashing ch%u -> v%s (attempt %d/%d)", ch, ver, fails + 1, BOOT_FAIL_MAX);
+    ambit_flash_image_result_t res;
+    esp_err_t err = ambit_flash_image(ch, tgt->dir, 0, &res);
+    bool verified = false;
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
+        for (int try = 0; try < BOOT_VERIFY_TRIES && !verified; try++) {
+            ambit_fw_info_t fw;
+            if (boot_read_version(ch, &fw)) {
+                if (fw_matches(&fw, tgt)) {
+                    verified = true;
+                } else {
+                    ESP_LOGE(TAG, "attach: ch%u flashed but reports v%u.%u.%u", ch, fw.major, fw.minor, fw.batch);
+                    break;
+                }
+            } else if (try + 1 < BOOT_VERIFY_TRIES) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+    }
+    /* New firmware (or a half-written app): either way the cached identity is stale. */
+    cmd_ambit_device_info_invalidate(ch);
+    if (verified) {
+        boot_fail_clear(ch);
+        ESP_LOGW(TAG, "attach: ch%u now running v%s (verified)", ch, ver);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "attach: ch%u flash to v%s NOT verified (%s; attempt %d/%d counted)", ch, ver,
+             esp_err_to_name(err), fails + 1, BOOT_FAIL_MAX);
+    return err == ESP_OK ? ESP_ERR_INVALID_VERSION : err;
+}
