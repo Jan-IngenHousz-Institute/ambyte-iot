@@ -194,7 +194,9 @@ internet connection on the computer is required.
    stay saved for deployment. Power-cycle at deployment if the board does not
    connect when the hub is available. Service firmware
    may need up to three minutes for startup first. USB errors and unexpected
-   firmware results are reported as unconfirmed, never retried automatically.
+   firmware results are reported as unconfirmed. Only a definite driver-busy
+   reply retries identical credentials on the same descriptor for up to 90
+   seconds. Lost or malformed replies never resend credentials.
    Existing MQTT certificates, registration, firmware and schedule remain intact.
    A connected result confirms the Wi-Fi join, not end-to-end cloud delivery.
 5. For the next board, use **Read device again** and check its MAC before writing.

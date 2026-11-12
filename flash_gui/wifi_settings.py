@@ -20,9 +20,10 @@ from .service_wire import ServiceError, TransportError
 
 
 class WifiSettingsError(RuntimeError):
-    def __init__(self, message, *, uncertain=False):
+    def __init__(self, message, *, uncertain=False, reason=None):
         super().__init__(message)
         self.uncertain = uncertain
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -205,11 +206,11 @@ def _legacy_join(console, ssid, password, *, require_connection=True):
                 raise WifiSettingsError(
                     "Wi-Fi save could not be confirmed (ESP_ERR_WIFI_STATE). The Ambyte was busy trying to connect. "
                     "Wait a few seconds and explicitly Save Wi-Fi again; resending the same credentials is safe.",
-                    uncertain=True)
+                    uncertain=True, reason=match[1])
             raise WifiSettingsError(
                 f"Wi-Fi save could not be confirmed ({match[1]}). The credentials may have changed. "
                 "Read the device again to check its identity, then explicitly Save Wi-Fi again with the same credentials if needed.",
-                uncertain=True)
+                uncertain=True, reason=match[1])
         raise WifiSettingsError(
             f"Wi-Fi connection failed ({match[1]}). Older firmware may have saved the new credentials and may keep retrying; check the hub and password.")
     # wifi_manager_connect returns ESP_OK only after getting an IP. Do not
@@ -232,6 +233,29 @@ def _wait_service_startup(console, expected):
         if time.monotonic() >= deadline:
             raise WifiSettingsError("Ambyte startup has not finished. No Wi-Fi credentials were sent. Wait and read the device again.")
         time.sleep(1.0)
+
+
+def _save_persistent(console, info, ssid, password):
+    # Reopening USB can reboot the board onto the same unreachable-network
+    # retry ladder. Stay on this descriptor for a bounded retry of the ONE
+    # definite busy reply. Identical persistent credentials are idempotent,
+    # even if WIFI_STATE came from a later disconnect/connect after saving.
+    # Missing, malformed, or lost replies have no reason code and never retry.
+    deadline = time.monotonic() + 90.0
+    while True:
+        try:
+            return _legacy_join(console, ssid, password, require_connection=False)
+        except WifiSettingsError as exc:
+            if exc.reason != "ESP_ERR_WIFI_STATE" or time.monotonic() + 5.0 >= deadline:
+                raise
+        time.sleep(5.0)
+        try:
+            _checked_info(console, info)
+        except Exception:
+            raise WifiSettingsError(
+                "Wi-Fi save remains unconfirmed after a busy reply and a failed device recheck. "
+                "Read and identify the device before explicitly saving again.",
+                uncertain=True, reason="ESP_ERR_WIFI_STATE") from None
 
 
 def save_wifi(expected: DeviceInfo, ssid: str, password: str) -> WifiResult:
@@ -262,7 +286,7 @@ def save_wifi(expected: DeviceInfo, ssid: str, password: str) -> WifiResult:
                     if not console.wait_prompt(ambyte_serial.PROBE_READY_TIMEOUT_S):
                         raise WifiSettingsError("The Ambyte did not return to its console. No Wi-Fi credentials were sent.")
                     _checked_info(console, info)
-                return _legacy_join(console, ssid, password, require_connection=False)
+                return _save_persistent(console, info, ssid, password)
         except ServiceClientError as exc:
             raise WifiSettingsError(f"No Wi-Fi credentials were sent. {exc}") from None
 

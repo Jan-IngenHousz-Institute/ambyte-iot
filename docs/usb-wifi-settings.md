@@ -62,7 +62,10 @@ sequenceDiagram
             GUI->>USB: Wait for startup, check active operation
             USB-->>GUI: No active service work
         end
-        GUI->>USB: Persistent wifi_join, once
+        GUI->>USB: Persistent wifi_join
+        opt Definite ESP_ERR_WIFI_STATE reply
+            GUI->>USB: Recheck MAC, retry identical command on same descriptor
+        end
         USB->>USB: Save credentials, then try connection
         USB-->>GUI: IP confirmed or post-save connection timeout/rejection
         GUI-->>Operator: Saved, connection state stated separately
@@ -81,9 +84,14 @@ sequenceDiagram
 For a persistent save, only `ESP_OK`, `ESP_ERR_TIMEOUT`, and
 `WIFI_MANAGER_ERR_AUTH_REJECTED` are recognized as post-save results. Only
 `ESP_OK` confirms an IP connection. Other errors can arise before persistence,
-so they report an unconfirmed save and no automatic retry. `ESP_ERR_WIFI_STATE`
-can mean the driver was busy trying the old network. Wait a few seconds and
-explicitly save the same credentials again; repeating them is safe. The command and its
+so they report an unconfirmed save. `ESP_ERR_WIFI_STATE` is the sole retryable
+reply: the driver may be busy trying the old unreachable network. The GUI keeps
+the descriptor open and retries the identical credentials every five seconds
+within a 90-second window, rechecking MAC and capabilities before each retry.
+This is idempotent even if the first call saved before its connection attempt
+returned busy. Missing, malformed or lost replies never retry; no other error
+code retries. If the busy window ends, the result remains unconfirmed and the
+operator can explicitly save again. The command and its
 password-bearing echo never leave the backend. A lost reply has no operation ID;
 **Check saved result** describes earlier service operations, not this console
 save. Read the device again to confirm its identity, then explicitly save the same
@@ -107,7 +115,10 @@ network connection.
 flowchart TD
     Ready[Device identified] --> Choice{Operator action}
     Choice -->|Save Wi-Fi| Guards[Check identity and unresolved work]
-    Guards -->|Clear| Save[Send persistent command once]
+    Guards -->|Clear| Save[Send persistent command]
+    Save -->|Definite busy reply| Retry[Wait five seconds, recheck MAC, retry same credentials]
+    Retry -->|Within 90-second window| Save
+    Retry -->|Window ended| Unknown
     Save -->|Known post-save reply| Saved[Saved, connection state reported separately]
     Save -->|Lost or ambiguous reply| Unknown[Save unconfirmed, check identity and explicitly retry]
     Choice -->|Test and save| Trial[Journaled service trial]
@@ -200,9 +211,8 @@ old network was unavailable. The result remained unconfirmed. An explicit bench
 restore using the same persistent command on one descriptor succeeded, and the
 original network connected after reboot. Its SSID/password, certificate
 fingerprints and MQTT/config keys matched the private baseline; firmware and the
-installed schedule SHA were unchanged. The private backup was removed. This is
-also why the GUI gives a specific wait-and-explicitly-save-again hint for that
-error rather than claiming success or retrying silently.
+installed schedule SHA were unchanged. The private backup was removed. This exposed the need for the bounded same-descriptor retry of only the definite
+busy reply, described above. Its qualification is recorded below.
 
 A real Tk desktop lifecycle check used a synthetic device-read fixture and
 verified modal construction, worker completion, both action labels, grab release

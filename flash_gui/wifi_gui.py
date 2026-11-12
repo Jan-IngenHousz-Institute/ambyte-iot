@@ -167,7 +167,7 @@ class WifiDialog(tk.Toplevel):
         self._start(action, apply,
                     f"Checking {info.mac} and waiting for startup (up to 3 minutes), then "
                     + ("testing Wi-Fi; keep the hub in range and USB connected…" if test_connection else
-                       "saving Wi-Fi; the hub can be out of range. Keep USB connected…"),
+                       "saving Wi-Fi; a busy driver can take up to 90 seconds. The hub can be out of range. Keep USB connected…"),
                     service_recovery=test_connection)
 
     def _recover(self):

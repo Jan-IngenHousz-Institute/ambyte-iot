@@ -428,9 +428,12 @@ def test_unconfirmed_save_never_claims_credentials_stored_or_exposes_password(us
     with pytest.raises(wifi_settings.WifiSettingsError, match="could not be confirmed") as error:
         wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
     assert error.value.uncertain and "synthetic-password" not in str(error.value)
+    attempts = len([c for c in device.plain if c.startswith("wifi_join ")])
     if result == "ESP_ERR_WIFI_STATE":
         assert "busy trying to connect" in str(error.value) and "same credentials is safe" in str(error.value)
-    assert len([c for c in device.plain if c.startswith("wifi_join ")]) == 1
+        assert 1 < attempts <= 18  # bounded 90-second window, five-second spacing
+    else:
+        assert attempts == 1
 
 
 def test_deployment_save_preserves_unresolved_wifi_and_never_resends_it(usb):
@@ -458,3 +461,69 @@ def test_deployment_save_does_not_bypass_foreign_active_schedule(usb):
 def test_password_echo_cannot_be_mistaken_for_an_unsupported_command(usb):
     info = wifi_settings.read_device("bench")
     assert wifi_settings.save_wifi(info, "Field hub 1", "Unrecognized command").connected
+
+
+def test_offline_save_retries_only_definite_busy_on_the_same_descriptor(usb):
+    device, handles, _ = usb
+    info = wifi_settings.read_device("bench")
+    original = device.console
+    results = iter(["ESP_ERR_WIFI_STATE", "ESP_ERR_WIFI_STATE", "ESP_ERR_TIMEOUT"])
+    def busy(command):
+        if command.startswith("wifi_join "):
+            device.legacy_result = next(results)
+        return original(command)
+    device.console = busy
+    count = len(handles)
+    assert not wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password").connected
+    assert len(handles) == count + 1
+    assert device.plain.count('wifi_join "Field hub 1" "synthetic-password"') == 3
+    assert all(not h.is_open for h in handles)
+
+
+def test_offline_save_stops_busy_retries_if_identity_changes(usb):
+    device, _, _ = usb
+    info = wifi_settings.read_device("bench")
+    original = device.console
+    def swap(command):
+        reply = original(command)
+        if command.startswith("wifi_join "):
+            device.mac = "00:11:22:33:44:55"
+        return reply
+    device.console, device.legacy_result = swap, "ESP_ERR_WIFI_STATE"
+    with pytest.raises(wifi_settings.WifiSettingsError, match="unconfirmed") as error:
+        wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
+    assert error.value.uncertain
+    assert len([c for c in device.plain if c.startswith("wifi_join ")]) == 1
+
+
+def test_offline_save_never_retries_a_lost_reply(usb, monkeypatch):
+    _, _, _ = usb
+    info = wifi_settings.read_device("bench")
+    original, sent = ambyte_serial.AmbyteConsole.command, []
+    def lost(self, command, *args, **kwargs):
+        if command.startswith("wifi_join "):
+            sent.append(command)
+            raise ambyte_serial.ConsoleError(command)
+        return original(self, command, *args, **kwargs)
+    monkeypatch.setattr(ambyte_serial.AmbyteConsole, "command", lost)
+    with pytest.raises(wifi_settings.WifiSettingsError, match="unknown") as error:
+        wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
+    assert len(sent) == 1 and "synthetic-password" not in str(error.value)
+
+
+def test_busy_retry_identity_error_remains_uncertain_and_redacted(usb, monkeypatch):
+    device, _, _ = usb
+    info = wifi_settings.read_device("bench")
+    original = wifi_settings._checked_info
+    calls = []
+    def checked(console, expected):
+        calls.append(1)
+        if any(c.startswith("wifi_join ") for c in device.plain):
+            raise ambyte_serial.ConsoleError("raw private console capture")
+        return original(console, expected)
+    monkeypatch.setattr(wifi_settings, "_checked_info", checked)
+    device.legacy_result = "ESP_ERR_WIFI_STATE"
+    with pytest.raises(wifi_settings.WifiSettingsError) as error:
+        wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
+    assert error.value.uncertain and "raw private" not in str(error.value)
+    assert len([c for c in device.plain if c.startswith("wifi_join ")]) == 1
