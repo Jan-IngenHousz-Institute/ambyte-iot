@@ -166,7 +166,7 @@ class WifiDialog(tk.Toplevel):
             self.saved_schedule = None
             self.message.set(f"Wi-Fi saved and connection confirmed for {result.ssid} on {info.mac}.")
         self._start(lambda: wifi_settings.update_wifi(info, ssid, password, new_request=new_request), apply,
-                    f"Checking {info.mac} and updating Wi-Fi; keep USB connected…")
+                    f"Checking {info.mac} and waiting for startup (up to 3 minutes), then updating Wi-Fi; keep USB connected…")
 
     def _recover(self):
         if self.working or self.info is None:
@@ -192,7 +192,7 @@ class WifiDialog(tk.Toplevel):
             verb = "Cancel the staged transfer" if saved.action == "cancel" else "Archive the unresolved recovery record"
             if messagebox.askyesno("Saved schedule recovery",
                     f"{verb} for schedule {saved.op}, version {saved.version}, on {info.mac}?\n\n"
-                    "This does not install a new workbook. An archived recovery record is preserved on disk.", parent=self):
+                    "This does not install a new workbook. Archiving saves this record on disk and replaces the single previous archive.", parent=self):
                 def apply(result):
                     self.saved_schedule = result if result.action else None
                     self.message.set(result.message)

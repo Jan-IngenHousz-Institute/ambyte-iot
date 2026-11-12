@@ -325,3 +325,57 @@ def test_recovery_of_expired_wifi_result_points_to_explicit_new_attempt(usb):
         wifi_settings.check_saved_result(info)
     assert "Start new Wi-Fi attempt" in str(error.value)
     assert "Use Check saved result" not in str(error.value)
+
+
+def test_completed_schedule_recovery_needs_no_device_io(usb, monkeypatch):
+    info, journal, _ = _pending_schedule(usb, "succeeded")
+    entry = journal.load()
+    entry["phase"] = "complete"
+    journal.save(entry)
+    monkeypatch.setattr(ambyte_serial.serial, "Serial", lambda: pytest.fail("completed recovery must not open USB"))
+    result = wifi_settings.check_saved_result(info)
+    assert result.state == "complete" and result.action is None
+    assert "already complete" in result.message
+
+
+def test_service_wifi_waits_for_boot_on_same_descriptor_before_joining(usb):
+    device, _, _ = usb
+    info = wifi_settings.read_device('bench')
+    device.loaded_source = 'NONE'
+    original, original_answer = device.console, device.answer
+    reads = []
+    def startup(command):
+        if command == 'identity':
+            reads.append(command)
+            if len(reads) >= 3:
+                device.loaded_source = 'INSTALLED'
+        return original(command)
+    def no_early_join(body):
+        if body.startswith('svc.wifi.join '):
+            assert device.loaded_source == 'INSTALLED', 'credentials sent before startup finished'
+        return original_answer(body)
+    device.console, device.answer = startup, no_early_join
+    assert wifi_settings.update_wifi(info, 'Field hub 1', 'synthetic-password').connected
+    assert device.joins == 1
+
+
+def test_service_wifi_never_sends_credentials_if_startup_stays_incomplete(usb):
+    device, handles, _ = usb
+    info = wifi_settings.read_device('bench')
+    device.loaded_source = 'NONE'
+    with pytest.raises(wifi_settings.WifiSettingsError, match='No Wi-Fi credentials were sent'):
+        wifi_settings.update_wifi(info, 'Field hub 1', 'synthetic-password')
+    assert device.joins == 0 and all(not handle.is_open for handle in handles)
+
+
+def test_busy_service_leaves_original_wifi_untouched_and_allows_retry(usb):
+    device, _, directory = usb
+    device.outcome, device.error_reason = "failed", "busy"
+    device.wifi_evidence = dict(saved=False, connected=False, restored=False,
+                               retrying=False, restoration_connected=False)
+    info = wifi_settings.read_device("bench")
+    with pytest.raises(wifi_settings.WifiSettingsError) as error:
+        wifi_settings.update_wifi(info, "Field hub 1", "synthetic-password")
+    assert "maintenance task" in str(error.value) and "not saved" in str(error.value)
+    assert "restoration" not in str(error.value) and not error.value.uncertain
+    assert OperationJournal(directory, MAC).load()["phase"] == "complete"

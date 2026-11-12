@@ -31,7 +31,7 @@ sequenceDiagram
     GUI->>GUI: Verify image version, signer pin and bounds
     GUI->>Console: Read identity and nonsecret cfg
     alt Version already installed
-        GUI-->>Operator: Up to date; no flash
+        GUI-->>Operator: Up to date, no flash
     else Different version
         GUI->>GUI: Refuse downgrade or incompatible storage
         GUI->>Console: Read-only active operation check
@@ -69,7 +69,10 @@ an old image left in the other slot is not a qualified automatic fallback.
 
 ## Verification and recovery
 
-After reboot, the GUI waits for the console and schedule startup, then compares
+Before writing, the GUI waits for schedule startup on the same descriptor and
+logs the loaded source and digest. Unavailable/`NONE` evidence after three minutes
+refuses the update before any write. After reboot, it again waits for the console
+and schedule startup, then compares
 MAC, effective client identity and all captured nonsecret settings. An installed
 schedule must retain its digest and workbook/version metadata and remain loaded.
 `NONE`/unavailable schedule evidence is given time to settle; embedded fallback or
@@ -86,9 +89,13 @@ flowchart TD
     E -->|Match| G[Write firmware images only]
     G --> H[Boot and verify preserved identity and configuration]
     H -->|Confirmed| I[Maintenance complete]
-    H -->|Not confirmed| J[Report attention required; preserve credentials]
+    H -->|Not confirmed| J[Report attention required, preserve credentials]
     J --> K[Inspect USB and firmware state before explicit retry]
 ```
+
+Post-boot reconnect currently uses the shared Espressif JTAG scan and then checks
+the MAC. Keep only the intended board connected during maintenance: another board
+can otherwise be opened/reset by that scan and cause verification to fail.
 
 An interrupted write can leave the board in ROM download mode. Automatic initial
 provisioning is never attempted. Recovery of a non-booting board requires a
@@ -114,3 +121,16 @@ Physical qualification results and redacted terminal captures are recorded under
 `docs/images/usb-maintenance-gui/`. Qualification must verify identity and
 certificate/key fingerprints before and after updating, reboot persistence,
 Wi-Fi operation on both legacy and service firmware, and the post-boot schedule.
+
+The first physical run updated bench Ambyte `28:37:2F:FF:E7:04` from 2.7.0 to
+signed 2.13.0 and verified the MAC, client identity and nonsecret configuration.
+Its early pre-flash identity reported `NONE`, so that run alone does not prove
+installed-schedule preservation. The updated implementation now waits for the
+loaded schedule before writing. The additional loaded-schedule and NVS
+fingerprint qualification is recorded in [PR #93](https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/93).
+
+![Real firmware-only bench capture](images/usb-maintenance-gui/firmware-2.7-to-2.13.png)
+
+See the [redacted transcript](images/usb-maintenance-gui/qualification.txt).
+These USB checks do not establish end-to-end MQTT ingestion or a real desktop Tk
+session. CI builds and smoke-tests packaged Windows, macOS and Linux executables.

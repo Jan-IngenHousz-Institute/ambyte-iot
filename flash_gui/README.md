@@ -195,6 +195,9 @@ internet connection on the computer is required.
    unreachable hub. A failed trial attempts to restore the previous network,
    and the displayed result says whether restoration was confirmed.
 4. Wait for **Wi-Fi saved and connection confirmed** before disconnecting USB.
+   Service firmware may need up to three minutes for startup first. If another
+   maintenance task is still busy, wait and retry; credentials are not sent again
+   automatically.
    Success confirms the Wi-Fi join, not end-to-end cloud delivery. Existing
    MQTT certificates, device registration, firmware and schedule remain intact.
 5. For the next board, use **Read device again** and check its MAC before writing.
@@ -211,7 +214,7 @@ reconciles a saved schedule after an app restart without signing in or starting
 onboarding. Terminal results are marked resolved, with active-workbook verification
 reported as unchecked. An owned staging transfer can be explicitly cancelled;
 uncertain/expired/changed-store records can be explicitly archived while no
-operation is active. Archives remain in the journal's `.previous.json` file.
+operation is active. The journal keeps one `.previous.json` archive; a later archive replaces it.
 
 Older firmware uses its existing persistent `wifi_join` command. A failed legacy
 join may already have stored the new credentials and may continue retrying;
@@ -327,8 +330,7 @@ Once per session:
    instead of the workbook's schedule.
 5. Enter the **Wi-Fi SSID/password** the boards should join.
 
-Per board: plug it in via USB-C → **Refresh** → pick the port → **On-board
-device** → confirm/edit the name in the prompt. Everything else is automatic,
+Per board: plug it in via USB-C → **Refresh** → pick the port → **Initial setup / replace identity…** → confirm/edit the name in the prompt. Everything else is automatic,
 and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
 RTC, installed schedule — including its stamped workbook id when installed
 from a workbook).

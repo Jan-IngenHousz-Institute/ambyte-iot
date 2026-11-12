@@ -11,6 +11,7 @@ error. No console reply containing an echoed password leaves this module.
 from contextlib import contextmanager
 from dataclasses import dataclass
 import re
+import time
 
 from . import ambyte_serial, config
 from .service_client import OperationJournal, ServiceClient, ServiceClientError, UnknownOutcome
@@ -106,6 +107,7 @@ def _checked_info(console, expected):
 
 
 _WIFI_FAILURES = {
+    "busy": "The Ambyte is busy with another maintenance task. Wait for it to finish, then retry.",
     "wifi_auth_rejected": "The hub rejected the credentials. Check the password and hub settings.",
     "wifi_timeout": "The Ambyte could not get an IP address. Keep the destination hub in range and check its settings.",
     "wifi_failed": "The Wi-Fi connection failed. Check the destination hub and password.",
@@ -128,7 +130,7 @@ def _service_error(error, journal, *, recovering=False):
             message += " Previous network restored."
             if result["restoration_connected"]:
                 message += " The previous network is connected."
-        else:
+        elif not (result["saved"] is False and error.reason == "busy"):
             message += " Previous network restoration was not confirmed."
         if result["retrying"]:
             message += " Wi-Fi is still retrying."
@@ -199,11 +201,29 @@ def _legacy_join(console, ssid, password):
     return WifiResult(ssid, True)
 
 
+
+def _wait_service_startup(console, expected):
+    # Opening native USB can reboot the board. Its console precedes the boot
+    # AMBIT firmware sync, which holds the maintenance lock. Wait read-only on
+    # this descriptor before sending credentials, never retry a rejected join.
+    deadline = time.monotonic() + 180.0
+    while True:
+        identity = console.identity()
+        if identity.mac != expected.mac or "svc" not in identity.capabilities:
+            raise WifiSettingsError("Connected Ambyte changed during startup. Read the device again.")
+        if identity.schedule.source not in {None, "NONE"}:
+            return
+        if time.monotonic() >= deadline:
+            raise WifiSettingsError("Ambyte startup has not finished. No Wi-Fi credentials were sent. Wait and read the device again.")
+        time.sleep(1.0)
+
+
 def update_wifi(expected: DeviceInfo, ssid: str, password: str, *, new_request=False) -> WifiResult:
     validate_credentials(ssid, password)
     with _selected_console(expected.port) as console:
         info = _checked_info(console, expected)
         if info.service:
+            _wait_service_startup(console, info)
             return _service(console, info, lambda client: client.join_wifi(ssid, password, new_request=new_request))
         return _legacy_join(console, ssid, password)
 
@@ -241,7 +261,7 @@ def _schedule_result(client, entry):
         client._foreign()  # Never offer archive while any device operation is live.
         action = "archive"
         message = (f"Schedule {entry['op']} has an {state} result. Check the device state, then explicitly "
-                   "archive this recovery record if you need to continue. The previous record is preserved.")
+                   "archive this recovery record if you need to continue. This record will replace the single previous archive on disk.")
     return SavedSchedule(entry["op"], entry["store"], entry["descriptor"]["version"], state, message, action)
 
 
@@ -299,4 +319,4 @@ def resolve_saved_schedule(expected, checked: SavedSchedule):
                                  "The staged schedule transfer was cancelled. The active workbook was left unchanged; Wi-Fi maintenance can continue.")
         journal.preserve()
         return SavedSchedule(entry["op"], entry["store"], current.version, "archived",
-                             "The unresolved schedule recovery record was archived and preserved. Wi-Fi maintenance can continue.")
+                             "The unresolved schedule recovery record was saved as the previous archive, replacing any earlier archive. Wi-Fi maintenance can continue.")
