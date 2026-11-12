@@ -8,8 +8,9 @@ MQTT config, timezone, Wi-Fi credentials, certificates, and a `flash_time` RTC
 seed. Certificates and Wi-Fi credentials have NO console path at all (the cert
 setters in components/certs are dead code; `wifi_join` does not set the
 `wifi_prov/provisioned` flag), so baking NVS is the only complete provisioning
-protocol — the console is used afterwards only for the exact RTC set and for
-verification.
+protocol — on-boarding uses the console afterwards only for the exact RTC set
+and for verification. (On a board that is already provisioned,
+device_settings.py changes Wi-Fi, name and clock over that console.)
 
 Field map mirrors tools/build_nvs_image.py in the firmware repo. Namespaces:
   device_cfg  mqtt_uri, mqtt_client_id, mqtt_topic_root, cmd_topic,

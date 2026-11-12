@@ -14,6 +14,14 @@ Console facts this module is built on (components/CLI/CLI.c):
     answers `device_name = AMBYTE_{MAC}`, and the firmware expands the {MAC}
     token at boot, in RAM only
   * `rtc set <epoch>` (UTC seconds) applies immediately; `rtc` reads UTC
+  * `wifi_join <ssid> <password>` stores the credentials in the Wi-Fi driver's
+    own NVS and blocks up to ~10 s for an IP. It prints exactly one result
+    line, `wifi_join "<ssid>": <ESP_OK | error name>`. The console echoes the
+    typed line, password included, so nothing from that reply except the
+    result line may ever reach a log or an exception
+  * arguments are split by esp_console_split_argv: spaces separate, double
+    quotes group, and a backslash escapes ONLY backslash, double quote and
+    space (any other escaped character is dropped)
   * opening the port must not assert DTR/RTS: esptool drives those lines to
     reset/bootloader-trip the chip, so leaving them deasserted means merely
     opening the port never disturbs the running app
@@ -45,6 +53,23 @@ _CFG_GET_RE_TMPL = r"{key}\s*=\s*(.*)"
 # that connected bit on IP_EVENT_STA_GOT_IP, not on association, so "connected"
 # already means the board holds a DHCP lease.
 _WIFI_RE = re.compile(r"Wi-?Fi:\s*(connected|disconnected)", re.IGNORECASE)
+_WIFI_PROVISIONED_RE = re.compile(r"provisioned:\s*(yes|no)", re.IGNORECASE)
+# The handler's one result line: `wifi_join "<ssid>": <name>`. The name is
+# anchored to the end of the line and limited to what esp_err_to_name can
+# print, so the echoed command (which always ends in the closing quote of the
+# quoted password) can never be mistaken for it.
+_WIFI_JOIN_RE = re.compile(
+    r'wifi_join ".*": ([A-Z][A-Z0-9_ ]*?)[ \t\r]*$', re.MULTILINE)
+# Worst case inside the firmware: two bounded driver retries (~2 s each), a
+# 2 s drain of the superseded attempt, then the 10 s wait for an IP.
+WIFI_JOIN_TIMEOUT_S = 30.0
+WIFI_JOIN_OK = "ESP_OK"
+WIFI_JOIN_AUTH_REJECTED = "WIFI_MANAGER_ERR_AUTH_REJECTED"
+WIFI_JOIN_NOT_RETRYING = "WIFI_MANAGER_ERR_NOT_RETRYING"
+WIFI_JOIN_DRIVER_UNRESOLVED = "WIFI_MANAGER_ERR_DRIVER_UNRESOLVED"
+# After these the credentials are stored and the firmware keeps retrying them
+# on its own backoff (components/wifi_manager/include/wifi_manager.h).
+WIFI_JOIN_RETRYING = (WIFI_JOIN_AUTH_REJECTED, "ESP_FAIL", "ESP_ERR_TIMEOUT")
 _SD_RE = re.compile(r"SD card:\s*(mounted|absent)", re.IGNORECASE)
 _SCHEDULE_PUT_RE = re.compile(r"schedule put:\s*(\d+)\s*bytes")
 # `schedule status` prints the program header as
@@ -84,6 +109,21 @@ def expand_mac_token(value: str, mac: str) -> str:
     return value.replace(MAC_TOKEN, mac.upper())
 
 
+def quote_arg(value: str, force: bool = False) -> str:
+    """One console argument, as esp_console_split_argv will read it back.
+
+    A value with no space, quote or backslash goes bare. Anything else is
+    wrapped in double quotes with backslash and double quote escaped: the
+    parser drops a backslash that precedes any other character, so a literal
+    backslash must always be doubled. An empty value only survives as `""`.
+    `force` quotes unconditionally.
+    """
+    if not force and value and not any(ch in value for ch in ' "\\'):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def esp_jtag_ports(exclude: str | None = None) -> list[str]:
     """Espressif USB-Serial-JTAG ports currently enumerated (VID 0x303A)."""
     out = []
@@ -102,6 +142,47 @@ class ProbeResult:
     mac: str | None = None
     device_name: str | None = None      # raw NVS value ({MAC} un-expanded)
     raw: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True)
+class BoardStatus:
+    """What one `status` reply says about the board. None = not reported
+    (older firmware), which callers must not read as a negative."""
+
+    mac: str | None
+    wifi_connected: bool | None
+    wifi_provisioned: bool | None
+
+
+def parse_status(text: str) -> BoardStatus:
+    mac = _STATUS_MAC_RE.search(text)
+    wifi = _WIFI_RE.search(text)
+    provisioned = _WIFI_PROVISIONED_RE.search(text)
+    return BoardStatus(
+        mac=mac.group(1).upper() if mac else None,
+        wifi_connected=(None if wifi is None
+                        else wifi.group(1).lower() == "connected"),
+        wifi_provisioned=(None if provisioned is None
+                          else provisioned.group(1).lower() == "yes"),
+    )
+
+
+@dataclass(frozen=True)
+class WifiJoinResult:
+    """The firmware's verdict on one `wifi_join`, by its printed name."""
+
+    code: str
+
+    @property
+    def connected(self) -> bool:
+        """Associated and holding a DHCP lease."""
+        return self.code == WIFI_JOIN_OK
+
+    @property
+    def retrying(self) -> bool:
+        """Not connected, but the credentials are stored and the firmware
+        keeps trying them."""
+        return self.code in WIFI_JOIN_RETRYING
 
 
 @dataclass(frozen=True)
@@ -200,11 +281,14 @@ class AmbyteConsole:
                     return True, seen
         return False, seen
 
-    def command(self, cmd: str, timeout: float = 5.0) -> str:
+    def command(self, cmd: str, timeout: float = 5.0,
+                shown: str | None = None) -> str:
         """Send one command, return the ANSI-stripped reply text.
 
         The reply is everything up to the re-printed prompt. Raises on the
         REPL's non-zero-exit marker; per-command parsing is the caller's job.
+        `shown` replaces the command in the timeout error, for a command line
+        that carries a secret.
         """
         self._ser.reset_input_buffer()
         self._write_line(cmd)
@@ -218,7 +302,8 @@ class AmbyteConsole:
             tail = plain.rfind(PROMPT)
             if tail > 0 and "\n" in plain[:tail]:
                 return plain
-        raise ConsoleError(f"'{cmd}' got no prompt back within {timeout:.0f}s")
+        raise ConsoleError(
+            f"'{shown or cmd}' got no prompt back within {timeout:.0f}s")
 
     # ── commands ─────────────────────────────────────────────────────────
     def status(self, timeout: float = 5.0) -> str:
@@ -227,6 +312,10 @@ class AmbyteConsole:
     def status_mac(self) -> str | None:
         m = _STATUS_MAC_RE.search(self.status())
         return m.group(1).upper() if m else None
+
+    def board_status(self, timeout: float = 10.0) -> BoardStatus:
+        """MAC, Wi-Fi link and provisioning flag from one `status` reply."""
+        return parse_status(self.status(timeout))
 
     def wifi_connected(self, timeout: float = 10.0) -> bool | None:
         """Whether the board has an IP, or None if it does not say.
@@ -262,8 +351,7 @@ class AmbyteConsole:
         return None
 
     def cfg_set(self, key: str, value: str, timeout: float = 5.0) -> None:
-        arg = f'"{value}"' if " " in value else value
-        reply = self.command(f"cfg set {key} {arg}", timeout)
+        reply = self.command(f"cfg set {key} {quote_arg(value)}", timeout)
         # Success is exactly: `cfg set <key> = <value>  (reboot to apply)`
         if "(reboot to apply)" not in reply or FAILURE_MARK in reply:
             raise ConsoleError(f"cfg set {key} failed:\n{reply[-300:]}")
@@ -288,6 +376,33 @@ class AmbyteConsole:
         if not m:
             raise ConsoleError(f"rtc set confirmation not understood:\n{reply[-300:]}")
         return int(m.group(2))
+
+    def wifi_join(self, ssid: str, password: str,
+                  timeout: float = WIFI_JOIN_TIMEOUT_S) -> WifiJoinResult:
+        """Store new Wi-Fi credentials and try them now.
+
+        Returns the firmware's verdict; a board that stored the credentials
+        but could not reach the access point is a result, not an exception.
+        Raises UnsupportedConsoleCommand when the firmware predates
+        `wifi_join`. The reply echoes the password, so no part of it other
+        than the parsed result name is ever returned or raised.
+        """
+        line = f"wifi_join {quote_arg(ssid, force=True)} " \
+               f"{quote_arg(password, force=True)}"
+        reply = self.command(
+            line, timeout,
+            shown=f"wifi_join {quote_arg(ssid, force=True)} ********")
+        results = _WIFI_JOIN_RE.findall(reply)
+        if results:
+            # The echo precedes the handler's output, so the last match is
+            # the verdict.
+            return WifiJoinResult(code=results[-1])
+        if "Unrecognized command" in reply:
+            raise UnsupportedConsoleCommand(
+                "this firmware has no `wifi_join` command")
+        raise ConsoleError(
+            "wifi_join printed no result line (the reply is withheld: the "
+            "console echoes the password)")
 
     def schedule_install(self, url: str, sha256: str, campaign_id: str,
                     script_version: str, built_against_fw: str) -> None:

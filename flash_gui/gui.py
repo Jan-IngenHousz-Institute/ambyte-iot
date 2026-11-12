@@ -3,11 +3,15 @@
 
 """Tkinter GUI: session settings on top, one-button per-device procedure below.
 
+Next to the full on-boarding, three buttons change one setting on a board that
+is already on-boarded (Wi-Fi, name, clock) over its console, with no re-flash
+and no openJII session: see device_settings.py.
+
 Threading model: all serial/esptool/HTTP work runs on a single worker thread
 per action; the Tk main loop is never blocked. Workers talk back exclusively
-via `_post` (thread-safe `after` scheduling); the one point where a worker
-needs an answer from the operator (the name prompt) blocks the worker on a
-Queue that the main-thread dialog fills.
+via `_post` (thread-safe `after` scheduling); where a worker needs an answer
+from the operator (the name prompt, a confirmation) it blocks on a Queue that
+the main-thread dialog fills.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from tkinter import font as tkfont
 
-from . import app_update, esptool_ops, procedure, release_fetch, timezones
+from . import (app_update, device_settings, esptool_ops, procedure,
+               release_fetch, timezones)
 from .config import ENVIRONMENTS, Settings
 from .openjii_client import OpenJIIClient, OpenJIIError, WorkbookProgramming
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
@@ -278,8 +283,34 @@ class App(ttk.Frame):
                                       command=self._onboard)
         self.onboard_btn.grid(row=0, column=3, padx=(8, 0))
 
+        # One setting at a time on an already on-boarded board: console only,
+        # so these need the port and nothing from the session above except the
+        # Wi-Fi fields.
+        settings_row = ttk.Frame(frame)
+        settings_row.grid(row=1, column=0, columnspan=4, sticky="w",
+                          pady=(8, 0))
+        ttk.Label(settings_row, text="Change without re-flashing:").pack(
+            side="left")
+        self.wifi_btn = ttk.Button(settings_row, text="Send Wi-Fi",
+                                   command=self._send_wifi)
+        self.wifi_btn.pack(side="left", padx=(8, 0))
+        self.rename_btn = ttk.Button(settings_row, text="Rename...",
+                                     command=self._rename)
+        self.rename_btn.pack(side="left", padx=(8, 0))
+        self.clock_btn = ttk.Button(settings_row, text="Set clock from this PC",
+                                    command=self._set_clock)
+        self.clock_btn.pack(side="left", padx=(8, 0))
+        self.clock_tz_var = tk.BooleanVar(value=False)
+        self.clock_tz_check = ttk.Checkbutton(
+            settings_row, text=f"also set timezone ({self.local_tz})",
+            variable=self.clock_tz_var)
+        self.clock_tz_check.pack(side="left", padx=(8, 0))
+        if not timezones.firmware_supports(self.local_tz):
+            # The device would reject it; the Detected frame says why.
+            self.clock_tz_check.configure(state="disabled")
+
         steps_row = ttk.Frame(frame)
-        steps_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        steps_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.step_labels: dict[str, ttk.Label] = {}
         for key, label in STEPS:
             lbl = ttk.Label(steps_row, text=f"· {label}", padding=(0, 0, 12, 0))
@@ -287,7 +318,7 @@ class App(ttk.Frame):
             self.step_labels[key] = lbl
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        btn_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.retry_flash_btn = ttk.Button(
             btn_row, text="Retry flash", command=self._retry_flash,
             state="disabled")
@@ -303,9 +334,9 @@ class App(ttk.Frame):
         self.log_text = scrolledtext.ScrolledText(frame, height=14,
                                                   state="disabled",
                                                   font="TkFixedFont")
-        self.log_text.grid(row=3, column=0, columnspan=4, sticky="nsew",
+        self.log_text.grid(row=4, column=0, columnspan=4, sticky="nsew",
                            pady=(8, 0))
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
 
     # ── thread-safe UI helpers ───────────────────────────────────────────
     def _post(self, fn, *args) -> None:
@@ -349,6 +380,11 @@ class App(ttk.Frame):
                 else "readonly")
             self.schedule_refresh_btn.configure(
                 state="disabled" if busy else "normal")
+            for btn in (self.wifi_btn, self.rename_btn, self.clock_btn):
+                btn.configure(state="disabled" if busy else "normal")
+            self.clock_tz_check.configure(
+                state="normal" if not busy
+                and timezones.firmware_supports(self.local_tz) else "disabled")
         self._post(apply)
 
     def _ask_on_main(self, fn):
@@ -356,6 +392,22 @@ class App(ttk.Frame):
         answer: queue.Queue = queue.Queue(maxsize=1)
         self._post(lambda: answer.put(fn()))
         return answer.get()
+
+    def _ask_device_name(self, prompt: str, initial: str) -> str | None:
+        """Ask for a device name until it is valid; None when cancelled.
+
+        Called from a worker thread; the dialog runs on the main thread.
+        """
+        message = prompt
+        while True:
+            def ask(message: str = message) -> str | None:
+                return simpledialog.askstring(
+                    "Device name", message, initialvalue=initial, parent=self)
+            name = self._ask_on_main(ask)
+            if name is None or clean_device_name(name) is not None:
+                return name
+            message = (f"'{name}' is invalid (max 63 chars, printable ASCII, "
+                       "no quotes/backslashes).\n\nDevice name:")
 
     # ── clock ────────────────────────────────────────────────────────────
     def _tick_clock(self) -> None:
@@ -365,7 +417,9 @@ class App(ttk.Frame):
         self.after(1000, self._tick_clock)
 
     # ── ports ────────────────────────────────────────────────────────────
-    def _refresh_ports(self) -> None:
+    def _refresh_ports(self, prefer: str | None = None) -> None:
+        """Re-list the serial ports. `prefer` is the device to keep selected
+        when it is still there (a board that re-enumerated after a reboot)."""
         ports = esptool_ops.list_serial_ports()
         display = []
         for p in ports:
@@ -374,7 +428,9 @@ class App(ttk.Frame):
         self.port_box.configure(values=display)
         if display:
             # Preselect the first ambyte-looking port.
-            self.port_box.current(0)
+            devices = [p["device"] for p in ports]
+            self.port_box.current(
+                devices.index(prefer) if prefer in devices else 0)
         else:
             self.port_var.set("")
 
@@ -824,30 +880,12 @@ class App(ttk.Frame):
             self._set_step("check", "ok")
 
             # name prompt (main thread)
-            def ask() -> str | None:
-                return simpledialog.askstring(
-                    "Device name",
-                    f"Board MAC: {info.mac}\n\nDevice name:",
-                    initialvalue=info.proposed_name, parent=self)
-            name = self._ask_on_main(ask)
+            name = self._ask_device_name(
+                f"Board MAC: {info.mac}\n\nDevice name:", info.proposed_name)
             if name is None:
                 self.log("On-boarding cancelled at the name prompt.")
                 self._set_step("check", "pending")
                 return
-            while clean_device_name(name) is None:
-                bad = name
-
-                def ask_again() -> str | None:
-                    return simpledialog.askstring(
-                        "Device name",
-                        f"'{bad}' is invalid (max 63 chars, printable ASCII, "
-                        "no quotes/backslashes).\n\nDevice name:",
-                        initialvalue=info.proposed_name, parent=self)
-                name = self._ask_on_main(ask_again)
-                if name is None:
-                    self.log("On-boarding cancelled at the name prompt.")
-                    self._set_step("check", "pending")
-                    return
 
             run = DeviceRun(port=port, preflight=info, name=name)
             self.current_run = run
@@ -953,6 +991,101 @@ class App(ttk.Frame):
             finally:
                 self._set_busy(False)
         threading.Thread(target=work, daemon=True).start()
+
+    # ── one setting on an on-boarded board (no re-flash) ─────────────────
+    def _run_setting(self, title: str, action) -> None:
+        """Open the selected board's console and run action(board) on a worker.
+
+        `action` returns a device_settings.Outcome, or None when the operator
+        cancelled a dialog it showed.
+        """
+        if self.busy:
+            messagebox.showwarning(
+                "Not ready", "Cannot start: a procedure is already running.")
+            return
+        port = self._selected_port()
+        if not port:
+            messagebox.showwarning("Not ready",
+                                   "Cannot start: select a serial port.")
+            return
+        self.result_var.set("")
+        self._set_busy(True)
+
+        def work():
+            board = None
+            try:
+                board = device_settings.BoardSession(port, log=self.log)
+                self.log(f"Board on {board.port}: {board.identity.describe()}.")
+                outcome = action(board)
+                if outcome is None:
+                    self.log(f"{title}: cancelled, nothing was changed.")
+                    return
+                self.log(("WARNING — " if outcome.warning else "DONE — ")
+                         + f"{outcome.summary}. {outcome.detail}")
+                self._post(self.result_var.set,
+                           ("⚠ " if outcome.warning else "") + outcome.summary)
+                if outcome.warning:
+                    self._post(messagebox.showwarning, title, outcome.detail)
+            except device_settings.SettingsError as exc:
+                self.log(f"{title} FAILED: {exc}")
+                self._post(self.result_var.set, f"{title}: FAILED")
+                self._post(messagebox.showerror, title, str(exc))
+            except Exception as exc:   # anything unexpected must surface
+                self.log(f"UNEXPECTED ERROR: {exc!r}")
+                self._post(messagebox.showerror, title, str(exc))
+            finally:
+                if board is not None:
+                    board.close()
+                    if board.rebooted:
+                        # The USB port may have come back under another name.
+                        self._post(self._refresh_ports, board.port)
+                self._set_busy(False)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_wifi(self) -> None:
+        ssid = self.ssid_var.get().strip()
+        password = self.wifi_pass_var.get()
+        problem = device_settings.wifi_problem(ssid, password)
+        if problem:
+            messagebox.showwarning("Wi-Fi", f"Cannot send: {problem}")
+            return
+        self.settings.wifi_ssid = ssid
+        self.settings.wifi_password = password
+        self.settings.save()
+
+        def action(board):
+            ident = board.identity
+            question = (
+                f"Send Wi-Fi '{ssid}' and its password to this board?\n\n"
+                f"Board: {ident.name or '(unnamed)'}\n"
+                f"MAC: {ident.mac or 'unknown'}\n"
+                f"Port: {board.port}\n\n"
+                "It replaces the network the board joins now.")
+            if not self._ask_on_main(lambda: messagebox.askokcancel(
+                    "Wi-Fi", question, parent=self)):
+                return None
+            return board.set_wifi(ssid, password)
+
+        self._run_setting("Wi-Fi", action)
+
+    def _rename(self) -> None:
+        def action(board):
+            ident = board.identity
+            name = self._ask_device_name(
+                f"Board MAC: {ident.mac or 'unknown'}\n"
+                f"Current name: {ident.name or '(unnamed)'}\n\n"
+                "New device name (the board reboots to apply it):",
+                ident.name)
+            if name is None:
+                return None
+            return board.rename(name)
+
+        self._run_setting("Rename", action)
+
+    def _set_clock(self) -> None:
+        zone = self.local_tz if self.clock_tz_var.get() else None
+        self._run_setting("Clock", lambda board: board.set_clock(timezone=zone))
 
 
 def main() -> None:

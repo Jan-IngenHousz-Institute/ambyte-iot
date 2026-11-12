@@ -182,6 +182,38 @@ and the procedure ends with an explicit per-item PASS/FAIL (name, timezone,
 RTC, installed schedule — including its stamped workbook id when installed
 from a workbook).
 
+### Changing Wi-Fi, name or clock later (no re-flash)
+
+A board that is already on-boarded does not need the procedure again to change
+one of these. Plug it in, pick its port, and use the **Change without
+re-flashing** row. These buttons talk only to the board's console: no openJII
+sign-in, experiment or firmware download is needed, and nothing is flashed.
+
+- **Send Wi-Fi** sends the SSID and password from the session fields above.
+  The board stores them and tries to join for about 10 s. The result is one of:
+  - *joined*: connected, with an IP;
+  - *saved, not connected yet*: the network is out of range. The board keeps
+    retrying and joins when it gets there, so field credentials can be set at
+    the bench;
+  - *saved, password rejected*: the access point refused the password. Correct
+    it and send again.
+- **Rename...** asks for the new name, writes it, reboots the board (about
+  30 s) and reads the name back. This changes the name the board reports in its
+  data. It does not change the device's entry in openJII or its MQTT identity.
+- **Set clock from this PC** sets the board's clock to this PC's UTC time and
+  reports the drift before and after. Tick **also set timezone** to store this
+  PC's timezone as well; if it differs from the board's, the board reboots
+  once.
+
+Before Wi-Fi and name changes the GUI shows the board's name and MAC, so the
+wrong board is not changed when several are plugged in.
+
+Limits: the SSID and password must be printable ASCII to go over the console
+(on-boarding has no such limit); the board cannot report which SSID it has
+stored, so Wi-Fi is confirmed by the join result, not by a read-back; and
+firmware older than 1.0.6 has no `wifi_join`, so such a board must be
+on-boarded again to update it.
+
 ## Factory PCBA flash + test (`factory_test`)
 
 Separate from onboarding: one CLI invocation per freshly assembled board. It
@@ -317,11 +349,16 @@ sequenceDiagram
 
 ## Design notes / firmware facts this tool relies on
 
-- Certificates and Wi-Fi credentials have **no console path** in the firmware
-  (the cert setters are dead code; `wifi_join` doesn't set the provisioned
-  flag) — NVS baking at 0x9000 (`0x6000` bytes, matches `partitions.csv`) is
-  the provisioning protocol. The NVS generator is vendored
+- Certificates and Wi-Fi credentials have **no console path that provisions a
+  board** (the cert setters are dead code; `wifi_join` doesn't set the
+  provisioned flag) — NVS baking at 0x9000 (`0x6000` bytes, matches
+  `partitions.csv`) is the provisioning protocol. The NVS generator is vendored
   (`vendor/nvs_partition_gen.py`, from ESP-IDF), so no IDF install is needed.
+  On a board that is already provisioned, `wifi_join` is enough to switch
+  networks, which is what **Send Wi-Fi** uses.
+- The console echoes every typed line, so the reply to `wifi_join` contains the
+  password. `ambyte_serial.wifi_join` returns only the firmware's result name
+  and never puts the reply in a log or an error.
 - `cfg get` returns **raw NVS strings**: a fleet-default board answers
   `device_name = AMBYTE_{MAC}` — the tool expands the token before comparing.
 - The MQTT client id **must equal the openJII Thing name**
@@ -353,11 +390,12 @@ flash_gui/
   __main__.py        python -m flash_gui
   gui.py             Tkinter app (worker threads, never blocks the UI)
   procedure.py       the per-board state machine + retry paths
+  device_settings.py Wi-Fi / name / clock on an on-boarded board (no re-flash)
   config.py          environments, topic conventions, persisted settings
   release_fetch.py   firmware download/cache + latest Schedule catalog validation
   nvs_builder.py     per-board NVS image (identity/certs/Wi-Fi/RTC seed)
   esptool_ops.py     esptool>=5 scripting API (read MAC, flash, NVS-only)
-  ambyte_serial.py   firmware console client (probe / cfg / rtc / verify)
+  ambyte_serial.py   firmware console client (probe / cfg / rtc / wifi / verify)
   openjii_client.py  API-key auth, experiments, device registry, credentials
   timezones.py       host IANA zone + the firmware's supported-zone table
   vendor/            vendored ESP-IDF nvs_partition_gen.py
