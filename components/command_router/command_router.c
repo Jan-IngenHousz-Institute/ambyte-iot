@@ -344,11 +344,17 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     } else if (strcmp(type, "ambit_flash") == 0) {
         /* Full 4-region ROM flash from /sdcard/ambit_fw/<version>/ (Strategy A —
          * revives bricked/pre-OTA units; AMBIT NVS/calibration preserved).
-         * {version:"M.m.b", channel: 0-3 | "all" | negative}; absent channel =
-         * all ROM-answering channels. The SD must already hold the folder —
-         * this path does not download. ambit_ota owns the id dedupe latch. */
+         * {version:"M.m.b", channel: 0-3 | "all" | negative, manifest_url?};
+         * absent channel = all ROM-answering channels. Without manifest_url the
+         * SD must already hold the folder; with it (an https:// ambit-iot release
+         * manifest.json) the worker downloads + verifies the release into the
+         * folder first (ambit_fw_fetch.h): the remote path for pre-1.0 AMBITs.
+         * ambit_ota owns the id dedupe latch. */
         const cJSON *jver = cJSON_GetObjectItemCaseSensitive(root, "version");
         const char *version = cJSON_IsString(jver) ? jver->valuestring : NULL;
+        const cJSON *jman = cJSON_GetObjectItemCaseSensitive(root, "manifest_url");
+        const char *manifest_url = cJSON_IsString(jman) ? jman->valuestring : NULL;
+        const bool man_ok = (jman == NULL || cJSON_IsNull(jman) || manifest_url != NULL);
         uint8_t ch = AMBIT_OTA_CH_ALL;
         const cJSON *jch = cJSON_GetObjectItemCaseSensitive(root, "channel");
         bool ch_ok = true;
@@ -367,14 +373,19 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         } else if (!ch_ok) {
             ESP_LOGW(TAG, "ambit_flash id=%s bad 'channel' (0-3 or \"all\") — ignoring",
                      id ? id : "");
+        } else if (!man_ok) {
+            /* A typed-but-wrong manifest_url must not silently become an
+             * SD-only flash of whatever happens to be on the card. */
+            ESP_LOGW(TAG, "ambit_flash id=%s 'manifest_url' must be a string; ignoring", id ? id : "");
         } else {
-            esp_err_t err = ambit_ota_request_flash(ch, version, id);
+            esp_err_t err = ambit_ota_request_flash(ch, version, id, manifest_url);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "ambit_flash id=%s dispatch failed: %s",
-                         id ? id : "", esp_err_to_name(err));
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatch failed: %s%s",
+                         id ? id : "", esp_err_to_name(err),
+                         (err == ESP_ERR_INVALID_ARG && manifest_url) ? " (manifest_url must be https://, < 256 chars)" : "");
             } else {
-                ESP_LOGW(TAG, "ambit_flash id=%s dispatched (ch=%u ver=%s)",
-                         id ? id : "", ch, version);
+                ESP_LOGW(TAG, "ambit_flash id=%s dispatched (ch=%u ver=%s%s)",
+                         id ? id : "", ch, version, manifest_url ? " +fetch" : "");
             }
         }
     } else if (strcmp(type, "ambit_versions") == 0) {

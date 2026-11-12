@@ -24,9 +24,11 @@ extern "C" {
 long ambit_flash_region_size(const char *dir, const char *fname);
 
 /* Create root and dir (EEXIST is fine), then require every fnames[i] in dir to
- * be present and non-empty. ESP_ERR_INVALID_STATE when the SD gate refuses,
- * ESP_FAIL when a directory cannot be created, ESP_ERR_NOT_FOUND when a region
- * file is missing/empty. */
+ * be present and non-empty, and, when dir holds a release manifest.json, every
+ * region to match its size and SHA-256 (ambit_fw_manifest.h). ESP_ERR_INVALID_STATE
+ * when the SD gate refuses, ESP_FAIL when a directory cannot be created or the
+ * manifest check hits a read error, ESP_ERR_NOT_FOUND when a region file is
+ * missing/empty, ESP_ERR_INVALID_CRC when the folder fails its manifest. */
 esp_err_t ambit_flash_preflight(const char *root, const char *dir, const char *const *fnames, size_t n);
 
 #ifdef __cplusplus

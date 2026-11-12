@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+import sys as _sys
+_sys.path.insert(0, str(ROOT / "tests"))
 HOST = ROOT / "tests" / "ambit_host"
 SHIM = ROOT / "tests" / "sd_shim"
 SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
@@ -137,7 +139,14 @@ def build(out_dir: Path, rev: str | None) -> Path:
     (gen / "slice_flash.c").write_text(slice_flash(rev))
     incs = [f"-I{SHIM / 'stubs'}", f"-I{SHIM}", f"-I{HOST}", f"-I{ROOT / 'components/sd_card'}",
             f"-I{ROOT / 'components/event_log/include'}", f"-I{ROOT / 'components/ambit_ota'}",
-            f"-I{ROOT / 'components/ambit_flash'}"]
+            f"-I{ROOT / 'components/ambit_flash'}", f"-I{ROOT / 'components/ambit_flash/include'}"]
+    cjson = []
+    if rev is None:
+        # The HEAD preflight runs the release-manifest gate (ambit_fw_manifest.c, cJSON).
+        from pinned_idf import pinned_idf
+        idf = pinned_idf()
+        incs.append(f"-I{idf / 'components/json/cJSON'}")
+        cjson = [idf / "components/json/cJSON/cJSON.c"]
     defs = ['-DSD_MOUNT_POINT="./sdcard"'] + (["-DAMBIT_BASE"] if rev is not None else [])
     warn = ["-Wall", "-Wextra"] + (["-Werror"] if rev is None else [])
     base = [cc(), "-std=gnu11", "-g", "-O1", *SAN, *warn, *incs, *defs]
@@ -145,12 +154,13 @@ def build(out_dir: Path, rev: str | None) -> Path:
     objdir.mkdir(exist_ok=True)
     shimmed = [gen / "slice_flash.c"]
     if rev is None:
-        shimmed += [ROOT / "components/ambit_ota/ambit_stage.c", ROOT / "components/ambit_flash/ambit_flash_preflight.c"]
+        shimmed += [ROOT / "components/ambit_ota/ambit_stage.c", ROOT / "components/ambit_flash/ambit_flash_preflight.c",
+                    ROOT / "components/ambit_flash/ambit_fw_manifest.c"]
     else:
         (gen / "slice_ota.c").write_text(slice_ota_base(rev))
         shimmed.append(gen / "slice_ota.c")
     plain = [SHIM / "sd_shim.c", SHIM / "sd_host_stubs.c", SHIM / "host_rtos.c", SHIM / "mbedtls_sha256_host.c",
-             ROOT / "components/sd_card/sd_diag_core.c", HOST / "http_stub.c", HOST / "ambit_driver.c"]
+             ROOT / "components/sd_card/sd_diag_core.c", HOST / "http_stub.c", HOST / "ambit_driver.c", *cjson]
     objs = []
     for s in shimmed:
         o = objdir / (s.stem + ".o")

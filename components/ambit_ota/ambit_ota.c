@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "ambit_flash.h"
+#include "ambit_fw_fetch.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
 #include "esp_crt_bundle.h"
@@ -70,7 +71,9 @@ typedef struct {
     uint8_t op;                       /* AMBIT_OP_* */
     uint8_t channel;
     bool    fleet_spread;             /* remote URL OTA only; local CLI stays immediate */
+    uint8_t ver[3];                   /* FLASH: parsed <major>.<minor>.<batch> */
     char    url[AMBIT_OTA_URL_MAX];   /* OTA: download URL; FLASH: /sdcard/ambit_fw/<ver> dir */
+    char    manifest_url[AMBIT_OTA_URL_MAX];  /* FLASH: release manifest to fetch first ("" = SD only) */
     char    id[AMBIT_OTA_ID_MAX];
 } ambit_ota_req_t;
 
@@ -259,7 +262,10 @@ static int http_stage_read(void *ctx, uint8_t *buf, size_t cap)
     return r;
 }
 
-__attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st)
+/* GET `url` up to a final 200, following redirects. NULL on any failure; on
+ * success the caller reads the body and calls http_close(). Shared by the OTA
+ * stage download and the ambit_flash release fetch (ambit_fw_fetch.h). */
+__attribute__((cold)) static esp_http_client_handle_t http_open_followed(const char *url, int64_t *clen_out)
 {
     esp_http_client_config_t cfg = {
         .url               = url,
@@ -270,12 +276,13 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         .buffer_size_tx    = 4096,
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) return ESP_FAIL;
+    if (c == NULL) return NULL;
 
     esp_err_t err = esp_http_client_open(c, 0);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP open failed (%s)", esp_err_to_name(err));
         esp_http_client_cleanup(c);
-        return err;
+        return NULL;
     }
 
     int64_t clen   = esp_http_client_fetch_headers(c);
@@ -295,8 +302,9 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         esp_http_client_close(c);
         err = esp_http_client_open(c, 0);
         if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP open after redirect failed (%s)", esp_err_to_name(err));
             esp_http_client_cleanup(c);
-            return err;
+            return NULL;
         }
         clen   = esp_http_client_fetch_headers(c);
         status = esp_http_client_get_status_code(c);
@@ -305,14 +313,29 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
         ESP_LOGE(TAG, "HTTP status %d (expected 200 after redirects)", status);
         esp_http_client_close(c);
         esp_http_client_cleanup(c);
-        return ESP_FAIL;
+        return NULL;
     }
+    if (clen_out) *clen_out = clen;
+    return c;
+}
 
+static void http_close(esp_http_client_handle_t c)
+{
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+}
+
+__attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, ambit_stage_t *st)
+{
+    int64_t clen = -1;
+    esp_http_client_handle_t c = http_open_followed(url, &clen);
+    if (c == NULL) return ESP_FAIL;
+
+    esp_err_t err;
     ambit_stage_why_t why = AMBIT_STAGE_OK;
     ambit_stage_cleanup_t cl = { 0 };
     err = ambit_stage_download(SD_MOUNT_POINT, http_stage_read, c, clen > 0 ? clen : 0, st, &why, &cl);
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
+    http_close(c);
     if (err != ESP_OK || cl.stale_removed || cl.stale_remove_err) {
         ESP_LOGW(TAG, "stage %s (%s), stale %u removed/%u failed", ambit_stage_why_name(why),
                  st->path[0] ? st->path : "-", cl.stale_removed, cl.stale_remove_err);
@@ -320,6 +343,28 @@ __attribute__((cold)) static esp_err_t http_get_to_stage_impl(const char *url, a
     if (err != ESP_OK) return ESP_FAIL;
     return ESP_OK;
 }
+
+/* esp_http_client behind the ambit_fw_fetch transport callbacks. */
+static void *fetch_open(void *ctx, const char *url, int64_t *clen)
+{
+    (void)ctx;
+    ESP_LOGW(TAG, "fetch GET %s", url);
+    return http_open_followed(url, clen);
+}
+
+static int fetch_read(void *h, uint8_t *buf, size_t cap)
+{
+    return http_stage_read(h, buf, cap);
+}
+
+static void fetch_close(void *h)
+{
+    http_close((esp_http_client_handle_t)h);
+}
+
+static const ambit_fw_http_t s_fetch_http = {
+    .ctx = NULL, .open = fetch_open, .read = fetch_read, .close = fetch_close,
+};
 
 /* ── version read (cmd 33/2) — pre/post-OTA confirmation ─────────────────── */
 
@@ -786,8 +831,9 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         ESP_LOGI(TAG, "ambit_flash id=%s already applied — skipping queued duplicate", r->id);
         return;
     }
-    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s dir=%s id=%s",
-             all ? "all" : "one", dir, r->id[0] ? r->id : "(none)");
+    ESP_LOGW(TAG, "AMBIT flash requested: ch=%s dir=%s id=%s%s%s",
+             all ? "all" : "one", dir, r->id[0] ? r->id : "(none)",
+             r->manifest_url[0] ? " fetch=" : "", r->manifest_url);
 
     /* Per-channel outcome, reported after comms resume. */
     enum { FL_SKIP = -1, FL_FAIL = 0, FL_OK = 1, FL_ABSENT = 2, FL_BUSY = 3 };
@@ -804,8 +850,34 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
     vTaskDelay(pdMS_TO_TICKS(500));
 
     bool ok = false;
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+    const bool sd_ok = sdcard_is_mounted() || sdcard_mount() == ESP_OK;
+    bool fetch_ok = true;
+    char fetch_detail[112] = "";
+    const char *detail = NULL;
+    if (!sd_ok) {
         ESP_LOGE(TAG, "SD not available — no region images to flash");
+        detail = "sd_unavailable";
+    } else if (r->manifest_url[0] != '\0') {
+        /* Remote release fetch (ambit_fw_fetch.h): runs inside the MQTT blackout
+         * because the board cannot hold the broker's TLS session and a download's
+         * at once, and BEFORE any AMBIT is reset. A failed fetch flashes nothing;
+         * whatever it left in the folder is rejected by the manifest gate. */
+        ambit_fw_fetch_result_t fr;
+        esp_err_t fe = ambit_fw_fetch("/sdcard/ambit_fw", r->manifest_url, r->ver[0], r->ver[1], r->ver[2],
+                                      &s_fetch_http, &fr);
+        fetch_ok = (fe == ESP_OK);
+        snprintf(fetch_detail, sizeof fetch_detail, "%s downloaded=%u reused=%u removed=%u bytes=%lu", fr.why,
+                 fr.downloaded, fr.reused, fr.removed, (unsigned long)fr.bytes);
+        if (fetch_ok) {
+            ESP_LOGW(TAG, "release fetched into %s (%s)", dir, fetch_detail);
+        } else {
+            ESP_LOGE(TAG, "release fetch FAILED (%s); no AMBIT touched", fetch_detail);
+            detail = "fetch_failed";
+        }
+    }
+
+    if (!sd_ok || !fetch_ok) {
+        /* Nothing to flash from: every AMBIT is left exactly as it was. */
     } else if (all) {
         int attempted = 0, ok_count = 0;
         for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
@@ -873,6 +945,9 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
                           "(verify by effect: ambit_versions)");
         }
     }
+    if (r->manifest_url[0] != '\0' && fetch_detail[0] != '\0') {
+        report_as("ambit_flash_status", fetch_ok ? "fetched" : "fetch_failed", r->channel, r->id, fetch_detail);
+    }
     for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
         if (res[c] == FL_SKIP) continue;
         report_as("ambit_flash_status",
@@ -887,7 +962,7 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         report_as("ambit_flash_status", "success", r->channel, r->id, NULL);
     } else {
         ESP_LOGE(TAG, "AMBIT FLASH FAILED (id=%s)", r->id[0] ? r->id : "(none)");
-        report_as("ambit_flash_status", "failed", r->channel, r->id, NULL);
+        report_as("ambit_flash_status", "failed", r->channel, r->id, detail);
     }
 }
 
@@ -921,7 +996,7 @@ static void ambit_ota_run(void *arg)
 }
 
 /* Hand a request to the shared maintenance worker. The heap copy is small
- * (~330 B), so it allocates even on a fragmented heap. */
+ * (~600 B with the manifest URL), so it allocates even on a fragmented heap. */
 static esp_err_t ambit_ota_enqueue(const ambit_ota_req_t *r)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
@@ -1000,7 +1075,8 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id)
     return ambit_ota_enqueue(&r);   /* identity read: never deduped */
 }
 
-esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id)
+esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id,
+                                  const char *manifest_url)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (channel >= UART_SENSOR_NUM_CHANNELS && channel != AMBIT_OTA_CH_ALL) {
@@ -1020,6 +1096,13 @@ esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const ch
     if (id != NULL && strlen(id) >= AMBIT_OTA_ID_MAX) {
         return ESP_ERR_INVALID_ARG;   /* would truncate — the latch could never match it */
     }
+    /* The manifest's SHA-256s are what every downloaded byte is checked against,
+     * and they arrive over the same connection: only TLS (cert bundle) makes them
+     * trustworthy, so plain http:// is refused. */
+    if (manifest_url != NULL && manifest_url[0] != '\0' &&
+        (strncmp(manifest_url, "https://", 8) != 0 || strlen(manifest_url) >= AMBIT_OTA_URL_MAX)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (already_applied(KEY_APPLIED_FLASH, id)) {
         ESP_LOGI(TAG, "ambit_flash id=%s already applied — ignoring", id);
         return ESP_OK;
@@ -1034,7 +1117,11 @@ esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const ch
     memset(&r, 0, sizeof r);
     r.op      = AMBIT_OP_FLASH;
     r.channel = channel;
+    r.ver[0]  = (uint8_t)mj;
+    r.ver[1]  = (uint8_t)mn;
+    r.ver[2]  = (uint8_t)bt;
     snprintf(r.url, sizeof r.url, "/sdcard/ambit_fw/%u.%u.%u", mj, mn, bt);
+    if (manifest_url != NULL) strncpy(r.manifest_url, manifest_url, sizeof r.manifest_url - 1);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
     return ambit_ota_enqueue(&r);
 }

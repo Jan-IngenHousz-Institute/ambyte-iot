@@ -54,6 +54,26 @@ class BuildMessage(unittest.TestCase):
             self.assertNotIn("from_id", msg)
             self.assertEqual(msg["mode"], mode)
 
+    def test_ambit_flash_with_manifest_url(self):
+        url = "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.4.0/manifest.json"
+        msg = self.fc.build_message(_args(cmd="ambit-flash", version="1.4.0", channel="0", manifest_url=url), "r")
+        self.assertEqual(msg, {"type": "ambit_flash", "id": "r", "version": "1.4.0", "channel": 0,
+                               "manifest_url": url})
+        msg = self.fc.build_message(_args(cmd="ambit-flash", version="1.4.0", channel="all", manifest_url=""), "r")
+        self.assertEqual(msg, {"type": "ambit_flash", "id": "r", "version": "1.4.0", "channel": "all"})
+
+    def test_ambit_flash_refuses_bad_input(self):
+        for kw in (dict(version="1.4", channel="0", manifest_url=""),
+                   dict(version="1.4.0", channel="4", manifest_url=""),
+                   dict(version="1.4.0", channel="0", manifest_url="http://x/manifest.json"),
+                   dict(version="1.4.0", channel="0", manifest_url="https://x/" + "a" * 250)):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="ambit-flash", **kw), "r")
+
+    def test_ambit_versions(self):
+        self.assertEqual(self.fc.build_message(_args(cmd="ambit-versions"), "r"),
+                         {"type": "ambit_versions", "id": "r"})
+
     def test_devices_keep_case(self):
         devs = self.fc.parse_devices("ambyte_28:37:2F:FF:FC:80, 28:37:2F:FF:E7:50")
         self.assertIn("ambyte_28:37:2F:FF:FC:80", devs)
