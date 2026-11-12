@@ -185,28 +185,30 @@ internet connection on the computer is required.
 2. Check the displayed **device name and MAC** against the board you intend to
    update. The MAC is the stable identifier to record alongside its assigned
    Wi-Fi hub. Sensor bag labels do not identify the Ambyte gateway.
-3. Enter that hub's exact **SSID** and **password**, then click **Update Wi-Fi**.
-   Leave the password empty for an open network. The tool accepts SSIDs up to
-   31 UTF-8 bytes and passwords of 8–63 printable ASCII characters; it rejects
-   values the current firmware would truncate or interpret as console controls.
-   **On service-capable firmware, keep the destination hub powered on and in
-   range during the USB session.** It saves the new credentials only after a
-   successful connection; this flow cannot preload credentials for an
-   unreachable hub. A failed trial attempts to restore the previous network,
-   and the displayed result says whether restoration was confirmed.
-4. Wait for **Wi-Fi saved and connection confirmed** before disconnecting USB.
-   Service firmware may need up to three minutes for startup first. If another
-   maintenance task is still busy, wait and retry; credentials are not sent again
-   automatically.
-   Success confirms the Wi-Fi join, not end-to-end cloud delivery. Existing
-   MQTT certificates, device registration, firmware and schedule remain intact.
+3. Enter that hub's exact **SSID** and **password**, then click **Save Wi-Fi**.
+   This replaces the saved credentials immediately, even if the hub is out of
+   range. Check the password before saving. Leave it empty for an open network.
+   SSIDs accept 1–31 UTF-8 bytes and passwords 8–63 printable ASCII characters.
+4. Wait for **Wi-Fi saved** before disconnecting USB. A separate message says
+   whether the connection was confirmed. Without a reachable hub, the credentials
+   stay saved for deployment. Power-cycle at deployment if the board does not
+   connect when the hub is available. Service firmware
+   may need up to three minutes for startup first. USB errors and unexpected
+   firmware results are reported as unconfirmed. Only a definite driver-busy
+   reply retries identical credentials on the same descriptor for up to 90
+   seconds. Lost or malformed replies never resend credentials.
+   Existing MQTT certificates, registration, firmware and schedule remain intact.
+   A connected result confirms the Wi-Fi join, not end-to-end cloud delivery.
 5. For the next board, use **Read device again** and check its MAC before writing.
    If the USB port name changes, close the window, refresh the main port list
    and select the new port. Choose the appropriate hub for each board.
 
 Credentials entered in this window stay in memory and are not saved to session
 settings or logs. The password clears when the window closes. On service-capable
-firmware, **Check saved result** recovers an interrupted update by its operation
+firmware, the optional **Test & save** action requires the hub in range. It
+tries credentials in RAM, saves only after getting an IP, and attempts to restore
+the previous network on failure. This trial is separate from the default save.
+**Check saved result** recovers an interrupted service trial by its operation
 ID without resending credentials. If that result is uncertain or expired,
 **Start new Wi-Fi attempt…** explicitly starts another attempt after operator
 confirmation; active operations are never displaced. **Check saved result** also
@@ -216,17 +218,39 @@ reported as unchecked. An owned staging transfer can be explicitly cancelled;
 uncertain/expired/changed-store records can be explicitly archived while no
 operation is active. The journal keeps one `.previous.json` archive; a later archive replaces it.
 
-Older firmware uses its existing persistent `wifi_join` command. A failed legacy
-join may already have stored the new credentials and may continue retrying;
-check the password and hub rather than interpreting a timeout as a successful
-connection. The GUI asks for confirmation before this older firmware overwrites
-the saved network, because it does not roll back a failed join. Firmware lacking
-both service support and `wifi_join` cannot use
-this flow. The GUI never flashes it as a fallback.
+**Save Wi-Fi** uses the existing persistent `wifi_join` command on both older
+and service-capable firmware. A connection timeout or authentication rejection
+can still mean the new credentials are saved. A wrong password stays saved too:
+use Save again to correct it. Unsupported commands, ambiguous errors or lost
+replies never claim a confirmed save. The optional rollback trial is disabled
+on older firmware. The GUI never flashes firmware as a fallback.
 
 See [USB Wi-Fi maintenance](../docs/usb-wifi-settings.md) for the selection and
 recovery mechanism. Full onboarding still writes its Wi-Fi settings into the
 NVS image as before.
+
+### Change experiment and workbook without replacing identity
+
+Open **Change experiment / workbook…** to read the connected device's actual
+broker, current experiment and workbook. Reading works without signing in.
+The broker environment is matched only against endpoints learned from explicit
+onboarding; otherwise it is shown as **Unknown / unverified**. Certificate
+presence/validity is not available offline. **Check cloud status** is optional
+registry evidence and never requires device access to perform the switch.
+
+Sign in and select the destination experiment in the main window, then use the
+window's **Change experiment / workbook…** button. It fetches that experiment's
+pinned workbook for the running firmware, installs it over the journaled USB
+service, changes the ingest/status topics, and verifies after reboot. The
+broker, certificates and registration are preserved. A known environment
+mismatch is refused; an unknown environment requires explicit confirmation of
+the displayed broker and API environment. Service-capable firmware (v2.9.0+)
+is required. No re-registration, binding or certificate rotation is attempted.
+Queued and transitional records follow the current topic/workbook when sent;
+this action does not drain or discard a backlog.
+
+See [experiment maintenance](../docs/usb-experiment-maintenance.md) for behavior,
+partial-operation recovery and environment-check limitations.
 
 ### Update firmware while keeping the existing identity
 

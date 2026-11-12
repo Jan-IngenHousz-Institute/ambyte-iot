@@ -312,6 +312,9 @@ class App(ttk.Frame):
         self.wifi_btn = ttk.Button(
             transfer_row, text="Wi-Fi settings (USB)…", command=self._open_wifi_settings)
         self.wifi_btn.pack(side="left", padx=(0, 8))
+        self.experiment_btn = ttk.Button(
+            transfer_row, text="Change experiment / workbook…", command=self._open_experiment_settings)
+        self.experiment_btn.pack(side="left", padx=(0, 8))
         self.cancel_schedule_btn = ttk.Button(
             transfer_row, text="Cancel schedule transfer", command=self._cancel_schedule,
             state="disabled")
@@ -343,6 +346,22 @@ class App(ttk.Frame):
         self._set_busy(True)
         try:
             WifiDialog(self, port)
+        except Exception:
+            self._set_busy(False)
+            raise
+
+    def _open_experiment_settings(self):
+        if self.busy:
+            return
+        port = self._selected_port()
+        if not port:
+            messagebox.showinfo("Device destination", "Select a serial port first.")
+            return
+        from .experiment_gui import ExperimentDialog
+        self.busy = True
+        self._set_busy(True)
+        try:
+            ExperimentDialog(self, port)
         except Exception:
             self._set_busy(False)
             raise
@@ -518,6 +537,8 @@ class App(ttk.Frame):
                 self.sensors_btn.configure(state="disabled" if busy else "normal")
             if hasattr(self, "wifi_btn"):
                 self.wifi_btn.configure(state="disabled" if busy else "normal")
+            if hasattr(self, "experiment_btn"):
+                self.experiment_btn.configure(state="disabled" if busy else "normal")
             self.schedule_script_box.configure(
                 state="disabled" if busy or self.schedule_catalog is None
                 else "readonly")
@@ -1045,6 +1066,11 @@ class App(ttk.Frame):
             # 2-3. credentials + NVS
             self._set_step("credentials", "running")
             procedure.prepare_provisioning(ctx, run, log=self.log)
+            # This endpoint came from the environment's authoritative onboarding
+            # response, never from the environment selector or a hostname guess.
+            from urllib.parse import urlsplit
+            self.settings.mqtt_endpoints[ctx.env.key] = urlsplit(run.plan.mqtt_uri).hostname
+            self.settings.save()
             self._set_step("credentials", "ok")
             self._set_step("nvs", "ok")
 

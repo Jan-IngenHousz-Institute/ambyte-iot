@@ -1,0 +1,17 @@
+Experiment-only maintenance qualification: physical USB, firmware 2.13.0, 2026-11-12
+PASS exact original workbook bytes and private Wi-Fi restoration data saved before any change
+PASS device disconnected from cloud before synthetic experiment/workbook testing
+PASS production experiment-maintenance function installed fixture workbook and changed topics; post-reboot verification passed
+PASS broker and MQTT client preserved; synthetic API fixture used, no cloud registration/provisioning or synthetic-experiment publishing
+PASS original topics and exact workbook SHA/version restored before reconnecting Wi-Fi
+PASS original Wi-Fi connected after reboot; firmware, client, topics, workbook and certificate fingerprints unchanged
+PASS private restoration backup removed
+
+Offline bench throughout the synthetic experiment phase. No synthetic experiment was published.
+Synthetic destination: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+Synthetic workbook: bbbbbbbb-cccc-4ddd-8eee-ffffffffffff (manual device/log only, no sensor actions).
+Real USB and service backend; API/workbook resolution used an explicit fixture.
+PASS real Tk experiment window lifecycle with a synthetic device-read fixture: modal, worker, Unknown environment, disabled write without sign-in, close and busy release
+PASS host GUI suite: 528 tests and 29 subtests
+PASS C wire/filter suite: 11 tests and 13 subtests, ASan/UBSan with CC=clang
+No original experiment identifiers, SSID, passwords or certificate/private-key values are included.

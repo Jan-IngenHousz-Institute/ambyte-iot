@@ -55,8 +55,10 @@ class WifiDialog(tk.Toplevel):
         buttons.grid(row=5, column=0, columnspan=2, sticky="w")
         self.read_btn = ttk.Button(buttons, text="Read device again", command=self._read)
         self.read_btn.pack(side="left")
-        self.update_btn = ttk.Button(buttons, text="Update Wi-Fi", command=self._update)
+        self.update_btn = ttk.Button(buttons, text="Save Wi-Fi", command=self._update)
         self.update_btn.pack(side="left", padx=(8, 0))
+        self.test_btn = ttk.Button(buttons, text="Test & save", command=lambda: self._update(test_connection=True))
+        self.test_btn.pack(side="left", padx=(8, 0))
         self.recover_btn = ttk.Button(buttons, text="Check saved result", command=self._recover)
         self.recover_btn.pack(side="left", padx=(8, 0))
         self.close_btn = ttk.Button(buttons, text="Close", command=self._close)
@@ -77,6 +79,7 @@ class WifiDialog(tk.Toplevel):
         for widget in (self.read_btn, self.close_btn, self.ssid_entry, self.password_entry):
             widget.configure(state=state)
         self.update_btn.configure(state="normal" if not self.working and self.info else "disabled")
+        self.test_btn.configure(state="normal" if not self.working and self.info and self.info.service else "disabled")
         self.recover_btn.configure(state="normal" if not self.working and self.info and self.info.service else "disabled")
         self.new_btn.configure(state="normal" if not self.working and self.info and (self.allow_new or self.saved_schedule) else "disabled")
         self.new_btn.configure(text=("Cancel staged schedule…" if self.saved_schedule and self.saved_schedule.action == "cancel"
@@ -86,7 +89,7 @@ class WifiDialog(tk.Toplevel):
         else:
             self.new_btn.grid_remove()
 
-    def _start(self, action, apply, progress):
+    def _start(self, action, apply, progress, *, service_recovery=True):
         if self.working:
             return
         self.working = True
@@ -97,7 +100,7 @@ class WifiDialog(tk.Toplevel):
                 return
             self.working = False
             if error:
-                self.allow_new = error.uncertain
+                self.allow_new = error.uncertain and service_recovery
                 self.saved_schedule = None
                 self.message.set(str(error))
             else:
@@ -133,20 +136,17 @@ class WifiDialog(tk.Toplevel):
             state = {True: "connected", False: "disconnected", None: "unavailable"}[info.connected]
             self.device_text.set(f"Serial port: {info.port}\nDevice name: {info.name}\n"
                                  f"MAC: {info.mac}\nFirmware: {info.firmware or 'unavailable (older firmware)'}\nWi-Fi at last read: {state}")
-            behavior = (
-                "Keep the destination hub in range. New Wi-Fi credentials are saved only after a successful connection. "
-                "A failed trial attempts to restore the previous network."
-                if info.service else
-                "Older firmware overwrites saved Wi-Fi before testing the connection. "
-                "A wrong password or unreachable hub can leave this board offline."
-            )
+            behavior = ("Save Wi-Fi replaces the stored credentials even if the hub is out of range. "
+                        "Check the password before saving. "
+                        + ("Optional Test & save requires the hub in range and saves only after a successful connection."
+                           if info.service else "Connection testing with rollback is unavailable on this older firmware."))
             self.network_note.set("Leave the password blank for an open network.\n" + behavior)
             self.message.set("Check the device name and MAC before updating.")
         self._start(lambda: wifi_settings.read_device(self.port), apply,
                     "Reading the Ambyte on the selected USB port; startup can take 45 seconds…")
 
-    def _update(self, *, new_request=False):
-        if self.working or self.info is None:
+    def _update(self, *, new_request=False, test_connection=False):
+        if self.working or self.info is None or (test_connection and not self.info.service):
             return
         ssid, password, info = self.ssid.get(), self.password.get(), self.info
         try:
@@ -154,19 +154,21 @@ class WifiDialog(tk.Toplevel):
         except wifi_settings.WifiSettingsError as exc:
             self.message.set(str(exc))
             return
-        if not info.service and not messagebox.askyesno(
-                "Replace saved Wi-Fi",
-                f"Replace the saved Wi-Fi on {info.name} ({info.mac})?\n\n"
-                "This older firmware saves the new credentials before testing the connection. "
-                "The previous network will be overwritten even if the password is wrong or the hub is out of range. "
-                "Check the hub and password before continuing.", parent=self):
-            return
         def apply(result):
             self.allow_new = False
             self.saved_schedule = None
-            self.message.set(f"Wi-Fi saved and connection confirmed for {result.ssid} on {info.mac}.")
-        self._start(lambda: wifi_settings.update_wifi(info, ssid, password, new_request=new_request), apply,
-                    f"Checking {info.mac} and waiting for startup (up to 3 minutes), then updating Wi-Fi; keep USB connected…")
+            if result.connected:
+                self.message.set(f"Wi-Fi saved and connection confirmed for {result.ssid} on {info.mac}.")
+            else:
+                self.message.set(f"Wi-Fi saved for {result.ssid} on {info.mac}. Connection not confirmed; "
+                                 "power-cycle at deployment if it does not connect when the hub is available.")
+        action = (lambda: wifi_settings.update_wifi(info, ssid, password, new_request=new_request)) if test_connection else (
+            lambda: wifi_settings.save_wifi(info, ssid, password))
+        self._start(action, apply,
+                    f"Checking {info.mac} and waiting for startup (up to 3 minutes), then "
+                    + ("testing Wi-Fi; keep the hub in range and USB connected…" if test_connection else
+                       "saving Wi-Fi; a busy driver can take up to 90 seconds. The hub can be out of range. Keep USB connected…"),
+                    service_recovery=test_connection)
 
     def _recover(self):
         if self.working or self.info is None:
@@ -206,7 +208,7 @@ class WifiDialog(tk.Toplevel):
                 "The previous result could not be confirmed. Check saved result first. "
                 "A new attempt sends the currently entered credentials again; the device will refuse if another operation is still active.",
                 parent=self):
-            self._update(new_request=True)
+            self._update(new_request=True, test_connection=True)
 
     def _close(self):
         if self.working:

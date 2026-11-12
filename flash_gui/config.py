@@ -156,6 +156,7 @@ class Settings:
     wifi_ssid: str = ""
     wifi_password: str = ""
     schedule_script_name: str = "default"
+    mqtt_endpoints: dict = field(default_factory=dict)  # authoritative hosts learned during explicit onboarding
     api_keys: dict = field(default_factory=dict)   # env key -> "jii_..." key
 
     @classmethod

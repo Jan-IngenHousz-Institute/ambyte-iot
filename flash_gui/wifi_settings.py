@@ -4,9 +4,10 @@
 
 Discovery and writes stay on the operator's selected port. Each write checks
 the previously displayed MAC again on the same descriptor that receives the
-credentials. Older firmware accepts a quoted wifi_join; advertised service
-firmware always uses its journaled transaction and never falls back after an
-error. No console reply containing an echoed password leaves this module.
+credentials. Save uses the persistent wifi_join on all supported firmware;
+Test & save explicitly selects the journaled service trial on newer firmware.
+These are separate operator actions, never an automatic fallback after an error.
+No console reply containing an echoed password leaves this module.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,9 +20,10 @@ from .service_wire import ServiceError, TransportError
 
 
 class WifiSettingsError(RuntimeError):
-    def __init__(self, message, *, uncertain=False):
+    def __init__(self, message, *, uncertain=False, reason=None):
         super().__init__(message)
         self.uncertain = uncertain
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -171,7 +173,7 @@ def _quote(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _legacy_join(console, ssid, password):
+def _legacy_join(console, ssid, password, *, require_connection=True):
     try:
         reply = console.command(f"wifi_join {_quote(ssid)} {_quote(password)}", timeout=45.0)
     except Exception:
@@ -180,7 +182,7 @@ def _legacy_join(console, ssid, password):
         raise WifiSettingsError(
             "Wi-Fi update outcome is unknown after a USB error. Read the device again before another attempt.",
             uncertain=True) from None
-    if "Unrecognized command" in reply:
+    if any(line.strip() == "Unrecognized command" for line in reply.splitlines()):
         raise WifiSettingsError("This firmware does not support local wifi_join; no Wi-Fi update was confirmed.")
     pattern = re.compile(r'wifi_join "' + re.escape(ssid) + r'": ([A-Z][A-Z0-9_]+)')
     match = None
@@ -193,7 +195,22 @@ def _legacy_join(console, ssid, password):
             break
     if match is None:
         raise WifiSettingsError("Wi-Fi update outcome is unknown: the firmware returned no recognized result. Read the device again.", uncertain=True)
+    # wifi_join writes esp_wifi's persistent config BEFORE waiting for an IP.
+    # These two results are the documented post-save connection outcomes. Other
+    # errors may come from set_config itself, so never label those as saved.
+    if not require_connection and match[1] in {"ESP_ERR_TIMEOUT", "WIFI_MANAGER_ERR_AUTH_REJECTED"}:
+        return WifiResult(ssid, False)
     if match[1] != "ESP_OK":
+        if not require_connection:
+            if match[1] == "ESP_ERR_WIFI_STATE":
+                raise WifiSettingsError(
+                    "Wi-Fi save could not be confirmed (ESP_ERR_WIFI_STATE). The Ambyte was busy trying to connect. "
+                    "Wait a few seconds and explicitly Save Wi-Fi again; resending the same credentials is safe.",
+                    uncertain=True, reason=match[1])
+            raise WifiSettingsError(
+                f"Wi-Fi save could not be confirmed ({match[1]}). The credentials may have changed. "
+                "Read the device again to check its identity, then explicitly Save Wi-Fi again with the same credentials if needed.",
+                uncertain=True, reason=match[1])
         raise WifiSettingsError(
             f"Wi-Fi connection failed ({match[1]}). Older firmware may have saved the new credentials and may keep retrying; check the hub and password.")
     # wifi_manager_connect returns ESP_OK only after getting an IP. Do not
@@ -216,6 +233,62 @@ def _wait_service_startup(console, expected):
         if time.monotonic() >= deadline:
             raise WifiSettingsError("Ambyte startup has not finished. No Wi-Fi credentials were sent. Wait and read the device again.")
         time.sleep(1.0)
+
+
+def _save_persistent(console, info, ssid, password):
+    # Reopening USB can reboot the board onto the same unreachable-network
+    # retry ladder. Stay on this descriptor for a bounded retry of the ONE
+    # definite busy reply. Identical persistent credentials are idempotent,
+    # even if WIFI_STATE came from a later disconnect/connect after saving.
+    # Missing, malformed, or lost replies have no reason code and never retry.
+    deadline = time.monotonic() + 90.0
+    while True:
+        try:
+            return _legacy_join(console, ssid, password, require_connection=False)
+        except WifiSettingsError as exc:
+            if exc.reason != "ESP_ERR_WIFI_STATE" or time.monotonic() + 5.0 >= deadline:
+                raise
+        time.sleep(5.0)
+        try:
+            _checked_info(console, info)
+        except Exception:
+            raise WifiSettingsError(
+                "Wi-Fi save remains unconfirmed after a busy reply and a failed device recheck. "
+                "Read and identify the device before explicitly saving again.",
+                uncertain=True, reason="ESP_ERR_WIFI_STATE") from None
+
+
+def save_wifi(expected: DeviceInfo, ssid: str, password: str) -> WifiResult:
+    """Persist deployment credentials even when the destination hub is absent.
+
+    This explicitly uses wifi_join rather than the RAM-only service trial. A
+    service-capable device is checked read-only first, so the local action does
+    not bypass a saved or active schedule/Wi-Fi transaction. No password is sent
+    until all checks finish, and a lost reply is never retried automatically.
+    """
+    validate_credentials(ssid, password)
+    with _selected_console(expected.port) as console:
+        info = _checked_info(console, expected)
+        journal = OperationJournal(config.SERVICE_OPERATIONS_DIR, info.mac)
+        try:
+            with journal.lease():
+                previous = journal.load()
+                if previous and previous["phase"] != "complete":
+                    raise WifiSettingsError("Resolve the saved operation with Check saved result before saving new Wi-Fi credentials.")
+                if info.service:
+                    _wait_service_startup(console, info)
+                    client = ServiceClient(console._ser, journal)
+                    try:
+                        client.connect()
+                        client._foreign()
+                    finally:
+                        client.exit()
+                    if not console.wait_prompt(ambyte_serial.PROBE_READY_TIMEOUT_S):
+                        raise WifiSettingsError("The Ambyte did not return to its console. No Wi-Fi credentials were sent.")
+                    _checked_info(console, info)
+                return _save_persistent(console, info, ssid, password)
+        except ServiceClientError as exc:
+            raise WifiSettingsError(f"No Wi-Fi credentials were sent. {exc}") from None
 
 
 def update_wifi(expected: DeviceInfo, ssid: str, password: str, *, new_request=False) -> WifiResult:

@@ -1,0 +1,18 @@
+Bounded busy retry qualification — physical USB, 2026-11-12
+Board 28:37:2F:FF:E7:04, firmware 2.13.0, installed schedule INSTALLED
+PASS original credentials privately backed up; no credentials emitted
+PASS default save returned saved with connection unconfirmed for an unavailable test hub
+PASS after reboot: test SSID AND password persisted without a successful connection
+PASS CA, device certificate and private-key fingerprints unchanged
+Definite busy reply: backend waits and retries identical credentials on the same descriptor
+PASS public Save with BOTH old/new hubs absent; command attempts=2
+PASS second absent-hub SSID/password persisted after reboot; cert fingerprints unchanged
+PASS original Wi-Fi restored and connected after reboot; identity, topics and installed workbook unchanged
+PASS restored SSID/password and certificate fingerprints verified from NVS
+PASS private backup and credentials removed
+
+Only definite ESP_ERR_WIFI_STATE replies retry identical credentials on the same descriptor.
+Lost or malformed replies never retry.
+PASS host GUI suite: 528 tests and 29 subtests
+PASS production C wire/filter: 11 tests and 13 subtests, ASan/UBSan with CC=clang
+No original SSID, passwords or certificate/private-key values are included.
