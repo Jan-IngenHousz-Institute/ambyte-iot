@@ -6,6 +6,12 @@ bumping firmware. Every catalog entry is published as the exact authored YAML
 plus a schema-1 manifest containing its SHA-256, byte length, firmware
 compatibility, immutable URL, and unchanged `script_update` command object.
 
+Host tests under `tests/` belong to neither release unit. Changes there retain
+the firmware validation build and its release checks, but do not request a new
+firmware or schedule version. Mixed changes that also touch production paths
+still participate in the appropriate release. Release analysis and notes use
+the same path filter, so a later release cannot pick up a test-only commit.
+
 The initial catalog contains:
 
 | Name | Purpose |
