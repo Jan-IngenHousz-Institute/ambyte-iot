@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 from pathlib import Path
+import tomllib
 import unittest
 
 
@@ -11,6 +12,18 @@ PR_WORKFLOW = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
 
 
 class ReleaseVersioningContractTest(unittest.TestCase):
+    def test_locked_test_group_covers_gui_runtime_requirements(self) -> None:
+        requirements = {
+            line.split("#", 1)[0].strip()
+            for line in (ROOT / "flash_gui/requirements.txt").read_text().splitlines()
+        } - {""}
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        test_group = set(project["dependency-groups"]["test"])
+        self.assertFalse(
+            requirements - test_group,
+            f"GUI requirements missing from locked test group: {sorted(requirements - test_group)}",
+        )
+
     def test_no_manual_firmware_version_file(self) -> None:
         self.assertFalse(
             (ROOT / "version.txt").exists(),

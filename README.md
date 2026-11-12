@@ -109,7 +109,7 @@ At boot the system clock is seeded from the PCF2131 RTC. If the RTC is invalid o
 
 - [PlatformIO Core](https://platformio.org/install) (VS Code extension or `pio` CLI)
 - [`uv`](https://docs.astral.sh/uv/) for the Python host tooling (provisioning + test client)
-- Python 3.13 (auto-managed by `uv`)
+- Python 3.12+ (auto-managed by `uv`)
 - Git with submodule support
 
 The repo root is a `uv` project ([pyproject.toml](pyproject.toml), [uv.lock](uv.lock)); `uv` auto-creates `.venv/` from the lockfile. (Note: `pyproject.toml` metadata still calls the project a "BLE provisioning helper" and lists `bleak` — this is stale; provisioning is now host-side NVS pre-pop and Bluetooth is compiled out.)
@@ -136,7 +136,7 @@ uv pip install --python ~/.platformio/penv/.espidf-5.5.0/bin/python -r ~/.platfo
 
 ## Host Python tooling tests
 
-The locked `test` dependency group uses Python 3.13+ and pytest 9+, including
+The locked `test` dependency group uses Python 3.12+ and pytest 9+, including
 support for the existing unittest cases, module/class fixtures, and subtests:
 
 ```bash
@@ -149,8 +149,8 @@ AMBYTE_REQUIRE_PINNED_IDF=1 uv run --locked --group test pytest \
 
 Python statement/branch coverage covers first-party `tools/` and `flash_gui/`,
 including Python CLI subprocesses and multiprocessing workers. It excludes GUI
-test helpers, bundled vendor code, and the generated timezone table, and does not measure firmware C
-coverage. The production C harnesses retain their ASan/UBSan checks, fault
+test helpers, bundled vendor code, and the generated timezone table, and does not
+measure firmware C coverage. The production C harnesses retain their ASan/UBSan checks, fault
 injection, seeds, and repetitions. CI uploads XML/HTML coverage separately from
 release candidates; no minimum percentage is imposed. Without the pinned SDK,
 the command above fails instead of silently skipping its coverage.
