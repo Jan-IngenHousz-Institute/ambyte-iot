@@ -32,69 +32,77 @@ console responds. This wait sends no credentials and never retries a rejected
 join. A separate maintenance task can still return a definite busy result. The Wi-Fi window owns the GUI's serial-action gate
 until closed, and stale identity is cleared before a new read.
 
+## Save for deployment or test a reachable hub
+
+**Save Wi-Fi** is the default action. It uses the existing persistent
+`wifi_join` command on both older and service-capable firmware. The firmware
+writes the credentials before waiting for a connection, so the destination hub
+can be absent while boards are prepared. The message separates **saved** from
+**connection confirmed**. This deliberately overwrites the previous network,
+including when a password is mistyped. Check the password before saving.
+
+**Test & save** is optional on service-capable firmware (v2.9.0+). It uses
+`svc.wifi.join`: try credentials in RAM, save after getting an IP, otherwise
+attempt to restore the previous network. The hub must be powered on and in
+range for this action. A failed trial never falls back to a persistent save.
+The trial contract dates to v2.9.0; pre-flashed NVS credentials have always been
+saved without requiring a connection and are unaffected by this GUI change.
+
 ```mermaid
 sequenceDiagram
     actor Operator
     participant GUI as Wi-Fi window
-    participant USB as Selected USB console
-    participant WiFi as Firmware Wi-Fi manager
-    Operator->>GUI: Open Wi-Fi settings (USB)
-    GUI->>USB: identity + cfg get device_name + status
-    USB-->>GUI: Name, MAC, firmware, last-read connection state
-    GUI-->>Operator: Display connected Ambyte
-    Operator->>GUI: Enter hub SSID/password, Update Wi-Fi
-    GUI->>GUI: Validate input before opening USB
-    GUI->>USB: Re-read identity on selected port
-    alt MAC changed
-        GUI-->>Operator: Stop, read and identify device again
-    else MAC matches, svc advertised
-        GUI->>USB: Fresh service version/bind, journaled svc.wifi.join
-        USB->>WiFi: Bounded Wi-Fi trial and persistence
-        WiFi-->>USB: Saved/connected evidence or failure
-        GUI->>USB: svc.result by operation ID
-        USB-->>GUI: Validated result
-        GUI-->>Operator: Confirmed Wi-Fi result or recovery guidance
-    else MAC matches, older firmware
-        GUI->>USB: Quoted wifi_join SSID password, once
-        USB->>WiFi: Persist and attempt connection
-        WiFi-->>USB: ESP_OK only after IP, or error
-        USB-->>GUI: Result plus echoed command (kept private)
-        GUI-->>Operator: Parsed result without raw console capture
+    participant USB as Selected Ambyte
+    Operator->>GUI: Check MAC and enter credentials
+    GUI->>USB: Recheck MAC on the same descriptor
+    alt Default Save Wi-Fi
+        GUI->>GUI: Reject unresolved host operation
+        opt Service-capable device
+            GUI->>USB: Wait for startup, check active operation
+            USB-->>GUI: No active service work
+        end
+        GUI->>USB: Persistent wifi_join, once
+        USB->>USB: Save credentials, then try connection
+        USB-->>GUI: IP confirmed or post-save connection timeout/rejection
+        GUI-->>Operator: Saved, connection state stated separately
+    else Optional Test and save
+        GUI->>USB: Journaled svc.wifi.join
+        USB->>USB: Trial in RAM
+        alt Connection succeeds
+            USB->>USB: Save credentials
+        else Connection fails
+            USB->>USB: Attempt to restore previous network
+        end
+        USB-->>GUI: Durable saved/connected/restored evidence
     end
 ```
 
-Service behavior comes from the existing
-[USB maintenance protocol](usb-maintenance.md). A service failure never
-downgrades to a plain `wifi_join` mutation. This action does not automatically
-reconnect or resend credentials after a dropped USB link.
+For a persistent save, only `ESP_OK`, `ESP_ERR_TIMEOUT`, and
+`WIFI_MANAGER_ERR_AUTH_REJECTED` are recognized as post-save results. Only
+`ESP_OK` confirms an IP connection. Other errors can arise before persistence,
+so they report an unconfirmed save and no automatic retry. The command and its
+password-bearing echo never leave the backend. A lost reply has no operation ID;
+**Check saved result** describes earlier service operations, not this console
+save. The operator must inspect the device before explicitly sending again.
 
-**Service-capable firmware requires the destination hub to be powered on and
-in range during the USB session.** It tries the credentials in RAM and commits
-them only after a successful connection. This action cannot preload a network
-that the Ambyte cannot currently reach. Failed trials attempt to restore the
-previous configuration; the GUI reports the recorded saved/restored/retrying
-evidence instead of assuming restoration succeeded.
+Before a persistent save, the MAC-keyed journal lease blocks every unresolved
+host operation. On service firmware, a read-only service check also refuses
+another active operation before returning to the console and rechecking the MAC.
+These checks never archive or cancel another operation to make a save proceed.
 
 ## Recovery and failures
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Identify
-    Identify --> Ready: Valid local MAC displayed
-    Identify --> ReadFailed: USB unavailable or invalid identity
-    ReadFailed --> Identify: Read device again
-    Ready --> Updating: Validate inputs and recheck MAC
-    Updating --> Ready: MAC changed, no credentials sent
-    Updating --> Confirmed: Saved and connected proven
-    Updating --> Failed: Join rejected
-    Updating --> Interrupted: USB reply lost or outcome uncertain
-    Interrupted --> Recovering: Check saved result (svc only)
-    Recovering --> Confirmed: Prior success proven by ID
-    Recovering --> Failed: Prior failure proven by ID
-    Recovering --> Uncertain: Result expired or cannot be proven
-    Uncertain --> Updating: Explicit new attempt after confirmation
-    Failed --> Identify: Check board, hub and password
-    Confirmed --> Identify: Read next board
+flowchart TD
+    Ready[Device identified] --> Choice{Operator action}
+    Choice -->|Save Wi-Fi| Guards[Check identity and unresolved work]
+    Guards -->|Clear| Save[Send persistent command once]
+    Save -->|Known post-save reply| Saved[Saved, connection state reported separately]
+    Save -->|Lost or ambiguous reply| Unknown[Save unconfirmed, inspect device before retry]
+    Choice -->|Test and save| Trial[Journaled service trial]
+    Trial -->|Reply lost| Recover[Check saved result by operation ID]
+    Trial -->|Definite result| Evidence[Report saved and restoration evidence]
+    Recover -->|Unknown or expired| Explicit[Explicit new trial after confirmation]
 ```
 
 **Check saved result** needs no password. Recovery reads the MAC-keyed journal
@@ -107,7 +115,7 @@ before admitting it. The journal retains one `.previous.json` archive; a later
 explicit archive replaces it. Pending schedule transfers can also be checked
 and resolved from this window after a GUI restart.
 
-The Wi-Fi action holds the journal's lease while checking the pending operation
+The service trial holds the journal's lease while checking the pending operation
 kind and invoking the client. It rejects any unresolved schedule intent before
 a join, explicit new attempt or Wi-Fi recovery call, preserving that schedule's
 recovery record. **Check saved result** resolves terminal schedule results, offers
@@ -117,13 +125,8 @@ A completed journal needs no USB access. These actions do not install a workbook
 or verify the current workbook. A definite failed Wi-Fi result allows
 normal correction and retry; recovery guidance is reserved for unresolved work.
 
-On older firmware, `wifi_join` persists configuration before attempting to
-connect. A rejected or timed-out legacy join may therefore leave new credentials
-stored and retrying. Its success line must explicitly return `ESP_OK`; an old
-connection bit alone is insufficient. Unsupported commands, malformed replies
-and timeouts never display success. The GUI asks the operator to confirm this
-overwrite before sending legacy credentials. Older images lacking `wifi_join` require a
-separate firmware decision; this action does not flash them automatically.
+Firmware lacking `wifi_join` cannot use the default save. Unsupported commands
+fail without automatically flashing or trying another write path.
 
 Credentials are validated before opening USB: SSID 1–31 UTF-8 bytes without
 console controls, and either an empty password or 8–63 printable ASCII bytes.
@@ -148,7 +151,7 @@ lost replies and recovery without duplicate credential transmission, malformed
 service responses, preservation of pending schedule recovery, explicit retries,
 rollback evidence and descriptor cleanup. Headless GUI tests
 exercise access without sign-in, worker-to-main-thread completion, stale-read
-write gating, legacy-overwrite confirmation, validation, error redaction and
+write gating, offline save versus optional trial, validation, error redaction and
 cleanup after a failed dialog construction. These tests do not substitute for
 a real Tk session. The existing registration-conflict
 test verifies the error points operators at the local USB action.
@@ -170,4 +173,4 @@ also contains the firmware run. This establishes local Wi-Fi behavior on these
 two images, not qualification of every firmware release or cloud ingestion.
 The final host suite passed 485 tests and 29 subtests; the additional production
 C framing/editor filter suite passed all 11 tests with ASan/UBSan.
-A real Tk desktop session was not available on the bench host.
+That first qualification did not include a real Tk desktop session.

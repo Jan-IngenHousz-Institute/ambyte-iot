@@ -379,3 +379,80 @@ def test_busy_service_leaves_original_wifi_untouched_and_allows_retry(usb):
     assert "maintenance task" in str(error.value) and "not saved" in str(error.value)
     assert "restoration" not in str(error.value) and not error.value.uncertain
     assert OperationJournal(directory, MAC).load()["phase"] == "complete"
+
+
+@pytest.mark.parametrize('service', [False, True])
+def test_save_for_deployment_keeps_credentials_when_hub_is_out_of_range(usb, service):
+    device, handles, _ = usb
+    device.svc, device.legacy_result = service, 'ESP_ERR_TIMEOUT'
+    info = wifi_settings.read_device('bench')
+    result = wifi_settings.save_wifi(info, 'Field hub 1', 'synthetic-password')
+    assert result.ssid == 'Field hub 1' and not result.connected
+    assert not device.joins
+    assert len([c for c in device.plain if c.startswith('wifi_join ')]) == 1
+    assert all(not h.is_open for h in handles)
+
+
+def test_save_for_deployment_rejects_board_swap_before_password(usb):
+    device, _, _ = usb
+    info = wifi_settings.read_device('bench')
+    device.mac = '00:11:22:33:44:55'
+    with pytest.raises(wifi_settings.WifiSettingsError, match='changed'):
+        wifi_settings.save_wifi(info, 'Field hub 1', 'synthetic-password')
+    assert not any(c.startswith('wifi_join ') for c in device.plain)
+
+
+def test_save_for_deployment_preserves_unresolved_schedule(usb):
+    info, journal, _ = _pending_schedule(usb, 'staging')
+    before = journal.path.read_bytes()
+    with pytest.raises(wifi_settings.WifiSettingsError, match='saved'):
+        wifi_settings.save_wifi(info, 'Field hub 1', 'synthetic-password')
+    assert journal.path.read_bytes() == before
+    assert not any(c.startswith('wifi_join ') for c in usb[0].plain)
+
+
+@pytest.mark.parametrize("result", ["ESP_ERR_TIMEOUT", "WIFI_MANAGER_ERR_AUTH_REJECTED"])
+def test_deployment_save_reports_post_save_connection_failure_separately(usb, result):
+    device, _, _ = usb
+    device.legacy_result = result
+    info = wifi_settings.read_device("bench")
+    assert not wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password").connected
+    assert not device.joins
+
+
+@pytest.mark.parametrize("result", ["ESP_FAIL", "ESP_ERR_INVALID_STATE", "WIFI_MANAGER_ERR_DRIVER_UNRESOLVED"])
+def test_unconfirmed_save_never_claims_credentials_stored_or_exposes_password(usb, result):
+    device, _, _ = usb
+    device.legacy_result = result
+    info = wifi_settings.read_device("bench")
+    with pytest.raises(wifi_settings.WifiSettingsError, match="could not be confirmed") as error:
+        wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
+    assert error.value.uncertain and "synthetic-password" not in str(error.value)
+    assert len([c for c in device.plain if c.startswith("wifi_join ")]) == 1
+
+
+def test_deployment_save_preserves_unresolved_wifi_and_never_resends_it(usb):
+    device, _, directory = usb
+    device.outcome, device.error_reason = "uncertain", "interrupted"
+    info = wifi_settings.read_device("bench")
+    with pytest.raises(wifi_settings.WifiSettingsError):
+        wifi_settings.update_wifi(info, "Field hub 1", "synthetic-password")
+    journal = OperationJournal(directory, MAC)
+    before = journal.path.read_bytes()
+    with pytest.raises(wifi_settings.WifiSettingsError, match="Check saved result"):
+        wifi_settings.save_wifi(info, "Field hub 1", "different-password")
+    assert journal.path.read_bytes() == before and device.joins == 1
+    assert not any(c.startswith("wifi_join ") for c in device.plain)
+
+
+def test_deployment_save_does_not_bypass_foreign_active_schedule(usb):
+    info, journal, _ = _pending_schedule(usb, "staging")
+    journal.path.unlink()  # Another host owns the active transfer, no local intent.
+    with pytest.raises(wifi_settings.WifiSettingsError, match="No Wi-Fi credentials were sent"):
+        wifi_settings.save_wifi(info, "Field hub 1", "synthetic-password")
+    assert not any(c.startswith("wifi_join ") for c in usb[0].plain)
+
+
+def test_password_echo_cannot_be_mistaken_for_an_unsupported_command(usb):
+    info = wifi_settings.read_device("bench")
+    assert wifi_settings.save_wifi(info, "Field hub 1", "Unrecognized command").connected
