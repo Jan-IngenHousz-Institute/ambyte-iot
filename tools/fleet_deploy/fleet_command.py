@@ -214,8 +214,10 @@ def main(argv=None):
                 progress.setdefault(dev, []).append(data)
                 if data.get("state") in AMBIT_FLASH_TERMINAL:
                     replies[dev] = data
-                if len(replies) >= len(devices):
-                    break
+                    if len(replies) >= len(devices):
+                        # AWS IoT does not preserve order: per-channel reports
+                        # published just before the terminal one can land after it.
+                        deadline = min(deadline, time.monotonic() + 5)
                 continue
             # keep the first terminal-looking reply; progress replies of a run keep coming
             if dev not in replies or data.get("detail") not in ("progress",):

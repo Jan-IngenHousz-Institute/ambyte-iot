@@ -39,10 +39,13 @@ python tools/fleet_deploy/fleet_command.py ambit-flash --devices ambyte_10:00:3B
 On the console, `ambit_flash all 1.4.0 https://…/manifest.json` queues the same
 operation.
 
-The status topic carries `ambit_flash_status` reports in this order:
+The status topic carries `ambit_flash_status` reports. The device publishes
 `accepted`, then (after MQTT is back) `fetched` or `fetch_failed` with a detail such as
 `ok downloaded=4 reused=0 removed=0 bytes=474224`, then one per channel
-(`flash_ok`, `flash_failed`, `absent`, `bus_busy`), then `success` or `failed`.
+(`flash_ok`, `flash_failed`, `absent`, `bus_busy`), then `success` or `failed`. AWS IoT
+does not preserve order, so the post-reconnect reports can arrive interleaved;
+`success` is sent only when every attempted channel flashed. `fleet_command.py` keeps
+listening 5 s after the terminal report to collect the rest.
 
 ## How it fits together
 
@@ -157,3 +160,29 @@ the fleet defaults for them until the unit is recalibrated.
 - `tests/ambit_host/red_green.py --rev e1ca6ee`: the earlier staging and preflight
   scenarios stay green with the gate in the preflight.
 - `tests/test_fleet_command.py`: `ambit-flash` and `ambit-versions` payloads.
+
+## Bench qualification (2026-11-12)
+
+Dev Ambyte `ambyte_10:00:3B:72:22:38` with one AMBIT on channel 0 (`sensor_id`
+3C:DC:75:0E:04:28) running 0.0.6, which had delivered spectra but no trace records.
+Everything below went over MQTT and HTTPS; the board was not on USB.
+
+1. The Ambyte was moved from 2.5.2 to this branch's build
+   (`2.11.0-bench.ambitfetch.1`, commit 54ecb20) with `fleet_deploy.py` and a presigned
+   URL in the dev firmware bucket.
+2. `ambit-flash` with the published ambit-iot v1.4.0 `manifest.json`: the Ambyte
+   downloaded all four regions (474,224 bytes), verified them, flashed channel 0 and
+   reported `success` 47 s after the command.
+3. A second `ambit-flash` under a new id downloaded only the manifest and reused all
+   four verified files.
+4. The AMBIT reports 1.4.0. It kept its NVS: the name it reports now comes from its NVS
+   `name` key (`AmbitV003`). Its first `ambit.trace/3` (SS, 45 pulses on four optical
+   series plus leaf temperature) reached openJII at 10:26 UTC.
+
+![Ambyte OTA to the bench build](images/ambit-remote-flash/ambyte-ota.png)
+
+![ambit_flash over MQTT with a release download](images/ambit-remote-flash/remote-flash.png)
+
+![re-run reuses the verified folder](images/ambit-remote-flash/rerun-reuse.png)
+
+![openJII: first trace after the remote flash](images/ambit-remote-flash/openjii-first-trace.png)
