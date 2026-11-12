@@ -38,8 +38,11 @@ cp .env.example .env && $EDITOR .env          # Wi-Fi creds, MQTT URI, topic roo
 
 # 3. Build the unsigned signing intermediate (the upload guard refuses it)
 pio run -e esp32-s3-devkitm-1
-# Physical development bench only: explicitly sign with the PUBLIC bench key
-python3 tools/bench_flash.py --env esp32-s3-devkitm-1 --port /dev/ttyACM0
+# Physical development bench only: explicitly sign with the PUBLIC bench key.
+# A new board's FIRST flash needs --provision, which writes the NVS built from
+# step 2 (Wi-Fi, MQTT, certificate). Later flashes omit it so the device keeps
+# its identity (NVS is preserved by default).
+python3 tools/bench_flash.py --env esp32-s3-devkitm-1 --port /dev/ttyACM0 --provision
 pio device monitor -b 115200
 
 # 4. The firmware embeds schedule/default.yaml. To install another catalog
