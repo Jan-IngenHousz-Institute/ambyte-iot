@@ -13,10 +13,10 @@ broker. Do not use a production device identity against a shared broker.
    git submodule update --init --recursive components/littlefs
    ```
 
-2. Build, flash, and monitor the instrumented baseline:
+2. Build, explicitly bench-sign, flash with NVS preserved, and monitor the instrumented baseline. The public bench root is for this development device only; [signed image recovery and field bootstrap](../signed-images.md) use different procedures:
 
    ```sh
-   pio run -e bench -t upload
+   python3 tools/bench_flash.py --env bench --port /dev/ttyACM0
    pio device monitor -b 115200
    ```
 
@@ -114,7 +114,7 @@ variant twice. Never combine variants in one result.
 For each row, substitute the environment name in:
 
 ```sh
-pio run -e ENVIRONMENT -t upload
+python3 tools/bench_flash.py --env ENVIRONMENT --port /dev/ttyACM0
 pio device monitor -b 115200
 ```
 

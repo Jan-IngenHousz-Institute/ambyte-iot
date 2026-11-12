@@ -108,12 +108,15 @@ class ScheduleWorkflowTest(unittest.TestCase):
         )
         self.assertIn('git reset --soft "${PR_MERGE_BASE}"', PR_WORKFLOW)
         condition = "if: steps.scope.outputs.firmware-build-required == 'true'"
-        self.assertEqual(PR_WORKFLOW.count(condition), 3)
+        self.assertEqual(PR_WORKFLOW.count(condition), 4)
         build = PR_WORKFLOW.index("name: Build unprovisioned firmware")
         hil_gate = PR_WORKFLOW.index("name: Check release image excludes bench HIL")
         package = PR_WORKFLOW.index("name: Verify version and create flash ZIP")
+        signing_gate = PR_WORKFLOW.index("name: Check unsigned signing intermediate and recovery config")
         self.assertLess(build, hil_gate)
         self.assertLess(hil_gate, package)
+        self.assertLess(hil_gate, signing_gate)
+        self.assertLess(signing_gate, package)
         self.assertIn("python tools/check_release_no_hil.py --self-test", PR_WORKFLOW)
         self.assertIn(
             "--sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json",

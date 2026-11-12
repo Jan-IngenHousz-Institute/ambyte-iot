@@ -197,6 +197,15 @@ jobs:
             .pio/build/esp32-s3-devkitm-1/components/CLI/cli_sensors.c.o \
             .pio/build/esp32-s3-devkitm-1/components/usb_service/*.o
 
+      - name: Check unsigned signing intermediate and recovery config
+        if: steps.scope.outputs.firmware-build-required == 'true'
+        run: |
+          python tools/check_release_signing.py --self-test
+          python tools/check_release_signing.py --intermediate \
+            --elf .pio/build/esp32-s3-devkitm-1/firmware.elf \
+            --bin .pio/build/esp32-s3-devkitm-1/firmware.bin \
+            --sdkconfig-json .pio/build/esp32-s3-devkitm-1/config/sdkconfig.json
+
       - name: Verify version and create flash ZIP
         if: steps.scope.outputs.firmware-build-required == 'true'
         env:

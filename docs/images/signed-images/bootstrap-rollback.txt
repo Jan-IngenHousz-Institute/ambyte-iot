@@ -1,0 +1,6 @@
+L1135: W (5957) ota_update: booted a PENDING_VERIFY image (id=[request]) — confirming via MQTT
+L1433: E (306147) ota_update: health gate failed (MQTT/persistence) within 300s — rolling back
+L1439: E (306507) esp_ota_ops: Rollback is not possible, do not have any suitable apps in slots
+L1440: E (306517) ota_update: rollback call returned (ESP_ERR_OTA_ROLLBACK_FAILED) — forcing reboot
+L1490: I (387) boot: Loaded app from partition at offset 0x20000
+L1500: I (817) app_init: App version:      2.7.0
