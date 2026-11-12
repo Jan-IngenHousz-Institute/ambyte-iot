@@ -16,6 +16,7 @@ import re
 import time
 
 from . import ambyte_serial, config, firmware_update, procedure, wifi_settings
+from .openjii_client import OpenJIIError
 from .service_client import OperationJournal, ServiceClient, ServiceClientError, schedule_descriptor
 
 
@@ -66,6 +67,7 @@ def topic_for_experiment(raw, experiment_id):
 
 def _target(console, endpoints):
     device = firmware_update._snapshot(console)
+    device = firmware_update._settled_schedule(console, device, lambda text: None, before_flash=True)
     broker = urlsplit(device.settings['mqtt_uri']).hostname.lower()
     matches = [env for env, host in endpoints.items() if env in config.ENVIRONMENTS and host == broker]
     match = _TOPIC.fullmatch(device.settings['mqtt_topic_root'] or '')
@@ -77,7 +79,7 @@ def read_target(port, endpoints=None):
     try:
         with wifi_settings._selected_console(port) as console:
             return _target(console, endpoints or {})
-    except (ambyte_serial.ConsoleError, firmware_update.FirmwareUpdateError, wifi_settings.WifiSettingsError) as exc:
+    except (OSError, ambyte_serial.ConsoleError, firmware_update.FirmwareUpdateError, wifi_settings.WifiSettingsError) as exc:
         raise ExperimentSettingsError(str(exc)) from None
 
 
@@ -103,20 +105,41 @@ def _checked(console, expected):
 
 @contextmanager
 def _after_reboot(previous_port, mac):
-    # Enumerating ports is read-only. Open only the same USB serial/MAC, never
-    # connect_after_boot's scan that can reset unrelated Ambytes.
+    # Let the old USB enumeration disappear before opening its replacement.
+    # Enumeration is read-only; never open an unrelated port to identify it.
     deadline = time.monotonic() + 180
+    time.sleep(2)
     while time.monotonic() < deadline:
-        ports = [p.device for p in ambyte_serial.list_ports.comports()
-                 if (p.serial_number or '').replace(':', '').upper() == mac.replace(':', '').upper()]
-        if len(ports) > 1:
-            raise ExperimentSettingsError("More than one USB port reports the expected serial. Select the device again.")
-        if ports:
-            with wifi_settings._selected_console(ports[0]) as console:
-                yield console
-                return
-        time.sleep(1)
-    raise ExperimentSettingsError("The same Ambyte did not return after reboot. Read its destination and retry; no provisioning was attempted.")
+        console = None
+        try:
+            ports = [p.device for p in ambyte_serial.list_ports.comports()
+                     if (p.serial_number or '').replace(':', '').upper() == mac.replace(':', '').upper()]
+            if len(ports) > 1:
+                raise ExperimentSettingsError("More than one USB port reports the expected serial. Select the device again.")
+            if not ports:
+                time.sleep(1)
+                continue
+            console = ambyte_serial.AmbyteConsole(ports[0])
+            if not console.wait_prompt(min(45, max(1, deadline-time.monotonic())), recover_service=True):
+                raise wifi_settings.WifiSettingsError("The same Ambyte is still booting.")
+            if console.identity().mac != mac:
+                raise ExperimentSettingsError("The USB serial reports a different Ambyte MAC after reboot.")
+        except (OSError, ambyte_serial.ConsoleError, wifi_settings.WifiSettingsError):
+            if console is not None:
+                console.close()
+            time.sleep(1)
+            continue
+        except Exception:
+            if console is not None:
+                console.close()
+            raise
+        try:
+            yield console
+        finally:
+            console.close()
+        return
+    raise ExperimentSettingsError("The same Ambyte did not return after reboot, or its USB driver did not report a MAC serial. "
+                                  "Refresh ports and read the destination again; no provisioning was attempted.")
 
 
 def change_experiment(expected, client, experiment_id, *, allow_unknown_environment=False, log=lambda text: None):
@@ -129,11 +152,14 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
         raise ExperimentSettingsError("Experiment maintenance requires service-capable firmware (v2.9.0+). Update firmware while keeping settings first.")
     # Resolve against RUNNING firmware. No onboard, register, issue or rotate
     # call belongs here, including as a fallback after a 403 or USB failure.
-    programming = client.resolve_programming(experiment_id, fw_version=expected.device.identity.fw, log=log)
-    if programming is None:
-        raise ExperimentSettingsError("The selected experiment has no pinned Ambyte workbook programming cell.")
-    source = procedure.schedule_source(SimpleNamespace(programming=programming, schedule_script=None,
-                                      release=SimpleNamespace(version=expected.device.identity.fw)), log=log)
+    try:
+        programming = client.resolve_programming(experiment_id, fw_version=expected.device.identity.fw, log=log)
+        if programming is None:
+            raise ExperimentSettingsError("The selected experiment has no pinned Ambyte workbook programming cell.")
+        source = procedure.schedule_source(SimpleNamespace(programming=programming, schedule_script=None,
+                                          release=SimpleNamespace(version=expected.device.identity.fw)), log=log)
+    except (OpenJIIError, procedure.ProcedureError) as exc:
+        raise ExperimentSettingsError(f"No device settings were changed. {exc}") from None
     descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
                                      source.built_against_fw, source.workbook_version_id)
     journal = OperationJournal(config.SERVICE_OPERATIONS_DIR, expected.mac)
@@ -153,6 +179,11 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
                 if not console.wait_prompt(45):
                     raise ExperimentSettingsError("The device did not return to its console after workbook installation.")
                 current = firmware_update._snapshot(console)
+                current = firmware_update._settled_schedule(console, current, log, before_flash=True)
+                if (current.identity.schedule.source != 'INSTALLED'
+                        or current.identity.schedule.sha256 != source.sha256
+                        or current.identity.schedule.workbook_version_id != source.workbook_version_id):
+                    raise ExperimentSettingsError("The destination workbook was not confirmed active before topic update.")
                 if (current.identity.mac != expected.mac or current.identity.thing_name != expected.device.identity.thing_name
                         or current.settings != expected.device.settings):
                     raise ExperimentSettingsError("The device configuration changed before topic update.")
@@ -184,6 +215,6 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
                         or schedule.workbook_version_id != source.workbook_version_id):
                     raise ExperimentSettingsError("The destination configuration/workbook was not verified after reboot.")
                 return _target(console, {client.env.key: expected.broker} if expected.environment else {})
-    except (ambyte_serial.ConsoleError, ServiceClientError, wifi_settings.WifiSettingsError,
+    except (OSError, ambyte_serial.ConsoleError, ServiceClientError, wifi_settings.WifiSettingsError,
             firmware_update.FirmwareUpdateError, ExperimentSettingsError) as exc:
         raise ExperimentSettingsError(f"{stage}. {exc} Read the device destination and retry this action. No registration or certificate write was attempted.") from None

@@ -198,7 +198,7 @@ C framing/editor filter suite passed all 11 tests with ASan/UBSan.
 That first qualification did not include a real Tk desktop session.
 
 
-### Offline-save qualification (GUI correction)
+### Initial one-shot qualification (before bounded busy retry)
 
 The default persistent save was exercised on the same physical Ambyte with
 firmware 2.13.0 and an installed workbook. The synthetic destination hub was
@@ -227,3 +227,21 @@ Mermaid diagrams were rendered with mermaid-cli.
 The production GUI never reads passwords or certificates back; private NVS
 readback was used only to qualify persistence. This run qualifies the 2.13.0
 image, with host coverage for older firmware, rather than every firmware image.
+
+
+### Final qualification with both hubs absent
+
+The final public Save flow was tested after storing an unreachable network, then
+saving a different unreachable network. It received a definite driver-busy reply,
+kept the same descriptor open, retried the identical credentials once, and
+returned saved with connection unconfirmed. After reboot the second SSID and
+password matched NVS, and certificate fingerprints were unchanged. The original
+network and exact configuration/workbook were restored and connected after a
+reboot; the private backup was removed. The final suite passes **528 tests and
+29 subtests**, plus **11 C wire/filter tests and 13 subtests** under ASan/UBSan.
+The earlier one-shot capture above records the discovery of this driver race;
+the final run below qualifies its bounded retry.
+
+![Both old and new hubs absent, bounded same-descriptor retry](images/offline-wifi-save/busy-retry-2.13.png)
+
+[Final retry transcript](images/offline-wifi-save/busy-retry-2.13.txt).

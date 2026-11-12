@@ -84,7 +84,11 @@ class ExperimentDialog(tk.Toplevel):
                          f'Current experiment: {target.experiment_id or "Unrecognized topic"}\n'
                          f'Workbook version: {identity.schedule.workbook_version_id or "None reported"}')
         self.cloud.set('Cloud status: not checked. Device certificate remains unverified.')
-        self.message.set('To change experiment, sign in and select the destination experiment in the main window, then use Change experiment / workbook.')
+        experiment = self.app._current_experiment()
+        if self.app.client is None or experiment is None:
+            self.message.set('Close this window, sign in and select the destination experiment in the main window, then reopen Change experiment / workbook.')
+        else:
+            self.message.set(f'Selected destination: {experiment.name} ({experiment.id}), API environment {self.app.client.env.key}.')
 
     def _read(self):
         if self.working:

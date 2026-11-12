@@ -229,6 +229,29 @@ See [USB Wi-Fi maintenance](../docs/usb-wifi-settings.md) for the selection and
 recovery mechanism. Full onboarding still writes its Wi-Fi settings into the
 NVS image as before.
 
+### Change experiment and workbook without replacing identity
+
+Open **Change experiment / workbook…** to read the connected device's actual
+broker, current experiment and workbook. Reading works without signing in.
+The broker environment is matched only against endpoints learned from explicit
+onboarding; otherwise it is shown as **Unknown / unverified**. Certificate
+presence/validity is not available offline. **Check cloud status** is optional
+registry evidence and never requires device access to perform the switch.
+
+Sign in and select the destination experiment in the main window, then use the
+window's **Change experiment / workbook…** button. It fetches that experiment's
+pinned workbook for the running firmware, installs it over the journaled USB
+service, changes the ingest/status topics, and verifies after reboot. The
+broker, certificates and registration are preserved. A known environment
+mismatch is refused; an unknown environment requires explicit confirmation of
+the displayed broker and API environment. Service-capable firmware (v2.9.0+)
+is required. No re-registration, binding or certificate rotation is attempted.
+Queued and transitional records follow the current topic/workbook when sent;
+this action does not drain or discard a backlog.
+
+See [experiment maintenance](../docs/usb-experiment-maintenance.md) for behavior,
+partial-operation recovery and environment-check limitations.
+
 ### Update firmware while keeping the existing identity
 
 Connect the board, select its USB port, and click **Update firmware (keep
