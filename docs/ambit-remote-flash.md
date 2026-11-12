@@ -161,6 +161,74 @@ the fleet defaults for them until the unit is recalibrated.
   scenarios stay green with the gate in the preflight.
 - `tests/test_fleet_command.py`: `ambit-flash` and `ambit-versions` payloads.
 
+## Attach-time update
+
+An AMBIT plugged in while the Ambyte runs used to be measured with whatever
+firmware it carried until the next clean, externally powered boot. On a solar unit
+the nightly reboot (around 01:20 UTC) has no input, so that boot may never come. Now
+the schedule measures an AMBIT only after its firmware was checked against the
+highest verified `/sdcard/ambit_fw/<ver>/` and, if older, updated.
+
+- **Gate.** Every schedule action asks `ch_present()`, which pings the channel,
+  reads the AMBIT's identity (MAC + firmware, cached after the first read) and asks
+  `ambit_attach_gate_allow()`. A `(MAC, firmware)` pair the checker has not cleared
+  (a new AMBIT, a swapped one, one reflashed by any path) is held and the checker is
+  woken. Other channels keep measuring.
+- **Check.** The `ambit_attach` pass on the maintenance worker compares the cached
+  firmware string with the SD target. Current, newer (never downgraded), no target
+  on the card, or a firmware string it cannot read: cleared at once, with no UART
+  traffic and no pause in measurement.
+- **Update.** Older: if there is charger input, or the battery is at least 3.7 V
+  (the system rail stands in when the charger reports `battery_v=0`), measurement
+  and MQTT pause and the AMBIT is ROM-flashed to the target and verified. The new
+  firmware is then checked like any new identity, and cleared.
+- **Not enough power:** the channel stays held and is re-checked every 10 min.
+- **SD card parked or missing:** the AMBIT is measured (a parked card must never stop
+  measurement) and re-checked every 10 min.
+- **Repeated failure:** flashes share boot sync's per-channel cap of 3 attempts per
+  target. After that the AMBIT is measured on its current firmware and an
+  `ambit_attach_status` `gave_up` report asks for attention.
+- **Identity unreadable** (pre-1.0 units that do not answer the version read): never
+  held, since it can never be auto-updated. Use `ambit-flash` for those.
+
+`ambit_attach_status` reports on the status topic: `updating`, `updated`,
+`update_failed`, `waiting_power`, `newer`, `no_target`, `unreadable`, `gave_up`, with
+`fw=<running> target=<sd target>`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Held: new (MAC, firmware) on a channel
+    Held --> Measuring: current / newer / no target / unreadable
+    Held --> Measuring: SD unavailable (re-check in 10 min)
+    Held --> Flashing: older and power ok
+    Held --> Held: older, low power (re-check in 10 min)
+    Flashing --> Held: new firmware is a new identity
+    Held --> Measuring: fail cap reached (gave_up report)
+    Measuring --> Held: AMBIT swapped or reflashed
+```
+
+```mermaid
+sequenceDiagram
+    participant R as Schedule runner
+    participant G as Attach gate
+    participant W as Maintenance worker
+    participant S as SD target
+    participant A as AMBIT
+    R->>A: ping, identity (MAC, fw 1.3.0)
+    R->>G: allow(ch, MAC, 1.3.0)?
+    G-->>R: no (held), wake checker
+    W->>S: highest verified folder: 1.4.0
+    W->>W: older; power ok
+    W->>R: pause schedule (and MQTT)
+    W->>A: ROM flash 1.4.0, verify version
+    W->>R: resume
+    R->>G: allow(ch, MAC, 1.4.0)?
+    G-->>R: no (new identity), wake checker
+    W->>S: 1.4.0 == target: clear
+    R->>G: allow(ch, MAC, 1.4.0)?
+    G-->>R: yes, measure
+```
+
 ## Bench qualification (2026-11-12)
 
 Dev Ambyte `ambyte_10:00:3B:72:22:38` with one AMBIT on channel 0 (`sensor_id`
