@@ -168,4 +168,6 @@ explicit retry succeeded. No automatic credential resend was added.
 The redacted [terminal transcript](images/usb-maintenance-gui/qualification.txt)
 also contains the firmware run. This establishes local Wi-Fi behavior on these
 two images, not qualification of every firmware release or cloud ingestion.
+The final host suite passed 485 tests and 29 subtests; the additional production
+C framing/editor filter suite passed all 11 tests with ASan/UBSan.
 A real Tk desktop session was not available on the bench host.

@@ -126,8 +126,20 @@ The first physical run updated bench Ambyte `28:37:2F:FF:E7:04` from 2.7.0 to
 signed 2.13.0 and verified the MAC, client identity and nonsecret configuration.
 Its early pre-flash identity reported `NONE`, so that run alone does not prove
 installed-schedule preservation. The updated implementation now waits for the
-loaded schedule before writing. The additional loaded-schedule and NVS
-fingerprint qualification is recorded in [PR #93](https://github.com/Jan-IngenHousz-Institute/ambyte-iot/pull/93).
+loaded schedule before writing. The additional run used a controlled signed 2.12.0 predecessor with the same
+MAC, partition table, storage checks and firmware-only image boundary. The
+production updater then moved it to 2.13.0 with pre-flash source `INSTALLED` and
+SHA `943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7`.
+The post-boot comparison preserved that SHA and workbook identity.
+
+The already-installed version was a no-op. A private bench-only NVS read compared
+CA, device certificate and private-key value fingerprints with the original
+2.7.0 baseline: all three were unchanged. No certificate or key bytes appear in
+the captures. The final reboot confirmed 2.13.0, the original nonsecret settings,
+the installed schedule and a Wi-Fi connection. Certificate presence remains
+unobservable through the normal console; the GUI never performs this bench read.
+
+![Loaded schedule and certificate preservation capture](images/usb-maintenance-gui/firmware-preservation.png)
 
 ![Real firmware-only bench capture](images/usb-maintenance-gui/firmware-2.7-to-2.13.png)
 

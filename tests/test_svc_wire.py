@@ -128,12 +128,14 @@ class ServiceWireTest(unittest.TestCase):
 
     def test_every_plain_gui_command_template_passes_byte_identical(self):
         from flash_gui.ambyte_serial import AmbyteConsole, ConsoleError
+        from flash_gui.wifi_settings import _legacy_join
         con = object.__new__(AmbyteConsole)
         captured = []
         staged = 0
         def command(line, *args, **kwargs):
             nonlocal staged
             captured.append(line)
+            if line.startswith("wifi_join "): return 'wifi_join "Field hub 1": ESP_OK'
             if line == "schedule begin": staged = 0; return "schedule begin: ready"
             if line.startswith("schedule put "):
                 staged += len(base64.b64decode(line.split()[-1]))
@@ -152,6 +154,8 @@ class ServiceWireTest(unittest.TestCase):
                            lambda k=key: con.cfg_set(k, "12345678"),
                            lambda k=key: con.cfg_set(k, "deadbeef svc.weekly"),
                            lambda k=key: con.cfg_set(k, "deadbeef svc.wifi.join literal")]
+        operations += [lambda: _legacy_join(con, "Field hub 1", 'literal "quotes" and \\ slash'),
+                       lambda: _legacy_join(con, "Field hub 1", "")]
         for operation in operations:
             try: operation()
             except ConsoleError: pass  # only response parsing fails; emitted command is captured
