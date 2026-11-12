@@ -254,3 +254,13 @@ Everything below went over MQTT and HTTPS; the board was not on USB.
 ![re-run reuses the verified folder](images/ambit-remote-flash/rerun-reuse.png)
 
 ![openJII: first trace after the remote flash](images/ambit-remote-flash/openjii-first-trace.png)
+
+### Attach-time update (2026-11-12, `2.12.0-bench.attach.1`)
+
+Same Ambyte, over MQTT only. With the verified 1.4.0 folder on the card, the AMBIT was
+reflashed to 1.3.0 remotely, which the gate sees exactly like an older AMBIT being
+plugged in. 20 s later the schedule's next steady-state run held the channel, the
+checker reported `updating fw=1.3.0 target=1.4.0`, and 29 s after that `updated`.
+`ambit-versions` read 1.4.0, and the next trace reached openJII at 10:52 UTC.
+
+![attach-time update](images/ambit-remote-flash/attach-update.png)
