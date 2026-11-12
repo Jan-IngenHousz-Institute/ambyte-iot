@@ -298,7 +298,9 @@ class OpenJIIClient:
             raise OpenJIIError(
                 f"{serial} is already registered on openJII by an account "
                 "whose devices you cannot see (typically someone's personal "
-                "workspace). Ask its owner to delete it or share it with "
+                "workspace). To change only Wi-Fi, use Wi-Fi settings (USB); "
+                "it needs no openJII registration or sign-in. For cloud onboarding, "
+                "ask its owner to delete it or share it with "
                 f"you, then retry: {self._error_text(payload)}")
         raise OpenJIIError(f"registering {serial} failed ({status}): "
                            f"{self._error_text(payload)}")

@@ -46,8 +46,12 @@ class PlainConsole(ProtocolError):
 
 
 class ServiceError(ServiceClientError):
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, result: dict | None = None):
         self.reason = reason
+        # Terminal-operation failures may carry the already validated,
+        # nonsecret result, so consumers can explain rollback/retry evidence.
+        # Admission/protocol failures have no terminal result to report.
+        self.result = result
         super().__init__(f"Device service: {reason}.")
 
 

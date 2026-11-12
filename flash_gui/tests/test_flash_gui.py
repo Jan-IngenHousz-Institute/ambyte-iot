@@ -381,9 +381,10 @@ def test_register_conflict_with_invisible_device_says_who_holds_it(
         ("POST", "/api/v1/devices"): (409, {"message": "already registered"}),
     })
 
-    with pytest.raises(OpenJIIError, match="cannot see"):
+    with pytest.raises(OpenJIIError, match="cannot see") as error:
         client.provision_device(MAC, None, organization_id="org-jii",
                                 log=lambda _m: None)
+    assert "Wi-Fi settings (USB)" in str(error.value)
 
 
 def test_existing_device_in_other_org_is_reused_with_warning(monkeypatch, tmp_path):
