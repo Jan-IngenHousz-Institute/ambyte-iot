@@ -43,7 +43,7 @@ class LightCleanupTest(unittest.TestCase):
                      function(commands, "cmd_ambit_actinic")]
         extracted += [function(actions, name) for name in (
             "sched_runner_cleanup_lights", "step_input", "channels_mask",
-            "ch_present", "act_fail", "act_sleep_ms", "find_protocol", "act_ambit_trace")]
+            "ch_ping", "ch_gate", "act_fail", "act_sleep_ms", "find_protocol", "act_ambit_trace")]
         declarations = "\n".join(line for line in actions.splitlines() if
             line.startswith(("#define POLL_", "#define TRACE_", "static bool s_persist_attempted;",
                              "static ambit_trace_pending_t s_pend[")))

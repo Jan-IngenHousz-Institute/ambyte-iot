@@ -48,11 +48,14 @@ typedef struct { unsigned op,channel; char id[8]; } ambit_ota_req_t;
 #define AMBIT_OP_VERSIONS 1
 #define AMBIT_OP_PROBE 2
 #define AMBIT_OP_FLASH 3
+#define AMBIT_OP_ATTACH 4
 static struct { bool (*maintenance_begin)(void); void (*maintenance_end)(void); } ambit_cfg;
 static void ambit_do_versions(const char *id) { (void)id; guarded_op(); }
 static void ambit_do_probe(const ambit_ota_req_t *r) { (void)r; guarded_op(); }
 static void ambit_do_flash(const ambit_ota_req_t *r) { (void)r; guarded_op(); }
 static void ambit_do_ota(const ambit_ota_req_t *r) { (void)r; guarded_op(); }
+static void ambit_do_attach(void) { guarded_op(); }
+static void ambit_attach_gate_checker_done(void) {}
 static void report_busy(const ambit_ota_req_t *r) { (void)r; assert(0); }
 #include "worker-production.inc"
 static maint_job_t queue[4];

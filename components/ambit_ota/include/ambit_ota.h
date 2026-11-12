@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -121,6 +122,12 @@ esp_err_t ambit_ota_request_probe(uint8_t channel, const char *id);
  * Non-https URLs or URLs ≥ 256 chars are ESP_ERR_INVALID_ARG. */
 esp_err_t ambit_ota_request_flash(uint8_t channel, const char *version, const char *id,
                                   const char *manifest_url);
+
+/* Queue an attach-time firmware check of every channel the schedule is holding
+ * (ambit_attach_gate.h): clears up-to-date AMBITs and flashes out-of-date ones to
+ * the SD target when power allows. Registered as the gate's kick; returns false
+ * when it could not be queued (the gate retries on its next call). */
+bool ambit_ota_request_attach_check(void);
 
 #ifdef __cplusplus
 }
