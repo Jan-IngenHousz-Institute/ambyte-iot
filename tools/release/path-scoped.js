@@ -6,7 +6,7 @@
  * pattern. The repository has two independent release units without forcing a
  * disruptive firmware-directory move:
  *
- *   repository root -> firmware, every tracked path except schedule/**
+ *   repository root -> firmware, except schedule and unreleased host paths
  *   schedule/       -> field schedule, only schedule/**
  *
  * Filtering both analysis and release-note steps matters. Merely skipping the
@@ -29,10 +29,17 @@ const releaseUnit = () => {
 
 const normalized = (file) => file.split(path.sep).join("/");
 
+export const isHostTestFile = (file) => {
+  const candidate = normalized(file);
+  return candidate === "tests" || candidate.startsWith("tests/");
+};
+
 // Paths that belong to NO release unit: the desktop flash GUI and its build
-// workflow are host-side tooling. A feat/fix there must not bump or rebuild
-// firmware any more than a schedule-only commit may.
+// workflow, and host tests. Tests still require the firmware validation build
+// (pr-build-scope.js), but test-only fixes/perf must not publish a new device
+// image. Filter analysis AND notes so a later release cannot pick them up.
 const isUnreleased = (candidate) =>
+  isHostTestFile(candidate) ||
   candidate === "flash_gui" ||
   candidate.startsWith("flash_gui/") ||
   candidate === ".github/workflows/flash-gui-build.yml";

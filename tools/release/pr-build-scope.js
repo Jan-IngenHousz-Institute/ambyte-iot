@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { pathToFileURL } from "node:url";
-import { isRelevantFile } from "./path-scoped.js";
+import { isHostTestFile, isRelevantFile } from "./path-scoped.js";
 
 export const firmwareBuildRequired = (files) =>
-  files.length === 0 || files.some((file) => isRelevantFile(file, "firmware"));
+  // Host-test changes still exercise the native build and release checks even
+  // though they do not change the device image's release version.
+  files.length === 0 || files.some((file) => isHostTestFile(file) || isRelevantFile(file, "firmware"));
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   let input = "";

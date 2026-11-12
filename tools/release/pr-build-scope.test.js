@@ -35,3 +35,13 @@ test("any non-schedule path retains the firmware build gate", () => {
   assert.equal(firmwareBuildRequired(["components/old.c", "schedule/old.yaml"]), true);
   assert.equal(firmwareBuildRequired([]), true);
 });
+
+test("host-test changes retain firmware validation without requiring a release", () => {
+  assert.equal(firmwareBuildRequired(["tests/test_evq_storage.py"]), true);
+  assert.equal(firmwareBuildRequired(["tests/svc_host/runtime_driver.c"]), true);
+  assert.equal(firmwareBuildRequired(["tests"]), true);
+  assert.equal(
+    firmwareBuildRequired(["schedule/default.yaml", "flash_gui/gui.py", "tests/test_evq_storage.py"]),
+    true,
+  );
+});

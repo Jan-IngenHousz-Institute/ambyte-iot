@@ -29,3 +29,15 @@ test("the flash GUI belongs to no release unit", () => {
   // Not to be confused with on-device flash paths.
   assert.equal(isRelevantFile("components/ambit_flash/ambit_flash.c", "firmware"), true);
 });
+
+test("host tests belong to no release unit, but production paths still do", () => {
+  for (const file of ["tests", "tests/test_evq_storage.py", "tests/svc_host/runtime_driver.c"]) {
+    assert.equal(isRelevantFile(file, "firmware"), false, file);
+    assert.equal(isRelevantFile(file, "schedule"), false, file);
+  }
+  // The exclusion is anchored at the repository's host-test directory.
+  assert.equal(isRelevantFile("tests-old/driver.c", "firmware"), true);
+  assert.equal(isRelevantFile("components/event_log/tests/driver.c", "firmware"), true);
+  assert.equal(isRelevantFile("components/event_log/event_log.c", "firmware"), true);
+  assert.equal(isRelevantFile("tools/release/path-scoped.js", "firmware"), true);
+});
