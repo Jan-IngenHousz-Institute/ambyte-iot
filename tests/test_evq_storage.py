@@ -29,7 +29,9 @@ RESULTS: dict = {}
 def setUpModule() -> None:
     R._prebuild()
     tasks = [(n, s) for n in NAMES for s in SEEDS]
-    jobs = max(1, (os.cpu_count() or 2) - 2)
+    # This pool is the only active test work during module setup. Reserving two
+    # CPUs leaves small CI runners half idle; each task has its own scratch dir.
+    jobs = max(1, os.cpu_count() or 2)
     with cf.ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("fork")) as ex:
         for r in ex.map(R._one, *zip(*tasks)):
             RESULTS[(r["name"], r["seed"])] = r

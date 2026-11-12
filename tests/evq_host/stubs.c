@@ -245,8 +245,12 @@ esp_err_t nvs_commit(nvs_handle_t h)
         for (size_t k = 0; k < s_nvs[i].len; k++) fprintf(f, "%02x", s_nvs[i].val[k]);
         fputc('\n', f);
     }
+    /* Our persistent medium is the host page cache: simulated crashes kill
+     * the driver process, not the runner machine. Flush/close + atomic rename
+     * still commit every NVS key together and survive _exit(). A real fsync
+     * here only waits for the runner's disk (thousands of times per scenario);
+     * flash/SD power-loss durability is modeled separately by the shim journal. */
     fflush(f);
-    fsync(fileno(f));
     fclose(f);
     esp_err_t rc = rename("nvs.txt.tmp", "nvs.txt") == 0 ? ESP_OK : ESP_FAIL;
     if (rc == ESP_OK) nvs_note_cursor("commit");
