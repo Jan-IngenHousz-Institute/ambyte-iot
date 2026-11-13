@@ -83,9 +83,18 @@ bool power_gate_step(power_gate_t *g, power_read_reason_t reason, const power_re
  * production rule itself. Never make it return false on a power reading. */
 bool power_publish_ok(const power_gate_t *g);
 
-/* AMBIT flashing: latest read valid with input present AND the frame changed
- * within POWER_FLASH_FRESH_WINDOW valid reads. Everything else refuses. */
+/* AMBIT flashing: latest read valid with input present AND, since the last
+ * reset, two CONSECUTIVE present frames with different ADC values (within
+ * POWER_FLASH_FRESH_WINDOW present reads). Any valid-absent, no_input or
+ * invalid read resets the evidence. Everything else refuses. */
 bool power_gate_flash_ok(const power_gate_t *g);
+
+/* Charger read cache: true when a new read is due at `now_ms`. Callers pass a
+ * MONOTONIC clock (esp_timer). Defensively, any backwards step is also "due",
+ * so a clock that jumps back can never freeze the cached power state (and with
+ * it AMBIT flash evidence) until the old time is reached again. last_ms 0 =
+ * never read. */
+bool power_refresh_due(int64_t last_ms, int64_t now_ms, int64_t interval_ms);
 
 /* True when two readings carry the same ADC frame (the five measured values). */
 bool power_frame_same(const power_reading_t *a, const power_reading_t *b);

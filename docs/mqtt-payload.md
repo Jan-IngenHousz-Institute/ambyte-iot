@@ -41,7 +41,9 @@ compiled app version. For older STATUS health stored in `data`, see §11.1.
 The declarative schedule runner measures and stores events through its fixed
 action catalog into the append-log event store; the `sync_runner` background task is the sole
 publisher and drains the store when MQTT is connected, no UART measurement is
-in progress, the external-power gate is open, and the clock is valid
+in progress, the power gate is open (always, while a charger is fitted, since
+2026-11-13: a charger reading never holds data back; see
+[power-telemetry.md](power-telemetry.md)), and the clock is valid
 (≥ 2024-01-01 UTC). One stored event (one `measure_id`) becomes exactly one
 MQTT message, FIFO. QoS 1, retain 0, publish window of 16 slots / 64 KiB
 outstanding; delivery is **at-least-once** and the cloud does not dedupe —

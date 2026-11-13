@@ -68,7 +68,7 @@ class PowerPolicyHostTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     def test_every_scenario_passes_on_the_fix(self):
-        self.assertGreaterEqual(len(self.scenarios), 18)
+        self.assertGreaterEqual(len(self.scenarios), 19)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 r = subprocess.run([str(self.current), name], capture_output=True, text=True)
@@ -101,6 +101,14 @@ class PowerWiringContractTest(unittest.TestCase):
         fn = fn[:fn.index("\n}\n")]
         self.assertIn("return true;", fn)
         self.assertNotIn("return false", fn)
+
+    def test_power_cache_uses_the_monotonic_clock(self):
+        src = self.read("components/device_commands/device_commands.c")
+        body = src[src.index("static void power_state_refresh(void)"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("const int64_t now = mono_ms();", body)
+        self.assertIn("power_refresh_due(s_pub_gate_eval_ms, now, PUB_GATE_EVAL_INTERVAL_MS)", body)
+        self.assertNotIn("now_ms()", body)
 
     def test_flash_gate_refuses_without_a_charger_monitor(self):
         src = self.read("components/device_commands/device_commands.c")

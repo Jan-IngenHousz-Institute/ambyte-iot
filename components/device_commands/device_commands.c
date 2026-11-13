@@ -881,12 +881,15 @@ static void power_state_refresh(void)
         power_gate_init(&s_pub_gate);
         s_pub_gate_inited = true;
     }
-    const int64_t now = now_ms();
-    if (s_pub_gate_eval_ms != 0 &&
-        (now - s_pub_gate_eval_ms) < PUB_GATE_EVAL_INTERVAL_MS) {
+    /* MONOTONIC time for the cache and every age below: AMBIT attach and boot
+     * sync decide on this cached state, and a wall-clock step back (SNTP/RTC)
+     * must never freeze it - with the wall clock, a step back by 100 s skipped
+     * every read for 100 s while the cached flash evidence stayed valid. */
+    const int64_t now = mono_ms();
+    if (!power_refresh_due(s_pub_gate_eval_ms, now, PUB_GATE_EVAL_INTERVAL_MS)) {
         return;
     }
-    s_pub_gate_eval_ms = now;
+    s_pub_gate_eval_ms = now != 0 ? now : 1;
 
     power_reading_t p = {0};
     const esp_err_t err = s_cfg.read_power(&p);

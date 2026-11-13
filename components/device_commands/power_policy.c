@@ -20,6 +20,11 @@ const char *power_gate_reason_name(power_gate_reason_t r)
     return "starting";
 }
 
+bool power_refresh_due(int64_t last_ms, int64_t now_ms, int64_t interval_ms)
+{
+    return last_ms == 0 || now_ms < last_ms || (now_ms - last_ms) >= interval_ms;
+}
+
 bool power_frame_same(const power_reading_t *a, const power_reading_t *b)
 {
     return a->battery_mv == b->battery_mv && a->system_mv == b->system_mv &&
@@ -62,10 +67,23 @@ bool power_gate_step(power_gate_t *g, power_read_reason_t reason, const power_re
                                  : POWER_GATE_REASON_ON_BATTERY;
     g->last_ok_present = p->input_present;
 
-    /* Freshness for AMBIT flashing: a converting ADC jitters by LSBs between
-     * reads; a frozen register file repeats bit-identically. START falling
-     * cannot prove a conversion on this silicon (bench: low ~0.6 ms after the
-     * write either way), so a CHANGED frame is the only freshness evidence. */
+    if (!p->input_present) {
+        /* A valid "absent" frame is evidence AGAINST flashing: reset the chain
+         * exactly like no_input or an invalid read. Freshness gathered before
+         * the loss must not survive it (not even when only the input flag
+         * flipped and the five ADC values stayed identical). */
+        g->have_prev = false;
+        g->changed_recently = false;
+        g->same_streak = 0;
+        return g->reason != before;
+    }
+
+    /* Freshness for AMBIT flashing, among CONSECUTIVE present frames only and
+     * on the numeric ADC frame only (never the input_present flag): a
+     * converting ADC jitters by LSBs between reads; a frozen register file
+     * repeats bit-identically. START falling cannot prove a conversion on this
+     * silicon (bench: low ~0.6 ms after the write either way), so a CHANGED
+     * frame is the only freshness evidence. */
     if (g->have_prev && !power_frame_same(&g->prev, p)) {
         g->changed_recently = true;
         g->same_streak = 0;

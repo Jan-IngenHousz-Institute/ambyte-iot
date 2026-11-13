@@ -8,7 +8,7 @@ external power is present. Three firmware decisions run on those facts. Since
 | Consumer | Where | Rule |
 |---|---|---|
 | Publish gate | `device_commands_publish_power_ok` → `power_publish_ok` | **Never closes** while a charger is fitted, whatever the reading. The charger is still read every 5 s so the heartbeat can report the power state (`publish_gate_reason`) |
-| AMBIT flashing (boot sync, attach update) | `device_commands_flash_power_ok` → `power_gate_flash_ok` | **Fail-closed.** Allowed only on fresh, positive evidence of external power: the latest read is valid with input present, AND the ADC frame has changed within the last 6 valid reads. Refused on battery, on `no_input`, on any invalid read, on a frozen frame, and without a charger monitor (unless the build sets `AMBYTE_FLASH_WITHOUT_CHARGER`) |
+| AMBIT flashing (boot sync, attach update) | `device_commands_flash_power_ok` → `power_gate_flash_ok` | **Fail-closed.** Allowed only on fresh, positive evidence of external power: the latest read is valid with input present, AND two consecutive present frames had different ADC values (within the last 6 present reads). Any valid-absent, `no_input` or invalid read resets that evidence. Refused on battery, on `no_input`, on any invalid read, on a frozen frame, and without a charger monitor (unless the build sets `AMBYTE_FLASH_WITHOUT_CHARGER`) |
 | Low-battery SD park guard | `app_power_guard_task` → `power_guard_step`, every 15 s | Parks only on **fresh** evidence: 3 consecutive changing, valid frames below 3300 mV on battery. Un-parks at ≥ 3600 mV or external power (4 reads), or after 12 reads without evidence. In practice it cannot fire on this hardware (below) |
 
 Every heartbeat reports what the charger said and the observed power state:
@@ -192,10 +192,10 @@ A brownout mid-flash bricks an AMBIT, so flashing needs evidence of its own:
   `POWER_FLASH_FRESH_WINDOW` = 6 valid reads.
 
 Any `no_input`, invalid read or valid "absent" frame resets the evidence at
-once. After that, two fresh, differing frames are needed again. A frozen frame
-(bit-identical across reads) never qualifies, even when it says
-"charging, input present". A converting ADC jitters by an LSB or more between
-reads; the bench changed on nearly every read.
+once. After that, flashing needs at least two **consecutive** present frames
+whose **ADC values** differ. Freshness is computed on the five measured values
+only, never on the `input_present` flag, so a flag flip with identical numbers
+never re-qualifies a frame seen before the loss.
 
 Without a charger monitor (`read_power == NULL`) the gate refuses. A real unit
 whose charger failed its boot I2C probe looks exactly like a dev board without

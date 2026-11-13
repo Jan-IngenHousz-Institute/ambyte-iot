@@ -178,11 +178,16 @@ highest verified `/sdcard/ambit_fw/<ver>/` and, if older, updated.
   firmware string with the SD target. Current, newer (never downgraded), no target
   on the card, or a firmware string it cannot read: cleared at once, with no UART
   traffic and no pause in measurement.
-- **Update.** Older: if there is charger input, or the battery is at least 3.7 V
-  (the system rail stands in when the charger reports `battery_v=0`), measurement
+- **Update.** Older: only on fresh evidence of external power
+  (`device_commands_flash_power_ok`: the latest charger read valid with input
+  present, and two consecutive present frames with different ADC values), measurement
   and MQTT pause and the AMBIT is ROM-flashed to the target and verified. The new
-  firmware is then checked like any new identity, and cleared.
-- **Not enough power:** the channel stays held and is re-checked every 10 min.
+  firmware is then checked like any new identity, and cleared. Since 2026-11-13
+  there is no battery-only flashing (the former "battery at least 3.7 V" rule
+  judged a stale charger frame; see [power-telemetry.md](power-telemetry.md)).
+- **No verified external power** (on battery, charger unreadable or frozen, or no
+  charger monitor): the channel stays held and is re-checked every 10 min. A unit
+  without external power therefore never auto-flashes its AMBITs.
 - **SD card parked or missing:** the AMBIT is measured (a parked card must never stop
   measurement) and re-checked every 10 min.
 - **Repeated failure:** flashes share boot sync's per-channel cap of 3 attempts per

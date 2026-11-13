@@ -344,9 +344,71 @@ static void s_flash_needs_fresh_present(void)
     feed_ok(&g, false, 4);                                      /* 20 s */
     CHECK(!power_gate_flash_ok(&g), "refused at once on a valid absent frame");
     feed_ok(&g, true, 5);
-    CHECK(power_gate_flash_ok(&g), "present again with a changed frame");
+    CHECK(!power_gate_flash_ok(&g), "a valid absent frame reset the evidence: one "
+                                    "present frame after it is not enough");
+    feed_ok(&g, true, 6);
+    CHECK(power_gate_flash_ok(&g), "two consecutive differing present frames");
     (void)power_gate_step(&g, POWER_READ_NO_INPUT, NULL);
     CHECK(!power_gate_flash_ok(&g), "refused at once on no_input");
+
+    /* Codex (a6f6d5e): only input_present flips, the five ADC values stay
+     * identical. Freshness is the numeric frame only; pre-loss freshness must
+     * not survive. */
+    power_gate_init(&g);
+    power_reading_t a = { .battery_mv = 4180, .system_mv = 4300, .input_mv = 5100,
+                          .input_ma = 119, .input_present = true, .charge_status = 3 };
+    power_reading_t b = a; b.input_ma = 132;
+    (void)power_gate_step(&g, POWER_READ_OK, &a);
+    (void)power_gate_step(&g, POWER_READ_OK, &b);
+    CHECK(power_gate_flash_ok(&g), "fresh before the loss");
+    power_reading_t lost = b; lost.input_present = false;    /* same ADC values */
+    (void)power_gate_step(&g, POWER_READ_OK, &lost);
+    CHECK(!power_gate_flash_ok(&g), "flag-only loss refuses");
+    for (int i = 0; i < 10; i++) {
+        (void)power_gate_step(&g, POWER_READ_OK, &b);        /* identical values again */
+        CHECK(!power_gate_flash_ok(&g), "identical ADC frames after the loss never "
+                                        "re-qualify (%d)", i);
+    }
+    (void)power_gate_step(&g, POWER_READ_OK, &a);
+    CHECK(power_gate_flash_ok(&g), "a genuinely changed present frame re-qualifies");
+
+    /* Codex re-check: absent reads must RESET the chain, never seed it. Two
+     * differing valid-absent frames, then the first present frame: refused. */
+    power_gate_init(&g);
+    feed_ok(&g, false, 0);
+    feed_ok(&g, false, 1);
+    feed_ok(&g, true, 2);
+    CHECK(!power_gate_flash_ok(&g), "absent frames seeded the freshness chain");
+    feed_ok(&g, true, 3);
+    CHECK(power_gate_flash_ok(&g), "two consecutive present frames qualify");
+}
+
+static void s_flash_cache_survives_clock_step_back(void)
+{
+    /* device_commands.c re-reads the charger when power_refresh_due() says so.
+     * Codex: with a wall clock, qualify at t=100/105 s, an SNTP/RTC step sets
+     * the clock back to 5 s, the charger now reports NO_INPUT - and the cache
+     * skipped every read until the old time came back, keeping flash=1. The
+     * production cache uses the monotonic clock; power_refresh_due() also
+     * treats any backwards step as due. Replay the cache loop with a clock that
+     * steps back. */
+    power_gate_t g; power_gate_init(&g);
+    int64_t last = 0;
+    int reads = 0;
+    const int64_t clock[] = { 100000, 105000, 5000, 6000, 10000 };
+    for (size_t i = 0; i < sizeof clock / sizeof clock[0]; i++) {
+        if (!power_refresh_due(last, clock[i], 5000)) continue;
+        last = clock[i];
+        reads++;
+        if (i < 2) feed_ok(&g, true, (int)i);
+        else (void)power_gate_step(&g, POWER_READ_NO_INPUT, NULL);
+        if (i == 1) CHECK(power_gate_flash_ok(&g), "qualified at 105 s");
+        if (i == 2) CHECK(!power_gate_flash_ok(&g), "the read after the step back revokes flashing");
+    }
+    CHECK(reads >= 3, "a backwards clock step froze the charger cache (%d reads)", reads);
+    CHECK(!power_gate_flash_ok(&g), "flash evidence survived a clock step back");
+    CHECK(power_refresh_due(0, 0, 5000) && !power_refresh_due(1000, 3000, 5000) &&
+          power_refresh_due(1000, 6000, 5000) && power_refresh_due(1000, 999, 5000), "due rule");
 
     /* Codex B1 (b): an interrupted dwell - invalid samples are not evidence. */
     power_gate_init(&g);
@@ -527,6 +589,7 @@ int main(int argc, char **argv)
         {"eu_night", s_eu_night},
         {"flash_needs_fresh_present", s_flash_needs_fresh_present},
         {"flash_refuses_frozen_frame", s_flash_refuses_frozen_frame},
+        {"flash_cache_survives_clock_step_back", s_flash_cache_survives_clock_step_back},
         {"twilight_stale_frame", s_twilight_stale_frame},
         {"guard", s_guard},
         {"incident_allzero", s_incident_allzero},
