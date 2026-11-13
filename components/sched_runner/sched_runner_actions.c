@@ -717,9 +717,9 @@ static void jw_placeholder(sched_jw_t *w, const char *ph,
         time_sync_get_location(&lat, &lon, NULL);
         sched_jw_raw(w, "%.5f", strcmp(ph, "$lat") == 0 ? lat : lon);
     } else if (strcmp(ph, "$tz") == 0) {
-        char tz[48] = "";
-        (void)device_config_get_timezone(tz, sizeof(tz));
-        sched_jw_str(w, tz);
+        /* The zone in effect (derived from the location), not the configured
+         * fallback in NVS: the same name the envelope's `timezone` carries. */
+        sched_jw_str(w, timezone_current_name());
     } else if (strcmp(ph, "$boot_epoch") == 0) {
         sched_jw_raw(w, "%lld", (long long)ctx->boot_epoch);
     } else if (strcmp(ph, "$uptime_ms") == 0) {

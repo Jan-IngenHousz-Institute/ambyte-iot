@@ -21,7 +21,7 @@ HOST = ROOT / "tests/identity_host"
 CAPABILITIES = {
     "identity", "cfg.get", "cfg.set", "reboot", "schedule.status",
     "schedule.release", "schedule.begin", "schedule.put", "schedule.commit", "schedule.abort",
-    "svc", "sensors",
+    "svc", "sensors", "timezone.auto",
 }
 WORKBOOK = "11111111-2222-4333-8444-555555555555"
 
@@ -34,6 +34,10 @@ class IdentityTest(unittest.TestCase):
         includes = [HOST / "include", ROOT / "tests/host_stubs", ROOT / "tests/ota_host/include"]
         includes += list((ROOT / "components").glob("*/include"))
         includes += [ROOT / "components/sched_runner"]
+        # timezone_command.h (identity's location/timezone snapshot) names cJSON.
+        packages = Path(os.environ.get("PLATFORMIO_CORE_DIR", Path.home() / ".platformio")) / "packages"
+        sdk = packages / "framework-espidf@3.50500.0"
+        includes.append((sdk if sdk.exists() else packages / "framework-espidf") / "components/json/cJSON")
         # sched_runner includes its generated default even though these tests
         # never start a task or compile the embedded fixture.
         (cls.out / "default_yaml_embed.h").write_text(
@@ -93,7 +97,14 @@ class IdentityTest(unittest.TestCase):
         self.assertTrue(line.endswith(b"}"))
         self.assertTrue(all(c >= 32 for c in line))
         result = json.loads(line.decode("utf-8"))
-        self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities", "signed", "storage"})
+        self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities", "signed", "storage",
+                                       "location", "timezone"})
+        self.assertEqual(set(result["location"]), {"set", "source", "lat", "lon", "accuracy_m",
+                                                   "configured_stale", "solar_position", "configured", "live"})
+        self.assertEqual(set(result["location"]["configured"]), {"set", "lat", "lon"})
+        self.assertEqual(set(result["location"]["live"]), {"set", "lat", "lon", "accuracy_m", "age_s", "wifi_age_s", "source", "status"})
+        self.assertEqual(set(result["timezone"]), {"configured", "active", "source", "pinned", "resolved",
+                                                   "utc_offset_seconds"})
         self.assertIs(result["signed"], True)
         self.assertEqual(result["storage"], {"readable":[1],"written":1,"fallback":1})
         self.assertIs(type(result["contract"]), int)
@@ -113,6 +124,45 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(obj["schedule"], dict(source="INSTALLED", sha256="a" * 64,
                         workbookVersionId=WORKBOOK, script_version="schedule-v1.2.3"))
         self.assertEqual(self.response("template")["thing_name"], "ambyte_02:00:00:00:00:01")
+
+    def test_location_and_timezone_contract(self):
+        # Frozen contract (docs/timezone-from-location.md): literal shapes.
+        obj = self.response("installed")
+        self.assertEqual(obj["location"], {
+            "set": False, "source": "none", "lat": None, "lon": None, "accuracy_m": None,
+            "configured_stale": False, "solar_position": "default",
+            "configured": {"set": False, "lat": None, "lon": None},
+            "live": {"set": False, "lat": None, "lon": None, "accuracy_m": None, "age_s": None,
+                     "wifi_age_s": None, "source": None, "status": "waiting"}})
+        self.assertEqual(obj["timezone"], {"configured": "Europe/Amsterdam", "active": "Europe/Amsterdam",
+                                           "source": "configured", "pinned": False, "resolved": None,
+                                           "utc_offset_seconds": 3600})
+        obj = self.response("tz_configured")
+        self.assertEqual(obj["location"]["source"], "configured")
+        self.assertEqual(obj["location"]["solar_position"], "location")
+        self.assertEqual((obj["location"]["lat"], obj["location"]["lon"]), (-25.3444, 131.0369))
+        self.assertIsNone(obj["location"]["accuracy_m"])
+        self.assertEqual(obj["timezone"], {"configured": "Europe/Berlin", "active": "Australia/Darwin",
+                                           "source": "location", "pinned": False,
+                                           "resolved": "Australia/Darwin", "utc_offset_seconds": 34200})
+        obj = self.response("tz_live_accepted")
+        self.assertEqual(obj["location"]["source"], "live")
+        self.assertEqual(obj["location"]["accuracy_m"], 50000)
+        self.assertEqual(obj["location"]["live"], {"set": True, "lat": -34.8545, "lon": 138.6471,
+                                                   "accuracy_m": 50000, "age_s": 120, "wifi_age_s": None,
+                                                   "source": "ip", "status": "ok"})
+        self.assertEqual(self.response("tz_live_rejected")["location"]["live"]["status"], "rejected_404")
+        obj = self.response("tz_same_country")
+        self.assertEqual((obj["location"]["source"], obj["location"]["live"]["set"]), ("configured", True))
+        obj = self.response("tz_configured_stale")
+        self.assertEqual((obj["location"]["source"], obj["location"]["configured_stale"]), ("live", True))
+        self.assertEqual(obj["location"]["live"]["source"], "wifi")
+        obj = self.response("tz_pinned")
+        self.assertEqual((obj["timezone"]["source"], obj["timezone"]["pinned"], obj["timezone"]["active"]),
+                         ("manual", True, "Europe/Berlin"))
+        obj = self.response("tz_unset")
+        self.assertEqual((obj["timezone"]["configured"], obj["timezone"]["active"], obj["timezone"]["source"]),
+                         (None, None, "none"))
 
     def test_sources_and_unavailable_snapshots(self):
         self.assertEqual(self.response("none")["schedule"], dict(source="NONE", sha256=None,
@@ -153,6 +203,8 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(obj["fw"], "\x02" * 31)
         self.assertEqual(obj["schedule"]["workbookVersionId"], "\x03" * 63)
         self.assertEqual(obj["schedule"]["script_version"], "\x04" * 31)
+        self.assertEqual(obj["timezone"]["resolved"], "A" + "a" * 46)
+        self.assertEqual(obj["location"]["live"]["age_s"], 2591999)
 
     def test_prefix_separation_and_bad_arguments(self):
         for prefix in ("prompt", "log_tail"):

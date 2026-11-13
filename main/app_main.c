@@ -15,12 +15,16 @@
 #include "certs.h"
 #include "device_config.h"
 #include "timezone.h"
+#include "timezone_command.h"
 #include "bme280.h"
 #include "bench_diag.h"
 #include "command_router.h"
 #include "clock_trust.h"
 #include "ota_update.h"
 #include "iot_jobs.h"
+#include "location_aws.h"
+#include <math.h>
+#include "esp_http_client.h"
 #include "ambit_attach_gate.h"
 #include "ambit_ota.h"
 #include "ambit_flash.h"
@@ -120,6 +124,13 @@ void sntp_sync_time(struct timeval *tv)
     }
     sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
     clock_trust_note_sntp();
+    /* First trusted time of the boot: a persisted live location fix can now
+     * be aged (it may have expired while the clock was unknown). */
+    static bool s_tz_refreshed_on_trust;
+    if (!s_tz_refreshed_on_trust) {
+        s_tz_refreshed_on_trust = true;
+        timezone_command_refresh();
+    }
 
     /* Make the correction survive a reboot/power interruption. The RTC setter
      * is UTC-pure (no process-global TZ changes) and reads the calendar back;
@@ -411,6 +422,102 @@ static void app_sensors_wake(void)
      * bursts, and consume no slots in the four-job maintenance queue. */
     if (s_maint_task) xTaskNotifyGive(s_maint_task);
 }
+/* ── Live location helpers (components/command_router/location_aws.h) ── */
+
+/* Blocking Wi-Fi scan while associated, on the maintenance worker. The
+ * association stays up (the STA hops channels for ~2 s); records are only
+ * BSSID + RSSI, handed to AWS Device Location in this account. */
+static int app_wifi_scan(location_aws_ap_t *aps, int max)
+{
+    wifi_scan_config_t scan = { .show_hidden = false };
+    if (esp_wifi_scan_start(&scan, true) != ESP_OK) return 0;
+    uint16_t count = 0;
+    if (esp_wifi_scan_get_ap_num(&count) != ESP_OK || count == 0) {
+        esp_wifi_clear_ap_list();
+        return 0;
+    }
+    if (count > 20) count = 20;
+    wifi_ap_record_t *records = calloc(count, sizeof *records);
+    if (records == NULL) {
+        esp_wifi_clear_ap_list();
+        return 0;
+    }
+    int n = 0;
+    if (esp_wifi_scan_get_ap_records(&count, records) == ESP_OK) {
+        for (int i = 0; i < count && n < max; i++, n++) {
+            memcpy(aps[n].bssid, records[i].bssid, 6);
+            aps[n].rssi = records[i].rssi;
+        }
+    }
+    free(records);
+    return n;
+}
+
+/* The device's PUBLIC IP (its CGNAT egress), which AWS's IP solver needs and
+ * does not take from the MQTT connection. Plain HTTP on purpose: this board
+ * cannot hold a second TLS session beside MQTT. An on-path attacker can
+ * therefore substitute any public IP and steer the IP estimate anywhere.
+ * What that can do is bounded by device_location: an IP-derived estimate
+ * never overrides a configured location (it can only flag it stale), and
+ * with no configured location it takes effect only after 2 agreeing answers
+ * an hour apart -- so a sustained spoof can still set the zone and sun
+ * position of a unit that has no configured coordinates. Wi-Fi is tried
+ * first. No redirects, 4 s, at most 63 bytes read; location_aws validates
+ * the answer as a public literal. */
+static bool app_public_ip(char *out, size_t len)
+{
+    esp_http_client_config_t cfg = {
+        .url = "http://checkip.amazonaws.com/",
+        .timeout_ms = 4000,
+        .disable_auto_redirect = true,
+        .buffer_size = 512,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c == NULL) return false;
+    bool ok = false;
+    if (esp_http_client_open(c, 0) == ESP_OK && esp_http_client_fetch_headers(c) >= 0 &&
+        esp_http_client_get_status_code(c) == 200) {
+        int n = esp_http_client_read(c, out, (int)len - 1);
+        if (n > 0) {
+            out[n] = '\0';
+            ok = true;
+        }
+    }
+    esp_http_client_cleanup(c);
+    return ok;
+}
+
+static void app_tz_refresh(void *arg)
+{
+    (void)arg;
+    timezone_command_refresh();
+}
+
+/* STATUS `location` group: effective location, its source, and why the
+ * timezone is what it is (timezone_command_status). Heartbeat task only. */
+static void app_location_report(device_commands_location_t *out)
+{
+    timezone_status_t st;
+    timezone_command_status(&st);
+    bool set = st.location.source != DEVICE_LOCATION_NONE;
+    *out = (device_commands_location_t){
+        .valid = true,
+        .source = device_location_source_name(st.location.source),
+        .has_coords = set,
+        .lat = st.location.lat,
+        .lon = st.location.lon,
+        .has_accuracy = set && isfinite(st.location.accuracy_m),
+        .accuracy_m = st.location.accuracy_m,
+        .configured_stale = st.location.configured_stale,
+        .live_source = st.live_set ? device_location_live_source_name(st.live.live_source) : NULL,
+        .live_wifi_age_s = st.live_set ? st.live.wifi_age_s : -1,
+        .solar_position = st.solar_position,
+        .timezone_source = st.source,
+        .pinned = st.pinned,
+    };
+    snprintf(out->live_status, sizeof out->live_status, "%s", st.live_status);
+}
+
 static void app_maint_worker(void *arg)
 {
     (void)arg;
@@ -604,7 +711,15 @@ static esp_err_t app_init_i2c_and_sensors(void)
     if (device_config_get_timezone(tz, sizeof(tz)) != ESP_OK) {
         tz[0] = '\0';
     }
-    timezone_apply(tz);
+    esp_err_t tz_err = timezone_apply(tz);
+    if (tz_err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "timezone '%s' not applied: %s", tz, esp_err_to_name(tz_err));
+    }
+    /* A unit preset elsewhere (the provisioning laptop's zone) corrects itself
+     * from its persisted deployment coordinates before the first scheduling
+     * decision; an operator's manual choice is kept. No coordinates, (0,0) or
+     * open ocean change nothing. docs/timezone-from-location.md. */
+    timezone_command_reconcile_boot();
 
     err = bme280_init(BME280_I2C_ADDR_SECONDARY);
     if (err != ESP_OK) {
@@ -1277,6 +1392,37 @@ void app_main(void)
         if (err != ESP_OK) {
             ESP_LOGW(APP_TAG, "IoT Jobs listener not started: %s", esp_err_to_name(err));
         }
+
+        /* Live location (timezone from location): AWS IoT Device Location
+         * on reserved topics of this same connection. Inert until the
+         * device-location policy grants its reply topics (location_aws.h). */
+        location_aws_config_t loc_cfg = {
+            .thing_name        = mqtt_client_id,
+            .publish           = mqtt_client_get_publish_fn(),
+            .add_subscription  = mqtt_client_get_add_subscription_fn(),
+            .connection_stats  = mqtt_client_get_connection_stats_fn(),
+            .submit            = app_maint_submit_legacy,
+            .maintenance_begin = app_maintenance_begin,
+            .maintenance_end   = app_maintenance_end,
+            .wifi_scan         = app_wifi_scan,
+            .public_ip         = app_public_ip,
+        };
+        err = location_aws_init(&loc_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(APP_TAG, "live location not started: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* Re-derive zone and sun position every 6 h: a live fix ageing past its
+     * 30 days, or `loc_live off`, changes the effective location without any
+     * other input. Worker job, silent unless something changes. */
+    {
+        static esp_timer_handle_t s_tz_refresh;
+        const esp_timer_create_args_t args = {
+            .callback = app_tz_refresh, .name = "tz_refresh" };
+        if (esp_timer_create(&args, &s_tz_refresh) == ESP_OK) {
+            esp_timer_start_periodic(s_tz_refresh, 6ULL * 3600ULL * 1000000ULL);
+        }
     }
 
     /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered
@@ -1540,6 +1686,7 @@ void app_main(void)
         .timezone               = timezone,
         .current_timezone       = timezone_current_name,
         .timezone_snapshot      = timezone_snapshot,
+        .location_report        = app_location_report,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,

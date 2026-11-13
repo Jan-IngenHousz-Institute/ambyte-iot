@@ -478,6 +478,7 @@ typedef struct {
     int64_t                anchor_wall_utc;
     int64_t                anchor_mono_us;
     int32_t                anchor_offset_s;
+    uint32_t               anchor_position_gen; /* time_sync position generation */
     sched_due_job_t        jobs[SCHED_SPEC_MAX_JOBS];
 } sched_due_t;
 

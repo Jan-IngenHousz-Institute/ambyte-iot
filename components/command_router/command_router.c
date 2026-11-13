@@ -484,19 +484,38 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         const cJSON *jdeployment = cJSON_GetObjectItemCaseSensitive(root, "deployment");
         const char *deployment = cJSON_IsString(jdeployment) ? jdeployment->valuestring : NULL;
         esp_err_t err = ESP_ERR_INVALID_ARG;
+        const char *tz_action = "location_not_saved";
+        /* One timezone decision (made after the save below) serves the
+         * position, the dispatch and this reply; none when not saved. */
+        timezone_status_t tz;
+        bool tz_known = false;
         if (cJSON_IsNumber(jlat) && cJSON_IsNumber(jlon) &&
             isfinite(jlat->valuedouble) && isfinite(jlon->valuedouble) &&
             jlat->valuedouble >= -90.0 && jlat->valuedouble <= 90.0 &&
             jlon->valuedouble >= -180.0 && jlon->valuedouble <= 180.0 &&
             (jdeployment == NULL || cJSON_IsString(jdeployment))) {
+            /* Compared BEFORE the write: a retained/duplicate set_location
+             * replays the same coordinates on every reconnect and must not
+             * release an operator's manual timezone pin. */
+            bool changed = timezone_command_location_differs(jlat->valuedouble,
+                                                             jlon->valuedouble);
             err = device_config_set_location(jlat->valuedouble,
                                              jlon->valuedouble,
                                              deployment);
             if (err == ESP_OK) {
-                time_sync_set_position(jlat->valuedouble, jlon->valuedouble);
+                /* Zone AND sun-math position follow the effective location
+                 * (a live estimate in another country can still win), both
+                 * from the one decision in timezone_command. */
+                /* The device's own timezone follows its coordinates
+                 * (docs/timezone-from-location.md). Lookup only here; any
+                 * persist/apply runs on the maintenance worker, which
+                 * publishes a timezone_result with this id when done. */
+                tz_action = timezone_command_location_stored(id, changed, &tz);
+                tz_known = true;
             }
         }
-        ESP_LOGW(TAG, "set_location id=%s -> %s", id ? id : "", esp_err_to_name(err));
+        ESP_LOGW(TAG, "set_location id=%s -> %s (timezone: %s %s)", id ? id : "",
+                 esp_err_to_name(err), tz_action, tz_known ? tz.resolved : "");
         char applied_deployment[64] = "";
         (void)device_config_get_deployment(applied_deployment,
                                            sizeof(applied_deployment));
@@ -513,6 +532,15 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                     ? jlon->valuedouble : 0.0);
             cJSON_AddStringToObject(reply, "deployment", applied_deployment);
             cJSON_AddStringToObject(reply, "detail", esp_err_to_name(err));
+            /* Additive: the zone these coordinates resolve to, who owns the
+             * configured zone now, and what happens next ("queued" means a
+             * timezone_result with this id follows from the worker). */
+            if (!tz_known) timezone_command_status(&tz);   /* refusal path only */
+            cJSON_AddStringToObject(reply, "resolved_timezone", tz.resolved);
+            cJSON_AddStringToObject(reply, "timezone_source", tz.source);
+            cJSON_AddBoolToObject(reply, "pinned", tz.pinned);
+            cJSON_AddStringToObject(reply, "location_source", device_location_source_name(tz.location.source));
+            cJSON_AddStringToObject(reply, "timezone_action", tz_action);
             char *encoded = cJSON_PrintUnformatted(reply);
             if (encoded != NULL) {
                 publish_reply(encoded);

@@ -558,6 +558,20 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "last_wd_reboot_reason": ""
     },
     "clock": { "source": "rtc", "suspect": false },
+    "location": {
+      "source": "configured",
+      "lat": -25.344400,
+      "lon": 131.036900,
+      "accuracy_m": null,
+      "configured_stale": false,
+      "solar_position": "location",
+      "live_status": "ok",
+      "live_source": "ip",
+      "live_wifi_age_s": null,
+      "timezone": "Australia/Darwin",
+      "timezone_source": "location",
+      "pinned": false
+    },
     "software": {
       "firmware": "1.6.6",
       "script_sha256": "7c222fb2927d828af22f592134e8932480637c0d2d88184a5be625042c22a6cd",
@@ -645,6 +659,17 @@ non-negative integers.
 | | `last_wd_reboot_reason` | string | Persisted watchdog reboot reason, empty when none is known. |
 | `clock` | `source` | string enum | `clock_src`; `rtc`, `hwm` (persisted high-water mark), or `sntp`. Unknown future values are preserved. |
 | | `suspect` | boolean | `clock_suspect`; wall clock may be wrong. |
+| `location` | `source` | string enum | Effective location: `live` (AWS IoT Device Location estimate), `configured` (provisioned / `set_location`), `none`. See docs/timezone-from-location.md. `{}` when unavailable. |
+| | `lat`, `lon` | number, degrees (6 decimals) or null | Effective coordinates; null when `source` is `none`. Never the scheduler's compiled default. |
+| | `accuracy_m` | integer, m, or null | Live-estimate horizontal accuracy; null for configured coordinates. |
+| | `configured_stale` | boolean | The stored live fix is in another country than the configured location (the configured one may be a stale preset). Reported whether or not the live fix won. |
+| | `solar_position` | string enum | `location` (sunrise/sunset/solar triggers from the effective location) or `default` (compiled 52.173 N 5.819 E; no location known). |
+| | `live_status` | string | Last live-source outcome (`waiting`, `not_authorized`, `ok`, `candidate`, `rejected_<code>`, `no_reply`, `off`, ...); unknown values are preserved. |
+| | `live_source` | string enum or null | How the stored live fix was obtained: `wifi` or `ip`; null without a usable live fix. An `ip` fix never overrides configured coordinates. |
+| | `live_wifi_age_s` | integer, s, or null | Age of the last Wi-Fi-sourced estimate behind the stored live fix; null when there was none. A large value with a fresh fix means it is kept alive only by IP answers. Up to a week old after a reboot. |
+| | `timezone` | string | Zone in effect (same as the envelope `timezone`). |
+| | `timezone_source` | string enum | Why: `manual` (pinned), `location`, `configured` (fallback zone), `none`. |
+| | `pinned` | boolean | An explicit timezone pin overrides the location. |
 | `software` | `firmware` | string | `app_version`; running Ambyte firmware version. |
 | | `script_sha256` | 64-char lowercase hex string | Digest of the active schedule file. |
 | | `script_version` | string | Independently released schedule version. |

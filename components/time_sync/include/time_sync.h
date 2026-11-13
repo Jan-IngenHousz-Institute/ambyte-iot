@@ -28,6 +28,11 @@ enum {
     TIME_SYNC_SUNSET  = 1,
 };
 
+/* Compiled sun-math position used while the device knows no location
+ * (Wageningen). Reported as solar_position "default", never as a location. */
+#define TIME_SYNC_DEFAULT_LAT 52.173
+#define TIME_SYNC_DEFAULT_LON 5.819
+
 /* Location / timezone. Defaults: 52.173 N, 5.819 E, tz = +2 (NL summer / CEST).
  * tz_offset_hours = whole hours the local clock is ahead of UTC (CEST=2, CET=1,
  * UTC=0). Sets both the sunrise/sunset shift AND the offset callers use to
@@ -37,6 +42,13 @@ void time_sync_set_location(double lat, double lon, int tz_offset_hours);
  * the legacy whole-hour getter would turn Darwin +09:30 into +09:00. */
 void time_sync_set_position(double lat, double lon);
 void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours);
+/* Bumped whenever set_position/set_location actually moves the position, so
+ * the schedule model can re-resolve armed solar dues (sched_due): sunrise and
+ * sunset depend on WHERE the device is, not on its timezone. */
+uint32_t time_sync_position_generation(void);
+/* Position and its generation in one consistent snapshot (any out-pointer
+ * may be NULL). */
+void time_sync_get_position(double *lat, double *lon, uint32_t *generation);
 
 /* Set/get the local-minus-UTC offset in seconds — the DST-aware value normally
  * owned by components/timezone. Finer-grained than set_location()'s whole hours

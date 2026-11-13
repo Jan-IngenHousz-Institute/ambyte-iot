@@ -293,16 +293,26 @@ static void compile_embedded_or_die(void)
 static void apply_location_from_config(void)
 {
     double lat, lon;
+    /* Only the deployment tag is taken from config here. The sun-math
+     * POSITION is owned by timezone_command (effective location: live
+     * estimate or configured coordinates, or the compiled default) and was
+     * applied at boot before this runner starts; writing configured
+     * coordinates here would clobber a live position on every reload. */
     if (device_config_get_location(&lat, &lon, s_act_ctx.deployment,
-                                   sizeof(s_act_ctx.deployment)) == ESP_OK) {
-        time_sync_set_position(lat, lon); /* preserve half-hour / DST offsets */
-        ESP_LOGI(TAG, "location from device_config: lat=%.5f lon=%.5f", lat, lon);
-    } else if (!s_loc_warned) {
-        /* One WARN per boot: sun triggers
-         * and windows fall back to time_sync's compiled NL default. */
-        ESP_LOGW(TAG, "no lat/lon in device_config — sun triggers use the "
-                      "compiled default (52.173N 5.819E)");
-        s_loc_warned = true;
+                                   sizeof(s_act_ctx.deployment)) != ESP_OK) {
+        s_act_ctx.deployment[0] = '\0';
+    }
+    time_sync_get_location(&lat, &lon, NULL);
+    if (lat == TIME_SYNC_DEFAULT_LAT && lon == TIME_SYNC_DEFAULT_LON) {
+        if (!s_loc_warned) {
+            /* One WARN per boot: sun triggers and windows use the compiled
+             * default until a location is known. */
+            ESP_LOGW(TAG, "no location yet: sun triggers use the compiled default "
+                          "(%.3fN %.3fE)", TIME_SYNC_DEFAULT_LAT, TIME_SYNC_DEFAULT_LON);
+            s_loc_warned = true;
+        }
+    } else {
+        ESP_LOGI(TAG, "sun position lat=%.5f lon=%.5f", lat, lon);
     }
 }
 

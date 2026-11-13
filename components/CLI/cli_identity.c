@@ -13,6 +13,10 @@
 #include "sched_runner.h"
 #include "script_update.h"
 #include "ota_identity.h"
+#include "timezone.h"
+#include "timezone_command.h"
+#include <math.h>
+#include <time.h>
 
 static const char *s_thing_name;
 
@@ -23,9 +27,11 @@ void cli_set_thing_name(const char *thing_name)
 
 typedef struct {
     /* At most 6 bytes per escaped character: MAC 17, client id 63, compiled
-     * fw 31, workbook 63, release version 31, plus fixed keys/tokens and SHA.
+     * fw 31, workbook 63, release version 31, plus fixed keys/tokens and SHA,
+     * plus the location/timezone tail (three <=47-char zone names; the
+     * worst case is pinned by the maximum_escaping host scenario).
      * Keep the whole record off the heap and below the console's 12 KiB stack. */
-    char data[2048];
+    char data[3072];
     size_t len;
     bool overflow;
 } identity_json_t;
@@ -150,6 +156,77 @@ static void json_schedule(identity_json_t *w)
     json_raw(w, "}");
 }
 
+/* Location + timezone provenance (additive since the location resolver;
+ * docs/timezone-from-location.md). `location` is the EFFECTIVE location with
+ * its source; `configured` is the persisted fallback and `live` the online
+ * estimate, both always shown so a tool can tell real deployment
+ * coordinates from defaults. time_sync's compiled 52.173N 5.819E sun-math
+ * default is never reported as a location. */
+static void json_number_or_null(identity_json_t *w, const char *key, bool set, double v, const char *fmt)
+{
+    char buf[48];
+    json_raw(w, key);
+    if (set && isfinite(v)) {
+        snprintf(buf, sizeof buf, fmt, v);
+        json_raw(w, buf);
+    } else {
+        json_raw(w, "null");
+    }
+}
+
+static void json_location_and_timezone(identity_json_t *w)
+{
+    timezone_status_t st;
+    timezone_command_status(&st);
+    bool set = st.location.source != DEVICE_LOCATION_NONE;
+    char buf[64];
+
+    json_raw(w, ",\"location\":{\"set\":");
+    json_raw(w, set ? "true" : "false");
+    json_raw(w, ",\"source\":");
+    json_string(w, device_location_source_name(st.location.source));
+    json_number_or_null(w, ",\"lat\":", set, st.location.lat, "%.6f");
+    json_number_or_null(w, ",\"lon\":", set, st.location.lon, "%.6f");
+    json_number_or_null(w, ",\"accuracy_m\":", set, st.location.accuracy_m, "%.0f");
+    json_raw(w, ",\"configured_stale\":");
+    json_raw(w, st.location.configured_stale ? "true" : "false");
+    json_raw(w, ",\"solar_position\":");
+    json_string(w, st.solar_position);
+    json_raw(w, ",\"configured\":{\"set\":");
+    json_raw(w, st.configured_set ? "true" : "false");
+    json_number_or_null(w, ",\"lat\":", st.configured_set, st.configured_lat, "%.6f");
+    json_number_or_null(w, ",\"lon\":", st.configured_set, st.configured_lon, "%.6f");
+    json_raw(w, "},\"live\":{\"set\":");
+    json_raw(w, st.live_set ? "true" : "false");
+    json_number_or_null(w, ",\"lat\":", st.live_set, st.live.lat, "%.6f");
+    json_number_or_null(w, ",\"lon\":", st.live_set, st.live.lon, "%.6f");
+    json_number_or_null(w, ",\"accuracy_m\":", st.live_set, st.live.accuracy_m, "%.0f");
+    json_number_or_null(w, ",\"age_s\":", st.live_set && st.live.age_s >= 0, (double)st.live.age_s, "%.0f");
+    json_number_or_null(w, ",\"wifi_age_s\":", st.live_set && st.live.wifi_age_s >= 0,
+                        (double)st.live.wifi_age_s, "%.0f");
+    json_raw(w, ",\"source\":");
+    json_string(w, st.live_set ? device_location_live_source_name(st.live.live_source) : NULL);
+    json_raw(w, ",\"status\":");
+    json_string(w, st.live_status);
+    json_raw(w, "}}");
+
+    const char *active;
+    int32_t offset;
+    timezone_snapshot((int64_t)time(NULL), &active, &offset);
+    json_raw(w, ",\"timezone\":{\"configured\":");
+    json_string(w, st.configured);
+    json_raw(w, ",\"active\":");
+    json_string(w, active);
+    json_raw(w, ",\"source\":");
+    json_string(w, st.source);
+    json_raw(w, ",\"pinned\":");
+    json_raw(w, st.pinned ? "true" : "false");
+    json_raw(w, ",\"resolved\":");
+    json_string(w, st.resolved);
+    snprintf(buf, sizeof buf, ",\"utc_offset_seconds\":%ld}", (long)offset);
+    json_raw(w, buf);
+}
+
 int cli_cmd_identity(int argc, char **argv)
 {
     (void)argv;
@@ -167,9 +244,11 @@ int cli_cmd_identity(int argc, char **argv)
     json_string(&w, app != NULL ? app->version : NULL);
     json_raw(&w, ",\"contract\":1,\"schedule\":");
     json_schedule(&w);
+    json_location_and_timezone(&w);
     json_raw(&w, ",\"capabilities\":[\"identity\",\"cfg.get\",\"cfg.set\",\"reboot\","
                  "\"schedule.status\",\"schedule.release\",\"schedule.begin\","
-                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\",\"sensors\"]");
+                 "\"schedule.put\",\"schedule.commit\",\"schedule.abort\",\"svc\",\"sensors\","
+                 "\"timezone.auto\"]");
     char firmware_identity[192];
     if (!ota_running_identity_json(firmware_identity, sizeof firmware_identity)) return 1;
     json_raw(&w, ",");

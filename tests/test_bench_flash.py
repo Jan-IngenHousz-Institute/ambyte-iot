@@ -43,6 +43,7 @@ class BenchFlashTest(unittest.TestCase):
             def flash(*args,**kwargs):events.append("flash")
             with mock.patch.object(mod.subprocess,"run",side_effect=run) as calls, \
                  mock.patch.object(mod,"flash_layout",return_value=(images,{})), \
+                 mock.patch.object(mod,"validate_signed_build",side_effect=lambda b:events.append("validate")), \
                  mock.patch("serial.tools.list_ports.comports",return_value=[SimpleNamespace(device="/dev/ttyACM9",serial_number="AA:BB:CC:DD:EE:FF")]), \
                  mock.patch("flash_gui.esptool_ops.read_mac") as mac, \
                  mock.patch("flash_gui.esptool_ops.flash_images",side_effect=flash) as writer:
@@ -93,6 +94,37 @@ class BenchFlashTest(unittest.TestCase):
                 mod.main(["--port","/dev/ttyACM9","--provision"])
             mac.assert_not_called();writer.assert_not_called()
             self.assertEqual(len(calls.call_args_list),1)
+
+
+    def test_effective_config_is_validated_after_signing_before_the_port(self):
+        with self.tool() as (mod,calls,writer,mac,events,table):
+            self.assertEqual(mod.main(["--port","/dev/ttyACM9"]),0)
+            sign=next(i for i,c in enumerate(events) if isinstance(c,list) and any("sign_firmware.py" in str(a) for a in c))
+            self.assertLess(sign,events.index("validate"))
+            self.assertLess(events.index("validate"),events.index("flash"))
+
+
+class BenchFlashGuardTest(unittest.TestCase):
+    """The real upload guard refuses a dangerous effective sdkconfig before
+    esptool ever opens the port (review of #98: direct flash bypassed it)."""
+
+    def test_dangerous_config_refused_before_any_port_access(self):
+        mod = load()
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            (build / "config").mkdir()
+            from flash_gui.firmware_metadata import REQUIRED
+            good = {key: True for key in REQUIRED}
+            for bad in ({**good, "SECURE_DISABLE_ROM_DL_MODE": True},
+                        {k: v for k, v in good.items() if k != sorted(REQUIRED)[0]}):
+                (build / "config/sdkconfig.json").write_text(json.dumps(bad))
+                (build / "firmware.bin").write_bytes(b"irrelevant: config is checked first")
+                with mock.patch("flash_gui.esptool_ops.flash_images") as writer, \
+                     mock.patch("flash_gui.esptool_ops.read_mac") as mac:
+                    with self.assertRaisesRegex(RuntimeError, "UPLOAD REFUSED"):
+                        mod.validate_signed_build(build)
+                    writer.assert_not_called()
+                    mac.assert_not_called()
 
 
 class BenchFlashLayoutTest(unittest.TestCase):

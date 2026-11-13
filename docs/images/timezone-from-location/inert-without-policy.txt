@@ -1,0 +1,21 @@
+Bench 28:37:2F:FF:E7:04 - fw v2.16.0-7-g7344e3b - device-location policy detached - 2026-11-13
+# Test policy detached 09:26:43Z, re-attached 09:28:10Z.
+# This image still used the old one-dash id, which the re-encoded thing attribute no longer matched either:
+# both the missing policy and the attribute mismatch refuse it the same way.
+I (5967) loc_aws: device location via AWS as 'ambyte-28-37-2F-FF-E7-04' (waits for the policy grant)
+I (20797) mqtt_client: MQTT connected
+I (20817) mqtt_client: subscribing to $aws/device_location/ambyte-28-37-2F-FF-E7-04/get_position_estimate/accepted (msg_id=4)
+I (20817) mqtt_client: subscribing to $aws/device_location/ambyte-28-37-2F-FF-E7-04/get_position_estimate/rejected (msg_id=5)
+I (20827) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (20837) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 135
+W (20837) loc_aws: broker refused the device-location topics for 'ambyte-28-37-2F-FF-E7-04': no policy on this certificate, or no deviceLocationId attribute. Live location stays off; nothing is published.
+I (20847) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 135
+I (20867) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (20877) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+### 2026-11-13T10:28:05 > identity
+identity -> fw=v2.16.0-7-g7344e3b capabilities[-1]=timezone.auto
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":299,"status":"not_authorized"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+# The two 135s answer msg_id 4/5 (the device-location pair; the 1s are the status/jobs/command
+# subscriptions). 135 = 0x87 not authorized: SUBSCRIBE refused, no disconnect, nothing published on the request topic,
+# no reason-coded PUBACK anywhere in the session. The persisted live fix (age 299 s) survives the reboot.

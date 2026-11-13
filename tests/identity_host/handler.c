@@ -14,6 +14,9 @@
 #include "freertos/task.h"
 #include "sched_runner.h"
 #include "script_update.h"
+#include <math.h>
+#include "timezone.h"
+#include "timezone_command.h"
 
 static esp_app_desc_t app = { .version = "2.6.0-a2" };
 static const char *mac = "02:00:00:00:00:01";
@@ -31,6 +34,55 @@ const esp_app_desc_t *esp_app_get_description(void)
 }
 
 const char *device_commands_get_mac(void) { return mac; }
+
+/* Location / timezone provenance boundary (timezone_command_status). */
+static timezone_status_t tz_state;
+static const char *active_zone = "Europe/Amsterdam";
+static int32_t active_offset = 3600;
+void timezone_command_status(timezone_status_t *out) { *out = tz_state; }
+const char *device_location_source_name(device_location_source_t s)
+{
+    return s == DEVICE_LOCATION_LIVE ? "live" : s == DEVICE_LOCATION_CONFIGURED ? "configured" : "none";
+}
+const char *device_location_live_source_name(device_live_source_t s)
+{
+    return s == DEVICE_LIVE_SOURCE_WIFI ? "wifi" : s == DEVICE_LIVE_SOURCE_IP ? "ip" : NULL;
+}
+void timezone_snapshot(int64_t utc, const char **name, int32_t *offset)
+{
+    (void)utc;
+    *name = active_zone;
+    *offset = active_offset;
+}
+static void tz_defaults(void)
+{
+    memset(&tz_state, 0, sizeof tz_state);
+    tz_state.location = (device_location_t){DEVICE_LOCATION_NONE, 0, 0, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE, -1};
+    tz_state.live = tz_state.location;
+    strcpy(tz_state.configured, "Europe/Amsterdam");
+    tz_state.source = "configured";
+    strcpy(tz_state.live_status, "waiting");
+    tz_state.solar_position = "default";
+}
+static void tz_configured_uluru(void)
+{
+    tz_state.configured_set = true;
+    tz_state.configured_lat = -25.3444;
+    tz_state.configured_lon = 131.0369;
+    tz_state.location = (device_location_t){DEVICE_LOCATION_CONFIGURED, -25.3444, 131.0369, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE, -1};
+    tz_state.solar_position = "location";
+    strcpy(tz_state.configured, "Europe/Berlin");
+    strcpy(tz_state.resolved, "Australia/Darwin");
+    tz_state.source = "location";
+    active_zone = "Australia/Darwin";
+    active_offset = 34200;
+}
+static void tz_live_adelaide(void)
+{
+    tz_state.live_set = true;
+    tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -34.8545, 138.6471, 50000, 120, false, DEVICE_LIVE_SOURCE_IP, -1};
+    strcpy(tz_state.live_status, "ok");
+}
 size_t heap_caps_get_free_size(unsigned caps) { assert(caps == MALLOC_CAP_INTERNAL); return 32768; }
 size_t heap_caps_get_largest_free_block(unsigned caps) { assert(caps == MALLOC_CAP_INTERNAL); return 16384; }
 size_t heap_caps_get_minimum_free_size(unsigned caps) { assert(caps == MALLOC_CAP_INTERNAL); return 30000; }
@@ -104,6 +156,7 @@ int main(int argc, char **argv)
     strcpy(release.installed_on_fw, "2.5.0");
     release.release_metadata_verified = true;
     cli_set_thing_name("Field_MixedCase_7");
+    tz_defaults();
     if (!strcmp(scenario, "utf8_bytes")) {
         assert(argc == 3 && strlen(argv[2]) <= 62 && strlen(argv[2]) % 2 == 0);
         static char bytes[32];
@@ -116,6 +169,49 @@ int main(int argc, char **argv)
         strcpy(app.version, bytes);
         strcpy(loaded.workbook, bytes);
         strcpy(release.version, bytes);
+    } else if (!strcmp(scenario, "tz_configured")) {
+        tz_configured_uluru();
+    } else if (!strcmp(scenario, "tz_live_accepted")) {
+        /* No configured location; the live estimate drives the zone. */
+        tz_live_adelaide();
+        tz_state.solar_position = "location";
+        tz_state.location = tz_state.live;
+        strcpy(tz_state.configured, "Europe/Berlin");
+        strcpy(tz_state.resolved, "Australia/Adelaide");
+        tz_state.source = "location";
+        active_zone = "Australia/Adelaide";
+        active_offset = 37800;
+    } else if (!strcmp(scenario, "tz_live_rejected")) {
+        tz_configured_uluru();
+        strcpy(tz_state.live_status, "rejected_404");
+    } else if (!strcmp(scenario, "tz_same_country")) {
+        /* Configured Uluru wins over the in-country IP estimate (informational). */
+        tz_configured_uluru();
+        tz_live_adelaide();
+    } else if (!strcmp(scenario, "tz_configured_stale")) {
+        tz_live_adelaide();
+        tz_state.live.live_source = DEVICE_LIVE_SOURCE_WIFI;   /* only Wi-Fi overrides */
+        tz_state.solar_position = "location";
+        tz_state.configured_set = true;
+        tz_state.configured_lat = 52.3676;
+        tz_state.configured_lon = 4.9041;
+        tz_state.location = tz_state.live;
+        tz_state.location.configured_stale = true;
+        strcpy(tz_state.resolved, "Australia/Adelaide");
+        tz_state.source = "location";
+        active_zone = "Australia/Adelaide";
+        active_offset = 37800;
+    } else if (!strcmp(scenario, "tz_pinned")) {
+        tz_configured_uluru();
+        tz_state.pinned = true;
+        tz_state.source = "manual";
+        active_zone = "Europe/Berlin";
+        active_offset = 3600;
+    } else if (!strcmp(scenario, "tz_unset")) {
+        tz_state.configured[0] = '\0';
+        tz_state.source = "none";
+        active_zone = "";
+        active_offset = 7200;
     } else if (!strcmp(scenario, "none")) {
         memset(&loaded, 0, sizeof loaded);
     } else if (!strcmp(scenario, "template")) {
@@ -167,6 +263,20 @@ int main(int argc, char **argv)
         memset(app.version, 2, 31);
         memset(loaded.workbook, 3, 63);
         memset(release.version, 4, 31);
+        /* Longest location/timezone tail: 47-char names (the NVS cap),
+         * every coordinate set and widest, the longest live status. */
+        static const char longest[] = "Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        tz_state.configured_set = tz_state.live_set = true;
+        tz_state.configured_lat = tz_state.configured_lon = -179.999999;
+        tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -89.999999, -179.999999, 199999, 2591999, false, DEVICE_LIVE_SOURCE_WIFI, 2591999};
+        tz_state.location = tz_state.live;
+        tz_state.location.configured_stale = true;
+        strcpy(tz_state.configured, longest);
+        strcpy(tz_state.resolved, longest);
+        strcpy(tz_state.live_status, "not_authorized_xxxxxxxx");
+        tz_state.source = "configured";
+        active_zone = longest;
+        active_offset = -43200;
     } else if (!strcmp(scenario, "prompt")) {
         fputs("ambyte> ", stdout);
     } else if (!strcmp(scenario, "log_tail")) {

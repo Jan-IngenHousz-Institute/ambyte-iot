@@ -60,9 +60,18 @@ def build_message(args, req_id):
         return {"type": "get_timezone", "id": req_id}
     if args.cmd == "set-timezone":
         zone = args.timezone
+        pin = bool(getattr(args, "pin", False))
+        if zone == "auto":
+            # Releases a pin; the device follows its location again.
+            if pin:
+                raise SystemExit("--pin cannot be combined with --timezone auto")
+            return {"type": "set_timezone", "id": req_id, "timezone": "auto"}
         if not isinstance(zone, str) or len(zone) > 47 or not re.fullmatch(r"(?:[A-Za-z0-9_+-]+/)+[A-Za-z0-9_+-]+|UTC", zone):
-            raise SystemExit("set-timezone needs --timezone with a supported IANA name, e.g. Australia/Darwin")
-        return {"type": "set_timezone", "id": req_id, "timezone": zone}
+            raise SystemExit("set-timezone needs --timezone with a supported IANA name, e.g. Australia/Darwin, or auto")
+        msg = {"type": "set_timezone", "id": req_id, "timezone": zone}
+        if pin:
+            msg["pin"] = True   # escape hatch: hold this zone over the location
+        return msg
     if args.cmd == "inventory":
         msg = {"type": "evlog_inventory", "id": req_id, "list": True}
         if args.from_id or args.to_id:
@@ -102,6 +111,50 @@ def build_message(args, req_id):
     raise SystemExit(f"unknown command {args.cmd}")
 
 
+def timezone_outcome(cmd, reply, requested=None, pin=False, expect_offset=None):
+    """Classify a timezone reply. Pure, so it can be unit-tested.
+
+    Returns (outcome, reason), outcome one of:
+      "verified"  -- the device runs what was asked (or, for get, a verified zone)
+      "fallback"  -- set-timezone without --pin stored the zone as the configured
+                     FALLBACK, but the device's location resolves to another zone,
+                     which is the one in effect (docs/timezone-from-location.md).
+                     Reported explicitly, never a silent pass; use --pin to override.
+      "failed"
+    Firmware before the location resolver (no `timezone_source` key) keeps the
+    #98 gate: stored == active == requested.
+    """
+    want_type = "timezone_result" if cmd == "get-timezone" else "set_timezone_result"
+    if reply.get("type") != want_type:
+        return "failed", "wrong reply type"
+    if reply.get("ok") is not True or reply.get("applied") is not True:
+        return "failed", f"ok={reply.get('ok')} applied={reply.get('applied')} detail={reply.get('detail')}"
+    active = reply.get("active_timezone")
+    if not active:
+        return "failed", "no active timezone"
+    if expect_offset is not None and reply.get("utc_offset_seconds") != expect_offset:
+        return "failed", f"offset {reply.get('utc_offset_seconds')} != {expect_offset}"
+    legacy = "timezone_source" not in reply
+    if cmd == "get-timezone":
+        if legacy and reply.get("timezone") != active:
+            return "failed", "stored and active timezone differ"
+        return "verified", f"active {active} ({reply.get('timezone_source', 'legacy')})"
+    if requested == "auto":
+        if reply.get("pinned") is not False:
+            return "failed", "still pinned"
+        return "verified", f"unpinned; active {active} ({reply.get('timezone_source')})"
+    if reply.get("saved") is not True or reply.get("timezone") != requested:
+        return "failed", f"stored {reply.get('timezone')!r}, requested {requested!r}"
+    if active == requested:
+        if pin and reply.get("pinned") is not True:
+            return "failed", "zone active but not pinned"
+        return "verified", f"active {active}" + (" (pinned)" if pin else "")
+    if not legacy and not pin and reply.get("timezone_source") == "location":
+        return "fallback", (f"stored {requested} as fallback; location resolves to "
+                            f"{reply.get('resolved_timezone') or active}, which is in effect (use --pin to override)")
+    return "failed", f"requested {requested} but active {active}"
+
+
 # ambit_flash_status states that end a request (accepted/fetched/flash_ok/... are progress).
 AMBIT_FLASH_TERMINAL = ("success", "failed", "busy")
 
@@ -128,9 +181,13 @@ def summarise(dev, reply):
                 f"detail={reply.get('detail')} matched={reply.get('matched')} appended={reply.get('appended')} "
                 f"next_id={reply.get('next_id')}")
     if t in ("timezone_result", "set_timezone_result"):
+        extra = ""
+        if "timezone_source" in reply:
+            extra = (f" source={reply.get('timezone_source')} pinned={reply.get('pinned')} "
+                     f"resolved={reply.get('resolved_timezone') or '-'} location={reply.get('location_source')}")
         return (f"timezone={reply.get('timezone')} active={reply.get('active_timezone')} "
                 f"offset_s={reply.get('utc_offset_seconds')} applied={reply.get('applied')} "
-                f"ok={reply.get('ok')} detail={reply.get('detail')}")
+                f"ok={reply.get('ok')} detail={reply.get('detail')}{extra}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -145,7 +202,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash", "get-timezone", "set-timezone"])
     ap.add_argument("--expect-offset", type=int, default=None, help="timezone commands: require this UTC offset in seconds at verification")
-    ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin)")
+    ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin), "
+                    "stored as the configured FALLBACK zone; or `auto` to release a pin")
+    ap.add_argument("--pin", action="store_true",
+                    help="set-timezone: pin the zone over the device's location (escape hatch)")
     ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
     ap.add_argument("--version", default="", help="ambit-flash: AMBIT release version M.m.b")
     ap.add_argument("--channel", default="all", help="ambit-flash: 0-3 or all (default)")
@@ -290,13 +350,17 @@ def main(argv=None):
     missing = [d for d in devices if d not in replies]
     bad_fw = []
     timezone_failed = []
+    timezone_fallback = []
     if args.cmd in ("get-timezone", "set-timezone"):
-        expected_type = "timezone_result" if args.cmd == "get-timezone" else "set_timezone_result"
-        timezone_failed = [d for d, r in replies.items()
-            if r.get("type") != expected_type or r.get("ok") is not True or r.get("applied") is not True
-            or not r.get("timezone") or r.get("timezone") != r.get("active_timezone")
-            or (args.expect_offset is not None and r.get("utc_offset_seconds") != args.expect_offset)
-            or (args.cmd == "set-timezone" and (r.get("saved") is not True or r.get("timezone") != args.timezone))]
+        for d, r in replies.items():
+            outcome, reason = timezone_outcome(args.cmd, r, args.timezone or None, args.pin, args.expect_offset)
+            print(f"  {d}: timezone {outcome}: {reason}")
+            if outcome == "failed":
+                timezone_failed.append(d)
+            elif outcome == "fallback":
+                timezone_fallback.append(d)
+        if timezone_fallback:
+            print(f"timezone stored as FALLBACK only (location wins, not in effect) on: {timezone_fallback}")
         if timezone_failed:
             print(f"timezone not verified on: {timezone_failed}")
     flash_failed = [d for d, r in replies.items()
@@ -329,7 +393,8 @@ def main(argv=None):
                        "request_id": req_id, "payload": payload, "devices": devices,
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
                        "firmware": fw_hist, "replay_states": states, "progress": progress,
-                       "timezone_failures": timezone_failed},
+                       "timezone_failures": timezone_failed,
+                       "timezone_fallback_only": timezone_fallback},
                       fh, indent=1, sort_keys=True)
     return 1 if (missing or bad_fw or flash_failed or timezone_failed) else 0
 

@@ -276,6 +276,8 @@ class FirmwareCanonicalizerTest(unittest.TestCase):
                 "#define ESP_OK 0\n"
                 "#define ESP_ERR_INVALID_ARG 0x102\n"
                 "#define ESP_ERR_INVALID_SIZE 0x104\n"
+                "#define ESP_ERR_NO_MEM 0x101\n"
+                "#define ESP_ERR_INVALID_STATE 0x103\n"
             )
             (temp / "esp_log.h").write_text(
                 "#pragma once\n"
@@ -291,6 +293,7 @@ class FirmwareCanonicalizerTest(unittest.TestCase):
             (temp / "test.c").write_text(
                 '#include <assert.h>\n#include <stdint.h>\n#include <string.h>\n'
                 '#include "timezone.h"\n'
+                '#include "tz_zone_table.inc"\n'
                 "static int32_t s_fallback = 7200;\n"
                 "int32_t time_sync_get_utc_offset_seconds(void) { return s_fallback; }\n"
                 "void time_sync_set_utc_offset_seconds(int32_t value) { s_fallback = value; }\n"
@@ -326,8 +329,22 @@ class FirmwareCanonicalizerTest(unittest.TestCase):
                 "  assert(timezone_utc_offset_seconds(JAN) == 13 * 3600);\n"
                 "  assert(timezone_utc_offset_seconds(JUL) == 12 * 3600);\n"
                 # an unknown zone leaves the time_sync fallback in charge
-                '  timezone_apply("Mars/Olympus");\n'
+                '  assert(timezone_apply("Mars/Olympus") == ESP_ERR_INVALID_ARG);\n'
                 "  assert(timezone_utc_offset_seconds(JAN) == s_fallback);\n"
+                "  assert(!timezone_rule_active());\n"
+                # every compiled rule must pass the installed-rule verification
+                # (exact TZ string + offsets the rule can produce) under libc
+                "  static unsigned char covered[TZ_TABLE_RULE_COUNT];\n"
+                "  for (size_t i = 0; i < TZ_TABLE_ZONE_COUNT; i++) {\n"
+                "    assert(timezone_apply(k_tz_zones[i].iana) == ESP_OK);\n"
+                "    assert(timezone_rule_active());\n"
+                "    assert(strcmp(timezone_current_name(), k_tz_zones[i].iana) == 0);\n"
+                "    covered[k_tz_zones[i].rule] = 1;\n"
+                "  }\n"
+                # every one of the distinct POSIX rules went through
+                # rule_installed()/posix_offsets() (Opus review NIT of #100)
+                "  for (size_t r = 0; r < TZ_TABLE_RULE_COUNT; r++) assert(covered[r]);\n"
+                "  assert(TZ_TABLE_RULE_COUNT == 94);\n"
                 "  return 0;\n}\n"
             )
             binary = temp / "timezone-test"
@@ -343,6 +360,9 @@ class FirmwareCanonicalizerTest(unittest.TestCase):
                     str(temp),
                     "-I",
                     str(ROOT / "components/timezone/include"),
+                    "-I",
+                    str(ROOT / "components/timezone"),
+                    "-Wno-unused-variable",
                     str(ROOT / "components/timezone/timezone.c"),
                     str(temp / "test.c"),
                     "-o",

@@ -258,6 +258,7 @@ void sched_due_init_mono(sched_due_t *d, const sched_program_t *prog,
     d->anchor_wall_utc = now_utc;
     d->anchor_mono_us = now_mono_us;
     d->anchor_offset_s = (int32_t)(localize(ctx, now_utc) - now_utc);
+    d->anchor_position_gen = time_sync_position_generation();
     int64_t L = localize(ctx, now_utc);
 
     for (int j = 0; j < prog->job_count; j++) {
@@ -294,6 +295,7 @@ void sched_due_reanchor_mono(sched_due_t *d, int64_t now_utc,
     d->anchor_wall_utc = now_utc;
     d->anchor_mono_us = now_mono_us;
     d->anchor_offset_s = (int32_t)(L - now_utc);
+    d->anchor_position_gen = time_sync_position_generation();
 
     for (int j = 0; j < prog->job_count; j++) {
         const sched_job_t *job = &prog->jobs[j];
@@ -316,8 +318,36 @@ void sched_due_reanchor(sched_due_t *d, int64_t now_utc)
     sched_due_reanchor_mono(d, now_utc, now_utc * US_PER_S);
 }
 
+/* The device moved (a new effective location: set_location, an accepted live
+ * estimate, a fix expiring). Sunrise/sunset are a function of position, so a
+ * solar due that is still ahead belongs to the old place: re-resolve it from
+ * now. Due-but-unfired ones keep their grace accounting; wall-clock crons and
+ * fixed cadences do not depend on position and are left alone. `day`/`night`
+ * windows need nothing here -- gates are evaluated afresh on every poll. */
+static void reresolve_solar(sched_due_t *d, int64_t now_mono_us)
+{
+    const sched_program_t *prog = d->prog;
+    int64_t L = local_at_mono(d, now_mono_us);
+    for (int j = 0; j < prog->job_count; j++) {
+        const sched_job_t *job = &prog->jobs[j];
+        sched_due_job_t *dj = &d->jobs[j];
+        for (int i = 0; i < job->trigger_count; i++) {
+            const sched_trigger_t *tr = &job->triggers[i];
+            if (tr->kind != SCHED_TRIG_SOLAR) continue;
+            if (dj->wall_due_local[i] >= 0 && dj->wall_due_local[i] <= L) continue;
+            set_wall_due(d, dj, i, next_trigger_due(tr, L), now_mono_us);
+        }
+    }
+}
+
 uint32_t sched_due_poll_mono(sched_due_t *d, int64_t now_mono_us)
 {
+    uint32_t pos_gen = time_sync_position_generation();
+    if (pos_gen != d->anchor_position_gen) {
+        d->anchor_position_gen = pos_gen;
+        reresolve_solar(d, now_mono_us);
+    }
+
     /* A timezone offset edge is not an RTC step, but wall triggers on the far
      * side need reprojection. Use projected UTC, never a fresh wall sample;
      * fixed cadences remain owned by monotonic time. */

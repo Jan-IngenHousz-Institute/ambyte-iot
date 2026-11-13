@@ -45,6 +45,8 @@
 #include "event_log.h"
 #include "time_sync.h"
 #include "timezone.h"
+#include "timezone_command.h"
+#include "location_aws.h"
 #include "i2c_bus.h"
 #include "mp2731.h"
 #include "pcf2131tfy_rtc_api.h"
@@ -1370,6 +1372,21 @@ static int cli_cmd_reboot(int argc, char **argv)
 /* sync [sun | loc <lat> <lon> [tz] | interval <s> [phase] | clock <hh> <mm> |
  *       weekly <d,d,…> <hh> <mm> | sunrise|sunset [offset_s]]
  * Computes scheduling triggers against the RTC (see components/time_sync). */
+/* locate [ip] -- one live location attempt now (components/command_router/
+ * location_aws.h). The outcome is logged by loc_aws and shown in identity's
+ * location.live.status; nothing is sent unless the policy grant holds. */
+static int cli_cmd_locate(int argc, char **argv)
+{
+    bool ip_only = argc >= 2 && strcmp(argv[1], "ip") == 0;
+    if (argc > 2 || (argc == 2 && !ip_only)) {
+        printf("Usage: locate [ip]\r\n");
+        return 1;
+    }
+    const char *result = location_aws_request_now(ip_only);
+    printf("locate%s: %s\r\n", ip_only ? " ip" : "", result);
+    return strcmp(result, "queued") == 0 ? 0 : 1;
+}
+
 static int cli_cmd_sync(int argc, char **argv)
 {
     time_t now_t = 0;
@@ -1413,18 +1430,25 @@ static int cli_cmd_sync(int argc, char **argv)
                 printf("Usage: sync loc <lat -90..90> <lon -180..180> [tz]\r\n");
                 return 1;
             }
+            bool changed = timezone_command_location_differs(lat, lon);
             esp_err_t err = device_config_set_location(lat, lon, NULL);
             if (err != ESP_OK) {
                 printf("location persist failed: %s\r\n", esp_err_to_name(err));
                 return 1;
             }
+            /* Same automatic timezone path as MQTT set_location; the worker
+             * logs the outcome (docs/timezone-from-location.md). */
+            timezone_status_t tz_status;
+            const char *action = timezone_command_location_stored(NULL, changed, &tz_status);
+            printf("timezone: %s%s%s\r\n", action, tz_status.resolved[0] ? " " : "",
+                   tz_status.resolved);
             if (argc >= 5) {
+                /* Position comes from the effective location (above); only
+                 * the legacy runtime offset is applied here. */
                 int tz = atoi(argv[4]);
                 printf("timezone offset is runtime-only; use `cfg set timezone <IANA-name>` "
                        "to persist it\r\n");
-                time_sync_set_location(lat, lon, tz);
-            } else {
-                time_sync_set_position(lat, lon);
+                time_sync_set_utc_offset_seconds(tz * 3600);
             }
         }
         double lat, lon; int tz;
@@ -2132,6 +2156,23 @@ typedef struct {
     cfg_set_fn  set;
 } cfg_entry_t;
 
+/* `cfg set timezone <zone>` sets the CONFIGURED FALLBACK zone: in effect
+ * only while no location resolves, or while pinned. It does not pin -- a pin
+ * is explicit (`cfg set timezone_source manual`). `cfg set timezone auto`
+ * releases a pin. Like every cfg key, the change applies at the next boot.
+ * docs/timezone-from-location.md. */
+static esp_err_t cli_set_timezone(const char *val)
+{
+    if (val != NULL && strcmp(val, "auto") == 0) {
+        return device_config_set_timezone_source("auto");
+    }
+    char canonical[48];
+    esp_err_t err = timezone_canonicalize(val, canonical, sizeof(canonical));
+    if (err != ESP_OK) return err;
+    if (!canonical[0]) return ESP_ERR_INVALID_ARG;
+    return device_config_set_timezone(canonical);
+}
+
 static const cfg_entry_t s_cfg_table[] = {
     { "mqtt_uri",         device_config_get_mqtt_uri,         device_config_set_mqtt_uri },
     { "mqtt_client_id",   device_config_get_mqtt_client_id,   device_config_set_mqtt_client_id },
@@ -2144,7 +2185,9 @@ static const cfg_entry_t s_cfg_table[] = {
     { "device_version",   device_config_get_device_version,   device_config_set_device_version },
     { "device_firmware",  device_config_get_device_firmware,  device_config_set_device_firmware },
     { "firmware_version", device_config_get_firmware_version, device_config_set_firmware_version },
-    { "timezone",         device_config_get_timezone,         device_config_set_timezone },
+    { "timezone",         device_config_get_timezone,         cli_set_timezone },
+    { "timezone_source",  device_config_get_timezone_source,  device_config_set_timezone_source },
+    { "loc_live",         device_config_get_live_location_mode, device_config_set_live_location_mode },
     { "publish_gzip",     device_config_get_publish_gzip,     device_config_set_publish_gzip },
 };
 
@@ -2398,6 +2441,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "sync [sun|loc|interval|clock|weekly|sunrise|sunset …]  RTC scheduling triggers",
         .func    = cli_cmd_sync,
     };
+    static const esp_console_cmd_t locate_cmd = {
+        .command = "locate",
+        .help    = "locate [ip]  request a live location estimate now (AWS IoT Device Location)",
+        .func    = cli_cmd_locate,
+    };
     static const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
         .help    = "restart the device",
@@ -2581,6 +2629,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&sync_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&locate_cmd);
     if (err != ESP_OK) {
         return err;
     }

@@ -36,6 +36,48 @@ esp_err_t device_config_get_firmware_version(char *buf, size_t len);
  * echoed in the MQTT envelope so the cloud derives local-time columns.
  * Optional. Invalid stored values fail closed instead of being returned. */
 esp_err_t device_config_get_timezone(char *buf, size_t len);
+/* Timezone pin (NVS key "tz_source", string). The NVS "timezone" key is the
+ * CONFIGURED FALLBACK zone; the zone in effect is derived at runtime
+ * (docs/timezone-from-location.md):
+ *   pinned ("manual")       -> the configured zone, whatever the location says
+ *   not pinned (absent or   -> the zone of the effective location when it
+ *   "auto")                    resolves, else the configured zone
+ *   other / unreadable      -> UNKNOWN: treated as pinned (never override what
+ *                              cannot be read)
+ * A provisioning image or older firmware leaves the key absent: not pinned. */
+typedef enum {
+    DEVICE_TZ_SOURCE_PROVISIONED = 0,   /* key absent */
+    DEVICE_TZ_SOURCE_AUTO,              /* "auto" */
+    DEVICE_TZ_SOURCE_MANUAL,            /* "manual": pinned */
+    DEVICE_TZ_SOURCE_UNKNOWN,
+} device_tz_source_t;
+device_tz_source_t device_config_timezone_source(void);
+const char *device_config_timezone_source_name(device_tz_source_t source);
+/* "provisioned" | "auto" | "manual" | "unknown" for the stored pin flag. */
+const char *device_config_timezone_source_label(void);
+/* cfg-table pair: "auto"/"manual"; get returns ESP_ERR_NVS_NOT_FOUND when absent. */
+esp_err_t device_config_get_timezone_source(char *buf, size_t len);
+esp_err_t device_config_set_timezone_source(const char *val);
+
+/* Live (online) location source: "aws" (default when absent: AWS IoT Core
+ * Device Location over the MQTT connection, inert unless the certificate's
+ * policy grants its topics) | "off". cfg-table pair. */
+esp_err_t device_config_get_live_location_mode(char *buf, size_t len);
+esp_err_t device_config_set_live_location_mode(const char *val);
+/* Last ACCEPTED live fix (one atomic blob), owned by device_location.c.
+ * source: 1 Wi-Fi, 2 IP. agree_count / agree_first_utc: how many agreeing
+ * estimates (same zone, same source) built it, and since when -- an
+ * IP-only or configured-overriding fix only counts once confirmed. */
+typedef struct {
+    double lat, lon, accuracy_m;
+    int64_t fix_utc;
+    int64_t agree_first_utc;
+    int64_t wifi_utc;          /* last Wi-Fi-sourced estimate, 0 = none */
+    uint8_t source;
+    uint8_t agree_count;
+} device_live_fix_t;
+esp_err_t device_config_get_live_fix(device_live_fix_t *out);
+esp_err_t device_config_set_live_fix(const device_live_fix_t *fix);
 /* UTC epoch of the provisioning-image build (written by tools/build_nvs_image.py
  * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
  * or behind it, so a correct clock is never moved. */

@@ -27,6 +27,23 @@ typedef struct {
     char message[256];
 } cmd_result_t;
 
+/* Location provenance for STATUS (filled by the app from timezone_command). */
+typedef struct {
+    bool        valid;
+    const char *source;            /* "live" | "configured" | "none" */
+    bool        has_coords;
+    double      lat, lon;
+    bool        has_accuracy;
+    double      accuracy_m;
+    bool        configured_stale;
+    const char *solar_position;    /* "location" | "default" */
+    const char *live_source;       /* "wifi" | "ip" | NULL (no usable live fix) */
+    int64_t     live_wifi_age_s;   /* age of the last Wi-Fi estimate; -1 none */
+    char        live_status[24];
+    const char *timezone_source;   /* "manual" | "location" | "configured" | "none" */
+    bool        pinned;
+} device_commands_location_t;
+
 typedef struct {
     /* Sensing ports */
     sensor_read_fn              read_env;
@@ -81,6 +98,8 @@ typedef struct {
     const char                         *timezone;      /* boot fallback; IANA name, "" = unset */
     const char                       *(*current_timezone)(void); /* optional live, immutable name */
     void                             (*timezone_snapshot)(int64_t utc, const char **name, int32_t *offset);
+    /* optional: STATUS metadata `location` group (docs/timezone-from-location.md) */
+    void                             (*location_report)(device_commands_location_t *out);
 
     /* UART sensor ports (Phase 7) */
     uart_sensor_query_fn                uart_query;        /* AMBIT binary */

@@ -127,29 +127,96 @@ static int32_t libc_offset_seconds(int64_t utc)
             + (lt.tm_min - gt.tm_min)) * 60 + (lt.tm_sec - gt.tm_sec);
 }
 
-/* Did libc actually accept the rule we just installed?
- *
- * newlib's tzset() parses the TZ string leniently and gives no error: a field it
- * cannot scan simply ends the parse, leaving localtime_r on UTC. That failure is
- * invisible — the scheduler would just run hours off, which is the exact bug
- * this component exists to prevent. So probe two instants half a year apart
- * (one per DST season, any year will do): a zone whose table offset is non-zero
- * while libc reports zero at BOTH instants was rejected. Zones that really are
- * UTC+0 are indistinguishable and need no check. */
-static bool rule_took_effect(const tz_zone_t *zone)
+/* "[+-]hh[:mm[:ss]]" in POSIX sign convention (west positive) -> seconds EAST
+ * of UTC. Advances *p. Returns false when no offset is present. */
+static bool posix_offset(const char **p, int32_t *east)
 {
-    if (zone->fallback_min == 0) return true;
+    const char *s = *p;
+    int sign = 1;
+    if (*s == '+' || *s == '-') sign = (*s++ == '-') ? -1 : 1;
+    if (*s < '0' || *s > '9') return false;
+    int32_t parts[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        int32_t v = 0;
+        int digits = 0;
+        while (*s >= '0' && *s <= '9' && digits < 3) v = v * 10 + (*s++ - '0'), digits++;
+        if (digits == 0) return false;
+        parts[i] = v;
+        if (*s != ':' || i == 2) break;
+        s++;
+    }
+    *east = -sign * (parts[0] * 3600 + parts[1] * 60 + parts[2]);
+    *p = s;
+    return true;
+}
+
+/* Abbreviation: three or more letters, or <...> (may hold digits and a sign). */
+static bool posix_abbr(const char **p)
+{
+    const char *s = *p;
+    if (*s == '<') {
+        const char *close = strchr(s, '>');
+        if (close == NULL || close == s + 1) return false;
+        *p = close + 1;
+        return true;
+    }
+    int n = 0;
+    while ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z')) s++, n++;
+    if (n < 3) return false;
+    *p = s;
+    return true;
+}
+
+/* The two offsets a POSIX rule can ever produce: standard and (if present)
+ * daylight time, east of UTC. DST defaults to standard + 1 h, as POSIX says. */
+static bool posix_offsets(const char *rule, int32_t *std_east, int32_t *dst_east, bool *has_dst)
+{
+    const char *p = rule;
+    if (!posix_abbr(&p) || !posix_offset(&p, std_east)) return false;
+    *has_dst = false;
+    *dst_east = *std_east;
+    if (*p == '\0') return true;
+    if (!posix_abbr(&p)) return false;
+    *has_dst = true;
+    *dst_east = *std_east + 3600;
+    if (*p != ',' && *p != '\0' && !posix_offset(&p, dst_east)) return false;
+    return true;
+}
+
+/* Is libc now running exactly `rule`?
+ *
+ * Two independent failures used to be invisible here. setenv() can fail
+ * (ENOMEM on a fragmented heap) and leave the PREVIOUS rule installed; and
+ * newlib's tzset() parses leniently, silently ending the parse at a field it
+ * cannot scan. The old check only asked whether the offset was non-zero, so a
+ * Berlin rule left in place by a failed setenv "passed" a Darwin probe and the
+ * worker reported applied=true at +3600 (gpt-6-astra review of #98). Now: TZ
+ * must hold exactly the rule string, and at both probe instants -- half a year
+ * apart, one per DST season -- libc's offset must be one this rule can produce
+ * (its standard or daylight offset). A leftover rule from another zone, or a
+ * half-parsed one falling back to UTC, cannot satisfy that for a non-UTC zone. */
+static bool rule_installed(const char *rule)
+{
+    const char *env = getenv("TZ");
+    if (env == NULL || strcmp(env, rule) != 0) return false;
+    int32_t std_east, dst_east;
+    bool has_dst;
+    if (!posix_offsets(rule, &std_east, &dst_east, &has_dst)) return false;
     static const int64_t k_probes[2] = {
         1768478400,   /* 2026-01-15 12:00 UTC */
         1784116800,   /* 2026-07-15 12:00 UTC */
     };
     for (size_t i = 0; i < sizeof(k_probes) / sizeof(k_probes[0]); i++) {
-        if (libc_offset_seconds(k_probes[i]) != 0) return true;
+        int32_t off = libc_offset_seconds(k_probes[i]);
+        if (off != std_east && !(has_dst && off == dst_east)) return false;
     }
-    return false;
+    return true;
 }
 
-static void apply_locked(const char *iana)
+/* POSIX rule currently installed AND verified, or NULL. Lock-protected. */
+static const char *s_rule = NULL;
+
+static esp_err_t apply_locked(const char *iana)
 {
     char canonical[48];
     esp_err_t canonical_err = timezone_canonicalize(iana, canonical, sizeof(canonical));
@@ -157,43 +224,79 @@ static void apply_locked(const char *iana)
         s_applied = false;
         atomic_store(&s_zone_name, "");
         ESP_LOGE(TAG, "rejecting invalid timezone '%s'", iana != NULL ? iana : "(null)");
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     const tz_zone_t *zone = zone_lookup(canonical);
     if (zone == NULL) {
         s_applied = false;
         atomic_store(&s_zone_name, "");
         ESP_LOGI(TAG, "no timezone configured — scheduler uses the fallback offset");
-        return;
+        return ESP_OK;
     }
     const char *posix = k_tz_rules[zone->rule];
-    setenv("TZ", posix, 1);
-    tzset();
-    s_applied = true;
-    atomic_store(&s_zone_name, zone->iana);
-    if (!rule_took_effect(zone)) {
-        /* Keep scheduling on the zone's own standard offset rather than the
-         * unrelated time_sync default: wrong by at most the DST hour, not by
-         * the whole distance from Amsterdam. */
-        s_applied = false;
-        time_sync_set_utc_offset_seconds((int32_t)zone->fallback_min * 60);
-        ESP_LOGE(TAG, "libc rejected TZ=%s for '%s' — scheduling on the fixed "
-                      "offset %d min, DST will NOT be tracked",
-                 posix, canonical, (int)zone->fallback_min);
-        return;
+    if (setenv("TZ", posix, 1) != 0) {
+        /* Nothing changed in libc: keep the previous identity, rule and
+         * offset, and say so. A retry is not skipped (see the worker). */
+        ESP_LOGE(TAG, "setenv(TZ) failed for '%s'; keeping '%s'", canonical,
+                 atomic_load(&s_zone_name));
+        return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "timezone '%s' -> TZ=%s (DST-aware scheduling, tzdata %s)",
-             canonical, posix, TZ_TABLE_TZDATA_VERSION);
+    tzset();
+    if (rule_installed(posix)) {
+        s_applied = true;
+        s_rule = posix;
+        atomic_store(&s_zone_name, zone->iana);
+        ESP_LOGI(TAG, "timezone '%s' -> TZ=%s (DST-aware scheduling, tzdata %s)",
+                 canonical, posix, TZ_TABLE_TZDATA_VERSION);
+        return ESP_OK;
+    }
+    /* libc did not take the new rule. Put the previous verified rule back, so
+     * the device keeps running its previous zone instead of a half-state. */
+    if (s_rule != NULL && setenv("TZ", s_rule, 1) == 0) {
+        tzset();
+        if (rule_installed(s_rule)) {
+            ESP_LOGE(TAG, "libc rejected TZ=%s for '%s'; kept '%s'", posix, canonical,
+                     atomic_load(&s_zone_name));
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    /* No verified rule at all (first apply at boot, or the restore failed too):
+     * keep scheduling on the zone's own prevailing offset rather than the
+     * unrelated time_sync default -- wrong by at most the DST hour, not by the
+     * whole distance from Amsterdam. Reported as not applied. */
+    s_applied = false;
+    s_rule = NULL;
+    atomic_store(&s_zone_name, zone->iana);
+    time_sync_set_utc_offset_seconds((int32_t)zone->fallback_min * 60);
+    ESP_LOGE(TAG, "libc rejected TZ=%s for '%s' — scheduling on the fixed "
+                  "offset %d min, DST will NOT be tracked",
+             posix, canonical, (int)zone->fallback_min);
+    return ESP_ERR_INVALID_STATE;
 }
 
-void timezone_apply(const char *iana)
+esp_err_t timezone_apply(const char *iana)
 {
     zone_lock();
-    apply_locked(iana);
+    esp_err_t err = apply_locked(iana);
     /* Solar calculations also consume this offset, including half-hour zones.
      * Keep that cache current without moving the RTC or any UTC timestamp. */
     if (s_applied) time_sync_set_utc_offset_seconds(libc_offset_seconds((int64_t)time(NULL)));
     zone_unlock();
+    return err;
+}
+
+bool timezone_rule_active(void)
+{
+    zone_lock();
+    bool active = s_applied;
+    zone_unlock();
+    return active;
+}
+
+const char *timezone_country(const char *iana)
+{
+    const tz_zone_t *zone = zone_lookup(iana);
+    return zone != NULL ? k_tz_countries[zone - k_tz_zones] : "";
 }
 
 const char *timezone_current_name(void)
