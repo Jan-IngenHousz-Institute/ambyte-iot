@@ -240,7 +240,10 @@ divider, or OTG-mode reads) is future work.
 | All-zero frame (A3:FC) | **holds data back indefinitely** | publishes; `power_unverified`, `reason: implausible` |
 | Frozen charging frame, live "not charging" (Uluru all day) | publishes; AMBIT boot sync could flash on battery | publishes; flash refused (`no_input` or frozen frame) |
 | Charger unreadable / failed boot probe | publishes (no charger = never gated); flash allowed | publishes; flash refused |
-| AMBIT attach-update (#91), unit without external power (Uluru today) | allowed on battery ≥ 3.7 V (a stale frame) | **never auto-flashes** (intended): attach updates need the same fresh external-power evidence as boot sync; the AMBIT keeps measuring on its current firmware and re-checks every 10 min |
+| AMBIT attach-update (#91), unit without external power (Uluru today) | allowed on battery ≥ 3.7 V (a stale frame) | **never auto-flashes** (intended): attach updates need the same fresh external-power evidence as boot sync; a stale AMBIT's channel stays **held** (not measured) and re-checks every 10 min (`AMBIT_ATTACH_RETRY`) |
+
+**AMBIT attach updates without external power.** A channel whose AMBIT is older than the SD target stays held while the unit has no external power; today's Uluru AMBITs match their target (1.4.0), so none is held.
+Current, newer or unreadable AMBITs are cleared at once and keep measuring.
 
 Drain after the OTA: A3:FC's 2,519 pending records go out through the
 windowed publisher (≤16 in flight, bench ~17 events/s), which is minutes on a
