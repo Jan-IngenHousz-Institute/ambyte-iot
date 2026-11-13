@@ -45,6 +45,9 @@ SCENARIOS = [
     "expired_fix_is_reported",
     "readers_never_wait_on_flash",
     "ip_cannot_walk_a_wifi_zone_to_the_egress_city",
+    "long_lived_fix_survives_reboots",
+    "expired_fix_needs_fresh_confirmation",
+    "wifi_upgrades_an_ip_fix_in_place",
 ]
 
 

@@ -757,12 +757,12 @@ esp_err_t device_config_set_live_location_mode(const char *val)
     return cfg_set(KEY_LOC_LIVE, val);
 }
 
-/* Last accepted live fix, one 48-byte blob so a power cut sees the old or the
+/* Last accepted live fix, one 56-byte blob so a power cut sees the old or the
  * new fix, never a mix:  0..3 "AMLF", 4 version 1, 5 source (1 Wi-Fi, 2 IP),
  * 6 agreeing-estimate count, 7 zero, 8..15 lat, 16..23 lon, 24..31 accuracy_m
- * (binary64 LE), 32..39 fix UTC, 40..47 UTC of the first agreeing estimate
- * (int64 LE). */
-#define LIVE_FIX_SIZE 48U
+ * (binary64 LE), 32..39 fix UTC, 40..47 UTC of the first agreeing estimate,
+ * 48..55 UTC of the last Wi-Fi estimate, 0 = none (int64 LE). */
+#define LIVE_FIX_SIZE 56U
 
 static void put_i64(uint8_t *dst, int64_t v)
 {
@@ -792,7 +792,8 @@ esp_err_t device_config_get_live_fix(device_live_fix_t *out)
     device_live_fix_t f = {
         .lat = site_get_double(blob + 8), .lon = site_get_double(blob + 16),
         .accuracy_m = site_get_double(blob + 24), .fix_utc = get_i64(blob + 32),
-        .agree_first_utc = get_i64(blob + 40), .source = blob[5], .agree_count = blob[6],
+        .agree_first_utc = get_i64(blob + 40), .wifi_utc = get_i64(blob + 48),
+        .source = blob[5], .agree_count = blob[6],
     };
     if (!isfinite(f.lat) || !isfinite(f.lon) || f.lat < -90.0 || f.lat > 90.0 ||
         f.lon < -180.0 || f.lon > 180.0 || !isfinite(f.accuracy_m) || f.accuracy_m < 0.0) {
@@ -820,6 +821,7 @@ esp_err_t device_config_set_live_fix(const device_live_fix_t *f)
     site_put_double(blob + 24, f->accuracy_m);
     put_i64(blob + 32, f->fix_utc);
     put_i64(blob + 40, f->agree_first_utc);
+    put_i64(blob + 48, f->wifi_utc);
     esp_err_t err = nvs_set_blob(s_handle, KEY_LOC_LIVE_FIX, blob, sizeof(blob));
     if (err != ESP_OK) return err;
     return nvs_commit(s_handle);

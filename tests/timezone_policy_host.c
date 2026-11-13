@@ -558,6 +558,70 @@ int main(int argc, char **argv)
          * that really moved), needing 3 agreeing over 6 h. */
         live_ip(OFFICE_IP, 5000);
         expect_active("Australia/Darwin", "location");
+    } else if (!strcmp(s, "long_lived_fix_survives_reboots")) {
+        /* gpt-6-astra S1: a confirmed, unmoved fix was never re-written, so
+         * after 30 days the next (nightly) reboot judged it by its first
+         * persisted time and dropped the zone and sun position. */
+        seed_zone("Europe/Berlin");
+        boot();
+        live(ULURU, 41);
+        for (int i = 0; i < 40 * 4; i++) {          /* 40 days, every 6 h */
+            fake_now += 6 * 3600;
+            live(ULURU, 41);
+        }
+        boot();
+        expect_active("Australia/Darwin", "location");
+        expect_position(-25.3444, 131.0369);
+        /* Kept fresh only by in-country IP answers for another 40 days: still
+         * live across a reboot, and the Wi-Fi age shows it (N2). */
+        for (int i = 0; i < 40 * 4; i++) {
+            fake_now += 6 * 3600;
+            live_ip(ADELAIDE_IP, 50000);
+        }
+        boot();
+        expect_active("Australia/Darwin", "location");
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(st.live.live_source == DEVICE_LIVE_SOURCE_WIFI);
+        assert(st.live.age_s <= 7 * 86400);
+        /* The last Wi-Fi answer was 40 days ago; across a reboot the persisted
+         * copy can be up to one weekly refresh older. */
+        assert(st.live.wifi_age_s >= 40 * 86400 &&
+               st.live.wifi_age_s <= 40 * 86400 + DEVICE_LOCATION_AGE_PERSIST_S);
+    } else if (!strcmp(s, "expired_fix_needs_fresh_confirmation")) {
+        /* gpt-6-astra S1b: an expired fix must not fast-track a single IP
+         * answer with its old confirmation count. */
+        seed_zone("Europe/Berlin");
+        boot();
+        live_ip(ADELAIDE_IP, 50000);
+        fake_now += 3600;
+        live_ip(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+        fake_now += 31 * 86400;
+        refresh();
+        expect_active("Europe/Berlin", "configured");
+        live_ip(ADELAIDE_IP, 50000);                 /* one answer: not yet */
+        expect_active("Europe/Berlin", "configured");
+        fake_now += 3600;
+        live_ip(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+    } else if (!strcmp(s, "wifi_upgrades_an_ip_fix_in_place")) {
+        /* gpt-6-astra N3: a Wi-Fi answer inside the noise of an IP fix used to
+         * keep source=ip, so a confirmed Wi-Fi override could never happen. */
+        assert(device_config_set_location(AMSTERDAM, NULL) == ESP_OK);
+        boot();
+        live_ip(ADELAIDE_IP, 50000);
+        fake_now += 3600;
+        live_ip(ADELAIDE_IP, 50000);
+        expect_active("Europe/Amsterdam", "location");   /* IP never overrides */
+        live(-34.8545 + 0.005, 138.6471, 41);            /* ~550 m: inside the noise */
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(st.live.live_source == DEVICE_LIVE_SOURCE_WIFI);
+        expect_active("Europe/Amsterdam", "location");   /* first Wi-Fi answer */
+        fake_now += 3600;
+        live(-34.8545 + 0.005, 138.6471, 41);
+        expect_active("Australia/Adelaide", "location"); /* confirmed Wi-Fi overrides */
     } else if (!strcmp(s, "readers_never_wait_on_flash")) {
         seed_zone("Europe/Berlin");
         boot();

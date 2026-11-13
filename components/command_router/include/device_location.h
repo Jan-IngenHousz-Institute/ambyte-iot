@@ -55,6 +55,9 @@ typedef struct {
                                than the configured location (reported whether
                                or not it won) */
     device_live_source_t live_source;  /* live fixes: wifi | ip */
+    int64_t wifi_age_s;     /* live fixes: age of the last Wi-Fi estimate, -1
+                               none/unknown -- a fix kept fresh only by IP
+                               answers shows here */
 } device_location_t;
 
 /* Live-estimate acceptance (approved 2026-11-13, calibrated on field data):
@@ -71,16 +74,22 @@ typedef struct {
  *    least twice as precise -- IP noise never re-anchors sunrise/sunset, and
  *    a coarse IP answer never displaces a nearby precise Wi-Fi fix.
  *  - `loc_live off` ignores the live fix entirely (configured / none).
- *  - the accepted fix persists (NVS) on a zone change, a real move or a new
- *    agreeing estimate (the confirmation count must survive a reboot), and
- *    is used while younger than 30 days (with an untrusted clock only a fix
- *    accepted during this boot is used). */
+ *  - the accepted fix persists (NVS) on a zone change, a real move, a new
+ *    agreeing estimate until it is confirmed, and at least weekly while
+ *    estimates keep refreshing it, so a reboot keeps the live location for
+ *    as long as estimates arrive. It is used while younger than 30 days
+ *    (with an untrusted clock only a fix accepted during this boot is used).
+ *  - a Wi-Fi estimate inside the noise of an IP-sourced fix upgrades it to a
+ *    Wi-Fi fix (position kept), so Wi-Fi confirmation can start. */
 #define DEVICE_LOCATION_MAX_ACCURACY_M   200000.0
 #define DEVICE_LOCATION_CONFIRMATIONS    3
 #define DEVICE_LOCATION_CONFIRM_SPAN_S   (6 * 3600)
 #define DEVICE_LOCATION_AGREE_COUNT      2
 #define DEVICE_LOCATION_AGREE_SPAN_S     3600
 #define DEVICE_LOCATION_MAX_AGE_S        (30 * 86400)
+/* A fix that only gets older-but-confirmed answers is re-written this often,
+ * so the persisted age never outruns MAX_AGE across a reboot. */
+#define DEVICE_LOCATION_AGE_PERSIST_S    (7 * 86400)
 #define DEVICE_LOCATION_PERSIST_MOVE_M   1000.0
 /* Any UTC earlier than this means the clock is not trusted (2024-01-01). */
 #define DEVICE_LOCATION_TRUSTED_UTC      1704067200LL

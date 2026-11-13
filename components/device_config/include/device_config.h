@@ -72,6 +72,7 @@ typedef struct {
     double lat, lon, accuracy_m;
     int64_t fix_utc;
     int64_t agree_first_utc;
+    int64_t wifi_utc;          /* last Wi-Fi-sourced estimate, 0 = none */
     uint8_t source;
     uint8_t agree_count;
 } device_live_fix_t;

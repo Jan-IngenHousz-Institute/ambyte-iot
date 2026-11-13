@@ -32,6 +32,7 @@
 typedef struct {
     bool has;
     bool this_boot;      /* accepted since boot: usable without a trusted clock */
+    int64_t persisted_fix_utc;   /* fix_utc of the copy in NVS */
     device_live_fix_t f;
 } fix_t;
 
@@ -65,7 +66,7 @@ static void load_locked(void)
     s_loaded = true;
     device_live_fix_t f;
     if (device_config_get_live_fix(&f) == ESP_OK && tz_geo_location_usable(f.lat, f.lon)) {
-        s_live = (fix_t){.has = true, .this_boot = false, .f = f};
+        s_live = (fix_t){.has = true, .this_boot = false, .persisted_fix_utc = f.fix_utc, .f = f};
     }
 }
 
@@ -108,16 +109,19 @@ bool device_location_configured(device_location_t *out)
     }
     if (out) {
         *out = (device_location_t){DEVICE_LOCATION_CONFIGURED, lat, lon, NAN, -1, false,
-                                   DEVICE_LIVE_SOURCE_NONE};
+                                   DEVICE_LIVE_SOURCE_NONE, -1};
     }
     return true;
 }
 
 static device_location_t live_out(const fix_t *fx, int64_t now_utc)
 {
-    int64_t age = now_utc >= DEVICE_LOCATION_TRUSTED_UTC ? now_utc - fx->f.fix_utc : -1;
+    bool trusted = now_utc >= DEVICE_LOCATION_TRUSTED_UTC;
+    int64_t age = trusted ? now_utc - fx->f.fix_utc : -1;
+    int64_t wifi_age = trusted && fx->f.wifi_utc > 0 ? now_utc - fx->f.wifi_utc : -1;
     return (device_location_t){DEVICE_LOCATION_LIVE, fx->f.lat, fx->f.lon, fx->f.accuracy_m,
-                               age < 0 ? -1 : age, false, (device_live_source_t)fx->f.source};
+                               age < 0 ? -1 : age, false, (device_live_source_t)fx->f.source,
+                               wifi_age < 0 ? -1 : wifi_age};
 }
 
 bool device_location_live(device_location_t *out, int64_t now_utc)
@@ -156,7 +160,7 @@ static device_location_source_t effective_locked(device_location_t *out, int64_t
 {
     device_location_t cfg;
     bool have_cfg = device_location_configured(&cfg);
-    device_location_t loc = {DEVICE_LOCATION_NONE, 0, 0, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE};
+    device_location_t loc = {DEVICE_LOCATION_NONE, 0, 0, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE, -1};
     if (have_cfg) loc = cfg;
     if (usable_locked(now_utc)) {
         bool stale;
@@ -205,21 +209,25 @@ static double distance_m(double lat1, double lon1, double lat2, double lon2)
 }
 
 /* The fix that adopting this estimate would store, and whether it must be
- * written to NVS. Caller holds s_lock.
+ * written to NVS. Caller holds s_lock. `stored`: the stored fix is fresh and
+ * live location is enabled -- an expired or disabled fix counts as absent,
+ * so its old confirmation cannot fast-track a new answer (gpt-6-astra).
  *
  * Agreement: an estimate of the same source in the same zone as the stored
  * fix counts towards its confirmation (count up, first time kept). Position
  * hysteresis (solar triggers re-resolve whenever the position moves): within
  * the zone the position changes only beyond max(1 km, the new estimate's own
- * uncertainty), or for an estimate at least twice as precise. A different zone, or a
- * different source that moves the position, replaces the fix and restarts
- * the count; a different source inside the noise only refreshes the age. */
+ * uncertainty), or for an estimate at least twice as precise. A different
+ * zone, or a different source that moves the position, replaces the fix and
+ * restarts the count. A Wi-Fi estimate inside the noise of an IP fix upgrades
+ * it to a Wi-Fi fix (position kept) and starts the Wi-Fi count; an IP
+ * estimate inside the noise of a Wi-Fi fix only refreshes the age. */
 static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char *zone,
-                                         bool zone_change, bool *persist)
+                                         bool zone_change, bool stored, bool *persist)
 {
     device_live_fix_t out = *in;
     *persist = true;
-    if (!s_live.has || zone_change || tz_geo_zone_for(s_live.f.lat, s_live.f.lon) != zone) {
+    if (!stored || zone_change || tz_geo_zone_for(s_live.f.lat, s_live.f.lon) != zone) {
         return out;
     }
     const device_live_fix_t *old = &s_live.f;
@@ -234,9 +242,18 @@ static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char
     bool moves = d > noise || sharper;
     if (in->source != old->source) {
         if (moves) return out;          /* a better, different source takes over */
-        out = *old;                     /* a different source inside the noise */
+        out = *old;
         out.fix_utc = in->fix_utc;
-        *persist = false;
+        out.wifi_utc = in->wifi_utc;
+        if (in->source == DEVICE_LIVE_SOURCE_WIFI) {
+            /* Upgrade an IP fix to Wi-Fi in place: the Wi-Fi count starts. */
+            out.source = DEVICE_LIVE_SOURCE_WIFI;
+            out.accuracy_m = in->accuracy_m;
+            out.agree_count = 1;
+            out.agree_first_utc = in->fix_utc;
+            return out;
+        }
+        *persist = false;               /* an IP answer inside a Wi-Fi fix: age only */
         return out;
     }
     out = *old;
@@ -246,10 +263,11 @@ static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char
         out.accuracy_m = in->accuracy_m;
     }
     out.fix_utc = in->fix_utc;
+    out.wifi_utc = in->wifi_utc;
     if (out.agree_count < 255) out.agree_count++;
     /* The count is what lets an IP / overriding fix win, so it is written
-     * until the fix is confirmed; after that only a real move writes (flash
-     * wear: a settled unit stops writing). */
+     * until the fix is confirmed; after that only a real move writes (plus
+     * the weekly age refresh in offer_live). */
     *persist = moves || !confirmed(old);
     return out;
 }
@@ -273,48 +291,58 @@ device_location_offer_t device_location_offer_live(double lat, double lon, doubl
     /* 1. Decide under the lock. */
     lock(&s_lock);
     load_locked();
-    if (source == DEVICE_LIVE_SOURCE_IP && fresh(&s_live, now_utc) &&
-        s_live.f.source == DEVICE_LIVE_SOURCE_WIFI &&
+    bool stored = usable_locked(now_utc);
+    in.wifi_utc = source == DEVICE_LIVE_SOURCE_WIFI ? fix_utc : (stored ? s_live.f.wifi_utc : 0);
+    device_live_fix_t next;
+    bool persist;
+    device_location_offer_t result = DEVICE_LOCATION_OFFER_ACCEPTED;
+    if (source == DEVICE_LIVE_SOURCE_IP && stored && s_live.f.source == DEVICE_LIVE_SOURCE_WIFI &&
         strcmp(timezone_country(zone), country_at(s_live.f.lat, s_live.f.lon)) == 0) {
         /* IP is country evidence only (Opus review of #100). Inside the
          * country of a Wi-Fi fix it confirms the country and refreshes the
          * fix's age, nothing more: no move, no candidate. Otherwise a period
          * of Wi-Fi 404s would walk a precise zone to the carrier's egress
          * city (Uluru -> Adelaide) after 3 agreeing IP answers. */
-        s_live.f.fix_utc = fix_utc;
-        s_live.this_boot = true;
-        unlock(&s_lock);
-        return DEVICE_LOCATION_OFFER_ACCEPTED;
-    }
-    bool live_driving = effective_locked(NULL, now_utc) == DEVICE_LOCATION_LIVE;
-    const char *live_zone = live_driving ? tz_geo_zone_for(s_live.f.lat, s_live.f.lon) : NULL;
-    bool zone_change = false;
-    device_location_offer_t result = DEVICE_LOCATION_OFFER_ACCEPTED;
-    if (live_zone != NULL && strcmp(live_zone, zone) != 0) {
-        /* Hysteresis guards only a zone that is ALREADY live-derived. */
-        if (!s_candidate.has || strcmp(s_candidate.zone, zone) != 0) {
-            s_candidate.has = true;
-            s_candidate.zone = zone;
-            s_candidate.count = 0;
-            s_candidate.first_utc = now_utc;
+        next = s_live.f;
+        next.fix_utc = fix_utc;
+        persist = false;
+    } else {
+        bool live_driving = effective_locked(NULL, now_utc) == DEVICE_LOCATION_LIVE;
+        const char *live_zone = live_driving ? tz_geo_zone_for(s_live.f.lat, s_live.f.lon) : NULL;
+        bool zone_change = false;
+        if (live_zone != NULL && strcmp(live_zone, zone) != 0) {
+            /* Hysteresis guards only a zone that is ALREADY live-derived. */
+            if (!s_candidate.has || strcmp(s_candidate.zone, zone) != 0) {
+                s_candidate.has = true;
+                s_candidate.zone = zone;
+                s_candidate.count = 0;
+                s_candidate.first_utc = now_utc;
+            }
+            s_candidate.count++;
+            if (s_candidate.count < DEVICE_LOCATION_CONFIRMATIONS ||
+                now_utc - s_candidate.first_utc < DEVICE_LOCATION_CONFIRM_SPAN_S) {
+                unlock(&s_lock);
+                return DEVICE_LOCATION_OFFER_CANDIDATE;
+            }
+            zone_change = true;
+            result = DEVICE_LOCATION_OFFER_ZONE_CHANGE;
         }
-        s_candidate.count++;
-        if (s_candidate.count < DEVICE_LOCATION_CONFIRMATIONS ||
-            now_utc - s_candidate.first_utc < DEVICE_LOCATION_CONFIRM_SPAN_S) {
-            unlock(&s_lock);
-            return DEVICE_LOCATION_OFFER_CANDIDATE;
+        s_candidate.has = false;
+        next = next_fix_locked(&in, zone, zone_change, stored, &persist);
+        if (zone_change) {
+            /* The confirmed change carries its confirmations. */
+            next.agree_count = DEVICE_LOCATION_CONFIRMATIONS;
+            next.agree_first_utc = next.fix_utc - DEVICE_LOCATION_CONFIRM_SPAN_S;
         }
-        zone_change = true;
-        result = DEVICE_LOCATION_OFFER_ZONE_CHANGE;
     }
-    s_candidate.has = false;
-    bool persist;
-    device_live_fix_t next = next_fix_locked(&in, zone, zone_change, &persist);
-    if (zone_change) {
-        /* The confirmed change carries its confirmations. */
-        next.agree_count = DEVICE_LOCATION_CONFIRMATIONS;
-        next.agree_first_utc = next.fix_utc - DEVICE_LOCATION_CONFIRM_SPAN_S;
+    /* The 30-day age is judged from the PERSISTED fix time after a reboot
+     * (units reboot nightly). A fix that only gets refreshed is therefore
+     * re-written at least weekly, or it would "expire" at the next reboot
+     * while estimates keep confirming it (gpt-6-astra review of #100). */
+    if (!persist && next.fix_utc - s_live.persisted_fix_utc >= DEVICE_LOCATION_AGE_PERSIST_S) {
+        persist = true;
     }
+    const int64_t persisted_before = s_live.persisted_fix_utc;
     unlock(&s_lock);
 
     /* 2. Flash write without the lock (worker task only: no other writer). */
@@ -324,7 +352,8 @@ device_location_offer_t device_location_offer_live(double lat, double lon, doubl
 
     /* 3. Commit the RAM copy. */
     lock(&s_lock);
-    s_live = (fix_t){.has = true, .this_boot = true, .f = next};
+    s_live = (fix_t){.has = true, .this_boot = true,
+                     .persisted_fix_utc = persist ? next.fix_utc : persisted_before, .f = next};
     s_expired_reported = false;
     unlock(&s_lock);
     return result;
