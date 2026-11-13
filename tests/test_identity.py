@@ -102,7 +102,7 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(set(result["location"]), {"set", "source", "lat", "lon", "accuracy_m",
                                                    "configured_stale", "solar_position", "configured", "live"})
         self.assertEqual(set(result["location"]["configured"]), {"set", "lat", "lon"})
-        self.assertEqual(set(result["location"]["live"]), {"set", "lat", "lon", "accuracy_m", "age_s", "source", "status"})
+        self.assertEqual(set(result["location"]["live"]), {"set", "lat", "lon", "accuracy_m", "age_s", "wifi_age_s", "source", "status"})
         self.assertEqual(set(result["timezone"]), {"configured", "active", "source", "pinned", "resolved",
                                                    "utc_offset_seconds"})
         self.assertIs(result["signed"], True)
@@ -133,7 +133,7 @@ class IdentityTest(unittest.TestCase):
             "configured_stale": False, "solar_position": "default",
             "configured": {"set": False, "lat": None, "lon": None},
             "live": {"set": False, "lat": None, "lon": None, "accuracy_m": None, "age_s": None,
-                     "source": None, "status": "waiting"}})
+                     "wifi_age_s": None, "source": None, "status": "waiting"}})
         self.assertEqual(obj["timezone"], {"configured": "Europe/Amsterdam", "active": "Europe/Amsterdam",
                                            "source": "configured", "pinned": False, "resolved": None,
                                            "utc_offset_seconds": 3600})
@@ -149,8 +149,8 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(obj["location"]["source"], "live")
         self.assertEqual(obj["location"]["accuracy_m"], 50000)
         self.assertEqual(obj["location"]["live"], {"set": True, "lat": -34.8545, "lon": 138.6471,
-                                                   "accuracy_m": 50000, "age_s": 120, "source": "ip",
-                                                   "status": "ok"})
+                                                   "accuracy_m": 50000, "age_s": 120, "wifi_age_s": None,
+                                                   "source": "ip", "status": "ok"})
         self.assertEqual(self.response("tz_live_rejected")["location"]["live"]["status"], "rejected_404")
         obj = self.response("tz_same_country")
         self.assertEqual((obj["location"]["source"], obj["location"]["live"]["set"]), ("configured", True))

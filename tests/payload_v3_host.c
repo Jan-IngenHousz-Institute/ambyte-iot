@@ -348,6 +348,7 @@ static void print_telemetry_fixture(void)
         .location_lat = -25.3444,
         .location_lon = 131.0369,
         .location_live_status = "ok",
+        .location_live_wifi_age_s = -1,
         .location_timezone = "Australia/Darwin",
         .location_timezone_source = "location",
         .software_valid = true,

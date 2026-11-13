@@ -510,6 +510,7 @@ static void app_location_report(device_commands_location_t *out)
         .accuracy_m = st.location.accuracy_m,
         .configured_stale = st.location.configured_stale,
         .live_source = st.live_set ? device_location_live_source_name(st.live.live_source) : NULL,
+        .live_wifi_age_s = st.live_set ? st.live.wifi_age_s : -1,
         .solar_position = st.solar_position,
         .timezone_source = st.source,
         .pinned = st.pinned,

@@ -329,7 +329,7 @@ class PayloadV3Test(unittest.TestCase):
         # STATUS location group (docs/timezone-from-location.md), literal.
         self.assertIn('"location":{"source":"configured","lat":-25.344400,"lon":131.036900,'
                       '"accuracy_m":null,"configured_stale":false,"live_status":"ok","live_source":null,'
-                      '"timezone":"Australia/Darwin","timezone_source":"location","pinned":false}',
+                      '"live_wifi_age_s":null,"timezone":"Australia/Darwin","timezone_source":"location","pinned":false}',
                       self.raw_records["TELEMETRY"])
         self.assertEqual(self.records["TELEMETRY_EMPTY"]["health"]["location"], {})
 

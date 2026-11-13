@@ -195,6 +195,7 @@ typedef struct {
     const char *location_solar_position;  /* "location" | "default" (compiled NL sun position) */
     const char *location_live_status;     /* last live-source outcome */
     const char *location_live_source;     /* "wifi" | "ip"; NULL: no usable live fix */
+    int64_t location_live_wifi_age_s;     /* age of the last Wi-Fi estimate; < 0: none */
     const char *location_timezone;        /* zone in effect */
     const char *location_timezone_source; /* "manual" | "location" | "configured" | "none" */
     bool location_timezone_pinned;

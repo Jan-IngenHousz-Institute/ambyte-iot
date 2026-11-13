@@ -1794,7 +1794,7 @@ static cmd_result_t emit_status_event(bool direct)
     const char *clock_source = "rtc";
     bool clock_suspect = false;
     clock_trust_get_status(&clock_source, &clock_suspect);
-    device_commands_location_t location = {0};
+    device_commands_location_t location = {.live_wifi_age_s = -1};
     if (s_cfg.location_report) s_cfg.location_report(&location);
     script_identity_t script_identity = {0};
     const bool script_valid = s_cfg.read_script_identity != NULL &&
@@ -1850,6 +1850,7 @@ static cmd_result_t emit_status_event(bool direct)
         .location_configured_stale = location.configured_stale,
         .location_solar_position = location.solar_position,
         .location_live_source = location.live_source,
+        .location_live_wifi_age_s = location.live_wifi_age_s,
         .location_live_status = location.live_status,
         .location_timezone = current_timezone(),
         .location_timezone_source = location.timezone_source,

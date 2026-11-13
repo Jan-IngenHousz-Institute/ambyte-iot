@@ -38,6 +38,7 @@ typedef struct {
     bool        configured_stale;
     const char *solar_position;    /* "location" | "default" */
     const char *live_source;       /* "wifi" | "ip" | NULL (no usable live fix) */
+    int64_t     live_wifi_age_s;   /* age of the last Wi-Fi estimate; -1 none */
     char        live_status[24];
     const char *timezone_source;   /* "manual" | "location" | "configured" | "none" */
     bool        pinned;
