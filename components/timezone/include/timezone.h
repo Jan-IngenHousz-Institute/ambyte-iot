@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -25,10 +26,21 @@ extern "C" {
  * of breaking. Stored/published timestamps are never affected either way. */
 
 /* Resolve `iana` (e.g. "Europe/Amsterdam") to a POSIX TZ string and install it
- * (setenv TZ + tzset) so libc localtime_r is DST-correct. NULL/empty/unknown
- * leaves the offset on the time_sync fallback. Call at boot and whenever the
- * timezone config changes. */
-void timezone_apply(const char *iana);
+ * (setenv TZ + tzset) so libc localtime_r is DST-correct. Call at boot and
+ * whenever the timezone config changes.
+ *   ESP_OK                 installed and verified (or NULL/empty: unset, the
+ *                          time_sync fallback offset is in charge)
+ *   ESP_ERR_INVALID_ARG    unknown name: cleared to the fallback offset
+ *   ESP_ERR_NO_MEM         setenv failed: the previous zone stays active
+ *   ESP_ERR_INVALID_STATE  libc did not run the rule: the previous verified
+ *                          zone was restored, or (none) the zone's fixed
+ *                          prevailing offset is used without DST
+ * Only ESP_OK may be reported as "applied". */
+esp_err_t timezone_apply(const char *iana);
+
+/* True while a verified libc rule is installed (the last apply succeeded or
+ * restored one). False when unset or degraded to a fixed offset. */
+bool timezone_rule_active(void);
 
 /* Immutable table-owned IANA name currently applied to the scheduler. Safe to
  * read concurrently with apply; valid for the lifetime of the firmware. */

@@ -34,7 +34,10 @@ static void report(const request_t *request, bool ok, bool saved, const char *de
     cJSON_AddBoolToObject(reply, "saved", saved);
     cJSON_AddStringToObject(reply, "timezone", stored);
     cJSON_AddStringToObject(reply, "active_timezone", active);
-    cJSON_AddBoolToObject(reply, "applied", ok && stored[0] && strcmp(stored, active) == 0);
+    /* Applied means a verified libc rule for exactly the stored zone, not just
+     * a matching name: a degraded fixed-offset fallback keeps the name. */
+    cJSON_AddBoolToObject(reply, "applied", ok && stored[0] && strcmp(stored, active) == 0 &&
+                                            timezone_rule_active());
     cJSON_AddNumberToObject(reply, "utc_offset_seconds", offset);
     cJSON_AddStringToObject(reply, "detail", detail);
     char *json = cJSON_PrintUnformatted(reply);
@@ -75,8 +78,14 @@ static void execute(void *arg)
              * read back after commit. apply serializes libc TZ with readers;
              * publisher metadata reads the same immutable active-zone pointer.
              * No reboot, schedule replacement or UTC clock write is involved. */
-            if (strcmp(timezone_current_name(), stored) != 0) timezone_apply(stored);
-            bool applied = strcmp(timezone_current_name(), stored) == 0;
+            esp_err_t apply_err = ESP_OK;
+            /* Re-apply when the name differs OR no verified rule is running:
+             * a failed earlier apply must not make the retry a no-op. */
+            if (strcmp(timezone_current_name(), stored) != 0 || !timezone_rule_active()) {
+                apply_err = timezone_apply(stored);
+            }
+            bool applied = apply_err == ESP_OK && timezone_rule_active() &&
+                           strcmp(timezone_current_name(), stored) == 0;
             report(request, applied, true, applied ? "applied" : "apply_failed");
         }
     }

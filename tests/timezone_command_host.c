@@ -1,5 +1,6 @@
 /* Production MQTT timezone worker, actual cJSON + IANA engine; only SDK/NVS
  * and resident-worker scheduling boundaries are replaced. */
+#define _XOPEN_SOURCE 700 /* putenv, for the libc boundary below */
 #include "timezone_command.h"
 #include "timezone.h"
 #include "device_config.h"
@@ -16,6 +17,22 @@ static char last[2048];
 static int writes, reads, fail_write, fail_readback, acquired, deny, queued;
 static void (*job)(void *);
 static void *argument;
+/* libc boundary: this file and timezone.c are compiled with -Dsetenv=host_setenv
+ * so a failing (ENOMEM) or misbehaving TZ installation can be injected into the
+ * production apply path. 0 = real, 1 = setenv fails, 2 = libc ends up on a
+ * different rule for the next call only. */
+static int setenv_mode;
+int host_setenv(const char *name, const char *value, int overwrite)
+{
+    static char env[2][160];
+    static int slot;
+    (void)overwrite;
+    if (setenv_mode == 1) return -1;
+    if (setenv_mode == 2) { setenv_mode = 0; value = "UTC0"; }
+    slot ^= 1;
+    snprintf(env[slot], sizeof env[slot], "%s=%s", name, value);
+    return putenv(env[slot]);
+}
 esp_err_t device_config_get_timezone(char *out, size_t size)
 {
     reads++;
@@ -81,6 +98,23 @@ int main(int argc, char **argv)
         request("{\"type\":\"get_timezone\",\"id\":\"before\"}"); execute();
         assert(!writes && strstr(last,"\"applied\":false"));
         request(set); execute(); assert(writes==1 && strstr(last,"\"applied\":true"));
+    } else if (!strcmp(argv[1],"setenv_fail")) {
+        /* setenv ENOMEM leaves libc on Berlin. Never report Darwin applied at
+         * +3600, and the retry must re-apply rather than skip on the name. */
+        setenv_mode=1; request(set); execute();
+        assert(strstr(last,"\"ok\":false") && strstr(last,"\"applied\":false"));
+        assert(strstr(last,"\"active_timezone\":\"Europe/Berlin\"") && strstr(last,"apply_failed"));
+        assert(strstr(last,"\"utc_offset_seconds\":3600") && writes==1);
+        setenv_mode=0; request(set); execute();
+        assert(writes==1 && strstr(last,"\"applied\":true") && strstr(last,"\"utc_offset_seconds\":34200"));
+    } else if (!strcmp(argv[1],"libc_reject")) {
+        /* libc runs some other rule after setenv: restore the verified Berlin
+         * rule, report not applied, and re-apply on retry. */
+        setenv_mode=2; request(set); execute();
+        assert(strstr(last,"\"applied\":false") && strstr(last,"\"active_timezone\":\"Europe/Berlin\""));
+        assert(timezone_utc_offset_seconds(1768478400)==3600 && timezone_utc_offset_seconds(1784116800)==7200);
+        request(set); execute();
+        assert(writes==1 && strstr(last,"\"applied\":true") && strstr(last,"\"utc_offset_seconds\":34200"));
     } else if (!strcmp(argv[1],"position")) {
         timezone_apply("Australia/Darwin");
         assert(time_sync_get_utc_offset_seconds()==34200);

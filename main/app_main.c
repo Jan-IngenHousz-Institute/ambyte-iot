@@ -604,7 +604,10 @@ static esp_err_t app_init_i2c_and_sensors(void)
     if (device_config_get_timezone(tz, sizeof(tz)) != ESP_OK) {
         tz[0] = '\0';
     }
-    timezone_apply(tz);
+    esp_err_t tz_err = timezone_apply(tz);
+    if (tz_err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "timezone '%s' not applied: %s", tz, esp_err_to_name(tz_err));
+    }
 
     err = bme280_init(BME280_I2C_ADDR_SECONDARY);
     if (err != ESP_OK) {

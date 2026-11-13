@@ -28,6 +28,7 @@ class RemoteTimezoneTest(unittest.TestCase):
         (directory/"esp_log.h").write_text("#define ESP_LOGE(...) ((void)0)\n#define ESP_LOGI(...) ((void)0)\n")
         subprocess.run([
             os.environ.get("CC", shutil.which("clang") or "cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
+            "-Dsetenv=host_setenv",
             "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", "-g", "-pthread",
             f"-I{directory}", f"-I{ROOT/'tests/host_stubs'}", f"-I{cjson}",
             *(f"-I{ROOT/'components'/name/'include'}" for name in ("command_router","timezone","time_sync","device_config")),
@@ -71,6 +72,12 @@ class RemoteTimezoneTest(unittest.TestCase):
 
     def test_unset_zone_can_be_read_and_then_configured(self):
         self.run_case("unset")
+
+    def test_setenv_failure_keeps_previous_zone_and_is_retried(self):
+        self.run_case("setenv_fail")
+
+    def test_libc_running_another_rule_restores_previous_zone(self):
+        self.run_case("libc_reject")
 
     def test_position_change_keeps_exact_half_hour_offset(self):
         self.run_case("position")
