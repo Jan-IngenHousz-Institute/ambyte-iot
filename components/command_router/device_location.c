@@ -220,7 +220,7 @@ static double distance_m(double lat1, double lon1, double lat2, double lon2)
  * uncertainty), or for an estimate at least twice as precise. A different
  * zone, or a different source that moves the position, replaces the fix and
  * restarts the count. A Wi-Fi estimate inside the noise of an IP fix upgrades
- * it to a Wi-Fi fix (position kept) and starts the Wi-Fi count; an IP
+ * it to a Wi-Fi fix at the Wi-Fi position and starts the Wi-Fi count; an IP
  * estimate inside the noise of a Wi-Fi fix only refreshes the age. */
 static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char *zone,
                                          bool zone_change, bool stored, bool *persist)
@@ -246,7 +246,12 @@ static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char
         out.fix_utc = in->fix_utc;
         out.wifi_utc = in->wifi_utc;
         if (in->source == DEVICE_LIVE_SOURCE_WIFI) {
-            /* Upgrade an IP fix to Wi-Fi in place: the Wi-Fi count starts. */
+            /* Upgrade an IP fix to Wi-Fi: take the Wi-Fi position too (a move
+             * of at most 1 km, one solar re-resolve), so the stored fix never
+             * claims Wi-Fi precision at an IP position (Opus re-check of
+             * #100). The Wi-Fi count starts. */
+            out.lat = in->lat;
+            out.lon = in->lon;
             out.source = DEVICE_LIVE_SOURCE_WIFI;
             out.accuracy_m = in->accuracy_m;
             out.agree_count = 1;

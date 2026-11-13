@@ -618,6 +618,9 @@ int main(int argc, char **argv)
         timezone_status_t st;
         timezone_command_status(&st);
         assert(st.live.live_source == DEVICE_LIVE_SOURCE_WIFI);
+        /* Opus re-check: the upgraded fix carries the Wi-Fi position with
+         * the Wi-Fi accuracy, never Wi-Fi precision at the IP position. */
+        assert(st.live.accuracy_m == 41 && st.live.lat == -34.8545 + 0.005);
         expect_active("Europe/Amsterdam", "location");   /* first Wi-Fi answer */
         fake_now += 3600;
         live(-34.8545 + 0.005, 138.6471, 41);

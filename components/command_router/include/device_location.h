@@ -80,7 +80,7 @@ typedef struct {
  *    as long as estimates arrive. It is used while younger than 30 days
  *    (with an untrusted clock only a fix accepted during this boot is used).
  *  - a Wi-Fi estimate inside the noise of an IP-sourced fix upgrades it to a
- *    Wi-Fi fix (position kept), so Wi-Fi confirmation can start. */
+ *    Wi-Fi fix at the Wi-Fi position, so Wi-Fi confirmation can start. */
 #define DEVICE_LOCATION_MAX_ACCURACY_M   200000.0
 #define DEVICE_LOCATION_CONFIRMATIONS    3
 #define DEVICE_LOCATION_CONFIRM_SPAN_S   (6 * 3600)

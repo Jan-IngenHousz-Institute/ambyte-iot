@@ -84,7 +84,8 @@ The reasons for this rule:
   the last Wi-Fi estimate separately, so a fix kept alive only by IP answers
   is visible. It can read up to a week old after a reboot (weekly
   persistence). A Wi-Fi answer inside the noise of an IP fix upgrades that fix
-  to Wi-Fi in place, so a later confirmed Wi-Fi override of a cross-border
+  to Wi-Fi, taking the Wi-Fi position and accuracy, so a later confirmed
+  Wi-Fi override of a cross-border
   preset can happen. With no configured location, IP answers in ANOTHER
   country can still replace a stored Wi-Fi fix after 3 agreeing estimates
   over at least 6 h (a home-routed roaming SIM, or a spoof, during
