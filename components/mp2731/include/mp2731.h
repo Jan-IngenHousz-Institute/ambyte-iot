@@ -31,6 +31,11 @@ bool mp2731_is_ready(void);
  * datasheet step sizes. Returns ESP_ERR_INVALID_STATE if the charger is absent. */
 esp_err_t mp2731_read_power(power_reading_t *out);
 
+/* Diagnostics only (CLI `mp2731_regs`): one raw register read, no side effects.
+ * Works whenever the I2C bus is up, ready or not. */
+#define MP2731_REG_DUMP_COUNT 0x17u   /* REG00..REG16 */
+esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out);
+
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);
 

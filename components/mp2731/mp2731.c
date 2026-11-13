@@ -170,6 +170,14 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     return ESP_OK;
 }
 
+esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return mp2731_read_reg(reg, out);
+}
+
 power_read_fn mp2731_get_power_read_fn(void)
 {
     return mp2731_read_power;
