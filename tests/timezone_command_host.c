@@ -62,10 +62,8 @@ esp_err_t device_config_get_location(double *lat, double *lon, char *d, size_t n
 { (void)lat; (void)lon; (void)d; (void)n; return ESP_ERR_NVS_NOT_FOUND; }
 esp_err_t device_config_get_live_location_mode(char *buf, size_t len)
 { (void)buf; (void)len; return ESP_ERR_NVS_NOT_FOUND; }
-esp_err_t device_config_get_live_fix(double *a, double *b, double *c, int64_t *t)
-{ (void)a; (void)b; (void)c; (void)t; return ESP_ERR_NVS_NOT_FOUND; }
-esp_err_t device_config_set_live_fix(double a, double b, double c, int64_t t)
-{ (void)a; (void)b; (void)c; (void)t; return ESP_FAIL; }
+esp_err_t device_config_get_live_fix(device_live_fix_t *f) { (void)f; return ESP_ERR_NVS_NOT_FOUND; }
+esp_err_t device_config_set_live_fix(const device_live_fix_t *f) { (void)f; return ESP_FAIL; }
 bool tz_geo_location_usable(double lat, double lon) { (void)lat; (void)lon; return false; }
 const char *tz_geo_zone_for(double lat, double lon) { (void)lat; (void)lon; return NULL; }
 static void reply(const char *json) { assert(strlen(json) < sizeof last); strcpy(last, json); }

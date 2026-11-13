@@ -566,6 +566,7 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "configured_stale": false,
       "solar_position": "location",
       "live_status": "ok",
+      "live_source": "ip",
       "timezone": "Australia/Darwin",
       "timezone_source": "location",
       "pinned": false
@@ -660,9 +661,10 @@ non-negative integers.
 | `location` | `source` | string enum | Effective location: `live` (AWS IoT Device Location estimate), `configured` (provisioned / `set_location`), `none`. See docs/timezone-from-location.md. `{}` when unavailable. |
 | | `lat`, `lon` | number, degrees (6 decimals) or null | Effective coordinates; null when `source` is `none`. Never the scheduler's compiled default. |
 | | `accuracy_m` | integer, m, or null | Live-estimate horizontal accuracy; null for configured coordinates. |
-| | `configured_stale` | boolean | A live estimate in another country than the configured location won (the configured one is a stale preset). |
+| | `configured_stale` | boolean | The stored live fix is in another country than the configured location (the configured one may be a stale preset). Reported whether or not the live fix won. |
 | | `solar_position` | string enum | `location` (sunrise/sunset/solar triggers from the effective location) or `default` (compiled 52.173 N 5.819 E; no location known). |
 | | `live_status` | string | Last live-source outcome (`waiting`, `not_authorized`, `ok`, `candidate`, `rejected_<code>`, `no_reply`, `off`, ...); unknown values are preserved. |
+| | `live_source` | string enum or null | How the stored live fix was obtained: `wifi` or `ip`; null without a usable live fix. An `ip` fix never overrides configured coordinates. |
 | | `timezone` | string | Zone in effect (same as the envelope `timezone`). |
 | | `timezone_source` | string enum | Why: `manual` (pinned), `location`, `configured` (fallback zone), `none`. |
 | | `pinned` | boolean | An explicit timezone pin overrides the location. |

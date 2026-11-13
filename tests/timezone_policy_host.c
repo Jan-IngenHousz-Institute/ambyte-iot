@@ -11,6 +11,8 @@
  * Usage: timezone_policy_host <tz_geo.bin> <scenario>; prints the last reply.
  */
 #include <assert.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,9 +39,54 @@ static entry_t *find(const char *key)
     for (int i = 0; i < 32; i++) if (nvs[i].used && !strcmp(nvs[i].key, key)) return &nvs[i];
     return NULL;
 }
+/* Reader-during-flash-write probe (Opus review of #100): while the live fix
+ * is being written, another task (identity, STATUS, the esp-mqtt task) must
+ * get through device_location without waiting for the write. */
+static bool probe_readers;
+static bool probe_done, probe_ok;
+static pthread_mutex_t probe_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t probe_cond = PTHREAD_COND_INITIALIZER;
+static void *probe_reader(void *arg)
+{
+    (void)arg;
+    device_location_t loc;
+    (void)device_location_effective(&loc, time(NULL));
+    device_location_set_live_status("probe");
+    char st[24];
+    device_location_live_status(st, sizeof st);
+    pthread_mutex_lock(&probe_lock);
+    probe_done = true;
+    pthread_cond_signal(&probe_cond);
+    pthread_mutex_unlock(&probe_lock);
+    return NULL;
+}
+static void probe_during_write(void)
+{
+    pthread_t t;
+    assert(pthread_create(&t, NULL, probe_reader, NULL) == 0);
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 2;
+    pthread_mutex_lock(&probe_lock);
+    while (!probe_done) {
+        if (pthread_cond_timedwait(&probe_cond, &probe_lock, &until) != 0) break;
+    }
+    probe_ok = probe_done;
+    pthread_mutex_unlock(&probe_lock);
+    if (!probe_ok) {
+        fprintf(stderr, "reader blocked behind the live-fix flash write\n");
+        _exit(3);   /* the reader is stuck on a lock this thread holds */
+    }
+    pthread_join(t, NULL);
+}
+
 static esp_err_t put(const char *key, const void *v, size_t len, bool is_str)
 {
     if (fail_key[0] && !strcmp(fail_key, key)) return ESP_FAIL;
+    if (probe_readers && !strcmp(key, "loc_live_fix")) {
+        probe_readers = false;
+        probe_during_write();
+    }
     entry_t *e = find(key);
     for (int i = 0; !e && i < 32; i++) if (!nvs[i].used) e = &nvs[i];
     assert(e && len <= sizeof e->val);
@@ -119,16 +166,21 @@ static const char *set_location(const char *id, double lat, double lon)
     /* The MQTT set_location handler's sequence (command_router.c). */
     bool changed = timezone_command_location_differs(lat, lon);
     assert(device_config_set_location(lat, lon, NULL) == ESP_OK);
-    const char *resolved;
-    const char *action = timezone_command_location_stored(id, changed, &resolved);
+    timezone_status_t st;
+    const char *action = timezone_command_location_stored(id, changed, &st);
+    /* The reply status comes from the same single decision. */
+    assert(st.solar_position != NULL && st.source != NULL);
     if (job) run_job();
     return action;
 }
-static void live(double lat, double lon, double acc)
+static void live_src(double lat, double lon, double acc, device_live_source_t src)
 {
-    assert(timezone_command_offer_live(lat, lon, acc, fake_now));
+    assert(timezone_command_offer_live(lat, lon, acc, fake_now, src));
     run_job();
 }
+/* A Wi-Fi fix (the precise source); IP answers use live_ip(). */
+static void live(double lat, double lon, double acc) { live_src(lat, lon, acc, DEVICE_LIVE_SOURCE_WIFI); }
+static void live_ip(double lat, double lon, double acc) { live_src(lat, lon, acc, DEVICE_LIVE_SOURCE_IP); }
 static void expect_active(const char *zone, const char *source)
 {
     timezone_status_t st;
@@ -237,6 +289,8 @@ int main(int argc, char **argv)
         assert(!strcmp(set_location("same", ULURU), "pinned"));
         expect_active("Europe/Berlin", "manual");
         live(ADELAIDE_IP, 50000);              /* a pin beats a live estimate too */
+        fake_now += 3600;
+        live(ADELAIDE_IP, 50000);
         expect_active("Europe/Berlin", "manual");
         assert(!strcmp(set_location("moved", -34.9285, 138.6007), "queued"));
         expect_active("Australia/Adelaide", "location");
@@ -257,16 +311,24 @@ int main(int argc, char **argv)
         assert(device_config_set_location(AMSTERDAM, NULL) == ESP_OK);
         boot();
         expect_active("Europe/Amsterdam", "location");
+        /* A Wi-Fi fix in another country overrides the preset only once two
+         * agreeing Wi-Fi estimates an hour apart confirm it. */
         live(ADELAIDE_IP, 50000);
-        expect_active("Australia/Adelaide", "location");
+        expect_active("Europe/Amsterdam", "location");
         timezone_status_t st;
         timezone_command_status(&st);
+        assert(st.location.source == DEVICE_LOCATION_CONFIGURED && st.location.configured_stale);
+        fake_now += 3600;
+        live(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+        timezone_command_status(&st);
         assert(st.location.source == DEVICE_LOCATION_LIVE && st.location.configured_stale);
+        assert(st.live.live_source == DEVICE_LIVE_SOURCE_WIFI);
     } else if (!strcmp(s, "configured_beats_live_in_same_country")) {
         seed_zone("Europe/Berlin");
         assert(device_config_set_location(ULURU, NULL) == ESP_OK);
         boot();
-        live(ADELAIDE_IP, 50000);
+        live_ip(ADELAIDE_IP, 50000);
         expect_active("Australia/Darwin", "location");
         timezone_status_t st;
         timezone_command_status(&st);
@@ -278,8 +340,13 @@ int main(int argc, char **argv)
         live(ADELAIDE_IP, 50000);
         expect_active("Australia/Adelaide", "location");
         writes = 0;
-        live(ADELAIDE_IP, 50000);              /* same place: no flash write */
-        assert(writes == 0);
+        live(ADELAIDE_IP, 50000);              /* agreeing: the count is persisted ... */
+        assert(writes == 1);
+        fake_now += 3600;
+        live(ADELAIDE_IP, 50000);              /* ... until the fix is confirmed ... */
+        assert(writes == 2);
+        live(ADELAIDE_IP, 50000);              /* ... then a settled unit writes nothing */
+        assert(writes == 2);
         /* Persisted: a reboot without uplink keeps the live location... */
         boot();
         expect_active("Australia/Adelaide", "location");
@@ -289,7 +356,10 @@ int main(int argc, char **argv)
         expect_active("Europe/Berlin", "configured");
     } else if (!strcmp(s, "office_ip_estimate")) {
         boot();
-        live(OFFICE_IP, 5000);
+        live_ip(OFFICE_IP, 5000);                /* one IP answer: not yet */
+        expect_active("", "none");
+        fake_now += 3600;
+        live_ip(OFFICE_IP, 5000);                /* agreeing, an hour later */
         expect_active("Europe/Amsterdam", "location");
     } else if (!strcmp(s, "live_zone_change_needs_confirmation")) {
         boot();
@@ -361,10 +431,12 @@ int main(int argc, char **argv)
         assert(!time_sync_is_daytime(utc + 3600));   /* 01:30 CET in NL: night */
     } else if (!strcmp(s, "solar_ignores_live_noise")) {
         boot();
-        live(-34.9285, 138.6007, 5000);                 /* IP-level fix in Adelaide */
+        live_ip(-34.9285, 138.6007, 5000);              /* IP-level fix in Adelaide ... */
+        fake_now += 3600;
+        live_ip(-34.9285, 138.6007, 5000);              /* ... confirmed an hour later */
         expect_position(-34.9285, 138.6007);
         uint32_t gen = time_sync_position_generation();
-        live(-34.9285 + 0.027, 138.6007, 5000);         /* ~3 km, inside +-5 km */
+        live_ip(-34.9285 + 0.027, 138.6007, 5000);      /* ~3 km, inside +-5 km */
         expect_position(-34.9285, 138.6007);
         assert(time_sync_position_generation() == gen);
         live(-34.9285 + 0.027, 138.6007, 41);           /* Wi-Fi: 2x sharper, moves */
@@ -379,7 +451,7 @@ int main(int argc, char **argv)
         expect_position(-25.3444, 131.0369);
         /* configured Uluru + live Adelaide: same country, configured wins for
          * the zone AND the sun position. */
-        live(ADELAIDE_IP, 50000);
+        live_ip(ADELAIDE_IP, 50000);
         expect_position(-25.3444, 131.0369);
         timezone_status_t st;
         timezone_command_status(&st);
@@ -411,6 +483,53 @@ int main(int argc, char **argv)
         /* set_location applies the position at once even when the zone is pinned. */
         assert(!strcmp(set_location("same", ULURU), "pinned"));
         expect_position(-25.3444, 131.0369);
+    } else if (!strcmp(s, "ip_never_overrides_configured")) {
+        /* Review decision: CGNAT egress, a roaming SIM or a spoofed lookup
+         * must not beat correct configured coordinates -- not even across a
+         * border. It is reported as configured_stale for an operator. */
+        assert(device_config_set_location(AMSTERDAM, NULL) == ESP_OK);
+        boot();
+        for (int i = 0; i < 4; i++) {
+            live_ip(ADELAIDE_IP, 50000);
+            fake_now += 3 * 3600;
+        }
+        expect_active("Europe/Amsterdam", "location");
+        expect_position(52.3676, 4.9041);
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(st.location.source == DEVICE_LOCATION_CONFIGURED && st.location.configured_stale);
+        assert(st.live_set && st.live.live_source == DEVICE_LIVE_SOURCE_IP);
+    } else if (!strcmp(s, "ip_needs_two_agreeing_an_hour_apart")) {
+        seed_zone("Europe/Berlin");
+        boot();
+        live_ip(ADELAIDE_IP, 50000);
+        expect_active("Europe/Berlin", "configured");
+        fake_now += 30 * 60;
+        live_ip(ADELAIDE_IP, 50000);           /* agreeing, but within the hour */
+        expect_active("Europe/Berlin", "configured");
+        /* The count survives a reboot (persisted with the fix). */
+        boot();
+        fake_now += 30 * 60;
+        live_ip(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+    } else if (!strcmp(s, "expired_fix_is_reported")) {
+        seed_zone("Europe/Berlin");
+        boot();
+        live(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+        fake_now += 31 * 86400;
+        refresh();
+        expect_active("Europe/Berlin", "configured");
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(!strcmp(st.live_status, "expired") && !st.live_set);
+    } else if (!strcmp(s, "readers_never_wait_on_flash")) {
+        seed_zone("Europe/Berlin");
+        boot();
+        probe_readers = true;
+        live(ADELAIDE_IP, 50000);
+        assert(probe_ok);
+        expect_active("Australia/Adelaide", "location");
     } else {
         return 2;
     }

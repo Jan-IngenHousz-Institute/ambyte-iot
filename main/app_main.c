@@ -124,6 +124,13 @@ void sntp_sync_time(struct timeval *tv)
     }
     sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
     clock_trust_note_sntp();
+    /* First trusted time of the boot: a persisted live location fix can now
+     * be aged (it may have expired while the clock was unknown). */
+    static bool s_tz_refreshed_on_trust;
+    if (!s_tz_refreshed_on_trust) {
+        s_tz_refreshed_on_trust = true;
+        timezone_command_refresh();
+    }
 
     /* Make the correction survive a reboot/power interruption. The RTC setter
      * is UTC-pure (no process-global TZ changes) and reads the calendar back;
@@ -448,9 +455,15 @@ static int app_wifi_scan(location_aws_ap_t *aps, int max)
 
 /* The device's PUBLIC IP (its CGNAT egress), which AWS's IP solver needs and
  * does not take from the MQTT connection. Plain HTTP on purpose: this board
- * cannot hold a second TLS session beside MQTT, and a spoofed answer only
- * shifts a coarse estimate that the country rule bounds. No redirects, 4 s,
- * at most 63 bytes read; location_aws validates it as a public literal. */
+ * cannot hold a second TLS session beside MQTT. An on-path attacker can
+ * therefore substitute any public IP and steer the IP estimate anywhere.
+ * What that can do is bounded by device_location: an IP-derived estimate
+ * never overrides a configured location (it can only flag it stale), and
+ * with no configured location it takes effect only after 2 agreeing answers
+ * an hour apart -- so a sustained spoof can still set the zone and sun
+ * position of a unit that has no configured coordinates. Wi-Fi is tried
+ * first. No redirects, 4 s, at most 63 bytes read; location_aws validates
+ * the answer as a public literal. */
 static bool app_public_ip(char *out, size_t len)
 {
     esp_http_client_config_t cfg = {
@@ -496,6 +509,7 @@ static void app_location_report(device_commands_location_t *out)
         .has_accuracy = set && isfinite(st.location.accuracy_m),
         .accuracy_m = st.location.accuracy_m,
         .configured_stale = st.location.configured_stale,
+        .live_source = st.live_set ? device_location_live_source_name(st.live.live_source) : NULL,
         .solar_position = st.solar_position,
         .timezone_source = st.source,
         .pinned = st.pinned,

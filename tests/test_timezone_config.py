@@ -334,11 +334,17 @@ class FirmwareCanonicalizerTest(unittest.TestCase):
                 "  assert(!timezone_rule_active());\n"
                 # every compiled rule must pass the installed-rule verification
                 # (exact TZ string + offsets the rule can produce) under libc
+                "  static unsigned char covered[TZ_TABLE_RULE_COUNT];\n"
                 "  for (size_t i = 0; i < TZ_TABLE_ZONE_COUNT; i++) {\n"
                 "    assert(timezone_apply(k_tz_zones[i].iana) == ESP_OK);\n"
                 "    assert(timezone_rule_active());\n"
                 "    assert(strcmp(timezone_current_name(), k_tz_zones[i].iana) == 0);\n"
+                "    covered[k_tz_zones[i].rule] = 1;\n"
                 "  }\n"
+                # every one of the distinct POSIX rules went through
+                # rule_installed()/posix_offsets() (Opus review NIT of #100)
+                "  for (size_t r = 0; r < TZ_TABLE_RULE_COUNT; r++) assert(covered[r]);\n"
+                "  assert(TZ_TABLE_RULE_COUNT == 94);\n"
                 "  return 0;\n}\n"
             )
             binary = temp / "timezone-test"

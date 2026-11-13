@@ -28,18 +28,22 @@ bool timezone_command_location_differs(double lat, double lon);
 
 /* Call AFTER new coordinates were persisted (MQTT set_location: `id` is the
  * request id, the worker publishes a timezone_result with trigger
- * "set_location"; USB CLI: id NULL, logged only). Returns the immediate
- * action for the set_location reply:
+ * "set_location"; USB CLI: id NULL, logged only). Applies the sun position at
+ * once and fills `*status` (may be NULL) from the same single decision, for
+ * the caller's reply. Returns the immediate action:
  *   "queued"      the worker re-derives and applies the zone
  *   "unchanged"   the zone in effect already matches
  *   "pinned"      a pinned zone is kept (coordinates did not change)
- *   "busy" / "queue_unavailable"  not attempted now; the next boot reconciles
- * `*resolved` is the effective location's zone, or "". */
-const char *timezone_command_location_stored(const char *id, bool changed, const char **resolved);
+ *   "busy" / "queue_unavailable"  not attempted now; the next boot reconciles */
+typedef struct timezone_status timezone_status_t;
+const char *timezone_command_location_stored(const char *id, bool changed, timezone_status_t *status);
 
 /* A live location estimate from an online source (already validated by the
- * source). Queued to the worker; false if it could not be queued. */
-bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int64_t fix_utc);
+ * source), with how it was obtained (Wi-Fi scan or public IP: IP estimates
+ * never override a configured location, device_location.h). Queued to the
+ * worker; false if it could not be queued. */
+bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int64_t fix_utc,
+                                 device_live_source_t source);
 
 /* Periodic re-evaluation on the worker (the app calls it every 6 h): a live
  * fix ageing past 30 days or `loc_live off` changes the effective location
@@ -51,7 +55,7 @@ void timezone_command_refresh(void);
 void timezone_command_reconcile_boot(void);
 
 /* Snapshot for identity / STATUS. */
-typedef struct {
+struct timezone_status {
     device_location_t location;     /* effective */
     bool configured_set;
     double configured_lat, configured_lon;
@@ -63,5 +67,5 @@ typedef struct {
     const char *source;             /* why the active zone: manual|location|configured|none */
     bool pinned;
     const char *solar_position;     /* "location" (effective) | "default" (compiled NL) */
-} timezone_status_t;
+};
 void timezone_command_status(timezone_status_t *out);

@@ -485,7 +485,10 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         const char *deployment = cJSON_IsString(jdeployment) ? jdeployment->valuestring : NULL;
         esp_err_t err = ESP_ERR_INVALID_ARG;
         const char *tz_action = "location_not_saved";
-        const char *tz_resolved = "";
+        /* One timezone decision (made after the save below) serves the
+         * position, the dispatch and this reply; none when not saved. */
+        timezone_status_t tz;
+        bool tz_known = false;
         if (cJSON_IsNumber(jlat) && cJSON_IsNumber(jlon) &&
             isfinite(jlat->valuedouble) && isfinite(jlon->valuedouble) &&
             jlat->valuedouble >= -90.0 && jlat->valuedouble <= 90.0 &&
@@ -507,11 +510,12 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                  * (docs/timezone-from-location.md). Lookup only here; any
                  * persist/apply runs on the maintenance worker, which
                  * publishes a timezone_result with this id when done. */
-                tz_action = timezone_command_location_stored(id, changed, &tz_resolved);
+                tz_action = timezone_command_location_stored(id, changed, &tz);
+                tz_known = true;
             }
         }
         ESP_LOGW(TAG, "set_location id=%s -> %s (timezone: %s %s)", id ? id : "",
-                 esp_err_to_name(err), tz_action, tz_resolved);
+                 esp_err_to_name(err), tz_action, tz_known ? tz.resolved : "");
         char applied_deployment[64] = "";
         (void)device_config_get_deployment(applied_deployment,
                                            sizeof(applied_deployment));
@@ -531,9 +535,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             /* Additive: the zone these coordinates resolve to, who owns the
              * configured zone now, and what happens next ("queued" means a
              * timezone_result with this id follows from the worker). */
-            timezone_status_t tz;
-            timezone_command_status(&tz);
-            cJSON_AddStringToObject(reply, "resolved_timezone", tz_resolved);
+            if (!tz_known) timezone_command_status(&tz);   /* refusal path only */
+            cJSON_AddStringToObject(reply, "resolved_timezone", tz.resolved);
             cJSON_AddStringToObject(reply, "timezone_source", tz.source);
             cJSON_AddBoolToObject(reply, "pinned", tz.pinned);
             cJSON_AddStringToObject(reply, "location_source", device_location_source_name(tz.location.source));

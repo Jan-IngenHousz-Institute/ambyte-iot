@@ -1849,6 +1849,7 @@ static cmd_result_t emit_status_event(bool direct)
         .location_accuracy_m = location.accuracy_m,
         .location_configured_stale = location.configured_stale,
         .location_solar_position = location.solar_position,
+        .location_live_source = location.live_source,
         .location_live_status = location.live_status,
         .location_timezone = current_timezone(),
         .location_timezone_source = location.timezone_source,

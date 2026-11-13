@@ -929,6 +929,9 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
             jw_append(&w, ",\"solar_position\":"); jw_string(&w, input->location_solar_position);
         }
         jw_append(&w, ",\"live_status\":"); jw_string(&w, input->location_live_status);
+        jw_append(&w, ",\"live_source\":");
+        if (input->location_live_source != NULL) jw_string(&w, input->location_live_source);
+        else jw_append(&w, "null");
         jw_append(&w, ",\"timezone\":"); jw_string(&w, input->location_timezone);
         jw_append(&w, ",\"timezone_source\":"); jw_string(&w, input->location_timezone_source);
         jw_append(&w, ",\"pinned\":%s", input->location_timezone_pinned ? "true" : "false");

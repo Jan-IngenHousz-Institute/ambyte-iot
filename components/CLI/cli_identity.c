@@ -202,6 +202,8 @@ static void json_location_and_timezone(identity_json_t *w)
     json_number_or_null(w, ",\"lon\":", st.live_set, st.live.lon, "%.6f");
     json_number_or_null(w, ",\"accuracy_m\":", st.live_set, st.live.accuracy_m, "%.0f");
     json_number_or_null(w, ",\"age_s\":", st.live_set && st.live.age_s >= 0, (double)st.live.age_s, "%.0f");
+    json_raw(w, ",\"source\":");
+    json_string(w, st.live_set ? device_location_live_source_name(st.live.live_source) : NULL);
     json_raw(w, ",\"status\":");
     json_string(w, st.live_status);
     json_raw(w, "}}");

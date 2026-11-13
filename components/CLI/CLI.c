@@ -1438,9 +1438,10 @@ static int cli_cmd_sync(int argc, char **argv)
             }
             /* Same automatic timezone path as MQTT set_location; the worker
              * logs the outcome (docs/timezone-from-location.md). */
-            const char *resolved = "";
-            const char *action = timezone_command_location_stored(NULL, changed, &resolved);
-            printf("timezone: %s%s%s\r\n", action, resolved[0] ? " " : "", resolved);
+            timezone_status_t tz_status;
+            const char *action = timezone_command_location_stored(NULL, changed, &tz_status);
+            printf("timezone: %s%s%s\r\n", action, tz_status.resolved[0] ? " " : "",
+                   tz_status.resolved);
             if (argc >= 5) {
                 /* Position comes from the effective location (above); only
                  * the legacy runtime offset is applied here. */

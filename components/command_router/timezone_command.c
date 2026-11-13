@@ -58,6 +58,7 @@ typedef struct {
     bool location_changed;
     double lat, lon, accuracy_m;
     int64_t fix_utc;
+    device_live_source_t source;
 } request_t;
 
 typedef enum { WHY_NONE, WHY_MANUAL, WHY_LOCATION, WHY_CONFIGURED } why_t;
@@ -305,14 +306,19 @@ static void execute(void *arg)
         break;
     case REQ_LIVE: {
         device_location_offer_t offer = device_location_offer_live(
-            request->lat, request->lon, request->accuracy_m, request->fix_utc, now_utc());
+            request->lat, request->lon, request->accuracy_m, request->fix_utc, now_utc(),
+            request->source);
         device_location_set_live_status(device_location_offer_name(offer));
         out.detail = device_location_offer_name(offer);
         if (offer == DEVICE_LOCATION_OFFER_PERSIST_FAILED) out.ok = false;
         break;
     }
-    case REQ_BOOT:
     case REQ_REFRESH:
+        /* A live fix past its 30 days (or shown too old once the clock is
+         * trusted) is reported and dropped by the reconcile below. */
+        (void)device_location_check_expiry(now_utc());
+        break;
+    case REQ_BOOT:
     default:
         break;
     }
@@ -390,14 +396,36 @@ bool timezone_command_location_differs(double lat, double lon)
            old_lat != lat || old_lon != lon;
 }
 
-const char *timezone_command_location_stored(const char *id, bool changed, const char **resolved)
+static void fill_status(const decision_t *d, timezone_status_t *out)
 {
+    memset(out, 0, sizeof *out);
+    out->location = d->loc;
+    snprintf(out->configured, sizeof out->configured, "%s", d->configured);
+    snprintf(out->resolved, sizeof out->resolved, "%s", d->resolved ? d->resolved : "");
+    out->source = why_name(d->why);
+    out->pinned = d->pinned;
+    out->solar_position = d->loc.source != DEVICE_LOCATION_NONE ? "location" : "default";
+    device_location_t configured;
+    out->configured_set = device_location_configured(&configured);
+    out->configured_lat = configured.lat;
+    out->configured_lon = configured.lon;
+    device_location_t live;
+    out->live_set = device_location_live(&live, now_utc());
+    out->live = live;
+    device_location_live_status(out->live_status, sizeof out->live_status);
+}
+
+const char *timezone_command_location_stored(const char *id, bool changed, timezone_status_t *status)
+{
+    /* One decision on the calling (MQTT / console) task: it drives the
+     * position, the dispatch choice and the caller's reply. Reads only; the
+     * device_location lock is never held across flash I/O. */
     decision_t d;
     decide(&d, false);
-    if (resolved) *resolved = d.resolved ? d.resolved : "";
     /* The position takes effect now, even when the zone needs no worker
      * job (same zone, or pinned). */
     (void)apply_position(&d);
+    if (status) fill_status(&d, status);
     bool will_unpin = changed && d.pinned;
     if (!will_unpin && strcmp(timezone_current_name(), d.zone) == 0 &&
         (d.zone[0] == '\0' || timezone_rule_active())) {
@@ -411,10 +439,11 @@ const char *timezone_command_location_stored(const char *id, bool changed, const
     return refused ? refused : "queued";
 }
 
-bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int64_t fix_utc)
+bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int64_t fix_utc,
+                                 device_live_source_t source)
 {
     request_t request = {.kind = REQ_LIVE, .lat = lat, .lon = lon,
-                         .accuracy_m = accuracy_m, .fix_utc = fix_utc};
+                         .accuracy_m = accuracy_m, .fix_utc = fix_utc, .source = source};
     const char *refused = dispatch(&request);
     if (refused) {
         /* The next estimate (every 6 h, or after the next connect) retries. */
@@ -459,19 +488,5 @@ void timezone_command_status(timezone_status_t *out)
     if (out == NULL) return;
     decision_t d;
     decide(&d, false);
-    memset(out, 0, sizeof *out);
-    out->location = d.loc;
-    snprintf(out->configured, sizeof out->configured, "%s", d.configured);
-    snprintf(out->resolved, sizeof out->resolved, "%s", d.resolved ? d.resolved : "");
-    out->source = why_name(d.why);
-    out->pinned = d.pinned;
-    out->solar_position = d.loc.source != DEVICE_LOCATION_NONE ? "location" : "default";
-    device_location_t configured;
-    out->configured_set = device_location_configured(&configured);
-    out->configured_lat = configured.lat;
-    out->configured_lon = configured.lon;
-    device_location_t live;
-    out->live_set = device_location_live(&live, now_utc());
-    out->live = live;
-    device_location_live_status(out->live_status, sizeof out->live_status);
+    fill_status(&d, out);
 }

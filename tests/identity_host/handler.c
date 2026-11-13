@@ -44,6 +44,10 @@ const char *device_location_source_name(device_location_source_t s)
 {
     return s == DEVICE_LOCATION_LIVE ? "live" : s == DEVICE_LOCATION_CONFIGURED ? "configured" : "none";
 }
+const char *device_location_live_source_name(device_live_source_t s)
+{
+    return s == DEVICE_LIVE_SOURCE_WIFI ? "wifi" : s == DEVICE_LIVE_SOURCE_IP ? "ip" : NULL;
+}
 void timezone_snapshot(int64_t utc, const char **name, int32_t *offset)
 {
     (void)utc;
@@ -53,7 +57,7 @@ void timezone_snapshot(int64_t utc, const char **name, int32_t *offset)
 static void tz_defaults(void)
 {
     memset(&tz_state, 0, sizeof tz_state);
-    tz_state.location = (device_location_t){DEVICE_LOCATION_NONE, 0, 0, NAN, -1, false};
+    tz_state.location = (device_location_t){DEVICE_LOCATION_NONE, 0, 0, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE};
     tz_state.live = tz_state.location;
     strcpy(tz_state.configured, "Europe/Amsterdam");
     tz_state.source = "configured";
@@ -65,7 +69,7 @@ static void tz_configured_uluru(void)
     tz_state.configured_set = true;
     tz_state.configured_lat = -25.3444;
     tz_state.configured_lon = 131.0369;
-    tz_state.location = (device_location_t){DEVICE_LOCATION_CONFIGURED, -25.3444, 131.0369, NAN, -1, false};
+    tz_state.location = (device_location_t){DEVICE_LOCATION_CONFIGURED, -25.3444, 131.0369, NAN, -1, false, DEVICE_LIVE_SOURCE_NONE};
     tz_state.solar_position = "location";
     strcpy(tz_state.configured, "Europe/Berlin");
     strcpy(tz_state.resolved, "Australia/Darwin");
@@ -76,7 +80,7 @@ static void tz_configured_uluru(void)
 static void tz_live_adelaide(void)
 {
     tz_state.live_set = true;
-    tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -34.8545, 138.6471, 50000, 120, false};
+    tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -34.8545, 138.6471, 50000, 120, false, DEVICE_LIVE_SOURCE_IP};
     strcpy(tz_state.live_status, "ok");
 }
 size_t heap_caps_get_free_size(unsigned caps) { assert(caps == MALLOC_CAP_INTERNAL); return 32768; }
@@ -186,6 +190,7 @@ int main(int argc, char **argv)
         tz_live_adelaide();
     } else if (!strcmp(scenario, "tz_configured_stale")) {
         tz_live_adelaide();
+        tz_state.live.live_source = DEVICE_LIVE_SOURCE_WIFI;   /* only Wi-Fi overrides */
         tz_state.solar_position = "location";
         tz_state.configured_set = true;
         tz_state.configured_lat = 52.3676;
@@ -263,7 +268,7 @@ int main(int argc, char **argv)
         static const char longest[] = "Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         tz_state.configured_set = tz_state.live_set = true;
         tz_state.configured_lat = tz_state.configured_lon = -179.999999;
-        tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -89.999999, -179.999999, 199999, 2591999, false};
+        tz_state.live = (device_location_t){DEVICE_LOCATION_LIVE, -89.999999, -179.999999, 199999, 2591999, false, DEVICE_LIVE_SOURCE_WIFI};
         tz_state.location = tz_state.live;
         tz_state.location.configured_stale = true;
         strcpy(tz_state.configured, longest);

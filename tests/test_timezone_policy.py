@@ -40,6 +40,10 @@ SCENARIOS = [
     "solar_configured_and_default",
     "loc_live_off_drops_live",
     "pin_keeps_solar_location",
+    "ip_never_overrides_configured",
+    "ip_needs_two_agreeing_an_hour_apart",
+    "expired_fix_is_reported",
+    "readers_never_wait_on_flash",
 ]
 
 

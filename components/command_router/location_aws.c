@@ -140,7 +140,10 @@ static void attempt(void *arg)
         return;
     }
     if (!authorized()) {
-        /* Not granted on this connection: wait for the next grant. */
+        /* Not granted on this connection (offline, or the policy is gone).
+         * Nothing is armed now: the next grant of both reply subscriptions
+         * re-arms the schedule (on_suback), so a timer that fired while
+         * offline cannot end live location for the rest of the boot. */
         status("not_authorized");
         return;
     }
@@ -188,7 +191,9 @@ static void attempt(void *arg)
     if (have && reply.accepted) {
         ESP_LOGW(TAG, "estimate (%s): %.4f,%.4f +-%.0f m", how, reply.lat, reply.lon, reply.accuracy_m);
         s_interval_s = INTERVAL_S;
-        timezone_command_offer_live(reply.lat, reply.lon, reply.accuracy_m, now);
+        timezone_command_offer_live(reply.lat, reply.lon, reply.accuracy_m, now,
+                                    strcmp(how, "wifi") == 0 ? DEVICE_LIVE_SOURCE_WIFI
+                                                             : DEVICE_LIVE_SOURCE_IP);
     } else {
         char text[24];
         if (have) snprintf(text, sizeof text, "rejected_%d", reply.error_code);
@@ -254,6 +259,13 @@ static void on_suback(bool granted, uint32_t session, void *ctx)
         s_scheduled_this_boot = true;
         first = true;
     }
+    bool pending = s_job_pending;
+    portEXIT_CRITICAL(&s_mux);
+    /* Any later grant re-arms only if nothing is scheduled (the timer fired
+     * while unauthorized, gpt-6-astra/Opus review of #100): a healthy pending
+     * 6 h timer is left alone, so reconnect churn adds no requests. */
+    bool rearm = both && !first && !pending && s_timer != NULL && !esp_timer_is_active(s_timer);
+    portENTER_CRITICAL(&s_mux);
     if (!granted && !s_refusal_logged) {
         s_refusal_logged = true;
         log_refusal = true;
@@ -268,7 +280,7 @@ static void on_suback(bool granted, uint32_t session, void *ctx)
     /* First grant of the boot: one attempt shortly after, jittered so a fleet
      * reconnecting together does not hit the account quota at once. Later
      * reconnects do not add requests; the 6 h timer carries on. */
-    if (first) arm(FIRST_MIN_S + esp_random() % FIRST_SPAN_S);
+    if (first || rearm) arm(FIRST_MIN_S + esp_random() % FIRST_SPAN_S);
 }
 
 esp_err_t location_aws_init(const location_aws_config_t *cfg)

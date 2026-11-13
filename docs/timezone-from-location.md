@@ -42,14 +42,18 @@ tzdata `zone.tab`:
 
 ```mermaid
 flowchart TD
-    S{Accepted live estimate younger than 30 days?} -->|no| CF{Configured location?}
+    S{Usable live fix, under 30 days old?} -->|no| CF{Configured location?}
     CF -->|yes| UC[configured]
     CF -->|no| NO[none]
     S -->|yes| CL{Configured location?}
-    CL -->|no| UL[live]
+    CL -->|no| NC{Wi-Fi fix, or IP fix confirmed by 2 answers an hour apart?}
+    NC -->|yes| UL[live]
+    NC -->|no| NO2[none until confirmed]
     CL -->|yes| SC{Same country?}
     SC -->|yes| UC2[configured - live is informational]
-    SC -->|no| ST[live - configured_stale true]
+    SC -->|no| WF{Wi-Fi fix confirmed by 2 answers an hour apart?}
+    WF -->|yes| ST[live - configured_stale true]
+    WF -->|no| ST2[configured - configured_stale true]
 ```
 
 The reasons for this rule:
@@ -60,10 +64,19 @@ The reasons for this rule:
   of `Australia/Darwin` (+9:30). An error inside one country is the expected
   failure of the live source, and the configured coordinates are more
   precise.
-- **Different country, live wins.** A configured location in another
-  country is a stale preset, for example the European preparation site.
-  Even a coarse estimate in the right country beats it. STATUS and identity
-  report `configured_stale: true`.
+- **Different country: reported, and only Wi-Fi may override.** A
+  configured location in another country looks like a stale preset (the
+  European preparation site), and identity and STATUS report
+  `configured_stale: true` for an operator. Only a **Wi-Fi** fix replaces it,
+  and only after 2 agreeing Wi-Fi estimates at least an hour apart.
+- **An IP estimate never overrides a configured location.** Several things
+  can put it far off and in another country: a CGNAT egress, a SIM that
+  breaks out abroad (home-routed roaming), or a spoofed public-IP lookup
+  (the lookup is plain HTTP). It can only flag the configured site stale.
+  With no configured location, an IP fix takes effect after 2 agreeing
+  answers at least an hour apart (Opus review of #100). A sustained spoof
+  can therefore still set the zone and sun position of a unit with no
+  configured coordinates; configure them to rule that out.
 - **A pin always wins.** It is an explicit escape hatch: MQTT `set_timezone`
   with `"pin": true`, or `cfg set timezone_source manual`. It is released by
   `"timezone": "auto"`, by `cfg set timezone auto`, or by a location change.
@@ -77,9 +90,10 @@ The reasons for this rule:
 | --- | --- | --- |
 | accuracy | reported and ≤ 200 km | A sanity floor only. Real IP answers are 5–50 km at 0.67 confidence, and the country rule does the real work. |
 | zone | must resolve to a zone with a country | Open water or `Etc/*` gives nothing to compare. |
-| hysteresis | 3 agreeing estimates (same zone) spanning ≥ 6 h | Applies only when changing a zone that is already live-derived, so a noisy source cannot flap the zone and re-anchor the scheduler. Replacing a configured- or fallback-derived zone takes effect at once. |
-| persistence | one NVS blob, written on a zone change or > 1 km movement | Flash wear. A reboot without an uplink keeps the live location. |
-| age | used while ≤ 30 days old (needs a trusted clock) | A unit moved and left offline falls back to configured. |
+| confirmation | 2 agreeing estimates (same source, same zone) ≥ 1 h apart | Required for an IP fix to count without a configured location, and for a Wi-Fi fix to override a configured location in another country. |
+| hysteresis | 3 agreeing estimates (same zone) spanning ≥ 6 h | Applies only when changing a zone that is already live-derived, so a noisy source cannot flap the zone and re-anchor the scheduler. |
+| persistence | one NVS blob with the source and the agreement count, written on a zone change, a real move, or until the fix is confirmed | Flash wear (a settled unit stops writing). A reboot keeps the live location and its confirmation. |
+| age | used while ≤ 30 days old (needs a trusted clock) | A unit moved and left offline falls back to configured. The 6 h refresh and the first SNTP sync of a boot report `live.status: expired`. |
 
 The unconfirmed candidate lives in RAM. A reboot restarts the count, which
 errs toward not changing the zone.
@@ -256,15 +270,15 @@ rewritten.
 - **identity** (`timezone.auto` capability) adds two keys:
   - `location{set, source, lat, lon, accuracy_m, configured_stale,
     solar_position, configured{set, lat, lon}, live{set, lat, lon,
-    accuracy_m, age_s, status}}`, where `solar_position` is `location` or
-    `default`
+    accuracy_m, age_s, source, status}}`, where `solar_position` is
+    `location` or `default` and `live.source` is `wifi`, `ip` or null
   - `timezone{configured, active, source: manual|location|configured|none,
     pinned, resolved, utc_offset_seconds}`
   - Coordinates are only ever persisted or live ones, never the scheduler's
     compiled default.
 - **STATUS** (`health.location`) carries `{source, lat, lon, accuracy_m,
-  configured_stale, solar_position, live_status, timezone, timezone_source,
-  pinned}`.
+  configured_stale, solar_position, live_status, live_source, timezone,
+  timezone_source, pinned}`.
   Measurement envelopes are unchanged: per-record location would carry the
   publish-time location on backlogged records.
 - **MQTT** `set_timezone`:

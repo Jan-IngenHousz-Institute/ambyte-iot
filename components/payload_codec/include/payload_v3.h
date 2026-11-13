@@ -194,6 +194,7 @@ typedef struct {
     bool location_configured_stale;       /* live won: configured is in another country */
     const char *location_solar_position;  /* "location" | "default" (compiled NL sun position) */
     const char *location_live_status;     /* last live-source outcome */
+    const char *location_live_source;     /* "wifi" | "ip"; NULL: no usable live fix */
     const char *location_timezone;        /* zone in effect */
     const char *location_timezone_source; /* "manual" | "location" | "configured" | "none" */
     bool location_timezone_pinned;

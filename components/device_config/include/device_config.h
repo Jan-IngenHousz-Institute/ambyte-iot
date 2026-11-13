@@ -64,10 +64,19 @@ esp_err_t device_config_set_timezone_source(const char *val);
  * policy grants its topics) | "off". cfg-table pair. */
 esp_err_t device_config_get_live_location_mode(char *buf, size_t len);
 esp_err_t device_config_set_live_location_mode(const char *val);
-/* Last ACCEPTED live fix (one atomic blob). Written only on a zone change or
- * > 1 km movement (flash wear); used while younger than 30 days. */
-esp_err_t device_config_get_live_fix(double *lat, double *lon, double *accuracy_m, int64_t *fix_utc);
-esp_err_t device_config_set_live_fix(double lat, double lon, double accuracy_m, int64_t fix_utc);
+/* Last ACCEPTED live fix (one atomic blob), owned by device_location.c.
+ * source: 1 Wi-Fi, 2 IP. agree_count / agree_first_utc: how many agreeing
+ * estimates (same zone, same source) built it, and since when -- an
+ * IP-only or configured-overriding fix only counts once confirmed. */
+typedef struct {
+    double lat, lon, accuracy_m;
+    int64_t fix_utc;
+    int64_t agree_first_utc;
+    uint8_t source;
+    uint8_t agree_count;
+} device_live_fix_t;
+esp_err_t device_config_get_live_fix(device_live_fix_t *out);
+esp_err_t device_config_set_live_fix(const device_live_fix_t *fix);
 /* UTC epoch of the provisioning-image build (written by tools/build_nvs_image.py
  * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
  * or behind it, so a correct clock is never moved. */
