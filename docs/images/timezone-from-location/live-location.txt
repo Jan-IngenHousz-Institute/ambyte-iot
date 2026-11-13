@@ -1,0 +1,34 @@
+Bench 28:37:2F:FF:E7:04 - fw v2.16.0-10-g67e8948 - live location, injective id - 2026-11-13
+I (5967) loc_aws: device location via AWS as 'ambyte-5F28-3A37-3A2F-3AFF-3AE7-3A04' (waits for the policy grant)
+W (6157) tz_cmd: timezone applied (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=live resolved=Europe/Amsterdam offset=3600
+I (20947) mqtt_client: subscribing to $aws/device_location/ambyte-5F28-3A37-3A2F-3AFF-3AE7-3A04/get_position_estimate/accepted (msg_id=4)
+I (20947) mqtt_client: subscribing to $aws/device_location/ambyte-5F28-3A37-3A2F-3AFF-3AE7-3A04/get_position_estimate/rejected (msg_id=5)
+I (20967) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (20987) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (20997) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (21007) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (21017) mqtt5_client: MQTT_MSG_TYPE_SUBACK return code is 1
+I (21027) mqtt_client: inbound 24 B on $aws/things/ambyte_28:37:2F:FF:E7:04/jobs/$next/get/accepted
+### 2026-11-13T10:30:43 > identity
+identity -> fw=v2.16.0-10-g67e8948 capabilities[-1]=timezone.auto
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":457,"status":"waiting"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T10:30:58 > locate
+locate: queued
+I (49257) mqtt_client: inbound 188 B on $aws/device_location/ambyte-5F28-3A37-3A2F-3AFF-3AE7-3A04/get_position_estimate/accepted
+W (49267) loc_aws: estimate (wifi): <lat>,<lon> +-41 m
+W (49357) tz_cmd: timezone ok (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=live resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T10:31:13 > identity
+identity -> fw=v2.16.0-10-g67e8948 capabilities[-1]=timezone.auto
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":15,"status":"ok"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T10:31:28 > locate ip
+locate ip: queued
+I (76337) mqtt_client: inbound 279 B on $aws/device_location/ambyte-5F28-3A37-3A2F-3AFF-3AE7-3A04/get_position_estimate/accepted
+W (76347) loc_aws: estimate (ip): <lat>,<lon> +-5000 m
+W (76467) tz_cmd: timezone ok (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=live resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T10:31:43 > identity
+identity -> fw=v2.16.0-10-g67e8948 capabilities[-1]=timezone.auto
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":5000,"configured_stale":false,"configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":5000,"age_s":15,"status":"ok"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+# Coordinates are redacted (bench site). SUBACK code 1 = granted QoS 1.

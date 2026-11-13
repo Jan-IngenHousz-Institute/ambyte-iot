@@ -1,0 +1,17 @@
+Bench 28:37:2F:FF:E7:04 - fw v2.16.0-7-g7344e3b - MQTT via fleet_command.py (DEV) - 2026-11-13
+$ fleet_command.py get-timezone
+  ambyte_28:37:2F:FF:E7:04: timezone=Europe/Amsterdam active=Europe/Amsterdam offset_s=3600 applied=True ok=True detail=read_only source=location pinned=False resolved=Europe/Amsterdam location=live
+  ambyte_28:37:2F:FF:E7:04: timezone verified: active Europe/Amsterdam (location)
+$ fleet_command.py set-timezone --timezone Asia/Tokyo
+  ambyte_28:37:2F:FF:E7:04: timezone=Asia/Tokyo active=Europe/Amsterdam offset_s=3600 applied=True ok=True detail=applied source=location pinned=False resolved=Europe/Amsterdam location=live
+  ambyte_28:37:2F:FF:E7:04: timezone fallback: stored Asia/Tokyo as fallback; location resolves to Europe/Amsterdam, which is in effect (use --pin to override)
+timezone stored as FALLBACK only (location wins, not in effect) on: ['ambyte_28:37:2F:FF:E7:04']
+$ fleet_command.py set-timezone --timezone Europe/Berlin --pin --expect-offset 3600
+  ambyte_28:37:2F:FF:E7:04: timezone=Europe/Berlin active=Europe/Berlin offset_s=3600 applied=True ok=True detail=applied source=manual pinned=True resolved=Europe/Amsterdam location=live
+  ambyte_28:37:2F:FF:E7:04: timezone verified: active Europe/Berlin (pinned)
+$ fleet_command.py set-timezone --timezone auto
+  ambyte_28:37:2F:FF:E7:04: timezone=Europe/Berlin active=Europe/Amsterdam offset_s=3600 applied=True ok=True detail=applied source=location pinned=False resolved=Europe/Amsterdam location=live
+  ambyte_28:37:2F:FF:E7:04: timezone verified: unpinned; active Europe/Amsterdam (location)
+$ fleet_command.py set-timezone --timezone Europe/Amsterdam
+  ambyte_28:37:2F:FF:E7:04: timezone=Europe/Amsterdam active=Europe/Amsterdam offset_s=3600 applied=True ok=True detail=applied source=location pinned=False resolved=Europe/Amsterdam location=live
+  ambyte_28:37:2F:FF:E7:04: timezone verified: active Europe/Amsterdam
