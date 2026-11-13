@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "mp2731_core.h"
 #include "sensing_port.h"
 
 #ifdef __cplusplus
@@ -26,10 +27,13 @@ extern "C" {
 esp_err_t mp2731_init(void);
 bool mp2731_is_ready(void);
 
-/* Trigger a one-shot ADC conversion and read battery/input/system voltages and
- * charge/input currents into *out. Values are scaled to mV / mA per the MP2731
- * datasheet step sizes. Returns ESP_ERR_INVALID_STATE if the charger is absent. */
+/* One verified power read (see mp2731_core_read for the verdicts): ESP_OK only
+ * for a fresh, plausible frame; POWER_ERR_NO_INPUT / _ADC_TIMEOUT / _IMPLAUSIBLE
+ * or a bus error otherwise. ESP_ERR_INVALID_STATE if the charger is absent. */
 esp_err_t mp2731_read_power(power_reading_t *out);
+
+/* Diagnostics: the register frame and verdict of the most recent power read. */
+esp_err_t mp2731_last_frame(mp2731_frame_t *out);
 
 /* Diagnostics only (CLI `mp2731_regs`): one raw register read, no side effects.
  * Works whenever the I2C bus is up, ready or not. */

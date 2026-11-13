@@ -44,9 +44,15 @@ typedef struct {
  *                            unit (all-zero, system rail below brown-out, out of
  *                            range). 2026-11-13: an all-zero frame held a prod
  *                            unit's publish gate closed for 9+ h.
+ *   POWER_ERR_NO_INPUT     — the charger's live status says, consistently, that
+ *                            there is no input. Its ADC only runs with an input
+ *                            (MP2731 datasheet p.26), so there are no voltages —
+ *                            but "no external power" itself is trustworthy, and
+ *                            the publish gate treats it as on-battery evidence.
  * ESP_ERR_INVALID_STATE = no charger; anything else is a bus error. */
 #define POWER_ERR_ADC_TIMEOUT ESP_ERR_NOT_FINISHED
 #define POWER_ERR_IMPLAUSIBLE ESP_ERR_INVALID_RESPONSE
+#define POWER_ERR_NO_INPUT    ESP_ERR_NOT_FOUND
 
 typedef enum {
     POWER_READ_OK = 0,
@@ -54,6 +60,7 @@ typedef enum {
     POWER_READ_IMPLAUSIBLE,
     POWER_READ_I2C_ERROR,
     POWER_READ_UNAVAILABLE,   /* no charger fitted / driver not ready */
+    POWER_READ_NO_INPUT,      /* no voltages, but live status: no external input */
 } power_read_reason_t;
 
 static inline power_read_reason_t power_read_reason_from_err(esp_err_t err)
@@ -61,6 +68,7 @@ static inline power_read_reason_t power_read_reason_from_err(esp_err_t err)
     if (err == ESP_OK) return POWER_READ_OK;
     if (err == POWER_ERR_ADC_TIMEOUT) return POWER_READ_ADC_TIMEOUT;
     if (err == POWER_ERR_IMPLAUSIBLE) return POWER_READ_IMPLAUSIBLE;
+    if (err == POWER_ERR_NO_INPUT) return POWER_READ_NO_INPUT;
     if (err == ESP_ERR_INVALID_STATE) return POWER_READ_UNAVAILABLE;
     return POWER_READ_I2C_ERROR;
 }
@@ -74,6 +82,7 @@ static inline const char *power_read_reason_name(power_read_reason_t r)
     case POWER_READ_IMPLAUSIBLE: return "implausible";
     case POWER_READ_I2C_ERROR:   return "i2c_error";
     case POWER_READ_UNAVAILABLE: return "unavailable";
+    case POWER_READ_NO_INPUT:    return "no_input";
     }
     return "i2c_error";
 }

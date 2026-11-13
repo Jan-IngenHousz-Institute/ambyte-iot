@@ -196,8 +196,14 @@ static int cli_cmd_status(int argc, char **argv)
                charge_str[pw.charge_status & 0x03],
                device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
     } else {
-        printf(" - Power: %s\r\n", pres.message);
+        /* A rejected charger frame is not a reading: show why, and the gate. */
+        printf(" - Power: no valid reading (%s): %s\r\n",
+               power_read_reason_name(power_read_reason_from_err(pres.status)),
+               pres.message);
+        printf("   publish gate: %s\r\n",
+               device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
     }
+    printf("   gate reason: %s\r\n", device_commands_publish_gate_reason());
     return 0;
 }
 
@@ -358,12 +364,15 @@ static int cli_cmd_mp2731_regs(int argc, char **argv)
     }
     for (int pass = 0; pass < passes; pass++) {
         if (pass > 0 && interval_ms > 0) vTaskDelay(pdMS_TO_TICKS(interval_ms));
-        char verdict[48] = "";
+        char verdict[64] = "";
         if (do_read) {
             power_reading_t pw;
             const cmd_result_t r = cmd_read_power(&pw);
-            snprintf(verdict, sizeof verdict, " read=%s",
-                     power_read_reason_name(power_read_reason_from_err(r.status)));
+            mp2731_frame_t f;
+            (void)mp2731_last_frame(&f);
+            snprintf(verdict, sizeof verdict, " read=%s conv=%s/%ums",
+                     power_read_reason_name(power_read_reason_from_err(r.status)),
+                     f.converted ? "done" : "none", (unsigned)f.conv_ms);
         }
         printf("MP2731 t=%lld%s",
                (long long)xTaskGetTickCount() * portTICK_PERIOD_MS, verdict);

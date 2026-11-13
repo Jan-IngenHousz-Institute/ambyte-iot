@@ -1,4 +1,5 @@
 #include "device_commands.h"
+#include "power_policy.h"
 #include "event_log.h"
 #include "sd_diag.h"
 
@@ -839,28 +840,33 @@ static int64_t now_ms(void)
     return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
 
-/* ── Publish power gate (Phase 1) ─────────────────────────────────────────
+/* ── Publish power gate (Phase 1 + the 2026-11-13 invalid-reading rule) ────
  * Snapshot callers (watchdog, direct heartbeat, CLI) also evaluate this cached
  * diagnostic state; the direct heartbeat reports it but never uses it to gate
  * delivery. The debounce/cache is advisory across those tasks.
  * Only drain the MQTT backlog while on external power. Keyed on VIN-present
- * (input voltage / charger VIN status) rather than input current: Iin has a
+ * (input voltage / charge current) rather than input current: Iin has a
  * ~13 mA ADC step and reads near-zero when the battery is full even in full
  * sun, so it under-reports available power. The charger reading is cached
  * (PUB_GATE_EVAL_INTERVAL_MS) so the drain loop's frequent re-checks stay cheap,
- * and the gate is debounced with asymmetric dwell times so a reading hovering
- * at the threshold can't toggle publishing on/off rapidly. */
+ * and the gate is debounced with asymmetric dwell times (power_policy.h) so a
+ * reading hovering at the threshold can't toggle publishing on/off rapidly.
+ *
+ * The decision itself is power_policy.c (host-tested). Its one new rule: a
+ * reading that is not evidence (stale ADC, impossible frame, bus error) never
+ * closes the gate and, after POWER_POLICY_INVALID_FAILOPEN_N of them, opens it —
+ * a frozen charger read held 14:63:93:37:A3:FC's data back for 9+ h. A "no
+ * input" verdict from the charger's live status is evidence (on battery). */
 #define PUB_GATE_EVAL_INTERVAL_MS   5000    /* re-read the charger at most this often */
-#define PUB_GATE_ON_DWELL_MS       15000    /* power present this long ⇒ open the gate  */
-#define PUB_GATE_OFF_DWELL_MS      60000    /* power absent this long  ⇒ close the gate */
+#define PUB_GATE_WARN_INTERVAL_MS (15 * 60 * 1000)  /* invalid-reading WARN rate limit */
 
-static bool    s_pub_gate_open    = false;  /* debounced gate state (closed at boot) */
-static bool    s_pub_gate_cand    = false;  /* last instantaneous reading vs. gate */
-static int64_t s_pub_gate_cand_ms = 0;      /* when cand first differed from the gate */
-static int64_t s_pub_gate_eval_ms = 0;      /* last charger evaluation (0 = never) */
+static power_gate_t        s_pub_gate;           /* zero = closed, "starting" */
+static bool                s_pub_gate_inited  = false;
+static int64_t             s_pub_gate_eval_ms = 0;  /* last charger evaluation (0 = never) */
+static int64_t             s_pub_gate_warn_ms = 0;  /* last invalid-reading WARN */
 
-/* Last known battery voltage, latched on every successful charger read (the
- * power gate and status report both feed it). 0 = never read; the envelope's
+/* Last known battery voltage, latched on every VALID charger read (the power
+ * gate and status report both feed it). 0 = never read; the envelope's
  * `device_battery` field is omitted in that case. */
 static uint32_t s_last_batt_mv = 0;
 
@@ -871,37 +877,76 @@ bool device_commands_publish_power_ok(void)
     if (!s_initialized || s_cfg.read_power == NULL) {
         return true;
     }
+    if (!s_pub_gate_inited) {
+        power_gate_init(&s_pub_gate);
+        s_pub_gate_inited = true;
+    }
 
     const int64_t now = now_ms();
     if (s_pub_gate_eval_ms != 0 &&
         (now - s_pub_gate_eval_ms) < PUB_GATE_EVAL_INTERVAL_MS) {
-        return s_pub_gate_open;   /* cached between evaluations */
+        return s_pub_gate.open;   /* cached between evaluations */
     }
     s_pub_gate_eval_ms = now;
 
-    power_reading_t p;
-    if (s_cfg.read_power(&p) != ESP_OK) {
-        /* Transient I2C/ADC failure: hold the last decision rather than flap. */
-        return s_pub_gate_open;
-    }
-    s_last_batt_mv = p.battery_mv;
-    const bool present = p.input_present;
-
-    if (present == s_pub_gate_open) {
-        s_pub_gate_cand = present;            /* steady — clear any pending change */
-    } else if (present != s_pub_gate_cand) {
-        s_pub_gate_cand    = present;         /* new candidate — start the dwell timer */
-        s_pub_gate_cand_ms = now;
+    power_reading_t p = {0};
+    const esp_err_t err = s_cfg.read_power(&p);
+    const power_read_reason_t reason = power_read_reason_from_err(err);
+    if (reason == POWER_READ_OK) {
+        s_last_batt_mv = p.battery_mv;
     } else {
-        const int64_t dwell = present ? PUB_GATE_ON_DWELL_MS : PUB_GATE_OFF_DWELL_MS;
-        if ((now - s_pub_gate_cand_ms) >= dwell) {
-            s_pub_gate_open = present;        /* debounce satisfied — flip the gate */
-            ESP_LOGI(TAG, "publish gate %s (Vin=%umV Ibat=%umA)",
-                     present ? "OPEN (external power)" : "CLOSED (on battery)",
-                     p.input_mv, p.charge_ma);
-        }
+        memset(&p, 0, sizeof p);   /* a rejected frame's numbers are not evidence */
     }
-    return s_pub_gate_open;
+    /* A consistent "no input" from the live status is on-battery evidence:
+     * feed it to the policy as a valid "absent" sample. */
+    const power_read_reason_t verdict =
+        reason == POWER_READ_NO_INPUT ? POWER_READ_OK : reason;
+    const bool present = reason == POWER_READ_OK && p.input_present;
+
+    switch (power_gate_step(&s_pub_gate, now, verdict, present)) {
+    case POWER_GATE_STEP_OPENED:
+    case POWER_GATE_STEP_CLOSED:
+        ESP_LOGI(TAG, "publish gate %s (Vin=%umV Ibat=%umA reading=%s)",
+                 s_pub_gate.open ? "OPEN (external power)" : "CLOSED (on battery)",
+                 p.input_mv, p.charge_ma, power_read_reason_name(reason));
+        break;
+    case POWER_GATE_STEP_FAILOPEN:
+        ESP_LOGW(TAG, "publish gate OPEN (power_unverified): %u consecutive charger "
+                      "reads without evidence (last: %s) — delivering rather than "
+                      "holding field data back on an unreadable charger",
+                 (unsigned)s_pub_gate.invalid_streak, power_read_reason_name(reason));
+        s_pub_gate_warn_ms = now;
+        break;
+    case POWER_GATE_STEP_NONE:
+        if (verdict != POWER_READ_OK && s_pub_gate.open &&
+            s_pub_gate.reason == POWER_GATE_REASON_POWER_UNVERIFIED &&
+            (now - s_pub_gate_warn_ms) >= PUB_GATE_WARN_INTERVAL_MS) {
+            ESP_LOGW(TAG, "publish gate still power_unverified: charger reading %s "
+                          "(%u in a row)", power_read_reason_name(reason),
+                     (unsigned)s_pub_gate.invalid_streak);
+            s_pub_gate_warn_ms = now;
+        }
+        break;
+    }
+    return s_pub_gate.open;
+}
+
+bool device_commands_flash_power_ok(void)
+{
+    if (!s_initialized || s_cfg.read_power == NULL) {
+        return true;   /* dev board without a charger: never gated (as before) */
+    }
+    (void)device_commands_publish_power_ok();   /* refresh the cached evaluation */
+    return power_gate_flash_ok(&s_pub_gate);
+}
+
+const char *device_commands_publish_gate_reason(void)
+{
+    if (!s_initialized || s_cfg.read_power == NULL) {
+        return power_gate_reason_name(POWER_GATE_REASON_NO_CHARGER);
+    }
+    return power_gate_reason_name(s_pub_gate_inited ? s_pub_gate.reason
+                                                    : POWER_GATE_REASON_STARTING);
 }
 
 cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading)
@@ -1725,11 +1770,20 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     int64_t total = 0, next_id = 0;
     (void)cmd_db_status(&out->db_online, &total, &out->pending, &next_id);
 
-    if (s_cfg.read_power != NULL && s_cfg.read_power(&out->power) == ESP_OK) {
-        out->power_valid = true;
-        s_last_batt_mv = out->power.battery_mv;
+    out->power_reason = POWER_READ_UNAVAILABLE;
+    if (s_cfg.read_power != NULL) {
+        const esp_err_t perr = s_cfg.read_power(&out->power);
+        out->power_reason = power_read_reason_from_err(perr);
+        out->power_valid = perr == ESP_OK;
+        if (out->power_valid) {
+            s_last_batt_mv = out->power.battery_mv;
+        } else {
+            /* A rejected frame is not a measurement: never report its numbers. */
+            memset(&out->power, 0, sizeof out->power);
+        }
     }
     out->publish_gate_open = device_commands_publish_power_ok();
+    out->publish_gate_reason = device_commands_publish_gate_reason();
 
     /* On-board BME280 environment, so every heartbeat carries T/H/P even when
      * the schedule is idle (broken/missing schedule, or power-gated). Same
@@ -1818,6 +1872,8 @@ static cmd_result_t emit_status_event(bool direct)
         .refusal_hold_s = refusal_hold_ms / 1000,
         .pending = s.pending,
         .power_valid = s.power_valid,
+        .power_reason = s_cfg.read_power != NULL ? power_read_reason_name(s.power_reason) : NULL,
+        .publish_gate_reason = s.publish_gate_reason,
         .battery_v = (double)s.power.battery_mv / 1000.0,
         .input_v = (double)s.power.input_mv / 1000.0,
         .system_v = (double)s.power.system_mv / 1000.0,

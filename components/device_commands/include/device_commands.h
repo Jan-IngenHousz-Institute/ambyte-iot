@@ -168,6 +168,15 @@ void device_commands_set_sync_notifier(void (*fn)(void));
  * power monitor is wired in, preserving behaviour on boards without the charger. */
 bool device_commands_publish_power_ok(void);
 
+/* AMBIT flashing power check: fail-CLOSED. True only when the publish gate is
+ * open on VALID external-power evidence — never on the gate's power_unverified
+ * fail-open (a brownout mid-flash bricks the sensor). True without a charger. */
+bool device_commands_flash_power_ok(void);
+
+/* Why the publish gate is in its state (stable telemetry string:
+ * starting | external_power | on_battery | power_unverified | no_charger). */
+const char *device_commands_publish_gate_reason(void);
+
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
 /* Set the RTC (and system clock) from a UTC epoch (seconds). Validates a sane
@@ -212,8 +221,10 @@ typedef struct {
     bool            db_online;
     int64_t         pending;
     bool            power_valid;        /* false if no charger / read failed */
-    power_reading_t power;              /* valid only when power_valid */
+    power_read_reason_t power_reason;   /* why (POWER_READ_OK when power_valid) */
+    power_reading_t power;              /* valid only when power_valid; zeroed otherwise */
     bool            publish_gate_open;  /* device_commands_publish_power_ok() */
+    const char     *publish_gate_reason; /* power_gate_reason_name(), static string */
     bool            env_valid;          /* false if no BME280 / read failed */
     float           temperature_c;      /* valid only when env_valid */
     float           humidity_percent;   /* valid only when env_valid */
