@@ -1,8 +1,8 @@
 # Automatic workbook and deployment timezone checks
 
-The GUI checks the workbook automatically after a successful **Read device**,
-**Save Wi-Fi**, **Test & save**, or verified firmware update. The result has its
-own line: `Workbook: up to date`, `Workbook: installed vX`, or
+The GUI publishes the primary result first, then checks the workbook after a successful **Read device**,
+**Save Wi-Fi**, **Test & save**, or verified firmware update. The extra phase says **Checking workbook… keep USB connected**, and its result
+has its own line: `Workbook: up to date`, `Workbook: installed vX`, or
 `Workbook: not checked: <reason>`. The Wi-Fi/firmware outcome remains successful
 if openJII is unavailable, the operator is signed out, the experiment is not
 visible, the workbook cannot compile/install, or firmware lacks journaled push.
@@ -25,6 +25,7 @@ sequenceDiagram
     Operator->>GUI: Read, save Wi-Fi, or update firmware
     GUI->>USB: Complete and verify requested action
     USB-->>GUI: Primary result
+    GUI-->>Operator: Show primary success now and checking progress
     GUI->>USB: Read settled identity and raw topic
     opt Signed in and supported topic / firmware
         GUI->>API: Resolve pinned workbook for running firmware
@@ -66,52 +67,77 @@ The additive identity contract distinguishes them:
 - `location.configured` is the persisted fallback tuple `{set, lat, lon}`.
 - `location` reports the effective tuple, `source` (`live`, `configured`, `none`)
   and `accuracy_m`; the nested `live` estimate also carries `age_s`.
-- `timezone` reports configured/active/resolved zones, the control source
-  (`auto`, `manual`, `provisioned`, `unknown`) and the active UTC offset.
+- `timezone` reports configured/active/resolved zones, the active-zone source
+  (`manual`, `location`, `configured`, `none`), a pin flag and the active UTC offset.
 
-The maintenance result displays effective values, source and accuracy separately
-from the configured fallback. Older firmware reports effective location
-unavailable. Malformed optional metadata is also unavailable, while stable MAC,
-firmware and workbook discovery remain usable. Runtime `sync loc` fallback values
-are never substituted for a persisted location. An arriving online estimate or
-its changing age cannot block workbook or experiment maintenance.
+The result displays effective values, source and accuracy separately from the
+configured fallback, including the firmware's `configured_stale` flag and opaque
+live-estimate status. `timezone.source` in the frozen contract is `manual`,
+`location`, `configured` or `none`; `pinned` is a separate boolean. Location source
+is independently `live`, `configured` or `none`. Samples from production
+`cli_identity.c` in PR3's host harness are checked into the GUI test fixtures.
+Physical PR3 capture alignment is still pending.
 
-When effective location source is `live`, the values are informational and no
-mismatch prompt appears. Otherwise the offline `tz_geo.zone_for` resolver compares
-the **configured fallback** coordinates with the stored fallback zone. Missing
-coordinates, `(0,0)` and no map match never cause a write. A mismatch asks once. Once a setter is attempted, a lost reply is
-reported as a possible saved change; only failures proven to precede transmission say unchanged.
-No leaves the fallback/source untouched. Yes on auto-capable firmware uses
-`cfg set timezone auto`, reads back `timezone_source`, reboots and reconnects only
-to the same USB MAC, then verifies the settled identity and public RTC local
-offset. Legacy persisted-location discovery without auto uses an explicitly
-confirmed zone and readback before the same reboot check. Firmware with no
-persisted-location discovery cannot take this path. Without active IANA identity,
-a legacy readback/reboot is reported as **saved, runtime unverified** even when
-STATUS prints a valid offset; an offset alone cannot prove the selected zone.
+All maintenance timezone prompts and writes require **`timezone.auto`** in
+`identity.capabilities` and valid PR3 metadata. Without it the GUI is display-only,
+so this GUI can ship before that firmware. A unit with a manual pin is also
+display-only; a fallback correction never unpins it. Pending journal work is
+reported before any prompt. Firmware too old to report identity gets a terminal
+unavailable label rather than a read-again loop. Malformed optional metadata is
+unavailable while MAC, firmware and workbook discovery remain usable.
 
-The firmware is the authority on geographic resolution. A different newly active
-zone is reported alongside the GUI prediction without retrying or writing a
-second explicit zone. A later internally consistent auto zone reports a map
-warning instead of asking to override it. The map is an estimate, with roughly
-5 km uncertainty near zone boundaries. No host tzdata or online lookup is needed
-for the GUI comparison; the live estimate, when available, belongs to the device.
+When effective location source is `live`, the GUI shows it without an override
+prompt. Otherwise it compares configured fallback coordinates with the stored
+fallback zone using the offline resolver. No coordinates, `(0,0)` or no map match
+cause no write. Each eligible mismatch may prompt when that maintenance check
+runs; declining does not pin or suppress future checks. No preserves the fallback.
+Yes sends **`cfg set timezone <coordinate-resolved zone>`**, reads back the fallback,
+reboots and reconnects only to the same USB MAC. The setter preserves pin/source
+state. The `auto` setter is never used here: in PR3 it only releases a pin and
+leaves the fallback unchanged.
+
+Verification compares the configured fallback, stable identity/workbook/settings
+and configured coordinates. Volatile effective position/age/source are excluded
+from stable write guards; arriving live state does not invalidate a successful
+primary action. Active zone/offset comes from the post-boot identity, with an
+optional cross-check against STATUS when the RTC local line exists. A missing
+line does not fail verification. If active identity disappears after a saved
+write, the result is **saved, runtime unverified**, never inferred from an offset
+alone. A setter with a lost reply is a **possible saved change** from the moment
+transmission starts. No automatic retry or alternate setter is attempted.
+
+Firmware owns geographic resolution. A different configured-source active zone
+is reported alongside the GUI prediction without retrying. A live-source active
+zone is informational. The map has roughly 5 km uncertainty near zone boundaries.
+No host tzdata or online GUI geolocation is needed. Initial setup shows both the
+coordinate-resolved fallback and the explicitly entered fallback, and catches an
+unavailable/corrupt resolver so the operator can select a fallback explicitly.
+The packaged smoke check verifies the bundled Uluru resolver/data result.
 
 ```mermaid
 flowchart TD
-    Read[Read configured fallback and effective location] --> Live{Effective source is live}
-    Live -->|Yes| Info[Show live values and accuracy without an override prompt]
-    Live -->|No| Known{Fallback coordinates and map match available}
-    Known -->|No| Keep[Report unchanged or unavailable]
-    Known -->|Yes| Match{Fallback zone matches coordinates}
+    Read[Read fallback and effective location] --> Live{Effective source is live}
+    Live -->|Yes| Info[Show live source and accuracy without a prompt]
+    Live -->|No| Cap{Timezone capability and metadata available}
+    Cap -->|No| Display[Display only]
+    Cap -->|Yes| Pin{Manual pin active}
+    Pin -->|Yes| Display
+    Pin -->|No| Journal{Saved operation unresolved}
+    Journal -->|Yes| Resolve[Show recovery guidance before prompting]
+    Journal -->|No| Map{Fallback coordinates and map match available}
+    Map -->|No| Keep[Keep fallback and report unavailable]
+    Map -->|Yes| Match{Fallback zone matches coordinates}
     Match -->|Yes| Keep
     Match -->|No| Ask{Operator confirms fallback correction}
     Ask -->|No| Keep
-    Ask -->|Yes| Guard[Recheck same MAC and idle service under lease]
-    Guard --> Auto[Set auto source and read source back]
-    Auto --> Boot[Reboot and reconnect to same USB MAC]
-    Boot --> Verify[Verify settled active zone and RTC local offset]
-    Verify --> Report[Report correction or separate verification warning]
+    Ask -->|Yes| Guard[Lease and stable identity recheck]
+    Guard --> Set[Write explicit fallback zone and read back]
+    Set -->|Lost reply| Unknown[Report possible saved change]
+    Set -->|Readback confirmed| Boot[Reboot same USB MAC]
+    Boot --> Active{Active timezone identity available}
+    Active -->|No| Saved[Saved with runtime unverified]
+    Active -->|Yes| Verify[Use active identity and optional RTC status]
+    Verify --> Report[Report verified fallback or separate warning]
 ```
 
 No location/timezone state can fail the primary maintenance action. After a
@@ -134,7 +160,7 @@ manual-pin escape hatch is separate from these setup inputs.
 
 ## Qualification
 
-The full GUI suite currently passes 610 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 631 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,

@@ -247,6 +247,25 @@ class App(ttk.Frame):
         ttk.Label(frame, text="Fallback location/timezone (used until the Ambyte finds its live location). Leave the zone blank to resolve the fallback coordinates.",
                   wraplength=720).grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
+        self.setup_preview = tk.StringVar()
+        ttk.Label(frame, textvariable=self.setup_preview, wraplength=720).grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for variable in (self.setup_lat, self.setup_lon, self.setup_tz):
+            variable.trace_add('write', lambda *args: self._update_setup_preview())
+        self._update_setup_preview()
+
+    def _update_setup_preview(self):
+        try:
+            coordinate_zone = timezones.setup_zone(self.setup_lat.get(), self.setup_lon.get(), '')[0]
+        except ValueError:
+            coordinate_zone = 'unavailable'
+        explicit = self.setup_tz.get().strip() or 'not selected'
+        try:
+            chosen = self._setup_zone()[0]
+        except ValueError:
+            chosen = 'selection required'
+        self.setup_preview.set(f'Coordinate-resolved fallback: {coordinate_zone} · Explicit fallback: {explicit} · Chosen fallback: {chosen}')
+
     def _build_info_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Detected (read-only)", padding=8)
         frame.pack(fill="x", pady=(8, 0))
@@ -386,6 +405,20 @@ class App(ttk.Frame):
         self.busy = True
         self._set_busy(True)
         self.result_var.set("Updating firmware; keeping existing settings…")
+        def result_text(result):
+            text = (f"Updated to {result.firmware}; settings preserved."
+                    if result.changed else f"Already on {result.firmware}; no flash needed.")
+            if result.timezone_correction:
+                text += "\n" + result.timezone_correction
+            return text
+        def primary_ready(result):
+            self.result_var.set(result_text(result) + "\nChecking workbook and fallback timezone… keep USB connected.")
+            self.log(result_text(result))
+        def post_primary(result):
+            try:
+                self._post(primary_ready, result)
+            except (RuntimeError, tk.TclError):
+                pass
         def finish(result, error):
             self._set_busy(False)
             if error:
@@ -393,10 +426,7 @@ class App(ttk.Frame):
                 self.log(error)
                 messagebox.showerror("Firmware update", error)
             else:
-                message = (f"Updated to {result.firmware}; settings preserved."
-                           if result.changed else f"Already on {result.firmware}; no flash needed.")
-                if result.timezone_correction:
-                    message += "\n" + result.timezone_correction
+                message = result_text(result)
                 if result.maintenance is not None:
                     message += "\n" + result.maintenance.text
                     if result.maintenance.port:
@@ -407,7 +437,7 @@ class App(ttk.Frame):
         def work():
             try:
                 result, error = update_firmware(port, release, client=client,
-                    confirm_timezone=self._confirm_timezone, log=self.log), None
+                    confirm_timezone=self._confirm_timezone, on_primary=post_primary, log=self.log), None
             except Exception as exc:
                 result, error = None, str(exc)
             try:

@@ -105,3 +105,10 @@ def test_automatic_check_preserves_saved_and_foreign_operations(target, foreign)
     assert target.device.records[entry['op']]==before
     assert not journal.path.with_suffix('.previous.json').exists()
     if not foreign:assert journal.load()==entry
+
+
+def test_pre_identity_firmware_has_a_terminal_unavailable_reason(target):
+    target.device.has_identity=False
+    result=m.run('bench',target.preview.mac,target.client)
+    assert result.workbook=='Workbook: not checked: firmware cannot report identity'
+    assert 'read device again' not in result.text

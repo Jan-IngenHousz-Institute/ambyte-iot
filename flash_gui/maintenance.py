@@ -74,6 +74,9 @@ def check_session(console, mac, client=None, *, confirm_timezone=None, log=lambd
             workbook = check_workbook(console, device, client, journal, log=log)
             timezone, port = check_timezone(console, device, journal, confirm_timezone, log=log)
             result = MaintenanceResult(workbook, timezone, port)
+    except firmware_update.IdentityUnavailable:
+        result = MaintenanceResult('Workbook: not checked: firmware cannot report identity',
+                                   'Fallback timezone: display only; firmware cannot report identity')
     except Exception:
         result = MaintenanceResult('Workbook: not checked: device unavailable, unsupported or busy; read device again',
                                    'Timezone: not checked: device unavailable, unsupported or busy')
@@ -101,13 +104,17 @@ class TimezoneMismatch:
 
 
 def _runtime_offset(console, identity):
-    # The firmware uses this offset for scheduling. Requiring the public status
-    # evidence catches a persisted-but-unapplied correction without host tzdata
-    # (which is absent on some packaged Windows installations).
-    status = console.command('status', max_reply_bytes=8192)
+    # Active identity is authoritative. When STATUS supplies an RTC local line,
+    # cross-check its offset too; old/unready RTC output is supplementary.
+    try:
+        status = console.command('status', max_reply_bytes=8192)
+    except Exception:
+        status = ''
     match = re.search(r'RTC local: [^\r\n]+ \(UTC([+-])(\d{2}):(\d{2})\)', status)
     if match is None:
-        raise ValueError('runtime RTC local offset unavailable')
+        # PR3 identity is the authoritative active zone/offset. Older STATUS
+        # formats and an unready RTC do not invalidate that evidence.
+        return identity.timezone.utc_offset_seconds if identity.timezone is not None else None
     hours, minutes = int(match[2]), int(match[3])
     if hours > 23 or minutes > 59:
         raise ValueError('invalid runtime RTC offset')
@@ -129,6 +136,10 @@ def _timezone_summary(device):
     effective = f'{location.lat}, {location.lon}' if location.set else 'unavailable'
     text += f'\nEffective location: {effective} (source={location.source}, accuracy={accuracy})'
     text += f'\nEffective timezone: {zone.active or "unset"} (source={zone.source})' if zone else '\nEffective timezone: unavailable'
+    if location.configured_stale:
+        text += '\nConfigured fallback is stale (device country selection)'
+    if location.live is not None:
+        text += f'\nLive estimate status: {location.live.status}'
     return text
 
 
@@ -154,14 +165,21 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
         fallback = location.configured
         if location.source == 'live':
             return prefix + '; live location is managed by the Ambyte', port
-        if current.identity.timezone_error or (zone is not None and zone.source == 'unknown'):
-            return prefix + '; fallback not checked: timezone source unavailable', port
+        if 'timezone.auto' not in current.identity.capabilities:
+            return prefix + '; display only: firmware does not advertise timezone.auto', port
+        if zone is None or current.identity.timezone_error:
+            return prefix + '; display only: timezone metadata unavailable', port
+        if zone.pinned or zone.source == 'manual':
+            return prefix + '; manual timezone pin is active; fallback correction not offered', port
+        entry = journal.load()
+        if entry and entry['phase'] != 'complete':
+            return prefix + '; fallback not checked: resolve the saved service operation first', port
         if fallback is None or not fallback.set or is_unset_location(fallback.lat, fallback.lon):
             return prefix + '; no deployment coordinates', port
         resolved = zone_for(fallback.lat, fallback.lon)
         if resolved is None:
             return prefix + '; fallback location timezone unresolved', port
-        if (zone is not None and zone.source == 'auto' and zone.resolved is not None
+        if (zone is not None and zone.source == 'location' and zone.resolved is not None
                 and zone.configured == zone.active == zone.resolved == stored and resolved != stored):
             return prefix + f'; warning: GUI fallback zone {resolved}, firmware zone {stored} (firmware is authoritative)', port
         if resolved == stored:
@@ -179,20 +197,20 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
             raise ValueError('device did not leave service mode')
         fresh = firmware_update._snapshot(console)
         fresh = firmware_update._settled_schedule(console, fresh, log, before_flash=True)
-        if fresh != current:
+        if (not experiment_settings._same_device_config(fresh, current)
+                or fresh.settings.get('timezone') != stored
+                or fresh.identity.location is None or fresh.identity.location.configured != fallback
+                or fresh.identity.timezone is None or fresh.identity.timezone.pinned
+                or fresh.identity.timezone.source != zone.source
+                or fresh.identity.location.source == 'live'):
             raise ValueError('device configuration or location changed while awaiting confirmation')
-        automatic = fresh.identity.timezone is not None
-        # New firmware owns resolution. Never send an explicit zone followed by
-        # auto: differing dataset versions must be reported, not fought over.
-        # A USB timeout can happen after persistence. From the first byte
-        # transmitted onward, absence of readback is an uncertain mutation.
-        written = True
-        console.cfg_set('timezone', 'auto' if automatic else resolved)
-        if automatic:
-            if console.cfg_get('timezone_source') != 'auto':
-                raise ValueError('automatic timezone source readback did not match')
-        elif console.cfg_get('timezone') != resolved:
-            raise ValueError('stored timezone readback did not match')
+        # timezone.auto admits the frozen PR3 contract. An explicit zone only
+        # changes the fallback; it never releases a manual pin or fights the
+        # device's effective location. A pin is refused above and after consent.
+        written = True  # Persistence can precede a lost USB acknowledgement.
+        console.cfg_set('timezone', resolved)
+        if console.cfg_get('timezone') != resolved:
+            raise ValueError('stored fallback timezone readback did not match')
         console.reboot()
         console.close()
         with experiment_settings._after_reboot(port, fresh.identity.mac) as after_console:
@@ -200,13 +218,15 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
             after = firmware_update._snapshot(after_console)
             after = firmware_update._settled_schedule(after_console, after, log, before_flash=False)
             zone = after.identity.timezone
-            if automatic and (zone is None or zone.source != 'auto' or zone.active != resolved):
+            if (zone is not None and after.identity.location is not None
+                    and after.identity.location.source != 'live' and zone.active != resolved):
                 active = zone.active if zone else 'unavailable'
                 raise ValueError(f'GUI expected {resolved}, firmware active zone is {active}; no retry was attempted')
             expected_settings = dict(fresh.settings, timezone=resolved)
             if (after.identity.mac != fresh.identity.mac or after.identity.thing_name != fresh.identity.thing_name
                     or after.identity.fw != fresh.identity.fw or after.identity.schedule != fresh.identity.schedule
-                    or after.identity.location != fresh.identity.location or after.settings != expected_settings):
+                    or after.identity.location is None or after.identity.location.configured != fallback
+                    or after.settings != expected_settings):
                 raise ValueError('post-reboot timezone or preserved configuration/workbook did not match')
             if zone is None:
                 # Legacy status describes an offset, but not which IANA zone

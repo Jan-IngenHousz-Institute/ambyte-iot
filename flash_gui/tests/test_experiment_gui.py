@@ -84,3 +84,18 @@ def test_device_display_does_not_claim_certificate_validity(monkeypatch,target):
     w._show(replace(target.preview,environment=None))
     assert 'Unknown / unverified' in w.summary.value
     assert 'certificate remains unverified' in w.cloud.value
+
+
+def test_primary_experiment_success_precedes_optional_checks(monkeypatch,target):
+    w,_=dialog(monkeypatch,target)
+    w.app._post=lambda fn,*a:fn(*a)
+    monkeypatch.setattr(g.messagebox,'askyesno',lambda *a,**kw:True)
+    changed=replace(target.preview,timezone_result='Timezone needs attention: old → new')
+    monkeypatch.setattr(e,'change_experiment',lambda *a,**kw:changed)
+    def slow(*a,**kw):
+        assert w.working and 'verified after reboot' in w.message.value
+        assert 'Timezone needs attention' in w.message.value and 'Checking workbook' in w.maintenance_text.value
+        raise RuntimeError('optional backend failed')
+    monkeypatch.setattr(g.maintenance,'run',slow)
+    w._change()
+    assert 'verified after reboot' in w.message.value and not w.working

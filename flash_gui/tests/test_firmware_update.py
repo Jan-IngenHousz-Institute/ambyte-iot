@@ -191,7 +191,7 @@ def automatic_timezone_pair():
     from flash_gui.tests.test_identity import IDENTITY
     before = firmware_update.ConfiguredDevice('bench', IDENTITY,
         {key: 'Europe/Berlin' if key == 'timezone' else key for key in firmware_update.CONFIG_KEYS})
-    zone = ambyte_serial.DeviceTimezone('Australia/Darwin','Australia/Darwin','auto','Australia/Darwin',34200)
+    zone = ambyte_serial.DeviceTimezone('Australia/Darwin','Australia/Darwin','location','Australia/Darwin',34200)
     after = replace(before, settings=dict(before.settings, timezone='Australia/Darwin'),
         identity=replace(IDENTITY, location=ambyte_serial.DeviceLocation(True,-25.3444,131.0369), timezone=zone))
     return before, after
@@ -250,3 +250,14 @@ def test_workbook_check_is_after_successful_postboot_verify_and_cannot_change_up
     result=firmware_update.update_firmware('bench',bench.release,client=client,log=bench.logs.append)
     assert result.changed and 'inaccessible experiment' in result.maintenance.text
     assert calls==[('bench',MAC,client)]
+
+
+def test_verified_primary_firmware_result_precedes_optional_checks(bench,monkeypatch):
+    from flash_gui import maintenance
+    seen=[]
+    def optional(*a,**kw):
+        assert len(seen)==1 and seen[0].changed and seen[0].firmware=='2.12.0'
+        return maintenance.MaintenanceResult('Workbook: up to date')
+    monkeypatch.setattr(maintenance,'run',optional)
+    result=firmware_update.update_firmware('bench',bench.release,on_primary=seen.append,log=bench.logs.append)
+    assert result.maintenance.workbook=='Workbook: up to date'

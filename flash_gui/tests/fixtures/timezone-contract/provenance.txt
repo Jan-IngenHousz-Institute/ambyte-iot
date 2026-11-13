@@ -1,0 +1,15 @@
+Frozen PR3 v1 contract, 2026-11-13, supplied by the PR3 implementing agent.
+The location/timezone groups were emitted by production cli_identity.c in its
+host harness, implemented in PR3 commit 0e82423 (PR #100). Stable legacy identity fields are added by each test's USB peer.
+These are host-harness captures, not physical-board qualification. The next
+coordinated PR3 bench slot must confirm them against the real firmware image.
+Capability token: timezone.auto. Without it, all timezone maintenance is display-only.
+
+Frozen cfg output:
+  cfg get timezone -> timezone = Europe/Berlin
+  cfg set timezone Asia/Tokyo -> cfg set timezone = Asia/Tokyo  (reboot to apply)
+  cfg set timezone auto -> cfg set timezone = auto  (reboot to apply)
+  cfg get timezone -> timezone = Europe/Berlin (unchanged after auto)
+  cfg get timezone_source -> timezone_source = auto
+The explicit setter changes only the fallback and preserves the pin/source key.
+The auto setter releases a pin; fallback maintenance must never invoke it.

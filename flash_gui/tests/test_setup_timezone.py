@@ -66,3 +66,22 @@ def test_provisioning_writes_fallback_without_pinning_the_device():
     assert 'tz_source,' not in build_nvs_csv(make_plan())
     csv=build_nvs_csv(make_plan(timezone='Australia/Darwin',lat=-25.3444,lon=131.0369))
     assert 'tz_source,' not in csv and 'site_state,data,hex2bin,' in csv
+
+
+@pytest.mark.parametrize('error',[RuntimeError('bad geo data'),ImportError('missing geo data')])
+def test_resolver_failure_requires_explicit_fallback_but_does_not_block_it(monkeypatch,error):
+    monkeypatch.setitem(sys.modules,'flash_gui.tz_geo',SimpleNamespace(zone_for=lambda *a:(_ for _ in ()).throw(error)))
+    with pytest.raises(ValueError,match='lookup unavailable'):
+        timezones.setup_zone('-25.3444','131.0369','')
+    assert timezones.setup_zone('-25.3444','131.0369','Australia/Darwin')[0]=='Australia/Darwin'
+
+
+def test_setup_preview_shows_coordinate_and_explicit_fallback_together(resolve):
+    from flash_gui import gui
+    from flash_gui.tests.test_wifi_gui import Var
+    app=SimpleNamespace(setup_lat=Var('-25.3444'),setup_lon=Var('131.0369'),setup_tz=Var('Europe/Berlin'),setup_preview=Var())
+    app._setup_zone=lambda:timezones.setup_zone(app.setup_lat.get(),app.setup_lon.get(),app.setup_tz.get())
+    gui.App._update_setup_preview(app)
+    assert 'Coordinate-resolved fallback: Australia/Darwin' in app.setup_preview.value
+    assert 'Explicit fallback: Europe/Berlin' in app.setup_preview.value
+    assert 'Chosen fallback: Europe/Berlin' in app.setup_preview.value

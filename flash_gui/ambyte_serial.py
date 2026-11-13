@@ -131,6 +131,7 @@ class LocationCoordinates:
 class LiveLocation(LocationCoordinates):
     accuracy_m: float | None
     age_s: int | None
+    status: str = "waiting"
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ class DeviceLocation(LocationCoordinates):
     accuracy_m: float | None = None
     configured: LocationCoordinates | None = None
     live: LiveLocation | None = None
+    configured_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,7 @@ class DeviceTimezone:
     source: str
     resolved: str | None
     utc_offset_seconds: int
+    pinned: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,10 +163,10 @@ class ConsoleIdentity:
     capabilities: frozenset[str]
     signed: bool = False
     storage: dict | None = None
-    location: DeviceLocation | None = None
-    timezone: DeviceTimezone | None = None
-    location_error: str | None = None
-    timezone_error: str | None = None
+    location: DeviceLocation | None = field(default=None, compare=False)
+    timezone: DeviceTimezone | None = field(default=None, compare=False)
+    location_error: str | None = field(default=None, compare=False)
+    timezone_error: str | None = field(default=None, compare=False)
 
 
 def _identity_object(obj: dict) -> ConsoleIdentity:
@@ -237,7 +240,11 @@ def _identity_object(obj: dict) -> ConsoleIdentity:
             age = live_site['age_s']
             if age is not None and (type(age) is not int or age < 0):
                 raise ValueError('invalid location age')
-            live = LiveLocation(live.set, live.lat, live.lon, accuracy(live_site['accuracy_m']), age)
+            status = live_site['status']
+            stale = site['configured_stale']
+            if not isinstance(status, str) or not status or type(stale) is not bool:
+                raise ValueError('invalid live status or configured-stale flag')
+            live = LiveLocation(live.set, live.lat, live.lon, accuracy(live_site['accuracy_m']), age, status)
             location_source = site['source']
             if location_source not in {'live', 'configured', 'none'}:
                 raise ValueError('invalid location source')
@@ -246,19 +253,20 @@ def _identity_object(obj: dict) -> ConsoleIdentity:
                     or (location_source == 'none' and effective.set)):
                 raise ValueError('location source disagrees with effective coordinates')
             location = DeviceLocation(effective.set, effective.lat, effective.lon, location_source,
-                                      accuracy(site['accuracy_m']), fallback, live)
+                                      accuracy(site['accuracy_m']), fallback, live, stale)
         except (ValueError, TypeError, KeyError, OverflowError):
             location_error = 'malformed location metadata'
     timezone = timezone_error = None
     if 'timezone' in obj:
         try:
             zone = obj['timezone']
-            if (not isinstance(zone, dict) or zone.get('source') not in {'auto', 'manual', 'provisioned', 'unknown', 'live'}
+            if (not isinstance(zone, dict) or zone.get('source') not in {'manual', 'location', 'configured', 'none'}
                     or not {'configured', 'active', 'resolved', 'utc_offset_seconds'} <= zone.keys()
+                    or type(zone.get('pinned')) is not bool
                     or type(zone['utc_offset_seconds']) is not int or abs(zone['utc_offset_seconds']) > 86400):
                 raise ValueError('invalid timezone identity')
             timezone = DeviceTimezone(nullable(zone['configured']), nullable(zone['active']), zone['source'],
-                                      nullable(zone['resolved']), zone['utc_offset_seconds'])
+                                      nullable(zone['resolved']), zone['utc_offset_seconds'], zone['pinned'])
         except (ValueError, TypeError, KeyError):
             timezone_error = 'malformed timezone metadata'
     return ConsoleIdentity(mac.upper() if mac else None,

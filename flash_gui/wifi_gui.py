@@ -101,6 +101,11 @@ class WifiDialog(tk.Toplevel):
         self._controls()
         client = getattr(self.app, "client", None)
         expected = self.info
+        def primary_ready(value):
+            if self.winfo_exists():
+                apply(value)
+                self.maintenance_text.set('Checking workbook and fallback timezone… keep USB connected. A workbook install or reboot may be needed.')
+
         def finish(value, error, extra):
             if not self.winfo_exists():
                 return
@@ -110,7 +115,8 @@ class WifiDialog(tk.Toplevel):
                 self.saved_schedule = None
                 self.message.set(str(error))
             else:
-                apply(value)
+                if not maintain:
+                    apply(value)
                 if extra is not None:
                     self.maintenance_text.set(extra.text)
                     if extra.port:
@@ -124,11 +130,6 @@ class WifiDialog(tk.Toplevel):
             extra = None
             try:
                 value, error = action(), None
-                if maintain:
-                    mac = value.mac if isinstance(value, wifi_settings.DeviceInfo) else expected.mac
-                    extra = maintenance.run(self.port, mac, client,
-                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self),
-                        log=getattr(self.app, "log", lambda text: None))
             except wifi_settings.WifiSettingsError as exc:
                 value, error = None, exc
             except Exception:
@@ -136,6 +137,16 @@ class WifiDialog(tk.Toplevel):
                 # failures generic; no raw serial capture is logged here.
                 value, error = None, wifi_settings.WifiSettingsError(
                     "Could not communicate with the Ambyte. Check USB, close other serial tools, then read the device again.")
+            if error is None and maintain:
+                try:
+                    self.app._post(primary_ready, value)
+                    mac = value.mac if isinstance(value, wifi_settings.DeviceInfo) else expected.mac
+                    extra = maintenance.run(self.port, mac, client,
+                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self),
+                        log=getattr(self.app, "log", lambda text: None))
+                except Exception:
+                    extra = maintenance.MaintenanceResult('Workbook: not checked: optional maintenance unavailable',
+                                                          'Fallback timezone: not checked')
             try:
                 self.app._post(finish, value, error, extra)
             except (RuntimeError, tk.TclError):
@@ -163,7 +174,7 @@ class WifiDialog(tk.Toplevel):
             self.network_note.set("Leave the password blank for an open network.\n" + behavior)
             self.message.set("Check the device name and MAC before updating.")
         self._start(lambda: wifi_settings.read_device(self.port), apply,
-                    "Reading the Ambyte on the selected USB port; startup can take 45 seconds…", maintain=True)
+                    "Reading the Ambyte; startup can take 45 seconds. The following workbook check may install or reboot; keep USB connected…", maintain=True)
 
     def _update(self, *, new_request=False, test_connection=False):
         if self.working or self.info is None or (test_connection and not self.info.service):

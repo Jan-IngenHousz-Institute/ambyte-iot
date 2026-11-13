@@ -1,20 +1,34 @@
-2026-11-13 | DEV bench Ambyte | firmware 2.16.0 | GUI source c2ad013
-Nonsecret selected-console baseline (credentials were never read):
-  schedule source: INSTALLED
-  SHA256: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7
-  workbook: 75c59552-4396-4948-8d08-c869445203e0 | script: wb-v7
-  timezone: Europe/Amsterdam
-  identity has no persisted-location field
+2026-11-13 | DEV firmware 2.16.0 | GUI 532f00e | read-only recapture
+Read device: 2.16.0 ScheduleIdentity(source='INSTALLED', sha256='943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7', workbook_version_id='75c59552-4396-4948-8d08-c869445203e0', script_version='wb-v7')
+PUBLIC STATUS: status
+CLI status:
 
-Actual DEV API read + production maintenance.run, same USB MAC:
-  Pinned DEV workbook compiled for fw 2.16.0 matches baseline SHA and workbook ID.
-  openJII workbook programming: 3 macros, 3 with branch routing.
-  Workbook: up to date
-  Timezone: Europe/Amsterdam; location unavailable (firmware too old)
-  PASS: actual DEV read endpoints + production USB maintenance;
-        unchanged public configuration and loaded workbook.
+ - BME280 ready: yes
 
-No flash, timezone, Wi-Fi, topic, certificate or workbook writes were performed.
-The absent identity location field intentionally prevents a mismatch prompt.
-Timezone yes/no and changed-workbook install qualification await the PR3 image.
-Bench released to coordinator; no restoration was needed.
+ - RTC ready: yes
+
+ - RTC (UTC): 2026-11-13 09:04:26 (1794560666)
+
+ - RTC local: 2026-11-13 10:04:26 (UTC+01:00)
+
+ - Wi-Fi: connected (provisioned: yes)
+
+ - MAC: 28:37:2F:FF:E7:04
+
+ - DB: online
+
+   events: 10 total, 10 pending sync, next id 234074
+
+ - SD card: mounted (archive/logs/AMBIT OTA only)
+
+ - Power: Vbat 4.18 V, Vin 5.16 V, Vsys 4.28 V, Iin 119 mA, Icharge 0 mA
+
+   source: external, charge: charged, publish gate: CLOSED
+
+ambyte>
+ambyte>
+PASS: read-only current output captured; original public configuration and workbook unchanged. No writes.
+
+Read-only guard: installation was inhibited in this capture process.
+No credential, Wi-Fi, topic, timezone or schedule writes were sent.
+No event/cursor actions were taken; pending events are normal DEV measurements.

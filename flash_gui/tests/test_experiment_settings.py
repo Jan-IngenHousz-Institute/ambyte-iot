@@ -194,3 +194,14 @@ def test_wrong_workbook_after_success_result_blocks_topic_writes(target):
     with pytest.raises(e.ExperimentSettingsError,match='workbook was not confirmed active'):
         e.change_experiment(target.preview,target.client,NEW)
     assert not any(c.startswith('cfg set ') for c in target.device.plain)
+
+
+def test_experiment_change_warns_about_unexplained_timezone_drift(target):
+    original=target.device.console
+    def console(cmd):
+        result=original(cmd)
+        if cmd=='reboot':target.values['timezone']='Etc/UTC'
+        return result
+    target.device.console=console
+    result=e.change_experiment(target.preview,target.client,NEW)
+    assert 'Timezone needs attention: Europe/Amsterdam → Etc/UTC' in result.timezone_result

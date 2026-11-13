@@ -8,7 +8,7 @@ policy. Broker/certificate ownership is preserved, not guessed from API login.
 Queued records deliberately follow the current topic/provenance at publication.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -30,6 +30,7 @@ class DeviceTarget:
     broker: str
     experiment_id: str | None
     environment: str | None
+    timezone_result: str | None = None
 
     @property
     def mac(self):
@@ -245,16 +246,19 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
                 after = firmware_update._snapshot(console)
                 after = firmware_update._settled_schedule(console, after, log, before_flash=False)
                 schedule = after.identity.schedule
-                preserved = ('mqtt_uri', 'mqtt_client_id', 'command_topic', 'device_name')
+                expected_after = replace(expected.device, settings=dict(expected.device.settings,
+                    mqtt_topic_root=new_root, status_topic=config.default_status_topic(new_root)))
+                changed, timezone_result = firmware_update._configuration_changes(expected_after, after)
                 if (after.identity.mac != expected.mac or after.identity.thing_name != expected.device.identity.thing_name
                         or after.identity.fw != expected.device.identity.fw
-                        or any(after.settings[key] != expected.device.settings[key] for key in preserved)
+                        or changed
                         or after.settings['mqtt_topic_root'] != new_root
                         or after.settings['status_topic'] != config.default_status_topic(new_root)
                         or schedule.source != 'INSTALLED' or schedule.sha256 != source.sha256
                         or schedule.workbook_version_id != source.workbook_version_id):
                     raise ExperimentSettingsError("The destination configuration/workbook was not verified after reboot.")
-                return _target(console, {client.env.key: expected.broker} if expected.environment else {})
+                return replace(_target(console, {client.env.key: expected.broker} if expected.environment else {}),
+                               timezone_result=timezone_result)
     except (OSError, ambyte_serial.ConsoleError, ServiceClientError, wifi_settings.WifiSettingsError,
             firmware_update.FirmwareUpdateError, ExperimentSettingsError) as exc:
         raise ExperimentSettingsError(f"{stage}. {exc} Read the device destination and retry this action. No registration or certificate write was attempted.") from None

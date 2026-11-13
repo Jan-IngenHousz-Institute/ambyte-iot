@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 """Device destination and experiment-only maintenance, separate from provisioning."""
+from dataclasses import replace
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -58,6 +59,11 @@ class ExperimentDialog(tk.Toplevel):
         self.message.set(progress)
         self._controls()
         client = self.app.client
+        def primary_ready(value):
+            if self.winfo_exists():
+                apply(value)
+                self.maintenance_text.set('Checking workbook and fallback timezone… keep USB connected. A workbook install or reboot may be needed.')
+
         def finish(value, error, extra):
             if not self.winfo_exists():
                 return
@@ -74,18 +80,21 @@ class ExperimentDialog(tk.Toplevel):
             extra = None
             try:
                 value, error = action(), None
-                if maintain:
-                    extra = maintenance.run(value.device.port, value.mac, client,
-                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self), log=self.app.log)
-                    # Display the loaded workbook after automatic installation.
-                    # A second read failure must not erase the completed action.
-                    try:
-                        value = settings.read_target(extra.port or value.device.port,
-                            dict(getattr(self.app.settings, "mqtt_endpoints", {})))
-                    except settings.ExperimentSettingsError:
-                        pass
             except Exception as exc:
                 value, error = None, str(exc)
+            if error is None and maintain:
+                try:
+                    self.app._post(primary_ready, value)
+                    extra = maintenance.run(value.device.port, value.mac, client,
+                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self), log=self.app.log)
+                    refreshed = settings.read_target(extra.port or value.device.port,
+                        dict(getattr(self.app.settings, "mqtt_endpoints", {})))
+                    value = replace(refreshed, timezone_result=value.timezone_result)
+                except settings.ExperimentSettingsError:
+                    pass  # A readback failure does not erase the primary result.
+                except Exception:
+                    extra = maintenance.MaintenanceResult('Workbook: not checked: optional maintenance unavailable',
+                                                          'Fallback timezone: not checked')
             try:
                 self.app._post(finish, value, error, extra)
             except (RuntimeError, tk.TclError):
@@ -112,7 +121,7 @@ class ExperimentDialog(tk.Toplevel):
         self.target = None
         endpoints = dict(getattr(self.app.settings, 'mqtt_endpoints', {}))
         self._run(lambda: settings.read_target(self.port, endpoints), self._show,
-                  'Reading identity, broker and topics, then checking the workbook and deployment timezone…', maintain=True)
+                  'Reading identity, broker and topics. The following workbook check may install or reboot; keep USB connected…', maintain=True)
 
     def _cloud(self):
         if self.working or self.target is None or self.app.client is None:

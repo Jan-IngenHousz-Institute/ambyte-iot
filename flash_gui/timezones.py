@@ -90,8 +90,12 @@ def setup_zone(latitude: str, longitude: str, selected: str) -> tuple[str, float
         except ValueError:
             raise ValueError('Enter both deployment coordinates: latitude −90…90 and longitude −180…180.') from None
         if (lat, lon) != (0, 0):
-            from .tz_geo import zone_for
-            resolved = zone_for(lat, lon)
+            try:
+                from .tz_geo import zone_for
+                resolved = zone_for(lat, lon)
+            except (RuntimeError, ImportError):
+                if not selected:
+                    raise ValueError('Coordinate timezone lookup unavailable; choose the fallback zone explicitly.') from None
     zone = selected or resolved
     if not zone:
         raise ValueError('Choose the fallback IANA timezone, or enter coordinates that resolve to one. The laptop timezone is not used.')

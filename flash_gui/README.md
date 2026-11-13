@@ -633,3 +633,10 @@ are displayed separately, and a live estimate never triggers an override prompt.
 Without a map match, select the fallback zone explicitly.
 See [automatic maintenance checks](../docs/usb-maintenance-sync.md) for source
 semantics, same-MAC reboot verification and bench evidence.
+
+Timezone maintenance prompts/writes are admitted only by the firmware's
+`timezone.auto` capability and frozen PR3 metadata. Older firmware is display-only,
+and a manual pin is never removed by a fallback correction. Eligible corrections
+write the explicit fallback zone, preserving pin/source state. The GUI publishes
+the primary Wi-Fi/experiment/firmware result before the extra check, with a
+separate progress line while a workbook install or reboot is running.

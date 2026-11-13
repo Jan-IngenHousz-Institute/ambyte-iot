@@ -263,3 +263,19 @@ def test_read_automatically_checks_device_mac_without_selected_experiment(monkey
         calls.append((port,mac,client)) or wifi_gui.maintenance.MaintenanceResult('Workbook: up to date'))
     window._read();finish()
     assert calls==[('bench',INFO.mac,None)] and window.maintenance_text.value.startswith('Workbook: up to date')
+
+
+def test_primary_save_is_visible_while_optional_maintenance_is_still_running(monkeypatch):
+    window,_=dialog(monkeypatch)
+    window.app._post=lambda fn,*a:fn(*a)
+    monkeypatch.setattr(wifi_settings,'save_wifi',lambda *a:wifi_settings.WifiResult('Field hub 1',True))
+    def slow(*a,**kw):
+        assert window.working and 'Wi-Fi saved and connection confirmed' in window.message.value
+        assert 'Checking workbook' in window.maintenance_text.value
+        assert window.update_btn.state=='disabled'
+        raise RuntimeError('optional backend failed')
+    monkeypatch.setattr(wifi_gui.maintenance,'run',slow)
+    window._update()
+    assert 'Wi-Fi saved and connection confirmed' in window.message.value
+    assert 'optional maintenance unavailable' in window.maintenance_text.value
+    assert not window.working

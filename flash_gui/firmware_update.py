@@ -32,6 +32,10 @@ class FirmwareUpdateError(RuntimeError):
     pass
 
 
+class IdentityUnavailable(FirmwareUpdateError):
+    pass
+
+
 @dataclass(frozen=True)
 class ConfiguredDevice:
     port: str
@@ -59,7 +63,7 @@ def _snapshot(console):
     try:
         identity = console.identity()
     except ambyte_serial.UnsupportedConsoleCommand:
-        raise FirmwareUpdateError("This firmware cannot report its compiled identity. Firmware-only maintenance requires identity-capable firmware; no credentials were changed.") from None
+        raise IdentityUnavailable("This firmware cannot report its compiled identity. Firmware-only maintenance requires identity-capable firmware; no credentials were changed.") from None
     if not identity.mac or not identity.thing_name or not identity.fw:
         raise FirmwareUpdateError("The Ambyte did not provide its MAC, client identity and compiled firmware version.")
     settings = {key: console.cfg_get(key) for key in CONFIG_KEYS}
@@ -155,7 +159,7 @@ def _configuration_changes(before, after):
         zone, location = after.identity.timezone, after.identity.location
         old, new = before.settings['timezone'] or 'unset', after.settings['timezone'] or 'unset'
         if (zone is not None and location is not None and location.set
-                and zone.source in {'auto', 'live'} and zone.configured == zone.active == zone.resolved == new):
+                and zone.source == 'location' and zone.configured == zone.active == zone.resolved == new):
             accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
             correction = (f'Timezone updated by the Ambyte: {old} → {new} '
                           f'(source={location.source}/{zone.source}, accuracy={accuracy})')
@@ -164,7 +168,7 @@ def _configuration_changes(before, after):
     return changed, correction
 
 
-def update_firmware(port, release, *, client=None, confirm_timezone=None, log=print):
+def update_firmware(port, release, *, client=None, confirm_timezone=None, on_primary=lambda result: None, log=print):
     """Update an existing configured device; initial provisioning is separate."""
     try:
         images, table, metadata = _candidate(release)
@@ -177,6 +181,7 @@ def update_firmware(port, release, *, client=None, confirm_timezone=None, log=pr
             if before.identity.fw.removeprefix("v") == release.version.removeprefix("v"):
                 log(f"{before.identity.mac}: firmware {release.version} is already installed; nothing was flashed.")
                 # No flash, but this is still a maintenance session.
+                on_primary(FirmwareUpdateResult(before.identity.mac, before.identity.fw, False))
                 from . import maintenance
                 extra = maintenance.check_session(console, before.identity.mac, client,
                     confirm_timezone=confirm_timezone, log=log)
@@ -213,6 +218,7 @@ def update_firmware(port, release, *, client=None, confirm_timezone=None, log=pr
         log("Verified firmware, MAC, client identity and existing configuration. No registration or certificate issuance was performed.")
         if timezone_correction:
             log(timezone_correction)
+        on_primary(FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, timezone_correction=timezone_correction))
         from . import maintenance
         extra = maintenance.run(after.port, after.identity.mac, client, confirm_timezone=confirm_timezone, log=log)
         return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, extra, timezone_correction)
