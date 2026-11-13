@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Pure policy — see power_policy.h for the rule and its field-incident origin.
+/* Pure policy - see power_policy.h for the rule and its field-incident origin.
  * Nothing here may touch I2C, the clock, or the log: the host tests drive this
  * file verbatim. */
 
@@ -39,7 +39,7 @@ power_gate_step_t power_gate_step(power_gate_t *g, int64_t now_ms,
          * OFF dwell of VALID "absent" readings. (Before this, a read error
          * merely held state, so error samples could silently age a close
          * candidate and the next valid sample flipped the gate at once.)
-         * A pending OPEN is left running — invalid samples never hold the
+         * A pending OPEN is left running - invalid samples never hold the
          * gate closed. */
         if (g->open) g->cand = true;
 
@@ -53,20 +53,20 @@ power_gate_step_t power_gate_step(power_gate_t *g, int64_t now_ms,
     }
 
     /* Valid evidence: exactly the Phase 1 debounce, starting from wherever the
-     * gate is (including a fail-open — a valid "on battery" reading closes it
+     * gate is (including a fail-open - a valid "on battery" reading closes it
      * after the normal OFF dwell). */
     g->last_valid = true;
     g->invalid_streak = 0;
 
     if (present == g->open) {
-        g->cand = present;                 /* steady — clear any pending change */
+        g->cand = present;                 /* steady - clear any pending change */
         if (!present) {
             g->reason = POWER_GATE_REASON_ON_BATTERY;
         } else if (g->reason == POWER_GATE_REASON_POWER_UNVERIFIED) {
             /* Open on the fail-open fallback and the charger reads again: the
              * gate is already open, but the reason (and with it AMBIT flashing)
              * upgrades to "external_power" only after the same ON dwell a
-             * closed gate would need — one good frame after a frozen spell is
+             * closed gate would need - one good frame after a frozen spell is
              * not yet evidence. */
             if (g->verify_ms == 0) g->verify_ms = now_ms != 0 ? now_ms : 1;
             if ((now_ms - g->verify_ms) >= POWER_GATE_ON_DWELL_MS) {
@@ -80,14 +80,14 @@ power_gate_step_t power_gate_step(power_gate_t *g, int64_t now_ms,
     }
     g->verify_ms = 0;
     if (present != g->cand) {
-        g->cand = present;                 /* new candidate — start the dwell timer */
+        g->cand = present;                 /* new candidate - start the dwell timer */
         g->cand_ms = now_ms;
         return POWER_GATE_STEP_NONE;
     }
     const int64_t dwell = present ? POWER_GATE_ON_DWELL_MS : POWER_GATE_OFF_DWELL_MS;
     if ((now_ms - g->cand_ms) < dwell) return POWER_GATE_STEP_NONE;
 
-    g->open = present;                     /* debounce satisfied — flip the gate */
+    g->open = present;                     /* debounce satisfied - flip the gate */
     g->reason = present ? POWER_GATE_REASON_EXTERNAL_POWER : POWER_GATE_REASON_ON_BATTERY;
     return present ? POWER_GATE_STEP_OPENED : POWER_GATE_STEP_CLOSED;
 }

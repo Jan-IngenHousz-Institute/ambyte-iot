@@ -32,21 +32,26 @@ typedef struct {
     uint16_t input_ma;     /* input current */
     bool     input_present;/* external source detected (VIN status or voltage > UVLO) */
     uint8_t  charge_status;/* 0=idle 1=pre-charge 2=fast-charge 3=charge-done (REG0C) */
+    /* Raw live charger status/fault registers (MP2731 REG0C / REG0D), filled on
+     * EVERY read the bus completed - also when the frame was rejected - so
+     * telemetry can say why a charger's ADC stopped (input, NTC, thermal, …). */
+    uint8_t  status_reg;
+    uint8_t  fault_reg;
 } power_reading_t;
 
 /* A power_read_fn returns ESP_OK ONLY for a fresh, plausible reading. Every other
  * return is "no power evidence" and is classified below; consumers must never
  * read *out as a measurement then (the driver may leave the raw, rejected frame
  * there for diagnostics). Two driver-specific codes carry the verdict:
- *   POWER_ERR_ADC_TIMEOUT  — the conversion never completed (a stuck/frozen ADC:
+ *   POWER_ERR_ADC_TIMEOUT  - the conversion never completed (a stuck/frozen ADC:
  *                            the result registers would be stale);
- *   POWER_ERR_IMPLAUSIBLE  — a completed frame that cannot describe a running
+ *   POWER_ERR_IMPLAUSIBLE  - a completed frame that cannot describe a running
  *                            unit (all-zero, system rail below brown-out, out of
  *                            range). 2026-11-13: an all-zero frame held a prod
  *                            unit's publish gate closed for 9+ h.
- *   POWER_ERR_NO_INPUT     — the charger's live status says, consistently, that
+ *   POWER_ERR_NO_INPUT     - the charger's live status says, consistently, that
  *                            there is no input. Its ADC only runs with an input
- *                            (MP2731 datasheet p.26), so there are no voltages —
+ *                            (MP2731 datasheet p.26), so there are no voltages -
  *                            but "no external power" itself is trustworthy, and
  *                            the publish gate treats it as on-battery evidence.
  * ESP_ERR_INVALID_STATE = no charger; anything else is a bus error. */

@@ -27,7 +27,7 @@ B = b"3C:DC:75:0E:02:B8"
 class PowerReading(ctypes.Structure):
     _fields_ = [("battery_mv", ctypes.c_uint16), ("system_mv", ctypes.c_uint16), ("input_mv", ctypes.c_uint16),
                 ("charge_ma", ctypes.c_uint16), ("input_ma", ctypes.c_uint16), ("input_present", ctypes.c_bool),
-                ("charge_status", ctypes.c_uint8)]
+                ("charge_status", ctypes.c_uint8), ("status_reg", ctypes.c_uint8), ("fault_reg", ctypes.c_uint8)]
 
 
 def build(out: Path) -> Path:

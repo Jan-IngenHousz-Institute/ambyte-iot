@@ -116,6 +116,12 @@ typedef struct {
      * implausible | i2c_error | unavailable). NULL = no charger wired: the power
      * group stays exactly as before (values when power_valid, else empty). */
     const char *power_reason;
+    /* Raw MP2731 REG0C (status) / REG0D (fault) as read with that verdict -
+     * emitted as power.status_reg / power.fault_reg (integers) when valid and
+     * power_reason is set, for valid AND rejected frames alike. */
+    bool power_regs_valid;
+    uint8_t power_status_reg;
+    uint8_t power_fault_reg;
     double battery_v;
     double input_v;
     double system_v;

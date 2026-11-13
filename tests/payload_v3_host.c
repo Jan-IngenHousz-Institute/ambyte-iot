@@ -374,6 +374,29 @@ static void print_telemetry_fixture(void)
     assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
     printf("TELEMETRY_SD_FAIL=%s\n", output);
 
+    /* 2026-11-13: charger verdict + raw status/fault, gate reason (additive). */
+    input.power_reason = "ok";
+    input.power_regs_valid = true;
+    input.power_status_reg = 0x39;
+    input.power_fault_reg = 0x80;
+    input.publish_gate_reason = "external_power";
+    assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
+    printf("TELEMETRY_POWER_OK=%s\n", output);
+
+    input.power_valid = false;          /* a rejected frame: no numbers, a reason */
+    input.power_reason = "implausible";
+    input.power_status_reg = 0x20;
+    input.power_fault_reg = 0x00;
+    input.publish_gate = true;
+    input.publish_gate_reason = "power_unverified";
+    assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
+    printf("TELEMETRY_POWER_INVALID=%s\n", output);
+
+    input.power_reason = "i2c_error";   /* bus error: registers not read */
+    input.power_regs_valid = false;
+    assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
+    printf("TELEMETRY_POWER_I2C=%s\n", output);
+
     input.air_temperature = NAN;
     assert(!payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
 

@@ -710,7 +710,7 @@ static void app_prepare_reboot(void)
  * KNOWN LIMIT (2026-11-13): the MP2731's ADC only converts with an input present
  * (datasheet p.26), so on battery there is no fresh battery voltage to compare
  * with the floor. Every release before this one compared a stale frame (or the
- * idle charger's VBAT 0, which the guard skipped) — so this guard has most
+ * idle charger's VBAT 0, which the guard skipped) - so this guard has most
  * likely never parked a field unit. It now refuses to act on such frames
  * instead of acting on them by accident; a real on-battery voltage source is
  * future work (docs/power-telemetry.md). */
@@ -770,7 +770,7 @@ static void app_power_guard_task(void *arg)
     (void)arg;
     /* The decision is power_policy.c (host-tested, same thresholds and streaks
      * as before). New since 2026-11-13: a charger read that is not battery
-     * evidence (stale/impossible frame, bus error, or "no input" — the MP2731's
+     * evidence (stale/impossible frame, bus error, or "no input" - the MP2731's
      * ADC does not run on battery, datasheet p.26) never parks the card, and
      * POWER_POLICY_INVALID_FAILOPEN_N of them in a row un-park it: a frozen
      * charger read must not keep the archive and the SD overflow offline. */
@@ -808,7 +808,7 @@ static void app_power_guard_task(void *arg)
             break;
         case POWER_GUARD_UNPARK_UNVERIFIED:
             ESP_LOGW(APP_TAG, "SD parked but %u charger reads in a row carry no battery "
-                              "evidence (last: %s) — remounting rather than holding the "
+                              "evidence (last: %s) - remounting rather than holding the "
                               "card offline on an unreadable charger",
                      (unsigned)POWER_POLICY_INVALID_FAILOPEN_N, power_read_reason_name(reason));
             app_sd_unpark_now();
@@ -818,7 +818,7 @@ static void app_power_guard_task(void *arg)
             const int64_t now = esp_timer_get_time() / 1000;
             if (reason != POWER_READ_OK && reason != POWER_READ_NO_INPUT &&
                 (last_warn_ms == 0 || now - last_warn_ms >= 15 * 60 * 1000)) {
-                ESP_LOGW(APP_TAG, "power guard: charger reading %s — not evidence; "
+                ESP_LOGW(APP_TAG, "power guard: charger reading %s - not evidence; "
                                   "the SD stays as it is (parked=%d)",
                          power_read_reason_name(reason), s_pwrguard_parked ? 1 : 0);
                 last_warn_ms = now;

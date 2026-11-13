@@ -854,7 +854,7 @@ static int64_t now_ms(void)
  *
  * The decision itself is power_policy.c (host-tested). Its one new rule: a
  * reading that is not evidence (stale ADC, impossible frame, bus error) never
- * closes the gate and, after POWER_POLICY_INVALID_FAILOPEN_N of them, opens it —
+ * closes the gate and, after POWER_POLICY_INVALID_FAILOPEN_N of them, opens it -
  * a frozen charger read held 14:63:93:37:A3:FC's data back for 9+ h. A "no
  * input" verdict from the charger's live status is evidence (on battery). */
 #define PUB_GATE_EVAL_INTERVAL_MS   5000    /* re-read the charger at most this often */
@@ -912,7 +912,7 @@ bool device_commands_publish_power_ok(void)
         break;
     case POWER_GATE_STEP_FAILOPEN:
         ESP_LOGW(TAG, "publish gate OPEN (power_unverified): %u consecutive charger "
-                      "reads without evidence (last: %s) — delivering rather than "
+                      "reads without evidence (last: %s) - delivering rather than "
                       "holding field data back on an unreadable charger",
                  (unsigned)s_pub_gate.invalid_streak, power_read_reason_name(reason));
         s_pub_gate_warn_ms = now;
@@ -1775,6 +1775,14 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
         const esp_err_t perr = s_cfg.read_power(&out->power);
         out->power_reason = power_read_reason_from_err(perr);
         out->power_valid = perr == ESP_OK;
+        /* The driver read the live status/fault registers whenever its verdict
+         * is a judgement of the frame (not a bus error / absent charger). */
+        out->charger_regs_valid = out->power_reason == POWER_READ_OK ||
+                                  out->power_reason == POWER_READ_NO_INPUT ||
+                                  out->power_reason == POWER_READ_ADC_TIMEOUT ||
+                                  out->power_reason == POWER_READ_IMPLAUSIBLE;
+        out->charger_status_reg = out->power.status_reg;
+        out->charger_fault_reg = out->power.fault_reg;
         if (out->power_valid) {
             s_last_batt_mv = out->power.battery_mv;
         } else {
@@ -1873,6 +1881,9 @@ static cmd_result_t emit_status_event(bool direct)
         .pending = s.pending,
         .power_valid = s.power_valid,
         .power_reason = s_cfg.read_power != NULL ? power_read_reason_name(s.power_reason) : NULL,
+        .power_regs_valid = s.charger_regs_valid,
+        .power_status_reg = s.charger_status_reg,
+        .power_fault_reg = s.charger_fault_reg,
         .publish_gate_reason = s.publish_gate_reason,
         .battery_v = (double)s.power.battery_mv / 1000.0,
         .input_v = (double)s.power.input_mv / 1000.0,

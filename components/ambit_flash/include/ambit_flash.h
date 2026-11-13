@@ -82,7 +82,7 @@ int ambit_flash_check(void);
 /* Boot-time firmware sync (Phase 3 full): find the SD target image, read each
  * present AMBIT's running version (ROM-probing silent channels so bare/bricked
  * units are found too), then flash every channel whose version differs from the
- * target — automatically, no operator. Flashing is gated on VERIFIED external
+ * target - automatically, no operator. Flashing is gated on VERIFIED external
  * power (device_commands_flash_power_ok: the publish gate's valid-evidence
  * decision, never its unreadable-charger fail-open), and a
  * per-channel NVS fail counter skips a channel after repeated failed attempts

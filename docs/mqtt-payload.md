@@ -617,11 +617,16 @@ non-negative integers.
 | `connectivity` | `wifi` | boolean | `wifi`; gateway has a Wi-Fi connection. |
 | | `provisioned` | boolean | `provisioned`; Wi-Fi credentials are provisioned. |
 | | `publish_gate` | boolean | `publish_gate`; external-power publication gate is open. |
+| | `publish_gate_reason` | string enum | Why the gate is in its state: `starting`, `external_power`, `on_battery`, `power_unverified` (opened because the charger could not be read; see [power-telemetry.md](power-telemetry.md)), `no_charger`. Additive since the 2026-11-13 fix; unknown future values are preserved. |
 | | `mqtt_reconnects` | integer | `mqtt_reconnects`; MQTT connection count for this boot. |
 | | `last_disc_reason` | string | `last_disc_reason`; most recent Wi-Fi/MQTT disconnect reason, empty when none is known. |
 | | `conn_age_s` | integer, s | `conn_age_s`; current MQTT connection age, `-1` when unavailable. |
 | | `pending` | integer | `pending`; persisted events awaiting acknowledgement. |
-| `power` | `battery_v` | number, V | Charger battery voltage. |
+| `power` | `valid` | boolean | The charger frame below is a fresh, plausible measurement. When `false` the numeric leaves are omitted, never zero-filled. Present whenever a charger is fitted (additive, 2026-11-13). |
+| | `reason` | string enum | Read verdict: `ok`, `no_input` (live status says no external input; the charger ADC does not run then, so no voltages), `adc_timeout`, `implausible` (e.g. all-zero, or charge current while not charging: a stale frame), `i2c_error`, `unavailable`. |
+| | `status_reg` | integer 0–255 | Raw MP2731 REG0C (VIN_STAT, CHG_STAT, …), also on rejected frames; omitted after a bus error. |
+| | `fault_reg` | integer 0–255 | Raw MP2731 REG0D (watchdog, input, thermal, NTC faults), same rules as `status_reg`. |
+| | `battery_v` | number, V | Charger battery voltage. |
 | | `input_v` | number, V | Charger input voltage. |
 | | `system_v` | number, V | Charger system-rail voltage. |
 | | `input_ma` | integer, mA | Charger input current. |

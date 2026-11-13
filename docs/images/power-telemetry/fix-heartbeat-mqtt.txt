@@ -1,0 +1,20 @@
+dev MQTT, topic experiment/data_ingest/v1/<experiment>/ambyte/v1.0/ambyte_<bench-mac>
+{
+ "measure_id": 236388,
+ "connectivity": {
+  "publish_gate": true,
+  "publish_gate_reason": "external_power",
+  "pending": 0
+ },
+ "power": {
+  "valid": true,
+  "reason": "ok",
+  "battery_v": 4.2,
+  "input_v": 5.1,
+  "system_v": 4.22,
+  "input_ma": 292,
+  "charge_ma": 175,
+  "input_present": true,
+  "charge_status": 2
+ }
+}

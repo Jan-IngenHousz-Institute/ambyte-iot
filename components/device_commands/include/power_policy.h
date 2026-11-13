@@ -1,8 +1,8 @@
 #ifndef AMBYTE_POWER_POLICY_H
 #define AMBYTE_POWER_POLICY_H
 
-/* What the firmware DOES with an MP2731 power reading — the publish gate and the
- * low-battery SD park guard — as pure state machines over (reading, verdict,
+/* What the firmware DOES with an MP2731 power reading - the publish gate and the
+ * low-battery SD park guard - as pure state machines over (reading, verdict,
  * now). No I2C, no clock, no logging: device_commands.c and app_main.c own those
  * and feed every sample through here, so tests/power_policy_host.c can drive the
  * exact production policy with a fake charger (stuck, all-zero, never-completing,
@@ -18,11 +18,11 @@
  * 14:63:93:37:A3:FC read an all-zero frame for 9+ h; the old gate took the frame at
  * face value ("no input"), stayed closed, and held 2,519 records back. Valid
  * readings behave exactly as before this module existed (same dwell times, same
- * thresholds). The one consumer that stays fail-CLOSED is AMBIT flashing — a
+ * thresholds). The one consumer that stays fail-CLOSED is AMBIT flashing - a
  * brownout mid-flash bricks a sensor, so it needs POSITIVE evidence of power
  * (power_gate_flash_ok). The trade-off of failing open is battery: a unit whose
  * charger cannot be read publishes on battery too, which can drain it faster at
- * night. That is the cheaper failure — internal littlefs keeps measuring through
+ * night. That is the cheaper failure - internal littlefs keeps measuring through
  * a brownout, but a closed gate on a dead charger reading holds data back for as
  * long as the reading stays dead (forever, on a frozen chip), until the ~17 h
  * store budget overflows. See docs/power-telemetry.md. */
@@ -85,7 +85,7 @@ power_gate_step_t power_gate_step(power_gate_t *g, int64_t now_ms,
                                   power_read_reason_t reason, bool present);
 
 /* AMBIT flashing: positive evidence only. True iff the gate is open on a VALID
- * external-power decision and the latest sample was itself valid — never on the
+ * external-power decision and the latest sample was itself valid - never on the
  * fail-open fallback (a frozen charger is exactly when we cannot know whether the
  * battery will survive a 30–60 s flash). */
 bool power_gate_flash_ok(const power_gate_t *g);

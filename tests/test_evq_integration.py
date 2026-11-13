@@ -63,6 +63,7 @@ PRODUCTION_SOURCES = [
     "components/sensor_inventory/sensor_inventory.c",
     "components/device_commands/envelope_provenance.c",
     "components/device_commands/telemetry_publish.c",
+    "components/device_commands/power_policy.c",
     "components/payload_codec/payload_v3.c",
     "components/payload_codec/payload_scalar.c",
     "components/payload_codec/payload_gzip.c",

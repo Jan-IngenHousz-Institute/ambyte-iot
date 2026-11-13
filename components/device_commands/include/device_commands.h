@@ -169,7 +169,7 @@ void device_commands_set_sync_notifier(void (*fn)(void));
 bool device_commands_publish_power_ok(void);
 
 /* AMBIT flashing power check: fail-CLOSED. True only when the publish gate is
- * open on VALID external-power evidence — never on the gate's power_unverified
+ * open on VALID external-power evidence - never on the gate's power_unverified
  * fail-open (a brownout mid-flash bricks the sensor). True without a charger. */
 bool device_commands_flash_power_ok(void);
 
@@ -222,6 +222,9 @@ typedef struct {
     int64_t         pending;
     bool            power_valid;        /* false if no charger / read failed */
     power_read_reason_t power_reason;   /* why (POWER_READ_OK when power_valid) */
+    bool            charger_regs_valid; /* the live REG0C/REG0D bytes below were read */
+    uint8_t         charger_status_reg; /* MP2731 REG0C, also for rejected frames */
+    uint8_t         charger_fault_reg;  /* MP2731 REG0D, also for rejected frames */
     power_reading_t power;              /* valid only when power_valid; zeroed otherwise */
     bool            publish_gate_open;  /* device_commands_publish_power_ok() */
     const char     *publish_gate_reason; /* power_gate_reason_name(), static string */

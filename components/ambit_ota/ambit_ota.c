@@ -1030,7 +1030,7 @@ static void ambit_do_attach(void)
             attach_report("gave_up", ch, inf.fw_version, &tgt);
             break;
         case AMBIT_ATTACH_DECIDE_STALE: {
-            power_reading_t p;
+            power_reading_t p = {0};   /* zeros, not stack garbage, in the log below */
             const bool power = cmd_read_power(&p).status == ESP_OK && ambit_attach_power_ok(&p);
             if (!power) {
                 ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but power is too low "

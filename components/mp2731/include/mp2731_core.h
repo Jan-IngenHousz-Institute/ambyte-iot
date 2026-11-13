@@ -6,7 +6,7 @@
  * never-completing, I2C-erroring or healthy. No ESP-IDF driver includes here.
  *
  * Datasheet: MPS "MP2731 Rev. 1.1", 8/24/2020 (Farnell mirror
- * https://www.farnell.com/datasheets/3437344.pdf — the MPS site serves a bot
+ * https://www.farnell.com/datasheets/3437344.pdf - the MPS site serves a bot
  * challenge). Page numbers below are the datasheet's own footers. */
 
 #include <stdbool.h>
@@ -20,12 +20,12 @@ extern "C" {
 #endif
 
 /* p.31 REG03 "ADC Control and OTG Configuration":
- *   bit7 ADC_START — "Set to 0 by default ... read-only when ADC_RATE = 1. This
+ *   bit7 ADC_START - "Set to 0 by default ... read-only when ADC_RATE = 1. This
  *                    bit stays high during ADC conversion." We use its fall as
  *                    the conversion-done signal (bench 2026-11-13: in charge mode
  *                    it reads 0 again well inside the old fixed 80 ms wait).
- *   bit6 ADC_RATE  — 0 one-shot, 1 continuous round-robin.
- *   bits5:0        — OTG voltage/current; preserved by every write.
+ *   bit6 ADC_RATE  - 0 one-shot, 1 continuous round-robin.
+ *   bits5:0        - OTG voltage/current; preserved by every write.
  * Both ADC bits are reset by REG_RST and by the I2C watchdog (p.31 "Reset by
  * WTD: Y"). */
 #define MP2731_REG_ADC_CTRL   0x03u
@@ -44,11 +44,11 @@ extern "C" {
 #define MP2731_FAULT_WATCHDOG     0x80u
 
 /* pp.37-39 ADC result registers: read-only, POR value 0x00, NOT reset by REG_RST
- * or the watchdog — so when no conversion runs they keep their last value (or
+ * or the watchdog - so when no conversion runs they keep their last value (or
  * 0x00 since the chip's own power-on). Bit weights (0 offset):
  *   0x0E VBATT 20 mV · 0x0F VSYS 20 mV · 0x11 VIN 60 mV ·
  *   0x12 ICHG 17.5 mA (charge mode only) · 0x13 IIN 13.3 mA (charge mode only).
- * p.26 ADC: "available in charge mode and OTG mode" — there is NO battery-only
+ * p.26 ADC: "available in charge mode and OTG mode" - there is NO battery-only
  * conversion. */
 #define MP2731_REG_VBAT       0x0Eu
 #define MP2731_REG_VSYS       0x0Fu
@@ -58,7 +58,7 @@ extern "C" {
 
 /* No conversion time is specified anywhere in the datasheet. The original
  * firmware waited a fixed 80 ms and that was always long enough in charge mode;
- * poll every 5 ms and give up after 250 ms (3x that) — a conversion that has
+ * poll every 5 ms and give up after 250 ms (3x that) - a conversion that has
  * not finished by then is not going to (ADC unavailable or wedged). */
 #define MP2731_ADC_POLL_MS        5u
 #define MP2731_ADC_TIMEOUT_MS   250u
@@ -81,6 +81,15 @@ extern "C" {
 #define MP2731_VSYS_MAX_MV     5000u
 #define MP2731_VBAT_MAX_MV     4800u
 
+/* Stale-frame signature: charge current in the ADC frame while the LIVE status
+ * says "not charging". ICHG is a charge-mode-only channel (p.10), so a real
+ * conversion cannot report current the chip is not delivering. Prod raw archive
+ * 2026-11-08..13: 0 of ~14,000 heartbeats from healthy units show it; every one
+ * of the eight 14:63:93:… Uluru units shows it on 85-100 % of its heartbeats,
+ * each repeating only 1-2 distinct frames (e.g. 39:37:30: charge_ma 420 with
+ * charge_status 0, ×181). Two LSBs, so a single-LSB ADC offset never trips it. */
+#define MP2731_ICHG_STALE_MA     35u
+
 typedef struct {
     esp_err_t (*read)(void *ctx, uint8_t reg, uint8_t *val);
     esp_err_t (*write)(void *ctx, uint8_t reg, uint8_t val);
@@ -99,14 +108,14 @@ typedef struct {
 } mp2731_frame_t;
 
 /* One power read. Returns:
- *   ESP_OK                 — fresh, plausible frame in *out;
- *   POWER_ERR_NO_INPUT     — live status consistently says no input
+ *   ESP_OK                 - fresh, plausible frame in *out;
+ *   POWER_ERR_NO_INPUT     - live status consistently says no input
  *                            (VIN_STAT 000 AND INPUT_FAULT AND not charging):
  *                            the ADC cannot convert (p.26), so the frame is
- *                            ignored — but this IS evidence of "on battery";
- *   POWER_ERR_ADC_TIMEOUT  — the conversion never completed;
- *   POWER_ERR_IMPLAUSIBLE  — a completed frame that cannot be real;
- *   any other error        — the bus failed.
+ *                            ignored - but this IS evidence of "on battery";
+ *   POWER_ERR_ADC_TIMEOUT  - the conversion never completed;
+ *   POWER_ERR_IMPLAUSIBLE  - a completed frame that cannot be real;
+ *   any other error        - the bus failed.
  * On every non-OK return *out still holds the decoded (rejected) frame, for
  * diagnostics only. `frame` may be NULL. */
 esp_err_t mp2731_core_read(const mp2731_bus_t *bus, power_reading_t *out,

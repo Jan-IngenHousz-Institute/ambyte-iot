@@ -3,14 +3,14 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Pure MP2731 read logic — see mp2731_core.h for the register map and datasheet
+/* Pure MP2731 read logic - see mp2731_core.h for the register map and datasheet
  * citations. Field incident 2026-11-13 (Uluru), the reason this file exists:
  *
  * The original read did `REG03 |= ADC_START`, slept 80 ms and read 0x0E-0x13,
  * never checking that a conversion had happened. But the MP2731 ADC only runs in
  * charge or OTG mode (datasheet p.26) and its result registers are never cleared
  * (pp.37-39). So whenever the panel gave no input, the firmware re-published the
- * last converted frame — or, after the chip itself had reset, its power-on 0x00s:
+ * last converted frame - or, after the chip itself had reset, its power-on 0x00s:
  *   - 14:63:93:37:A3:FC: all-zero frame (system_v 0 on a running unit) for 9+ h →
  *     "no input" → publish gate closed → 2,519 records held back;
  *   - 14:63:93:39:37:30 / 39:40:0C: one CHARGING frame (VIN 4.98 V) bit-identical
@@ -22,8 +22,8 @@
  * which do work on battery, before believing any frame.
  *
  * One-shot, not continuous (ADC_RATE=1): in continuous mode ADC_START is
- * read-only, so freshness becomes unobservable — exactly the property that
- * failed in the field — and the un-kicked I2C watchdog (below) resets ADC_RATE
+ * read-only, so freshness becomes unobservable - exactly the property that
+ * failed in the field - and the un-kicked I2C watchdog (below) resets ADC_RATE
  * to one-shot 40 s later anyway.
  *
  * The chip's I2C watchdog (REG08[5:4], default 40 s, p.33) is deliberately left
@@ -32,7 +32,7 @@
  * whole fleet's charging behaviour is calibrated on that. Expiry only resets
  * REG03's ADC bits between reads, and every read below sets them itself, so the
  * watchdog cannot freeze this path. Kicking or disabling it would move the
- * charger to "host mode" — a charging-behaviour change this fix does not need. */
+ * charger to "host mode" - a charging-behaviour change this fix does not need. */
 
 static esp_err_t rd(const mp2731_bus_t *bus, uint8_t reg, uint8_t *val)
 {
@@ -54,6 +54,8 @@ void mp2731_core_decode(const mp2731_frame_t *f, power_reading_t *out)
      * float with charge_ma 0) nor on VIN_STAT (flickers at the margin).
      * Unchanged from the original driver: valid frames gate exactly as before. */
     out->input_present = (out->charge_ma > 0u) || (out->input_mv >= MP2731_VIN_MIN_MV);
+    out->status_reg = f->status;
+    out->fault_reg = f->fault;
 }
 
 bool mp2731_core_plausible(const power_reading_t *p)
@@ -64,6 +66,9 @@ bool mp2731_core_plausible(const power_reading_t *p)
     }
     if (p->system_mv < MP2731_VSYS_MIN_MV || p->system_mv > MP2731_VSYS_MAX_MV) {
         return false;                          /* we are running on this rail */
+    }
+    if (p->charge_ma >= MP2731_ICHG_STALE_MA && p->charge_status == 0u) {
+        return false;                          /* charging per ADC, not per live status */
     }
     return p->battery_mv <= MP2731_VBAT_MAX_MV;
 }
@@ -92,7 +97,7 @@ esp_err_t mp2731_core_read(const mp2731_bus_t *bus, power_reading_t *out,
     f.ctrl_found = ctrl;
 
     /* A real start edge. If ADC_START (or continuous mode) is already set, a
-     * read-modify-write `ctrl | START` writes 1 over 1 and starts nothing — the
+     * read-modify-write `ctrl | START` writes 1 over 1 and starts nothing - the
      * original driver's blind spot. Clear both ADC bits first, then set START
      * alone (one-shot). Bits 5:0 (OTG settings) are preserved verbatim. */
     const uint8_t base = (uint8_t)(ctrl & (uint8_t)~(MP2731_ADC_START_BIT | MP2731_ADC_RATE_BIT));
@@ -133,10 +138,10 @@ esp_err_t mp2731_core_read(const mp2731_bus_t *bus, power_reading_t *out,
     mp2731_core_decode(&f, out);
 
     /* Verdict order matters:
-     * 1. No input (live status) — the ADC cannot have converted (p.26), whatever
+     * 1. No input (live status) - the ADC cannot have converted (p.26), whatever
      *    ADC_START did, so the frame is stale by definition; but the absence of
      *    external power is itself solid evidence.
-     * 2. No completion — stale frame.
+     * 2. No completion - stale frame.
      * 3. Completed but impossible. */
     if (mp2731_core_no_input(f.status, f.fault)) {
         out->input_present = false;

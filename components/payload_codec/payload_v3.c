@@ -834,10 +834,14 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
     jw_append(&w, "},\"power\":{");
     /* Additive (2026-11-13): `valid` + `reason` lead the group whenever a charger
      * is wired, so a rejected or stale charger frame is explicit instead of an
-     * empty object — and its numbers are never published as a measurement. */
+     * empty object - and its numbers are never published as a measurement. */
     if (input->power_reason != NULL) {
         jw_append(&w, "\"valid\":%s,\"reason\":", input->power_valid ? "true" : "false");
         jw_string(&w, input->power_reason);
+        if (input->power_regs_valid) {
+            jw_append(&w, ",\"status_reg\":%u,\"fault_reg\":%u",
+                      (unsigned)input->power_status_reg, (unsigned)input->power_fault_reg);
+        }
         if (input->power_valid) jw_append(&w, ",");
     }
     if (input->power_valid) {

@@ -337,7 +337,7 @@ static int cli_cmd_read_env(int argc, char **argv)
     return 0;
 }
 
-/* mp2731_regs [passes] [interval_ms] [read] — raw MP2731 register dump, one line
+/* mp2731_regs [passes] [interval_ms] [read] - raw MP2731 register dump, one line
  * per pass. Pure reads (no ADC kick, no configuration) unless `read` is given,
  * in which case each pass first runs the production power read (cmd_read_power)
  * so the dump shows exactly what that read left behind. Built for the 2026-11-13

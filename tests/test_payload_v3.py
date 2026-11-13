@@ -334,6 +334,32 @@ class PayloadV3Test(unittest.TestCase):
         )
         self.assertEqual(empty["health"]["attached_sensors"], [])
 
+    def test_telemetry_power_validity_is_additive(self) -> None:
+        # No charger verdict wired (power_reason NULL): byte-for-byte as before.
+        base = self.records["TELEMETRY"]["health"]
+        self.assertNotIn("valid", base["power"])
+        self.assertNotIn("publish_gate_reason", base["connectivity"])
+
+        ok = self.records["TELEMETRY_POWER_OK"]["health"]
+        self.assertEqual(ok["connectivity"]["publish_gate_reason"], "external_power")
+        self.assertEqual(
+            ok["power"],
+            {"valid": True, "reason": "ok", "status_reg": 0x39, "fault_reg": 0x80,
+             "battery_v": 3.912, "input_v": 5.04, "system_v": 3.92, "input_ma": 518,
+             "charge_ma": 297, "input_present": True, "charge_status": 2},
+        )
+        self.assertIn('"power":{"valid":true,"reason":"ok","status_reg":57,"fault_reg":128,'
+                      '"battery_v":3.912,', self.raw_records["TELEMETRY_POWER_OK"])
+
+        # A rejected frame publishes the verdict and the live registers, never numbers.
+        bad = self.records["TELEMETRY_POWER_INVALID"]["health"]
+        self.assertEqual(bad["power"], {"valid": False, "reason": "implausible",
+                                        "status_reg": 0x20, "fault_reg": 0})
+        self.assertEqual(bad["connectivity"]["publish_gate"], True)
+        self.assertEqual(bad["connectivity"]["publish_gate_reason"], "power_unverified")
+        self.assertEqual(self.records["TELEMETRY_POWER_I2C"]["health"]["power"],
+                         {"valid": False, "reason": "i2c_error"})
+
     def test_device_object_exact_contract(self) -> None:
         device = self.records["DEVICE"]
         self.assertEqual(device["schema"], "ambit.device/1")

@@ -1710,7 +1710,7 @@ static void sc_worst(void)
     fill_str(csrc, 15, '\x02');
     h_set_clock_source(csrc);
     g_env[0] = g_env[1] = g_env[2] = -FLT_MAX;
-    g_power = (power_reading_t){ 65535, 65535, 65535, 65535, 65535, true, 255 };
+    g_power = (power_reading_t){ 65535, 65535, 65535, 65535, 65535, true, 255, 255, 255 };
     size_t before = g_npub;
     B.connected = true;
     cmd_result_t r = cmd_publish_status_event();
