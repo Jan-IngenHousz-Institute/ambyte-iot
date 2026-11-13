@@ -80,7 +80,9 @@ def check_session(console, mac, client=None, *, confirm_timezone=None, log=lambd
     except Exception:
         result = MaintenanceResult('Workbook: not checked: device unavailable, unsupported or busy; read device again',
                                    'Timezone: not checked: device unavailable, unsupported or busy')
-    log(result.text)
+    public_log = re.sub(r'fallback coordinates: [^;\n]+', 'fallback coordinates: [redacted]', result.text)
+    public_log = re.sub(r'Effective location: [-+0-9.e]+, [-+0-9.e]+', 'Effective location: [redacted]', public_log)
+    log(public_log)
     return result
 
 

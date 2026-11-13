@@ -640,3 +640,23 @@ and a manual pin is never removed by a fallback correction. Eligible corrections
 write the explicit fallback zone, preserving pin/source state. The GUI publishes
 the primary Wi-Fi/experiment/firmware result before the extra check, with a
 separate progress line while a workbook install or reboot is running.
+
+
+## Experiment locations over USB
+
+Initial setup can fill its editable fallback coordinates from a readable experiment
+location. A single site is preselected; several require an explicit choice. The
+Device destination dialog offers **Set location from experiment** for the device's
+current experiment and **Also set this device's location** after an experiment
+change. PR3 metadata defaults the latter on for a missing/different-country
+configured site; legacy firmware defaults it off with an explanation.
+
+PR3 verifies persisted configured coordinates and reports its own effective zone.
+Audited 2.9.0, 2.14.0 and 2.16.0 firmware use persistent `sync loc`, with an explicit
+confirmation naming the fallback IANA zone, USB save/readback and same-MAC reboot.
+The legacy runtime is verified only when its local offset matches the expected
+offset at the device UTC clock; otherwise it reports saved, runtime unverified.
+Other legacy images refuse with update/MQTT guidance. This explicit action is the
+only exception to the automatic timezone write gate. Location results are separate
+from successful experiment changes. Coordinates stay out of diagnostic logs and
+public captures. See [maintenance details](../docs/usb-maintenance-sync.md#experiment-locations).

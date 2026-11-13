@@ -166,15 +166,102 @@ provisioning plan. The GUI writes no `tz_source` pin: explicit defaults remain
 eligible for replacement when the Ambyte finds a better location. The remote
 manual-pin escape hatch is separate from these setup inputs.
 
+## Experiment locations
+
+The signed-in account can read `GET /api/v1/experiments/{id}/locations` with
+experiment read access. The GUI rejects invalid lists, non-finite or out-of-range
+coordinates, booleans and the `(0,0)` unset marker. No registry or certificate
+permission is involved.
+
+Initial setup offers **Use experiment location** beside the editable fallback
+fields. One site is preselected and fills the coordinates; several sites require
+an explicit dropdown selection. Selecting a site resolves its fallback zone,
+while later coordinate/zone edits remain available. Changing experiments clears
+an unchanged automatic prefill; manually edited coordinates remain explicit.
+Stale API replies cannot populate a different experiment or account.
+
+The destination dialog offers **Also set this device's location to <name>**.
+With PR3 persisted metadata it defaults on when the configured site is absent or
+in another country, and off in the same country. Country comparison uses the
+shared IANA zone-country table, not the laptop or API display labels. Multiple
+sites need a selection first. On legacy firmware it defaults off with
+`Configured location unavailable on this firmware; choose explicitly`.
+The experiment change publishes its verified primary result first, then writes
+the chosen location as a separate phase/result. A location failure never erases
+the successful experiment change.
+
+**Set location from experiment** uses the connected device's **current** raw
+ingest topic, independently of the selected destination. It is disabled with a
+reason when signed out, the topic is unrecognized, the experiment is unreadable
+or has no locations. Merely reading locations never writes a device.
+
+### Persisted console paths and verification
+
+| Firmware | Persistence path | Verification |
+| --- | --- | --- |
+| 2.9.0, 2.14.0, 2.16.0 | `sync loc <lat> <lon>` calls `device_config_set_location`, which atomically writes `device_cfg/site_state` | Explicitly confirm the resolved fallback zone, write/read `cfg set timezone`, reboot the same MAC, then compare post-boot `sync loc` within its four-decimal precision |
+| PR3 with `timezone.auto` and valid identity | The same persisted `sync loc` path plus the firmware location/timezone worker | Read `identity.location.configured` before and after reboot, preserve the fallback zone, show effective zone/source from the device |
+| Other legacy/custom images | Not admitted without a source audit | Refuse with update/MQTT `set_location` guidance |
+
+Source audit: each named legacy tag's `components/CLI/CLI.c:cli_cmd_sync` calls
+the persistent setter before its runtime position update. `components/device_config`
+encodes `site_state`, and `components/sched_runner/sched_runner.c:apply_location_from_config`
+loads it before the schedule runs after reboot. A pre-write `sync loc` read is
+never evidence that a deployment site exists; it can be the compiled default.
+
+The legacy timezone exception is restricted to this explicit location action,
+with a confirmation naming the target IANA zone. It does not weaken automatic
+maintenance's `timezone.auto` write gate. Verification reads the device's UTC
+clock with `rtc`, computes the expected offset using host IANA data and compares
+it to RTC local STATUS. Missing clock/tzdata/status or a wrong offset reports
+`saved, runtime unverified`, never a verified zone. PR3 writes no zone itself;
+the device remains authoritative. A changed configured location can release a
+manual pin, which the confirmation states explicitly.
+
+Each action holds the same MAC lease, refuses unresolved journal/foreign device
+operations and rechecks stable identity/site configuration after service exit.
+Every write is possibly saved from transmission onward. Lost replies or failed
+readback report uncertainty with no automatic retry. No topics, certificates,
+Wi-Fi, raw NVS image or runtime-only offset argument are written. Coordinates
+appear only in operator-facing choices/results; diagnostic logs and public
+captures redact them. Fixtures use synthetic sites.
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant GUI
+    participant API as openJII
+    participant USB as Same Ambyte
+    GUI->>API: Read locations for selected or stored experiment
+    API-->>GUI: Validated sites or unavailable reason
+    Operator->>GUI: Choose site and confirm explicit location action
+    GUI->>USB: Lease and check journal plus foreign operation guard
+    GUI->>USB: Persist sync loc coordinates
+    alt PR3 capability and metadata
+        GUI->>USB: Read configured tuple without writing a zone
+    else Audited legacy release
+        GUI->>USB: Save explicitly confirmed fallback zone and read back
+    end
+    GUI->>USB: Reboot and reconnect the same MAC
+    USB-->>GUI: Settled config and workbook identity
+    alt PR3
+        GUI-->>Operator: Configured tuple verified and effective zone plus source
+    else Legacy
+        GUI->>USB: Read post-boot position and UTC clock plus local offset
+        GUI-->>Operator: Verified offset or saved with runtime unverified
+    end
+    Note over GUI,Operator: Lost replies report possible saved change without retry
+```
+
 ## Qualification
 
-The full GUI suite currently passes 644 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 701 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,
 source/readback/runtime verification, live metadata failure isolation and initial setup fallback defaults.
 The repository suite with `CC=clang uv run --locked --group test pytest -q`
-passed 786 tests and 1276 subtests (4 skips, 2 expected failures). The default
+passed 787 tests and 1286 subtests (3 skips, 2 expected failures). The default
 `cc` lacks its ASan/UBSan libraries on this host, so the full run uses clang.
 
 On the shared DEV bench with firmware 2.16.0, the actual DEV pinned workbook

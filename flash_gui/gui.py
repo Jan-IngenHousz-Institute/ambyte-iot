@@ -21,7 +21,7 @@ from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from tkinter import font as tkfont
 
-from . import app_update, esptool_ops, procedure, release_fetch, timezones, sensor_diagnostics
+from . import app_update, esptool_ops, procedure, release_fetch, timezones, sensor_diagnostics, location_settings
 from .config import ENVIRONMENTS, Settings
 from .openjii_client import OpenJIIClient, OpenJIIError, WorkbookProgramming
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
@@ -253,6 +253,42 @@ class App(ttk.Frame):
         for variable in (self.setup_lat, self.setup_lon, self.setup_tz):
             variable.trace_add('write', lambda *args: self._update_setup_preview())
         self._update_setup_preview()
+        from .location_gui import LocationPicker
+        self.setup_location_picker = LocationPicker(frame, 'Use experiment location:', self._use_setup_location)
+        self.setup_location_picker.grid(row=8, column=0, columnspan=4, sticky='we', pady=(6, 0))
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Select an experiment to read its locations.'))
+
+    def _use_setup_location(self):
+        chosen = self.setup_location_picker.selected()
+        if chosen is not None:
+            self.setup_lat.set(str(chosen.latitude))
+            self.setup_lon.set(str(chosen.longitude))
+            self.setup_tz.set('')  # Resolve the selected coordinates; later manual edits remain available.
+            self._setup_location_prefill = (self.setup_lat.get(), self.setup_lon.get())
+
+    def _reset_setup_location(self):
+        previous = self.__dict__.get('_setup_location_prefill')
+        if previous and previous == (self.setup_lat.get(), self.setup_lon.get()):
+            self.setup_lat.set('')
+            self.setup_lon.set('')
+        self._setup_location_prefill = None
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Select an experiment to read its locations.'))
+
+    def _load_setup_locations(self, experiment):
+        self._reset_setup_location()
+        client = self.client
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Reading experiment locations…'))
+        def work():
+            result = location_settings.destination_options(client, experiment.id)
+            self._post(self._apply_setup_locations, client, experiment.id, result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_setup_locations(self, client, experiment_id, result):
+        current = self._current_experiment()
+        if self.client is not client or current is None or current.id != experiment_id:
+            return
+        self.setup_location_picker.set_options(result)
+        self._use_setup_location()
 
     def _update_setup_preview(self):
         try:
@@ -920,6 +956,8 @@ class App(ttk.Frame):
         self.settings.environment = self.env_var.get()
         self.settings.save()
         self.client = None
+        if hasattr(self, 'setup_location_picker'):
+            self._reset_setup_location()
         self.user_label.set("not signed in")
         self.exp_box.configure(state="disabled", values=[])
         self.exp_var.set("")
@@ -1016,6 +1054,7 @@ class App(ttk.Frame):
         self.programming_override = False
         self._apply_programming_labels()
         self._resolve_programming_async(exp)
+        self._load_setup_locations(exp)
 
     # ── the procedure ────────────────────────────────────────────────────
     def _session_ready(self) -> str | None:
@@ -1082,7 +1121,7 @@ class App(ttk.Frame):
             return
         port = self._selected_port()
         ctx = self._make_context()
-        self.log(f"Initial setup fallback timezone: {ctx.timezone}; coordinates: {ctx.latitude}, {ctx.longitude}")
+        self.log(f"Initial setup fallback timezone: {ctx.timezone}; configured coordinates supplied: {ctx.latitude is not None}")
         self._reset_steps()
         self._set_busy(True)
         threading.Thread(target=self._run_procedure, args=(ctx, port),

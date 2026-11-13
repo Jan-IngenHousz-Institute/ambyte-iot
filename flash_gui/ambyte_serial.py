@@ -541,6 +541,17 @@ class AmbyteConsole:
         m = _SD_RE.search(self.status(timeout))
         return None if m is None else m.group(1).lower() == "mounted"
 
+    def location_set(self, latitude: float, longitude: float) -> None:
+        """Persist coordinates on audited sync-loc firmware, without echoing sites in errors."""
+        if (type(latitude) not in (int, float) or type(longitude) not in (int, float)
+                or not math.isfinite(latitude) or not math.isfinite(longitude)
+                or not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+                or (latitude, longitude) == (0, 0)):
+            raise ConsoleError('Invalid or unset location coordinates.')
+        reply = self.command(f'sync loc {latitude:.8f} {longitude:.8f}', max_reply_bytes=4096)
+        if ('location persist failed:' in reply or FAILURE_MARK in reply or 'loc: lat=' not in reply):
+            raise ConsoleError('Location persistence acknowledgement unavailable.')
+
     def cfg_get(self, key: str, timeout: float = 5.0) -> str | None:
         """Raw NVS value, or None when unset/unreadable."""
         reply = self.command(f"cfg get {key}", timeout)

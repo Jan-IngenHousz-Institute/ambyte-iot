@@ -31,6 +31,7 @@ class DeviceTarget:
     experiment_id: str | None
     environment: str | None
     timezone_result: str | None = None
+    location_result: str | None = None
 
     @property
     def mac(self):
