@@ -4,5 +4,5 @@ idf_component_register(
         "mp2731_core.c"
     INCLUDE_DIRS "include"
     REQUIRES domain
-    PRIV_REQUIRES i2c_bus
+    PRIV_REQUIRES i2c_bus esp_timer
 )

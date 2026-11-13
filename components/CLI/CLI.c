@@ -349,6 +349,24 @@ static int cli_cmd_mp2731_regs(int argc, char **argv)
 {
     int passes = 1, interval_ms = 1000;
     bool do_read = false;
+    if (argc >= 2 && strcmp(argv[1], "probe") == 0) {
+        const int n = argc >= 3 ? atoi(argv[2]) : 5;
+        for (int i = 0; i < n && i < 50; i++) {
+            uint8_t first = 0;
+            uint32_t done_us = 0;
+            const esp_err_t err = mp2731_probe_conversion(&first, &done_us);
+            if (err != ESP_OK) {
+                printf("MP2731 probe err=%s\r\n", esp_err_to_name(err));
+            } else if (done_us == UINT32_MAX) {
+                printf("MP2731 probe first03=%02X done=never(>%ums)\r\n", first,
+                       (unsigned)MP2731_ADC_TIMEOUT_MS);
+            } else {
+                printf("MP2731 probe first03=%02X done=%uus\r\n", first, (unsigned)done_us);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        return 0;
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "read") == 0) {
             do_read = true;
@@ -2353,8 +2371,9 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t mp2731_regs_cmd = {
         .command = "mp2731_regs",
-        .help = "mp2731_regs [passes] [interval_ms] [read]  raw MP2731 register dump "
-                "(read = run the power read before each pass)",
+        .help = "mp2731_regs [passes] [interval_ms] [read] | probe [n]  raw MP2731 register "
+                "dump (read = run the power read before each pass; probe = time one "
+                "conversion by polling REG03)",
         .func = cli_cmd_mp2731_regs,
     };
     static const esp_console_cmd_t selftest_cmd = {

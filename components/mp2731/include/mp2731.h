@@ -40,6 +40,12 @@ esp_err_t mp2731_last_frame(mp2731_frame_t *out);
 #define MP2731_REG_DUMP_COUNT 0x17u   /* REG00..REG16 */
 esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out);
 
+/* Diagnostics only (CLI `mp2731_regs probe`): start one conversion and poll
+ * REG03 back-to-back. *first_ctrl = REG03 on the first read after the start
+ * write (bit7 set = the chip latched ADC_START); *done_us = time until bit7
+ * fell, UINT32_MAX if it never did within MP2731_ADC_TIMEOUT_MS. */
+esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us);
+
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);
 

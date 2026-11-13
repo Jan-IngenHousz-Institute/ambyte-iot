@@ -4,6 +4,8 @@
 
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -153,6 +155,43 @@ esp_err_t mp2731_last_frame(mp2731_frame_t *out)
     }
     *out = s_last_frame;
     const esp_err_t err = s_last_err;
+    xSemaphoreGive(s_read_mtx);
+    return err;
+}
+
+esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us)
+{
+    if (first_ctrl == NULL || done_us == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready || s_read_mtx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    uint8_t ctrl = 0;
+    esp_err_t err = mp2731_read_reg(MP2731_REG_ADC_CTRL, &ctrl);
+    const uint8_t base = (uint8_t)(ctrl & (uint8_t)~(MP2731_ADC_START_BIT | MP2731_ADC_RATE_BIT));
+    if (err == ESP_OK && ctrl != base) err = mp2731_write_reg(MP2731_REG_ADC_CTRL, base);
+    if (err == ESP_OK) err = mp2731_write_reg(MP2731_REG_ADC_CTRL, base | MP2731_ADC_START_BIT);
+    const int64_t t0 = esp_timer_get_time();
+    *done_us = UINT32_MAX;
+    bool first = true;
+    while (err == ESP_OK && esp_timer_get_time() - t0 < (int64_t)MP2731_ADC_TIMEOUT_MS * 1000) {
+        uint8_t now = 0;
+        err = mp2731_read_reg(MP2731_REG_ADC_CTRL, &now);
+        if (err != ESP_OK) break;
+        if (first) { *first_ctrl = now; first = false; }
+        if ((now & MP2731_ADC_START_BIT) == 0u) {
+            *done_us = (uint32_t)(esp_timer_get_time() - t0);
+            break;
+        }
+        esp_rom_delay_us(100);
+    }
+    if (err == ESP_OK && *done_us == UINT32_MAX) {
+        (void)mp2731_write_reg(MP2731_REG_ADC_CTRL, base);
+    }
     xSemaphoreGive(s_read_mtx);
     return err;
 }
