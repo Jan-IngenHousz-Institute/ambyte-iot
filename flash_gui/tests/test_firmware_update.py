@@ -272,7 +272,8 @@ def test_existing_active_identity_is_used_instead_of_the_fallback():
     before=replace(before,identity=replace(before.identity,timezone=ambyte_serial.DeviceTimezone(
         'Europe/Berlin','Asia/Tokyo','manual','Australia/Darwin',32400,True)))
     changed,note=firmware_update._configuration_changes(before,after)
-    assert not changed and 'Asia/Tokyo → Australia/Darwin' in note
+    assert not changed and 'Timezone needs attention: Asia/Tokyo → Australia/Darwin' in note
+    assert 'pinned=true/source=manual → pinned=false/source=location' in note
 
 
 def test_a_mutated_fallback_is_always_a_warning_even_with_location_metadata():
@@ -329,3 +330,18 @@ def test_lost_active_metadata_is_a_warning_without_claiming_the_fallback_is_acti
     after=replace(after,identity=replace(after.identity,timezone=None))
     changed,note=firmware_update._configuration_changes(before,after)
     assert not changed and 'active zone unavailable' in note and 'was Australia/Darwin' in note
+
+
+@pytest.mark.parametrize('fallback_changed', [False, True])
+def test_released_manual_pin_needs_attention_even_when_active_zone_is_unchanged(fallback_changed):
+    from dataclasses import replace
+    before,after=automatic_timezone_pair()
+    before=replace(before,identity=replace(before.identity,timezone=replace(after.identity.timezone,
+        source='manual',pinned=True)))
+    if fallback_changed:
+        after=replace(after,settings=dict(after.settings,timezone='Australia/Darwin'),
+            identity=replace(after.identity,timezone=replace(after.identity.timezone,configured='Australia/Darwin')))
+    changed,note=firmware_update._configuration_changes(before,after)
+    assert not changed and note.startswith('Timezone needs attention:')
+    assert 'pinned=true/source=manual → pinned=false/source=location' in note
+    assert ('configured fallback changed' in note)==fallback_changed

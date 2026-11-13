@@ -444,7 +444,7 @@ def test_bad_runtime_timezone_identity_fails_closed(field,value):
     assert identity.mac==MAC and identity.timezone is None and identity.timezone_error
 
 
-@pytest.mark.parametrize('capture', ['none','configured','live','configured-stale','manual','configured-wins','live-rejected'])
+@pytest.mark.parametrize('capture', ['none','configured','live','configured-stale','manual','configured-wins','live-rejected','physical-live'])
 def test_frozen_production_cli_contract_groups(capture):
     obj=json.loads(wire())
     group=json.loads((Path(__file__).parent/f'fixtures/timezone-contract/{capture}.json').read_text())

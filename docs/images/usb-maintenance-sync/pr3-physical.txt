@@ -1,0 +1,75 @@
+2026-11-13 | DEV bench | GUI after 747076a + manual-pin grading follow-up
+Firmware v2.16.0-10-g67e8948 | PR #100 head 312f55c
+Coordinates are redacted. No BSSIDs/IPs were captured.
+
+PHASE baseline | DEV v2.16.0-10-g67e8948 | MAC 28:37:2F:FF:E7:04
+WORKBOOK 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+IDENTITY {"location": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "source": "live", "accuracy_m": 41, "configured": {"set": false, "lat": null, "lon": null}, "live": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "accuracy_m": 41, "age_s": 343, "status": "waiting"}, "configured_stale": false}, "timezone": {"configured": "Europe/Amsterdam", "active": "Europe/Amsterdam", "source": "location", "resolved": "Europe/Amsterdam", "utc_offset_seconds": 3600, "pinned": false}}
+CAPABILITY timezone.auto: True
+cfg get timezone: Europe/Amsterdam
+cfg get timezone_source: auto
+WIRE {"location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":345,"status":"waiting"}},"timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}}
+openJII: workbook 6594c938-04bf-45b3-b216-5036cbdce063 version 75c59552-4396-4948-8d08-c869445203e0 has an Ambyte programming cell (3 macro(s), 3 with branch routing).
+Workbook programming: stamping workbookVersionId=75c59552-4396-4948-8d08-c869445203e0 and 3 macro(s) with branch routing (firmware v2.16.0-10-g67e8948 ≥ 2.2.0 evaluates when:).
+Workbook: up to date
+Fallback timezone: Europe/Amsterdam; no fallback coordinates
+Effective location: <coordinates redacted> (source=live, accuracy=41 m)
+Effective timezone: Europe/Amsterdam (source=location)
+Live estimate status: waiting; live location is managed by the Ambyte
+PASS: no timezone prompt/write; all public settings, workbook and pin state unchanged.
+
+PHASE pinned | DEV v2.16.0-10-g67e8948 | MAC 28:37:2F:FF:E7:04
+WORKBOOK 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+IDENTITY {"location": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "source": "live", "accuracy_m": 41, "configured": {"set": false, "lat": null, "lon": null}, "live": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "accuracy_m": 41, "age_s": 414, "status": "waiting"}, "configured_stale": false}, "timezone": {"configured": "Europe/Berlin", "active": "Europe/Berlin", "source": "manual", "resolved": "Europe/Amsterdam", "utc_offset_seconds": 3600, "pinned": true}}
+CAPABILITY timezone.auto: True
+cfg get timezone: Europe/Berlin
+cfg get timezone_source: manual
+openJII: workbook 6594c938-04bf-45b3-b216-5036cbdce063 version 75c59552-4396-4948-8d08-c869445203e0 has an Ambyte programming cell (3 macro(s), 3 with branch routing).
+Workbook programming: stamping workbookVersionId=75c59552-4396-4948-8d08-c869445203e0 and 3 macro(s) with branch routing (firmware v2.16.0-10-g67e8948 ≥ 2.2.0 evaluates when:).
+Workbook: up to date
+Fallback timezone: Europe/Berlin; no fallback coordinates
+Effective location: <coordinates redacted> (source=live, accuracy=41 m)
+Effective timezone: Europe/Berlin (source=manual)
+Live estimate status: waiting; live location is managed by the Ambyte
+PASS: no timezone prompt/write; all public settings, workbook and pin state unchanged.
+
+PHASE unpinned | DEV v2.16.0-10-g67e8948 | MAC 28:37:2F:FF:E7:04
+WORKBOOK 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+IDENTITY {"location": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "source": "live", "accuracy_m": 41, "configured": {"set": false, "lat": null, "lon": null}, "live": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "accuracy_m": 41, "age_s": 474, "status": "waiting"}, "configured_stale": false}, "timezone": {"configured": "Europe/Berlin", "active": "Europe/Amsterdam", "source": "location", "resolved": "Europe/Amsterdam", "utc_offset_seconds": 3600, "pinned": false}}
+CAPABILITY timezone.auto: True
+cfg get timezone: Europe/Berlin
+cfg get timezone_source: auto
+REAL SNAPSHOT GRADING: Timezone needs attention: Europe/Berlin → Europe/Amsterdam; manual pin released (pinned=true/source=manual → pinned=false/source=location).
+
+PHASE restored | DEV v2.16.0-10-g67e8948 | MAC 28:37:2F:FF:E7:04
+WORKBOOK 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+IDENTITY {"location": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "source": "live", "accuracy_m": 41, "configured": {"set": false, "lat": null, "lon": null}, "live": {"set": true, "lat": "<redacted>", "lon": "<redacted>", "accuracy_m": 41, "age_s": 524, "status": "waiting"}, "configured_stale": false}, "timezone": {"configured": "Europe/Amsterdam", "active": "Europe/Amsterdam", "source": "location", "resolved": "Europe/Amsterdam", "utc_offset_seconds": 3600, "pinned": false}}
+CAPABILITY timezone.auto: True
+cfg get timezone: Europe/Amsterdam
+cfg get timezone_source: auto
+openJII: workbook 6594c938-04bf-45b3-b216-5036cbdce063 version 75c59552-4396-4948-8d08-c869445203e0 has an Ambyte programming cell (3 macro(s), 3 with branch routing).
+Workbook programming: stamping workbookVersionId=75c59552-4396-4948-8d08-c869445203e0 and 3 macro(s) with branch routing (firmware v2.16.0-10-g67e8948 ≥ 2.2.0 evaluates when:).
+Workbook: up to date
+Fallback timezone: Europe/Amsterdam; no fallback coordinates
+Effective location: <coordinates redacted> (source=live, accuracy=41 m)
+Effective timezone: Europe/Amsterdam (source=location)
+Live estimate status: waiting; live location is managed by the Ambyte
+PASS: no timezone prompt/write; all public settings, workbook and pin state unchanged.
+PASS: same-MAC reboot settled verify; effective Europe/Amsterdam, offset +3600s, source=location
+PASS: exact public baseline restored; tz_source=auto, unpinned, no configured coordinates, original workbook. No Wi-Fi/topic/certificate/location writes.
+
+MQTT commands: one explicit DEV device; local --profile openjii-dev.
+PAYLOAD {"id": "fc-set-timezone-x-1794562935", "pin": true, "timezone": "Europe/Berlin", "type": "set_timezone"}
+REPLY {"type": "set_timezone_result", "ok": true, "saved": true, "timezone": "Europe/Berlin", "active_timezone": "Europe/Berlin", "applied": true, "utc_offset_seconds": 3600, "detail": "applied", "timezone_source": "manual", "pinned": true, "resolved_timezone": "Europe/Amsterdam", "location_source": "live", "location_set": true}
+PAYLOAD {"id": "fc-set-timezone-x-1794562996", "timezone": "auto", "type": "set_timezone"}
+REPLY {"type": "set_timezone_result", "ok": true, "saved": true, "timezone": "Europe/Berlin", "active_timezone": "Europe/Amsterdam", "applied": true, "utc_offset_seconds": 3600, "detail": "applied", "timezone_source": "location", "pinned": false, "resolved_timezone": "Europe/Amsterdam", "location_source": "live", "location_set": true}
+PAYLOAD {"id": "fc-set-timezone-x-1794563050", "timezone": "Europe/Amsterdam", "type": "set_timezone"}
+REPLY {"type": "set_timezone_result", "ok": true, "saved": true, "timezone": "Europe/Amsterdam", "active_timezone": "Europe/Amsterdam", "applied": true, "utc_offset_seconds": 3600, "detail": "applied", "timezone_source": "location", "pinned": false, "resolved_timezone": "Europe/Amsterdam", "location_source": "live", "location_set": true}
+
+Physical yes/no deferred to the first field-prep session with configured coordinates.
+The baseline has no configured coordinates and source=live; creating a mismatch
+would violate the instruction not to write coordinates. Both consent choices
+remain covered by real-console fixture tests based on the physical wire shape.
+No full firmware-update flash was repeated; the shared grading helper used real
+pinned/unpinned snapshots, and same-image reboot verification passed.
+BENCH RELEASED after exact restoration verification.

@@ -165,11 +165,17 @@ def _configuration_changes(before, after):
     new_active = zone.active if zone is not None else None
     old_label = old_active or 'unset'
     new_label = (new_active or 'unset') if zone is not None else 'unavailable'
+    released_pin = old_zone is not None and old_zone.pinned and zone is not None and not zone.pinned
+    pin_warning = (f'manual pin released (pinned=true/source={old_zone.source} → '
+                   f'pinned=false/source={zone.source})' if released_pin else None)
     if before.settings['timezone'] != after.settings['timezone']:
         old_fallback = before.settings['timezone'] or 'unset'
         new_fallback = after.settings['timezone'] or 'unset'
         return changed, (f'Timezone needs attention: {old_fallback} → {new_fallback}; configured fallback changed '
-                         f'(effective {old_label} → {new_label}).')
+                         f'(effective {old_label} → {new_label}).'
+                         + (f' {pin_warning}.' if pin_warning else ''))
+    if released_pin:
+        return changed, f'Timezone needs attention: {old_label} → {new_label}; {pin_warning}.'
     if zone is None:
         if old_zone is not None:
             return changed, f'Timezone needs attention: active zone unavailable after maintenance (was {old_label}).'

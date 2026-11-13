@@ -27,8 +27,6 @@ def site(target):
             target.values['timezone_source'] = 'auto'
             return b'cfg set timezone = auto  (reboot to apply)\r\nambyte> '
         if command == 'reboot':
-            if target.values['timezone_source'] == 'auto':
-                target.values['timezone'] = target.device.resolved
             target.device.active_zone = target.device.resolved
             target.device.offset = 34200
         if command == 'status':
@@ -40,12 +38,15 @@ def site(target):
             for i,line in enumerate(lines):
                 if line.startswith('{'):
                     obj = json.loads(line)
-                    capture = json.loads((Path(__file__).parent/'fixtures/timezone-contract/configured.json').read_text())
+                    capture = json.loads((Path(__file__).parent/'fixtures/timezone-contract/physical-live.json').read_text())
                     obj.update(capture)
                     if getattr(target.device, 'tz_cap', True):
                         obj['capabilities'].append('timezone.auto')
                     fallback = target.device.site
-                    obj['location'].update(dict(fallback,source='configured' if fallback['set'] else 'none',configured=fallback))
+                    # Physical live capture supplies the wire schema; the configured
+                    # scenarios use synthetic Uluru coordinates and no live estimate.
+                    obj['location'].update(dict(fallback,source='configured' if fallback['set'] else 'none',configured=fallback,accuracy_m=None,
+                        live=dict(set=False,lat=None,lon=None,accuracy_m=None,age_s=None,status='waiting')))
                     if hasattr(target.device, 'live_site'):
                         obj['location'].update(target.device.live_site)
                     if (not getattr(target.device, 'legacy_zone', False)
@@ -66,13 +67,15 @@ def mutations(site):
     return [x for x in site.device.plain if x.startswith('cfg set ') or x == 'reboot']
 
 
-def test_yes_writes_explicit_fallback_preserves_source_and_verifies_active_identity(site):
+@pytest.mark.parametrize('timezone_source', ['provisioned', 'auto'])
+def test_yes_writes_explicit_fallback_preserves_source_and_verifies_active_identity(site, timezone_source):
+    site.values['timezone_source'] = timezone_source
     prompts = []
     result = m.run('bench', site.preview.mac, confirm_timezone=lambda p: prompts.append(p) or True)
     assert prompts == [m.TimezoneMismatch(site.preview.mac, 'Europe/Berlin', -25.3444, 131.0369, 'Australia/Darwin', 'Australia/Darwin')]
     assert 'updated to Australia/Darwin' in result.timezone and '+34200s' in result.timezone
     assert mutations(site) == ['cfg set timezone Australia/Darwin', 'reboot']
-    assert site.values['timezone'] == 'Australia/Darwin' and site.values['timezone_source'] == 'provisioned'
+    assert site.values['timezone'] == 'Australia/Darwin' and site.values['timezone_source'] == timezone_source
     assert not site.device.commits
 
 

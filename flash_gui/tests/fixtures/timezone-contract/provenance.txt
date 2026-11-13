@@ -1,8 +1,15 @@
 Frozen PR3 v1 contract, 2026-11-13, supplied by the PR3 implementing agent.
 The location/timezone groups were emitted by production cli_identity.c in its
 host harness, implemented in PR3 commit 0e82423 (PR #100). Stable legacy identity fields are added by each test's USB peer.
-These are host-harness captures, not physical-board qualification. The next
-coordinated PR3 bench slot must confirm them against the real firmware image.
+The named scenario groups are host-harness captures. The physical-live group
+was captured on the DEV USB board on 2026-11-13, PR3 image
+v2.16.0-10-g67e8948 (PR #100 head 312f55c). All numeric coordinates in that
+group are replaced with synthetic Amsterdam coordinates 52.3676,4.9041 for
+public-repository privacy. Other keys, enum values and numeric fields come
+from the capture. The raw console was parsed by the production AmbyteConsole,
+with no metadata errors. See docs/images/usb-maintenance-sync/pr3-physical.txt.
+Real live source, capability, cfg fallback/source and reboot behaviour confirmed
+the frozen shape; configured/manual scenarios retain the host-harness origins.
 Capability token: timezone.auto. Without it, all timezone maintenance is display-only.
 
 Frozen cfg output:

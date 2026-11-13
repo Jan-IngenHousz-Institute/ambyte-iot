@@ -146,7 +146,9 @@ pre-action `identity.timezone.active` (or stored fallback on older images) again
 the post-action active zone. Location-derived changes show `Timezone updated by
 the Ambyte: <old> → <new>` with source and accuracy, even when the fallback remains
 unchanged, as PR3 intends. A mutation of the stored fallback itself always shows
-`Timezone needs attention`, as does an unexplained effective change. The grade
+`Timezone needs attention`, as does an unexplained effective change or a released
+manual pin, even if the effective zone stays the same. A released-pin warning
+shows both pin/source states. The grade
 is displayed in the primary and final result, retained across optional checks,
 and logged. All other configuration, MAC/client and workbook checks remain strict.
 
@@ -166,7 +168,7 @@ manual-pin escape hatch is separate from these setup inputs.
 
 ## Qualification
 
-The full GUI suite currently passes 640 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 644 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,
@@ -204,6 +206,32 @@ frame, Wi-Fi/destination dialogs, worker completion, fallback/live labels, empty
 fallback setup fields, enabled controls, modal/grab cleanup and busy-gate release.
 It performed no USB/network actions and closed every created window.
 
-Fallback-mismatch yes/no and active-zone/reboot hardware qualification await the
-PR3 image and coordinated bench access. Existing manual experiment-change
-qualification is recorded in [USB experiment maintenance](usb-experiment-maintenance.md).
+The PR3 image `v2.16.0-10-g67e8948` (PR #100 head `312f55c`) was qualified on
+the same DEV board. Production `AmbyteConsole` parsed the real location/timezone
+groups without metadata errors, including capability `timezone.auto`, a persisted
+live fix, `source=location` timezone and `cfg get timezone_source = auto`. A
+redacted physical-live fixture preserves the captured fields with synthetic
+coordinates; the configured-coordinate yes/no tests build on that wire shape.
+
+The physical run confirmed that live location suppresses the fallback prompt,
+that maintenance leaves an explicit MQTT Europe/Berlin manual pin intact, and
+that `set-timezone auto` restores location control while leaving the Berlin
+fallback unchanged. The shared firmware/experiment grading helper, given those
+real before/after snapshots, reported the released pin as `needs attention` with
+both states. No firmware was flashed in this slot; a full USB firmware-update
+run was not repeated. Restoring the Amsterdam fallback and rebooting the same
+MAC verified active Europe/Amsterdam and offset +3600 seconds. Final public
+configuration and original workbook SHA/ID/script matched the baseline,
+`tz_source=auto`, unpinned, with no configured coordinates. No coordinate,
+Wi-Fi, topic or certificate writes occurred; the bench was released.
+
+Physical yes/no deferred to the first field-prep session with configured
+coordinates. The bench has no configured coordinates and live source, so
+creating a mismatch would have violated the instruction to leave coordinates
+untouched. Real-console fixture tests cover both consent choices and USB write /
+read-back / reboot verification. Existing manual experiment-change qualification
+is recorded in [USB experiment maintenance](usb-experiment-maintenance.md).
+
+![PR3 physical contract and restoration](images/usb-maintenance-sync/pr3-physical.png)
+
+[Redacted PR3 capture](images/usb-maintenance-sync/pr3-physical.txt).
