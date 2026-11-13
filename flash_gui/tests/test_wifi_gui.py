@@ -45,6 +45,8 @@ def dialog(monkeypatch):
     window.saved_schedule = None
     window.ssid, window.password = Var("Field hub 1"), Var("synthetic-password")
     window.device_text, window.message, window.network_note = Var(), Var(), Var()
+    window.maintenance_text = Var()
+    monkeypatch.setattr(wifi_gui.maintenance, "run", lambda *a, **kw: wifi_gui.maintenance.MaintenanceResult("Workbook: up to date"))
     window.winfo_exists = lambda: True
     for name in ("read_btn", "close_btn", "ssid_entry", "password_entry", "update_btn", "test_btn", "recover_btn", "new_btn"):
         setattr(window, name, Widget())

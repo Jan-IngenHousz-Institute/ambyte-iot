@@ -141,7 +141,7 @@ def test_chip_checks_run_on_the_writing_session_before_any_erase(tmp_path, monke
 
 def test_primary_firmware_action_needs_no_api_key_experiment_or_schedule(monkeypatch):
     calls, posted = [], []
-    app = SimpleNamespace(busy=False, release=object(), _selected_port=lambda: "bench",
+    app = SimpleNamespace(busy=False, client=None, _confirm_timezone=lambda status: False, release=object(), _selected_port=lambda: "bench",
                           _reset_steps=lambda: None, _set_busy=calls.append,
                           result_var=SimpleNamespace(set=calls.append), log=calls.append,
                           _post=lambda fn, *args: posted.append((fn, args)))

@@ -5,7 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import wifi_settings
+from . import maintenance, wifi_settings
 
 
 class WifiDialog(tk.Toplevel):
@@ -66,11 +66,14 @@ class WifiDialog(tk.Toplevel):
         self.new_btn = ttk.Button(frame, text="Start new Wi-Fi attempt…", command=self._new_attempt)
         self.new_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.new_btn.grid_remove()
+        self.maintenance_text = tk.StringVar(value="Workbook: waiting for device read")
+        ttk.Label(frame, textvariable=self.maintenance_text, wraplength=640).grid(
+            row=8, column=0, columnspan=2, sticky="w")
         self.message = tk.StringVar()
         ttk.Label(frame, textvariable=self.message, wraplength=640).grid(
             row=7, column=0, columnspan=2, sticky="w", pady=12)
-        ttk.Label(frame, text="Firmware, cloud identity, certificates and measurement schedule are preserved.",
-                  wraplength=640).grid(row=8, column=0, columnspan=2, sticky="w")
+        ttk.Label(frame, text="Identity and certificates are preserved. Signed-in sessions automatically sync the device experiment’s workbook.",
+                  wraplength=640).grid(row=9, column=0, columnspan=2, sticky="w")
         self.grab_set()
         self._read()
 
@@ -89,13 +92,15 @@ class WifiDialog(tk.Toplevel):
         else:
             self.new_btn.grid_remove()
 
-    def _start(self, action, apply, progress, *, service_recovery=True):
+    def _start(self, action, apply, progress, *, service_recovery=True, maintain=False):
         if self.working:
             return
         self.working = True
         self.message.set(progress)
         self._controls()
-        def finish(value, error):
+        client = getattr(self.app, "client", None)
+        expected = self.info
+        def finish(value, error, extra):
             if not self.winfo_exists():
                 return
             self.working = False
@@ -105,10 +110,18 @@ class WifiDialog(tk.Toplevel):
                 self.message.set(str(error))
             else:
                 apply(value)
+                if extra is not None:
+                    self.maintenance_text.set(extra.text)
             self._controls()
         def work():
+            extra = None
             try:
                 value, error = action(), None
+                if maintain:
+                    mac = value.mac if isinstance(value, wifi_settings.DeviceInfo) else expected.mac
+                    extra = maintenance.run(self.port, mac, client,
+                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self),
+                        log=getattr(self.app, "log", lambda text: None))
             except wifi_settings.WifiSettingsError as exc:
                 value, error = None, exc
             except Exception:
@@ -117,7 +130,7 @@ class WifiDialog(tk.Toplevel):
                 value, error = None, wifi_settings.WifiSettingsError(
                     "Could not communicate with the Ambyte. Check USB, close other serial tools, then read the device again.")
             try:
-                self.app._post(finish, value, error)
+                self.app._post(finish, value, error, extra)
             except (RuntimeError, tk.TclError):
                 pass  # App closure is allowed; the worker closes its USB handle.
         threading.Thread(target=work, daemon=True).start()
@@ -143,7 +156,7 @@ class WifiDialog(tk.Toplevel):
             self.network_note.set("Leave the password blank for an open network.\n" + behavior)
             self.message.set("Check the device name and MAC before updating.")
         self._start(lambda: wifi_settings.read_device(self.port), apply,
-                    "Reading the Ambyte on the selected USB port; startup can take 45 seconds…")
+                    "Reading the Ambyte on the selected USB port; startup can take 45 seconds…", maintain=True)
 
     def _update(self, *, new_request=False, test_connection=False):
         if self.working or self.info is None or (test_connection and not self.info.service):
@@ -168,7 +181,7 @@ class WifiDialog(tk.Toplevel):
                     f"Checking {info.mac} and waiting for startup (up to 3 minutes), then "
                     + ("testing Wi-Fi; keep the hub in range and USB connected…" if test_connection else
                        "saving Wi-Fi; a busy driver can take up to 90 seconds. The hub can be out of range. Keep USB connected…"),
-                    service_recovery=test_connection)
+                    service_recovery=test_connection, maintain=True)
 
     def _recover(self):
         if self.working or self.info is None:

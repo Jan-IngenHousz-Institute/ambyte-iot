@@ -44,6 +44,7 @@ class FirmwareUpdateResult:
     mac: str
     firmware: str
     changed: bool
+    maintenance: object = None
 
 
 def _version(value):
@@ -145,7 +146,7 @@ def _settled_schedule(console, snapshot, log, *, before_flash):
     return snapshot
 
 
-def update_firmware(port, release, *, log=print):
+def update_firmware(port, release, *, client=None, confirm_timezone=None, log=print):
     """Update an existing configured device; initial provisioning is separate."""
     try:
         images, table, metadata = _candidate(release)
@@ -157,7 +158,11 @@ def update_firmware(port, release, *, log=print):
                 raise FirmwareUpdateError("This would downgrade the running firmware. Maintenance refuses downgrades by default.")
             if before.identity.fw.removeprefix("v") == release.version.removeprefix("v"):
                 log(f"{before.identity.mac}: firmware {release.version} is already installed; nothing was flashed.")
-                return FirmwareUpdateResult(before.identity.mac, before.identity.fw, False)
+                # No flash, but this is still a maintenance session.
+                from . import maintenance
+                extra = maintenance.check_session(console, before.identity.mac, client,
+                    confirm_timezone=confirm_timezone, log=log)
+                return FirmwareUpdateResult(before.identity.mac, before.identity.fw, False, extra)
             before = _settled_schedule(console, before, log, before_flash=True)
             if before.identity.schedule.source == "INSTALLED" and not before.identity.schedule.sha256:
                 raise FirmwareUpdateError("The installed schedule identity is not ready. Wait for startup and retry; nothing was flashed.")
@@ -188,7 +193,9 @@ def update_firmware(port, release, *, log=print):
                     or old.source == "INSTALLED" and new != old):
                 raise FirmwareUpdateError("Firmware was updated, but the existing installed schedule was not confirmed active. Install a compatible workbook separately; credentials were preserved.")
         log("Verified firmware, MAC, client identity and existing configuration. No registration or certificate issuance was performed.")
-        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True)
+        from . import maintenance
+        extra = maintenance.run(after.port, after.identity.mac, client, confirm_timezone=confirm_timezone, log=log)
+        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, extra)
     except FirmwareUpdateError:
         raise
     except (ambyte_serial.ConsoleError, esptool_ops.EsptoolError, ServiceClientError) as exc:

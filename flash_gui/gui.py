@@ -389,11 +389,15 @@ class App(ttk.Frame):
             else:
                 message = (f"Updated to {result.firmware}; settings preserved."
                            if result.changed else f"Already on {result.firmware}; no flash needed.")
+                if result.maintenance is not None:
+                    message += "\n" + result.maintenance.text
                 self.result_var.set(message)
                 self.log(message)
+        client = self.client
         def work():
             try:
-                result, error = update_firmware(port, release, log=self.log), None
+                result, error = update_firmware(port, release, client=client,
+                    confirm_timezone=self._confirm_timezone, log=self.log), None
             except Exception as exc:
                 result, error = None, str(exc)
             try:
