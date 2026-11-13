@@ -80,6 +80,31 @@ class FirmwareReaderParityTest(unittest.TestCase):
             answers = self.resolve(points, blob=corrupt)  # no crash, no OOB read
             self.assertEqual(answers, [tz_geo._lookup(bytes(mutated), a, b) for a, b in points])
 
+    def test_every_claimed_depth(self):
+        # Every tile/max depth a header can claim, deterministically.
+        # gpt-6-astra's review of #100 forged tile_depth 16: the tile count
+        # wrapped to 0 in 32 bits, the directory bound passed and the reader
+        # went out of bounds. Both readers now reject depths beyond 12 (tile)
+        # / 24 (cell) before shifting or indexing; for every combination they
+        # must agree and the C reader must stay inside the blob (ASan).
+        data = BIN.read_bytes()
+        points = [(-25.3444, 131.0369), (52.3676, 4.9041), (89.9, -179.9), (-89.9, 179.9)]
+        blob = Path(self.temp.name) / "depth.bin"
+        checked = 0
+        for tile_depth in range(0, 26):
+            for max_depth in sorted({tile_depth, min(tile_depth + 1, 25), 13, 24, 25, 255}):
+                mutated = bytearray(data)
+                mutated[5] = tile_depth & 0xFF
+                mutated[6] = max_depth & 0xFF
+                blob.write_bytes(mutated)
+                want = [tz_geo._lookup(bytes(mutated), a, b) for a, b in points]
+                got = self.resolve(points, blob=blob)
+                self.assertEqual(got, want, (tile_depth, max_depth))
+                if not (1 <= tile_depth <= 12 and tile_depth <= max_depth <= 24):
+                    self.assertEqual(got, [None] * len(points), (tile_depth, max_depth))
+                checked += 1
+        self.assertGreater(checked, 100)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,8 @@
 
 #define TZ_GEO_HEADER   64U
 #define TZ_GEO_NONE     0xFFFFU
+#define TZ_GEO_MAX_DEPTH      24U   /* finest level the reader accepts */
+#define TZ_GEO_MAX_TILE_DEPTH 12U   /* 4^12 tiles: far beyond any embedded map */
 
 static uint32_t rd_u32(const uint8_t *p)
 {
@@ -76,20 +78,30 @@ const char *tz_geo_lookup(const uint8_t *blob, size_t len, double lat, double lo
     uint32_t names_off = rd_u32(blob + 52);
     uint32_t tiles_off = rd_u32(blob + 56);
     uint32_t size = rd_u32(blob + 60);
-    if (size != len || tile_depth == 0 || tile_depth > max_depth || max_depth > 24) return NULL;
-    uint32_t n_tiles = 1UL << (2 * tile_depth);
+    /* Dimensions are checked before any shift or index, in 64-bit
+     * arithmetic. A tile depth beyond TZ_GEO_MAX_TILE_DEPTH cannot be a real
+     * map: 4^13 four-byte offsets alone exceed any blob we embed, and at 16
+     * the tile count would no longer fit 32 bits (gpt-6-astra review: a
+     * forged depth-16 header wrapped the count to 0 and read out of bounds). */
+    if (size != len || tile_depth == 0 || tile_depth > TZ_GEO_MAX_TILE_DEPTH ||
+        tile_depth > max_depth || max_depth > TZ_GEO_MAX_DEPTH) {
+        return NULL;
+    }
+    const uint64_t n_tiles = 1ULL << (2 * tile_depth);
+    const uint64_t dir_end = (uint64_t)tiles_off + 4ULL * n_tiles;
     if (names_off < TZ_GEO_HEADER || (uint64_t)names_off + 2ULL * n_names > tiles_off ||
-        (uint64_t)tiles_off + 4ULL * n_tiles > size) {
+        dir_end > size) {
         return NULL;
     }
 
     uint32_t x = cell_index(lon, 180.0, 360.0, max_depth);
     uint32_t y = cell_index(lat, 90.0, 180.0, max_depth);
     unsigned shift = max_depth - tile_depth;
-    uint32_t tile = (y >> shift) * (1UL << tile_depth) + (x >> shift);
+    const uint64_t tile = ((uint64_t)(y >> shift) << tile_depth) + (x >> shift);
+    if (tile >= n_tiles) return NULL;
     uint32_t start = rd_u32(blob + tiles_off + 4 * tile);
     uint32_t end = (tile + 1 == n_tiles) ? size : rd_u32(blob + tiles_off + 4 * tile + 4);
-    if (start < tiles_off + 4 * n_tiles || start >= end || end > size) return NULL;
+    if (start < dir_end || start >= end || end > size) return NULL;
 
     unsigned k = blob[start];
     if (k == 0 || (uint64_t)start + 1 + 2ULL * k > end) return NULL;

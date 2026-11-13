@@ -29,6 +29,8 @@ import struct
 __all__ = ["zone_for", "is_unset_location"]
 
 _NONE = 0xFFFF
+_MAX_DEPTH = 24
+_MAX_TILE_DEPTH = 12
 _NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/_+-")
 _HEADER = struct.Struct("<4sBBBBHH8s32sIII")
 
@@ -61,7 +63,9 @@ def _lookup(blob: bytes, lat: float, lon: float) -> str | None:
         return None
     (magic, version, tile_depth, max_depth, _coast, n_names, _reserved, _release,
      _sha, names_off, tiles_off, size) = _HEADER.unpack_from(blob)
-    if magic != b"TZG1" or version != 1 or size != len(blob) or not 0 < tile_depth <= max_depth <= 24:
+    # Same dimension limits as tz_geo.c, checked before anything is indexed.
+    if (magic != b"TZG1" or version != 1 or size != len(blob)
+            or not 0 < tile_depth <= _MAX_TILE_DEPTH or not tile_depth <= max_depth <= _MAX_DEPTH):
         return None
     x = _cell_index(lon, 180.0, 360.0, max_depth)
     y = _cell_index(lat, 90.0, 180.0, max_depth)
