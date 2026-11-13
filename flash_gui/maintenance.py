@@ -184,8 +184,10 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
         automatic = fresh.identity.timezone is not None
         # New firmware owns resolution. Never send an explicit zone followed by
         # auto: differing dataset versions must be reported, not fought over.
-        console.cfg_set('timezone', 'auto' if automatic else resolved)
+        # A USB timeout can happen after persistence. From the first byte
+        # transmitted onward, absence of readback is an uncertain mutation.
         written = True
+        console.cfg_set('timezone', 'auto' if automatic else resolved)
         if automatic:
             if console.cfg_get('timezone_source') != 'auto':
                 raise ValueError('automatic timezone source readback did not match')
@@ -206,6 +208,15 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
                     or after.identity.fw != fresh.identity.fw or after.identity.schedule != fresh.identity.schedule
                     or after.identity.location != fresh.identity.location or after.settings != expected_settings):
                 raise ValueError('post-reboot timezone or preserved configuration/workbook did not match')
+            if zone is None:
+                # Legacy status describes an offset, but not which IANA zone
+                # produced it. It cannot prove that a persisted zone was applied.
+                try:
+                    observed = f'{_runtime_offset(after_console, after.identity):+d}s'
+                except Exception:
+                    observed = 'unavailable'
+                return (_timezone_summary(after) + f'\nFallback timezone: saved {resolved}; runtime unverified '
+                        f'(legacy firmware lacks active timezone identity, observed UTC offset {observed})'), port
             offset = _runtime_offset(after_console, after.identity)
         return _timezone_summary(after) + f'\nFallback timezone: updated to {resolved}; verified after reboot (UTC offset {offset:+d}s)', port
     except Exception as error:

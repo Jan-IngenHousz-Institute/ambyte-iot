@@ -148,7 +148,8 @@ def test_runtime_status_must_agree_with_identity_offset(site):
 def test_older_location_contract_without_auto_uses_explicit_zone_and_readback(site):
     site.device.legacy_zone = True
     result = m.run('bench', site.preview.mac, confirm_timezone=lambda p: True)
-    assert 'updated to Australia/Darwin' in result.timezone
+    assert 'saved Australia/Darwin; runtime unverified' in result.timezone
+    assert 'verified after reboot' not in result.timezone
     assert mutations(site) == ['cfg set timezone Australia/Darwin', 'reboot']
 
 
@@ -198,3 +199,35 @@ def test_live_estimate_age_changes_do_not_block_workbook_install(site):
     result=m.run('bench',site.preview.mac,site.client,confirm_timezone=lambda p:pytest.fail('no live override'))
     assert result.workbook=='Workbook: installed v3' and site.device.commits==1
     assert 'source=live' in result.timezone
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_lost_setter_reply_reports_uncertain_mutation_after_real_persistence(site, legacy):
+    site.device.legacy_zone=legacy
+    original=site.device.console
+    def console(command):
+        value=original(command)
+        if command.startswith('cfg set timezone '):
+            return b''  # Setter ran, but its USB response never reaches the host.
+        return value
+    site.device.console=console
+    result=m.run('bench',site.preview.mac,confirm_timezone=lambda p:True)
+    if legacy:assert site.values['timezone']=='Australia/Darwin'
+    else:assert site.values['timezone_source']=='auto'
+    assert 'change may be saved, verification incomplete' in result.timezone
+    assert 'unchanged:' not in result.timezone and 'reboot' not in mutations(site)
+    assert result.workbook=='Workbook: not checked: not signed in to openJII'
+
+
+def test_legacy_wrong_runtime_offset_is_saved_but_never_verified(site):
+    site.device.legacy_zone=True
+    original=site.device.console
+    def console(command):
+        value=original(command)
+        return value.replace(b'UTC+09:30',b'UTC+01:00') if command=='status' else value
+    site.device.console=console
+    result=m.run('bench',site.preview.mac,confirm_timezone=lambda p:True)
+    assert site.values['timezone']=='Australia/Darwin'
+    assert 'saved Australia/Darwin; runtime unverified' in result.timezone
+    assert 'observed UTC offset +3600s' in result.timezone
+    assert 'verified after reboot' not in result.timezone

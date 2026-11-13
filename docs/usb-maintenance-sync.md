@@ -79,13 +79,16 @@ its changing age cannot block workbook or experiment maintenance.
 When effective location source is `live`, the values are informational and no
 mismatch prompt appears. Otherwise the offline `tz_geo.zone_for` resolver compares
 the **configured fallback** coordinates with the stored fallback zone. Missing
-coordinates, `(0,0)` and no map match never cause a write. A mismatch asks once.
+coordinates, `(0,0)` and no map match never cause a write. A mismatch asks once. Once a setter is attempted, a lost reply is
+reported as a possible saved change; only failures proven to precede transmission say unchanged.
 No leaves the fallback/source untouched. Yes on auto-capable firmware uses
 `cfg set timezone auto`, reads back `timezone_source`, reboots and reconnects only
 to the same USB MAC, then verifies the settled identity and public RTC local
 offset. Legacy persisted-location discovery without auto uses an explicitly
 confirmed zone and readback before the same reboot check. Firmware with no
-persisted-location discovery cannot take this path.
+persisted-location discovery cannot take this path. Without active IANA identity,
+a legacy readback/reboot is reported as **saved, runtime unverified** even when
+STATUS prints a valid offset; an offset alone cannot prove the selected zone.
 
 The firmware is the authority on geographic resolution. A different newly active
 zone is reported alongside the GUI prediction without retrying or writing a
@@ -131,7 +134,7 @@ manual-pin escape hatch is separate from these setup inputs.
 
 ## Qualification
 
-The full GUI suite currently passes 607 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 610 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,
@@ -149,7 +152,26 @@ were unchanged; no device writes were performed, so no restoration was needed.
 ![Actual DEV workbook read on firmware 2.16.0](images/usb-maintenance-sync/read-2.16.png)
 
 [Redacted capture](images/usb-maintenance-sync/read-2.16.txt).
-Changed-workbook install, timezone yes/no and firmware-auto correction hardware
-qualification await the PR3 image and coordinated bench access. Existing manual
-experiment-change qualification is recorded in
-[USB experiment maintenance](usb-experiment-maintenance.md).
+The outdated-to-installed path also passed on the same 2.16.0 DEV board. A
+fixture added only a trailing YAML comment and a temporary script version to the
+original workbook, preserving its jobs/macros and workbook ID. The stale digest
+`12665b64…` was confirmed active before the production automatic check fetched
+the actual DEV pinned workbook and reported `Workbook: installed v7`. A final
+settled snapshot proved exact restoration of original SHA `943c2942…`, workbook
+ID `75c59552…`, script `wb-v7`, firmware `2.16.0` and all public configuration.
+Timezone stayed Europe/Amsterdam and Wi-Fi was connected. No topic, Wi-Fi,
+timezone or certificate write was performed, and the original-byte backup was
+deleted after restoration proof. The bench was released.
+
+![Outdated workbook repair and exact restoration](images/usb-maintenance-sync/outdated-2.16.png)
+
+[Full redacted transfer output](images/usb-maintenance-sync/outdated-2.16.txt).
+
+A real Tk desktop lifecycle run with synthetic device reads exercised the main
+frame, Wi-Fi/destination dialogs, worker completion, fallback/live labels, empty
+fallback setup fields, enabled controls, modal/grab cleanup and busy-gate release.
+It performed no USB/network actions and closed every created window.
+
+Fallback-mismatch yes/no and active-zone/reboot hardware qualification await the
+PR3 image and coordinated bench access. Existing manual experiment-change
+qualification is recorded in [USB experiment maintenance](usb-experiment-maintenance.md).
