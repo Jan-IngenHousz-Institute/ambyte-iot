@@ -24,10 +24,15 @@ static double  s_lon   = 5.819;    /* degrees east (positive = east) */
  * unchanged until a timezone is applied. */
 static int32_t s_off_s = 2 * 3600;
 
+void time_sync_set_position(double lat, double lon)
+{
+    s_lat = lat;
+    s_lon = lon;
+}
+
 void time_sync_set_location(double lat, double lon, int tz_offset_hours)
 {
-    s_lat   = lat;
-    s_lon   = lon;
+    time_sync_set_position(lat, lon);
     s_off_s = tz_offset_hours * 3600;
 }
 

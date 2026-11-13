@@ -56,6 +56,13 @@ def build_message(args, req_id):
     """Command payload for one device. Pure, so it can be unit-tested."""
     if args.cmd == "ping":
         return {"type": "ping", "id": req_id}
+    if args.cmd == "get-timezone":
+        return {"type": "get_timezone", "id": req_id}
+    if args.cmd == "set-timezone":
+        zone = args.timezone
+        if not isinstance(zone, str) or len(zone) > 47 or not re.fullmatch(r"(?:[A-Za-z0-9_+-]+/)+[A-Za-z0-9_+-]+|UTC", zone):
+            raise SystemExit("set-timezone needs --timezone with a supported IANA name, e.g. Australia/Darwin")
+        return {"type": "set_timezone", "id": req_id, "timezone": zone}
     if args.cmd == "inventory":
         msg = {"type": "evlog_inventory", "id": req_id, "list": True}
         if args.from_id or args.to_id:
@@ -120,6 +127,10 @@ def summarise(dev, reply):
         return (f"replay mode={reply.get('mode')} ok={reply.get('ok')} state={reply.get('state')} "
                 f"detail={reply.get('detail')} matched={reply.get('matched')} appended={reply.get('appended')} "
                 f"next_id={reply.get('next_id')}")
+    if t in ("timezone_result", "set_timezone_result"):
+        return (f"timezone={reply.get('timezone')} active={reply.get('active_timezone')} "
+                f"offset_s={reply.get('utc_offset_seconds')} applied={reply.get('applied')} "
+                f"ok={reply.get('ok')} detail={reply.get('detail')}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -132,7 +143,9 @@ def summarise(dev, reply):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash"])
+    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash", "get-timezone", "set-timezone"])
+    ap.add_argument("--expect-offset", type=int, default=None, help="timezone commands: require this UTC offset in seconds at verification")
+    ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin)")
     ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
     ap.add_argument("--version", default="", help="ambit-flash: AMBIT release version M.m.b")
     ap.add_argument("--channel", default="all", help="ambit-flash: 0-3 or all (default)")
@@ -155,6 +168,8 @@ def main(argv=None):
     ap.add_argument("--results-json", default=None)
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the payload, publish nothing")
     args = ap.parse_args(argv)
+    if args.cmd == "set-timezone" and (not args.devices.strip() or not parse_devices(args.devices)):
+        ap.error("set-timezone requires an explicit --devices list; fleet-wide discovery is refused")
     if args.wait <= 0:
         # ambit-versions quiesces 65 s before sweeping; ambit-flash adds the
         # release download, ~10-60 s per channel and the MQTT reconnect.
@@ -193,7 +208,7 @@ def main(argv=None):
         raise SystemExit("no target devices")
     req_id = f"fc-{args.cmd}-{args.mode if args.cmd == 'replay' else 'x'}-{int(time.time())}"
     payload = build_message(args, req_id)
-    mutating = (args.cmd == "replay" and args.mode not in READ_ONLY_MODES) or args.cmd == "ambit-flash"
+    mutating = (args.cmd == "replay" and args.mode not in READ_ONLY_MODES) or args.cmd in ("ambit-flash", "set-timezone")
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
           f"request id {req_id}{' (MUTATING)' if mutating else ''}")
@@ -249,6 +264,21 @@ def main(argv=None):
                         # published just before the terminal one can land after it.
                         deadline = min(deadline, time.monotonic() + 5)
                 continue
+            if args.cmd in ("get-timezone", "set-timezone"):
+                want_type = "timezone_result" if args.cmd == "get-timezone" else "set_timezone_result"
+                if data.get("type") != want_type:
+                    continue
+                if data.get("detail") in ("busy", "queue_unavailable"):
+                    # A QoS 1 duplicate can be refused while the original
+                    # request is still queued. Keep that evidence, but wait for
+                    # the actual terminal rather than exiting on a false fail.
+                    progress.setdefault(dev, []).append(data)
+                    replies.setdefault(dev, data)
+                    continue
+                replies[dev] = data
+                if len(replies) >= len(devices) and all(r.get("detail") not in ("busy", "queue_unavailable") for r in replies.values()):
+                    break
+                continue
             # keep the first terminal-looking reply; progress replies of a run keep coming
             if dev not in replies or data.get("detail") not in ("progress",):
                 replies[dev] = data
@@ -259,6 +289,16 @@ def main(argv=None):
 
     missing = [d for d in devices if d not in replies]
     bad_fw = []
+    timezone_failed = []
+    if args.cmd in ("get-timezone", "set-timezone"):
+        expected_type = "timezone_result" if args.cmd == "get-timezone" else "set_timezone_result"
+        timezone_failed = [d for d, r in replies.items()
+            if r.get("type") != expected_type or r.get("ok") is not True or r.get("applied") is not True
+            or not r.get("timezone") or r.get("timezone") != r.get("active_timezone")
+            or (args.expect_offset is not None and r.get("utc_offset_seconds") != args.expect_offset)
+            or (args.cmd == "set-timezone" and (r.get("saved") is not True or r.get("timezone") != args.timezone))]
+        if timezone_failed:
+            print(f"timezone not verified on: {timezone_failed}")
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -288,9 +328,10 @@ def main(argv=None):
             json.dump({"command": args.cmd, "mode": args.mode if args.cmd == "replay" else None,
                        "request_id": req_id, "payload": payload, "devices": devices,
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
-                       "firmware": fw_hist, "replay_states": states, "progress": progress},
+                       "firmware": fw_hist, "replay_states": states, "progress": progress,
+                       "timezone_failures": timezone_failed},
                       fh, indent=1, sort_keys=True)
-    return 1 if (missing or bad_fw or flash_failed) else 0
+    return 1 if (missing or bad_fw or flash_failed or timezone_failed) else 0
 
 
 if __name__ == "__main__":

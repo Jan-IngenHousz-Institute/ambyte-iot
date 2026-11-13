@@ -18,8 +18,16 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay]
+        options: [ping, inventory, replay, get-timezone, set-timezone]
         default: ping
+      timezone:
+        description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
+        type: string
+        default: ""
+      expect_offset:
+        description: "Optional timezone verification: exact UTC offset in seconds (Darwin = 34200)"
+        type: string
+        default: ""
       devices:
         description: "Exact client ids (ambyte_<MAC> or AMBYTE_<MAC>, case matters) or MACs, comma/space separated; empty = discover active devices"
         type: string
@@ -114,6 +122,8 @@ jobs:
         env:
           COMMAND: ${{ inputs.command }}
           DEVICES: ${{ inputs.devices }}
+          TIMEZONE: ${{ inputs.timezone }}
+          EXPECT_OFFSET: ${{ inputs.expect_offset }}
           WINDOW: ${{ inputs.discovery_window_minutes }}
           EXPECT_FW: ${{ inputs.expect_fw }}
           MODE: ${{ inputs.mode }}
@@ -130,10 +140,20 @@ jobs:
           for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT; do
             [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "::error::${v} must be a non-negative integer"; exit 2; }
           done
+          if [[ "${COMMAND}" == "set-timezone" && -z "${DEVICES//[[:space:]]/}" ]]; then
+            echo "::error::set-timezone requires an explicit device list; discovery is refused"
+            exit 2
+          fi
+          if [[ -n "${EXPECT_OFFSET}" && ! "${EXPECT_OFFSET}" =~ ^-?[0-9]+$ ]]; then
+            echo "::error::expect_offset must be integer seconds"
+            exit 2
+          fi
           ARGS=("${COMMAND}" --window-minutes "${WINDOW}" --wait "${WAIT}" --chunk "${CHUNK}"
                 --from-id "${FROM_ID}" --to-id "${TO_ID}" --from-ms "${FROM_MS}" --to-ms "${TO_MS}"
                 --results-json results.json)
           [[ -n "${DEVICES}" ]] && ARGS+=(--devices "${DEVICES}")
+          [[ "${COMMAND}" == "set-timezone" ]] && ARGS+=(--timezone "${TIMEZONE}")
+          [[ -n "${EXPECT_OFFSET}" ]] && ARGS+=(--expect-offset "${EXPECT_OFFSET}")
           [[ -n "${EXPECT_FW}" ]] && ARGS+=(--expect-fw "${EXPECT_FW}")
           [[ "${COMMAND}" == "replay" ]] && ARGS+=(--mode "${MODE}" --token "${TOKEN}")
           [[ "${DRY_RUN}" == "true" ]] && ARGS+=(--dry-run)

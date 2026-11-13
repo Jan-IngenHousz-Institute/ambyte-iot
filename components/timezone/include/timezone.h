@@ -30,6 +30,13 @@ extern "C" {
  * timezone config changes. */
 void timezone_apply(const char *iana);
 
+/* Immutable table-owned IANA name currently applied to the scheduler. Safe to
+ * read concurrently with apply; valid for the lifetime of the firmware. */
+const char *timezone_current_name(void);
+/* One consistent name/offset pair for a publication, even if apply runs on
+ * another task between constructing timestamp_local and the zone label. */
+void timezone_snapshot(int64_t utc, const char **name, int32_t *offset);
+
 /* Validate and canonicalize a configured timezone before it is persisted or
  * published. Whitespace is trimmed, the historical JII shorthand "AMT" is
  * migrated to "Europe/Amsterdam", and "Z" is canonicalized to "UTC". Only

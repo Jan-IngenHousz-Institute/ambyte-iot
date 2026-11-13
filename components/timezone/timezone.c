@@ -8,6 +8,8 @@
 #include "timezone.h"
 
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -37,6 +39,19 @@
 
 /* Whether a POSIX TZ rule is currently installed (timezone_apply succeeded). */
 static bool s_applied = false;
+/* Runtime timezone changes serialize libc TZ mutation with offset reads. Never
+ * publish a mutable char buffer: telemetry takes one immutable table pointer. */
+static pthread_mutex_t s_zone_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(const char *) s_zone_name = "";
+
+static void zone_lock(void)
+{
+    if (pthread_mutex_lock(&s_zone_lock) != 0) abort();
+}
+static void zone_unlock(void)
+{
+    if (pthread_mutex_unlock(&s_zone_lock) != 0) abort();
+}
 
 /* Bytewise binary search over k_tz_zones (the generator emits it strcmp-sorted).
  * ~10 strcmps for 598 zones; this runs at boot and on config change only. */
@@ -134,18 +149,20 @@ static bool rule_took_effect(const tz_zone_t *zone)
     return false;
 }
 
-void timezone_apply(const char *iana)
+static void apply_locked(const char *iana)
 {
     char canonical[48];
     esp_err_t canonical_err = timezone_canonicalize(iana, canonical, sizeof(canonical));
     if (canonical_err != ESP_OK) {
         s_applied = false;
+        atomic_store(&s_zone_name, "");
         ESP_LOGE(TAG, "rejecting invalid timezone '%s'", iana != NULL ? iana : "(null)");
         return;
     }
     const tz_zone_t *zone = zone_lookup(canonical);
     if (zone == NULL) {
         s_applied = false;
+        atomic_store(&s_zone_name, "");
         ESP_LOGI(TAG, "no timezone configured — scheduler uses the fallback offset");
         return;
     }
@@ -153,6 +170,7 @@ void timezone_apply(const char *iana)
     setenv("TZ", posix, 1);
     tzset();
     s_applied = true;
+    atomic_store(&s_zone_name, zone->iana);
     if (!rule_took_effect(zone)) {
         /* Keep scheduling on the zone's own standard offset rather than the
          * unrelated time_sync default: wrong by at most the DST hour, not by
@@ -168,17 +186,43 @@ void timezone_apply(const char *iana)
              canonical, posix, TZ_TABLE_TZDATA_VERSION);
 }
 
-int32_t timezone_utc_offset_seconds(int64_t utc)
+void timezone_apply(const char *iana)
 {
-    if (!s_applied) {
-        return time_sync_get_utc_offset_seconds();   /* fallback: fixed offset */
-    }
-    return libc_offset_seconds(utc);
+    zone_lock();
+    apply_locked(iana);
+    /* Solar calculations also consume this offset, including half-hour zones.
+     * Keep that cache current without moving the RTC or any UTC timestamp. */
+    if (s_applied) time_sync_set_utc_offset_seconds(libc_offset_seconds((int64_t)time(NULL)));
+    zone_unlock();
 }
 
+const char *timezone_current_name(void)
+{
+    return atomic_load(&s_zone_name);
+}
+
+void timezone_snapshot(int64_t utc, const char **name, int32_t *offset)
+{
+    zone_lock();
+    if (name) *name = atomic_load(&s_zone_name);
+    if (offset) *offset = s_applied ? libc_offset_seconds(utc) : time_sync_get_utc_offset_seconds();
+    zone_unlock();
+}
+
+int32_t timezone_utc_offset_seconds(int64_t utc)
+{
+    int32_t offset;
+    timezone_snapshot(utc, NULL, &offset);
+    return offset;
+}
+
+/* Kept within the same lock as apply: an old reader must not overwrite the
+ * solar offset cache after a new zone has been installed. */
 int64_t timezone_localize(int64_t utc)
 {
-    int32_t off = timezone_utc_offset_seconds(utc);
-    time_sync_set_utc_offset_seconds(off);   /* keep the sun path on the same frame */
+    zone_lock();
+    int32_t off = s_applied ? libc_offset_seconds(utc) : time_sync_get_utc_offset_seconds();
+    time_sync_set_utc_offset_seconds(off);
+    zone_unlock();
     return utc + off;
 }

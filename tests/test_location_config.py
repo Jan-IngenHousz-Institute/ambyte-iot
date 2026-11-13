@@ -98,7 +98,7 @@ class LocationConfigContractTest(unittest.TestCase):
         branch = branch.split('strcmp(type, "set_time") == 0', 1)[0]
         for call in (
             "device_config_set_location",
-            "time_sync_set_location",
+            "time_sync_set_position",
         ):
             self.assertIn(call, branch)
         self.assertIn('"set_location_result"', branch)

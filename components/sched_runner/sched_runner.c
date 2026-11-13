@@ -295,9 +295,7 @@ static void apply_location_from_config(void)
     double lat, lon;
     if (device_config_get_location(&lat, &lon, s_act_ctx.deployment,
                                    sizeof(s_act_ctx.deployment)) == ESP_OK) {
-        int tz;
-        time_sync_get_location(NULL, NULL, &tz); /* keep the configured tz */
-        time_sync_set_location(lat, lon, tz);
+        time_sync_set_position(lat, lon); /* preserve half-hour / DST offsets */
         ESP_LOGI(TAG, "location from device_config: lat=%.5f lon=%.5f", lat, lon);
     } else if (!s_loc_warned) {
         /* One WARN per boot: sun triggers

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 #include "messaging_port.h"
 
@@ -32,6 +33,9 @@ typedef struct {
     const char         *status_topic;     /* topic for replies, e.g. "<topic_root>/status" */
     const char         *device_id;        /* included in reply payloads */
     const char         *firmware_version; /* included in reply payloads */
+    bool              (*submit)(void (*run)(void *), void *arg);
+    bool              (*maintenance_begin)(void);
+    void              (*maintenance_end)(void);
 } command_router_config_t;
 
 esp_err_t command_router_init(const command_router_config_t *cfg);

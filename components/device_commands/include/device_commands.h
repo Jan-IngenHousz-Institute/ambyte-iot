@@ -78,7 +78,9 @@ typedef struct {
     const char                         *device_name;
     const char                         *device_version;
     const char                         *device_firmware;
-    const char                         *timezone;      /* IANA name, "" = unset */
+    const char                         *timezone;      /* boot fallback; IANA name, "" = unset */
+    const char                       *(*current_timezone)(void); /* optional live, immutable name */
+    void                             (*timezone_snapshot)(int64_t utc, const char **name, int32_t *offset);
 
     /* UART sensor ports (Phase 7) */
     uart_sensor_query_fn                uart_query;        /* AMBIT binary */
