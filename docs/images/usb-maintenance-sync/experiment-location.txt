@@ -1,0 +1,23 @@
+2026-11-13 | DEV experiment-location qualification | coordinates redacted
+DEV API: original location list empty; added one temporary Amsterdam-centre location (coordinates redacted).
+PHASE modern | firmware v2.16.0-14-g19ecd20 | 28:37:2F:FF:E7:04
+WORKBOOK: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+CONFIRM: Set configured location to Bench test (Amsterdam centre) (<coordinates redacted>)? The Ambyte will determine its effective location and timezone. Reboot and verify the same device?
+Location: saved Bench test (Amsterdam centre) (<coordinates redacted>); configured readback verified after reboot. Effective timezone: Europe/Amsterdam (source=location, location=configured).
+PHASE modern-check | firmware v2.16.0-14-g19ecd20 | 28:37:2F:FF:E7:04
+WORKBOOK: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+PASS: PR3 configured location readback, effective location=configured, timezone=Europe/Amsterdam source=location; all public config and workbook unchanged.
+PHASE legacy | firmware 2.16.0 | 28:37:2F:FF:E7:04
+WORKBOOK: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+CONFIRM: Set configured location to Bench test (Amsterdam centre) (<coordinates redacted>) and fallback timezone to Europe/Amsterdam? This legacy firmware needs the explicitly confirmed fallback zone. Reboot and verify the same device?
+Location: saved Bench test (Amsterdam centre) (<coordinates redacted>); fallback timezone Europe/Amsterdam; verified after reboot (UTC offset +3600s).
+PHASE legacy-final | firmware 2.16.0 | 28:37:2F:FF:E7:04
+WORKBOOK: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 / 75c59552-4396-4948-8d08-c869445203e0 / wb-v7
+PASS: 2.16.0 post-reboot sync loc matches the persisted coordinates at four decimals; fallback Europe/Amsterdam and device-UTC runtime offset +3600s verified.
+PASS: DEV API original empty locations list restored with PUT [] and confirmed by GET.
+FINAL: firmware 2.16.0; configured coordinates Amsterdam centre (redacted); fallback Europe/Amsterdam; timezone_source=auto preserved from PR3 (legacy CLI cannot read it); original workbook/public configuration unchanged. No Wi-Fi/topic/certificate writes. Bench released.
+
+FLASH RECEIPT: official v2.16.0 C/build inputs; reviewed tools/bench_flash.py plus effective-sdkconfig upload guard; AMBYTE_PROJECT_VER=2.16.0; NVS preserved.
+Signed app SHA256: 40c54568a93da49e1326b1971fcf3ca2e081c2957121ea11e59bf33ae4152572
+Verified write regions: 0x0, 0x8000, 0xf000, 0x20000 only; no NVS/filesystem image.
+GUI follow-up verification: Windows needs no host tzdata; bundled firmware POSIX rules verify Darwin +34200 and Amsterdam CET/CEST across both DST transitions.

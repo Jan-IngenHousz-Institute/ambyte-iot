@@ -313,7 +313,9 @@ def render_py(zones: list[Zone], rules: list[str], tzdata_version: str) -> str:
         "ZONES = frozenset({",
     ]
     lines += [f'    "{z.name}",' for z in zones]
-    lines += ["})", ""]
+    lines += ["})", "", "# The exact newlib rules used by the firmware, including clamped transitions.", "POSIX_RULES = {"]
+    lines += [f'    "{z.name}": "{z.rule}",' for z in zones]
+    lines += ["}", ""]
     return "\n".join(lines)
 
 

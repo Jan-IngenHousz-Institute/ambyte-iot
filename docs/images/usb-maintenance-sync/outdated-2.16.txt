@@ -1,0 +1,67 @@
+2026-11-13 | DEV USB bench | fw 2.16.0 | GUI source 622140e
+Actual console/API qualification output (no credentials read or logged)
+
+QUALIFICATION | firmware 2.16.0 | DEV USB only
+Baseline SHA 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7 workbook 75c59552-4396-4948-8d08-c869445203e0
+Fixture changes only a YAML comment and script version; workbook/macros/topics/credentials retained.
+Pushed 144/2693 durable bytes of wb-v7-stale.
+Pushed 288/2693 durable bytes of wb-v7-stale.
+Pushed 432/2693 durable bytes of wb-v7-stale.
+Pushed 576/2693 durable bytes of wb-v7-stale.
+Pushed 720/2693 durable bytes of wb-v7-stale.
+Pushed 864/2693 durable bytes of wb-v7-stale.
+Pushed 1008/2693 durable bytes of wb-v7-stale.
+Pushed 1152/2693 durable bytes of wb-v7-stale.
+Pushed 1296/2693 durable bytes of wb-v7-stale.
+Pushed 1440/2693 durable bytes of wb-v7-stale.
+Pushed 1584/2693 durable bytes of wb-v7-stale.
+Pushed 1728/2693 durable bytes of wb-v7-stale.
+Pushed 1872/2693 durable bytes of wb-v7-stale.
+Pushed 2016/2693 durable bytes of wb-v7-stale.
+Pushed 2160/2693 durable bytes of wb-v7-stale.
+Pushed 2304/2693 durable bytes of wb-v7-stale.
+Pushed 2448/2693 durable bytes of wb-v7-stale.
+Pushed 2592/2693 durable bytes of wb-v7-stale.
+Pushed 2693/2693 durable bytes of wb-v7-stale.
+OUTDATED FIXTURE ACTIVE SHA 12665b64ebd6f0148295304bf544c4c396c531a375bd2796aced872bba7859d5
+openJII: workbook 6594c938-04bf-45b3-b216-5036cbdce063 version 75c59552-4396-4948-8d08-c869445203e0 has an Ambyte programming cell (3 macro(s), 3 with branch routing).
+Workbook programming: stamping workbookVersionId=75c59552-4396-4948-8d08-c869445203e0 and 3 macro(s) with branch routing (firmware 2.16.0 ≥ 2.2.0 evaluates when:).
+Pushed 144/2624 durable bytes of wb-v7.
+Pushed 288/2624 durable bytes of wb-v7.
+Pushed 432/2624 durable bytes of wb-v7.
+Pushed 576/2624 durable bytes of wb-v7.
+Pushed 720/2624 durable bytes of wb-v7.
+Pushed 864/2624 durable bytes of wb-v7.
+Pushed 1008/2624 durable bytes of wb-v7.
+Pushed 1152/2624 durable bytes of wb-v7.
+Pushed 1296/2624 durable bytes of wb-v7.
+Pushed 1440/2624 durable bytes of wb-v7.
+Pushed 1584/2624 durable bytes of wb-v7.
+Pushed 1728/2624 durable bytes of wb-v7.
+Pushed 1872/2624 durable bytes of wb-v7.
+Pushed 2016/2624 durable bytes of wb-v7.
+Pushed 2160/2624 durable bytes of wb-v7.
+Pushed 2304/2624 durable bytes of wb-v7.
+Pushed 2448/2624 durable bytes of wb-v7.
+Pushed 2592/2624 durable bytes of wb-v7.
+Pushed 2624/2624 durable bytes of wb-v7.
+Workbook: installed v7
+Fallback timezone: Europe/Amsterdam; effective location unavailable (firmware too old)
+AUTOMATIC RESULT: Workbook: installed v7
+RESTORATION CHECK
+PASS: exact original loaded workbook SHA/ID/script, firmware and public config restored.
+Timezone: Europe/Amsterdam
+Wi-Fi state: True
+
+The original script source backup was deleted after exact restoration proof.
+No Wi-Fi, topic, timezone or certificate writes were performed.
+The stale fixture added only a YAML comment and a temporary script-version label.
+Bench released to the coordinator after the final snapshot.
+
+Real Tk desktop qualification, synthetic device data (no USB/network actions):
+PASS: real Tk Wi-Fi dialog constructed, worker completed, separate fallback/live result shown, controls enabled.
+PASS: real Tk destination dialog worker, fallback/live labels, modal destruction and grab release.
+PASS: empty fallback defaults, serial-action gate released, all created windows closed; no USB/network actions.
+
+The journaled workbook install/repair path is unchanged at this PR merge head.
+Subsequent changes address timezone results and GUI phase reporting.

@@ -440,7 +440,7 @@ continues automatically; no restart needed.
    (`<config>/device_certs/<thing>/`). This happens **before** flashing, so an
    API failure leaves the board untouched.
 3. **NVS + littlefs bake** — a per-board provisioning image: device name, IANA
-   timezone (from this PC's clock), `flash_time` RTC seed, the board's own
+   timezone (resolved from deployment coordinates or explicitly selected), `flash_time` RTC seed, the board's own
    cert + key + Amazon Root CA 1, Wi-Fi credentials, MQTT broker from openJII,
    client id = openJII Thing name (required by the AWS IoT policy),
    server-provided topic prefix plus the API-required sensor version/id suffix,
@@ -519,9 +519,9 @@ sequenceDiagram
   (`ambyte_<MAC>`): the platform IoT policy renders identity-bound resources
   as `${iot:Connection.Thing.ThingName}`, which AWS only resolves when they
   match.
-- The device timezone table is fixed (`components/timezone/timezone.c`); the
-  GUI warns when this PC's zone is not in it (scheduling then falls back to a
-  fixed UTC offset on the device).
+- The device timezone table is fixed (`components/timezone/timezone.c`). Initial
+  setup resolves deployment coordinates or requires an explicit supported IANA
+  zone. The laptop timezone is display-only.
 - openJII auth: the API exposes **no password login and no OAuth device
   flow**; the supported desktop flow is a personal **API key** sent as
   `x-api-key`. The key only authenticates the operator during the run; the
@@ -613,3 +613,50 @@ ports can refresh after the expected run window. An explicit new acquisition,
 a definitive normal poll/fetch or existing bank reset clears/restarts this
 state; diagnostics do not reset a sensor. See the [maintenance protocol](../docs/usb-maintenance.md#refresh-exclusion-and-counters)
 for the two-exchange proof and separate acquisition-recovery wire counter.
+
+## Automatic maintenance checks
+
+Successful Read device, Save Wi-Fi, Test & save and verified firmware updates
+check the connected device's current experiment workbook. Signed-in users need
+only experiment/workbook read access. The GUI compares settled source, workbook
+ID and compiled SHA for the running firmware, then uses the journaled USB install
+if needed. Its own `Workbook:` result states up to date, installed version, or
+why it was not checked; cloud or install problems preserve the original action's
+success. The Device destination window runs the same checks on read.
+
+Configured fallback coordinates/timezone and effective device values are displayed separately. A geographic
+mismatch asks before an update/reboot; older firmware lacking persisted-location
+discovery reports that limitation. Initial setup accepts fallback coordinates
+and an optional IANA fallback zone. These defaults remain eligible for replacement
+when the Ambyte finds its live location. Effective values, source and accuracy
+are displayed separately, and a live estimate never triggers an override prompt.
+Without a map match, select the fallback zone explicitly.
+See [automatic maintenance checks](../docs/usb-maintenance-sync.md) for source
+semantics, same-MAC reboot verification and bench evidence.
+
+Timezone maintenance prompts/writes are admitted only by the firmware's
+`timezone.auto` capability and frozen PR3 metadata. Older firmware is display-only,
+and a manual pin is never removed by a fallback correction. Eligible corrections
+write the explicit fallback zone, preserving pin/source state. The GUI publishes
+the primary Wi-Fi/experiment/firmware result before the extra check, with a
+separate progress line while a workbook install or reboot is running.
+
+
+## Experiment locations over USB
+
+Initial setup can fill its editable fallback coordinates from a readable experiment
+location. A single site is preselected; several require an explicit choice. The
+Device destination dialog offers **Set location from experiment** for the device's
+current experiment and **Also set this device's location** after an experiment
+change. PR3 metadata defaults the latter on for a missing/different-country
+configured site; legacy firmware defaults it off with an explanation.
+
+PR3 verifies persisted configured coordinates and reports its own effective zone.
+Audited 2.9.0, 2.14.0 and 2.16.0 firmware use persistent `sync loc`, with an explicit
+confirmation naming the fallback IANA zone, USB save/readback and same-MAC reboot.
+The legacy runtime is verified only when its local offset matches the expected
+offset at the device UTC clock; otherwise it reports saved, runtime unverified.
+Other legacy images refuse with update/MQTT guidance. This explicit action is the
+only exception to the automatic timezone write gate. Location results are separate
+from successful experiment changes. Coordinates stay out of diagnostic logs and
+public captures. See [maintenance details](../docs/usb-maintenance-sync.md#experiment-locations).

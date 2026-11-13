@@ -66,3 +66,39 @@ def utc_offset_label(now: datetime.datetime | None = None) -> str:
     sign = "+" if total >= 0 else "-"
     total = abs(total)
     return f"UTC{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+
+
+def setup_zone(latitude: str, longitude: str, selected: str) -> tuple[str, float | None, float | None]:
+    """Fallback zone for initial setup; the laptop clock is never an input.
+
+    With coordinates we resolve the fallback unless a zone is explicitly entered.
+    If the map has no match,
+    or coordinates are unknown, the operator must explicitly choose a zone.
+    Both coordinates travel with the provisioning plan instead of disappearing
+    after choosing the timezone.
+    """
+    import math
+    latitude, longitude, selected = latitude.strip(), longitude.strip(), selected.strip()
+    lat = lon = None
+    resolved = None
+    if latitude or longitude:
+        try:
+            lat, lon = float(latitude), float(longitude)
+            if (not math.isfinite(lat) or not math.isfinite(lon)
+                    or not -90 <= lat <= 90 or not -180 <= lon <= 180):
+                raise ValueError
+        except ValueError:
+            raise ValueError('Enter both deployment coordinates: latitude −90…90 and longitude −180…180.') from None
+        if (lat, lon) != (0, 0):
+            try:
+                from .tz_geo import zone_for
+                resolved = zone_for(lat, lon)
+            except (RuntimeError, ImportError):
+                if not selected:
+                    raise ValueError('Coordinate timezone lookup unavailable; choose the fallback zone explicitly.') from None
+    zone = selected or resolved
+    if not zone:
+        raise ValueError('Choose the fallback IANA timezone, or enter coordinates that resolve to one. The laptop timezone is not used.')
+    if not firmware_supports(zone):
+        raise ValueError(f"Deployment timezone '{zone}' is not in the firmware zone table.")
+    return zone, lat, lon

@@ -44,7 +44,8 @@ transfer and loaded SHA/workbook verification finish before topic writes.
 Only the experiment UUID segment of the raw seven-segment ingest root changes.
 Sensor type, version and sensor ID, including a literal `{MAC}`, are preserved.
 The status topic is explicitly set to `<new-root>/status`; the command topic,
-client ID, broker, name and timezone stay unchanged. The old `a3b865d1` migration
+client ID, broker and name stay unchanged. The switch does not write timezone;
+any device-managed drift is reported separately. The old `a3b865d1` migration
 destination is refused because released firmware rewrites its status topic.
 Unsupported topic shapes and lines exceeding the USB console buffer fail before
 any maintenance write.
@@ -109,7 +110,7 @@ flowchart TD
 ```
 
 The final check requires unchanged MAC, client identity, firmware, broker,
-command topic, device name and timezone, the expected ingest/status topics, and
+command topic and device name, the expected ingest/status topics, and
 an INSTALLED schedule with the exact target SHA and workbook version.
 
 ## Qualification
@@ -145,3 +146,17 @@ passes **528 tests and 29 subtests**; the production C wire/filter suite passes
 ![Experiment change and original-state restoration](images/usb-experiment-maintenance/qualification.png)
 
 [Redacted qualification transcript](images/usb-experiment-maintenance/qualification.txt).
+
+## Automatic checks on maintenance reads
+
+The destination window also performs the [automatic workbook and deployment
+checks](usb-maintenance-sync.md) on read. It uses the device's current experiment,
+regardless of the destination selected in the main window. The direct Change
+experiment action still installs and verifies its selected workbook before topic
+writes; afterward the deployment timezone check can ask for a separate correction.
+The workbook/timezone results are shown independently of the experiment result.
+
+Device-managed timezone drift after experiment switching is graded through the
+same function as firmware maintenance: an explained location-derived change is
+informational; an unexplained configured/manual change has a visible needs-attention
+warning with both values. It cannot silently disappear from the primary result.

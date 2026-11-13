@@ -10,7 +10,7 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from . import release_fetch
+from . import release_fetch, tz_geo
 from .config import LITTLEFS_PARTITION_SIZE
 from .littlefs_image import build_schedule_image
 from .release_fetch import ScheduleScriptRelease
@@ -24,6 +24,8 @@ def run_littlefs_smoke(report_path: Path | None = None) -> None:
 
     report_path = report_path or Path.cwd() / REPORT_NAME
     try:
+        if tz_geo.zone_for(-25.3444, 131.0369) != "Australia/Darwin":
+            raise RuntimeError("packaged timezone resolver/data smoke failed for Uluru")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script_blob = b"return { packaged_smoke = true }\n"
@@ -63,7 +65,7 @@ def run_littlefs_smoke(report_path: Path | None = None) -> None:
         report_path.write_text(traceback.format_exc(), encoding="utf-8")
         raise
     report_path.write_text(
-        "PASS: cold-cache fetch, digest check, and "
+        "PASS: offline timezone resolver, cold-cache fetch, digest check, and "
         f"{LITTLEFS_PARTITION_SIZE}-byte littlefs image read-back\n",
         encoding="utf-8",
     )

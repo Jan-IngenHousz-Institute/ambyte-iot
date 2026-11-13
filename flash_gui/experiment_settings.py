@@ -8,7 +8,7 @@ policy. Broker/certificate ownership is preserved, not guessed from API login.
 Queued records deliberately follow the current topic/provenance at publication.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -30,6 +30,8 @@ class DeviceTarget:
     broker: str
     experiment_id: str | None
     environment: str | None
+    timezone_result: str | None = None
+    location_result: str | None = None
 
     @property
     def mac(self):
@@ -94,10 +96,26 @@ def cloud_status(target, client):
             "This does not compare the certificate stored on the USB device.")
 
 
+def _same_device_config(first, second, *, schedule=True):
+    """Stable maintenance guards exclude device-managed location/timezone.
+
+    Online estimate age and effective position can change between consecutive
+    identity reads. They cannot invalidate workbook or topic maintenance; MAC,
+    running image, service capability, the loaded workbook and other persistent
+    configuration still guard every write.
+    """
+    a, b = first.identity, second.identity
+    keys = (key for key in firmware_update.CONFIG_KEYS if key != 'timezone')
+    return (a.mac == b.mac and a.thing_name == b.thing_name and a.fw == b.fw
+            and a.capabilities == b.capabilities and a.storage == b.storage and a.signed == b.signed
+            and (not schedule or a.schedule == b.schedule)
+            and all(first.settings[key] == second.settings[key] for key in keys))
+
+
 def _checked(console, expected):
     current = _target(console, {})
-    if current.device != expected.device:
-        # Port stays bound but reads may be separated by an API lookup. All
+    if not _same_device_config(current.device, expected.device):
+        # Port stays bound but reads may be separated by an API lookup. Stable
         # configuration and loaded-program fields must still match the preview.
         raise ExperimentSettingsError("Device identity, configuration or workbook changed. Read the device destination again.")
     return current
@@ -142,6 +160,50 @@ def _after_reboot(previous_port, mac):
                                   "Refresh ports and read the destination again; no provisioning was attempted.")
 
 
+def workbook_source(client, experiment_id, firmware, *, log=lambda text: None):
+    """Resolve only destination read endpoints and compile for the running image."""
+    try:
+        programming = client.resolve_programming(experiment_id, fw_version=firmware, log=log)
+        if programming is None:
+            raise ExperimentSettingsError("The experiment has no pinned Ambyte workbook programming cell.")
+        return procedure.schedule_source(SimpleNamespace(programming=programming, schedule_script=None,
+                                        release=SimpleNamespace(version=firmware)), log=log)
+    except (OpenJIIError, procedure.ProcedureError) as exc:
+        raise ExperimentSettingsError(f"No device settings were changed. {exc}") from None
+
+
+def install_workbook(console, expected, source, journal, *, log=lambda text: None):
+    """Shared journaled install, with loaded identity and preserved config proof.
+
+    The caller holds the MAC lease. ServiceClient checks foreign operations and
+    resumes only matching saved intent; an automatic check never archives an
+    unresolved operation just to make progress.
+    """
+    descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
+                                     source.built_against_fw, source.workbook_version_id)
+    entry = journal.load()
+    if entry and entry['phase'] != 'complete' and entry['descriptor'] != descriptor:
+        raise ExperimentSettingsError("Resolve the saved operation using Wi-Fi settings → Check saved result before installing a workbook.")
+    current = firmware_update._snapshot(console)
+    current = firmware_update._settled_schedule(console, current, log, before_flash=True)
+    if not _same_device_config(current, expected):
+        raise ExperimentSettingsError("Device identity, configuration or workbook changed before installation. Read the device again.")
+    service = ServiceClient(console._ser, journal)
+    service.upload_schedule(source.blob, source.sha256, source.script_version,
+                            source.built_against_fw, source.workbook_version_id, log=log)
+    if not console.wait_prompt(45):
+        raise ExperimentSettingsError("The device did not return to its console after workbook installation.")
+    current = firmware_update._snapshot(console)
+    current = firmware_update._settled_schedule(console, current, log, before_flash=True)
+    schedule = current.identity.schedule
+    if (schedule.source != 'INSTALLED' or schedule.sha256 != source.sha256
+            or schedule.workbook_version_id != source.workbook_version_id):
+        raise ExperimentSettingsError("The destination workbook was not confirmed active after installation.")
+    if not _same_device_config(current, expected, schedule=False):
+        raise ExperimentSettingsError("The device configuration changed during workbook installation.")
+    return current
+
+
 def change_experiment(expected, client, experiment_id, *, allow_unknown_environment=False, log=lambda text: None):
     if expected.environment and expected.environment != client.env.key:
         raise ExperimentSettingsError("The device broker belongs to a different environment. Experiment maintenance preserves its broker and credentials.")
@@ -152,14 +214,7 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
         raise ExperimentSettingsError("Experiment maintenance requires service-capable firmware (v2.9.0+). Update firmware while keeping settings first.")
     # Resolve against RUNNING firmware. No onboard, register, issue or rotate
     # call belongs here, including as a fallback after a 403 or USB failure.
-    try:
-        programming = client.resolve_programming(experiment_id, fw_version=expected.device.identity.fw, log=log)
-        if programming is None:
-            raise ExperimentSettingsError("The selected experiment has no pinned Ambyte workbook programming cell.")
-        source = procedure.schedule_source(SimpleNamespace(programming=programming, schedule_script=None,
-                                          release=SimpleNamespace(version=expected.device.identity.fw)), log=log)
-    except (OpenJIIError, procedure.ProcedureError) as exc:
-        raise ExperimentSettingsError(f"No device settings were changed. {exc}") from None
+    source = workbook_source(client, experiment_id, expected.device.identity.fw, log=log)
     descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
                                      source.built_against_fw, source.workbook_version_id)
     journal = OperationJournal(config.SERVICE_OPERATIONS_DIR, expected.mac)
@@ -172,21 +227,8 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
             with wifi_settings._selected_console(expected.device.port) as console:
                 _checked(console, expected)
                 log(f"Installing destination workbook on {expected.mac}; keeping broker {expected.broker}.")
-                service = ServiceClient(console._ser, journal)
-                service.upload_schedule(source.blob, source.sha256, source.script_version,
-                                        source.built_against_fw, source.workbook_version_id, log=log)
+                current = install_workbook(console, expected.device, source, journal, log=log)
                 stage = 'Destination workbook installed; topic writes may be partial'
-                if not console.wait_prompt(45):
-                    raise ExperimentSettingsError("The device did not return to its console after workbook installation.")
-                current = firmware_update._snapshot(console)
-                current = firmware_update._settled_schedule(console, current, log, before_flash=True)
-                if (current.identity.schedule.source != 'INSTALLED'
-                        or current.identity.schedule.sha256 != source.sha256
-                        or current.identity.schedule.workbook_version_id != source.workbook_version_id):
-                    raise ExperimentSettingsError("The destination workbook was not confirmed active before topic update.")
-                if (current.identity.mac != expected.mac or current.identity.thing_name != expected.device.identity.thing_name
-                        or current.settings != expected.device.settings):
-                    raise ExperimentSettingsError("The device configuration changed before topic update.")
                 firmware_update._idle(console, current.identity)
                 if not console.wait_prompt(45):
                     raise ExperimentSettingsError("The device did not leave service mode before topic update.")
@@ -205,16 +247,19 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
                 after = firmware_update._snapshot(console)
                 after = firmware_update._settled_schedule(console, after, log, before_flash=False)
                 schedule = after.identity.schedule
-                preserved = ('mqtt_uri', 'mqtt_client_id', 'command_topic', 'device_name', 'timezone')
+                expected_after = replace(expected.device, settings=dict(expected.device.settings,
+                    mqtt_topic_root=new_root, status_topic=config.default_status_topic(new_root)))
+                changed, timezone_result = firmware_update._configuration_changes(expected_after, after)
                 if (after.identity.mac != expected.mac or after.identity.thing_name != expected.device.identity.thing_name
                         or after.identity.fw != expected.device.identity.fw
-                        or any(after.settings[key] != expected.device.settings[key] for key in preserved)
+                        or changed
                         or after.settings['mqtt_topic_root'] != new_root
                         or after.settings['status_topic'] != config.default_status_topic(new_root)
                         or schedule.source != 'INSTALLED' or schedule.sha256 != source.sha256
                         or schedule.workbook_version_id != source.workbook_version_id):
                     raise ExperimentSettingsError("The destination configuration/workbook was not verified after reboot.")
-                return _target(console, {client.env.key: expected.broker} if expected.environment else {})
+                return replace(_target(console, {client.env.key: expected.broker} if expected.environment else {}),
+                               timezone_result=timezone_result)
     except (OSError, ambyte_serial.ConsoleError, ServiceClientError, wifi_settings.WifiSettingsError,
             firmware_update.FirmwareUpdateError, ExperimentSettingsError) as exc:
         raise ExperimentSettingsError(f"{stage}. {exc} Read the device destination and retry this action. No registration or certificate write was attempted.") from None

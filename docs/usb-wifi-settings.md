@@ -143,8 +143,9 @@ a join, explicit new attempt or Wi-Fi recovery call, preserving that schedule's
 recovery record. **Check saved result** resolves terminal schedule results, offers
 explicit cancellation for a staged transfer, or offers explicit archival for an
 unknown/expired result only after checking that no device operation is active.
-A completed journal needs no USB access. These actions do not install a workbook
-or verify the current workbook. A definite failed Wi-Fi result allows
+A completed journal needs no USB access. Recovery actions do not install a workbook or verify the current workbook.
+Successful Read device, Save Wi-Fi and Test & save now run the automatic check
+described below. A definite failed Wi-Fi result allows
 normal correction and retry; recovery guidance is reserved for unresolved work.
 
 Firmware lacking `wifi_join` cannot use the default save. Unsupported commands
@@ -245,3 +246,14 @@ the final run below qualifies its bounded retry.
 ![Both old and new hubs absent, bounded same-descriptor retry](images/offline-wifi-save/busy-retry-2.13.png)
 
 [Final retry transcript](images/offline-wifi-save/busy-retry-2.13.txt).
+
+## Automatic workbook and deployment checks
+
+After a successful device read or Wi-Fi save/trial, signed-in sessions check the
+pinned workbook of the experiment stored on the device and install it if missing
+or changed. The workbook result is a separate line; missing sign-in, access,
+network or compatible firmware cannot turn a successful Wi-Fi save into failure.
+Stored topics, certificates and identity are preserved. A deployment timezone
+mismatch asks before changing it, and an accepted correction is verified after
+a same-MAC reboot. See [automatic maintenance checks](usb-maintenance-sync.md)
+for permissions, persisted-location discovery, failure recovery and qualification.
