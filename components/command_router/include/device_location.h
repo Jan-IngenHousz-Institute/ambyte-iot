@@ -63,6 +63,9 @@ typedef struct {
  *  - the estimate must resolve to a zone with a country (not open water).
  *  - while the zone in effect is ALREADY live-derived, changing it needs 3
  *    agreeing estimates (same zone) spanning >= 6 h.
+ *  - an IP estimate in the same country as a stored Wi-Fi fix is country
+ *    evidence only: it refreshes the fix's age and never moves it or opens
+ *    a change candidate.
  *  - within a zone, a new estimate moves the fix (and with it the solar
  *    position) only beyond max(1 km, its own uncertainty), or when it is at
  *    least twice as precise -- IP noise never re-anchors sunrise/sunset, and

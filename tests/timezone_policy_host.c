@@ -537,6 +537,27 @@ int main(int argc, char **argv)
         timezone_status_t st;
         timezone_command_status(&st);
         assert(!strcmp(st.live_status, "expired") && !st.live_set);
+    } else if (!strcmp(s, "ip_cannot_walk_a_wifi_zone_to_the_egress_city")) {
+        /* Opus review of #100: Wi-Fi fix at Uluru (Darwin), then a stretch of
+         * Wi-Fi 404s where only IP answers come back, resolving to the
+         * carrier's Adelaide egress. Same country: country evidence only. */
+        boot();
+        live(ULURU, 41);
+        expect_active("Australia/Darwin", "location");
+        for (int i = 0; i < 4; i++) {
+            fake_now += 2 * 3600;
+            live_ip(ADELAIDE_IP, 50000);
+        }
+        expect_active("Australia/Darwin", "location");
+        expect_position(-25.3444, 131.0369);
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(st.live_set && st.live.live_source == DEVICE_LIVE_SOURCE_WIFI);
+        assert(st.live.age_s == 0);   /* the IP answers kept the fix fresh */
+        /* An IP answer in ANOTHER country still counts as a candidate (a unit
+         * that really moved), needing 3 agreeing over 6 h. */
+        live_ip(OFFICE_IP, 5000);
+        expect_active("Australia/Darwin", "location");
     } else if (!strcmp(s, "readers_never_wait_on_flash")) {
         seed_zone("Europe/Berlin");
         boot();

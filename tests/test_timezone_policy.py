@@ -44,6 +44,7 @@ SCENARIOS = [
     "ip_needs_two_agreeing_an_hour_apart",
     "expired_fix_is_reported",
     "readers_never_wait_on_flash",
+    "ip_cannot_walk_a_wifi_zone_to_the_egress_city",
 ]
 
 

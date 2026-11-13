@@ -8,11 +8,13 @@
  * NOT changing the zone).
  *
  * Locking (Opus review of #100): s_lock guards the fix and candidate and is
- * never held across I/O. Offers come only from the maintenance worker, which
- * prepares the new fix under the lock, writes NVS without it, then commits
- * the RAM copy. Identity, STATUS and the MQTT task therefore never wait on a
- * flash write. The live status string has its own short lock because the
- * esp-mqtt task sets it (SUBACK refusals).
+ * never held across an NVS WRITE. Offers come only from the maintenance
+ * worker, which prepares the new fix under the lock, writes NVS without it,
+ * then commits the RAM copy. Short NVS READS remain under the lock (the
+ * configured coordinates and the loc_live mode, via device_config), so a
+ * reader can wait for those reads but never for a flash write or erase. The
+ * live status string has its own short lock because the esp-mqtt task sets
+ * it (SUBACK refusals).
  */
 #include "device_location.h"
 
@@ -271,6 +273,19 @@ device_location_offer_t device_location_offer_live(double lat, double lon, doubl
     /* 1. Decide under the lock. */
     lock(&s_lock);
     load_locked();
+    if (source == DEVICE_LIVE_SOURCE_IP && fresh(&s_live, now_utc) &&
+        s_live.f.source == DEVICE_LIVE_SOURCE_WIFI &&
+        strcmp(timezone_country(zone), country_at(s_live.f.lat, s_live.f.lon)) == 0) {
+        /* IP is country evidence only (Opus review of #100). Inside the
+         * country of a Wi-Fi fix it confirms the country and refreshes the
+         * fix's age, nothing more: no move, no candidate. Otherwise a period
+         * of Wi-Fi 404s would walk a precise zone to the carrier's egress
+         * city (Uluru -> Adelaide) after 3 agreeing IP answers. */
+        s_live.f.fix_utc = fix_utc;
+        s_live.this_boot = true;
+        unlock(&s_lock);
+        return DEVICE_LOCATION_OFFER_ACCEPTED;
+    }
     bool live_driving = effective_locked(NULL, now_utc) == DEVICE_LOCATION_LIVE;
     const char *live_zone = live_driving ? tz_geo_zone_for(s_live.f.lat, s_live.f.lon) : NULL;
     bool zone_change = false;
