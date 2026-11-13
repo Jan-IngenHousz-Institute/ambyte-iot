@@ -44,6 +44,15 @@ static bool s_applied = false;
 static pthread_mutex_t s_zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(const char *) s_zone_name = "";
 
+static void zone_lock(void)
+{
+    if (pthread_mutex_lock(&s_zone_lock) != 0) abort();
+}
+static void zone_unlock(void)
+{
+    if (pthread_mutex_unlock(&s_zone_lock) != 0) abort();
+}
+
 /* Bytewise binary search over k_tz_zones (the generator emits it strcmp-sorted).
  * ~10 strcmps for 598 zones; this runs at boot and on config change only. */
 static const tz_zone_t *zone_lookup(const char *iana)
@@ -179,12 +188,12 @@ static void apply_locked(const char *iana)
 
 void timezone_apply(const char *iana)
 {
-    pthread_mutex_lock(&s_zone_lock);
+    zone_lock();
     apply_locked(iana);
     /* Solar calculations also consume this offset, including half-hour zones.
      * Keep that cache current without moving the RTC or any UTC timestamp. */
     if (s_applied) time_sync_set_utc_offset_seconds(libc_offset_seconds((int64_t)time(NULL)));
-    pthread_mutex_unlock(&s_zone_lock);
+    zone_unlock();
 }
 
 const char *timezone_current_name(void)
@@ -192,11 +201,18 @@ const char *timezone_current_name(void)
     return atomic_load(&s_zone_name);
 }
 
+void timezone_snapshot(int64_t utc, const char **name, int32_t *offset)
+{
+    zone_lock();
+    if (name) *name = atomic_load(&s_zone_name);
+    if (offset) *offset = s_applied ? libc_offset_seconds(utc) : time_sync_get_utc_offset_seconds();
+    zone_unlock();
+}
+
 int32_t timezone_utc_offset_seconds(int64_t utc)
 {
-    pthread_mutex_lock(&s_zone_lock);
-    int32_t offset = s_applied ? libc_offset_seconds(utc) : time_sync_get_utc_offset_seconds();
-    pthread_mutex_unlock(&s_zone_lock);
+    int32_t offset;
+    timezone_snapshot(utc, NULL, &offset);
     return offset;
 }
 
@@ -204,10 +220,9 @@ int32_t timezone_utc_offset_seconds(int64_t utc)
  * solar offset cache after a new zone has been installed. */
 int64_t timezone_localize(int64_t utc)
 {
-    pthread_mutex_lock(&s_zone_lock);
+    zone_lock();
     int32_t off = s_applied ? libc_offset_seconds(utc) : time_sync_get_utc_offset_seconds();
     time_sync_set_utc_offset_seconds(off);
-    pthread_mutex_unlock(&s_zone_lock);
+    zone_unlock();
     return utc + off;
 }
-

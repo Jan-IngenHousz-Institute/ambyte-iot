@@ -19,7 +19,7 @@ Darwin is +34200 seconds in both seasons. `get_timezone` with a unique `id`
 returns `timezone_result` without writing configuration.
 
 The command accepts nonempty names supported by the firmware's compiled IANA
-zone table. The MQTT task copies only bounded input. The existing resident
+zone table. The MQTT task copies bounded input; fast refusal replies may read the current configuration and runtime snapshot. The existing resident
 maintenance worker acquires the shared maintenance gate, persists and reads back
 the timezone, then applies it. Duplicate desired values skip the NVS write.
 Persistence/readback failures do not change the runtime timezone. Busy/queue
@@ -81,3 +81,22 @@ invalid input, deferred dispatch, busy rejection, commit/readback failures,
 idempotent desired state, both Darwin seasons and concurrent offset readers.
 Physical bench and live rollout evidence will be recorded before claiming the
 field fleet is corrected.
+
+## Scheduler transition at application
+
+Applying a new zone re-anchors local-wall and solar triggers on the next poll.
+For Uluru, Berlin in November (+01:00) to Darwin (+09:30) advances the local
+frame by 8.5 hours. Wall triggers in that skipped window are not replayed as a
+historical campaign; the existing 600-second grace can run one recently due job.
+A backward change can repeat a daily wall trigger in the repeated window. The
+nightly maintenance window also follows the new zone. UTC capture timestamps and
+measurement IDs are not rewritten. The rollout accepts this one-time scheduling
+transition in order to restore the correct field schedule; verification must
+include the active zone and +34200-second offset.
+
+Queued records use the timezone active when published, resolved at their capture
+UTC instant. They do not carry a historical per-record timezone. The publisher
+snapshots the IANA name and offset together so concurrent application cannot
+produce a mismatched `timestamp_local` and `timezone` pair. Position-only changes
+and schedule restarts now preserve the exact offset instead of round-tripping
+through the legacy whole-hour location getter.

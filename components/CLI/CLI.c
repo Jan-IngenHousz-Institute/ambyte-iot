@@ -1418,13 +1418,14 @@ static int cli_cmd_sync(int argc, char **argv)
                 printf("location persist failed: %s\r\n", esp_err_to_name(err));
                 return 1;
             }
-            int tz; time_sync_get_location(NULL, NULL, &tz);
             if (argc >= 5) {
-                tz = atoi(argv[4]);
+                int tz = atoi(argv[4]);
                 printf("timezone offset is runtime-only; use `cfg set timezone <IANA-name>` "
                        "to persist it\r\n");
+                time_sync_set_location(lat, lon, tz);
+            } else {
+                time_sync_set_position(lat, lon);
             }
-            time_sync_set_location(lat, lon, tz);
         }
         double lat, lon; int tz;
         char deployment[64] = "";

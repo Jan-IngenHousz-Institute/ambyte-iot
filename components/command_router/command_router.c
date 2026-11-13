@@ -493,9 +493,7 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                                              jlon->valuedouble,
                                              deployment);
             if (err == ESP_OK) {
-                int tz = 0;
-                time_sync_get_location(NULL, NULL, &tz);
-                time_sync_set_location(jlat->valuedouble, jlon->valuedouble, tz);
+                time_sync_set_position(jlat->valuedouble, jlon->valuedouble);
             }
         }
         ESP_LOGW(TAG, "set_location id=%s -> %s", id ? id : "", esp_err_to_name(err));

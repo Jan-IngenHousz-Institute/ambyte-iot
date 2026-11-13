@@ -1279,6 +1279,13 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
      * carry their capture time, not the publish time. Publish time goes into the
      * sample as `published`. */
     char meas_ts[32], pub_ts[32], meas_local[40];
+    const char *zone = current_timezone();
+    int32_t local_offset;
+    if (s_cfg.timezone_snapshot) {
+        s_cfg.timezone_snapshot((int64_t)(e.start_ticks_ms / 1000), &zone, &local_offset);
+    } else {
+        local_offset = timezone_utc_offset_seconds((int64_t)(e.start_ticks_ms / 1000));
+    }
     {
         struct tm tm_info;
         time_t ts = (time_t)(e.start_ticks_ms / 1000);
@@ -1295,7 +1302,7 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
          * battery-queued winter event localizes with the winter offset. Use the
          * PURE timezone_utc_offset_seconds(); timezone_localize() must NOT be called
          * here — it mutates time_sync's stored offset (a scheduler-only side effect). */
-        int32_t off = timezone_utc_offset_seconds((int64_t)(e.start_ticks_ms / 1000));
+        int32_t off = local_offset;
         time_t loc = (time_t)(e.start_ticks_ms / 1000) + off;
         gmtime_r(&loc, &tm_info);
         size_t k = strftime(meas_local, sizeof(meas_local), "%Y-%m-%dT%H:%M:%S", &tm_info);
@@ -1336,7 +1343,6 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                  (double)s_last_batt_mv / 1000.0);
     }
     char tzpart[96] = "";
-    const char *zone = current_timezone();
     if (zone != NULL && zone[0] != '\0') {
         snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", zone);
     }

@@ -3,6 +3,7 @@
 #include "timezone_command.h"
 #include "timezone.h"
 #include "device_config.h"
+#include "time_sync.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -15,13 +16,12 @@ static char last[2048];
 static int writes, reads, fail_write, fail_readback, acquired, deny, queued;
 static void (*job)(void *);
 static void *argument;
-static int32_t fallback;
-void time_sync_set_utc_offset_seconds(int32_t value) { fallback = value; }
-int32_t time_sync_get_utc_offset_seconds(void) { return fallback; }
 esp_err_t device_config_get_timezone(char *out, size_t size)
 {
     reads++;
     if (fail_readback && writes) return ESP_FAIL;
+    if (!stored[0]) return ESP_ERR_NVS_NOT_FOUND;
+    if (!strcmp(stored,"Mars/Olympus")) return ESP_ERR_INVALID_ARG;
     assert(size > strlen(stored)); strcpy(out, stored); return ESP_OK;
 }
 esp_err_t device_config_set_timezone(const char *value)
@@ -43,10 +43,11 @@ static void *offset_reader(void *arg)
 {
     (void)arg;
     for (int i=0; i<10000; i++) {
-        int off=timezone_utc_offset_seconds(1768478400);
-        assert(off==3600 || off==34200);
-        const char *name=timezone_current_name();
-        assert(!strcmp(name,"Europe/Berlin") || !strcmp(name,"Australia/Darwin"));
+        int32_t off;
+        const char *name;
+        timezone_snapshot(1768478400, &name, &off);
+        assert((!strcmp(name,"Europe/Berlin") && off==3600) ||
+               (!strcmp(name,"Australia/Darwin") && off==34200));
     }
     return NULL;
 }
@@ -72,6 +73,22 @@ int main(int argc, char **argv)
     } else if (!strcmp(argv[1],"readback_fail")) {
         fail_readback=1; request(set); execute();
         assert(strstr(last,"readback_failed") && !strcmp(timezone_current_name(),"Europe/Berlin"));
+    } else if (!strcmp(argv[1],"repair")) {
+        strcpy(stored,"Mars/Olympus"); request(set); execute();
+        assert(writes==1 && strstr(last,"\"applied\":true"));
+    } else if (!strcmp(argv[1],"unset")) {
+        stored[0]='\0'; timezone_apply(NULL);
+        request("{\"type\":\"get_timezone\",\"id\":\"before\"}"); execute();
+        assert(!writes && strstr(last,"\"applied\":false"));
+        request(set); execute(); assert(writes==1 && strstr(last,"\"applied\":true"));
+    } else if (!strcmp(argv[1],"position")) {
+        timezone_apply("Australia/Darwin");
+        assert(time_sync_get_utc_offset_seconds()==34200);
+        time_sync_set_position(-25.3444,131.0369);
+        double lat,lon; time_sync_get_location(&lat,&lon,NULL);
+        assert(lat==-25.3444 && lon==131.0369);
+        assert(time_sync_get_utc_offset_seconds()==34200);
+        puts("position preserved half-hour offset: OK"); return 0;
     } else if (!strcmp(argv[1],"threads")) {
         pthread_t threads[4]; for(int i=0;i<4;i++) assert(!pthread_create(&threads[i],NULL,offset_reader,NULL));
         for(int i=0;i<1000;i++) timezone_apply(i%2 ? "Australia/Darwin" : "Europe/Berlin");

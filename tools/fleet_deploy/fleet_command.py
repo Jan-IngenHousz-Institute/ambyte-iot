@@ -144,6 +144,7 @@ def summarise(dev, reply):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash", "get-timezone", "set-timezone"])
+    ap.add_argument("--expect-offset", type=int, default=None, help="timezone commands: require this UTC offset in seconds at verification")
     ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin)")
     ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
     ap.add_argument("--version", default="", help="ambit-flash: AMBIT release version M.m.b")
@@ -167,6 +168,8 @@ def main(argv=None):
     ap.add_argument("--results-json", default=None)
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the payload, publish nothing")
     args = ap.parse_args(argv)
+    if args.cmd == "set-timezone" and (not args.devices.strip() or not parse_devices(args.devices)):
+        ap.error("set-timezone requires an explicit --devices list; fleet-wide discovery is refused")
     if args.wait <= 0:
         # ambit-versions quiesces 65 s before sweeping; ambit-flash adds the
         # release download, ~10-60 s per channel and the MQTT reconnect.
@@ -261,6 +264,21 @@ def main(argv=None):
                         # published just before the terminal one can land after it.
                         deadline = min(deadline, time.monotonic() + 5)
                 continue
+            if args.cmd in ("get-timezone", "set-timezone"):
+                want_type = "timezone_result" if args.cmd == "get-timezone" else "set_timezone_result"
+                if data.get("type") != want_type:
+                    continue
+                if data.get("detail") in ("busy", "queue_unavailable"):
+                    # A QoS 1 duplicate can be refused while the original
+                    # request is still queued. Keep that evidence, but wait for
+                    # the actual terminal rather than exiting on a false fail.
+                    progress.setdefault(dev, []).append(data)
+                    replies.setdefault(dev, data)
+                    continue
+                replies[dev] = data
+                if len(replies) >= len(devices) and all(r.get("detail") not in ("busy", "queue_unavailable") for r in replies.values()):
+                    break
+                continue
             # keep the first terminal-looking reply; progress replies of a run keep coming
             if dev not in replies or data.get("detail") not in ("progress",):
                 replies[dev] = data
@@ -277,6 +295,7 @@ def main(argv=None):
         timezone_failed = [d for d, r in replies.items()
             if r.get("type") != expected_type or r.get("ok") is not True or r.get("applied") is not True
             or not r.get("timezone") or r.get("timezone") != r.get("active_timezone")
+            or (args.expect_offset is not None and r.get("utc_offset_seconds") != args.expect_offset)
             or (args.cmd == "set-timezone" and (r.get("saved") is not True or r.get("timezone") != args.timezone))]
         if timezone_failed:
             print(f"timezone not verified on: {timezone_failed}")

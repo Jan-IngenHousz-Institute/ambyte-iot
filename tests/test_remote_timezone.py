@@ -32,7 +32,7 @@ class RemoteTimezoneTest(unittest.TestCase):
             f"-I{directory}", f"-I{ROOT/'tests/host_stubs'}", f"-I{cjson}",
             *(f"-I{ROOT/'components'/name/'include'}" for name in ("command_router","timezone","time_sync","device_config")),
             str(ROOT/"tests/timezone_command_host.c"), str(ROOT/"components/command_router/timezone_command.c"),
-            str(ROOT/"components/timezone/timezone.c"), str(cjson/"cJSON.c"), "-lm", "-o", str(cls.binary),
+            str(ROOT/"components/timezone/timezone.c"), str(ROOT/"components/time_sync/time_sync.c"), str(cjson/"cJSON.c"), "-lm", "-o", str(cls.binary),
         ], check=True)
 
     @classmethod
@@ -65,3 +65,12 @@ class RemoteTimezoneTest(unittest.TestCase):
 
     def test_offset_readers_are_safe_during_runtime_zone_changes(self):
         self.run_case("threads")
+
+    def test_invalid_stored_zone_is_repairable(self):
+        self.run_case("repair")
+
+    def test_unset_zone_can_be_read_and_then_configured(self):
+        self.run_case("unset")
+
+    def test_position_change_keeps_exact_half_hour_offset(self):
+        self.run_case("position")

@@ -33,6 +33,9 @@ enum {
  * UTC=0). Sets both the sunrise/sunset shift AND the offset callers use to
  * localize `now`; get rounds the stored seconds to hours. */
 void time_sync_set_location(double lat, double lon, int tz_offset_hours);
+/* Position-only updates must preserve the exact seconds offset. Round-tripping
+ * the legacy whole-hour getter would turn Darwin +09:30 into +09:00. */
+void time_sync_set_position(double lat, double lon);
 void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours);
 
 /* Set/get the local-minus-UTC offset in seconds — the DST-aware value normally

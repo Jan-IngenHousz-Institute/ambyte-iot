@@ -23,7 +23,9 @@ static void report(const request_t *request, bool ok, bool saved, const char *de
      * active timezone: a failed write/readback leaves the runtime untouched. */
     char stored[48] = "";
     (void)device_config_get_timezone(stored, sizeof stored);
-    const char *active = timezone_current_name();
+    const char *active;
+    int32_t offset;
+    timezone_snapshot((int64_t)time(NULL), &active, &offset);
     cJSON *reply = cJSON_CreateObject();
     if (!reply) return;
     cJSON_AddStringToObject(reply, "type", request->write ? "set_timezone_result" : "timezone_result");
@@ -33,7 +35,7 @@ static void report(const request_t *request, bool ok, bool saved, const char *de
     cJSON_AddStringToObject(reply, "timezone", stored);
     cJSON_AddStringToObject(reply, "active_timezone", active);
     cJSON_AddBoolToObject(reply, "applied", ok && stored[0] && strcmp(stored, active) == 0);
-    cJSON_AddNumberToObject(reply, "utc_offset_seconds", timezone_utc_offset_seconds((int64_t)time(NULL)));
+    cJSON_AddNumberToObject(reply, "utc_offset_seconds", offset);
     cJSON_AddStringToObject(reply, "detail", detail);
     char *json = cJSON_PrintUnformatted(reply);
     if (json) {
@@ -59,7 +61,7 @@ static void execute(void *arg)
     /* Desired-state idempotency: QoS 1 duplicates and an explicit retry need
      * neither another NVS commit nor an RTC adjustment. Unknown reads refuse
      * rather than guessing whether a previous write persisted. */
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND && err != ESP_ERR_INVALID_ARG) {
         report(request, false, false, "read_failed");
     } else {
         bool saved = err == ESP_OK && strcmp(stored, request->zone) == 0;

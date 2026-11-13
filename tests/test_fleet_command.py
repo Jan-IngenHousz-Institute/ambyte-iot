@@ -83,6 +83,35 @@ class BuildMessage(unittest.TestCase):
         self.assertEqual(self.fc.build_message(_args(cmd="ambit-versions"), "r"),
                          {"type": "ambit_versions", "id": "r"})
 
+    def test_site_specific_timezone_refuses_discovery_before_aws_access(self):
+        from unittest.mock import patch
+        with patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")):
+            with self.assertRaises(SystemExit) as error:
+                self.fc.main(["set-timezone", "--timezone", "Australia/Darwin"])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_timezone_duplicate_busy_waits_for_the_actual_applied_reply(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        client = "ambyte_14:63:93:37:A1:E8"
+        future = SimpleNamespace(result=lambda **kw: None)
+        def connection(session, subscription, receive, **kwargs):
+            def publish(*, topic, payload, qos):
+                request=json.loads(payload)
+                base={"id":request["id"],"type":"set_timezone_result"}
+                status=f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{client}/status"
+                receive(status,json.dumps(dict(base,ok=False,detail="busy")).encode())
+                receive(status,json.dumps(dict(base,ok=True,saved=True,applied=True,
+                    timezone="Australia/Darwin",active_timezone="Australia/Darwin",utc_offset_seconds=34200,detail="applied")).encode())
+                return future, 1
+            return SimpleNamespace(publish=publish,disconnect=lambda:future)
+        aws=SimpleNamespace(mqtt=SimpleNamespace(QoS=SimpleNamespace(AT_LEAST_ONCE=1)))
+        with patch.dict(sys.modules,awscrt=aws), patch.object(self.fc.fleet_deploy,"boto_session",return_value=object()), \
+             patch.object(self.fc.fleet_deploy,"mqtt_connection",connection), patch.object(self.fc.time,"sleep",lambda _:None):
+            result=self.fc.main(["set-timezone","--devices",client,"--timezone","Australia/Darwin","--expect-offset","34200","--wait","1"])
+        self.assertEqual(result,0)
+
     def test_devices_keep_case(self):
         devs = self.fc.parse_devices("ambyte_28:37:2F:FF:FC:80, 28:37:2F:FF:E7:50")
         self.assertIn("ambyte_28:37:2F:FF:FC:80", devs)

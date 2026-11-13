@@ -2,8 +2,8 @@
 #include <stdbool.h>
 #include "cJSON.h"
 
-/* The shared worker owns persistence + apply. MQTT only copies bounded input;
- * it never blocks on NVS, libc timezone locks or another maintenance operation. */
+/* The shared worker owns persistence + apply. MQTT copies bounded input and does no persistence or runtime apply.
+ * Fast refusal replies may read the current NVS/runtime timezone snapshot. */
 typedef struct {
     void (*reply)(const char *json);
     bool (*submit)(void (*run)(void *), void *arg);
