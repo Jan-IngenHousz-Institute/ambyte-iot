@@ -146,6 +146,7 @@ class ServiceWireTest(unittest.TestCase):
         con.command = command
         con._write_line = lambda line: captured.append(line)
         operations = [con.identity, con.status, con.rtc_read, lambda: con.rtc_set(1790000000),
+                      lambda: con.location_set(52.3730, 4.8924),
                       con.schedule_release, con.schedule_status_workbook, con._schedule_abort_quietly,
                       lambda: con.schedule_install("https://example.test/schedule.yaml", "a" * 64, "deadbeef", "a3", "test"),
                       lambda: con.schedule_push(bytes(range(256)) * 2, "0123456789abcdef" * 4, "deadbeef", "a3", "test")]

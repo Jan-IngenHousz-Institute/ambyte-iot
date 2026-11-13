@@ -179,6 +179,8 @@ class SessionContext:
     # organizations afterwards, so this is decided here or not at all.
     organization_id: str | None = None
     organization_label: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +421,8 @@ def prepare_provisioning(ctx: SessionContext, run: DeviceRun, log=print) -> None
     plan = ProvisioningPlan(
         device_name=name,
         timezone=ctx.timezone,
+        lat=getattr(ctx, "latitude", None),
+        lon=getattr(ctx, "longitude", None),
         mqtt_uri=endpoint,
         client_id=identity.thing_name,
         topic_root=topic_root,

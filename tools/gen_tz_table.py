@@ -376,6 +376,8 @@ def render_py(zones: list[Zone], rules: list[str], tzdata_version: str) -> str:
         "ZONE_COUNTRY = {",
     ]
     lines += [f'    "{z.name}": "{countries[z.name]}",' for z in zones if z.name in countries]
+    lines += ["}", "", "# The exact newlib rules used by the firmware, including clamped transitions.", "POSIX_RULES = {"]
+    lines += [f'    "{z.name}": "{z.rule}",' for z in zones]
     lines += ["}", ""]
     return "\n".join(lines)
 

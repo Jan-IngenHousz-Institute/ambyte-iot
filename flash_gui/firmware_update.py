@@ -32,6 +32,10 @@ class FirmwareUpdateError(RuntimeError):
     pass
 
 
+class IdentityUnavailable(FirmwareUpdateError):
+    pass
+
+
 @dataclass(frozen=True)
 class ConfiguredDevice:
     port: str
@@ -44,6 +48,8 @@ class FirmwareUpdateResult:
     mac: str
     firmware: str
     changed: bool
+    maintenance: object = None
+    timezone_correction: str | None = None
 
 
 def _version(value):
@@ -57,7 +63,7 @@ def _snapshot(console):
     try:
         identity = console.identity()
     except ambyte_serial.UnsupportedConsoleCommand:
-        raise FirmwareUpdateError("This firmware cannot report its compiled identity. Firmware-only maintenance requires identity-capable firmware; no credentials were changed.") from None
+        raise IdentityUnavailable("This firmware cannot report its compiled identity. Firmware-only maintenance requires identity-capable firmware; no credentials were changed.") from None
     if not identity.mac or not identity.thing_name or not identity.fw:
         raise FirmwareUpdateError("The Ambyte did not provide its MAC, client identity and compiled firmware version.")
     settings = {key: console.cfg_get(key) for key in CONFIG_KEYS}
@@ -145,7 +151,47 @@ def _settled_schedule(console, snapshot, log, *, before_flash):
     return snapshot
 
 
-def update_firmware(port, release, *, log=print):
+def _configuration_changes(before, after):
+    """Preserve config strictly, grading device-managed runtime zones separately.
+
+    PR3 keeps the configured fallback unchanged when location changes the active
+    zone. Old images expose only that fallback, so it is our best pre-update
+    runtime estimate. A fallback mutation is always suspicious, even if the
+    resulting effective zone could otherwise be explained by location.
+    """
+    changed = [key for key in CONFIG_KEYS if key != 'timezone' and after.settings[key] != before.settings[key]]
+    old_zone, zone, location = before.identity.timezone, after.identity.timezone, after.identity.location
+    old_active = old_zone.active if old_zone is not None else before.settings['timezone']
+    new_active = zone.active if zone is not None else None
+    old_label = old_active or 'unset'
+    new_label = (new_active or 'unset') if zone is not None else 'unavailable'
+    released_pin = old_zone is not None and old_zone.pinned and zone is not None and not zone.pinned
+    pin_warning = (f'manual pin released (pinned=true/source={old_zone.source} → '
+                   f'pinned=false/source={zone.source})' if released_pin else None)
+    if before.settings['timezone'] != after.settings['timezone']:
+        old_fallback = before.settings['timezone'] or 'unset'
+        new_fallback = after.settings['timezone'] or 'unset'
+        return changed, (f'Timezone needs attention: {old_fallback} → {new_fallback}; configured fallback changed '
+                         f'(effective {old_label} → {new_label}).'
+                         + (f' {pin_warning}.' if pin_warning else ''))
+    if released_pin:
+        return changed, f'Timezone needs attention: {old_label} → {new_label}; {pin_warning}.'
+    if zone is None:
+        if old_zone is not None:
+            return changed, f'Timezone needs attention: active zone unavailable after maintenance (was {old_label}).'
+        return changed, None  # Neither legacy image exposes effective timezone.
+    if old_active == new_active:
+        return changed, None
+    if (zone is not None and location is not None and location.set and not zone.pinned
+            and zone.source == 'location' and zone.configured == after.settings['timezone']
+            and zone.active == zone.resolved and zone.active is not None):
+        accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
+        return changed, (f'Timezone updated by the Ambyte: {old_label} → {new_label} '
+                         f'(source={zone.source}, location={location.source}, accuracy={accuracy})')
+    return changed, f'Timezone needs attention: {old_label} → {new_label}; effective change could not be explained.'
+
+
+def update_firmware(port, release, *, client=None, confirm_timezone=None, on_primary=lambda result: None, log=print):
     """Update an existing configured device; initial provisioning is separate."""
     try:
         images, table, metadata = _candidate(release)
@@ -157,7 +203,12 @@ def update_firmware(port, release, *, log=print):
                 raise FirmwareUpdateError("This would downgrade the running firmware. Maintenance refuses downgrades by default.")
             if before.identity.fw.removeprefix("v") == release.version.removeprefix("v"):
                 log(f"{before.identity.mac}: firmware {release.version} is already installed; nothing was flashed.")
-                return FirmwareUpdateResult(before.identity.mac, before.identity.fw, False)
+                # No flash, but this is still a maintenance session.
+                on_primary(FirmwareUpdateResult(before.identity.mac, before.identity.fw, False))
+                from . import maintenance
+                extra = maintenance.check_session(console, before.identity.mac, client,
+                    confirm_timezone=confirm_timezone, log=log)
+                return FirmwareUpdateResult(before.identity.mac, before.identity.fw, False, extra)
             before = _settled_schedule(console, before, log, before_flash=True)
             if before.identity.schedule.source == "INSTALLED" and not before.identity.schedule.sha256:
                 raise FirmwareUpdateError("The installed schedule identity is not ready. Wait for startup and retry; nothing was flashed.")
@@ -179,7 +230,7 @@ def update_firmware(port, release, *, log=print):
                 raise FirmwareUpdateError("Post-update device identity differs. Firmware was written; no provisioning fallback was attempted.")
             if after.identity.fw.removeprefix("v") != release.version.removeprefix("v"):
                 raise FirmwareUpdateError("The expected firmware did not start. Device credentials were preserved.")
-            changed = [key for key in CONFIG_KEYS if after.settings[key] != before.settings[key]]
+            changed, timezone_correction = _configuration_changes(before, after)
             if changed:
                 raise FirmwareUpdateError("Firmware was updated but configuration verification failed for: " + ", ".join(changed))
             old, new = before.identity.schedule, after.identity.schedule
@@ -188,7 +239,12 @@ def update_firmware(port, release, *, log=print):
                     or old.source == "INSTALLED" and new != old):
                 raise FirmwareUpdateError("Firmware was updated, but the existing installed schedule was not confirmed active. Install a compatible workbook separately; credentials were preserved.")
         log("Verified firmware, MAC, client identity and existing configuration. No registration or certificate issuance was performed.")
-        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True)
+        if timezone_correction:
+            log(timezone_correction)
+        on_primary(FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, timezone_correction=timezone_correction))
+        from . import maintenance
+        extra = maintenance.run(after.port, after.identity.mac, client, confirm_timezone=confirm_timezone, log=log)
+        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, extra, timezone_correction)
     except FirmwareUpdateError:
         raise
     except (ambyte_serial.ConsoleError, esptool_ops.EsptoolError, ServiceClientError) as exc:

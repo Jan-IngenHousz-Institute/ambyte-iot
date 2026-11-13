@@ -21,7 +21,7 @@ from datetime import datetime, timezone as dt_timezone
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from tkinter import font as tkfont
 
-from . import app_update, esptool_ops, procedure, release_fetch, timezones, sensor_diagnostics
+from . import app_update, esptool_ops, procedure, release_fetch, timezones, sensor_diagnostics, location_settings
 from .config import ENVIRONMENTS, Settings
 from .openjii_client import OpenJIIClient, OpenJIIError, WorkbookProgramming
 from .procedure import (DeviceRun, ProcedureError, SessionContext,
@@ -234,19 +234,86 @@ class App(ttk.Frame):
         ttk.Entry(frame, textvariable=self.wifi_pass_var, show="•",
                   width=20).grid(row=3, column=3, sticky="we", pady=(6, 0))
 
+        self.setup_lat = tk.StringVar()
+        self.setup_lon = tk.StringVar()
+        self.setup_tz = tk.StringVar()
+        ttk.Label(frame, text="Fallback latitude:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frame, textvariable=self.setup_lat, width=18).grid(row=4, column=1, sticky="we")
+        ttk.Label(frame, text="Longitude:").grid(row=4, column=2, sticky="e")
+        ttk.Entry(frame, textvariable=self.setup_lon, width=18).grid(row=4, column=3, sticky="we")
+        ttk.Label(frame, text="Fallback timezone:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(frame, textvariable=self.setup_tz, values=sorted(timezones.FIRMWARE_SUPPORTED_ZONES),
+                     width=30).grid(row=5, column=1, columnspan=3, sticky="we")
+        ttk.Label(frame, text="Fallback location/timezone (used until the Ambyte finds its live location). Leave the zone blank to resolve the fallback coordinates.",
+                  wraplength=720).grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        self.setup_preview = tk.StringVar()
+        ttk.Label(frame, textvariable=self.setup_preview, wraplength=720).grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for variable in (self.setup_lat, self.setup_lon, self.setup_tz):
+            variable.trace_add('write', lambda *args: self._update_setup_preview())
+        self._update_setup_preview()
+        from .location_gui import LocationPicker
+        self.setup_location_picker = LocationPicker(frame, 'Use experiment location:', self._use_setup_location)
+        self.setup_location_picker.grid(row=8, column=0, columnspan=4, sticky='we', pady=(6, 0))
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Select an experiment to read its locations.'))
+
+    def _use_setup_location(self):
+        chosen = self.setup_location_picker.selected()
+        if chosen is not None:
+            prefill = dict(self.__dict__.get('_setup_location_prefill') or {})
+            for name, value in (('setup_lat', chosen.latitude), ('setup_lon', chosen.longitude)):
+                variable = getattr(self, name)
+                if not variable.get().strip():
+                    variable.set(str(value))
+                    prefill[name] = variable.get()
+            # A blank zone resolves from the resulting coordinate fields. Never
+            # replace an explicit zone or an operator's edits with a late API reply.
+            self._setup_location_prefill = prefill
+
+    def _reset_setup_location(self):
+        previous = self.__dict__.get('_setup_location_prefill') or {}
+        for name, value in previous.items():
+            variable = getattr(self, name)
+            if variable.get() == value:
+                variable.set('')
+        self._setup_location_prefill = None
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Select an experiment to read its locations.'))
+
+    def _load_setup_locations(self, experiment):
+        self._reset_setup_location()
+        client = self.client
+        self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Reading experiment locations…'))
+        def work():
+            result = location_settings.destination_options(client, experiment.id)
+            self._post(self._apply_setup_locations, client, experiment.id, result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_setup_locations(self, client, experiment_id, result):
+        current = self._current_experiment()
+        if self.client is not client or current is None or current.id != experiment_id:
+            return
+        self.setup_location_picker.set_options(result)
+        self._use_setup_location()
+
+    def _update_setup_preview(self):
+        try:
+            coordinate_zone = timezones.setup_zone(self.setup_lat.get(), self.setup_lon.get(), '')[0]
+        except ValueError:
+            coordinate_zone = 'unavailable'
+        explicit = self.setup_tz.get().strip() or 'not selected'
+        try:
+            chosen = self._setup_zone()[0]
+        except ValueError:
+            chosen = 'selection required'
+        self.setup_preview.set(f'Coordinate-resolved fallback: {coordinate_zone} · Explicit fallback: {explicit} · Chosen fallback: {chosen}')
+
     def _build_info_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Detected (read-only)", padding=8)
         frame.pack(fill="x", pady=(8, 0))
         self.clock_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.clock_var).pack(anchor="w")
-        tz_ok = timezones.firmware_supports(self.local_tz)
-        tz_note = "" if tz_ok else ("  ⚠ not in the firmware's zone table — "
-                                    "the device would reject it, so on-boarding "
-                                    "is blocked (see the log)")
-        self.tz_label = ttk.Label(
-            frame, text=f"Timezone: {self.local_tz} "
-                        f"({timezones.utc_offset_label()}){tz_note}",
-            foreground=("black" if tz_ok else "#a15c00"))
+        self.tz_label = ttk.Label(frame, text=f"Laptop timezone: {self.local_tz} (display only; not used for setup)")
         self.tz_label.pack(anchor="w")
         self.fw_var = tk.StringVar(value="Firmware release: fetching...")
         ttk.Label(frame, textvariable=self.fw_var).pack(anchor="w")
@@ -380,6 +447,20 @@ class App(ttk.Frame):
         self.busy = True
         self._set_busy(True)
         self.result_var.set("Updating firmware; keeping existing settings…")
+        def result_text(result):
+            text = (f"Updated to {result.firmware}; settings preserved."
+                    if result.changed else f"Already on {result.firmware}; no flash needed.")
+            if result.timezone_correction:
+                text += "\n" + result.timezone_correction
+            return text
+        def primary_ready(result):
+            self.result_var.set(result_text(result) + "\nChecking workbook and fallback timezone… keep USB connected.")
+            self.log(result_text(result))
+        def post_primary(result):
+            try:
+                self._post(primary_ready, result)
+            except (RuntimeError, tk.TclError):
+                pass
         def finish(result, error):
             self._set_busy(False)
             if error:
@@ -387,13 +468,18 @@ class App(ttk.Frame):
                 self.log(error)
                 messagebox.showerror("Firmware update", error)
             else:
-                message = (f"Updated to {result.firmware}; settings preserved."
-                           if result.changed else f"Already on {result.firmware}; no flash needed.")
+                message = result_text(result)
+                if result.maintenance is not None:
+                    message += "\n" + result.maintenance.text
+                    if result.maintenance.port:
+                        self.port_var.set(result.maintenance.port)
                 self.result_var.set(message)
                 self.log(message)
+        client = self.client
         def work():
             try:
-                result, error = update_firmware(port, release, log=self.log), None
+                result, error = update_firmware(port, release, client=client,
+                    confirm_timezone=self._confirm_timezone, on_primary=post_primary, log=self.log), None
             except Exception as exc:
                 result, error = None, str(exc)
             try:
@@ -565,6 +651,20 @@ class App(ttk.Frame):
         answer: queue.Queue = queue.Queue(maxsize=1)
         self._post(lambda: answer.put(fn()))
         return answer.get()
+
+    def _confirm_timezone(self, status, *, parent=None):
+        effect = (f"The Ambyte already runs {status.active} from its location. Saving this fallback "
+                  "does not change the active timezone now.\n\n"
+                  if status.active == status.resolved else
+                  f"Effective timezone at last read: {status.active or 'unavailable'}. "
+                  "The Ambyte manages its effective timezone.\n\n")
+        return self._ask_on_main(lambda: messagebox.askyesno(
+            "Fallback timezone mismatch",
+            f"Device {status.mac}\nConfigured fallback timezone: {status.stored or 'unset'}\n"
+            f"Coordinates: {status.latitude}, {status.longitude}\n"
+            f"Fallback coordinate timezone: {status.resolved}\n\n" + effect +
+            "Save this fallback default and reboot to verify it? Choose No to leave it unchanged.",
+            parent=parent or self.winfo_toplevel()))
 
     # ── clock ────────────────────────────────────────────────────────────
     def _tick_clock(self) -> None:
@@ -862,6 +962,8 @@ class App(ttk.Frame):
         self.settings.environment = self.env_var.get()
         self.settings.save()
         self.client = None
+        if hasattr(self, 'setup_location_picker'):
+            self._reset_setup_location()
         self.user_label.set("not signed in")
         self.exp_box.configure(state="disabled", values=[])
         self.exp_var.set("")
@@ -958,6 +1060,7 @@ class App(ttk.Frame):
         self.programming_override = False
         self._apply_programming_labels()
         self._resolve_programming_async(exp)
+        self._load_setup_locations(exp)
 
     # ── the procedure ────────────────────────────────────────────────────
     def _session_ready(self) -> str | None:
@@ -980,15 +1083,14 @@ class App(ttk.Frame):
             return "enter the Wi-Fi SSID the boards should join."
         if not self._selected_port():
             return "select a serial port."
-        if not timezones.firmware_supports(self.local_tz):
-            # `cfg set timezone` fails closed on an unknown zone, so this would
-            # otherwise be flashed and then fail verification unrepairably.
-            return (f"this PC's timezone '{self.local_tz}' is not in the "
-                    f"firmware's zone table (IANA tzdata "
-                    f"{timezones.FIRMWARE_TZDATA_VERSION}). Set the PC to a "
-                    "standard IANA zone, or regenerate the table with "
-                    "tools/gen_tz_table.py and release firmware built from it.")
+        try:
+            self._setup_zone()
+        except ValueError as exc:
+            return str(exc)
         return None
+
+    def _setup_zone(self):
+        return timezones.setup_zone(self.setup_lat.get(), self.setup_lon.get(), self.setup_tz.get())
 
     def _make_context(self) -> SessionContext:
         self.settings.wifi_ssid = self.ssid_var.get().strip()
@@ -1001,13 +1103,16 @@ class App(ttk.Frame):
         programming = (self.programming
                        if self._programming_active()
                        and not self.programming_override else None)
+        deployment_zone, latitude, longitude = self._setup_zone()
         return SessionContext(
             env=self._env(),
             client=self.client,
             release=self.release,
             schedule_script=schedule_script,
             experiment_id=experiment.id,
-            timezone=self.local_tz,
+            timezone=deployment_zone,
+            latitude=latitude,
+            longitude=longitude,
             wifi_ssid=self.settings.wifi_ssid,
             wifi_password=self.settings.wifi_password,
             programming=programming,
@@ -1022,6 +1127,7 @@ class App(ttk.Frame):
             return
         port = self._selected_port()
         ctx = self._make_context()
+        self.log(f"Initial setup fallback timezone: {ctx.timezone}; configured coordinates supplied: {ctx.latitude is not None}")
         self._reset_steps()
         self._set_busy(True)
         threading.Thread(target=self._run_procedure, args=(ctx, port),

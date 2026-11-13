@@ -50,6 +50,7 @@ calibration, so a 403 here is an access decision, not a flag.
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -93,6 +94,33 @@ class Experiment:
         own personal org) exactly as before org ownership existed.
         """
         return self.organization_id if self.organization_name else None
+
+
+@dataclass(frozen=True)
+class ExperimentLocation:
+    id: str
+    name: str
+    latitude: float
+    longitude: float
+    country: str | None = None
+
+    @property
+    def label(self):
+        return f"{self.name} ({self.latitude:.6f}, {self.longitude:.6f})"
+
+
+def location_coordinates(lat, lon):
+    """API locations cannot use booleans, non-finite values or the unset marker."""
+    try:
+        if type(lat) not in (int, float) or type(lon) not in (int, float):
+            raise ValueError
+        lat, lon = float(lat), float(lon)
+        if (not math.isfinite(lat) or not math.isfinite(lon)
+                or not -90 <= lat <= 90 or not -180 <= lon <= 180 or (lat, lon) == (0, 0)):
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise OpenJIIError("Experiment location has invalid or unset coordinates.") from None
+    return lat, lon
 
 
 @dataclass(frozen=True)
@@ -259,6 +287,29 @@ class OpenJIIClient:
                     organization_name=_optional_str(
                         exp.get("organizationName"))))
         return out
+
+    def list_experiment_locations(self, experiment_id: str) -> list[ExperimentLocation]:
+        """Read-only destination access, with no registry or device permission gate."""
+        from uuid import UUID
+        try:
+            if str(UUID(experiment_id)) != experiment_id:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise OpenJIIError("Experiment ID must be a canonical UUID.") from None
+        status, payload = self._request("GET", f"/api/v1/experiments/{experiment_id}/locations")
+        if status != 200 or not isinstance(payload, list):
+            # Do not echo API bodies that can carry private site coordinates.
+            raise OpenJIIError(f"Experiment locations unavailable ({status}); check experiment read access.")
+        result, ids = [], set()
+        for item in payload:
+            if (not isinstance(item, dict) or not isinstance(item.get('id'), str) or not item['id']
+                    or item['id'] in ids or not isinstance(item.get('name'), str) or not item['name'].strip()
+                    or (item.get('country') is not None and not isinstance(item['country'], str))):
+                raise OpenJIIError("Experiment locations contain an invalid entry.")
+            lat, lon = location_coordinates(item.get('latitude'), item.get('longitude'))
+            ids.add(item['id'])
+            result.append(ExperimentLocation(item['id'], item['name'].strip(), lat, lon, item.get('country')))
+        return result
 
     # ── device registry ──────────────────────────────────────────────────
     def find_device(self, serial: str) -> dict | None:

@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import codecs
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -120,6 +121,39 @@ class ScheduleIdentity:
 
 
 @dataclass(frozen=True)
+class LocationCoordinates:
+    set: bool
+    lat: float | None
+    lon: float | None
+
+
+@dataclass(frozen=True)
+class LiveLocation(LocationCoordinates):
+    accuracy_m: float | None
+    age_s: int | None
+    status: str = "waiting"
+
+
+@dataclass(frozen=True)
+class DeviceLocation(LocationCoordinates):
+    source: str = 'configured'
+    accuracy_m: float | None = None
+    configured: LocationCoordinates | None = None
+    live: LiveLocation | None = None
+    configured_stale: bool = False
+
+
+@dataclass(frozen=True)
+class DeviceTimezone:
+    configured: str | None
+    active: str | None
+    source: str
+    resolved: str | None
+    utc_offset_seconds: int
+    pinned: bool = False
+
+
+@dataclass(frozen=True)
 class ConsoleIdentity:
     mac: str | None
     thing_name: str | None
@@ -129,6 +163,10 @@ class ConsoleIdentity:
     capabilities: frozenset[str]
     signed: bool = False
     storage: dict | None = None
+    location: DeviceLocation | None = field(default=None, compare=False)
+    timezone: DeviceTimezone | None = field(default=None, compare=False)
+    location_error: str | None = field(default=None, compare=False)
+    timezone_error: str | None = field(default=None, compare=False)
 
 
 def _identity_object(obj: dict) -> ConsoleIdentity:
@@ -171,11 +209,71 @@ def _identity_object(obj: dict) -> ConsoleIdentity:
                 readable != sorted(set(readable)) or type(written) is not int or written not in readable or
                 type(fallback) is not int or not 1 <= fallback <= 31):
             raise ValueError("invalid storage versions")
+    # Location/timezone are optional diagnostic extensions. A malformed field
+    # must not reject the stable identity used for Wi-Fi/firmware maintenance.
+    def coordinates(site):
+        if (not isinstance(site, dict) or type(site.get('set')) is not bool
+                or not {'lat', 'lon'} <= site.keys()):
+            raise ValueError('invalid location')
+        lat, lon = site['lat'], site['lon']
+        if site['set']:
+            if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (lat, lon))
+                    or not -90 <= lat <= 90 or not -180 <= lon <= 180 or (lat, lon) == (0, 0)):
+                raise ValueError('invalid coordinates')
+        elif lat is not None or lon is not None:
+            raise ValueError('unset location must have null coordinates')
+        return LocationCoordinates(site['set'], lat, lon)
+
+    def accuracy(value):
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+            raise ValueError('invalid accuracy')
+        return value
+
+    location = location_error = None
+    if 'location' in obj:
+        try:
+            site = obj['location']
+            effective = coordinates(site)
+            fallback = coordinates(site['configured'])
+            live_site = site['live']
+            live = coordinates(live_site)
+            age = live_site['age_s']
+            if age is not None and (type(age) is not int or age < 0):
+                raise ValueError('invalid location age')
+            status = live_site['status']
+            stale = site['configured_stale']
+            if not isinstance(status, str) or not status or type(stale) is not bool:
+                raise ValueError('invalid live status or configured-stale flag')
+            live = LiveLocation(live.set, live.lat, live.lon, accuracy(live_site['accuracy_m']), age, status)
+            location_source = site['source']
+            if location_source not in {'live', 'configured', 'none'}:
+                raise ValueError('invalid location source')
+            if ((location_source == 'live' and effective != LocationCoordinates(live.set, live.lat, live.lon))
+                    or (location_source == 'configured' and effective != fallback)
+                    or (location_source == 'none' and effective.set)):
+                raise ValueError('location source disagrees with effective coordinates')
+            location = DeviceLocation(effective.set, effective.lat, effective.lon, location_source,
+                                      accuracy(site['accuracy_m']), fallback, live, stale)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            location_error = 'malformed location metadata'
+    timezone = timezone_error = None
+    if 'timezone' in obj:
+        try:
+            zone = obj['timezone']
+            if (not isinstance(zone, dict) or zone.get('source') not in {'manual', 'location', 'configured', 'none'}
+                    or not {'configured', 'active', 'resolved', 'utc_offset_seconds'} <= zone.keys()
+                    or type(zone.get('pinned')) is not bool
+                    or type(zone['utc_offset_seconds']) is not int or abs(zone['utc_offset_seconds']) > 86400):
+                raise ValueError('invalid timezone identity')
+            timezone = DeviceTimezone(nullable(zone['configured']), nullable(zone['active']), zone['source'],
+                                      nullable(zone['resolved']), zone['utc_offset_seconds'], zone['pinned'])
+        except (ValueError, TypeError, KeyError):
+            timezone_error = 'malformed timezone metadata'
     return ConsoleIdentity(mac.upper() if mac else None,
         nullable(obj["thing_name"]), nullable(obj["fw"]), 1,
         ScheduleIdentity(source, sha.lower() if sha else None,
                          nullable(schedule["workbookVersionId"]),
-                         nullable(schedule["script_version"])), frozenset(caps), signed, storage)
+                         nullable(schedule["script_version"])), frozenset(caps), signed, storage, location, timezone, location_error, timezone_error)
 
 
 @dataclass(frozen=True)
@@ -442,6 +540,17 @@ class AmbyteConsole:
         """
         m = _SD_RE.search(self.status(timeout))
         return None if m is None else m.group(1).lower() == "mounted"
+
+    def location_set(self, latitude: float, longitude: float) -> None:
+        """Persist coordinates on audited sync-loc firmware, without echoing sites in errors."""
+        if (type(latitude) not in (int, float) or type(longitude) not in (int, float)
+                or not math.isfinite(latitude) or not math.isfinite(longitude)
+                or not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+                or (latitude, longitude) == (0, 0)):
+            raise ConsoleError('Invalid or unset location coordinates.')
+        reply = self.command(f'sync loc {latitude:.8f} {longitude:.8f}', max_reply_bytes=4096)
+        if ('location persist failed:' in reply or FAILURE_MARK in reply or 'loc: lat=' not in reply):
+            raise ConsoleError('Location persistence acknowledgement unavailable.')
 
     def cfg_get(self, key: str, timeout: float = 5.0) -> str | None:
         """Raw NVS value, or None when unset/unreadable."""

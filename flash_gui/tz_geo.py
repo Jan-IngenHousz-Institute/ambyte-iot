@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Offline coordinate -> IANA timezone lookup, identical to the firmware's.
 
-The Ambyte resolves its own zone from its stored deployment coordinates
-(components/timezone/tz_geo.c, docs/timezone-from-location.md). This module reads
+The Ambyte can resolve its effective location on capable firmware. This module
+compares configured fallback coordinates without choosing the device's source. It reads
 the very same generated quadtree (flash_gui/tz_geo_data.py is byte-identical to
-components/timezone/tz_geo.bin), so the GUI can predict exactly which zone a
-device will pick for a coordinate -- e.g. to flag a provisioning timezone that
-disagrees with the deployment site before the unit ships.
+components/timezone/tz_geo.bin), so a GUI and firmware with the same dataset predict the same zone for a
+coordinate. Firmware remains authoritative when datasets differ. The compact
+format and generation are documented in tools/gen_tz_geo.py.
 
     zone_for(-25.3444, 131.0369)  -> "Australia/Darwin"
     zone_for(0.0, -30.0)          -> None   (open ocean)
