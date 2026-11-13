@@ -21,9 +21,13 @@ on:
         options: [ping, inventory, replay, get-timezone, set-timezone]
         default: ping
       timezone:
-        description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
+        description: "set-timezone only: IANA timezone stored as the configured FALLBACK (the device's location wins unless pinned), or auto to release a pin"
         type: string
         default: ""
+      pin:
+        description: "set-timezone only: pin the zone over the device's location (escape hatch)"
+        type: boolean
+        default: false
       expect_offset:
         description: "Optional timezone verification: exact UTC offset in seconds (Darwin = 34200)"
         type: string
@@ -123,6 +127,7 @@ jobs:
           COMMAND: ${{ inputs.command }}
           DEVICES: ${{ inputs.devices }}
           TIMEZONE: ${{ inputs.timezone }}
+          PIN: ${{ inputs.pin }}
           EXPECT_OFFSET: ${{ inputs.expect_offset }}
           WINDOW: ${{ inputs.discovery_window_minutes }}
           EXPECT_FW: ${{ inputs.expect_fw }}
@@ -153,6 +158,7 @@ jobs:
                 --results-json results.json)
           [[ -n "${DEVICES}" ]] && ARGS+=(--devices "${DEVICES}")
           [[ "${COMMAND}" == "set-timezone" ]] && ARGS+=(--timezone "${TIMEZONE}")
+          [[ "${COMMAND}" == "set-timezone" && "${PIN}" == "true" ]] && ARGS+=(--pin)
           [[ -n "${EXPECT_OFFSET}" ]] && ARGS+=(--expect-offset "${EXPECT_OFFSET}")
           [[ -n "${EXPECT_FW}" ]] && ARGS+=(--expect-fw "${EXPECT_FW}")
           [[ "${COMMAND}" == "replay" ]] && ARGS+=(--mode "${MODE}" --token "${TOKEN}")

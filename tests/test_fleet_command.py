@@ -38,6 +38,39 @@ class BuildMessage(unittest.TestCase):
             with self.subTest(zone=zone), self.assertRaises(SystemExit):
                 self.fc.build_message(_args(cmd="set-timezone", timezone=zone), "r")
 
+    def test_pin_and_auto(self):
+        self.assertEqual(self.fc.build_message(_args(cmd="set-timezone", timezone="Europe/Berlin", pin=True), "r"),
+                         {"type": "set_timezone", "id": "r", "timezone": "Europe/Berlin", "pin": True})
+        self.assertEqual(self.fc.build_message(_args(cmd="set-timezone", timezone="auto"), "r"),
+                         {"type": "set_timezone", "id": "r", "timezone": "auto"})
+        with self.assertRaises(SystemExit):
+            self.fc.build_message(_args(cmd="set-timezone", timezone="auto", pin=True), "r")
+
+    def test_timezone_outcomes(self):
+        o = self.fc.timezone_outcome
+        base = dict(type="set_timezone_result", ok=True, saved=True, applied=True, utc_offset_seconds=34200)
+        # #98 firmware: the old strict gate.
+        legacy = dict(base, timezone="Australia/Darwin", active_timezone="Australia/Darwin")
+        self.assertEqual(o("set-timezone", legacy, "Australia/Darwin", expect_offset=34200)[0], "verified")
+        self.assertEqual(o("set-timezone", dict(legacy, active_timezone="Europe/Berlin"), "Australia/Darwin")[0], "failed")
+        # Resolver firmware: a fallback the location overrides is reported, not passed silently.
+        new = dict(base, timezone="Asia/Tokyo", active_timezone="Australia/Darwin", timezone_source="location",
+                   pinned=False, resolved_timezone="Australia/Darwin", location_source="configured")
+        outcome, reason = o("set-timezone", new, "Asia/Tokyo")
+        self.assertEqual(outcome, "fallback")
+        self.assertIn("Australia/Darwin", reason)
+        self.assertEqual(o("set-timezone", new, "Asia/Tokyo", pin=True)[0], "failed")
+        pinned = dict(base, timezone="Europe/Berlin", active_timezone="Europe/Berlin", timezone_source="manual", pinned=True)
+        self.assertEqual(o("set-timezone", pinned, "Europe/Berlin", pin=True)[0], "verified")
+        self.assertEqual(o("set-timezone", dict(pinned, pinned=False), "Europe/Berlin", pin=True)[0], "failed")
+        unpinned = dict(new, timezone="Europe/Berlin")
+        self.assertEqual(o("set-timezone", unpinned, "auto")[0], "verified")
+        self.assertEqual(o("set-timezone", dict(base, ok=False, detail="persist_failed", timezone="x",
+                                                active_timezone="y"), "x")[0], "failed")
+        get = dict(new, type="timezone_result", timezone="Europe/Berlin")
+        self.assertEqual(o("get-timezone", get, expect_offset=34200)[0], "verified")
+        self.assertEqual(o("get-timezone", get, expect_offset=3600)[0], "failed")
+
     def test_inventory_window_optional(self):
         self.assertEqual(self.fc.build_message(_args(cmd="inventory"), "r"),
                          {"type": "evlog_inventory", "id": "r", "list": True})
