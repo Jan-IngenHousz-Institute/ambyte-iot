@@ -74,7 +74,10 @@ The reasons for this rule:
   breaks out abroad (home-routed roaming), or a spoofed public-IP lookup
   (the lookup is plain HTTP). It can only flag the configured site stale.
   With no configured location, an IP fix takes effect after 2 agreeing
-  answers at least an hour apart (Opus review of #100). A sustained spoof
+  answers at least an hour apart (Opus review of #100). Inside the country
+  of a stored Wi-Fi fix, an IP answer is country evidence only: it refreshes
+  the fix's age but never moves it or starts a zone change, so a period of
+  Wi-Fi 404s cannot walk a precise zone to the egress city. A sustained spoof
   can therefore still set the zone and sun position of a unit with no
   configured coordinates; configure them to rule that out.
 - **A pin always wins.** It is an explicit escape hatch: MQTT `set_timezone`
@@ -118,7 +121,10 @@ without any other input.
   then re-resolves every armed solar due that is still ahead, just as an
   offset edge re-projects wall triggers. Dues already passed keep their
   grace accounting. `day`/`night` windows need nothing, because gates are
-  evaluated on every poll.
+  evaluated on every poll. A **westward** move makes local solar events
+  later, so a solar trigger that already fired today can come due again the
+  same day. This is the same class of one-time repeat as a backward zone
+  change; hysteresis and the confirmation rules keep such moves rare.
 - **Noise does not move it.** Within one zone, a live estimate replaces the
   fix only when it lands more than both 1 km and its own uncertainty away,
   or is at least twice as precise. IP answers wandering inside their
