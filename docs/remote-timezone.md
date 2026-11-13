@@ -100,3 +100,20 @@ snapshots the IANA name and offset together so concurrent application cannot
 produce a mismatched `timestamp_local` and `timezone` pair. Position-only changes
 and schedule restarts now preserve the exact offset instead of round-tripping
 through the legacy whole-hour location getter.
+
+## Physical uploader correction found during qualification
+
+The existing bench wrapper used `pio -t nobuild -t upload`. Without CMake upload
+metadata, that route wrote the app at the board default `0x10000`, although
+`partitions.csv` and IDF's generated `flasher_args.json` place it at `0x20000`.
+The board booted its old OTA fallback, so an uploader exit status was not proof
+that the intended firmware ran. The qualification caught this before field use.
+
+The wrapper now consumes the generated four-image layout, substitutes the signed
+application, bounds every image including erase rounding, and invokes the GUI's
+shared flash routine. It checks the MAC and existing partition table in the same
+flash session and writes otadata to select the new app. NVS is omitted unless
+`--provision` was explicitly requested; littlefs and event storage are untouched.
+Run it in the GUI dependency environment (for example `uv run --group test python
+tools/bench_flash.py --port <selected-port>`). This correction does not change
+MQTT OTA delivery.
