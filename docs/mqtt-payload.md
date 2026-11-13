@@ -567,6 +567,7 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "solar_position": "location",
       "live_status": "ok",
       "live_source": "ip",
+      "live_wifi_age_s": null,
       "timezone": "Australia/Darwin",
       "timezone_source": "location",
       "pinned": false
@@ -665,6 +666,7 @@ non-negative integers.
 | | `solar_position` | string enum | `location` (sunrise/sunset/solar triggers from the effective location) or `default` (compiled 52.173 N 5.819 E; no location known). |
 | | `live_status` | string | Last live-source outcome (`waiting`, `not_authorized`, `ok`, `candidate`, `rejected_<code>`, `no_reply`, `off`, ...); unknown values are preserved. |
 | | `live_source` | string enum or null | How the stored live fix was obtained: `wifi` or `ip`; null without a usable live fix. An `ip` fix never overrides configured coordinates. |
+| | `live_wifi_age_s` | integer, s, or null | Age of the last Wi-Fi-sourced estimate behind the stored live fix; null when there was none. A large value with a fresh fix means it is kept alive only by IP answers. Up to a week old after a reboot. |
 | | `timezone` | string | Zone in effect (same as the envelope `timezone`). |
 | | `timezone_source` | string enum | Why: `manual` (pinned), `location`, `configured` (fallback zone), `none`. |
 | | `pinned` | boolean | An explicit timezone pin overrides the location. |

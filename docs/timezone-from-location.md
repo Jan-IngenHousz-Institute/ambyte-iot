@@ -77,7 +77,19 @@ The reasons for this rule:
   answers at least an hour apart (Opus review of #100). Inside the country
   of a stored Wi-Fi fix, an IP answer is country evidence only: it refreshes
   the fix's age but never moves it or starts a zone change, so a period of
-  Wi-Fi 404s cannot walk a precise zone to the egress city. A sustained spoof
+  Wi-Fi 404s cannot walk a precise zone to the egress city. The trade-off: a
+  unit relocated within its country whose Wi-Fi never resolves keeps its old
+  zone and position, and its fix keeps looking fresh, so the 30-day expiry
+  never fires. `live.wifi_age_s` (STATUS `live_wifi_age_s`) shows the age of
+  the last Wi-Fi estimate separately, so a fix kept alive only by IP answers
+  is visible. It can read up to a week old after a reboot (weekly
+  persistence). A Wi-Fi answer inside the noise of an IP fix upgrades that fix
+  to Wi-Fi in place, so a later confirmed Wi-Fi override of a cross-border
+  preset can happen. With no configured location, IP answers in ANOTHER
+  country can still replace a stored Wi-Fi fix after 3 agreeing estimates
+  over at least 6 h (a home-routed roaming SIM, or a spoof, during
+  consecutive Wi-Fi misses): the documented trade-off, which configured
+  coordinates rule out. A sustained spoof
   can therefore still set the zone and sun position of a unit with no
   configured coordinates; configure them to rule that out.
 - **A pin always wins.** It is an explicit escape hatch: MQTT `set_timezone`
@@ -95,7 +107,7 @@ The reasons for this rule:
 | zone | must resolve to a zone with a country | Open water or `Etc/*` gives nothing to compare. |
 | confirmation | 2 agreeing estimates (same source, same zone) ≥ 1 h apart | Required for an IP fix to count without a configured location, and for a Wi-Fi fix to override a configured location in another country. |
 | hysteresis | 3 agreeing estimates (same zone) spanning ≥ 6 h | Applies only when changing a zone that is already live-derived, so a noisy source cannot flap the zone and re-anchor the scheduler. |
-| persistence | one NVS blob with the source and the agreement count, written on a zone change, a real move, or until the fix is confirmed | Flash wear (a settled unit stops writing). A reboot keeps the live location and its confirmation. |
+| persistence | one NVS blob with the source, the agreement count and the time of the last Wi-Fi estimate, written on a zone change, a real move, until the fix is confirmed, and at least weekly while estimates keep refreshing it | Flash wear (a settled unit writes about once a week). A reboot keeps the live location and its confirmation for as long as estimates keep arriving: the 30-day age is judged from the persisted time, which is never more than a week behind. |
 | age | used while ≤ 30 days old (needs a trusted clock) | A unit moved and left offline falls back to configured. The 6 h refresh and the first SNTP sync of a boot report `live.status: expired`. |
 
 The unconfirmed candidate lives in RAM. A reboot restarts the count, which
@@ -130,6 +142,16 @@ without any other input.
   or is at least twice as precise. IP answers wandering inside their
   ±5–50 km never re-anchor sunrise, and a coarse IP answer never displaces a
   nearby Wi-Fi fix. A Wi-Fi fix replacing an IP fix does move it.
+
+Implementation notes from review:
+
+- `device_location`'s lock is never held across an NVS write. Short NVS
+  reads (configured coordinates, the `loc_live` mode) still happen under it.
+  The NVS lock is a leaf, so this is no deadlock, and every reader reads NVS
+  in its own decision anyway.
+- The one-shot refresh on the first trusted SNTP sync is dropped if the
+  worker is busy at that moment. The 6 h refresh, live offers and the boot
+  reconcile cover it.
 
 Accuracy: about 1 km of east–west error shifts sunrise by
 roughly 2–4 seconds (east–west: 4 min per degree of longitude). IP-level ±50 km is one to two minutes of solar-time error.
@@ -277,15 +299,16 @@ rewritten.
 - **identity** (`timezone.auto` capability) adds two keys:
   - `location{set, source, lat, lon, accuracy_m, configured_stale,
     solar_position, configured{set, lat, lon}, live{set, lat, lon,
-    accuracy_m, age_s, source, status}}`, where `solar_position` is
-    `location` or `default` and `live.source` is `wifi`, `ip` or null
+    accuracy_m, age_s, wifi_age_s, source, status}}`, where `solar_position`
+    is `location` or `default`, `live.source` is `wifi`, `ip` or null, and
+    `live.wifi_age_s` is the age of the last Wi-Fi estimate (null if none)
   - `timezone{configured, active, source: manual|location|configured|none,
     pinned, resolved, utc_offset_seconds}`
   - Coordinates are only ever persisted or live ones, never the scheduler's
     compiled default.
 - **STATUS** (`health.location`) carries `{source, lat, lon, accuracy_m,
-  configured_stale, solar_position, live_status, live_source, timezone,
-  timezone_source, pinned}`.
+  configured_stale, solar_position, live_status, live_source,
+  live_wifi_age_s, timezone, timezone_source, pinned}`.
   Measurement envelopes are unchanged: per-record location would carry the
   publish-time location on backlogged records.
 - **MQTT** `set_timezone`:
