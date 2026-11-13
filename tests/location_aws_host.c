@@ -50,6 +50,7 @@ int main(int argc, char **argv)
             if (isfinite(r.accuracy_m)) fprintf(stderr, "%.1f\n", r.accuracy_m);
         }
     } else if (!strcmp(op, "wifi")) {
+        /* Documentation MACs (RFC 7042, 00-00-5E-00-53-xx): never a real AP. */
         location_aws_ap_t scan[] = {
             {{0x00, 0x00, 0x5E, 0x00, 0x53, 0x01}, -61},
             {{0x02, 0x11, 0x22, 0x33, 0x44, 0x55}, -40},   /* locally administered: dropped */

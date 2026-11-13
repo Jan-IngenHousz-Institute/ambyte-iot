@@ -130,12 +130,12 @@ class LocationAwsCodecTest(unittest.TestCase):
         self.assertEqual(set(body), {"Timestamp", "MessageId", "WiFiAccessPoints"})
         self.assertEqual(body["Timestamp"], "1794559977")            # a STRING
         self.assertEqual(body["MessageId"], "tz-1-w")
+        # Documentation MACs (RFC 7042), strongest first, dropped ones absent.
         self.assertEqual(body["WiFiAccessPoints"], [
-            {"MacAddress": "00:00:5E:00:53:01", "Rss": -61},
             {"MacAddress": "00:00:5E:00:53:03", "Rss": -50},
+            {"MacAddress": "00:00:5E:00:53:01", "Rss": -61},
             {"MacAddress": "00:00:5E:00:53:02", "Rss": -75},
-        ][::1] and sorted(body["WiFiAccessPoints"], key=lambda a: -a["Rss"]))
-        self.assertEqual([a["Rss"] for a in body["WiFiAccessPoints"]], [-50, -61, -75])
+        ])
 
     def test_ip_request_never_mixes_wifi(self):
         body = json.loads(self.run_op("ip", "9.9.9.9")[0])
@@ -144,14 +144,17 @@ class LocationAwsCodecTest(unittest.TestCase):
 
     def test_public_ip_validation(self):
         for text, want in [
+            # Accepted: well-known public resolvers only (no site address).
             ("9.9.9.9\n", "9.9.9.9"),
             ("8.8.4.4\r\n", "8.8.4.4"),
-            ("2a02:a45f:1::5\n", "2a02:a45f:1::5"),
+            ("2606:4700:4700::1111\n", "2606:4700:4700::1111"),
+            # Documentation ranges are not anyone's public address.
+            ("192.0.2.10", "!"), ("198.51.100.7", "!"), ("203.0.113.5", "!"), ("2001:db8::5", "!"),
             ("10.0.0.7", "!"), ("192.168.1.20", "!"), ("172.20.1.1", "!"), ("100.72.1.9", "!"),
             ("127.0.0.1", "!"), ("169.254.3.4", "!"), ("224.0.0.1", "!"), ("0.0.0.0", "!"),
             ("fe80::1", "!"), ("::1", "!"), ("fd00::1", "!"),
-            ("1.2.3", "!"), ("01.2.3.4", "!"), ("256.1.1.1", "!"), ("<html>", "!"), ("", "!"),
-            ("1.2.3.4 extra", "!"),
+            ("9.9.9", "!"), ("09.9.9.9", "!"), ("256.1.1.1", "!"), ("<html>", "!"), ("", "!"),
+            ("9.9.9.9 extra", "!"),
         ]:
             with self.subTest(text):
                 self.assertEqual(self.run_op("publicip", text)[0], want)

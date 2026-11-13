@@ -155,7 +155,14 @@ static bool ipv6_public(const char *s)
     }
     if (doubles > 1 || groups > 8 || (doubles == 0 && groups != 8)) return false;
     unsigned first = (unsigned)strtoul(s, NULL, 16);
-    return s[0] != ':' && (first & 0xE000) == 0x2000;
+    if (s[0] == ':' || (first & 0xE000) != 0x2000) return false;
+    /* 2001:db8::/32 is documentation (RFC 3849), nobody's public address. */
+    const char *colon = strchr(s, ':');
+    if (first == 0x2001 && colon && strtoul(colon + 1, NULL, 16) == 0xdb8 &&
+        (colon[1] != ':')) {
+        return false;
+    }
+    return true;
 }
 
 bool location_aws_public_ip(const char *text, char *out, size_t len)
