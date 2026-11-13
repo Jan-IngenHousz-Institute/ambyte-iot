@@ -45,6 +45,24 @@ def flash_layout(build: Path, signed_app: Path, provision: bool):
     return sorted(images), manifest["flash_settings"]
 
 
+def validate_signed_build(build: Path) -> None:
+    """The PlatformIO before_upload guard, applied to this direct flash path.
+
+    flash_images() bypasses PlatformIO's upload hook, which is where
+    tools/upload_guard.validate_upload checks the EFFECTIVE sdkconfig (eFuse-
+    burning options such as SECURE_DISABLE_ROM_DL_MODE, signed-update
+    verification, rollback) and the signed image. Without this, a bench build
+    with a dangerous cached setting could be bench-signed and flashed
+    (gpt-6-astra review of #98). Runs after signing, before any port access.
+    """
+    sys.path.insert(0, str(ROOT))
+    from tools.upload_guard import validate_upload
+    try:
+        validate_upload(build)
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"UPLOAD REFUSED before esptool: {exc}; no device was flashed") from exc
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--env", default="esp32-s3-devkitm-1")
@@ -80,6 +98,7 @@ def main(argv=None):
     subprocess.run([sys.executable, str(ROOT / "tools/sign_firmware.py"), "--image", str(image),
                     "--key", str(ROOT / "tools/keys/UNSAFE_BENCH_ONLY_firmware.pem"),
                     "--allow-bench", "--output", str(image)], cwd=ROOT, check=True)
+    validate_signed_build(image.parent)
     # Cross the same signature, MAC and partition-table checks as the GUI.
     # Partition/data layout changes are refused on an existing configured board.
     sys.path.insert(0, str(ROOT))
