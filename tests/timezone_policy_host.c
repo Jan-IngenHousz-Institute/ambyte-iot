@@ -442,6 +442,20 @@ int main(int argc, char **argv)
         live(-34.9285 + 0.027, 138.6007, 41);           /* Wi-Fi: 2x sharper, moves */
         expect_position(-34.9285 + 0.027, 138.6007);
         gen = time_sync_position_generation();
+        /* Bench, 2026-11-13: a +-5 km IP answer ~1.9 km from the +-41 m Wi-Fi
+         * fix replaced it and, unconfirmed, dropped the unit to none. It lies
+         * inside its own uncertainty: the Wi-Fi fix and position stay. */
+        live_ip(-34.9285 + 0.027 + 0.017, 138.6007, 5000);
+        expect_position(-34.9285 + 0.027, 138.6007);
+        assert(time_sync_position_generation() == gen);
+        {
+            timezone_status_t st;
+            timezone_command_status(&st);
+            assert(st.location.source == DEVICE_LOCATION_LIVE &&
+                   st.location.live_source == DEVICE_LIVE_SOURCE_WIFI);
+        }
+        expect_position(-34.9285 + 0.027, 138.6007);
+        gen = time_sync_position_generation();
         live(-34.9285 + 0.0315, 138.6007, 41);          /* ~500 m: under 1 km, stays */
         expect_position(-34.9285 + 0.027, 138.6007);
         assert(time_sync_position_generation() == gen);

@@ -208,8 +208,8 @@ static double distance_m(double lat1, double lon1, double lat2, double lon2)
  * Agreement: an estimate of the same source in the same zone as the stored
  * fix counts towards its confirmation (count up, first time kept). Position
  * hysteresis (solar triggers re-resolve whenever the position moves): within
- * the zone the position changes only beyond max(1 km, smaller uncertainty),
- * or for an estimate at least twice as precise. A different zone, or a
+ * the zone the position changes only beyond max(1 km, the new estimate's own
+ * uncertainty), or for an estimate at least twice as precise. A different zone, or a
  * different source that moves the position, replaces the fix and restarts
  * the count; a different source inside the noise only refreshes the age. */
 static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char *zone,
@@ -222,9 +222,12 @@ static device_live_fix_t next_fix_locked(const device_live_fix_t *in, const char
     }
     const device_live_fix_t *old = &s_live.f;
     double d = distance_m(old->lat, old->lon, in->lat, in->lon);
-    double noise = DEVICE_LOCATION_PERSIST_MOVE_M;
-    double smaller = fmin(in->accuracy_m, old->accuracy_m);
-    if (smaller > noise) noise = smaller;
+    /* An estimate that lands inside its OWN uncertainty of the stored fix
+     * agrees with it and moves nothing: a +-5 km IP answer 2 km from a +-41 m
+     * Wi-Fi fix must not replace it (found on the bench, 2026-11-13). It
+     * moves the fix only beyond max(1 km, its own uncertainty), or when it is
+     * at least twice as precise and over 1 km away. */
+    double noise = fmax(DEVICE_LOCATION_PERSIST_MOVE_M, in->accuracy_m);
     bool sharper = in->accuracy_m * 2.0 <= old->accuracy_m && d > DEVICE_LOCATION_PERSIST_MOVE_M;
     bool moves = d > noise || sharper;
     if (in->source != old->source) {

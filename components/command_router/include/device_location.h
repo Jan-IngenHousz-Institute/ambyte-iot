@@ -64,8 +64,9 @@ typedef struct {
  *  - while the zone in effect is ALREADY live-derived, changing it needs 3
  *    agreeing estimates (same zone) spanning >= 6 h.
  *  - within a zone, a new estimate moves the fix (and with it the solar
- *    position) only beyond max(1 km, smaller uncertainty), or when it is at
- *    least twice as precise -- IP noise never re-anchors sunrise/sunset.
+ *    position) only beyond max(1 km, its own uncertainty), or when it is at
+ *    least twice as precise -- IP noise never re-anchors sunrise/sunset, and
+ *    a coarse IP answer never displaces a nearby precise Wi-Fi fix.
  *  - `loc_live off` ignores the live fix entirely (configured / none).
  *  - the accepted fix persists (NVS) on a zone change, a real move or a new
  *    agreeing estimate (the confirmation count must survive a reboot), and

@@ -120,9 +120,10 @@ without any other input.
   grace accounting. `day`/`night` windows need nothing, because gates are
   evaluated on every poll.
 - **Noise does not move it.** Within one zone, a live estimate replaces the
-  fix only when it moved more than both 1 km and the smaller uncertainty,
+  fix only when it lands more than both 1 km and its own uncertainty away,
   or is at least twice as precise. IP answers wandering inside their
-  ±5–50 km never re-anchor sunrise; a Wi-Fi fix replacing an IP fix does.
+  ±5–50 km never re-anchor sunrise, and a coarse IP answer never displaces a
+  nearby Wi-Fi fix. A Wi-Fi fix replacing an IP fix does move it.
 
 Accuracy: about 1 km of east–west error shifts sunrise by
 roughly 2–4 seconds (east–west: 4 min per degree of longitude). IP-level ±50 km is one to two minutes of solar-time error.
