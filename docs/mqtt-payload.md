@@ -41,7 +41,9 @@ compiled app version. For older STATUS health stored in `data`, see §11.1.
 The declarative schedule runner measures and stores events through its fixed
 action catalog into the append-log event store; the `sync_runner` background task is the sole
 publisher and drains the store when MQTT is connected, no UART measurement is
-in progress, the external-power gate is open, and the clock is valid
+in progress, the power gate is open (always, while a charger is fitted, since
+2026-11-13: a charger reading never holds data back; see
+[power-telemetry.md](power-telemetry.md)), and the clock is valid
 (≥ 2024-01-01 UTC). One stored event (one `measure_id`) becomes exactly one
 MQTT message, FIFO. QoS 1, retain 0, publish window of 16 slots / 64 KiB
 outstanding; delivery is **at-least-once** and the cloud does not dedupe —
@@ -616,12 +618,17 @@ non-negative integers.
 |---|---|---|---|
 | `connectivity` | `wifi` | boolean | `wifi`; gateway has a Wi-Fi connection. |
 | | `provisioned` | boolean | `provisioned`; Wi-Fi credentials are provisioned. |
-| | `publish_gate` | boolean | `publish_gate`; external-power publication gate is open. |
+| | `publish_gate` | boolean | `publish_gate`; publication gate is open. Since the 2026-11-13 fix it is always `true` (the gate never closes on a power reading; see [power-telemetry.md](power-telemetry.md)). Earlier firmware reported `false` while it held the backlog on battery. |
+| | `publish_gate_reason` | string enum | Observed power state (observability only; it never stops publishing): `starting` (no charger read yet), `external_power` (valid read, input present), `on_battery` (valid read without input, or live status `no_input`), `power_unverified` (stale, implausible or unreadable charger), `no_charger`. Additive since the 2026-11-13 fix; unknown future values are preserved. |
 | | `mqtt_reconnects` | integer | `mqtt_reconnects`; MQTT connection count for this boot. |
 | | `last_disc_reason` | string | `last_disc_reason`; most recent Wi-Fi/MQTT disconnect reason, empty when none is known. |
 | | `conn_age_s` | integer, s | `conn_age_s`; current MQTT connection age, `-1` when unavailable. |
 | | `pending` | integer | `pending`; persisted events awaiting acknowledgement. |
-| `power` | `battery_v` | number, V | Charger battery voltage. |
+| `power` | `valid` | boolean | The charger frame below is a fresh, plausible measurement. When `false` the numeric leaves are omitted, never zero-filled. Present whenever a charger is fitted (additive, 2026-11-13). |
+| | `reason` | string enum | Read verdict: `ok`, `no_input` (live status says no external input; the charger ADC does not run then, so no voltages), `adc_timeout`, `implausible` (e.g. all-zero, or charge current while not charging: a stale frame), `i2c_error`, `unavailable`. |
+| | `status_reg` | integer 0–255 | Raw MP2731 REG0C (VIN_STAT, CHG_STAT, …), also on rejected frames; omitted after a bus error. |
+| | `fault_reg` | integer 0–255 | Raw MP2731 REG0D (watchdog, input, thermal, NTC faults), same rules as `status_reg`. |
+| | `battery_v` | number, V | Charger battery voltage. |
 | | `input_v` | number, V | Charger input voltage. |
 | | `system_v` | number, V | Charger system-rail voltage. |
 | | `input_ma` | integer, mA | Charger input current. |

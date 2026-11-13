@@ -24,12 +24,6 @@ A = b"3C:DC:75:0E:04:28"
 B = b"3C:DC:75:0E:02:B8"
 
 
-class PowerReading(ctypes.Structure):
-    _fields_ = [("battery_mv", ctypes.c_uint16), ("system_mv", ctypes.c_uint16), ("input_mv", ctypes.c_uint16),
-                ("charge_ma", ctypes.c_uint16), ("input_ma", ctypes.c_uint16), ("input_present", ctypes.c_bool),
-                ("charge_status", ctypes.c_uint8)]
-
-
 def build(out: Path) -> Path:
     cc = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc") or "cc"
     lib = out / "libgate.so"
@@ -62,7 +56,6 @@ class GateTest(unittest.TestCase):
                                                      ctypes.c_int, ctypes.c_int64]
         self.g.ambit_attach_gate_pending.restype = ctypes.c_uint8
         self.g.ambit_attach_gate_held.restype = ctypes.c_bool
-        self.g.ambit_attach_power_ok.restype = ctypes.c_bool
         self.kicks = 0
         self.kick_ok = True
 
@@ -140,18 +133,6 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.allow(0, A, b"0.0.6"))
         self.assertEqual(self.kicks, 2)
 
-    def test_power_rule(self):
-        def ok(**kw):
-            p = PowerReading(**kw)
-            return self.g.ambit_attach_power_ok(ctypes.byref(p))
-        self.assertTrue(ok(input_present=True))
-        self.assertTrue(ok(battery_mv=3700))
-        self.assertFalse(ok(battery_mv=3699))
-        # MP2731: battery reads 0 when not charging; the system rail stands in.
-        self.assertTrue(ok(battery_mv=0, system_mv=3900))
-        self.assertFalse(ok(battery_mv=0, system_mv=3500))
-        self.assertFalse(ok(battery_mv=0, system_mv=0), "no usable reading is not enough")
-
 
 class WiringContractTest(unittest.TestCase):
     def setUp(self):
@@ -174,7 +155,7 @@ class WiringContractTest(unittest.TestCase):
         ota = (ROOT / "components/ambit_ota/ambit_ota.c").read_text()
         fn = ota.split("static void ambit_do_attach(void)", 1)[1].split("\n}\n", 1)[0]
         stale = fn.split("case AMBIT_ATTACH_DECIDE_STALE:", 1)[1]
-        self.assertLess(stale.index("ambit_attach_power_ok(&p)"), stale.index("ambit_flash_attach_flash("))
+        self.assertLess(stale.index("device_commands_flash_power_ok()"), stale.index("ambit_flash_attach_flash("))
         self.assertLess(stale.index("s_cfg.workload_suspend()"), stale.index("ambit_flash_attach_flash("))
         self.assertIn("ambit_attach_gate_checker_done();", fn)
         main = (ROOT / "main/app_main.c").read_text()

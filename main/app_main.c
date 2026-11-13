@@ -27,6 +27,7 @@
 #include "ambit_announcement_nvs.h"
 #include "script_update.h"
 #include "device_commands.h"
+#include "power_policy.h"
 #include "esp_err.h"
 #include "esp_app_desc.h"
 #include "esp_event.h"
@@ -702,11 +703,17 @@ static void app_prepare_reboot(void)
  * needs real headroom above the floor because unloading the pack rebounds its
  * voltage ~100 mV — resuming on rebound would park/unpark in a thrash loop.
  * In practice a parked unit un-parks the next morning via input_present. */
-#define PWRGUARD_POLL_MS     15000   /* MP2731 poll cadence (one cheap I2C read) */
-#define PWRGUARD_PARK_MV      3300   /* on-battery floor: park persistence below this */
-#define PWRGUARD_PARK_N          3   /* consecutive low reads (45 s) — rides out sag/ADC steps */
-#define PWRGUARD_RESUME_MV    3600   /* battery-only resume level (> park + rebound) */
-#define PWRGUARD_RESUME_N        4   /* consecutive good reads (60 s) before un-parking */
+#define PWRGUARD_POLL_MS     15000   /* MP2731 poll cadence (one verified read) */
+/* Park floor 3300 mV / 3 reads, resume 3600 mV or input / 4 reads: see
+ * POWER_GUARD_* in components/device_commands/include/power_policy.h.
+ *
+ * KNOWN LIMIT (2026-11-13): the MP2731's ADC only converts with an input present
+ * (datasheet p.26), so on battery there is no fresh battery voltage to compare
+ * with the floor. Every release before this one compared a stale frame (or the
+ * idle charger's VBAT 0, which the guard skipped) - so this guard has most
+ * likely never parked a field unit. It now refuses to act on such frames
+ * instead of acting on them by accident; a real on-battery voltage source is
+ * future work (docs/power-telemetry.md). */
 /* The un-park path runs esp_vfs_fat_sdmmc_mount + event_log reopen — the same
  * heavy fan-out the SD monitor carries 12 KB for; 8 KB was marginal
  * there. Created once at boot while the heap is still clean. */
@@ -761,25 +768,26 @@ static void app_sd_unpark_now(void)
 static void app_power_guard_task(void *arg)
 {
     (void)arg;
-    int low_n = 0, good_n = 0;
+    /* The decision is power_policy.c (host-tested, same thresholds and streaks
+     * as before). Since 2026-11-13 it parks only on FRESH evidence: a valid
+     * charger frame that differs from the previous one, below the floor, on
+     * battery. Anything else (stale/impossible frame, bus error, "no input" -
+     * the MP2731's ADC does not run on battery, datasheet p.26) never parks,
+     * and POWER_POLICY_INVALID_FAILOPEN_N such reads in a row un-park: a frozen
+     * charger read must not keep the archive and the SD overflow offline. */
+    power_guard_t guard;
+    power_guard_init(&guard);
+    int64_t last_warn_ms = 0;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(PWRGUARD_POLL_MS));
 
-        power_reading_t p;
-        if (s_pwrguard_read(&p) != ESP_OK || p.battery_mv == 0) {
-            continue;   /* charger unreadable — hold the current state, never guess */
-        }
-
-        if (!s_pwrguard_parked) {
-            low_n = (!p.input_present && p.battery_mv < PWRGUARD_PARK_MV) ? low_n + 1 : 0;
-            if (low_n < PWRGUARD_PARK_N) continue;
-            low_n = 0;
-            /* Never yank the card out from under an OTA/AMBIT-flash/script op
-             * (they read /sdcard mid-write); the battery keeps sagging, so the
-             * next poll re-trips the moment the op ends. */
-            if (app_maintenance_active()) continue;
-
+        power_reading_t p = {0};
+        const power_read_reason_t reason = power_read_reason_from_err(s_pwrguard_read(&p));
+        const power_guard_action_t act =
+            power_guard_step(&guard, reason, &p, app_maintenance_active());
+        switch (act) {
+        case POWER_GUARD_PARK:
             ESP_LOGW(APP_TAG, "battery %umV on battery power — parking the SD (FAT) "
                               "before brownout can tear it; measurement continues on "
                               "the internal store", (unsigned)p.battery_mv);
@@ -792,17 +800,32 @@ static void app_power_guard_task(void *arg)
              * app_prepare_reboot). */
             app_sd_park_now();
             s_pwrguard_parked = true;
-            good_n = 0;
-        } else {
-            good_n = (p.input_present || p.battery_mv >= PWRGUARD_RESUME_MV) ? good_n + 1 : 0;
-            if (good_n < PWRGUARD_RESUME_N) continue;
-            good_n = 0;
-
+            break;
+        case POWER_GUARD_UNPARK:
             ESP_LOGW(APP_TAG, "power recovered (battery %umV, input %s) — resuming SD persistence",
                      (unsigned)p.battery_mv, p.input_present ? "present" : "absent");
             app_sd_unpark_now();
             s_pwrguard_parked = false;
-            low_n = 0;
+            break;
+        case POWER_GUARD_UNPARK_UNVERIFIED:
+            ESP_LOGW(APP_TAG, "SD parked but %u charger reads in a row carry no battery "
+                              "evidence (last: %s) - remounting rather than holding the "
+                              "card offline on an unreadable charger",
+                     (unsigned)POWER_POLICY_INVALID_FAILOPEN_N, power_read_reason_name(reason));
+            app_sd_unpark_now();
+            s_pwrguard_parked = false;
+            break;
+        case POWER_GUARD_HOLD: {
+            const int64_t now = esp_timer_get_time() / 1000;
+            if (reason != POWER_READ_OK && reason != POWER_READ_NO_INPUT &&
+                (last_warn_ms == 0 || now - last_warn_ms >= 15 * 60 * 1000)) {
+                ESP_LOGW(APP_TAG, "power guard: charger reading %s - not evidence; "
+                                  "the SD stays as it is (parked=%d)",
+                         power_read_reason_name(reason), s_pwrguard_parked ? 1 : 0);
+                last_warn_ms = now;
+            }
+            break;
+        }
         }
     }
 }
@@ -820,7 +843,7 @@ static void app_start_power_guard(void)
         return;
     }
     ESP_LOGI(APP_TAG, "low-battery persistence guard armed (park <%dmV, resume >=%dmV/ext)",
-             PWRGUARD_PARK_MV, PWRGUARD_RESUME_MV);
+             (int)POWER_GUARD_PARK_MV, (int)POWER_GUARD_RESUME_MV);
 }
 
 /* Self-reboot veto handed to sync_runner (nightly maintenance + the conn/memory/

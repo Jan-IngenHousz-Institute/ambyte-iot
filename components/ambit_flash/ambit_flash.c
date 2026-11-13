@@ -967,20 +967,23 @@ int ambit_flash_boot_sync(void)
         return 0;
     }
 
-    /* Power gate — the same condition that gates MQTT publishing. The gate needs
-     * ~15 s of observed external power to open from its boot-closed state, so
-     * give it time instead of sampling once. */
-    if (!device_commands_publish_power_ok()) {
+    /* Power gate (AMBIT flash) - fresh, positive evidence of external power
+     * (fail-closed): the latest charger read valid with input present AND its
+     * ADC frame changing between reads. The publish gate no longer says anything about power (it
+     * never closes since 2026-11-13). Fresh evidence needs a few 5 s charger
+     * reads after boot, so give it time instead of sampling once. A brownout
+     * mid-flash bricks the AMBIT; no flashing on battery or unknown power. */
+    if (!device_commands_flash_power_ok()) {
         ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing — waiting up to %d s "
                       "for the power gate", n_need, BOOT_GATE_WAIT_MS / 1000);
         for (int waited = 0;
-             waited < BOOT_GATE_WAIT_MS && !device_commands_publish_power_ok();
+             waited < BOOT_GATE_WAIT_MS && !device_commands_flash_power_ok();
              waited += BOOT_GATE_POLL_MS) {
             vTaskDelay(pdMS_TO_TICKS(BOOT_GATE_POLL_MS));
         }
     }
-    if (!device_commands_publish_power_ok()) {
-        ESP_LOGE(TAG, "boot sync: on battery — %d channel(s) stay on their current "
+    if (!device_commands_flash_power_ok()) {
+        ESP_LOGE(TAG, "boot sync: no verified external power - %d channel(s) stay on their current "
                       "firmware until a powered boot (or run ambit_flash manually)", n_need);
         return 0;
     }

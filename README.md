@@ -1,6 +1,6 @@
 # Ambyte IoT
 
-ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs — the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. A declarative YAML document at `/littlefs/schedule.yaml` controls what and when the device measures; it is compile-checked before an atomic install, so schedule changes need no firmware reflash. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power management** so an unattended field unit reserves bulk uploads for external power while still reporting liveness on battery.
+ESP32-S3 field IoT node that drives an external **AMBIT** fluorescence sensor (up to four of them) over UART, buffers every measurement locally in an append-only `event_log` on internal flash (littlefs - the SD card is bulk archive only), and publishes MQTT-over-TLS telemetry to **AWS IoT Core**. A declarative YAML document at `/littlefs/schedule.yaml` controls what and when the device measures; it is compile-checked before an atomic install, so schedule changes need no firmware reflash. The firmware supports **self-OTA over MQTT** (dual-slot with rollback), two independent **AMBIT firmware-update paths**, and **solar/battery power telemetry**: since 2026-11-13 an unattended unit publishes its backlog on battery too (a charger reading never holds field data back), while AMBIT flashing waits for fresh evidence of external power.
 
 Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on the host from `.env` + a `device_certs/<bundle>/` PEM set and flashed into the NVS partition next to the firmware — **no BLE companion app, no runtime provisioning round-trip** (BLE provisioning is deprecated/compiled out).
 
@@ -18,7 +18,7 @@ Provisioning (Wi-Fi, MQTT identity, TLS certs, build-time clock) is generated on
 | **Transport** | MQTT v5 over mutual TLS → AWS IoT Core (device cert + private key from NVS) |
 | **Storage** | Append-only `event_log` on internal littlefs (`/evstore/events/`, the 9.4 MiB `storage` partition); read cursor + `next_id` HWM in NVS; SD = bulk archive (`/sdcard/archive/`) + logs + AMBIT firmware. **SQLite has been removed.** |
 | **Scheduling** | Declarative YAML catalog; compile-checked and hot-updatable over MQTT or serial |
-| **Power** | Bulk uploads gated on external power (MP2731); 15-minute connected status on battery; DFS 40–160 MHz (`esp_pm`) |
+| **Power** | Publishes always, also on battery (since 2026-11-13; MP2731 telemetry reported, not used to hold data); AMBIT flashing only on fresh external power; DFS 40–160 MHz (`esp_pm`) |
 | **Console** | USB-Serial/JTAG @ 115200 |
 | **License** | Firmware and hardware: CERN-OHL-S v2 ([LICENSE](LICENSE)). Host-side software: GPL-3.0 ([LICENSE.GPL-3.0](LICENSE.GPL-3.0)) |
 
@@ -94,7 +94,7 @@ The firmware uses a hexagonal **ports-and-adapters** design. The `domain` compon
 - **status_heartbeat** — a direct canonical telemetry upload every 15 minutes while connected, including on battery or with storage unavailable. Does not drain the measurement queue.
 - **sched_runner** — compiles the installed schedule or embedded default, arms wall-clock triggers against monotonic deadlines, and executes fused actions. **Pinned to core 1 (APP_CPU)** so latency-sensitive UART measurement is not preempted by the Wi-Fi/LwIP stack on core 0.
 - **sd_logger writer**, **RTC periodic sync** (3600 s), **SD hot-plug monitor** (2000 ms poll), **LED blinker**, **CLI**.
-- **power guard** — polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running — the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV.
+- **power guard** - polls the MP2731 (15 s) and, after 45 s on battery below 3300 mV, parks the SD card (flushes + closes the SD logger, unmounts) so the battery dying can never brown out the unit mid-FAT-write. Measurement, storage, and publishing keep running - the event store is internal littlefs, which is power-loss-safe. Un-parks after 60 s of external power or battery ≥ 3600 mV. Parks only on fresh (changing) valid frames and remounts after 12 reads without evidence; on battery the MP2731 ADC does not convert, so in practice this guard cannot fire on battery and has most likely never fired in the field ([docs/power-telemetry.md](docs/power-telemetry.md)).
 - **sd_keeper** — the only event-pipeline SD writer: migrates a legacy `/sdcard/events` backlog into the internal store (post-OTA, oldest-first, duplicate-safe) and bulk-archives fully-synced files to `/sdcard/archive/arc-<first_id>.log` once per 1000 stores.
 - **ota_update / ambit_ota / script_update** — lazy workers spawned on demand (zero steady-state heap); `script_update` is the retained component/API name for atomic schedule installation.
 - **mqtt_client / wifi** run on the esp-mqtt / esp-netif event loops.
@@ -311,7 +311,7 @@ For live wire inspection without the firmware in the loop, use [docs/mqtt_tls_te
 [components/sync_runner](components/sync_runner) is the only publisher: it wakes on store (event-driven, not polled; a burst of N stores collapses into one drain) and drains all PENDING events **one message in flight at a time** at **QoS 1**, advancing the cursor on PUBACK (at-least-once; duplicates deduped downstream). Draining runs only while `sync_runner_is_allowed()`:
 
 - **no measurement in progress** (don't compete with latency-sensitive UART reads), **and**
-- **on external power** (Phase-1 power gate; battery-queued events flush when power returns), **and**
+- **past the power gate**, which since 2026-11-13 is always open while a charger is fitted (publishing continues on battery; the gate only reports `publish_gate_reason`, see [docs/power-telemetry.md](docs/power-telemetry.md)), **and**
 - **clock is valid** (≥ 2024-01-01 UTC — never ship 1970-stamped events into the wrong cloud date partition).
 
 **Reliability hardening** (current branch): one in-flight slot is cleared on both Wi-Fi and MQTT-level disconnects (`device_commands_on_mqtt_disconnect`), and a slot held past 60 s without a PUBACK is reaped back to PENDING (`device_commands_reap_stale_inflight`) so a lost/expired QoS1 PUBACK on a marginal link can't silently wedge the drain forever. A separate connectivity **watchdog** reboots the unit if it *should* be publishing (external power, clock valid, events pending) but lands no PUBACK for 1 h — the SD backlog and NVS cursor survive.
@@ -320,7 +320,7 @@ For live wire inspection without the firmware in the loop, use [docs/mqtt_tls_te
 
 A firmware-owned `ambyte.telemetry/1` heartbeat rides the `sync_runner` loop (default 300 s, NVS override via `heartbeat_s`) independently of the measurement schedule. Each interval stores exactly one `tag=TELEMETRY` event grouping the single onboard BME280 read with connectivity, power, storage, runtime, clock, software, and cache-only attached-sensor health. It performs no heartbeat UART queries and creates no companion environment row. Schedule release metadata is included only when its persisted digest still matches the installed schedule.
 
-Stored telemetry follows the measurement FIFO and can wait for external power.
+Stored telemetry follows the measurement FIFO (it no longer waits for external power since 2026-11-13).
 For live reachability, an independent `status_heartbeat` task sends the same
 canonical `ambyte.telemetry/1` sample in the normal `sample` envelope directly to
 **`mqtt_topic_root`**, the measurement ingest topic. It includes workbook
@@ -350,8 +350,8 @@ publish failures retry after 30 seconds. Wi-Fi **and MQTT** must be connected an
 the device must remain powered. Only one fresh snapshot is sent on recovery;
 there is no offline direct-heartbeat backlog. Transport QoS 1 provides delivery
 retry, but an accepted submission is not proof of broker receipt or warehouse
-processing. The bulk upload power gate and low-battery SD protection remain in
-force.
+processing. The low-battery SD protection remains in force; the bulk upload
+power gate no longer closes on a charger reading (since 2026-11-13).
 
 ### Payload schema
 
@@ -375,9 +375,9 @@ The **AMBIT** is an external multispeq-style measurement device (leaf photosynth
 - **Strategy B — cooperative app-OTA over UART** ([components/ambit_ota](components/ambit_ota)): the ambyte downloads a C3 `.bin` from HTTPS to SD, then streams it in ≤200-byte CRC16 chunks (cmds 25–29) into the AMBIT's spare OTA slot with C3-side rollback. Needs a **running, cooperating** AMBIT. Trigger: CLI `ambit_ota <ch> <url>` or MQTT `{type:ambit_ota}` (`ch` can be `all`/0xFF). The protected manual **Fleet deploy (AMBIT via Ambyte)** workflow verifies an immutable public `Jan-IngenHousz-Institute/ambit` release and manifest, deterministically selects gateways, preflights every channel with correlated `ambit_versions`, tracks all-channel OTA outcomes, and verifies executed gateways by version effect. Firmware creates a measurement-safe idle window before each version sweep; the host also retries and reconciles incomplete, busy, absent, or unversioned inventory without accepting conflicting evidence. Same-version recovery reflashes require an explicit device list. See [fleet deploy documentation](tools/fleet_deploy/README.md#deploying-ambit-firmware-through-ambytes).
 - **Strategy A — ROM-bootloader UART flasher** ([components/ambit_flash](components/ambit_flash) + vendored [components/esp_serial_flasher](components/esp_serial_flasher)): the **universal** path for **bare / bricked / pre-OTA** units. It drives the C3 hardware straps (shared `CHIP_EN` reset on IO1, per-channel `GPIO9` boot strap) to force one target into the ROM download mode, then flashes 4 region images from `/sdcard/ambit_fw/<ver>/` (`bootloader.bin@0x0`, `partitions.bin@0x8000`, `boot_app0.bin@0xe000`, `app.bin@0x10000`) with per-region MD5 verify. Missing canonical recovery directories are created before the file preflight, allowing old SD cards to be staged remotely; all four non-empty files are still required before the AMBIT is touched. **NVS at `0x9000` is never written**, so per-unit AMBIT calibration survives. A successful flash invalidates the cached AMBIT identity so later STATUS/events report the new firmware. CLI: `ambit_probe`, `ambit_dl`, `ambit_flash <ch> <ver>`.
 - **Remote release download** ([docs/ambit-remote-flash.md](docs/ambit-remote-flash.md)): the MQTT `ambit_flash` command takes an optional `manifest_url` (an `https://` ambit-iot release `manifest.json`). The Ambyte then downloads that release into `/sdcard/ambit_fw/<ver>/`, checks every region against the manifest's size and SHA-256, and only then flashes. This is how a pre-1.0 AMBIT, which has no OTA receiver, is updated with no one touching the SD card. A folder carrying `manifest.json` is flashed (by hand, remotely or by boot sync) only when every region matches it, so an interrupted download is never flashed. `fleet_command.py ambit-flash --manifest-url …` sends it.
-- **Attach-time update** ([docs/ambit-remote-flash.md](docs/ambit-remote-flash.md#attach-time-update)): the schedule measures an AMBIT only after its (MAC, firmware) was checked against the highest verified `/sdcard/ambit_fw/<ver>/`. A newly plugged, swapped or reflashed AMBIT is held until the maintenance worker clears it (current, newer, no target, unreadable) or flashes it to the target (charger input, or battery at least 3.7 V); low power keeps it held and re-checks every 10 min, a parked SD card never stops measurement, and after the shared 3-attempt cap it is measured on its current firmware with a `gave_up` report.
+- **Attach-time update** ([docs/ambit-remote-flash.md](docs/ambit-remote-flash.md#attach-time-update)): the schedule measures an AMBIT only after its (MAC, firmware) was checked against the highest verified `/sdcard/ambit_fw/<ver>/`. A newly plugged, swapped or reflashed AMBIT is held until the maintenance worker clears it (current, newer, no target, unreadable) or flashes it to the target (only on fresh evidence of external power: a valid charger read with input present and a changing ADC frame, `device_commands_flash_power_ok`; never on battery); without that evidence it stays held and re-checks every 10 min, a parked SD card never stops measurement, and after the shared 3-attempt cap it is measured on its current firmware with a `gave_up` report.
 - **Version-drift detection** ([ambit_flash_check](components/ambit_flash), CLI `ambit_check` / `ambit_versions`): on demand, reads each AMBIT's running version (cmd 33/2), compares against the highest complete `/sdcard/ambit_fw/<ver>/` folder, and logs match/mismatch plus the exact `ambit_flash <ch> <ver>` to run. Read-only + bus-mutex-serialised so safe with measurement active.
-- **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before measurement starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on the same power condition as MQTT publishing (skips to the next powered boot on battery) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
+- **Boot auto-flash** ([ambit_flash_boot_sync](components/ambit_flash)): once per boot, before measurement starts, every present AMBIT is version-checked (silent channels are ROM-probed, so bare/bricked units are found and revived) and any channel whose version differs from the SD target is flashed automatically and verified. Gated on fresh evidence of external power (`device_commands_flash_power_ok`: a valid charger read with input present and a changing ADC frame; skips to the next powered boot on battery, on an unreadable charger, or without a charger monitor) + a per-channel NVS fail cap (3 unverified attempts per target ⇒ give up until a different version is staged).
 
 ---
 
@@ -443,7 +443,7 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 
 ## Power management
 
-- **Radio gating (Phase 1):** `device_commands_publish_power_ok()` allows backlog draining only when external (solar/USB) power is present (keyed on VIN via the MP2731 charger @ I2C 0x4B, not input current). Debounced with asymmetric dwell (≈15 s to open on power present, 60 s to close on power absent); the charger read is cached (5 s). Returns true (never gates) when no charger is wired (dev boards).
+- **Publish gate:** `device_commands_publish_power_ok()` is always true since 2026-11-13 ("keep sending always"): the MP2731 ADC does not convert without input, so its frames on battery are stale and no power reading may hold field data back. The cost is battery: units publish through the night. The charger is still read (cached 5 s) to report `publish_gate_reason` and to gate AMBIT flashing, which is fail-closed on fresh, positive evidence of external power (`device_commands_flash_power_ok`). See [docs/power-telemetry.md](docs/power-telemetry.md).
 - **DFS clock scaling (Phase 2):** `esp_pm` dynamic frequency scaling `AMBYTE_PM_MIN_FREQ_MHZ=40` … `MAX=160` MHz (defined in `app_main.c` — PlatformIO `-D` flags don't reach IDF component sources). CPU coasts at the min during idle gaps. Light-sleep stays **off**. DFS is safe: AMBIT UART pinned to XTAL, SD/SPI holds its own APB lock, measurement windows hold a `NO_LIGHT_SLEEP` PM lock. `min=40` is HW-validated (1 h soak). Requires `CONFIG_PM_ENABLE`.
 - **PM-independent quick wins:** Wi-Fi power-save, MQTT keepalive tuning, ping cache, BME280 forced mode.
 
@@ -499,7 +499,7 @@ components/
   sched_runner/      # schedule lifecycle + fused device actions
   time_sync/         # pure RTC/local-time and solar scheduling math
   bme280/            # I2C temp/humidity/pressure
-  mp2731/            # I2C battery charger / power-path (power gate + battery telemetry)
+  mp2731/            # I2C battery charger / power-path (verified power reads + telemetry)
   pcf2131tfy_rtc/    # PCF2131 RTC driver + system-clock sync
   sd_card/           # SDMMC mount + hot-plug monitor
   sd_logger/         # tees WARN/ERROR logs to /sdcard/logs (RAM ring + low-prio writer)
@@ -540,7 +540,7 @@ LICENSE.GPL-3.0      # GPL-3.0 (flash_gui/, tools/, tests/)
 | Device boots and logs `Device not provisioned` | NVS image wasn't flashed — confirm `extra_scripts = pre:tools/extra_script.py` in `platformio.ini` and that `.env` resolves to non-empty values |
 | MQTT connects then immediately disconnects | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 | Telemetry stops but no data loss / device on external power | In-flight slot may have stalled — check the `inflight` CLI command; the 60 s reaper + MQTT-disconnect clear should recover it, else the 1 h watchdog reboots |
-| Events pile up in `event_log`, measurements do not publish | Expected on battery (power gate) or before the clock is valid (< 2024). The independent 15-minute ingest telemetry heartbeat still reports while Wi-Fi/MQTT are connected. |
+| Events pile up in `event_log`, measurements do not publish | Not a power-gate effect since 2026-11-13 (the gate never closes on a charger reading; check `health.connectivity.publish_gate_reason` and `health.power.reason`). Expected before the clock is valid (< 2024), while a UART measurement holds publishing, during a broker-refusal hold, or with Wi-Fi/MQTT down. The independent ingest telemetry heartbeat still reports while Wi-Fi/MQTT are connected. |
 | Installed schedule is rejected | Run `schedule status` for the compile error; the embedded default remains active |
 | Schedule update does not take effect | Check `schedule release`, then use `schedule reload` or reboot after a successful install |
 | sdmmc `0x107` errors after pulling the SD card | Hot-plug recovery should latch the loss and remount on reinsert; if it floods, this path needs the HW pull/reinsert verification still pending (see Status) |

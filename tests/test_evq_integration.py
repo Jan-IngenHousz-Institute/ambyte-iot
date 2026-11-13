@@ -63,6 +63,7 @@ PRODUCTION_SOURCES = [
     "components/sensor_inventory/sensor_inventory.c",
     "components/device_commands/envelope_provenance.c",
     "components/device_commands/telemetry_publish.c",
+    "components/device_commands/power_policy.c",
     "components/payload_codec/payload_v3.c",
     "components/payload_codec/payload_scalar.c",
     "components/payload_codec/payload_gzip.c",
@@ -181,7 +182,13 @@ class EvqIntegration(unittest.TestCase):
         prelude = ["-include", str(HARNESS / "prelude.h")]
         jobs = []
         for src in PRODUCTION_SOURCES:
-            extra = ["-Dpayload_v3_build_telemetry=h_capture_build_telemetry"] if src.endswith("device_commands.c") else []
+            # device_commands.c: capture telemetry, and route the publish decision
+            # through the harness (h_power_publish_ok) - since 2026-11-13 the
+            # production power gate never closes, so I7 drives its closed-gate
+            # delivery mechanics from a harness-controlled decision instead.
+            extra = (["-Dpayload_v3_build_telemetry=h_capture_build_telemetry",
+                      "-Dpower_publish_ok=h_power_publish_ok"]
+                     if src.endswith("device_commands.c") else [])
             jobs.append((src, base + PRODUCTION_WNO + prelude + dflags + extra + inc))
         for src in HARNESS_SOURCES:
             jobs.append((src, base + ["-Werror"] + prelude + dflags + inc))

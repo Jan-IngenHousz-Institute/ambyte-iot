@@ -82,8 +82,9 @@ int ambit_flash_check(void);
 /* Boot-time firmware sync (Phase 3 full): find the SD target image, read each
  * present AMBIT's running version (ROM-probing silent channels so bare/bricked
  * units are found too), then flash every channel whose version differs from the
- * target — automatically, no operator. Flashing is gated on the same power
- * condition as MQTT publishing (device_commands_publish_power_ok), and a
+ * target - automatically, no operator. Flashing is gated on FRESH, verified
+ * external power (device_commands_flash_power_ok; fail-closed, refused on
+ * battery, on an unreadable or frozen charger, and without a charger monitor), and a
  * per-channel NVS fail counter skips a channel after repeated failed attempts
  * for the same target so a broken unit can't add a doomed flash to every boot.
  *

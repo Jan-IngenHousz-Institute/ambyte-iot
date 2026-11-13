@@ -159,14 +159,21 @@ uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s);
  * in the caller's task context; keep it cheap (a task notify). */
 void device_commands_set_sync_notifier(void (*fn)(void));
 
-/* Phase-1 power gate: true when it's OK to drain the MQTT backlog — i.e. the
- * device is on external (solar/USB) power, so battery-only operation doesn't
- * spend the radio's energy budget. Keyed on VIN-present (not input current) and
- * debounced with on/off dwell times to avoid flapping near the threshold. The
- * charger reading is cached so the 10 s sync cycle and the back-to-back drain
- * loop don't each pay an ADC conversion. Returns true (never gates) when no
- * power monitor is wired in, preserving behaviour on boards without the charger. */
+/* Publish power gate: since 2026-11-13 ALWAYS true (never hold field data back
+ * on a charger reading; see device_commands.c). Still refreshes the observed
+ * power state (cached 5 s) that publish_gate_reason and the flash gate use. */
 bool device_commands_publish_power_ok(void);
+
+/* AMBIT flashing power check: fail-CLOSED. True only on fresh, positive
+ * evidence of external power: the latest charger read valid with input
+ * present AND the ADC frame changed recently (power_gate_flash_ok). False with
+ * no charger monitor (a real unit whose charger failed its boot probe looks the
+ * same) unless the build sets AMBYTE_FLASH_WITHOUT_CHARGER. */
+bool device_commands_flash_power_ok(void);
+
+/* Observed power state, as a stable telemetry string:
+ * starting | external_power | on_battery | power_unverified | no_charger. */
+const char *device_commands_publish_gate_reason(void);
 
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
@@ -212,8 +219,13 @@ typedef struct {
     bool            db_online;
     int64_t         pending;
     bool            power_valid;        /* false if no charger / read failed */
-    power_reading_t power;              /* valid only when power_valid */
+    power_read_reason_t power_reason;   /* why (POWER_READ_OK when power_valid) */
+    bool            charger_regs_valid; /* the live REG0C/REG0D bytes below were read */
+    uint8_t         charger_status_reg; /* MP2731 REG0C, also for rejected frames */
+    uint8_t         charger_fault_reg;  /* MP2731 REG0D, also for rejected frames */
+    power_reading_t power;              /* valid only when power_valid; zeroed otherwise */
     bool            publish_gate_open;  /* device_commands_publish_power_ok() */
+    const char     *publish_gate_reason; /* power_gate_reason_name(), static string */
     bool            env_valid;          /* false if no BME280 / read failed */
     float           temperature_c;      /* valid only when env_valid */
     float           humidity_percent;   /* valid only when env_valid */

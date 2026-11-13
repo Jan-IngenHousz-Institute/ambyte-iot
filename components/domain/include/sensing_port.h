@@ -32,7 +32,66 @@ typedef struct {
     uint16_t input_ma;     /* input current */
     bool     input_present;/* external source detected (VIN status or voltage > UVLO) */
     uint8_t  charge_status;/* 0=idle 1=pre-charge 2=fast-charge 3=charge-done (REG0C) */
+    /* Raw live charger status/fault registers (MP2731 REG0C / REG0D), filled on
+     * EVERY read the bus completed - also when the frame was rejected - so
+     * telemetry can say why a charger's ADC stopped (input, NTC, thermal, …). */
+    uint8_t  status_reg;
+    uint8_t  fault_reg;
 } power_reading_t;
+
+/* A power_read_fn returns ESP_OK ONLY for a fresh, plausible reading. Every other
+ * return is "no power evidence" and is classified below; consumers must never
+ * read *out as a measurement then (the driver may leave the raw, rejected frame
+ * there for diagnostics). Two driver-specific codes carry the verdict:
+ *   POWER_ERR_ADC_TIMEOUT  - the conversion never completed (a stuck/frozen ADC:
+ *                            the result registers would be stale);
+ *   POWER_ERR_IMPLAUSIBLE  - a completed frame that cannot describe a running
+ *                            unit (all-zero, system rail below brown-out, out of
+ *                            range). 2026-11-13: an all-zero frame held a prod
+ *                            unit's publish gate closed for 9+ h.
+ *   POWER_ERR_NO_INPUT     - the charger's live status says, consistently, that
+ *                            there is no input. Its ADC only runs with an input
+ *                            (MP2731 datasheet p.26), so there are no voltages -
+ *                            but "no external power" itself is trustworthy: it is
+ *                            reported (on_battery) and refuses AMBIT flashing;
+ *                            it never stops publishing.
+ * ESP_ERR_INVALID_STATE = no charger; anything else is a bus error. */
+#define POWER_ERR_ADC_TIMEOUT ESP_ERR_NOT_FINISHED
+#define POWER_ERR_IMPLAUSIBLE ESP_ERR_INVALID_RESPONSE
+#define POWER_ERR_NO_INPUT    ESP_ERR_NOT_FOUND
+
+typedef enum {
+    POWER_READ_OK = 0,
+    POWER_READ_ADC_TIMEOUT,
+    POWER_READ_IMPLAUSIBLE,
+    POWER_READ_I2C_ERROR,
+    POWER_READ_UNAVAILABLE,   /* no charger fitted / driver not ready */
+    POWER_READ_NO_INPUT,      /* no voltages, but live status: no external input */
+} power_read_reason_t;
+
+static inline power_read_reason_t power_read_reason_from_err(esp_err_t err)
+{
+    if (err == ESP_OK) return POWER_READ_OK;
+    if (err == POWER_ERR_ADC_TIMEOUT) return POWER_READ_ADC_TIMEOUT;
+    if (err == POWER_ERR_IMPLAUSIBLE) return POWER_READ_IMPLAUSIBLE;
+    if (err == POWER_ERR_NO_INPUT) return POWER_READ_NO_INPUT;
+    if (err == ESP_ERR_INVALID_STATE) return POWER_READ_UNAVAILABLE;
+    return POWER_READ_I2C_ERROR;
+}
+
+/* Stable telemetry spelling (health.power.reason). Never rename a value. */
+static inline const char *power_read_reason_name(power_read_reason_t r)
+{
+    switch (r) {
+    case POWER_READ_OK:          return "ok";
+    case POWER_READ_ADC_TIMEOUT: return "adc_timeout";
+    case POWER_READ_IMPLAUSIBLE: return "implausible";
+    case POWER_READ_I2C_ERROR:   return "i2c_error";
+    case POWER_READ_UNAVAILABLE: return "unavailable";
+    case POWER_READ_NO_INPUT:    return "no_input";
+    }
+    return "i2c_error";
+}
 
 typedef esp_err_t (*power_read_fn)(power_reading_t *out);
 

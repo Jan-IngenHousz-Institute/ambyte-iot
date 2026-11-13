@@ -68,12 +68,11 @@ void    ambit_attach_gate_checker_done(void);
 /* True while `ch` is held (diagnostics). */
 bool    ambit_attach_gate_held(uint8_t ch);
 
-/* Enough power to flash an AMBIT now: external input present, or the battery at
- * or above AMBIT_ATTACH_BATTERY_FLOOR_MV. The MP2731 reports battery_mv = 0
- * whenever it is not charging (every night), so with no input the system rail,
- * which then runs from the battery, stands in; no usable reading = not enough. */
-#define AMBIT_ATTACH_BATTERY_FLOOR_MV 3700u
-bool ambit_attach_power_ok(const power_reading_t *p);
+/* Power for an attach-time flash is device_commands_flash_power_ok() (fresh,
+ * positive evidence of external power; fail-closed). The former battery-floor
+ * rule (AMBIT_ATTACH_BATTERY_FLOOR_MV, judged on whatever frame the MP2731 held)
+ * was retired on 2026-11-13: on battery that frame is stale, and the decision is
+ * no AMBIT flashing on battery or unknown power. */
 
 /* Forget everything (tests; also a port that came up empty). */
 void    ambit_attach_gate_forget(uint8_t ch);

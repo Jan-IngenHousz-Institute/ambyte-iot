@@ -1,0 +1,18 @@
+L76: ### 11:55:28 > status
+L98:  - Power: Vbat 4.18 V, Vin 5.16 V, Vsys 4.32 V, Iin 119 mA, Icharge 0 mA
+L100: I (41073) dev_cmd: publish gate OPEN (external power) (Vin=5160mV Ibat=0mA reading=ok)
+L101:    source: external, charge: charged, publish gate: OPEN
+L103:    gate reason: external_power
+L142: ### 11:55:31 > mp2731_regs 12 400 read
+L144: MP2731 t=43070 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=D9 10=8A 11=56 12=00 13=11 14=08 15=60 16=EE
+L146: MP2731 t=43500 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DA 10=89 11=55 12=00 13=0E 14=08 15=60 16=EE
+L148: MP2731 t=43930 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D1 0F=DA 10=8A 11=55 12=00 13=0C 14=08 15=60 16=EE
+L150: MP2731 t=44360 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=D9 10=8A 11=55 12=00 13=0D 14=08 15=60 16=EE
+L142: ### 12:01:40 > mp2731_regs probe 10
+L143: mp2731_regs probe 10
+L144: MP2731 probe first03=10 done=592us
+L146: MP2731 probe first03=10 done=589us
+L148: MP2731 probe first03=10 done=590us
+L150: MP2731 probe first03=10 done=588us
+L153: MP2731 probe first03=10 done=780us
+L156: MP2731 probe first03=10 done=588us

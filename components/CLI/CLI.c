@@ -196,8 +196,14 @@ static int cli_cmd_status(int argc, char **argv)
                charge_str[pw.charge_status & 0x03],
                device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
     } else {
-        printf(" - Power: %s\r\n", pres.message);
+        /* A rejected charger frame is not a reading: show why, and the gate. */
+        printf(" - Power: no valid reading (%s): %s\r\n",
+               power_read_reason_name(power_read_reason_from_err(pres.status)),
+               pres.message);
+        printf("   publish gate: %s\r\n",
+               device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
     }
+    printf("   gate reason: %s\r\n", device_commands_publish_gate_reason());
     return 0;
 }
 
@@ -328,6 +334,76 @@ static int cli_cmd_read_env(int argc, char **argv)
         return 1;
     }
     printf("T=%.2fC  H=%.1f%%  P=%.0fPa\r\n", temp, hum, pres);
+    return 0;
+}
+
+/* mp2731_regs [passes] [interval_ms] [read] - raw MP2731 register dump, one line
+ * per pass. Pure reads (no ADC kick, no configuration) unless `read` is given,
+ * in which case each pass first runs the production power read (cmd_read_power)
+ * so the dump shows exactly what that read left behind. Built for the 2026-11-13
+ * frozen/all-zero charger investigation: the charger stays powered across ESP
+ * resets and keeps its registers, so this is how a bench (or a field unit over
+ * USB) shows whether REG03's conversion bit is stuck and whether the result
+ * registers move between conversions. */
+static int cli_cmd_mp2731_regs(int argc, char **argv)
+{
+    int passes = 1, interval_ms = 1000;
+    bool do_read = false;
+    if (argc >= 2 && strcmp(argv[1], "probe") == 0) {
+        const int n = argc >= 3 ? atoi(argv[2]) : 5;
+        for (int i = 0; i < n && i < 50; i++) {
+            uint8_t first = 0;
+            uint32_t done_us = 0;
+            const esp_err_t err = mp2731_probe_conversion(&first, &done_us);
+            if (err != ESP_OK) {
+                printf("MP2731 probe err=%s\r\n", esp_err_to_name(err));
+            } else if (done_us == UINT32_MAX) {
+                printf("MP2731 probe first03=%02X done=never(>%ums)\r\n", first,
+                       (unsigned)MP2731_ADC_TIMEOUT_MS);
+            } else {
+                printf("MP2731 probe first03=%02X done=%uus\r\n", first, (unsigned)done_us);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        return 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "read") == 0) {
+            do_read = true;
+        } else if (i == 1) {
+            passes = atoi(argv[i]);
+        } else if (i == 2) {
+            interval_ms = atoi(argv[i]);
+        }
+    }
+    if (passes < 1 || passes > 600 || interval_ms < 0 || interval_ms > 60000) {
+        printf("Usage: mp2731_regs [passes 1-600] [interval_ms 0-60000] [read]\r\n");
+        return 1;
+    }
+    for (int pass = 0; pass < passes; pass++) {
+        if (pass > 0 && interval_ms > 0) vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        char verdict[64] = "";
+        if (do_read) {
+            power_reading_t pw;
+            const cmd_result_t r = cmd_read_power(&pw);
+            mp2731_frame_t f;
+            (void)mp2731_last_frame(&f);
+            snprintf(verdict, sizeof verdict, " read=%s conv=%s/%ums",
+                     power_read_reason_name(power_read_reason_from_err(r.status)),
+                     f.converted ? "done" : "none", (unsigned)f.conv_ms);
+        }
+        printf("MP2731 t=%lld%s",
+               (long long)xTaskGetTickCount() * portTICK_PERIOD_MS, verdict);
+        for (uint8_t reg = 0; reg < MP2731_REG_DUMP_COUNT; reg++) {
+            uint8_t v = 0;
+            if (mp2731_read_raw(reg, &v) == ESP_OK) {
+                printf(" %02X=%02X", reg, v);
+            } else {
+                printf(" %02X=--", reg);
+            }
+        }
+        printf("\r\n");
+    }
     return 0;
 }
 
@@ -2293,6 +2369,13 @@ static esp_err_t cli_register_commands(void)
         .help = "scan the shared I2C bus for responding 7-bit addresses",
         .func = cli_cmd_i2cscan,
     };
+    static const esp_console_cmd_t mp2731_regs_cmd = {
+        .command = "mp2731_regs",
+        .help = "mp2731_regs [passes] [interval_ms] [read] | probe [n]  raw MP2731 register "
+                "dump (read = run the power read before each pass; probe = time one "
+                "conversion by polling REG03)",
+        .func = cli_cmd_mp2731_regs,
+    };
     static const esp_console_cmd_t selftest_cmd = {
         .command = "selftest",
         .help = "factory PCBA test: TEST lines + SELFTEST verdict; leaves LED on (red 0 to clear)",
@@ -2476,6 +2559,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&i2cscan_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&mp2731_regs_cmd);
     if (err != ESP_OK) {
         return err;
     }

@@ -99,6 +99,8 @@ typedef struct {
     bool wifi;
     bool provisioned;
     bool publish_gate;
+    /* Why the gate is in its state (power_gate_reason_name); NULL = omit. */
+    const char *publish_gate_reason;
     uint32_t mqtt_reconnects;
     const char *last_disc_reason;
     int64_t conn_age_s;
@@ -110,6 +112,16 @@ typedef struct {
     int64_t refusal_hold_s;
 
     bool power_valid;
+    /* Charger read verdict (power_read_reason_name: ok | no_input | adc_timeout |
+     * implausible | i2c_error | unavailable). NULL = no charger wired: the power
+     * group stays exactly as before (values when power_valid, else empty). */
+    const char *power_reason;
+    /* Raw MP2731 REG0C (status) / REG0D (fault) as read with that verdict -
+     * emitted as power.status_reg / power.fault_reg (integers) when valid and
+     * power_reason is set, for valid AND rejected frames alike. */
+    bool power_regs_valid;
+    uint8_t power_status_reg;
+    uint8_t power_fault_reg;
     double battery_v;
     double input_v;
     double system_v;
