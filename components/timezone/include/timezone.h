@@ -42,6 +42,12 @@ esp_err_t timezone_apply(const char *iana);
  * restored one). False when unset or degraded to a fixed offset. */
 bool timezone_rule_active(void);
 
+/* ISO 3166 alpha-2 country of a supported zone name ("NL", "AU"), from
+ * tzdata zone.tab; "" for unknown names and zones without a country (Etc).
+ * Used to decide whether a live location estimate or the configured location
+ * wins (docs/timezone-from-location.md). Table-owned, immutable. */
+const char *timezone_country(const char *iana);
+
 /* Immutable table-owned IANA name currently applied to the scheduler. Safe to
  * read concurrently with apply; valid for the lifetime of the firmware. */
 const char *timezone_current_name(void);

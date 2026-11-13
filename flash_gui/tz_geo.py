@@ -29,6 +29,7 @@ import struct
 __all__ = ["zone_for", "is_unset_location"]
 
 _NONE = 0xFFFF
+_NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/_+-")
 _HEADER = struct.Struct("<4sBBBBHH8s32sIII")
 
 
@@ -115,9 +116,13 @@ def _lookup(blob: bytes, lat: float, lon: float) -> str | None:
         return None
     name_at = names_off + struct.unpack_from("<H", blob, names_off + 2 * zone)[0]
     name_end = blob.find(b"\0", name_at, tiles_off)
-    if name_end < 0:
+    if name_end <= name_at:
         return None
-    return blob[name_at:name_end].decode("ascii")
+    name = blob[name_at:name_end]
+    # IANA names are [A-Za-z0-9/_+-]; anything else is a damaged table.
+    if not all(c in _NAME_BYTES for c in name):
+        return None
+    return name.decode("ascii")
 
 
 def zone_for(lat: float, lon: float) -> str | None:

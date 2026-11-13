@@ -293,6 +293,12 @@ bool timezone_rule_active(void)
     return active;
 }
 
+const char *timezone_country(const char *iana)
+{
+    const tz_zone_t *zone = zone_lookup(iana);
+    return zone != NULL ? k_tz_countries[zone - k_tz_zones] : "";
+}
+
 const char *timezone_current_name(void)
 {
     return atomic_load(&s_zone_name);

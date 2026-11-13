@@ -72,6 +72,50 @@ def _zone_bytes(name: str) -> bytes:
         return (Path("/usr/share/zoneinfo") / name).read_bytes()
 
 
+def _tzdata_text(name: str) -> str:
+    """A tzdata metadata file (zone.tab, tzdata.zi), pip tzdata first."""
+    try:
+        import importlib.resources as ir
+        return (ir.files("tzdata") / "zoneinfo" / name).read_text(encoding="utf-8")
+    except (ImportError, ModuleNotFoundError, FileNotFoundError, OSError):
+        return (Path("/usr/share/zoneinfo") / name).read_text(encoding="utf-8")
+
+
+def zone_countries(names: list[str]) -> dict[str, str]:
+    """ISO 3166 alpha-2 country of each zone name, from tzdata's zone.tab.
+
+    WHY: the device decides whether a live (online) location estimate or the
+    configured (provisioned) location wins by comparing their COUNTRIES -- a
+    preset from another country is stale, while an estimate inside the same
+    country is just a coarse IP/CGNAT egress (Uluru resolving to Adelaide).
+    zone.tab (not zone1970.tab) because it keeps one row per country, so
+    Europe/Amsterdam stays NL although tzdata now links it to Europe/Brussels.
+    Names absent from zone.tab follow their tzdata.zi link chain ("US/Pacific"
+    -> America/Los_Angeles -> US); zones with no country (Etc/*, UTC) get none.
+    """
+    tab: dict[str, str] = {}
+    for line in _tzdata_text("zone.tab").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        cc, _coords, name = line.split("\t")[:3]
+        tab[name] = cc
+    links: dict[str, str] = {}
+    for line in _tzdata_text("tzdata.zi").splitlines():
+        if line.startswith("L "):
+            _, target, link = line.split()
+            links[link] = target
+    out: dict[str, str] = {}
+    for name in names:
+        seen = set()
+        cur = name
+        while cur not in tab and cur in links and cur not in seen:
+            seen.add(cur)
+            cur = links[cur]
+        if cur in tab:
+            out[name] = tab[cur]
+    return out
+
+
 def _tzdata_version() -> str:
     try:
         import tzdata
@@ -292,6 +336,17 @@ def render_c(zones: list[Zone], rules: list[str], tzdata_version: str) -> str:
         name = f'"{z.name}",'
         lines.append(f"    {{ {name:<{width}} {index[z.rule]:>3}, {z.std_min:>5} }},")
     lines += ["};", ""]
+    countries = zone_countries([z.name for z in zones])
+    lines += [
+        "/* ISO 3166 alpha-2 country of each k_tz_zones entry (same index), from",
+        ' * tzdata zone.tab plus link chains; "" for zones without one (Etc zones).',
+        " * Decides live-vs-configured location by country (timezone_country). */",
+        "static const char k_tz_countries[TZ_TABLE_ZONE_COUNT][3] = {",
+    ]
+    for i in range(0, len(zones), 12):
+        row = ", ".join(f'"{countries.get(z.name, "")}"' for z in zones[i:i + 12])
+        lines.append(f"    {row},")
+    lines += ["};", ""]
     return "\n".join(lines)
 
 
@@ -314,6 +369,14 @@ def render_py(zones: list[Zone], rules: list[str], tzdata_version: str) -> str:
     ]
     lines += [f'    "{z.name}",' for z in zones]
     lines += ["})", ""]
+    countries = zone_countries([z.name for z in zones])
+    lines += [
+        "# ISO 3166 alpha-2 country per zone (tzdata zone.tab + links), the same",
+        "# table the firmware compares live vs configured locations with.",
+        "ZONE_COUNTRY = {",
+    ]
+    lines += [f'    "{z.name}": "{countries[z.name]}",' for z in zones if z.name in countries]
+    lines += ["}", ""]
     return "\n".join(lines)
 
 
