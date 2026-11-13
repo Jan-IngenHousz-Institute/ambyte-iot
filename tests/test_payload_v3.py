@@ -326,11 +326,18 @@ class PayloadV3Test(unittest.TestCase):
             {"db_online": True},
         )
 
+        # STATUS location group (docs/timezone-from-location.md), literal.
+        self.assertIn('"location":{"source":"configured","lat":-25.344400,"lon":131.036900,'
+                      '"accuracy_m":null,"configured_stale":false,"live_status":"ok",'
+                      '"timezone":"Australia/Darwin","timezone_source":"location","pinned":false}',
+                      self.raw_records["TELEMETRY"])
+        self.assertEqual(self.records["TELEMETRY_EMPTY"]["health"]["location"], {})
+
         empty = self.records["TELEMETRY_EMPTY"]
         self.assertEqual(empty["observations"], {})
         self.assertEqual(
             set(empty["health"]),
-            {"connectivity", "power", "storage", "runtime", "clock", "software", "attached_sensors"},
+            {"connectivity", "power", "storage", "runtime", "clock", "location", "software", "attached_sensors"},
         )
         self.assertEqual(empty["health"]["attached_sensors"], [])
 

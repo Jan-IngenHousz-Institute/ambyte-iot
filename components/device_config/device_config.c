@@ -26,6 +26,9 @@
 #define KEY_DEVICE_FIRMWARE "device_firm"
 #define KEY_FIRMWARE_VER    "firmware_ver"
 #define KEY_TIMEZONE        "timezone"
+#define KEY_TZ_SOURCE       "tz_source"
+#define KEY_LOC_LIVE        "loc_live"
+#define KEY_LOC_LIVE_FIX    "loc_live_fix"
 #define KEY_FLASH_TIME      "flash_time"
 #define KEY_HEARTBEAT_S     "heartbeat_s"
 #define KEY_PUBLISH_GZIP    "publish_gzip"
@@ -198,6 +201,55 @@ esp_err_t device_config_get_timezone(char *buf, size_t len)
     esp_err_t err = cfg_get(KEY_TIMEZONE, stored, sizeof(stored));
     if (err != ESP_OK) return err;
     return timezone_canonicalize(stored, buf, len);
+}
+
+/* Timezone pin flag ("manual" = pinned, "auto"/absent = follow the location).
+ * docs/timezone-from-location.md has the state model. NVS commits one key at a
+ * time, so a pin writes "manual" BEFORE the zone: a power cut leaves the old
+ * zone pinned, never the new one unpinned and silently overridden. */
+esp_err_t device_config_get_timezone_source(char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) return ESP_ERR_INVALID_ARG;
+    buf[0] = '\0';
+    char stored[16];
+    esp_err_t err = cfg_get(KEY_TZ_SOURCE, stored, sizeof(stored));
+    if (err != ESP_OK) return err;
+    if (strcmp(stored, "auto") != 0 && strcmp(stored, "manual") != 0) return ESP_ERR_INVALID_ARG;
+    if (strlen(stored) + 1 > len) return ESP_ERR_INVALID_SIZE;
+    strcpy(buf, stored);
+    return ESP_OK;
+}
+
+esp_err_t device_config_set_timezone_source(const char *val)
+{
+    if (val == NULL || (strcmp(val, "auto") != 0 && strcmp(val, "manual") != 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cfg_set(KEY_TZ_SOURCE, val);
+}
+
+device_tz_source_t device_config_timezone_source(void)
+{
+    char value[16];
+    esp_err_t err = device_config_get_timezone_source(value, sizeof(value));
+    if (err == ESP_ERR_NVS_NOT_FOUND) return DEVICE_TZ_SOURCE_PROVISIONED;
+    if (err != ESP_OK) return DEVICE_TZ_SOURCE_UNKNOWN;
+    return strcmp(value, "manual") == 0 ? DEVICE_TZ_SOURCE_MANUAL : DEVICE_TZ_SOURCE_AUTO;
+}
+
+const char *device_config_timezone_source_name(device_tz_source_t source)
+{
+    switch (source) {
+    case DEVICE_TZ_SOURCE_PROVISIONED: return "provisioned";
+    case DEVICE_TZ_SOURCE_AUTO:        return "auto";
+    case DEVICE_TZ_SOURCE_MANUAL:      return "manual";
+    default:                           return "unknown";
+    }
+}
+
+const char *device_config_timezone_source_label(void)
+{
+    return device_config_timezone_source_name(device_config_timezone_source());
 }
 
 esp_err_t device_config_get_flash_time(uint32_t *out)
@@ -680,4 +732,80 @@ esp_err_t device_config_set_publish_gzip(const char *val)
     esp_err_t err = cfg_set(KEY_PUBLISH_GZIP, enable ? "1" : "0");
     if (err == ESP_OK) s_publish_gzip = enable;
     return err;
+}
+
+/* ── Live location (docs/timezone-from-location.md) ─────────────────────── */
+
+esp_err_t device_config_get_live_location_mode(char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) return ESP_ERR_INVALID_ARG;
+    buf[0] = '\0';
+    char stored[24];
+    esp_err_t err = cfg_get(KEY_LOC_LIVE, stored, sizeof(stored));
+    if (err != ESP_OK) return err;
+    if (strcmp(stored, "off") != 0 && strcmp(stored, "aws") != 0) return ESP_ERR_INVALID_ARG;
+    if (strlen(stored) + 1 > len) return ESP_ERR_INVALID_SIZE;
+    strcpy(buf, stored);
+    return ESP_OK;
+}
+
+esp_err_t device_config_set_live_location_mode(const char *val)
+{
+    if (val == NULL || (strcmp(val, "off") != 0 && strcmp(val, "aws") != 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cfg_set(KEY_LOC_LIVE, val);
+}
+
+/* Last accepted live fix, one 40-byte blob so a power cut sees the old or the
+ * new fix, never a mix:  0..3 "AMLF", 4 version 1, 5..7 zero,
+ * 8..15 lat, 16..23 lon, 24..31 accuracy_m (binary64 LE), 32..39 fix UTC
+ * seconds (int64 LE). */
+#define LIVE_FIX_SIZE 40U
+
+esp_err_t device_config_get_live_fix(double *lat, double *lon, double *accuracy_m, int64_t *fix_utc)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (lat == NULL || lon == NULL || accuracy_m == NULL || fix_utc == NULL) return ESP_ERR_INVALID_ARG;
+    uint8_t blob[LIVE_FIX_SIZE];
+    size_t len = sizeof(blob);
+    esp_err_t err = nvs_get_blob(s_handle, KEY_LOC_LIVE_FIX, blob, &len);
+    if (err != ESP_OK) return err;
+    if (len != sizeof(blob) || memcmp(blob, "AMLF", 4) != 0 || blob[4] != 1 ||
+        blob[5] || blob[6] || blob[7]) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    double a = site_get_double(blob + 8), b = site_get_double(blob + 16);
+    double acc = site_get_double(blob + 24);
+    uint64_t t = 0;
+    for (int i = 7; i >= 0; i--) t = (t << 8) | blob[32 + i];
+    if (!isfinite(a) || !isfinite(b) || a < -90.0 || a > 90.0 || b < -180.0 || b > 180.0 ||
+        !isfinite(acc) || acc < 0.0) {
+        return ESP_ERR_INVALID_VERSION;
+    }
+    *lat = a;
+    *lon = b;
+    *accuracy_m = acc;
+    *fix_utc = (int64_t)t;
+    return ESP_OK;
+}
+
+esp_err_t device_config_set_live_fix(double lat, double lon, double accuracy_m, int64_t fix_utc)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (!isfinite(lat) || !isfinite(lon) || lat < -90.0 || lat > 90.0 || lon < -180.0 ||
+        lon > 180.0 || !isfinite(accuracy_m) || accuracy_m < 0.0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t blob[LIVE_FIX_SIZE] = {0};
+    memcpy(blob, "AMLF", 4);
+    blob[4] = 1;
+    site_put_double(blob + 8, lat);
+    site_put_double(blob + 16, lon);
+    site_put_double(blob + 24, accuracy_m);
+    uint64_t t = (uint64_t)fix_utc;
+    for (int i = 0; i < 8; i++) blob[32 + i] = (uint8_t)(t >> (8 * i));
+    esp_err_t err = nvs_set_blob(s_handle, KEY_LOC_LIVE_FIX, blob, sizeof(blob));
+    if (err != ESP_OK) return err;
+    return nvs_commit(s_handle);
 }

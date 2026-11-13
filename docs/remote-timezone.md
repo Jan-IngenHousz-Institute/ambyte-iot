@@ -1,10 +1,20 @@
 # Remote timezone maintenance
 
+> **Since the location resolver ([timezone-from-location.md](timezone-from-location.md)):**
+> the device derives its zone from its location. `set_timezone` with a zone
+> now stores the configured **fallback** (in effect only while no location
+> resolves); add `"pin": true` to hold it over the location, and send
+> `"timezone": "auto"` to release a pin. Replies keep every key below
+> (`timezone` is the configured fallback) and add `requested_timezone`,
+> `requested_pin`, `timezone_source`, `pinned`, `resolved_timezone`,
+> `location_source` and `location_set`. The text below describes #98 as it
+> shipped in 2.16.0.
+
 `set_location` stores latitude/longitude and preserves the current timezone.
 It does not translate coordinates into an IANA timezone. Field firmware 2.9.0
 and 2.14.0 therefore cannot correct a provisioned `Europe/Berlin` timezone over
-MQTT. This change adds explicit remote timezone maintenance; automatic online
-coordinate lookup is separate work.
+MQTT. This change adds explicit remote timezone maintenance; automatic
+coordinate lookup followed in [timezone-from-location.md](timezone-from-location.md).
 
 Publish on the device's existing command topic, QoS 1, **not retained**:
 

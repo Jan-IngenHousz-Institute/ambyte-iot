@@ -1794,6 +1794,8 @@ static cmd_result_t emit_status_event(bool direct)
     const char *clock_source = "rtc";
     bool clock_suspect = false;
     clock_trust_get_status(&clock_source, &clock_suspect);
+    device_commands_location_t location = {0};
+    if (s_cfg.location_report) s_cfg.location_report(&location);
     script_identity_t script_identity = {0};
     const bool script_valid = s_cfg.read_script_identity != NULL &&
                               s_cfg.read_script_identity(&script_identity) == ESP_OK;
@@ -1838,6 +1840,18 @@ static cmd_result_t emit_status_event(bool direct)
         .clock_valid = true,
         .clock_source = clock_source,
         .clock_suspect = clock_suspect,
+        .location_valid = location.valid,
+        .location_source = location.source,
+        .location_has_coords = location.has_coords,
+        .location_lat = location.lat,
+        .location_lon = location.lon,
+        .location_has_accuracy = location.has_accuracy,
+        .location_accuracy_m = location.accuracy_m,
+        .location_configured_stale = location.configured_stale,
+        .location_live_status = location.live_status,
+        .location_timezone = current_timezone(),
+        .location_timezone_source = location.timezone_source,
+        .location_timezone_pinned = location.pinned,
         .software_valid = true,
         .firmware = app != NULL ? app->version : "",
         .script_valid = script_valid,

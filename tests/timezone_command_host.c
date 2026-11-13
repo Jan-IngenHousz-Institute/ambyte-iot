@@ -5,6 +5,7 @@
 #include "timezone.h"
 #include "device_config.h"
 #include "time_sync.h"
+#include "tz_geo.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -46,6 +47,25 @@ esp_err_t device_config_set_timezone(const char *value)
     writes++; if (fail_write) return ESP_FAIL;
     strcpy(stored, value); return ESP_OK;
 }
+/* Coordinate resolver boundaries: no persisted location in these #98 cases,
+ * so the source flag is the only new state (tests/timezone_auto_host.c covers
+ * the resolver policy against the real device_config and map). */
+static char source[16] = "";
+esp_err_t device_config_set_timezone_source(const char *value) { strcpy(source, value); return ESP_OK; }
+device_tz_source_t device_config_timezone_source(void)
+{
+    if (!source[0]) return DEVICE_TZ_SOURCE_PROVISIONED;
+    return strcmp(source, "manual") ? DEVICE_TZ_SOURCE_AUTO : DEVICE_TZ_SOURCE_MANUAL;
+}
+const char *device_config_timezone_source_label(void) { return source[0] ? source : "provisioned"; }
+esp_err_t device_config_get_location(double *lat, double *lon, char *d, size_t n)
+{ (void)lat; (void)lon; (void)d; (void)n; return ESP_ERR_NVS_NOT_FOUND; }
+esp_err_t device_config_get_live_fix(double *a, double *b, double *c, int64_t *t)
+{ (void)a; (void)b; (void)c; (void)t; return ESP_ERR_NVS_NOT_FOUND; }
+esp_err_t device_config_set_live_fix(double a, double b, double c, int64_t t)
+{ (void)a; (void)b; (void)c; (void)t; return ESP_FAIL; }
+bool tz_geo_location_usable(double lat, double lon) { (void)lat; (void)lon; return false; }
+const char *tz_geo_zone_for(double lat, double lon) { (void)lat; (void)lon; return NULL; }
 static void reply(const char *json) { assert(strlen(json) < sizeof last); strcpy(last, json); }
 static bool submit(void (*run)(void *), void *arg) { queued++; job=run; argument=arg; return true; }
 static bool begin(void) { if (deny) return false; acquired++; return true; }
@@ -131,7 +151,10 @@ int main(int argc, char **argv)
     } else {
         assert(!strcmp(argv[1],"apply"));
         request(set); assert(!writes && !strcmp(timezone_current_name(),"Europe/Berlin"));
-        execute(); assert(writes==1 && !strcmp(stored,"Australia/Darwin"));
+        execute(); assert(writes==1 && !strcmp(stored,"Australia/Darwin") && !source[0]);
+        /* No location: the configured (fallback) zone is the zone in effect. */
+        assert(strstr(last,"\"timezone_source\":\"configured\"") && strstr(last,"\"location_set\":false"));
+        assert(strstr(last,"\"pinned\":false") && strstr(last,"\"requested_timezone\":\"Australia/Darwin\""));
         assert(timezone_utc_offset_seconds(1768478400)==34200);
         assert(timezone_utc_offset_seconds(1784116800)==34200);
         assert(strstr(last,"\"applied\":true"));

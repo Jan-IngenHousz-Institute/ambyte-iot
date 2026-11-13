@@ -911,6 +911,25 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
         jw_append(&w, "\"source\":"); jw_string(&w, input->clock_source);
         jw_append(&w, ",\"suspect\":%s", input->clock_suspect ? "true" : "false");
     }
+    jw_append(&w, "},\"location\":{");
+    if (input->location_valid) {
+        jw_append(&w, "\"source\":"); jw_string(&w, input->location_source);
+        if (input->location_has_coords) {
+            jw_append(&w, ",\"lat\":%.6f,\"lon\":%.6f", input->location_lat, input->location_lon);
+        } else {
+            jw_append(&w, ",\"lat\":null,\"lon\":null");
+        }
+        if (input->location_has_accuracy) {
+            jw_append(&w, ",\"accuracy_m\":%.0f", input->location_accuracy_m);
+        } else {
+            jw_append(&w, ",\"accuracy_m\":null");
+        }
+        jw_append(&w, ",\"configured_stale\":%s", input->location_configured_stale ? "true" : "false");
+        jw_append(&w, ",\"live_status\":"); jw_string(&w, input->location_live_status);
+        jw_append(&w, ",\"timezone\":"); jw_string(&w, input->location_timezone);
+        jw_append(&w, ",\"timezone_source\":"); jw_string(&w, input->location_timezone_source);
+        jw_append(&w, ",\"pinned\":%s", input->location_timezone_pinned ? "true" : "false");
+    }
     jw_append(&w, "},\"software\":{");
     if (input->software_valid) {
         jw_append(&w, "\"firmware\":"); jw_string(&w, input->firmware);

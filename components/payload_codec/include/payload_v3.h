@@ -181,6 +181,22 @@ typedef struct {
     const char *clock_source;
     bool clock_suspect;
 
+    /* Where the device is and why its timezone is what it is
+     * (docs/timezone-from-location.md). STATUS metadata only: measurement
+     * envelopes keep just `timezone`. */
+    bool location_valid;
+    const char *location_source;          /* "live" | "configured" | "none" */
+    bool location_has_coords;
+    double location_lat;
+    double location_lon;
+    bool location_has_accuracy;
+    double location_accuracy_m;
+    bool location_configured_stale;       /* live won: configured is in another country */
+    const char *location_live_status;     /* last live-source outcome */
+    const char *location_timezone;        /* zone in effect */
+    const char *location_timezone_source; /* "manual" | "location" | "configured" | "none" */
+    bool location_timezone_pinned;
+
     bool software_valid;
     const char *firmware;
     bool script_valid;
