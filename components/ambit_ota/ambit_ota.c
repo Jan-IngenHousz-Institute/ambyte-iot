@@ -1030,13 +1030,15 @@ static void ambit_do_attach(void)
             attach_report("gave_up", ch, inf.fw_version, &tgt);
             break;
         case AMBIT_ATTACH_DECIDE_STALE: {
-            power_reading_t p = {0};   /* zeros, not stack garbage, in the log below */
-            const bool power = cmd_read_power(&p).status == ESP_OK && ambit_attach_power_ok(&p);
+            /* Fresh, positive evidence of external power only (fail-closed,
+             * 2026-11-13): never on battery, never on an unreadable or frozen
+             * charger - a brownout mid-flash bricks the AMBIT. */
+            const bool power = device_commands_flash_power_ok();
             if (!power) {
-                ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but power is too low "
-                              "(input %s, battery %u mV, system %u mV); held, re-checking in 10 min",
+                ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but external power is not "
+                              "verified (power state %s); held, re-checking in 10 min",
                          ch + 1, inf.fw_version, tgt.major, tgt.minor, tgt.batch,
-                         p.input_present ? "on" : "off", p.battery_mv, p.system_mv);
+                         device_commands_publish_gate_reason());
                 ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_RETRY, now_ms);
                 attach_report("waiting_power", ch, inf.fw_version, &tgt);
                 break;

@@ -24,6 +24,7 @@
  * Exit status 0 only when every CHECK held.
  */
 #include "device_commands.h"
+#include "power_policy.h"
 #include "event_log.h"
 #include "evq_index.h"
 #include "payload_v3.h"
@@ -430,6 +431,25 @@ static bool g_input_present;
 static power_reading_t g_power = { .battery_mv = 4100, .system_mv = 4000, .input_mv = 5000,
                                    .charge_ma = 120, .input_ma = 300, .charge_status = 2 };
 static esp_err_t p_read_power(power_reading_t *out) { *out = g_power; out->input_present = g_input_present; return ESP_OK; }
+
+/* The publish decision device_commands.c consults (renamed in at compile time
+ * by test_evq_integration.py). Production power_publish_ok() is always true
+ * since 2026-11-13 - a charger reading never holds data back - so the
+ * closed-gate delivery mechanics I7 proves (no claims while closed, fallback
+ * wake on reopen) are driven here: closed while g_input_present is false. The
+ * delivery path itself (sync_runner gate → drain) is unchanged production code
+ * and still closes for the publish hold and the HIL gate. */
+bool h_power_publish_ok(const power_gate_t *g);
+bool h_power_publish_ok(const power_gate_t *g)
+{
+    (void)g;
+    const bool open = g_input_present;
+    if (open != g_gate_open) {
+        g_gate_open = open;
+        h_trace("gate", open ? "open" : "closed", open ? 1 : 0);
+    }
+    return open;
+}
 static float g_env[3] = { 21.5f, 48.25f, 101325.0f };
 static esp_err_t p_read_env(measurement_t *m) { m->temperature_c = g_env[0]; m->humidity_percent = g_env[1]; m->pressure_pa = g_env[2]; return ESP_OK; }
 static script_identity_t g_script = { .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",

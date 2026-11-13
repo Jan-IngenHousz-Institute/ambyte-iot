@@ -616,8 +616,8 @@ non-negative integers.
 |---|---|---|---|
 | `connectivity` | `wifi` | boolean | `wifi`; gateway has a Wi-Fi connection. |
 | | `provisioned` | boolean | `provisioned`; Wi-Fi credentials are provisioned. |
-| | `publish_gate` | boolean | `publish_gate`; external-power publication gate is open. |
-| | `publish_gate_reason` | string enum | Why the gate is in its state: `starting`, `external_power`, `on_battery`, `power_unverified` (opened because the charger could not be read; see [power-telemetry.md](power-telemetry.md)), `no_charger`. Additive since the 2026-11-13 fix; unknown future values are preserved. |
+| | `publish_gate` | boolean | `publish_gate`; publication gate is open. Since the 2026-11-13 fix it is always `true` (the gate never closes on a power reading; see [power-telemetry.md](power-telemetry.md)). Earlier firmware reported `false` while it held the backlog on battery. |
+| | `publish_gate_reason` | string enum | Observed power state (observability only; it never stops publishing): `starting` (no charger read yet), `external_power` (valid read, input present), `on_battery` (valid read without input, or live status `no_input`), `power_unverified` (stale, implausible or unreadable charger), `no_charger`. Additive since the 2026-11-13 fix; unknown future values are preserved. |
 | | `mqtt_reconnects` | integer | `mqtt_reconnects`; MQTT connection count for this boot. |
 | | `last_disc_reason` | string | `last_disc_reason`; most recent Wi-Fi/MQTT disconnect reason, empty when none is known. |
 | | `conn_age_s` | integer, s | `conn_age_s`; current MQTT connection age, `-1` when unavailable. |

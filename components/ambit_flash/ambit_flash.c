@@ -967,11 +967,12 @@ int ambit_flash_boot_sync(void)
         return 0;
     }
 
-    /* Power gate - the publish gate's VALID external-power decision. The gate
-     * needs ~15 s of observed external power to open from its boot-closed state,
-     * so give it time instead of sampling once. Fail-closed: the publish gate's
-     * power_unverified fail-open (unreadable charger) does NOT count - a brownout
-     * mid-flash bricks the AMBIT, so flashing needs positive power evidence. */
+    /* Power gate (AMBIT flash) - fresh, positive evidence of external power
+     * (fail-closed): the latest charger read valid with input present AND its
+     * ADC frame changing between reads. The publish gate no longer says anything about power (it
+     * never closes since 2026-11-13). Fresh evidence needs a few 5 s charger
+     * reads after boot, so give it time instead of sampling once. A brownout
+     * mid-flash bricks the AMBIT; no flashing on battery or unknown power. */
     if (!device_commands_flash_power_ok()) {
         ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing — waiting up to %d s "
                       "for the power gate", n_need, BOOT_GATE_WAIT_MS / 1000);

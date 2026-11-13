@@ -1,9 +1,15 @@
 /* Host harness: the production MP2731 read (components/mp2731/mp2731_core.c) and
  * power policy (components/device_commands/power_policy.c) driven by a fake
  * charger behind the register seam. tests/test_power_policy.py runs every
- * scenario; built with -DLEGACY_IMPL the two incident scenarios run the v2.16.0
+ * scenario; built with -DLEGACY_IMPL the incident scenarios run the v2.16.0
  * code instead (tests/fixtures/power_v2_16_0) and must FAIL - the red half of
  * the red/green reproduction of the 2026-11-13 Uluru incident.
+ *
+ * The incident replays are MODELED, not captured: field heartbeats carry the
+ * ADC frame and CHG_STAT only, never REG0C/REG0D in full. The all-zero replay
+ * ASSUMES live status 0x20 (VIN_STAT 001) with fault 0x00; the frozen-frame
+ * replay ASSUMES status 0x01 with INPUT_FAULT set. Assumptions consistent with
+ * the datasheet, not field captures.
  *
  * usage: power_policy_host <scenario>   (exit 0 = pass) */
 #include <stdbool.h>
@@ -113,57 +119,31 @@ static esp_err_t rd(chip_t *c, power_reading_t *p, mp2731_frame_t *f)
     return mp2731_core_read(&b, p, f);
 }
 
-/* ── Gate driver: one evaluation per 5 s, like device_commands.c ─────────── */
+/* ── Policy driver: one charger read per 5 s, like device_commands.c ─────── */
 
-typedef struct { power_gate_t g; int64_t now; } gate_run_t;
-
-static power_gate_step_t gate_eval(gate_run_t *run, chip_t *c)
+static power_read_reason_t eval(power_gate_t *g, chip_t *c)
 {
     power_reading_t p;
     const power_read_reason_t r = power_read_reason_from_err(rd(c, &p, NULL));
-    const power_read_reason_t verdict = r == POWER_READ_NO_INPUT ? POWER_READ_OK : r;
-    const power_gate_step_t st = power_gate_step(&run->g, run->now, verdict,
-                                                 r == POWER_READ_OK && p.input_present);
-    run->now += 5000;
-    return st;
+    (void)power_gate_step(g, r, r == POWER_READ_OK ? &p : NULL);
+    return r;
+}
+
+/* Feed a synthetic valid frame; `seq` varies the LSBs like a converting ADC. */
+static void feed_ok(power_gate_t *g, bool present, int seq)
+{
+    power_reading_t p = { .battery_mv = (uint16_t)(4180 + 20 * (seq % 2)),
+                          .system_mv = (uint16_t)(4300 + 20 * (seq % 3)),
+                          .input_mv = present ? 5100 : 0,
+                          .input_ma = (uint16_t)(106 + 13 * (seq % 4)),
+                          .input_present = present, .charge_status = present ? 3 : 0 };
+    (void)power_gate_step(g, POWER_READ_OK, &p);
 }
 
 #ifdef LEGACY_IMPL
 esp_err_t legacy_read_power(const mp2731_bus_t *bus, power_reading_t *out);
 bool legacy_publish_power_ok(const mp2731_bus_t *bus, int64_t now);
 #endif
-
-/* Run `seconds` of gate evaluations on chip c; returns the final gate state. */
-static bool incident_gate(chip_t *c, int seconds, bool start_open)
-{
-#ifdef LEGACY_IMPL
-    /* The v2.16.0 gate: open it first with a healthy frame when asked. */
-    const mp2731_bus_t b = bus_of(c);
-    int64_t now = 0;
-    bool open = false;
-    if (start_open) {
-        chip_t h; chip_bench(&h);
-        const mp2731_bus_t hb = bus_of(&h);
-        for (; now <= 20000; now += 5000) open = legacy_publish_power_ok(&hb, now);
-        CHECK(open, "legacy gate failed to open on a healthy charger");
-    }
-    for (int64_t end = now + (int64_t)seconds * 1000; now <= end; now += 5000) {
-        open = legacy_publish_power_ok(&b, now);
-    }
-    return open;
-#else
-    gate_run_t run = {0};
-    power_gate_init(&run.g);
-    if (start_open) {
-        chip_t h; chip_bench(&h);
-        while (run.now <= 20000) (void)gate_eval(&run, &h);
-        CHECK(run.g.open, "gate failed to open on a healthy charger");
-    }
-    const int64_t end = run.now + (int64_t)seconds * 1000;
-    while (run.now <= end) (void)gate_eval(&run, c);
-    return run.g.open;
-#endif
-}
 
 /* ── Driver scenarios ────────────────────────────────────────────────────── */
 
@@ -283,142 +263,191 @@ static void s_i2c_error(void)
     CHECK(err != ESP_OK && power_read_reason_from_err(err) == POWER_READ_I2C_ERROR, "bus error");
 }
 
-/* ── Gate policy scenarios ───────────────────────────────────────────────── */
+/* ── Publish gate: never closes ──────────────────────────────────────────── */
 
-static void s_gate_valid_unchanged(void)
+static void s_publish_never_closes(void)
 {
-    /* Healthy charger on external power: opens on the 15 s dwell, like v2.16.0. */
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    chip_t c; chip_bench(&c);
-    int64_t opened_at = -1;
-    for (int i = 0; i < 6; i++) {
-        const int64_t t = run.now;
-        if (gate_eval(&run, &c) == POWER_GATE_STEP_OPENED) opened_at = t;
+    /* Every reading class, interleaved, for ~28 h of 5 s evaluations. */
+    power_gate_t g; power_gate_init(&g);
+    CHECK(power_publish_ok(&g), "open from boot");
+    static const power_read_reason_t R[] = {
+        POWER_READ_OK, POWER_READ_NO_INPUT, POWER_READ_ADC_TIMEOUT,
+        POWER_READ_IMPLAUSIBLE, POWER_READ_I2C_ERROR, POWER_READ_UNAVAILABLE };
+    for (int i = 0; i < 20000; i++) {
+        const power_read_reason_t r = R[(i * 7 + i / 13) % 6];
+        if (r == POWER_READ_OK) feed_ok(&g, (i / 3) % 2 == 0, i);
+        else (void)power_gate_step(&g, r, NULL);
+        CHECK(power_publish_ok(&g), "closed at step %d (reason %s)", i, power_read_reason_name(r));
     }
-    CHECK(opened_at == 15000, "opened at %lld", (long long)opened_at);
-    CHECK(power_gate_flash_ok(&run.g), "valid external power allows flashing");
-    CHECK(strcmp(power_gate_reason_name(run.g.reason), "external_power") == 0, "reason");
-    /* Then valid "on battery" (dusk float VIN 4.26 V): closes after the 60 s dwell. */
-    c.r[0x11] = 71; c.vary = false;
-    int64_t closed_at = -1; const int64_t t0 = run.now;
-    for (int i = 0; i < 16; i++) {
-        const int64_t t = run.now;
-        if (gate_eval(&run, &c) == POWER_GATE_STEP_CLOSED) closed_at = t - t0;
+    /* A long run of fresh, valid "absent" frames: still open. */
+    for (int i = 0; i < 1000; i++) {
+        feed_ok(&g, false, i);
+        CHECK(power_publish_ok(&g), "valid absent closed it");
     }
-    CHECK(closed_at == 60000, "closed after %lld ms", (long long)closed_at);
-    CHECK(strcmp(power_gate_reason_name(run.g.reason), "on_battery") == 0, "reason");
+    CHECK(g.reason == POWER_GATE_REASON_ON_BATTERY, "reported on battery");
 }
 
-static void s_gate_invalid_never_closes(void)
+static void s_power_state_reason(void)
 {
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    for (int i = 0; i < 4; i++) power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    CHECK(run.g.open, "open");
-    for (int i = 0; i < 10000; i++) {
-        const power_read_reason_t r = (power_read_reason_t)(POWER_READ_ADC_TIMEOUT + i % 3);
-        CHECK(power_gate_step(&run.g, run.now += 5000, r, false) == POWER_GATE_STEP_NONE, "step");
-        CHECK(run.g.open, "invalid sample %d closed the gate", i);
-    }
-    CHECK(!power_gate_flash_ok(&run.g), "no flashing on an unreadable charger");
+    power_gate_t g; power_gate_init(&g);
+    CHECK(strcmp(power_gate_reason_name(g.reason), "starting") == 0, "starting");
+    feed_ok(&g, true, 0);
+    CHECK(strcmp(power_gate_reason_name(g.reason), "external_power") == 0, "external");
+    CHECK(power_gate_step(&g, POWER_READ_NO_INPUT, NULL) && g.reason == POWER_GATE_REASON_ON_BATTERY,
+          "no_input reports on_battery");
+    (void)power_gate_step(&g, POWER_READ_ADC_TIMEOUT, NULL);
+    CHECK(strcmp(power_gate_reason_name(g.reason), "power_unverified") == 0, "unverified");
+    CHECK(g.invalid_streak == 1, "streak");
+    (void)power_gate_step(&g, POWER_READ_NO_INPUT, NULL);
+    CHECK(g.invalid_streak == 0, "no_input is evidence, not an unreadable charger");
+    CHECK(strcmp(power_gate_reason_name(POWER_GATE_REASON_NO_CHARGER), "no_charger") == 0, "name");
 }
 
-static void s_gate_failopen_after_n(void)
+static void s_eu_night(void)
 {
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    for (unsigned i = 1; i < POWER_POLICY_INVALID_FAILOPEN_N; i++) {
-        CHECK(power_gate_step(&run.g, run.now += 5000, POWER_READ_IMPLAUSIBLE, false) ==
-              POWER_GATE_STEP_NONE && !run.g.open, "closed before N (%u)", i);
-    }
-    CHECK(power_gate_step(&run.g, run.now += 5000, POWER_READ_IMPLAUSIBLE, false) ==
-          POWER_GATE_STEP_FAILOPEN && run.g.open, "fail-open at N");
-    CHECK(strcmp(power_gate_reason_name(run.g.reason), "power_unverified") == 0, "reason");
-    CHECK(!power_gate_flash_ok(&run.g), "AMBIT flash stays refused on fail-open");
-
-    /* A valid present reading keeps it open; flashing needs the ON dwell. */
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    CHECK(!power_gate_flash_ok(&run.g), "one good frame is not evidence yet");
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    CHECK(power_gate_flash_ok(&run.g) && run.g.reason == POWER_GATE_REASON_EXTERNAL_POWER,
-          "verified after the ON dwell");
-}
-
-static void s_gate_failopen_then_valid_absent_closes(void)
-{
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    for (unsigned i = 0; i < POWER_POLICY_INVALID_FAILOPEN_N; i++)
-        power_gate_step(&run.g, run.now += 5000, POWER_READ_I2C_ERROR, false);
-    CHECK(run.g.open, "fail-open");
-    int closes = 0; const int64_t t0 = run.now;
-    int64_t at = -1;
+    /* Healthy solar unit: day on the panel, dusk (valid frames, VIN 4.26 V below
+     * the 4.7 V source threshold), night (ADC off, live status "no input"). It
+     * keeps publishing throughout - the battery cost accepted on 2026-11-13 -
+     * and may not flash an AMBIT after dusk. */
+    power_gate_t g; power_gate_init(&g);
+    chip_t day; chip_bench(&day);
+    for (int i = 0; i < 6; i++) (void)eval(&g, &day);
+    CHECK(g.reason == POWER_GATE_REASON_EXTERNAL_POWER && power_gate_flash_ok(&g), "day");
+    chip_t dusk; chip_bench(&dusk);
+    dusk.r[0x11] = 71; dusk.r[0x0C] = 0x21;              /* VIN 4.26 V, not charging */
     for (int i = 0; i < 20; i++) {
-        if (power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, false) == POWER_GATE_STEP_CLOSED) {
-            closes++; at = run.now - t0;
-        }
+        CHECK(eval(&g, &dusk) == POWER_READ_OK, "dusk frames are valid");
+        CHECK(power_publish_ok(&g) && !power_gate_flash_ok(&g), "dusk: publish, no flash");
     }
-    CHECK(closes == 1 && at == 65000, "valid absent closes on the normal dwell (%lld)", (long long)at);
+    CHECK(g.reason == POWER_GATE_REASON_ON_BATTERY, "dusk reported on battery");
+    chip_t night; chip_frozen_charging(&night, 0x01, MP2731_FAULT_INPUT);
+    for (int i = 0; i < 720; i++) {
+        CHECK(eval(&g, &night) == POWER_READ_NO_INPUT, "night");
+        CHECK(power_publish_ok(&g) && !power_gate_flash_ok(&g), "night: publish, no flash");
+    }
 }
 
-static void s_gate_invalid_cancels_pending_close(void)
+/* ── AMBIT flash gate: its own fresh, positive evidence ─────────────────── */
+
+static void s_flash_needs_fresh_present(void)
 {
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    for (int i = 0; i < 4; i++) power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    for (int i = 0; i < 11; i++) power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, false);
-    CHECK(run.g.open, "50 s of absence: still open");
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_ADC_TIMEOUT, false);
-    /* Without the cancel, the next valid absent sample (>60 s after the first)
-     * would close at once. */
-    CHECK(power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, false) == POWER_GATE_STEP_NONE &&
-          run.g.open, "an invalid sample must not let the close mature");
-    for (int i = 0; i < 12; i++) power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, false);
-    CHECK(!run.g.open, "a fresh full OFF dwell still closes it");
+    power_gate_t g; power_gate_init(&g);
+    feed_ok(&g, true, 0);
+    CHECK(!power_gate_flash_ok(&g), "one frame is not freshness evidence");
+    feed_ok(&g, true, 1);
+    CHECK(power_gate_flash_ok(&g), "two differing valid present frames");
+
+    /* Codex B1 (a): input lost where the old publish OFF dwell used to run. */
+    power_gate_init(&g);
+    for (int i = 0; i < 4; i++) feed_ok(&g, true, i);          /* 0/5/10/15 s */
+    CHECK(power_gate_flash_ok(&g), "verified");
+    feed_ok(&g, false, 4);                                      /* 20 s */
+    CHECK(!power_gate_flash_ok(&g), "refused at once on a valid absent frame");
+    feed_ok(&g, true, 5);
+    CHECK(power_gate_flash_ok(&g), "present again with a changed frame");
+    (void)power_gate_step(&g, POWER_READ_NO_INPUT, NULL);
+    CHECK(!power_gate_flash_ok(&g), "refused at once on no_input");
+
+    /* Codex B1 (b): an interrupted dwell - invalid samples are not evidence. */
+    power_gate_init(&g);
+    feed_ok(&g, true, 0);                                       /* 0 s  */
+    (void)power_gate_step(&g, POWER_READ_ADC_TIMEOUT, NULL);    /* 5 s  */
+    (void)power_gate_step(&g, POWER_READ_IMPLAUSIBLE, NULL);    /* 10 s */
+    feed_ok(&g, true, 1);                                       /* 15 s */
+    CHECK(!power_gate_flash_ok(&g), "invalid samples break the evidence chain");
+    feed_ok(&g, true, 2);
+    CHECK(power_gate_flash_ok(&g), "two fresh frames after the gap");
+
+    for (int r = POWER_READ_ADC_TIMEOUT; r <= POWER_READ_NO_INPUT; r++) {
+        power_gate_init(&g);
+        feed_ok(&g, true, 0); feed_ok(&g, true, 1);
+        (void)power_gate_step(&g, (power_read_reason_t)r, NULL);
+        CHECK(!power_gate_flash_ok(&g), "refused on %s",
+              power_read_reason_name((power_read_reason_t)r));
+    }
 }
 
-static void s_gate_invalid_does_not_block_open(void)
+static void s_flash_refuses_frozen_frame(void)
 {
-    gate_run_t run = {0}; power_gate_init(&run.g);
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_ADC_TIMEOUT, false);
-    power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true);
-    CHECK(power_gate_step(&run.g, run.now += 5000, POWER_READ_OK, true) == POWER_GATE_STEP_OPENED,
-          "an invalid sample does not restart the ON dwell");
-}
-
-static void s_gate_no_input_closes_like_battery(void)
-{
-    gate_run_t run = {0}; power_gate_init(&run.g);
+    /* A frozen but internally consistent charging frame (status CC charging,
+     * input present): the read says ok, the frame never changes. */
+    power_gate_t g; power_gate_init(&g);
+    chip_t c; chip_frozen_charging(&c, 0x31 /* VIN_STAT 001, CHG CC */, 0x80);
+    for (int i = 0; i < 50; i++) {
+        CHECK(eval(&g, &c) == POWER_READ_OK, "consistent frame reads ok");
+        CHECK(c.conversions == 0 && power_publish_ok(&g), "no conversion, still publishing");
+        CHECK(!power_gate_flash_ok(&g), "an unchanging frame is never flash evidence (%d)", i);
+    }
+    /* Changing frames that then freeze: the evidence expires after the window. */
     chip_t h; chip_bench(&h);
-    while (run.now <= 20000) (void)gate_eval(&run, &h);
-    CHECK(run.g.open, "open");
-    chip_t c; chip_frozen_charging(&c, 0x01, MP2731_FAULT_INPUT);
-    for (int i = 0; i < 14; i++) (void)gate_eval(&run, &c);
-    CHECK(!run.g.open && run.g.reason == POWER_GATE_REASON_ON_BATTERY, "no_input closes");
-    CHECK(run.g.invalid_streak == 0, "no_input is evidence, never counted toward fail-open");
+    for (int i = 0; i < 4; i++) (void)eval(&g, &h);
+    CHECK(power_gate_flash_ok(&g), "live ADC");
+    h.adc_available = false;
+    for (unsigned i = 0; i < POWER_FLASH_FRESH_WINDOW + 1; i++) (void)eval(&g, &h);
+    CHECK(!power_gate_flash_ok(&g), "frozen for the window: refused");
 }
 
-/* ── SD park guard ───────────────────────────────────────────────────────── */
+static void s_twilight_stale_frame(void)
+{
+    /* Codex L3: no conversion, a plausible twilight frame, live status that is
+     * not "no input" (0x01 / fault 0x00). Indistinguishable from fresh: the read
+     * says ok. Publishing continues; flashing and parking refuse. */
+    chip_t c; memset(&c, 0, sizeof c);
+    c.r[0x03] = 0x10; c.r[0x0C] = 0x01; c.r[0x0D] = 0x00;
+    c.r[0x0E] = 200; c.r[0x0F] = 201; c.r[0x11] = 71; c.r[0x12] = 0; c.r[0x13] = 0;
+    power_gate_t g; power_gate_init(&g);
+    power_guard_t guard; power_guard_init(&guard);
+    for (int i = 0; i < 100; i++) {
+        power_reading_t p;
+        const power_read_reason_t r = power_read_reason_from_err(rd(&c, &p, NULL));
+        CHECK(r == POWER_READ_OK && c.conversions == 0, "stale twilight frame reads ok");
+        (void)power_gate_step(&g, r, &p);
+        CHECK(power_publish_ok(&g) && !power_gate_flash_ok(&g), "publish yes, flash no");
+        CHECK(power_guard_step(&guard, r, &p, false) == POWER_GUARD_HOLD, "never parks");
+    }
+}
+
+/* ── SD park guard: fresh, changing evidence only ───────────────────────── */
+
+static power_reading_t low_frame(int seq)
+{
+    power_reading_t p = { .battery_mv = (uint16_t)(3200 - 20 * (seq % 3)),
+                          .system_mv = (uint16_t)(3200 - 20 * (seq % 3)),
+                          .input_ma = (uint16_t)(13 * (seq % 2)) };
+    return p;
+}
 
 static void s_guard(void)
 {
     power_guard_t g; power_guard_init(&g);
-    const power_reading_t low = { .battery_mv = 3200, .system_mv = 3200 };
-    const power_reading_t idle0 = { .battery_mv = 0, .system_mv = 3700 };
-    const power_reading_t ext = { .battery_mv = 0, .system_mv = 4200, .input_present = true };
+    const power_reading_t low = low_frame(0);
 
     for (int i = 0; i < 100; i++)
         CHECK(power_guard_step(&g, POWER_READ_IMPLAUSIBLE, &low, false) == POWER_GUARD_HOLD,
               "invalid never parks");
     for (int i = 0; i < 100; i++)
-        CHECK(power_guard_step(&g, POWER_READ_OK, &idle0, false) == POWER_GUARD_HOLD,
+        CHECK(power_guard_step(&g, POWER_READ_NO_INPUT, &low, false) == POWER_GUARD_HOLD,
+              "no_input never parks");
+    for (int i = 0; i < 100; i++)
+        CHECK(power_guard_step(&g, POWER_READ_OK, &low, false) == POWER_GUARD_HOLD,
+              "an unchanging low frame never parks");
+    for (int i = 0; i < 100; i++) {
+        power_reading_t p = { .battery_mv = 0, .system_mv = (uint16_t)(3700 + 20 * (i % 2)) };
+        CHECK(power_guard_step(&g, POWER_READ_OK, &p, false) == POWER_GUARD_HOLD,
               "VBAT 0 without input is no evidence");
-    CHECK(power_guard_step(&g, POWER_READ_OK, &low, false) == POWER_GUARD_HOLD, "1");
-    CHECK(power_guard_step(&g, POWER_READ_ADC_TIMEOUT, &low, false) == POWER_GUARD_HOLD, "x");
-    CHECK(power_guard_step(&g, POWER_READ_OK, &low, false) == POWER_GUARD_HOLD, "1'");
-    CHECK(power_guard_step(&g, POWER_READ_OK, &low, false) == POWER_GUARD_HOLD, "2'");
-    CHECK(power_guard_step(&g, POWER_READ_OK, &low, true) == POWER_GUARD_HOLD, "maintenance veto");
-    for (int i = 0; i < 2; i++) power_guard_step(&g, POWER_READ_OK, &low, false);
-    CHECK(power_guard_step(&g, POWER_READ_OK, &low, false) == POWER_GUARD_PARK && g.parked, "park");
+    }
+
+    /* Fresh, changing low frames: park after PARK_N; maintenance vetoes. */
+    power_guard_init(&g);
+    int seq = 0;
+    power_reading_t f = low_frame(seq++);
+    CHECK(power_guard_step(&g, POWER_READ_OK, &f, false) == POWER_GUARD_HOLD, "first frame: no prev");
+    f = low_frame(seq++); CHECK(power_guard_step(&g, POWER_READ_OK, &f, false) == POWER_GUARD_HOLD, "1");
+    f = low_frame(seq++); CHECK(power_guard_step(&g, POWER_READ_OK, &f, false) == POWER_GUARD_HOLD, "2");
+    f = low_frame(seq++); CHECK(power_guard_step(&g, POWER_READ_OK, &f, true) == POWER_GUARD_HOLD, "veto");
+    for (int i = 0; i < 2; i++) { f = low_frame(seq++); (void)power_guard_step(&g, POWER_READ_OK, &f, false); }
+    f = low_frame(seq++);
+    CHECK(power_guard_step(&g, POWER_READ_OK, &f, false) == POWER_GUARD_PARK && g.parked, "park");
 
     /* Parked: N reads without evidence remount (never stay parked on none). */
     for (unsigned i = 1; i < POWER_POLICY_INVALID_FAILOPEN_N; i++)
@@ -426,36 +455,59 @@ static void s_guard(void)
     CHECK(power_guard_step(&g, POWER_READ_NO_INPUT, &low, false) == POWER_GUARD_UNPARK_UNVERIFIED &&
           !g.parked, "unpark after N without evidence");
 
-    /* Valid recovery: 4 good reads (as before). */
-    for (int i = 0; i < 3; i++) power_guard_step(&g, POWER_READ_OK, &low, false);
+    /* Re-park, then valid recovery: 4 fresh good reads (as before). */
+    for (int i = 0; i < 4; i++) { f = low_frame(seq++); (void)power_guard_step(&g, POWER_READ_OK, &f, false); }
     CHECK(g.parked, "re-parked");
-    for (int i = 0; i < 3; i++)
-        CHECK(power_guard_step(&g, POWER_READ_OK, &ext, false) == POWER_GUARD_HOLD, "good %d", i);
-    CHECK(power_guard_step(&g, POWER_READ_OK, &ext, false) == POWER_GUARD_UNPARK, "unpark");
+    for (int i = 0; i < 3; i++) {
+        power_reading_t e = { .battery_mv = 0, .system_mv = (uint16_t)(4200 + 20 * (i % 2)),
+                              .input_mv = 5100, .input_present = true };
+        CHECK(power_guard_step(&g, POWER_READ_OK, &e, false) == POWER_GUARD_HOLD, "good %d", i);
+    }
+    power_reading_t e = { .battery_mv = 0, .system_mv = 4240, .input_mv = 5100, .input_present = true };
+    CHECK(power_guard_step(&g, POWER_READ_OK, &e, false) == POWER_GUARD_UNPARK, "unpark");
 }
 
-/* ── Incident replays (red on v2.16.0, green now) ────────────────────────── */
+/* ── Incident replays (MODELED; red on v2.16.0, green now) ──────────────── */
 
 static void s_incident_allzero(void)
 {
-    /* 14:63:93:37:A3:FC, 2026-11-13 01:13 UTC: the chip has restarted, its ADC
-     * has not converted since (result registers at their 0x00 power-on value),
-     * and the status is NOT a consistent "no input". v2.16.0 read "no input"
-     * from the zeros and held the gate closed for 9+ h (2,519 records). */
+    /* 14:63:93:37:A3:FC, 2026-11-13 from 01:13 UTC: all-zero frame for 9+ h.
+     * MODELED live registers (assumed, not captured): status 0x20, fault 0x00.
+     * v2.16.0 read "no input" from the zeros and held the gate closed. */
     chip_t c; chip_por_no_conversion(&c, 0x20, 0x00);
-    const bool open = incident_gate(&c, 10 * 60, false);
-    CHECK(open, "an all-zero charger frame held the publish gate CLOSED for 10 min "
+    bool open = false;
+#ifdef LEGACY_IMPL
+    const mp2731_bus_t b = bus_of(&c);
+    for (int64_t now = 0; now <= 10 * 60 * 1000; now += 5000) open = legacy_publish_power_ok(&b, now);
+#else
+    power_gate_t g; power_gate_init(&g);
+    for (int i = 0; i <= 120; i++) {
+        (void)eval(&g, &c);
+        open = power_publish_ok(&g);
+        if (!open) break;
+    }
+#endif
+    CHECK(open, "an all-zero charger frame held the publish gate CLOSED "
                 "(field data held back)");
 }
 
-static void s_incident_stale_open_on_battery(void)
+static void s_incident_frozen_frame_flash(void)
 {
-    /* 14:63:93:39:37:30: a CHARGING frame frozen through the night (×181) with the
-     * live status saying no input. v2.16.0 believed the frame (VIN 4.98 V) and
-     * kept publishing on a dying battery. */
+    /* 14:63:93:39:37:30: one CHARGING frame (charge 420 mA, VIN 4.98 V) frozen
+     * for 10+ h while the heartbeat's CHG_STAT said "not charging". MODELED live
+     * registers (assumed, not captured): status 0x01, INPUT_FAULT set. v2.16.0
+     * believed the frame; its AMBIT boot-sync flash gate (the publish gate
+     * itself) opened and would have flashed without external power. */
     chip_t c; chip_frozen_charging(&c, 0x01, MP2731_FAULT_INPUT);
-    const bool open = incident_gate(&c, 10 * 60, true);
-    CHECK(!open, "a frozen charging frame kept the publish gate OPEN on battery");
+    bool flash = false;
+#ifdef LEGACY_IMPL
+    const mp2731_bus_t b = bus_of(&c);
+    for (int64_t now = 0; now <= 10 * 60 * 1000; now += 5000) flash = legacy_publish_power_ok(&b, now);
+#else
+    power_gate_t g; power_gate_init(&g);
+    for (int i = 0; i <= 120; i++) { (void)eval(&g, &c); flash = flash || power_gate_flash_ok(&g); }
+#endif
+    CHECK(!flash, "a frozen charging frame let an AMBIT flash proceed without external power");
 }
 
 int main(int argc, char **argv)
@@ -470,16 +522,15 @@ int main(int argc, char **argv)
         {"stale_charging_frame", s_stale_charging_frame},
         {"plausibility_limits", s_plausibility_limits},
         {"i2c_error", s_i2c_error},
-        {"gate_valid_unchanged", s_gate_valid_unchanged},
-        {"gate_invalid_never_closes", s_gate_invalid_never_closes},
-        {"gate_failopen_after_n", s_gate_failopen_after_n},
-        {"gate_failopen_then_valid_absent_closes", s_gate_failopen_then_valid_absent_closes},
-        {"gate_invalid_cancels_pending_close", s_gate_invalid_cancels_pending_close},
-        {"gate_invalid_does_not_block_open", s_gate_invalid_does_not_block_open},
-        {"gate_no_input_closes_like_battery", s_gate_no_input_closes_like_battery},
+        {"publish_never_closes", s_publish_never_closes},
+        {"power_state_reason", s_power_state_reason},
+        {"eu_night", s_eu_night},
+        {"flash_needs_fresh_present", s_flash_needs_fresh_present},
+        {"flash_refuses_frozen_frame", s_flash_refuses_frozen_frame},
+        {"twilight_stale_frame", s_twilight_stale_frame},
         {"guard", s_guard},
         {"incident_allzero", s_incident_allzero},
-        {"incident_stale_open_on_battery", s_incident_stale_open_on_battery},
+        {"incident_frozen_frame_flash", s_incident_frozen_frame_flash},
     };
     if (argc == 2 && strcmp(argv[1], "--list") == 0) {
         for (size_t i = 0; i < sizeof S / sizeof S[0]; i++) printf("%s\n", S[i].name);

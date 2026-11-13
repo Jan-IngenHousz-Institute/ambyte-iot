@@ -769,10 +769,11 @@ static void app_power_guard_task(void *arg)
 {
     (void)arg;
     /* The decision is power_policy.c (host-tested, same thresholds and streaks
-     * as before). New since 2026-11-13: a charger read that is not battery
-     * evidence (stale/impossible frame, bus error, or "no input" - the MP2731's
-     * ADC does not run on battery, datasheet p.26) never parks the card, and
-     * POWER_POLICY_INVALID_FAILOPEN_N of them in a row un-park it: a frozen
+     * as before). Since 2026-11-13 it parks only on FRESH evidence: a valid
+     * charger frame that differs from the previous one, below the floor, on
+     * battery. Anything else (stale/impossible frame, bus error, "no input" -
+     * the MP2731's ADC does not run on battery, datasheet p.26) never parks,
+     * and POWER_POLICY_INVALID_FAILOPEN_N such reads in a row un-park: a frozen
      * charger read must not keep the archive and the SD overflow offline. */
     power_guard_t guard;
     power_guard_init(&guard);

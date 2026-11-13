@@ -52,8 +52,9 @@ typedef struct {
  *   POWER_ERR_NO_INPUT     - the charger's live status says, consistently, that
  *                            there is no input. Its ADC only runs with an input
  *                            (MP2731 datasheet p.26), so there are no voltages -
- *                            but "no external power" itself is trustworthy, and
- *                            the publish gate treats it as on-battery evidence.
+ *                            but "no external power" itself is trustworthy: it is
+ *                            reported (on_battery) and refuses AMBIT flashing;
+ *                            it never stops publishing.
  * ESP_ERR_INVALID_STATE = no charger; anything else is a bus error. */
 #define POWER_ERR_ADC_TIMEOUT ESP_ERR_NOT_FINISHED
 #define POWER_ERR_IMPLAUSIBLE ESP_ERR_INVALID_RESPONSE

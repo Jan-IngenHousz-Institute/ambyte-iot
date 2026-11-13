@@ -9,17 +9,24 @@
  * The original read did `REG03 |= ADC_START`, slept 80 ms and read 0x0E-0x13,
  * never checking that a conversion had happened. But the MP2731 ADC only runs in
  * charge or OTG mode (datasheet p.26) and its result registers are never cleared
- * (pp.37-39). So whenever the panel gave no input, the firmware re-published the
- * last converted frame - or, after the chip itself had reset, its power-on 0x00s:
+ * (pp.37-39). So whenever the chip was not charging, the firmware re-published
+ * the last converted frame - or, after the chip itself had reset, its power-on
+ * 0x00s. On 2026-11-13 every 14:63:93:… Uluru unit reported "not charging" in
+ * its live status on every heartbeat for the whole day (08:47-21:04 ACST) while
+ * its ADC frame never changed, and units died during the day:
  *   - 14:63:93:37:A3:FC: all-zero frame (system_v 0 on a running unit) for 9+ h →
  *     "no input" → publish gate closed → 2,519 records held back;
  *   - 14:63:93:39:37:30 / 39:40:0C: one CHARGING frame (VIN 4.98 V) bit-identical
- *     for 10+ h across 30+ ESP resets → "input present" → gate OPEN on a dying
- *     battery through the night (suspected brownout loop).
- * A stale frame fails both ways, so this read now (1) makes a real 0→1 start
- * edge, (2) proves completion by watching ADC_START fall, (3) rejects frames no
+ *     for 10+ h across 30+ ESP resets → "input present" → gate open while the
+ *     chip itself said it was not charging.
+ * So this read now (1) makes a real 0→1 start edge, (2) watches ADC_START fall
+ * (which catches a stuck-high bit, but cannot prove a conversion: on the bench
+ * it reads low ~0.6 ms after the write either way), (3) rejects frames no
  * running unit can produce, and (4) consults the chip's LIVE status registers,
- * which do work on battery, before believing any frame.
+ * which do work without input, before believing any frame. Stale-but-plausible
+ * frames remain indistinguishable here; consumers that need fresh evidence
+ * (AMBIT flashing, the SD park guard) additionally require the frame to CHANGE
+ * between reads (power_policy.c).
  *
  * One-shot, not continuous (ADC_RATE=1): in continuous mode ADC_START is
  * read-only, so freshness becomes unobservable - exactly the property that

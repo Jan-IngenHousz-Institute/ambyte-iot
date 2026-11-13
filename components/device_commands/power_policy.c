@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 
-/* Pure policy - see power_policy.h for the rule and its field-incident origin.
+/* Pure policy - see power_policy.h for the decisions and their field origin.
  * Nothing here may touch I2C, the clock, or the log: the host tests drive this
  * file verbatim. */
 
@@ -20,89 +20,79 @@ const char *power_gate_reason_name(power_gate_reason_t r)
     return "starting";
 }
 
+bool power_frame_same(const power_reading_t *a, const power_reading_t *b)
+{
+    return a->battery_mv == b->battery_mv && a->system_mv == b->system_mv &&
+           a->input_mv == b->input_mv && a->charge_ma == b->charge_ma &&
+           a->input_ma == b->input_ma;
+}
+
 void power_gate_init(power_gate_t *g)
 {
     memset(g, 0, sizeof *g);
-    g->reason = POWER_GATE_REASON_STARTING;   /* closed at boot, as before */
+    g->reason = POWER_GATE_REASON_STARTING;
 }
 
-power_gate_step_t power_gate_step(power_gate_t *g, int64_t now_ms,
-                                  power_read_reason_t reason, bool present)
+bool power_gate_step(power_gate_t *g, power_read_reason_t reason, const power_reading_t *p)
 {
-    if (reason != POWER_READ_OK) {
-        g->last_valid = false;
-        g->verify_ms = 0;
-        if (g->invalid_streak < UINT32_MAX) g->invalid_streak++;
+    const power_gate_reason_t before = g->reason;
+    const bool ok = reason == POWER_READ_OK && p != NULL;
 
-        /* An invalid sample is no evidence that power went away, so it must not
-         * let a pending CLOSE mature: cancel it. A close then needs a fresh
-         * OFF dwell of VALID "absent" readings. (Before this, a read error
-         * merely held state, so error samples could silently age a close
-         * candidate and the next valid sample flipped the gate at once.)
-         * A pending OPEN is left running - invalid samples never hold the
-         * gate closed. */
-        if (g->open) g->cand = true;
-
-        if (!g->open && g->invalid_streak >= POWER_POLICY_INVALID_FAILOPEN_N) {
-            g->open = true;
-            g->cand = true;
-            g->reason = POWER_GATE_REASON_POWER_UNVERIFIED;
-            return POWER_GATE_STEP_FAILOPEN;
-        }
-        return POWER_GATE_STEP_NONE;
-    }
-
-    /* Valid evidence: exactly the Phase 1 debounce, starting from wherever the
-     * gate is (including a fail-open - a valid "on battery" reading closes it
-     * after the normal OFF dwell). */
-    g->last_valid = true;
-    g->invalid_streak = 0;
-
-    if (present == g->open) {
-        g->cand = present;                 /* steady - clear any pending change */
-        if (!present) {
+    if (!ok) {
+        /* Not positive evidence of anything flashable: break the freshness
+         * chain, so flashing needs two differing valid frames AFTER this. */
+        g->last_ok_present = false;
+        g->have_prev = false;
+        g->changed_recently = false;
+        g->same_streak = 0;
+        if (reason == POWER_READ_NO_INPUT) {
+            /* Live status: no external input. Evidence of battery power, which
+             * since 2026-11-13 never stops publishing; reported only. */
+            g->invalid_streak = 0;
             g->reason = POWER_GATE_REASON_ON_BATTERY;
-        } else if (g->reason == POWER_GATE_REASON_POWER_UNVERIFIED) {
-            /* Open on the fail-open fallback and the charger reads again: the
-             * gate is already open, but the reason (and with it AMBIT flashing)
-             * upgrades to "external_power" only after the same ON dwell a
-             * closed gate would need - one good frame after a frozen spell is
-             * not yet evidence. */
-            if (g->verify_ms == 0) g->verify_ms = now_ms != 0 ? now_ms : 1;
-            if ((now_ms - g->verify_ms) >= POWER_GATE_ON_DWELL_MS) {
-                g->reason = POWER_GATE_REASON_EXTERNAL_POWER;
-                g->verify_ms = 0;
-            }
         } else {
-            g->reason = POWER_GATE_REASON_EXTERNAL_POWER;
+            if (g->invalid_streak < UINT32_MAX) g->invalid_streak++;
+            g->reason = POWER_GATE_REASON_POWER_UNVERIFIED;
         }
-        return POWER_GATE_STEP_NONE;
+        return g->reason != before;
     }
-    g->verify_ms = 0;
-    if (present != g->cand) {
-        g->cand = present;                 /* new candidate - start the dwell timer */
-        g->cand_ms = now_ms;
-        return POWER_GATE_STEP_NONE;
-    }
-    const int64_t dwell = present ? POWER_GATE_ON_DWELL_MS : POWER_GATE_OFF_DWELL_MS;
-    if ((now_ms - g->cand_ms) < dwell) return POWER_GATE_STEP_NONE;
 
-    g->open = present;                     /* debounce satisfied - flip the gate */
-    g->reason = present ? POWER_GATE_REASON_EXTERNAL_POWER : POWER_GATE_REASON_ON_BATTERY;
-    return present ? POWER_GATE_STEP_OPENED : POWER_GATE_STEP_CLOSED;
+    g->invalid_streak = 0;
+    g->reason = p->input_present ? POWER_GATE_REASON_EXTERNAL_POWER
+                                 : POWER_GATE_REASON_ON_BATTERY;
+    g->last_ok_present = p->input_present;
+
+    /* Freshness for AMBIT flashing: a converting ADC jitters by LSBs between
+     * reads; a frozen register file repeats bit-identically. START falling
+     * cannot prove a conversion on this silicon (bench: low ~0.6 ms after the
+     * write either way), so a CHANGED frame is the only freshness evidence. */
+    if (g->have_prev && !power_frame_same(&g->prev, p)) {
+        g->changed_recently = true;
+        g->same_streak = 0;
+    } else if (g->have_prev) {
+        if (g->same_streak < UINT32_MAX) g->same_streak++;
+        if (g->same_streak >= POWER_FLASH_FRESH_WINDOW) g->changed_recently = false;
+    }
+    g->prev = *p;
+    g->have_prev = true;
+    return g->reason != before;
+}
+
+bool power_publish_ok(const power_gate_t *g)
+{
+    (void)g;   /* keep sending always (2026-11-13): no reading class stops it */
+    return true;
 }
 
 bool power_gate_flash_ok(const power_gate_t *g)
 {
-    return g != NULL && g->open && g->last_valid &&
-           g->reason == POWER_GATE_REASON_EXTERNAL_POWER;
+    return g != NULL && g->last_ok_present && g->changed_recently;
 }
 
 /* ── Low-battery SD park guard ─────────────────────────────────────────────
- * Same thresholds/streaks as the original app_main guard. A sample carries
- * battery evidence only when it is valid AND either reports external input or a
- * non-zero battery voltage: the MP2731 frame with battery_mv == 0 and no input
- * says nothing about how low the pack is (the original guard skipped it too). */
+ * Same thresholds/streaks as the original app_main guard, but a read carries
+ * battery evidence only when it is valid, FRESH (its frame differs from the
+ * previous valid frame) and reports external input or a non-zero VBAT. */
 
 void power_guard_init(power_guard_t *g)
 {
@@ -112,10 +102,18 @@ void power_guard_init(power_guard_t *g)
 power_guard_action_t power_guard_step(power_guard_t *g, power_read_reason_t reason,
                                       const power_reading_t *p, bool maintenance_active)
 {
-    const bool evidence = reason == POWER_READ_OK && p != NULL &&
-                          (p->input_present || p->battery_mv != 0);
+    const bool ok = reason == POWER_READ_OK && p != NULL;
+    const bool fresh = ok && g->have_prev && !power_frame_same(&g->prev, p);
+    if (ok) {
+        g->prev = *p;
+        g->have_prev = true;
+    } else {
+        g->have_prev = false;
+    }
+    const bool evidence = fresh && (p->input_present || p->battery_mv != 0);
+
     if (!evidence) {
-        /* Never park on no evidence; a park needs PARK_N consecutive VALID lows. */
+        /* Never park on no evidence; a park needs PARK_N consecutive fresh lows. */
         g->low_n = 0;
         if (g->invalid_n < UINT32_MAX) g->invalid_n++;
         if (g->parked && g->invalid_n >= POWER_POLICY_INVALID_FAILOPEN_N) {
@@ -134,13 +132,10 @@ power_guard_action_t power_guard_step(power_guard_t *g, power_read_reason_t reas
     if (!g->parked) {
         g->low_n = (!p->input_present && p->battery_mv < POWER_GUARD_PARK_MV) ? g->low_n + 1 : 0;
         if (g->low_n < POWER_GUARD_PARK_N) return POWER_GUARD_HOLD;
-        /* Never yank the card out from under an OTA/AMBIT-flash/script op; the
-         * battery keeps sagging, so the next poll re-trips once the op ends. */
-        if (maintenance_active) {
-            g->low_n = 0;
-            return POWER_GUARD_HOLD;
-        }
         g->low_n = 0;
+        /* Never yank the card out from under an OTA/AMBIT-flash/script op; the
+         * battery keeps sagging, so the next polls re-trip once the op ends. */
+        if (maintenance_active) return POWER_GUARD_HOLD;
         g->good_n = 0;
         g->parked = true;
         return POWER_GUARD_PARK;

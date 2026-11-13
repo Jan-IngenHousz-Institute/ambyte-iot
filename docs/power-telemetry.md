@@ -2,35 +2,43 @@
 
 The MP2731 charger (I2C 0x4B) is the only source of the device's power facts:
 battery, system and input voltage, charge and input current, and whether
-external power is present. Three firmware decisions run on those facts:
+external power is present. Three firmware decisions run on those facts. Since
+2026-11-13 only two of them can refuse anything:
 
-| Consumer | Where | On a valid reading | On an invalid reading |
-|---|---|---|---|
-| Publish gate (drain the backlog only on external power) | `device_commands_publish_power_ok`, every 5 s | Phase 1 rule, unchanged: VIN ≥ 4.7 V or charge current → open after 15 s; otherwise close after 60 s | Never closes the gate. After 12 invalid reads in a row it **opens** (`power_unverified`) |
-| Low-battery SD park guard | `app_power_guard_task`, every 15 s | Unchanged: park below 3300 mV on battery (3 reads), un-park at ≥ 3600 mV or external power (4 reads) | Never parks. After 12 reads without evidence a parked card is **remounted** |
-| AMBIT flashing (boot sync, attach update) | `device_commands_flash_power_ok`, `ambit_attach_power_ok` | Allowed on verified external power (or battery ≥ 3700 mV for attach) | **Refused** (fail-closed: a brownout mid-flash bricks the sensor) |
+| Consumer | Where | Rule |
+|---|---|---|
+| Publish gate | `device_commands_publish_power_ok` → `power_publish_ok` | **Never closes** while a charger is fitted, whatever the reading. The charger is still read every 5 s so the heartbeat can report the power state (`publish_gate_reason`) |
+| AMBIT flashing (boot sync, attach update) | `device_commands_flash_power_ok` → `power_gate_flash_ok` | **Fail-closed.** Allowed only on fresh, positive evidence of external power: the latest read is valid with input present, AND the ADC frame has changed within the last 6 valid reads. Refused on battery, on `no_input`, on any invalid read, on a frozen frame, and without a charger monitor (unless the build sets `AMBYTE_FLASH_WITHOUT_CHARGER`) |
+| Low-battery SD park guard | `app_power_guard_task` → `power_guard_step`, every 15 s | Parks only on **fresh** evidence: 3 consecutive changing, valid frames below 3300 mV on battery. Un-parks at ≥ 3600 mV or external power (4 reads), or after 12 reads without evidence. In practice it cannot fire on this hardware (below) |
 
-Every heartbeat reports what the charger said and what the gate did with it
-(`health.power.valid`, `reason`, `status_reg`, `fault_reg`;
-`health.connectivity.publish_gate_reason`, see [mqtt-payload.md](mqtt-payload.md) §9.2).
+Every heartbeat reports what the charger said and the observed power state:
+`health.power.valid`, `reason`, `status_reg`, `fault_reg`, and
+`health.connectivity.publish_gate_reason`. See [mqtt-payload.md](mqtt-payload.md) §9.2.
 
 ## The 2026-11-13 incident
 
-Uluru (prod), fw 2.9.0 – 2.16.0:
+Uluru (prod), fw 2.9.0 – 2.16.0, local time ACST (UTC+9:30):
 
-- `14:63:93:37:A3:FC` reported an all-zero power frame (system_v 0 V on a
-  running unit) on every heartbeat from 01:13 UTC. The gate read it as "no
-  input", stayed closed for 9+ h, and the store grew from 340 to 2,519 pending
-  records while only heartbeats went out.
-- `14:63:93:39:37:30` and `39:40:0C` repeated one bit-identical *charging*
-  frame (VIN 4.98 V, 420 mA charge) for 10+ h across 30+ ESP resets. The gate
-  believed VIN 4.98 V and stayed **open**, on battery, through the night.
+- **No charging all day.** On 2026-11-13, from 08:47 to 21:04 ACST, every
+  `14:63:93:…` unit's live charger status said "not charging" on every
+  heartbeat, while its ADC frame never changed. These were daytime hours.
+  Units died during the day (`39:36:18` at 12:10, `37:A0:A8` at 15:22 ACST).
+  The units appear to have had no external power or charging at all in the
+  field.
+- **`14:63:93:37:A3:FC`:** an all-zero power frame (system_v 0 V on a running
+  unit) on every heartbeat from 10:43 ACST. The old gate read it as "no input"
+  and stayed closed for 9+ h. The store grew from 340 to 2,519 pending records
+  while only heartbeats went out.
+- **`14:63:93:39:37:30` and `39:40:0C`:** one bit-identical *charging* frame
+  (VIN 4.98 V, 420 mA charge) for 10+ h, across 30+ ESP resets, while the same
+  heartbeats' live status said "not charging". The old gate believed VIN 4.98 V
+  and stayed open. Its AMBIT boot-sync flash used that same gate.
 
 The prod raw archive (2026-11-08 … 13, ~18,000 heartbeats from 18 devices)
-shows the signature on every Uluru unit. In 85–100 % of their heartbeats the
-frame reports charge current while the live status in the same heartbeat
-says "not charging". Each unit repeats only 1–2 distinct frames. The healthy
-`10:BD:A3:…` units show that combination in 0 of ~14,000 heartbeats.
+shows the stale signature on every Uluru unit: charge current in the frame
+while the live status says "not charging", in 85–100 % of their heartbeats,
+with only 1–2 distinct frames per unit. The healthy `10:BD:A3:…` units show it
+in 0 of ~14,000 heartbeats.
 
 ## Root cause
 
@@ -56,12 +64,13 @@ The v2.16.0 read was: write `REG03 | ADC_START`, sleep 80 ms, read
 wasn't converting, the firmware republished the last frame as a fresh
 measurement:
 
-- the dusk frame every night (the long-standing "battery_v = 0 at night"
-  pattern);
-- the power-on zeros after a chip reset (A3:FC);
-- a frozen charging frame (37:30, 40:0C).
+- on a unit without input (Uluru, all day on 2026-11-13): a frozen frame,
+  e.g. a charging one (37:30, 40:0C);
+- after a chip reset: the power-on zeros (A3:FC);
+- on healthy solar units at night: the dusk frame. That is the long-standing
+  "battery_v = 0 at night" pattern.
 
-A stale frame fails in both directions, as the two incidents show.
+A stale frame fails in both directions, as the incident shows.
 
 ## The read (components/mp2731/mp2731_core.c)
 
@@ -74,7 +83,7 @@ flowchart TD
     D --> E[poll REG03 every 5 ms<br/>until START falls, max 250 ms]
     E --> F[read REG0C status, REG0D fault,<br/>results 0x0E–0x13]
     F --> G{live status: VIN_STAT 000<br/>AND INPUT_FAULT AND not charging?}
-    G -- yes --> NI[POWER_ERR_NO_INPUT<br/>no voltages, but evidence: on battery]
+    G -- yes --> NI[POWER_ERR_NO_INPUT<br/>no voltages; reported on_battery]
     G -- no --> H{START fell?}
     H -- no --> TO[POWER_ERR_ADC_TIMEOUT]
     H -- yes --> I{plausible frame?}
@@ -109,93 +118,133 @@ behaviour this fix does not need. Each read sets the ADC bits itself.
 **What the completion poll can and cannot prove.** On the bench (charge mode)
 `ADC_START` already reads 0 on the first read-back, about 0.6 ms after the
 start write (10/10 probes). The poll therefore catches a START bit stuck high
-but cannot prove a fresh conversion. Freshness rests on the live-status
-cross-checks (no input; charging per ADC but not per status) and the
-plausibility limits.
+but cannot prove a fresh conversion. The live-status cross-checks (no input;
+charging per ADC but not per status) and the plausibility limits reject what
+they can. A stale-but-plausible frame still reads `ok` (for example a frozen
+twilight frame with an inconclusive status). That is why:
+
+- the publish gate no longer acts on readings at all;
+- the consumers that need freshness (AMBIT flashing, the SD guard) require the
+  frame to change between reads.
 
 Whole reads are serialised by a driver mutex: four tasks read the charger,
 and an interleaved "clear START" would abort another task's conversion.
 
-## The publish gate (components/device_commands/power_policy.c)
+## The publish gate: keep sending always
+
+**Decision (user, 2026-11-13).** Uluru ran a whole day without charging, with
+stale frames that misled the gate in both directions. A stale-but-plausible
+frame cannot be told from a fresh one on this silicon: `ADC_START` reads low
+within ~0.6 ms either way, and a frozen twilight frame passes every
+plausibility check. So no reading class may stop publishing:
+
+- the gate is open from boot;
+- `power_publish_ok()` is true for every state;
+- it holds whether the reading is a valid "absent" frame, `no_input`, stale,
+  implausible, or an I2C error.
+
+`publish_gate_reason` reports the observed power state for observability
+only:
+
+| Reason | Meaning |
+|---|---|
+| `starting` | no charger read yet |
+| `external_power` | latest read valid, input present |
+| `on_battery` | latest read valid without input, or live status `no_input` |
+| `power_unverified` | latest read stale, implausible or unreadable. A rate-limited WARN fires after 12 in a row |
+| `no_charger` | no charger monitor wired |
+
+**Trade-off, stated plainly: the publish gate no longer saves battery at
+night.** Before, a healthy solar unit stopped draining its backlog from dusk
+to dawn. It closed at dusk on a valid frame below 4.7 V and then stayed closed
+on the frozen dusk frame. Now it publishes through the night on battery:
+
+- dusk frames are valid "absent" frames, reason `on_battery`;
+- the night reads `no_input`, also reason `on_battery`;
+- AMBIT flashing is refused from dusk to dawn.
+
+That costs energy on every battery night, fleet-wide. The user accepted it:
+holding data back on an unverifiable reading proved worse (A3:FC). The event
+store is internal littlefs and power-loss-safe, so a unit that browns out
+loses nothing it had stored.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Closed_starting
-    Closed_starting --> Open_external: valid present ≥ 15 s
-    Closed_starting --> Closed_battery: valid absent / no_input
-    Closed_starting --> Open_unverified: 12 invalid in a row
-    Closed_battery --> Open_external: valid present ≥ 15 s
-    Closed_battery --> Open_unverified: 12 invalid in a row
-    Open_external --> Closed_battery: valid absent / no_input ≥ 60 s
-    Open_unverified --> Closed_battery: valid absent / no_input ≥ 60 s
-    Open_unverified --> Open_external: valid present ≥ 15 s (flash allowed again)
-    Open_external --> Open_external: invalid (cancels a pending close)
-    Open_unverified --> Open_unverified: invalid (rate-limited WARN)
+    [*] --> starting
+    starting --> external_power: valid, input present
+    starting --> on_battery: valid absent / no_input
+    starting --> power_unverified: stale / implausible / I2C error
+    external_power --> on_battery: valid absent / no_input
+    external_power --> power_unverified: invalid
+    on_battery --> external_power: valid, input present
+    on_battery --> power_unverified: invalid
+    power_unverified --> external_power: valid, input present
+    power_unverified --> on_battery: valid absent / no_input
+    note right of starting: publishing is ON in every state
 ```
 
-- *valid* = `ESP_OK`. `no_input` counts as a valid "absent" sample: the
-  charger's live status is evidence that there is no external power.
-- *invalid* = `adc_timeout`, `implausible` or `i2c_error`. An invalid sample
-  is the absence of evidence:
-  - it never closes the gate;
-  - it cancels a pending close, so a close needs a fresh 60 s of valid
-    "absent" samples;
-  - it never restarts a pending open;
-  - after `POWER_POLICY_INVALID_FAILOPEN_N` = 12 in a row (≥ 60 s at the 5 s
-    cache) it opens the gate.
-- AMBIT flashing uses `power_gate_flash_ok`. It is true only when the gate is
-  `external_power` and the latest sample was valid, never on
-  `power_unverified`.
+## The AMBIT flash gate: fresh, positive evidence
 
-### The trade-off: battery
+A brownout mid-flash bricks an AMBIT, so flashing needs evidence of its own:
 
-Failing open costs energy: a unit whose charger cannot be read publishes on
-battery too. That is the cheaper failure:
+- the **latest** read is valid (`ok`) with input present; and
+- the frame **changed** between two valid reads within the last
+  `POWER_FLASH_FRESH_WINDOW` = 6 valid reads.
 
-- the event store is internal littlefs and power-loss-safe, so a unit that
-  browns out loses nothing;
-- a gate held closed by an unreadable charger holds data back for as long as
-  the reading stays dead (forever, on a frozen chip) and eventually overflows
-  the ~17 h store budget.
+Any `no_input`, invalid read or valid "absent" frame resets the evidence at
+once. After that, two fresh, differing frames are needed again. A frozen frame
+(bit-identical across reads) never qualifies, even when it says
+"charging, input present". A converting ADC jitters by an LSB or more between
+reads; the bench changed on nearly every read.
 
-The approved boundary is that only *missing* evidence fails open. A charger
-that reports "no input" consistently closes the gate as before. So a normal
-battery night (ADC off, live status "no input") stays closed, and the
-fail-open is confined to charger faults.
+Without a charger monitor (`read_power == NULL`) the gate refuses. A real unit
+whose charger failed its boot I2C probe looks exactly like a dev board without
+one. Only a dev/bench build may opt in with `-DAMBYTE_FLASH_WITHOUT_CHARGER=1`.
+
+The attach-time battery-floor rule (flash on battery ≥ 3700 mV) is retired. On
+battery that battery value is a stale frame, and the decision is no AMBIT
+flashing on battery or unknown power.
+
+Boot sync waits up to 30 s for the evidence. That is about six 5 s charger
+reads, enough for two differing frames on a powered unit. Attach updates
+re-check every 10 min.
 
 ## The SD park guard
 
-Same thresholds, same streaks. A read carries battery evidence only when it is
-valid and reports either external input or a non-zero VBAT.
+Same thresholds and streaks as before, but a read counts as battery evidence
+only when all of these hold:
 
-- No evidence → never park.
-- Parked + 12 reads without evidence → remount (`POWER_GUARD_UNPARK_UNVERIFIED`).
+- it is valid;
+- it is fresh (its frame differs from the previous valid frame);
+- it reports external input or a non-zero VBAT.
 
-**Known limit: this guard has most likely never parked a field unit.** It
-needs a fresh battery voltage below 3300 mV while on battery, but on battery
-the MP2731 ADC does not convert (p.26). Every release before this one
-compared a stale frame, or the idle charger's VBAT 0, which it skipped. The
-guard now refuses to act on such frames instead of acting on them by accident.
-A real on-battery voltage source (an ESP ADC divider, or OTG-mode reads) is
-future work.
+Rules:
+
+- no evidence → never park;
+- parked + 12 reads without evidence → remount (`POWER_GUARD_UNPARK_UNVERIFIED`).
+
+**This guard effectively cannot fire on battery on this hardware.** It needs a
+fresh battery voltage below 3300 mV while on battery, and on battery the
+MP2731 ADC does not convert (p.26). Every release before this one compared a
+stale frame, or the idle charger's VBAT 0, which it skipped. So it has most
+likely never parked a field unit correctly. It now refuses stale frames instead
+of acting on them by accident. A real on-battery voltage source (an ESP ADC
+divider, or OTG-mode reads) is future work.
 
 ## Field effect of the OTA
 
-| Unit state | Before | After |
+| Unit state | Before (≤ 2.16.0) | After |
 |---|---|---|
-| Healthy, charging by day | gate opens at 15 s | same |
-| Battery night, ADC off, live status "no input" | closed (by luck: stale dusk frame said VIN < 4.7 V) | closed (`no_input`), heartbeats say `valid:false, reason:no_input` |
-| Frozen charging frame, live status "no input" (37:30 at night) | **open on battery** | closed after 60 s |
-| All-zero frame, status not "no input" (A3:FC if its input is present) | **closed indefinitely** | open after 60 s (`power_unverified`), backlog drains |
-| Frozen charging frame, status input present (the Uluru daytime pattern) | open | open (`power_unverified`), AMBIT flashing refused, `reason:implausible` |
-| A3:FC if its input really is absent | closed | closed (`no_input`): the backlog keeps waiting for input, as designed |
+| Healthy, charging by day | publishes (gate opens at 15 s) | publishes; `external_power`; AMBIT flash allowed |
+| Healthy solar unit at night | stops publishing at dusk | **publishes on battery**; `on_battery`; flash refused |
+| All-zero frame (A3:FC) | **holds data back indefinitely** | publishes; `power_unverified`, `reason: implausible` |
+| Frozen charging frame, live "not charging" (Uluru all day) | publishes; AMBIT boot sync could flash on battery | publishes; flash refused (`no_input` or frozen frame) |
+| Charger unreadable / failed boot probe | publishes (no charger = never gated); flash allowed | publishes; flash refused |
 
-On the drain: a unit that opens on `power_unverified` drains its backlog
-through the windowed publisher (≤16 in flight, bench ~17 events/s), i.e.
-2,519 records in a few minutes on a good link. Delivery stays at-least-once:
-the cursor and acknowledgement path are untouched. A store that already
-overflowed to SD drains from the card when the card is mounted. With this
-change a frozen charger can no longer keep the card parked.
+Drain after the OTA: A3:FC's 2,519 pending records go out through the
+windowed publisher (≤16 in flight, bench ~17 events/s), which is minutes on a
+good link and well inside the ~17 h store budget. Delivery stays
+at-least-once: the cursor, ACK and SD-overflow paths are untouched.
 
 ## Diagnostics
 
@@ -221,5 +270,8 @@ Host evidence:
 - `tests/test_power_policy.py` drives the production read and policy against a
   fake charger (stuck, all-zero, never-completing, I2C-erroring,
   no-input, stale-charging, healthy-changing).
-- It replays the two incidents against a verbatim v2.16.0 port
-  (`tests/fixtures/power_v2_16_0`), which must fail.
+- It replays the incidents against a verbatim v2.16.0 port
+  (`tests/fixtures/power_v2_16_0`), which must fail. These replays are
+  MODELED. Field heartbeats never carried full REG0C/REG0D, so the all-zero
+  replay assumes status 0x20 / fault 0x00, and the frozen-frame replay assumes
+  status 0x01 with INPUT_FAULT. Both are assumed values, not captured ones.

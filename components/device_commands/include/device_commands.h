@@ -159,22 +159,20 @@ uint32_t device_commands_mqtt_error_disconnects(uint32_t window_s);
  * in the caller's task context; keep it cheap (a task notify). */
 void device_commands_set_sync_notifier(void (*fn)(void));
 
-/* Phase-1 power gate: true when it's OK to drain the MQTT backlog — i.e. the
- * device is on external (solar/USB) power, so battery-only operation doesn't
- * spend the radio's energy budget. Keyed on VIN-present (not input current) and
- * debounced with on/off dwell times to avoid flapping near the threshold. The
- * charger reading is cached so the 10 s sync cycle and the back-to-back drain
- * loop don't each pay an ADC conversion. Returns true (never gates) when no
- * power monitor is wired in, preserving behaviour on boards without the charger. */
+/* Publish power gate: since 2026-11-13 ALWAYS true (never hold field data back
+ * on a charger reading; see device_commands.c). Still refreshes the observed
+ * power state (cached 5 s) that publish_gate_reason and the flash gate use. */
 bool device_commands_publish_power_ok(void);
 
-/* AMBIT flashing power check: fail-CLOSED. True only when the publish gate is
- * open on VALID external-power evidence - never on the gate's power_unverified
- * fail-open (a brownout mid-flash bricks the sensor). True without a charger. */
+/* AMBIT flashing power check: fail-CLOSED. True only on fresh, positive
+ * evidence of external power: the latest charger read valid with input
+ * present AND the ADC frame changed recently (power_gate_flash_ok). False with
+ * no charger monitor (a real unit whose charger failed its boot probe looks the
+ * same) unless the build sets AMBYTE_FLASH_WITHOUT_CHARGER. */
 bool device_commands_flash_power_ok(void);
 
-/* Why the publish gate is in its state (stable telemetry string:
- * starting | external_power | on_battery | power_unverified | no_charger). */
+/* Observed power state, as a stable telemetry string:
+ * starting | external_power | on_battery | power_unverified | no_charger. */
 const char *device_commands_publish_gate_reason(void);
 
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);

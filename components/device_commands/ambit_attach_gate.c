@@ -141,11 +141,3 @@ void ambit_attach_gate_forget(uint8_t ch)
     s_pending &= (uint8_t)~(1u << ch);
     UNLOCK();
 }
-
-bool ambit_attach_power_ok(const power_reading_t *p)
-{
-    if (p == NULL) return false;
-    if (p->input_present) return true;
-    const unsigned mv = p->battery_mv != 0 ? p->battery_mv : p->system_mv;
-    return mv >= AMBIT_ATTACH_BATTERY_FLOOR_MV;
-}
