@@ -1,0 +1,38 @@
+Bench 28:37:2F:FF:E7:04 - sun position follows the live location - 2026-11-13
+# Before (fw v2.16.0-10-g67e8948): a live fix was active, but the sun math used the compiled NL default.
+### > sync sun
+loc: lat=52.1730 lon=5.8190 tz=+1
+sunrise 07:54  sunset 16:50  (local time)
+# After (fw v2.16.0-14-g19ecd20, same code path as #100): no confirmed fix -> default; locate -> the Wi-Fi fix.
+W (6078) tz_cmd: timezone applied (ok=1 saved=0): active=Europe/Amsterdam source=configured pinned=0 configured=Europe/Amsterdam location=none resolved=- offset=3600
+### 2026-11-13T11:16:01 > identity
+identity -> fw=v2.16.0-14-g19ecd20
+  "location":{"set":false,"source":"none","lat":null,"lon":null,"accuracy_m":null,"configured_stale":false,"solar_position":"default","configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":5000,"age_s":174,"source":"ip","status":"waiting"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"configured","pinned":false,"resolved":null,"utc_offset_seconds":3600}
+### 2026-11-13T11:16:19 > sync sun
+loc: lat=52.1730 lon=5.8190 tz=+1
+sunrise 07:54  sunset 16:50  (local time)
+### 2026-11-13T11:16:37 > locate
+locate: queued
+W (68288) loc_aws: estimate (wifi): <lat>,<lon> +-41 m
+W (68318) tz_cmd: solar position now from live (location)
+W (68318) tz_cmd: timezone ok (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=live resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T11:16:55 > identity
+identity -> fw=v2.16.0-14-g19ecd20
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"solar_position":"location","configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":18,"source":"wifi","status":"ok"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T11:17:13 > sync sun
+loc: lat=<redacted> lon=<redacted> tz=+1
+sunrise 07:59  sunset 16:53  (local time)
+### 2026-11-13T11:17:31 > locate ip
+locate ip: queued
+W (119468) loc_aws: estimate (ip): <lat>,<lon> +-5000 m
+W (119478) tz_cmd: timezone ok (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=live resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T11:17:49 > identity
+identity -> fw=v2.16.0-14-g19ecd20
+  "location":{"set":true,"source":"live","lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"configured_stale":false,"solar_position":"location","configured":{"set":false,"lat":null,"lon":null},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":18,"source":"wifi","status":"ok"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T11:18:07 > sync sun
+loc: lat=<redacted> lon=<redacted> tz=+1
+sunrise 07:59  sunset 16:53  (local time)
+# Coordinates of the bench site are redacted. 52.1730/5.8190 is the compiled default, not a location.

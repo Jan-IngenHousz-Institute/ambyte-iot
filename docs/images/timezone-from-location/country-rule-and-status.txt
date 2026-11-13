@@ -1,0 +1,26 @@
+Bench 28:37:2F:FF:E7:04 - fw v2.16.0-21-gf964045 - country rule + published STATUS - 2026-11-13
+# Configured: Amsterdam centre (set by the GUI flow). Live: the bench's Wi-Fi fix, same country.
+W (6148) tz_cmd: solar position now from configured (location)
+W (6228) tz_cmd: timezone applied (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=configured resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T12:07:44 > identity
+identity -> fw=v2.16.0-21-gf964045
+  "location":{"set":true,"source":"configured","lat":52.373,"lon":4.8924,"accuracy_m":null,"configured_stale":false,"solar_position":"location","configured":{"set":true,"lat":52.373,"lon":4.8924},"live":{"set":false,"lat":null,"lon":null,"accuracy_m":null,"age_s":null,"wifi_age_s":null,"source":null,"status":"waiting"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T12:08:02 > sync sun
+loc: lat=52.3730 lon=4.8924 tz=+1
+sunrise 07:58  sunset 16:53  (local time)
+### 2026-11-13T12:08:20 > locate
+locate: queued
+W (70248) loc_aws: estimate (wifi): <lat>,<lon> +-41 m
+W (70278) tz_cmd: timezone ok (ok=1 saved=0): active=Europe/Amsterdam source=location pinned=0 configured=Europe/Amsterdam location=configured resolved=Europe/Amsterdam offset=3600
+### 2026-11-13T12:08:38 > identity
+identity -> fw=v2.16.0-21-gf964045
+  "location":{"set":true,"source":"configured","lat":52.373,"lon":4.8924,"accuracy_m":null,"configured_stale":false,"solar_position":"location","configured":{"set":true,"lat":52.373,"lon":4.8924},"live":{"set":true,"lat":"<redacted>","lon":"<redacted>","accuracy_m":41,"age_s":18,"wifi_age_s":18,"source":"wifi","status":"ok"}}
+  "timezone":{"configured":"Europe/Amsterdam","active":"Europe/Amsterdam","source":"location","pinned":false,"resolved":"Europe/Amsterdam","utc_offset_seconds":3600}
+### 2026-11-13T12:08:56 > sync sun
+loc: lat=52.3730 lon=4.8924 tz=+1
+sunrise 07:58  sunset 16:53  (local time)
+# Published STATUS heartbeat on the DEV data topic, 2026-11-13T11:13:00Z, health.location:
+  {"source":"configured","lat":52.373,"lon":4.8924,"accuracy_m":null,"configured_stale":false,"solar_position":"location","live_status":"ok","live_source":"wifi","live_wifi_age_s":267,"timezone":"Europe/Amsterdam","timezone_source":"location","pinned":false}
+# Same country: the precise configured site keeps zone and sun position; the live fix is informational.
+# Live coordinates redacted; the configured point is the public Amsterdam centre.
