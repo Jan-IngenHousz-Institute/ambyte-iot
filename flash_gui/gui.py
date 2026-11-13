@@ -611,13 +611,18 @@ class App(ttk.Frame):
         return answer.get()
 
     def _confirm_timezone(self, status, *, parent=None):
+        effect = (f"The Ambyte already runs {status.active} from its location. Saving this fallback "
+                  "does not change the active timezone now.\n\n"
+                  if status.active == status.resolved else
+                  f"Effective timezone at last read: {status.active or 'unavailable'}. "
+                  "The Ambyte manages its effective timezone.\n\n")
         return self._ask_on_main(lambda: messagebox.askyesno(
             "Fallback timezone mismatch",
-            f"Device {status.mac}\nStored timezone: {status.stored or 'unset'}\n"
+            f"Device {status.mac}\nConfigured fallback timezone: {status.stored or 'unset'}\n"
             f"Coordinates: {status.latitude}, {status.longitude}\n"
-            f"Fallback coordinate timezone: {status.resolved}\n\n"
-            "Update this fallback default, then reboot and verify it? The Ambyte manages its effective timezone. "
-            "Choose No to leave it unchanged.", parent=parent or self.winfo_toplevel()))
+            f"Fallback coordinate timezone: {status.resolved}\n\n" + effect +
+            "Save this fallback default and reboot to verify it? Choose No to leave it unchanged.",
+            parent=parent or self.winfo_toplevel()))
 
     # ── clock ────────────────────────────────────────────────────────────
     def _tick_clock(self) -> None:

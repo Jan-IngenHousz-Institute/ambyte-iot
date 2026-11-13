@@ -43,13 +43,13 @@ def test_unknown_environment_requires_operator_confirmation_and_keeps_api_env_vi
     def confirm(title,text,**kw):messages.append(text);return True
     monkeypatch.setattr(g.messagebox,'askyesno',confirm)
     def change(*args,**kw):
-        assert w.working and w.change_btn.state=='disabled'
-        calls.append(kw)
+        calls.append((kw,w.working,w.change_btn.state))
         return target.preview
     monkeypatch.setattr(e,'change_experiment',change)
     w._change();finish()
     assert 'API environment: dev' in messages[0] and 'UNKNOWN' in messages[0]
-    assert calls[0]['allow_unknown_environment'] is True
+    assert calls[0][0]['allow_unknown_environment'] is True
+    assert calls[0][1:] == (True,'disabled')
     assert 'verified after reboot' in w.message.value
 
 
@@ -92,10 +92,35 @@ def test_primary_experiment_success_precedes_optional_checks(monkeypatch,target)
     monkeypatch.setattr(g.messagebox,'askyesno',lambda *a,**kw:True)
     changed=replace(target.preview,timezone_result='Timezone needs attention: old → new')
     monkeypatch.setattr(e,'change_experiment',lambda *a,**kw:changed)
+    observed=[]
     def slow(*a,**kw):
-        assert w.working and 'verified after reboot' in w.message.value
-        assert 'Timezone needs attention' in w.message.value and 'Checking workbook' in w.maintenance_text.value
+        observed.append((w.working,w.message.value,w.maintenance_text.value))
         raise RuntimeError('optional backend failed')
     monkeypatch.setattr(g.maintenance,'run',slow)
     w._change()
-    assert 'verified after reboot' in w.message.value and not w.working
+    assert observed and observed[0][0]
+    assert 'verified after reboot' in observed[0][1] and 'Timezone needs attention' in observed[0][1]
+    assert 'Checking workbook' in observed[0][2]
+    assert 'verified after reboot' in w.message.value and 'Timezone needs attention' in w.message.value
+    assert not w.working
+
+
+@pytest.mark.parametrize('optional_failure',[False,True])
+def test_real_experiment_switch_warning_stays_visible_and_logged(monkeypatch,target,optional_failure):
+    original=target.device.console
+    def console(command):
+        reply=original(command)
+        if command=='reboot':target.values['timezone']='Etc/UTC'
+        return reply
+    target.device.console=console
+    window,finish=dialog(monkeypatch,target)
+    logs=[];window.app.log=logs.append
+    monkeypatch.setattr(g.messagebox,'askyesno',lambda *a,**kw:True)
+    if optional_failure:
+        monkeypatch.setattr(g.maintenance,'run',lambda *a,**kw:(_ for _ in ()).throw(RuntimeError('optional lookup unavailable')))
+    window._change();finish()
+    warning='Timezone needs attention: Europe/Amsterdam → Etc/UTC'
+    assert warning in window.target.timezone_result
+    visible='\n'.join(v.value for v in (window.summary,window.message,window.maintenance_text))
+    assert warning in visible
+    assert any(warning in line for line in logs)

@@ -56,6 +56,7 @@ class ExperimentDialog(tk.Toplevel):
         if self.working:
             return
         self.working = True
+        self._last_logged_timezone_result = None
         self.message.set(progress)
         self._controls()
         client = self.app.client
@@ -114,6 +115,12 @@ class ExperimentDialog(tk.Toplevel):
             self.message.set('Close this window, sign in and select the destination experiment in the main window, then reopen Change experiment / workbook.')
         else:
             self.message.set(f'Selected destination: {experiment.name} ({experiment.id}), API environment {self.app.client.env.key}.')
+        if target.timezone_result:
+            self.message.set(self.message.get() + '\n' + target.timezone_result)
+            if self.__dict__.get('_last_logged_timezone_result') != target.timezone_result:
+                self.app.log(target.timezone_result)
+                self._last_logged_timezone_result = target.timezone_result
+
 
     def _read(self):
         if self.working:
@@ -150,7 +157,8 @@ class ExperimentDialog(tk.Toplevel):
             return
         def apply(value):
             self._show(value)
-            self.message.set('Experiment topics and workbook verified after reboot. Broker and client identity preserved; no registration or certificate writes.')
+            self.message.set('Experiment topics and workbook verified after reboot. Broker and client identity preserved; no registration or certificate writes.'
+                             + ('\n' + value.timezone_result if value.timezone_result else ''))
         self._run(lambda: settings.change_experiment(target, client, experiment.id,
                   allow_unknown_environment=not bool(target.environment), log=self.app.log), apply,
                   'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…', maintain=True)

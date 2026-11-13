@@ -101,6 +101,7 @@ class TimezoneMismatch:
     latitude: float
     longitude: float
     resolved: str
+    active: str | None = None
 
 
 def _runtime_offset(console, identity):
@@ -184,7 +185,7 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
             return prefix + f'; warning: GUI fallback zone {resolved}, firmware zone {stored} (firmware is authoritative)', port
         if resolved == stored:
             return prefix + '; matches fallback location', port
-        mismatch = TimezoneMismatch(current.identity.mac, stored, fallback.lat, fallback.lon, resolved)
+        mismatch = TimezoneMismatch(current.identity.mac, stored, fallback.lat, fallback.lon, resolved, zone.active)
         if confirm is None:
             return prefix + f'; mismatch with {resolved} (confirmation required, unchanged)', port
         if not confirm(mismatch):

@@ -76,13 +76,15 @@ def test_main_action_is_available_without_login_release_or_experiment(monkeypatc
 def test_update_uses_worker_and_posts_result_to_main_thread(monkeypatch):
     window, finish = dialog(monkeypatch)
     calls = []
+    states=[]
     def update(info, ssid, password, **kwargs):
-        assert window.working and window.update_btn.state == "disabled"
+        states.append((window.working,window.update_btn.state))
         calls.append((info, ssid, password))
         return wifi_settings.WifiResult(ssid, True)
     monkeypatch.setattr(wifi_settings, "save_wifi", update)
     window._update()
     assert calls == [(INFO, "Field hub 1", "synthetic-password")]
+    assert states == [(True,"disabled")]
     assert window.working and "saved and connection confirmed" not in window.message.value
     finish()
     assert not window.working and window.update_btn.state == "normal"
@@ -241,17 +243,18 @@ def test_automatic_check_follows_save_and_its_error_keeps_saved_result(monkeypat
     window,finish=dialog(monkeypatch)
     window.app.client=object()
     order=[]
+    observed=[]
     def save(*a,**kw):
         order.append('saved')
         return wifi_settings.WifiResult('Field hub 1',False)
     def maintain(port,mac,client,**kw):
-        assert order==['saved'] and client is window.app.client
+        observed.append((list(order),client))
         order.append('checked')
         return wifi_gui.maintenance.MaintenanceResult('Workbook: not checked: cloud unavailable')
     monkeypatch.setattr(wifi_settings,'save_wifi',save)
     monkeypatch.setattr(wifi_gui.maintenance,'run',maintain)
     window._update();finish()
-    assert order==['saved','checked']
+    assert order==['saved','checked'] and observed==[(['saved'],window.app.client)]
     assert 'Wi-Fi saved' in window.message.value and 'cloud unavailable' in window.maintenance_text.value
 
 
@@ -269,13 +272,15 @@ def test_primary_save_is_visible_while_optional_maintenance_is_still_running(mon
     window,_=dialog(monkeypatch)
     window.app._post=lambda fn,*a:fn(*a)
     monkeypatch.setattr(wifi_settings,'save_wifi',lambda *a:wifi_settings.WifiResult('Field hub 1',True))
+    observed=[]
     def slow(*a,**kw):
-        assert window.working and 'Wi-Fi saved and connection confirmed' in window.message.value
-        assert 'Checking workbook' in window.maintenance_text.value
-        assert window.update_btn.state=='disabled'
+        observed.append((window.working,window.message.value,window.maintenance_text.value,window.update_btn.state))
         raise RuntimeError('optional backend failed')
     monkeypatch.setattr(wifi_gui.maintenance,'run',slow)
     window._update()
     assert 'Wi-Fi saved and connection confirmed' in window.message.value
     assert 'optional maintenance unavailable' in window.maintenance_text.value
+    assert observed and observed[0][0] and observed[0][3]=='disabled'
+    assert 'Wi-Fi saved and connection confirmed' in observed[0][1]
+    assert 'Checking workbook' in observed[0][2]
     assert not window.working

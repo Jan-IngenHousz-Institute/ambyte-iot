@@ -62,3 +62,6 @@ Real Tk desktop qualification, synthetic device data (no USB/network actions):
 PASS: real Tk Wi-Fi dialog constructed, worker completed, separate fallback/live result shown, controls enabled.
 PASS: real Tk destination dialog worker, fallback/live labels, modal destruction and grab release.
 PASS: empty fallback defaults, serial-action gate released, all created windows closed; no USB/network actions.
+
+The journaled workbook install/repair path is unchanged at this PR merge head.
+Subsequent changes address timezone results and GUI phase reporting.

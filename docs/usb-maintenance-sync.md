@@ -140,13 +140,19 @@ flowchart TD
     Verify --> Report[Report verified fallback or separate warning]
 ```
 
-No location/timezone state can fail the primary maintenance action. After a
-verified firmware update, any stored timezone drift is reported separately.
-Explained device-managed changes show `Timezone updated by the Ambyte: <old> →
-<new>` with source and accuracy. Missing/inconsistent source evidence or a change
-under configured/manual control shows a visible `Timezone needs attention`
-warning with both values. All other configuration, MAC/client and workbook
-verification requirements remain in force.
+No location/timezone state can fail the primary maintenance action. Grading after
+firmware updates and experiment switches compares the **effective** zone: the
+pre-action `identity.timezone.active` (or stored fallback on older images) against
+the post-action active zone. Location-derived changes show `Timezone updated by
+the Ambyte: <old> → <new>` with source and accuracy, even when the fallback remains
+unchanged, as PR3 intends. A mutation of the stored fallback itself always shows
+`Timezone needs attention`, as does an unexplained effective change. The grade
+is displayed in the primary and final result, retained across optional checks,
+and logged. All other configuration, MAC/client and workbook checks remain strict.
+
+When the device already uses the coordinate-resolved active zone, the fallback
+prompt explains that saving the offline default does not change the active zone
+now. It still confirms the persistent fallback and reboot verification separately.
 
 ## Initial setup
 
@@ -160,7 +166,7 @@ manual-pin escape hatch is separate from these setup inputs.
 
 ## Qualification
 
-The full GUI suite currently passes 631 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 640 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,

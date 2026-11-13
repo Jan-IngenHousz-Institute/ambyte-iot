@@ -69,7 +69,7 @@ def mutations(site):
 def test_yes_writes_explicit_fallback_preserves_source_and_verifies_active_identity(site):
     prompts = []
     result = m.run('bench', site.preview.mac, confirm_timezone=lambda p: prompts.append(p) or True)
-    assert prompts == [m.TimezoneMismatch(site.preview.mac, 'Europe/Berlin', -25.3444, 131.0369, 'Australia/Darwin')]
+    assert prompts == [m.TimezoneMismatch(site.preview.mac, 'Europe/Berlin', -25.3444, 131.0369, 'Australia/Darwin', 'Australia/Darwin')]
     assert 'updated to Australia/Darwin' in result.timezone and '+34200s' in result.timezone
     assert mutations(site) == ['cfg set timezone Australia/Darwin', 'reboot']
     assert site.values['timezone'] == 'Australia/Darwin' and site.values['timezone_source'] == 'provisioned'
@@ -262,14 +262,19 @@ def test_fallback_prompt_and_reboot_ignore_volatile_live_estimate_age(site):
 
 def test_experiment_change_grades_device_managed_timezone_drift(site):
     from flash_gui.tests.test_experiment_settings import NEW
+    # A location derivation completes during maintenance, without mutating the
+    # configured fallback (the frozen PR3 behaviour).
+    site.device.active_zone='Europe/Berlin'
+    site.device.tz_source='configured'
     original=site.device.console
     def console(cmd):
         result=original(cmd)
-        if cmd=='reboot':site.values['timezone']='Australia/Darwin'
+        if cmd=='reboot':site.device.tz_source='location'
         return result
     site.device.console=console
     preview=m.experiment_settings.read_target('bench',{'dev':'example.test'})
     result=m.experiment_settings.change_experiment(preview,site.client,NEW)
+    assert site.values['timezone']=='Europe/Berlin'
     assert 'Timezone updated by the Ambyte: Europe/Berlin → Australia/Darwin' in result.timezone_result
 
 
@@ -291,3 +296,14 @@ def test_frozen_capability_and_contract_are_needed_even_if_location_is_readable(
     site.device.legacy_zone=True
     result=m.run('bench',site.preview.mac,confirm_timezone=lambda p:pytest.fail('valid PR3 contract required'))
     assert 'display only: timezone metadata unavailable' in result.timezone and not mutations(site)
+
+
+
+def test_prompt_explains_when_the_device_already_uses_the_resolved_zone(monkeypatch):
+    prompts=[]
+    app=SimpleNamespace(_ask_on_main=lambda fn:fn(),winfo_toplevel=lambda:'root')
+    monkeypatch.setattr(gui.messagebox,'askyesno',lambda title,text,**kw:prompts.append(text) or False)
+    mismatch=m.TimezoneMismatch('AA:BB:CC:DD:EE:FF','Europe/Berlin',-25.3444,131.0369,'Australia/Darwin','Australia/Darwin')
+    gui.App._confirm_timezone(app,mismatch)
+    assert 'does not change the active timezone now' in prompts[0]
+    assert 'already runs Australia/Darwin' in prompts[0]

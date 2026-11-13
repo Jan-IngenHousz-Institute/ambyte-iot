@@ -152,20 +152,37 @@ def _settled_schedule(console, snapshot, log, *, before_flash):
 
 
 def _configuration_changes(before, after):
-    changed = [key for key in CONFIG_KEYS if after.settings[key] != before.settings[key]]
-    correction = None
-    if 'timezone' in changed:
-        changed.remove('timezone')
-        zone, location = after.identity.timezone, after.identity.location
-        old, new = before.settings['timezone'] or 'unset', after.settings['timezone'] or 'unset'
-        if (zone is not None and location is not None and location.set
-                and zone.source == 'location' and zone.configured == zone.active == zone.resolved == new):
-            accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
-            correction = (f'Timezone updated by the Ambyte: {old} → {new} '
-                          f'(source={location.source}/{zone.source}, accuracy={accuracy})')
-        else:
-            correction = f'Timezone needs attention: {old} → {new}; device-managed change could not be explained.'
-    return changed, correction
+    """Preserve config strictly, grading device-managed runtime zones separately.
+
+    PR3 keeps the configured fallback unchanged when location changes the active
+    zone. Old images expose only that fallback, so it is our best pre-update
+    runtime estimate. A fallback mutation is always suspicious, even if the
+    resulting effective zone could otherwise be explained by location.
+    """
+    changed = [key for key in CONFIG_KEYS if key != 'timezone' and after.settings[key] != before.settings[key]]
+    old_zone, zone, location = before.identity.timezone, after.identity.timezone, after.identity.location
+    old_active = old_zone.active if old_zone is not None else before.settings['timezone']
+    new_active = zone.active if zone is not None else None
+    old_label = old_active or 'unset'
+    new_label = (new_active or 'unset') if zone is not None else 'unavailable'
+    if before.settings['timezone'] != after.settings['timezone']:
+        old_fallback = before.settings['timezone'] or 'unset'
+        new_fallback = after.settings['timezone'] or 'unset'
+        return changed, (f'Timezone needs attention: {old_fallback} → {new_fallback}; configured fallback changed '
+                         f'(effective {old_label} → {new_label}).')
+    if zone is None:
+        if old_zone is not None:
+            return changed, f'Timezone needs attention: active zone unavailable after maintenance (was {old_label}).'
+        return changed, None  # Neither legacy image exposes effective timezone.
+    if old_active == new_active:
+        return changed, None
+    if (zone is not None and location is not None and location.set and not zone.pinned
+            and zone.source == 'location' and zone.configured == after.settings['timezone']
+            and zone.active == zone.resolved and zone.active is not None):
+        accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
+        return changed, (f'Timezone updated by the Ambyte: {old_label} → {new_label} '
+                         f'(source={zone.source}, location={location.source}, accuracy={accuracy})')
+    return changed, f'Timezone needs attention: {old_label} → {new_label}; effective change could not be explained.'
 
 
 def update_firmware(port, release, *, client=None, confirm_timezone=None, on_primary=lambda result: None, log=print):
