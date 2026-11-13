@@ -97,6 +97,12 @@ _Static_assert(EVLOG_RECORD_CAP_NORMAL < AMBYTE_PUBLISH_MAX_BYTES,
 #endif
 
 static device_commands_config_t s_cfg;
+
+static const char *current_timezone(void)
+{
+    return s_cfg.current_timezone ? s_cfg.current_timezone() : s_cfg.timezone;
+}
+
 static ambit_announcement_tracker_t s_ambit_announcements;
 static SemaphoreHandle_t s_ambit_announcement_mutex;
 static StaticSemaphore_t s_ambit_announcement_mutex_control;
@@ -1330,8 +1336,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
                  (double)s_last_batt_mv / 1000.0);
     }
     char tzpart[96] = "";
-    if (s_cfg.timezone != NULL && s_cfg.timezone[0] != '\0') {
-        snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", s_cfg.timezone);
+    const char *zone = current_timezone();
+    if (zone != NULL && zone[0] != '\0') {
+        snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", zone);
     }
     /* Workbook provenance ("" when the schedule header declares none — the
      * envelope then stays byte-identical to an unstamped schedule). Built once
@@ -1971,7 +1978,7 @@ static cmd_result_t emit_status_event(bool direct)
             .publish = s_cfg.publish, .topic = s_cfg.topic_root,
             .device_id = s_mac_str, .device_name = s_cfg.device_name,
             .device_version = s_cfg.device_version, .device_firmware = s_cfg.device_firmware,
-            .timezone = s_cfg.timezone, .provenance = s_cfg.schedule_provenance,
+            .timezone = current_timezone(), .provenance = s_cfg.schedule_provenance,
         };
         err = telemetry_publish(&config, payload, now,
                                 s.power_valid ? s.power.battery_mv : 0);

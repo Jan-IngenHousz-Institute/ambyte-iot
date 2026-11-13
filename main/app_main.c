@@ -1218,6 +1218,9 @@ void app_main(void)
     /* Route inbound commands (ping/ota_update/script_update) to the command router. */
     const esp_app_desc_t *running_app = esp_app_get_description();
     command_router_config_t cr_cfg = {
+        .submit = app_maint_submit_legacy,
+        .maintenance_begin = app_maintenance_begin,
+        .maintenance_end = app_maintenance_end,
         .publish          = mqtt_client_get_publish_fn(),
         .status_topic     = status_topic,
         .device_id        = device_id,
@@ -1535,6 +1538,7 @@ void app_main(void)
         .device_version         = device_version,
         .device_firmware        = device_firmware,
         .timezone               = timezone,
+        .current_timezone       = timezone_current_name,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,

@@ -30,6 +30,14 @@ class BuildMessage(unittest.TestCase):
     def test_ping(self):
         self.assertEqual(self.fc.build_message(_args(), "r1"), {"type": "ping", "id": "r1"})
 
+    def test_timezone_commands_are_explicit_and_nonempty(self):
+        self.assertEqual(self.fc.build_message(_args(cmd="get-timezone"), "r"), {"type":"get_timezone","id":"r"})
+        self.assertEqual(self.fc.build_message(_args(cmd="set-timezone", timezone="Australia/Darwin"), "r"),
+                         {"type":"set_timezone","id":"r","timezone":"Australia/Darwin"})
+        for zone in ("", "9.5", "Australia/Darwin\n", "bad zone", "x"*48):
+            with self.subTest(zone=zone), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="set-timezone", timezone=zone), "r")
+
     def test_inventory_window_optional(self):
         self.assertEqual(self.fc.build_message(_args(cmd="inventory"), "r"),
                          {"type": "evlog_inventory", "id": "r", "list": True})

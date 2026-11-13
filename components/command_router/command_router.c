@@ -1,5 +1,6 @@
 #include "command_router.h"
 #include "command_router_pong.h"
+#include "timezone_command.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -473,6 +474,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                 cJSON_Delete(reply);
             }
         }
+    } else if (timezone_command_handle(root)) {
+        /* Bounded input was copied to the resident maintenance worker. */
     } else if (strcmp(type, "set_location") == 0) {
         /* Persist and apply site position. Safe as a retained command: unlike
          * set_time these values do not become stale while a device is offline. */
@@ -556,6 +559,11 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
     s_cfg = *cfg;
+    timezone_command_config_t timezone_config = {
+        .reply = publish_reply, .submit = cfg->submit,
+        .maintenance_begin = cfg->maintenance_begin, .maintenance_end = cfg->maintenance_end,
+    };
+    timezone_command_init(&timezone_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",
              s_cfg.status_topic ? s_cfg.status_topic : "(none)");
     return ESP_OK;

@@ -18,8 +18,12 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay]
+        options: [ping, inventory, replay, get-timezone, set-timezone]
         default: ping
+      timezone:
+        description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
+        type: string
+        default: ""
       devices:
         description: "Exact client ids (ambyte_<MAC> or AMBYTE_<MAC>, case matters) or MACs, comma/space separated; empty = discover active devices"
         type: string
@@ -114,6 +118,7 @@ jobs:
         env:
           COMMAND: ${{ inputs.command }}
           DEVICES: ${{ inputs.devices }}
+          TIMEZONE: ${{ inputs.timezone }}
           WINDOW: ${{ inputs.discovery_window_minutes }}
           EXPECT_FW: ${{ inputs.expect_fw }}
           MODE: ${{ inputs.mode }}
@@ -134,6 +139,7 @@ jobs:
                 --from-id "${FROM_ID}" --to-id "${TO_ID}" --from-ms "${FROM_MS}" --to-ms "${TO_MS}"
                 --results-json results.json)
           [[ -n "${DEVICES}" ]] && ARGS+=(--devices "${DEVICES}")
+          [[ "${COMMAND}" == "set-timezone" ]] && ARGS+=(--timezone "${TIMEZONE}")
           [[ -n "${EXPECT_FW}" ]] && ARGS+=(--expect-fw "${EXPECT_FW}")
           [[ "${COMMAND}" == "replay" ]] && ARGS+=(--mode "${MODE}" --token "${TOKEN}")
           [[ "${DRY_RUN}" == "true" ]] && ARGS+=(--dry-run)
