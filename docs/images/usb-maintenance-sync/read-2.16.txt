@@ -1,0 +1,20 @@
+2026-11-13 | DEV bench Ambyte | firmware 2.16.0 | GUI source c2ad013
+Nonsecret selected-console baseline (credentials were never read):
+  schedule source: INSTALLED
+  SHA256: 943c294243a0254b364172dd3252069e350cbc54428fed88fb84f65c642ea2b7
+  workbook: 75c59552-4396-4948-8d08-c869445203e0 | script: wb-v7
+  timezone: Europe/Amsterdam
+  identity has no persisted-location field
+
+Actual DEV API read + production maintenance.run, same USB MAC:
+  Pinned DEV workbook compiled for fw 2.16.0 matches baseline SHA and workbook ID.
+  openJII workbook programming: 3 macros, 3 with branch routing.
+  Workbook: up to date
+  Timezone: Europe/Amsterdam; location unavailable (firmware too old)
+  PASS: actual DEV read endpoints + production USB maintenance;
+        unchanged public configuration and loaded workbook.
+
+No flash, timezone, Wi-Fi, topic, certificate or workbook writes were performed.
+The absent identity location field intentionally prevents a mismatch prompt.
+Timezone yes/no and changed-workbook install qualification await the PR3 image.
+Bench released to coordinator; no restoration was needed.

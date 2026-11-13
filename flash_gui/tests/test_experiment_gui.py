@@ -14,6 +14,7 @@ def dialog(monkeypatch, target):
     w=object.__new__(g.ExperimentDialog)
     w.target,w.port,w.working=target.preview,'bench',False
     w.summary,w.message,w.cloud=Var(),Var(),Var()
+    w.maintenance_text=Var()
     for name in ['read_btn','cloud_btn','change_btn','close_btn']:setattr(w,name,Widget())
     posted=[]
     w.app=SimpleNamespace(client=target.client,settings=SimpleNamespace(mqtt_endpoints={}),log=lambda text:None,

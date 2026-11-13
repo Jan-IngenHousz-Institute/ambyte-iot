@@ -45,6 +45,7 @@ class FirmwareUpdateResult:
     firmware: str
     changed: bool
     maintenance: object = None
+    timezone_correction: str | None = None
 
 
 def _version(value):
@@ -146,6 +147,23 @@ def _settled_schedule(console, snapshot, log, *, before_flash):
     return snapshot
 
 
+def _configuration_changes(before, after):
+    changed = [key for key in CONFIG_KEYS if after.settings[key] != before.settings[key]]
+    correction = None
+    if 'timezone' in changed:
+        changed.remove('timezone')
+        zone, location = after.identity.timezone, after.identity.location
+        old, new = before.settings['timezone'] or 'unset', after.settings['timezone'] or 'unset'
+        if (zone is not None and location is not None and location.set
+                and zone.source in {'auto', 'live'} and zone.configured == zone.active == zone.resolved == new):
+            accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
+            correction = (f'Timezone updated by the Ambyte: {old} → {new} '
+                          f'(source={location.source}/{zone.source}, accuracy={accuracy})')
+        else:
+            correction = f'Timezone needs attention: {old} → {new}; device-managed change could not be explained.'
+    return changed, correction
+
+
 def update_firmware(port, release, *, client=None, confirm_timezone=None, log=print):
     """Update an existing configured device; initial provisioning is separate."""
     try:
@@ -184,7 +202,7 @@ def update_firmware(port, release, *, client=None, confirm_timezone=None, log=pr
                 raise FirmwareUpdateError("Post-update device identity differs. Firmware was written; no provisioning fallback was attempted.")
             if after.identity.fw.removeprefix("v") != release.version.removeprefix("v"):
                 raise FirmwareUpdateError("The expected firmware did not start. Device credentials were preserved.")
-            changed = [key for key in CONFIG_KEYS if after.settings[key] != before.settings[key]]
+            changed, timezone_correction = _configuration_changes(before, after)
             if changed:
                 raise FirmwareUpdateError("Firmware was updated but configuration verification failed for: " + ", ".join(changed))
             old, new = before.identity.schedule, after.identity.schedule
@@ -193,9 +211,11 @@ def update_firmware(port, release, *, client=None, confirm_timezone=None, log=pr
                     or old.source == "INSTALLED" and new != old):
                 raise FirmwareUpdateError("Firmware was updated, but the existing installed schedule was not confirmed active. Install a compatible workbook separately; credentials were preserved.")
         log("Verified firmware, MAC, client identity and existing configuration. No registration or certificate issuance was performed.")
+        if timezone_correction:
+            log(timezone_correction)
         from . import maintenance
         extra = maintenance.run(after.port, after.identity.mac, client, confirm_timezone=confirm_timezone, log=log)
-        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, extra)
+        return FirmwareUpdateResult(after.identity.mac, after.identity.fw, True, extra, timezone_correction)
     except FirmwareUpdateError:
         raise
     except (ambyte_serial.ConsoleError, esptool_ops.EsptoolError, ServiceClientError) as exc:

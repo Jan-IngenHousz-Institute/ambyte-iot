@@ -234,19 +234,25 @@ class App(ttk.Frame):
         ttk.Entry(frame, textvariable=self.wifi_pass_var, show="•",
                   width=20).grid(row=3, column=3, sticky="we", pady=(6, 0))
 
+        self.setup_lat = tk.StringVar()
+        self.setup_lon = tk.StringVar()
+        self.setup_tz = tk.StringVar()
+        ttk.Label(frame, text="Fallback latitude:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frame, textvariable=self.setup_lat, width=18).grid(row=4, column=1, sticky="we")
+        ttk.Label(frame, text="Longitude:").grid(row=4, column=2, sticky="e")
+        ttk.Entry(frame, textvariable=self.setup_lon, width=18).grid(row=4, column=3, sticky="we")
+        ttk.Label(frame, text="Fallback timezone:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(frame, textvariable=self.setup_tz, values=sorted(timezones.FIRMWARE_SUPPORTED_ZONES),
+                     width=30).grid(row=5, column=1, columnspan=3, sticky="we")
+        ttk.Label(frame, text="Fallback location/timezone (used until the Ambyte finds its live location). Leave the zone blank to resolve the fallback coordinates.",
+                  wraplength=720).grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
     def _build_info_frame(self) -> None:
         frame = ttk.LabelFrame(self, text="Detected (read-only)", padding=8)
         frame.pack(fill="x", pady=(8, 0))
         self.clock_var = tk.StringVar()
         ttk.Label(frame, textvariable=self.clock_var).pack(anchor="w")
-        tz_ok = timezones.firmware_supports(self.local_tz)
-        tz_note = "" if tz_ok else ("  ⚠ not in the firmware's zone table — "
-                                    "the device would reject it, so on-boarding "
-                                    "is blocked (see the log)")
-        self.tz_label = ttk.Label(
-            frame, text=f"Timezone: {self.local_tz} "
-                        f"({timezones.utc_offset_label()}){tz_note}",
-            foreground=("black" if tz_ok else "#a15c00"))
+        self.tz_label = ttk.Label(frame, text=f"Laptop timezone: {self.local_tz} (display only; not used for setup)")
         self.tz_label.pack(anchor="w")
         self.fw_var = tk.StringVar(value="Firmware release: fetching...")
         ttk.Label(frame, textvariable=self.fw_var).pack(anchor="w")
@@ -389,8 +395,12 @@ class App(ttk.Frame):
             else:
                 message = (f"Updated to {result.firmware}; settings preserved."
                            if result.changed else f"Already on {result.firmware}; no flash needed.")
+                if result.timezone_correction:
+                    message += "\n" + result.timezone_correction
                 if result.maintenance is not None:
                     message += "\n" + result.maintenance.text
+                    if result.maintenance.port:
+                        self.port_var.set(result.maintenance.port)
                 self.result_var.set(message)
                 self.log(message)
         client = self.client
@@ -569,6 +579,15 @@ class App(ttk.Frame):
         answer: queue.Queue = queue.Queue(maxsize=1)
         self._post(lambda: answer.put(fn()))
         return answer.get()
+
+    def _confirm_timezone(self, status, *, parent=None):
+        return self._ask_on_main(lambda: messagebox.askyesno(
+            "Fallback timezone mismatch",
+            f"Device {status.mac}\nStored timezone: {status.stored or 'unset'}\n"
+            f"Coordinates: {status.latitude}, {status.longitude}\n"
+            f"Fallback coordinate timezone: {status.resolved}\n\n"
+            "Update this fallback default, then reboot and verify it? The Ambyte manages its effective timezone. "
+            "Choose No to leave it unchanged.", parent=parent or self.winfo_toplevel()))
 
     # ── clock ────────────────────────────────────────────────────────────
     def _tick_clock(self) -> None:
@@ -984,15 +1003,14 @@ class App(ttk.Frame):
             return "enter the Wi-Fi SSID the boards should join."
         if not self._selected_port():
             return "select a serial port."
-        if not timezones.firmware_supports(self.local_tz):
-            # `cfg set timezone` fails closed on an unknown zone, so this would
-            # otherwise be flashed and then fail verification unrepairably.
-            return (f"this PC's timezone '{self.local_tz}' is not in the "
-                    f"firmware's zone table (IANA tzdata "
-                    f"{timezones.FIRMWARE_TZDATA_VERSION}). Set the PC to a "
-                    "standard IANA zone, or regenerate the table with "
-                    "tools/gen_tz_table.py and release firmware built from it.")
+        try:
+            self._setup_zone()
+        except ValueError as exc:
+            return str(exc)
         return None
+
+    def _setup_zone(self):
+        return timezones.setup_zone(self.setup_lat.get(), self.setup_lon.get(), self.setup_tz.get())
 
     def _make_context(self) -> SessionContext:
         self.settings.wifi_ssid = self.ssid_var.get().strip()
@@ -1005,13 +1023,16 @@ class App(ttk.Frame):
         programming = (self.programming
                        if self._programming_active()
                        and not self.programming_override else None)
+        deployment_zone, latitude, longitude = self._setup_zone()
         return SessionContext(
             env=self._env(),
             client=self.client,
             release=self.release,
             schedule_script=schedule_script,
             experiment_id=experiment.id,
-            timezone=self.local_tz,
+            timezone=deployment_zone,
+            latitude=latitude,
+            longitude=longitude,
             wifi_ssid=self.settings.wifi_ssid,
             wifi_password=self.settings.wifi_password,
             programming=programming,
@@ -1026,6 +1047,7 @@ class App(ttk.Frame):
             return
         port = self._selected_port()
         ctx = self._make_context()
+        self.log(f"Initial setup fallback timezone: {ctx.timezone}; coordinates: {ctx.latitude}, {ctx.longitude}")
         self._reset_steps()
         self._set_busy(True)
         threading.Thread(target=self._run_procedure, args=(ctx, port),

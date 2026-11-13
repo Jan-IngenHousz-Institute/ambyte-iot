@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Jan Ingenhousz Institute
 # SPDX-License-Identifier: GPL-3.0-only
 """Wi-Fi maintenance window; all USB work stays off the Tk thread."""
+from dataclasses import replace
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -112,6 +113,12 @@ class WifiDialog(tk.Toplevel):
                 apply(value)
                 if extra is not None:
                     self.maintenance_text.set(extra.text)
+                    if extra.port:
+                        old_port = self.port
+                        self.port = extra.port
+                        self.device_text.set(self.device_text.get().replace(f"Serial port: {old_port}", f"Serial port: {extra.port}"))
+                        if self.info is not None:
+                            self.info = replace(self.info, port=extra.port)
             self._controls()
         def work():
             extra = None

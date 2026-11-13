@@ -5,7 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from . import experiment_settings as settings
+from . import experiment_settings as settings, maintenance
 
 
 class ExperimentDialog(tk.Toplevel):
@@ -34,6 +34,8 @@ class ExperimentDialog(tk.Toplevel):
             self.change_btn.pack(side='left')
             self.close_btn = ttk.Button(row, text='Close', command=self._close)
             self.close_btn.pack(side='left', padx=8)
+            self.maintenance_text = tk.StringVar(value="Workbook: waiting for device read")
+            ttk.Label(frame, textvariable=self.maintenance_text, wraplength=720).pack(anchor="w")
             self.message = tk.StringVar()
             ttk.Label(frame, textvariable=self.message, wraplength=720).pack(anchor='w')
             self.grab_set()
@@ -49,13 +51,14 @@ class ExperimentDialog(tk.Toplevel):
         self.cloud_btn.configure(state='normal' if ready else 'disabled')
         self.change_btn.configure(state='normal' if ready and self.app._current_experiment() is not None else 'disabled')
 
-    def _run(self, action, apply, progress):
+    def _run(self, action, apply, progress, *, maintain=False):
         if self.working:
             return
         self.working = True
         self.message.set(progress)
         self._controls()
-        def finish(value, error):
+        client = self.app.client
+        def finish(value, error, extra):
             if not self.winfo_exists():
                 return
             self.working = False
@@ -64,14 +67,27 @@ class ExperimentDialog(tk.Toplevel):
                 self.message.set(error)
             else:
                 apply(value)
+                if extra is not None:
+                    self.maintenance_text.set(extra.text)
             self._controls()
         def work():
+            extra = None
             try:
                 value, error = action(), None
+                if maintain:
+                    extra = maintenance.run(value.device.port, value.mac, client,
+                        confirm_timezone=lambda status: self.app._confirm_timezone(status, parent=self), log=self.app.log)
+                    # Display the loaded workbook after automatic installation.
+                    # A second read failure must not erase the completed action.
+                    try:
+                        value = settings.read_target(extra.port or value.device.port,
+                            dict(getattr(self.app.settings, "mqtt_endpoints", {})))
+                    except settings.ExperimentSettingsError:
+                        pass
             except Exception as exc:
                 value, error = None, str(exc)
             try:
-                self.app._post(finish, value, error)
+                self.app._post(finish, value, error, extra)
             except (RuntimeError, tk.TclError):
                 pass
         threading.Thread(target=work, daemon=True).start()
@@ -96,7 +112,7 @@ class ExperimentDialog(tk.Toplevel):
         self.target = None
         endpoints = dict(getattr(self.app.settings, 'mqtt_endpoints', {}))
         self._run(lambda: settings.read_target(self.port, endpoints), self._show,
-                  'Reading identity, broker and topics without changing configuration…')
+                  'Reading identity, broker and topics, then checking the workbook and deployment timezone…', maintain=True)
 
     def _cloud(self):
         if self.working or self.target is None or self.app.client is None:
@@ -128,7 +144,7 @@ class ExperimentDialog(tk.Toplevel):
             self.message.set('Experiment topics and workbook verified after reboot. Broker and client identity preserved; no registration or certificate writes.')
         self._run(lambda: settings.change_experiment(target, client, experiment.id,
                   allow_unknown_environment=not bool(target.environment), log=self.app.log), apply,
-                  'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…')
+                  'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…', maintain=True)
 
     def _close(self):
         if self.working:

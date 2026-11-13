@@ -94,10 +94,26 @@ def cloud_status(target, client):
             "This does not compare the certificate stored on the USB device.")
 
 
+def _same_device_config(first, second, *, schedule=True):
+    """Stable maintenance guards exclude device-managed location/timezone.
+
+    Online estimate age and effective position can change between consecutive
+    identity reads. They cannot invalidate workbook or topic maintenance; MAC,
+    running image, service capability, the loaded workbook and other persistent
+    configuration still guard every write.
+    """
+    a, b = first.identity, second.identity
+    keys = (key for key in firmware_update.CONFIG_KEYS if key != 'timezone')
+    return (a.mac == b.mac and a.thing_name == b.thing_name and a.fw == b.fw
+            and a.capabilities == b.capabilities and a.storage == b.storage and a.signed == b.signed
+            and (not schedule or a.schedule == b.schedule)
+            and all(first.settings[key] == second.settings[key] for key in keys))
+
+
 def _checked(console, expected):
     current = _target(console, {})
-    if current.device != expected.device:
-        # Port stays bound but reads may be separated by an API lookup. All
+    if not _same_device_config(current.device, expected.device):
+        # Port stays bound but reads may be separated by an API lookup. Stable
         # configuration and loaded-program fields must still match the preview.
         raise ExperimentSettingsError("Device identity, configuration or workbook changed. Read the device destination again.")
     return current
@@ -168,7 +184,7 @@ def install_workbook(console, expected, source, journal, *, log=lambda text: Non
         raise ExperimentSettingsError("Resolve the saved operation using Wi-Fi settings → Check saved result before installing a workbook.")
     current = firmware_update._snapshot(console)
     current = firmware_update._settled_schedule(console, current, log, before_flash=True)
-    if current != expected:
+    if not _same_device_config(current, expected):
         raise ExperimentSettingsError("Device identity, configuration or workbook changed before installation. Read the device again.")
     service = ServiceClient(console._ser, journal)
     service.upload_schedule(source.blob, source.sha256, source.script_version,
@@ -181,9 +197,7 @@ def install_workbook(console, expected, source, journal, *, log=lambda text: Non
     if (schedule.source != 'INSTALLED' or schedule.sha256 != source.sha256
             or schedule.workbook_version_id != source.workbook_version_id):
         raise ExperimentSettingsError("The destination workbook was not confirmed active after installation.")
-    if (current.identity.mac != expected.identity.mac
-            or current.identity.thing_name != expected.identity.thing_name
-            or current.identity.fw != expected.identity.fw or current.settings != expected.settings):
+    if not _same_device_config(current, expected, schedule=False):
         raise ExperimentSettingsError("The device configuration changed during workbook installation.")
     return current
 
@@ -231,7 +245,7 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
                 after = firmware_update._snapshot(console)
                 after = firmware_update._settled_schedule(console, after, log, before_flash=False)
                 schedule = after.identity.schedule
-                preserved = ('mqtt_uri', 'mqtt_client_id', 'command_topic', 'device_name', 'timezone')
+                preserved = ('mqtt_uri', 'mqtt_client_id', 'command_topic', 'device_name')
                 if (after.identity.mac != expected.mac or after.identity.thing_name != expected.device.identity.thing_name
                         or after.identity.fw != expected.device.identity.fw
                         or any(after.settings[key] != expected.device.settings[key] for key in preserved)

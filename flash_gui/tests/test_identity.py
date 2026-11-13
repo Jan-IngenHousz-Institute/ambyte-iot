@@ -406,3 +406,43 @@ def test_malformed_ota_policy_fails_explicitly(transport, change):
     policy.update(change)
     con, _ = transport([("policy: " + json.dumps(policy)).encode() + b"\r\nambyte> "])
     with pytest.raises(ConsoleError, match="Invalid OTA policy"): con.ota_policy()
+
+
+def location_identity_object():
+    obj=json.loads(wire())
+    coords=dict(set=True,lat=-25.3444,lon=131.0369)
+    obj['location']=dict(coords,source='configured',accuracy_m=None,configured=coords,
+        live=dict(set=False,lat=None,lon=None,accuracy_m=None,age_s=None))
+    obj['timezone']=dict(configured='Europe/Berlin',active='Europe/Berlin',source='provisioned',
+                         resolved='Australia/Darwin',utc_offset_seconds=3600)
+    return obj
+
+
+def test_additive_persisted_location_and_timezone_identity():
+    obj=location_identity_object()
+    identity=serial_client._identity_object(obj)
+    assert identity.location.configured==serial_client.LocationCoordinates(True,-25.3444,131.0369)
+    assert identity.location.source=="configured"
+    assert identity.schedule == IDENTITY.schedule
+    assert identity.timezone.active=='Europe/Berlin' and identity.timezone.source=='provisioned'
+    assert identity.timezone.utc_offset_seconds==3600
+    del obj['location'],obj['timezone']
+    old=serial_client._identity_object(obj)
+    assert old.location is None and old.timezone is None
+
+
+@pytest.mark.parametrize('location', [None, {}, dict(set=1,lat=1,lon=1), dict(set=True,lat=True,lon=1),
+    dict(set=True,lat=10**1000,lon=1),dict(set=True,lat=91,lon=1),dict(set=True,lat=1,lon=181),dict(set=True,lat=float('nan'),lon=1),
+    dict(set=False,lat=1,lon=1),dict(set=True,lat=None,lon=None)])
+def test_bad_persisted_location_identity_fails_closed(location):
+    obj=location_identity_object();obj['location']=location
+    identity=serial_client._identity_object(obj)
+    assert identity.mac==MAC and identity.location is None and identity.location_error
+
+
+@pytest.mark.parametrize('field,value',[('source','bogus'),('active',''),('configured',[]),
+    ('utc_offset_seconds',True),('utc_offset_seconds',86401)])
+def test_bad_runtime_timezone_identity_fails_closed(field,value):
+    obj=location_identity_object();obj['timezone'][field]=value
+    identity=serial_client._identity_object(obj)
+    assert identity.mac==MAC and identity.timezone is None and identity.timezone_error

@@ -145,3 +145,12 @@ passes **528 tests and 29 subtests**; the production C wire/filter suite passes
 ![Experiment change and original-state restoration](images/usb-experiment-maintenance/qualification.png)
 
 [Redacted qualification transcript](images/usb-experiment-maintenance/qualification.txt).
+
+## Automatic checks on maintenance reads
+
+The destination window also performs the [automatic workbook and deployment
+checks](usb-maintenance-sync.md) on read. It uses the device's current experiment,
+regardless of the destination selected in the main window. The direct Change
+experiment action still installs and verifies its selected workbook before topic
+writes; afterward the deployment timezone check can ask for a separate correction.
+The workbook/timezone results are shown independently of the experiment result.

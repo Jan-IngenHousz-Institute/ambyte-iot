@@ -92,3 +92,16 @@ def test_unknown_cloud_error_is_separate_and_sanitized(target):
     target.client.resolve_programming = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('private transport detail'))
     result = m.run('bench', target.preview.mac, target.client)
     assert 'cloud lookup' in result.workbook and 'private' not in result.workbook
+
+
+@pytest.mark.parametrize('foreign', [False, True])
+def test_automatic_check_preserves_saved_and_foreign_operations(target, foreign):
+    from flash_gui.tests.test_wifi_settings import _pending_schedule
+    info,journal,entry=_pending_schedule((target.device,target.handles,target.directory),'staging')
+    if foreign:journal.path.unlink()
+    before=dict(target.device.records[entry['op']])
+    result=m.run('bench',info.mac,target.client)
+    assert 'not checked' in result.workbook and not target.device.commits
+    assert target.device.records[entry['op']]==before
+    assert not journal.path.with_suffix('.previous.json').exists()
+    if not foreign:assert journal.load()==entry

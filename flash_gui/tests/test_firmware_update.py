@@ -184,3 +184,69 @@ def test_unavailable_pre_flash_schedule_never_writes_firmware(bench):
     with pytest.raises(firmware_update.FirmwareUpdateError, match="No firmware was written"):
         firmware_update.update_firmware("bench", bench.release, log=bench.logs.append)
     assert not bench.writes
+
+
+def automatic_timezone_pair():
+    from dataclasses import replace
+    from flash_gui.tests.test_identity import IDENTITY
+    before = firmware_update.ConfiguredDevice('bench', IDENTITY,
+        {key: 'Europe/Berlin' if key == 'timezone' else key for key in firmware_update.CONFIG_KEYS})
+    zone = ambyte_serial.DeviceTimezone('Australia/Darwin','Australia/Darwin','auto','Australia/Darwin',34200)
+    after = replace(before, settings=dict(before.settings, timezone='Australia/Darwin'),
+        identity=replace(IDENTITY, location=ambyte_serial.DeviceLocation(True,-25.3444,131.0369), timezone=zone))
+    return before, after
+
+
+def test_verified_firmware_auto_timezone_change_is_separate_success():
+    before,after=automatic_timezone_pair()
+    changed,note=firmware_update._configuration_changes(before,after)
+    assert changed==[] and 'Timezone updated by the Ambyte: Europe/Berlin → Australia/Darwin' in note
+
+
+@pytest.mark.parametrize('field,value', [('source','manual'), ('configured','Europe/Berlin'),
+    ('active','Europe/Berlin'), ('resolved','Europe/Berlin'), ('resolved',None)])
+def test_unproven_timezone_change_is_a_visible_warning(field,value):
+    from dataclasses import replace
+    before,after=automatic_timezone_pair()
+    after=replace(after,identity=replace(after.identity,timezone=replace(after.identity.timezone,**{field:value})))
+    changed,note=firmware_update._configuration_changes(before,after)
+    assert not changed and 'Timezone needs attention: Europe/Berlin → Australia/Darwin' in note
+
+
+@pytest.mark.parametrize('location', [None, ambyte_serial.DeviceLocation(False,None,None)])
+def test_missing_effective_location_makes_timezone_drift_a_warning(location):
+    from dataclasses import replace
+    before,after=automatic_timezone_pair()
+    after=replace(after,identity=replace(after.identity,location=location))
+    changed,note=firmware_update._configuration_changes(before,after)
+    assert not changed and 'Timezone needs attention: Europe/Berlin → Australia/Darwin' in note
+
+
+def test_auto_timezone_does_not_excuse_other_config_changes():
+    from dataclasses import replace
+    before,after=automatic_timezone_pair()
+    after=replace(after,settings=dict(after.settings, mqtt_topic_root='unexpected'))
+    changes,note=firmware_update._configuration_changes(before,after)
+    assert changes==['mqtt_topic_root'] and 'Timezone updated by the Ambyte' in note
+
+
+def test_verified_device_change_is_informational_independent_of_the_host_map(monkeypatch):
+    from flash_gui import tz_geo
+    before,after=automatic_timezone_pair()
+    monkeypatch.setattr(tz_geo,'zone_for',lambda *a:'Australia/Adelaide')
+    changed,note=firmware_update._configuration_changes(before,after)
+    assert not changed and 'Timezone updated by the Ambyte' in note
+
+
+def test_workbook_check_is_after_successful_postboot_verify_and_cannot_change_update_success(bench,monkeypatch):
+    from flash_gui import maintenance
+    calls=[]
+    def check(port,mac,client,**kw):
+        assert bench.writes and bench.device.version=='2.12.0'
+        calls.append((port,mac,client))
+        return maintenance.MaintenanceResult('Workbook: not checked: inaccessible experiment')
+    monkeypatch.setattr(maintenance,'run',check)
+    client=object()
+    result=firmware_update.update_firmware('bench',bench.release,client=client,log=bench.logs.append)
+    assert result.changed and 'inaccessible experiment' in result.maintenance.text
+    assert calls==[('bench',MAC,client)]

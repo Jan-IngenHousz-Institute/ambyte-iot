@@ -235,3 +235,31 @@ def test_failed_dialog_creation_releases_app_busy_gate(monkeypatch):
     with pytest.raises(wifi_gui.tk.TclError):
         gui.App._open_wifi_settings(app)
     assert calls == [True, False]
+
+
+def test_automatic_check_follows_save_and_its_error_keeps_saved_result(monkeypatch):
+    window,finish=dialog(monkeypatch)
+    window.app.client=object()
+    order=[]
+    def save(*a,**kw):
+        order.append('saved')
+        return wifi_settings.WifiResult('Field hub 1',False)
+    def maintain(port,mac,client,**kw):
+        assert order==['saved'] and client is window.app.client
+        order.append('checked')
+        return wifi_gui.maintenance.MaintenanceResult('Workbook: not checked: cloud unavailable')
+    monkeypatch.setattr(wifi_settings,'save_wifi',save)
+    monkeypatch.setattr(wifi_gui.maintenance,'run',maintain)
+    window._update();finish()
+    assert order==['saved','checked']
+    assert 'Wi-Fi saved' in window.message.value and 'cloud unavailable' in window.maintenance_text.value
+
+
+def test_read_automatically_checks_device_mac_without_selected_experiment(monkeypatch):
+    window,finish=dialog(monkeypatch)
+    calls=[]
+    monkeypatch.setattr(wifi_settings,'read_device',lambda port:INFO)
+    monkeypatch.setattr(wifi_gui.maintenance,'run',lambda port,mac,client,**kw:
+        calls.append((port,mac,client)) or wifi_gui.maintenance.MaintenanceResult('Workbook: up to date'))
+    window._read();finish()
+    assert calls==[('bench',INFO.mac,None)] and window.maintenance_text.value.startswith('Workbook: up to date')
