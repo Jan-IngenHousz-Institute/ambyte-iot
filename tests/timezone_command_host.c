@@ -60,6 +60,8 @@ device_tz_source_t device_config_timezone_source(void)
 const char *device_config_timezone_source_label(void) { return source[0] ? source : "provisioned"; }
 esp_err_t device_config_get_location(double *lat, double *lon, char *d, size_t n)
 { (void)lat; (void)lon; (void)d; (void)n; return ESP_ERR_NVS_NOT_FOUND; }
+esp_err_t device_config_get_live_location_mode(char *buf, size_t len)
+{ (void)buf; (void)len; return ESP_ERR_NVS_NOT_FOUND; }
 esp_err_t device_config_get_live_fix(double *a, double *b, double *c, int64_t *t)
 { (void)a; (void)b; (void)c; (void)t; return ESP_ERR_NVS_NOT_FOUND; }
 esp_err_t device_config_set_live_fix(double a, double b, double c, int64_t t)

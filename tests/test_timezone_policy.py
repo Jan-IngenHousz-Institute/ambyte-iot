@@ -35,6 +35,11 @@ SCENARIOS = [
     "live_zone_change_needs_confirmation",
     "unusable_estimates_ignored",
     "persist_failure_reports_and_keeps_zone",
+    "solar_follows_live",
+    "solar_ignores_live_noise",
+    "solar_configured_and_default",
+    "loc_live_off_drops_live",
+    "pin_keeps_solar_location",
 ]
 
 

@@ -62,11 +62,21 @@ static void load_locked(void)
     }
 }
 
+/* `cfg set loc_live off` turns the live source off entirely: the persisted
+ * fix stops counting too, so position and zone fall back to configured. */
+static bool live_enabled(void)
+{
+    char mode[8];
+    return device_config_get_live_location_mode(mode, sizeof mode) != ESP_OK ||
+           strcmp(mode, "off") != 0;
+}
+
 static bool usable_locked(int64_t now_utc)
 {
-    if (!s_live.has) return false;
-    if (s_live.this_boot) return true;
-    if (now_utc < DEVICE_LOCATION_TRUSTED_UTC) return false;
+    if (!s_live.has || !live_enabled()) return false;
+    /* Without a trusted clock the age is unknowable: a fix accepted during
+     * this boot is still good, a persisted one is not. */
+    if (now_utc < DEVICE_LOCATION_TRUSTED_UTC) return s_live.this_boot;
     int64_t age = now_utc - s_live.fix_utc;
     return age >= -86400 && age <= DEVICE_LOCATION_MAX_AGE_S;
 }
@@ -149,22 +159,36 @@ static double distance_m(double lat1, double lon1, double lat2, double lon2)
     return r * sqrt(x * x + y * y);
 }
 
-/* Adopt (lat, lon) as the live fix; persist when required. */
+/* Adopt (lat, lon) as the live fix; persist when required.
+ *
+ * Position hysteresis (solar triggers are re-resolved whenever the position
+ * moves): within the same zone, an estimate replaces the fix only when it
+ * moved more than both 1 km and the smaller of the two uncertainties, or is
+ * at least twice as precise. Repeated IP answers wandering a few km inside
+ * their +-5..50 km never move sunrise; a Wi-Fi fix replacing an IP one does. */
 static bool adopt_locked(double lat, double lon, double acc, int64_t fix_utc, bool zone_change)
 {
-    bool persist = zone_change || !s_live.has ||
-                   distance_m(s_live.lat, s_live.lon, lat, lon) > DEVICE_LOCATION_PERSIST_MOVE_M;
+    bool moved = true;
+    if (s_live.has && !zone_change) {
+        double d = distance_m(s_live.lat, s_live.lon, lat, lon);
+        double noise = DEVICE_LOCATION_PERSIST_MOVE_M;
+        double smaller = fmin(isfinite(acc) ? acc : INFINITY, isfinite(s_live.acc) ? s_live.acc : INFINITY);
+        if (isfinite(smaller) && smaller > noise) noise = smaller;
+        bool sharper = isfinite(acc) && isfinite(s_live.acc) && acc * 2.0 <= s_live.acc &&
+                       d > DEVICE_LOCATION_PERSIST_MOVE_M;
+        moved = d > noise || sharper;
+    }
+    bool persist = zone_change || !s_live.has || moved;
     if (persist && device_config_set_live_fix(lat, lon, isfinite(acc) ? acc : 0.0, fix_utc) != ESP_OK) {
         return false;
     }
     if (persist) {
         s_live = (fix_t){true, true, lat, lon, acc, fix_utc};
     } else {
-        /* Same place within 1 km: refresh freshness in RAM only (flash wear);
-         * the persisted copy keeps its older position and time. */
+        /* Same place within the noise: refresh freshness in RAM only (flash
+         * wear); position and accuracy stay, so nothing re-anchors. */
         s_live.this_boot = true;
         s_live.fix_utc = fix_utc;
-        s_live.acc = acc;
     }
     return true;
 }

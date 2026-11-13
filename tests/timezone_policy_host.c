@@ -23,6 +23,7 @@
 #include "nvs.h"
 #include "timezone.h"
 #include "timezone_command.h"
+#include "time_sync.h"
 #include "tz_geo.h"
 
 /* ── fake NVS ─────────────────────────────────────────────────────────── */
@@ -138,6 +139,16 @@ static void expect_active(const char *zone, const char *source)
     }
     assert(zone[0] == '\0' || timezone_rule_active());
 }
+static void expect_position(double lat, double lon)
+{
+    double a, b;
+    time_sync_get_location(&a, &b, NULL);
+    if (a != lat || b != lon) {
+        fprintf(stderr, "position %.6f,%.6f, want %.6f,%.6f\n", a, b, lat, lon);
+        abort();
+    }
+}
+static void refresh(void) { timezone_command_refresh(); if (job) run_job(); }
 static void seed_zone(const char *zone) { assert(device_config_init() == ESP_OK); assert(device_config_set_timezone(zone) == ESP_OK); }
 
 #define ULURU       -25.3444, 131.0369
@@ -322,6 +333,84 @@ int main(int argc, char **argv)
         strcpy(fail_key, "loc_live_fix");
         live(ADELAIDE_IP, 50000);
         expect_active("Europe/Berlin", "configured");
+    } else if (!strcmp(s, "solar_follows_live")) {
+        /* The Uluru failure mode: preset with no configured coordinates. The
+         * accepted live fix must drive the sun position, not just the zone. */
+        seed_zone("Europe/Berlin");
+        boot();
+        expect_position(TIME_SYNC_DEFAULT_LAT, TIME_SYNC_DEFAULT_LON);
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(!strcmp(st.solar_position, "default") && st.location.source == DEVICE_LOCATION_NONE);
+        live(ULURU, 50000);
+        expect_active("Australia/Darwin", "location");
+        expect_position(-25.3444, 131.0369);
+        timezone_command_status(&st);
+        assert(!strcmp(st.solar_position, "location"));
+        /* 2026-11-13 00:30 UTC = 10:00 in Darwin: daytime at Uluru, night in
+         * the Netherlands; sunrise lands in the Uluru dawn. */
+        int64_t utc = 1794529800;
+        int64_t local = utc + timezone_utc_offset_seconds(utc);
+        assert(time_sync_is_daytime(local));
+        int64_t sunrise;
+        assert(time_sync_sun_on_date(local, TIME_SYNC_SUNRISE, &sunrise) == ESP_OK);
+        int h, m;
+        time_sync_localtime(sunrise, NULL, NULL, NULL, &h, &m, NULL, NULL);
+        assert(h == 6 || h == 5);   /* ~05:5x Darwin time in mid November */
+        time_sync_set_position(TIME_SYNC_DEFAULT_LAT, TIME_SYNC_DEFAULT_LON);
+        assert(!time_sync_is_daytime(utc + 3600));   /* 01:30 CET in NL: night */
+    } else if (!strcmp(s, "solar_ignores_live_noise")) {
+        boot();
+        live(-34.9285, 138.6007, 5000);                 /* IP-level fix in Adelaide */
+        expect_position(-34.9285, 138.6007);
+        uint32_t gen = time_sync_position_generation();
+        live(-34.9285 + 0.027, 138.6007, 5000);         /* ~3 km, inside +-5 km */
+        expect_position(-34.9285, 138.6007);
+        assert(time_sync_position_generation() == gen);
+        live(-34.9285 + 0.027, 138.6007, 41);           /* Wi-Fi: 2x sharper, moves */
+        expect_position(-34.9285 + 0.027, 138.6007);
+        gen = time_sync_position_generation();
+        live(-34.9285 + 0.0315, 138.6007, 41);          /* ~500 m: under 1 km, stays */
+        expect_position(-34.9285 + 0.027, 138.6007);
+        assert(time_sync_position_generation() == gen);
+    } else if (!strcmp(s, "solar_configured_and_default")) {
+        assert(device_config_set_location(ULURU, NULL) == ESP_OK);
+        boot();
+        expect_position(-25.3444, 131.0369);
+        /* configured Uluru + live Adelaide: same country, configured wins for
+         * the zone AND the sun position. */
+        live(ADELAIDE_IP, 50000);
+        expect_position(-25.3444, 131.0369);
+        timezone_status_t st;
+        timezone_command_status(&st);
+        assert(!strcmp(st.solar_position, "location"));
+    } else if (!strcmp(s, "loc_live_off_drops_live")) {
+        seed_zone("Europe/Berlin");
+        boot();
+        live(ADELAIDE_IP, 50000);
+        expect_active("Australia/Adelaide", "location");
+        expect_position(-34.8545, 138.6471);
+        assert(device_config_set_live_location_mode("off") == ESP_OK);
+        refresh();
+        expect_active("Europe/Berlin", "configured");
+        expect_position(TIME_SYNC_DEFAULT_LAT, TIME_SYNC_DEFAULT_LON);
+        assert(device_config_set_live_location_mode("aws") == ESP_OK);
+        refresh();
+        expect_active("Australia/Adelaide", "location");
+        /* Expiry without any new input: the periodic refresh catches it. */
+        fake_now += 31 * 86400;
+        refresh();
+        expect_active("Europe/Berlin", "configured");
+        expect_position(TIME_SYNC_DEFAULT_LAT, TIME_SYNC_DEFAULT_LON);
+    } else if (!strcmp(s, "pin_keeps_solar_location")) {
+        assert(device_config_set_location(ULURU, NULL) == ESP_OK);
+        boot();
+        command("{\"type\":\"set_timezone\",\"id\":\"p\",\"timezone\":\"Europe/Berlin\",\"pin\":true}");
+        expect_active("Europe/Berlin", "manual");
+        expect_position(-25.3444, 131.0369);   /* the pin holds the zone only */
+        /* set_location applies the position at once even when the zone is pinned. */
+        assert(!strcmp(set_location("same", ULURU), "pinned"));
+        expect_position(-25.3444, 131.0369);
     } else {
         return 2;
     }

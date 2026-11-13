@@ -36,6 +36,7 @@ typedef struct {
     bool        has_accuracy;
     double      accuracy_m;
     bool        configured_stale;
+    const char *solar_position;    /* "location" | "default" */
     char        live_status[24];
     const char *timezone_source;   /* "manual" | "location" | "configured" | "none" */
     bool        pinned;

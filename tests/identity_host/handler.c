@@ -58,6 +58,7 @@ static void tz_defaults(void)
     strcpy(tz_state.configured, "Europe/Amsterdam");
     tz_state.source = "configured";
     strcpy(tz_state.live_status, "waiting");
+    tz_state.solar_position = "default";
 }
 static void tz_configured_uluru(void)
 {
@@ -65,6 +66,7 @@ static void tz_configured_uluru(void)
     tz_state.configured_lat = -25.3444;
     tz_state.configured_lon = 131.0369;
     tz_state.location = (device_location_t){DEVICE_LOCATION_CONFIGURED, -25.3444, 131.0369, NAN, -1, false};
+    tz_state.solar_position = "location";
     strcpy(tz_state.configured, "Europe/Berlin");
     strcpy(tz_state.resolved, "Australia/Darwin");
     tz_state.source = "location";
@@ -168,6 +170,7 @@ int main(int argc, char **argv)
     } else if (!strcmp(scenario, "tz_live_accepted")) {
         /* No configured location; the live estimate drives the zone. */
         tz_live_adelaide();
+        tz_state.solar_position = "location";
         tz_state.location = tz_state.live;
         strcpy(tz_state.configured, "Europe/Berlin");
         strcpy(tz_state.resolved, "Australia/Adelaide");
@@ -183,6 +186,7 @@ int main(int argc, char **argv)
         tz_live_adelaide();
     } else if (!strcmp(scenario, "tz_configured_stale")) {
         tz_live_adelaide();
+        tz_state.solar_position = "location";
         tz_state.configured_set = true;
         tz_state.configured_lat = 52.3676;
         tz_state.configured_lon = 4.9041;

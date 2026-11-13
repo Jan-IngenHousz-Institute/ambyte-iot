@@ -41,6 +41,11 @@ const char *timezone_command_location_stored(const char *id, bool changed, const
  * source). Queued to the worker; false if it could not be queued. */
 bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int64_t fix_utc);
 
+/* Periodic re-evaluation on the worker (the app calls it every 6 h): a live
+ * fix ageing past 30 days or `loc_live off` changes the effective location
+ * without any other input. Silent unless something changes. */
+void timezone_command_refresh(void);
+
 /* One synchronous reconciliation at boot (after the boot timezone_apply,
  * before the schedule runner starts). Writes nothing. */
 void timezone_command_reconcile_boot(void);
@@ -57,5 +62,6 @@ typedef struct {
     char resolved[48];              /* zone of the effective location */
     const char *source;             /* why the active zone: manual|location|configured|none */
     bool pinned;
+    const char *solar_position;     /* "location" (effective) | "default" (compiled NL) */
 } timezone_status_t;
 void timezone_command_status(timezone_status_t *out);

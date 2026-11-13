@@ -55,9 +55,13 @@ typedef struct {
  *    agreeing estimates (same zone) spanning >= 6 h, so a noisy source cannot
  *    flap the zone and re-anchor the scheduler. Replacing a configured- or
  *    fallback-derived zone takes effect on the first accepted estimate.
- *  - the accepted fix persists (NVS) only on a zone change or > 1 km movement,
- *    and is used while younger than 30 days (needs a trusted clock; a fix
- *    accepted during this boot is always usable). */
+ *  - within a zone, a new estimate moves the fix (and with it the solar
+ *    position) only beyond max(1 km, smaller uncertainty), or when it is at
+ *    least twice as precise -- IP noise never re-anchors sunrise/sunset.
+ *  - `loc_live off` ignores the live fix entirely (configured / none).
+ *  - the accepted fix persists (NVS) only on a zone change or a real move,
+ *    and is used while younger than 30 days (with an untrusted clock only a
+ *    fix accepted during this boot is used). */
 #define DEVICE_LOCATION_MAX_ACCURACY_M   200000.0
 #define DEVICE_LOCATION_CONFIRMATIONS    3
 #define DEVICE_LOCATION_CONFIRM_SPAN_S   (6 * 3600)

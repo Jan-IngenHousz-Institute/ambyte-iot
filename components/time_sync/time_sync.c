@@ -14,8 +14,8 @@
 #define TS_DEG (TS_PI / 180.0)
 
 /* ── location / timezone config (defaults: NL, CEST) ─────────────────── */
-static double  s_lat   = 52.173;   /* degrees north */
-static double  s_lon   = 5.819;    /* degrees east (positive = east) */
+static double  s_lat   = TIME_SYNC_DEFAULT_LAT;   /* degrees north */
+static double  s_lon   = TIME_SYNC_DEFAULT_LON;    /* degrees east (positive = east) */
 /* Seconds the local clock is ahead of UTC. Callers hand in LOCAL times (they
  * read the UTC RTC and add this — see components/timezone), and the sun path
  * shifts its UTC instants onto the same local frame by the same amount. Kept in
@@ -24,10 +24,18 @@ static double  s_lon   = 5.819;    /* degrees east (positive = east) */
  * unchanged until a timezone is applied. */
 static int32_t s_off_s = 2 * 3600;
 
+static uint32_t s_pos_gen = 0;
+
 void time_sync_set_position(double lat, double lon)
 {
+    if (lat != s_lat || lon != s_lon) s_pos_gen++;
     s_lat = lat;
     s_lon = lon;
+}
+
+uint32_t time_sync_position_generation(void)
+{
+    return s_pos_gen;
 }
 
 void time_sync_set_location(double lat, double lon, int tz_offset_hours)

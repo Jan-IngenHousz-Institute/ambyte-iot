@@ -190,6 +190,8 @@ static void json_location_and_timezone(identity_json_t *w)
     json_number_or_null(w, ",\"accuracy_m\":", set, st.location.accuracy_m, "%.0f");
     json_raw(w, ",\"configured_stale\":");
     json_raw(w, st.location.configured_stale ? "true" : "false");
+    json_raw(w, ",\"solar_position\":");
+    json_string(w, st.solar_position);
     json_raw(w, ",\"configured\":{\"set\":");
     json_raw(w, st.configured_set ? "true" : "false");
     json_number_or_null(w, ",\"lat\":", st.configured_set, st.configured_lat, "%.6f");

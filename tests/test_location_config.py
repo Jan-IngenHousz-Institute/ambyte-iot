@@ -96,11 +96,13 @@ class LocationConfigContractTest(unittest.TestCase):
     def test_mqtt_command_persists_then_applies_and_replies(self):
         branch = COMMAND_ROUTER.split('strcmp(type, "set_location") == 0', 1)[1]
         branch = branch.split('strcmp(type, "set_time") == 0', 1)[0]
-        for call in (
-            "device_config_set_location",
-            "time_sync_set_position",
-        ):
-            self.assertIn(call, branch)
+        # Persist first, then the ONE apply path (zone + sun position from
+        # the effective location, docs/timezone-from-location.md).
+        self.assertLess(branch.index("timezone_command_location_differs"),
+                        branch.index("device_config_set_location"))
+        self.assertLess(branch.index("device_config_set_location"),
+                        branch.index("timezone_command_location_stored"))
+        self.assertNotIn("time_sync_set_position", branch)
         self.assertIn('"set_location_result"', branch)
         self.assertIn('"deployment"', branch)
 
@@ -108,7 +110,9 @@ class LocationConfigContractTest(unittest.TestCase):
         branch = CLI.split('strcmp(sub, "loc") == 0', 1)[1]
         branch = branch.split('strcmp(sub, "interval") == 0', 1)[0]
         self.assertLess(branch.index("device_config_set_location"),
-                        branch.index("time_sync_set_location"))
+                        branch.index("timezone_command_location_stored"))
+        self.assertNotIn("time_sync_set_position", branch)
+        self.assertNotIn("time_sync_set_location", branch)
         self.assertIn("device_config_get_deployment", branch)
         self.assertIn("deployment=%s", branch)
 

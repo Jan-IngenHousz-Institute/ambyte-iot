@@ -1442,12 +1442,12 @@ static int cli_cmd_sync(int argc, char **argv)
             const char *action = timezone_command_location_stored(NULL, changed, &resolved);
             printf("timezone: %s%s%s\r\n", action, resolved[0] ? " " : "", resolved);
             if (argc >= 5) {
+                /* Position comes from the effective location (above); only
+                 * the legacy runtime offset is applied here. */
                 int tz = atoi(argv[4]);
                 printf("timezone offset is runtime-only; use `cfg set timezone <IANA-name>` "
                        "to persist it\r\n");
-                time_sync_set_location(lat, lon, tz);
-            } else {
-                time_sync_set_position(lat, lon);
+                time_sync_set_utc_offset_seconds(tz * 3600);
             }
         }
         double lat, lon; int tz;

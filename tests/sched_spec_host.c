@@ -2235,6 +2235,51 @@ static void test_actions_dump(void)
     free(buf);
 }
 
+/* Timezone from location: sunrise/sunset depend on WHERE the device is. A
+ * position change alone (no offset edge, no clock step) must re-resolve armed
+ * solar dues, and an unchanged position must not re-anchor anything. */
+static void test_due_position_change(void)
+{
+    sched_program_t *p = NULL;
+    time_sync_set_location(52.173, 5.819, 0);
+    time_sync_set_utc_offset_seconds(0);
+    const int64_t t0 = time_sync_make(2026, 11, 13, 12, 0, 0);
+    sched_due_t *d = mk_due(
+        "schema: jii.ambyte-schedule/v1-draft\n"
+        "jobs:\n"
+        "  j:\n"
+        "    schedule:\n"
+        "      solar: sunrise\n"
+        "    steps:\n"
+        "      - uses: device/log\n"
+        "        with:\n"
+        "          message: hi\n",
+        t0, identity_localize, &p);
+    if (d != NULL) {
+        const int64_t nl_due = d->jobs[0].wall_due_local[0];
+        CHECK(nl_due == t0 + time_sync_until_sun(t0, TIME_SYNC_SUNRISE, 0));
+        /* Same position again: no generation bump, the due stays. */
+        uint32_t gen = time_sync_position_generation();
+        time_sync_set_position(52.173, 5.819);
+        CHECK(time_sync_position_generation() == gen);
+        CHECK(sched_due_poll(d, t0 + 1) == 0);
+        CHECK(d->jobs[0].wall_due_local[0] == nl_due);
+        /* Uluru, other hemisphere and ~8.5 h earlier sunrise in UTC. */
+        time_sync_set_position(-25.3444, 131.0369);
+        CHECK(time_sync_position_generation() != gen);
+        CHECK(sched_due_poll(d, t0 + 2) == 0);
+        int64_t uluru_due = t0 + 2 + time_sync_until_sun(t0 + 2, TIME_SYNC_SUNRISE, 0);
+        CHECK(d->jobs[0].wall_due_local[0] == uluru_due);
+        CHECK(uluru_due != nl_due && uluru_due > t0);
+        /* And it fires at the Uluru sunrise, not the NL one. */
+        CHECK(sched_due_poll(d, uluru_due) == 1);
+        free(p);
+        free(d);
+    }
+    time_sync_set_location(52.173, 5.819, 0);
+    time_sync_set_utc_offset_seconds(7200);
+}
+
 int main(void)
 {
     test_parser_acceptance();
@@ -2247,6 +2292,7 @@ int main(void)
     test_due_reanchor();
     test_due_monotonic_clock();
     test_due_dst();
+    test_due_position_change();
     test_actions_dump();
 
     printf("SIZES sched_program_t=%zu job=%zu trigger=%zu entry=%zu protocol=%zu "

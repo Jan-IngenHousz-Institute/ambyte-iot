@@ -500,7 +500,9 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
                                              jlon->valuedouble,
                                              deployment);
             if (err == ESP_OK) {
-                time_sync_set_position(jlat->valuedouble, jlon->valuedouble);
+                /* Zone AND sun-math position follow the effective location
+                 * (a live estimate in another country can still win), both
+                 * from the one decision in timezone_command. */
                 /* The device's own timezone follows its coordinates
                  * (docs/timezone-from-location.md). Lookup only here; any
                  * persist/apply runs on the maintenance worker, which

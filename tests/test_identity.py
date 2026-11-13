@@ -100,7 +100,7 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(set(result), {"mac", "thing_name", "fw", "contract", "schedule", "capabilities", "signed", "storage",
                                        "location", "timezone"})
         self.assertEqual(set(result["location"]), {"set", "source", "lat", "lon", "accuracy_m",
-                                                   "configured_stale", "configured", "live"})
+                                                   "configured_stale", "solar_position", "configured", "live"})
         self.assertEqual(set(result["location"]["configured"]), {"set", "lat", "lon"})
         self.assertEqual(set(result["location"]["live"]), {"set", "lat", "lon", "accuracy_m", "age_s", "status"})
         self.assertEqual(set(result["timezone"]), {"configured", "active", "source", "pinned", "resolved",
@@ -130,7 +130,7 @@ class IdentityTest(unittest.TestCase):
         obj = self.response("installed")
         self.assertEqual(obj["location"], {
             "set": False, "source": "none", "lat": None, "lon": None, "accuracy_m": None,
-            "configured_stale": False,
+            "configured_stale": False, "solar_position": "default",
             "configured": {"set": False, "lat": None, "lon": None},
             "live": {"set": False, "lat": None, "lon": None, "accuracy_m": None, "age_s": None,
                      "status": "waiting"}})
@@ -139,6 +139,7 @@ class IdentityTest(unittest.TestCase):
                                            "utc_offset_seconds": 3600})
         obj = self.response("tz_configured")
         self.assertEqual(obj["location"]["source"], "configured")
+        self.assertEqual(obj["location"]["solar_position"], "location")
         self.assertEqual((obj["location"]["lat"], obj["location"]["lon"]), (-25.3444, 131.0369))
         self.assertIsNone(obj["location"]["accuracy_m"])
         self.assertEqual(obj["timezone"], {"configured": "Europe/Berlin", "active": "Australia/Darwin",

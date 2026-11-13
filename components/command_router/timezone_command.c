@@ -24,6 +24,7 @@
 #include "device_location.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "time_sync.h"
 #include "timezone.h"
 #include "tz_geo.h"
 
@@ -46,6 +47,7 @@ typedef enum {
     REQ_LOCATION,   /* set_location / sync loc stored coordinates */
     REQ_BOOT,       /* boot reconciliation */
     REQ_LIVE,       /* a live location estimate arrived */
+    REQ_REFRESH,    /* periodic re-evaluation (live fix expiry, loc_live off) */
 } req_kind_t;
 
 typedef struct {
@@ -125,10 +127,36 @@ static void decide(decision_t *d, bool ignore_pin)
     }
 }
 
+/* The sun-math position follows the SAME effective location as the zone
+ * (one decision, one source): sunrise, sunset, solar triggers and day/night
+ * windows depend on where the device is, and two sites in one zone can be in
+ * different seasons. With no location the compiled default stays, reported
+ * as solar_position "default". A pin holds the zone only; the position still
+ * follows the location. Changing it bumps time_sync's position generation,
+ * which makes the schedule re-resolve armed solar dues (sched_due). Live
+ * noise never reaches here: device_location only moves the live fix beyond
+ * its uncertainty. Returns true if the position changed. */
+static bool apply_position(const decision_t *d)
+{
+    double lat = TIME_SYNC_DEFAULT_LAT, lon = TIME_SYNC_DEFAULT_LON;
+    if (d->loc.source != DEVICE_LOCATION_NONE) {
+        lat = d->loc.lat;
+        lon = d->loc.lon;
+    }
+    double cur_lat, cur_lon;
+    time_sync_get_location(&cur_lat, &cur_lon, NULL);
+    if (cur_lat == lat && cur_lon == lon) return false;
+    time_sync_set_position(lat, lon);
+    ESP_LOGW(TAG, "solar position now from %s (%s)", device_location_source_name(d->loc.source),
+             d->loc.source != DEVICE_LOCATION_NONE ? "location" : "default");
+    return true;
+}
+
 /* Apply the derived zone if libc is not already running it, verified. */
 static bool reconcile(decision_t *d)
 {
     decide(d, false);
+    (void)apply_position(d);
     const char *active = timezone_current_name();
     bool running = strcmp(active, d->zone) == 0 && (d->zone[0] == '\0' || timezone_rule_active());
     if (!running) {
@@ -163,6 +191,7 @@ static void report(const request_t *request, bool ok, bool saved, const char *de
     bool applied = strcmp(active, d.zone) == 0 && (d.zone[0] == '\0' || timezone_rule_active()) &&
                    d.zone[0] != '\0';
 
+    if (request->kind == REQ_REFRESH) return;   /* apply_position/timezone log changes */
     if (request->kind == REQ_BOOT || request->kind == REQ_LIVE ||
         (request->kind == REQ_LOCATION && !request->id[0])) {
         /* No MQTT requester (boot, live estimate, USB CLI): the log is the record. */
@@ -283,6 +312,7 @@ static void execute(void *arg)
         break;
     }
     case REQ_BOOT:
+    case REQ_REFRESH:
     default:
         break;
     }
@@ -365,6 +395,9 @@ const char *timezone_command_location_stored(const char *id, bool changed, const
     decision_t d;
     decide(&d, false);
     if (resolved) *resolved = d.resolved ? d.resolved : "";
+    /* The position takes effect now, even when the zone needs no worker
+     * job (same zone, or pinned). */
+    (void)apply_position(&d);
     bool will_unpin = changed && d.pinned;
     if (!will_unpin && strcmp(timezone_current_name(), d.zone) == 0 &&
         (d.zone[0] == '\0' || timezone_rule_active())) {
@@ -390,6 +423,12 @@ bool timezone_command_offer_live(double lat, double lon, double accuracy_m, int6
         return false;
     }
     return true;
+}
+
+void timezone_command_refresh(void)
+{
+    request_t request = {.kind = REQ_REFRESH};
+    (void)dispatch(&request);   /* busy: the next refresh or input retries */
 }
 
 void timezone_command_reconcile_boot(void)
@@ -426,6 +465,7 @@ void timezone_command_status(timezone_status_t *out)
     snprintf(out->resolved, sizeof out->resolved, "%s", d.resolved ? d.resolved : "");
     out->source = why_name(d.why);
     out->pinned = d.pinned;
+    out->solar_position = d.loc.source != DEVICE_LOCATION_NONE ? "location" : "default";
     device_location_t configured;
     out->configured_set = device_location_configured(&configured);
     out->configured_lat = configured.lat;

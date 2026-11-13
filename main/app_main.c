@@ -474,6 +474,12 @@ static bool app_public_ip(char *out, size_t len)
     return ok;
 }
 
+static void app_tz_refresh(void *arg)
+{
+    (void)arg;
+    timezone_command_refresh();
+}
+
 /* STATUS `location` group: effective location, its source, and why the
  * timezone is what it is (timezone_command_status). Heartbeat task only. */
 static void app_location_report(device_commands_location_t *out)
@@ -490,6 +496,7 @@ static void app_location_report(device_commands_location_t *out)
         .has_accuracy = set && isfinite(st.location.accuracy_m),
         .accuracy_m = st.location.accuracy_m,
         .configured_stale = st.location.configured_stale,
+        .solar_position = st.solar_position,
         .timezone_source = st.source,
         .pinned = st.pinned,
     };
@@ -1388,6 +1395,18 @@ void app_main(void)
         err = location_aws_init(&loc_cfg);
         if (err != ESP_OK) {
             ESP_LOGW(APP_TAG, "live location not started: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* Re-derive zone and sun position every 6 h: a live fix ageing past its
+     * 30 days, or `loc_live off`, changes the effective location without any
+     * other input. Worker job, silent unless something changes. */
+    {
+        static esp_timer_handle_t s_tz_refresh;
+        const esp_timer_create_args_t args = {
+            .callback = app_tz_refresh, .name = "tz_refresh" };
+        if (esp_timer_create(&args, &s_tz_refresh) == ESP_OK) {
+            esp_timer_start_periodic(s_tz_refresh, 6ULL * 3600ULL * 1000000ULL);
         }
     }
 
