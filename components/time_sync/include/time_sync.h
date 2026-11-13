@@ -46,6 +46,9 @@ void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours);
  * the schedule model can re-resolve armed solar dues (sched_due): sunrise and
  * sunset depend on WHERE the device is, not on its timezone. */
 uint32_t time_sync_position_generation(void);
+/* Position and its generation in one consistent snapshot (any out-pointer
+ * may be NULL). */
+void time_sync_get_position(double *lat, double *lon, uint32_t *generation);
 
 /* Set/get the local-minus-UTC offset in seconds — the DST-aware value normally
  * owned by components/timezone. Finer-grained than set_location()'s whole hours

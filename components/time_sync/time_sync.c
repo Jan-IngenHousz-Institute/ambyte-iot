@@ -7,6 +7,7 @@
 #include "time_sync.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <string.h>
 #include <strings.h>
 
@@ -24,18 +25,43 @@ static double  s_lon   = TIME_SYNC_DEFAULT_LON;    /* degrees east (positive = e
  * unchanged until a timezone is applied. */
 static int32_t s_off_s = 2 * 3600;
 
+/* Position + its generation are written by two tasks (the MQTT set_location
+ * path and the maintenance worker) and read by the schedule runner. One small
+ * lock keeps the triple consistent: a reader that sees generation N always
+ * sees position N or newer, never N's generation with the old position (Opus
+ * review of #100). Never held across anything but these copies. */
+static pthread_mutex_t s_pos_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_pos_gen = 0;
+
+static void pos_lock(void) { (void)pthread_mutex_lock(&s_pos_lock); }
+static void pos_unlock(void) { (void)pthread_mutex_unlock(&s_pos_lock); }
 
 void time_sync_set_position(double lat, double lon)
 {
-    if (lat != s_lat || lon != s_lon) s_pos_gen++;
-    s_lat = lat;
-    s_lon = lon;
+    pos_lock();
+    if (lat != s_lat || lon != s_lon) {
+        s_lat = lat;
+        s_lon = lon;
+        s_pos_gen++;
+    }
+    pos_unlock();
 }
 
 uint32_t time_sync_position_generation(void)
 {
-    return s_pos_gen;
+    pos_lock();
+    uint32_t gen = s_pos_gen;
+    pos_unlock();
+    return gen;
+}
+
+void time_sync_get_position(double *lat, double *lon, uint32_t *generation)
+{
+    pos_lock();
+    if (lat) *lat = s_lat;
+    if (lon) *lon = s_lon;
+    if (generation) *generation = s_pos_gen;
+    pos_unlock();
 }
 
 void time_sync_set_location(double lat, double lon, int tz_offset_hours)
@@ -46,8 +72,7 @@ void time_sync_set_location(double lat, double lon, int tz_offset_hours)
 
 void time_sync_get_location(double *lat, double *lon, int *tz_offset_hours)
 {
-    if (lat) *lat = s_lat;
-    if (lon) *lon = s_lon;
+    time_sync_get_position(lat, lon, NULL);
     if (tz_offset_hours) *tz_offset_hours = (int)(s_off_s / 3600);
 }
 
@@ -149,8 +174,10 @@ esp_err_t time_sync_sun_on_date(int64_t date_unix, int event, int64_t *out_unix)
     int y, mo, d;
     time_sync_localtime(date_unix, &y, &mo, &d, NULL, NULL, NULL, NULL);
 
-    double lw  = -s_lon;                  /* west longitude positive */
-    double phi = s_lat;
+    double lat, lon;
+    time_sync_get_position(&lat, &lon, NULL);   /* one consistent pair */
+    double lw  = -lon;                    /* west longitude positive */
+    double phi = lat;
     double Jd0 = (double)days_from_civil(y, mo, d) + 2440587.5;
     double n   = floor(Jd0 - 2451545.0 - 0.0009 - lw / 360.0 + 0.5);
     double J   = 2451545.0 + 0.0009 + lw / 360.0 + n;
