@@ -8,3 +8,8 @@ flash_gui/tests/fixtures/*.raw -text -whitespace
 # Released parser and A3 reference sources: SHA256 guards require exact bytes on every host.
 flash_gui/tests/fixtures/released/ambyte_serial_6b86c8e.py -text
 tests/fixtures/sensors/a3_6a57c2a/*.c -text
+
+# Generated coordinate -> timezone quadtree (tools/gen_tz_geo.py): the .bin is embedded byte-exact,
+# the .py is the same bytes in base64. Never hand-edit; review the generator diff instead.
+components/timezone/tz_geo.bin binary
+flash_gui/tz_geo_data.py -diff linguist-generated
