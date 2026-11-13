@@ -117,6 +117,21 @@ def _runtime_offset(console, identity):
     return offset
 
 
+def _timezone_summary(device):
+    location, zone = device.identity.location, device.identity.timezone
+    text = f'Fallback timezone: {device.settings.get("timezone") or "unset"}'
+    if location is None:
+        return text + f'; effective location unavailable ({device.identity.location_error or "firmware too old"})'
+    fallback = location.configured
+    text += (f'; fallback coordinates: {fallback.lat}, {fallback.lon}'
+             if fallback is not None and fallback.set else '; no fallback coordinates')
+    accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
+    effective = f'{location.lat}, {location.lon}' if location.set else 'unavailable'
+    text += f'\nEffective location: {effective} (source={location.source}, accuracy={accuracy})'
+    text += f'\nEffective timezone: {zone.active or "unset"} (source={zone.source})' if zone else '\nEffective timezone: unavailable'
+    return text
+
+
 def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
     port = console.port
     stored = device.settings.get('timezone')
@@ -131,21 +146,12 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
         if current.identity.mac != device.identity.mac:
             return 'Timezone: not checked: connected Ambyte changed', port
         stored = current.settings.get('timezone')
-        prefix = f'Fallback timezone: {stored or "unset"}'
+        prefix = _timezone_summary(current)
         location = current.identity.location
         zone = current.identity.timezone
         if location is None:
-            detail = current.identity.location_error or 'firmware too old'
-            return prefix + f'; effective location unavailable ({detail})', port
+            return prefix, port
         fallback = location.configured
-        if fallback is not None and fallback.set:
-            prefix += f'; fallback coordinates: {fallback.lat}, {fallback.lon}'
-        else:
-            prefix += '; no fallback coordinates'
-        accuracy = f'{location.accuracy_m:g} m' if location.accuracy_m is not None else 'unknown'
-        effective = f'{location.lat}, {location.lon}' if location.set else 'unavailable'
-        prefix += f'\nEffective location: {effective} (source={location.source}, accuracy={accuracy})'
-        prefix += f'\nEffective timezone: {zone.active or "unset"} (source={zone.source})' if zone else '\nEffective timezone: unavailable'
         if location.source == 'live':
             return prefix + '; live location is managed by the Ambyte', port
         if current.identity.timezone_error or (zone is not None and zone.source == 'unknown'):
@@ -201,7 +207,7 @@ def check_timezone(console, device, journal, confirm, *, log=lambda text: None):
                     or after.identity.location != fresh.identity.location or after.settings != expected_settings):
                 raise ValueError('post-reboot timezone or preserved configuration/workbook did not match')
             offset = _runtime_offset(after_console, after.identity)
-        return f'Timezone: updated to {resolved}; verified after reboot (UTC offset {offset:+d}s)', port
+        return _timezone_summary(after) + f'\nFallback timezone: updated to {resolved}; verified after reboot (UTC offset {offset:+d}s)', port
     except Exception as error:
         # No cloud/serial exception from an optional check may replace a
         # successful Wi-Fi/firmware result. Preserve the write stage truthfully.
