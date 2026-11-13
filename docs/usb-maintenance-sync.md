@@ -174,9 +174,9 @@ coordinates, booleans and the `(0,0)` unset marker. No registry or certificate
 permission is involved.
 
 Initial setup offers **Use experiment location** beside the editable fallback
-fields. One site is preselected and fills the coordinates; several sites require
-an explicit dropdown selection. Selecting a site resolves its fallback zone,
-while later coordinate/zone edits remain available. Changing experiments clears
+fields. One site is preselected and fills only empty coordinate fields; several sites require
+an explicit dropdown selection. Selecting a site resolves its fallback zone when no explicit zone is entered.
+Operator-typed coordinates/zone are preserved, including late single-site API replies. Changing experiments clears
 an unchanged automatic prefill; manually edited coordinates remain explicit.
 Stale API replies cannot populate a different experiment or account.
 
@@ -212,8 +212,11 @@ never evidence that a deployment site exists; it can be the compiled default.
 The legacy timezone exception is restricted to this explicit location action,
 with a confirmation naming the target IANA zone. It does not weaken automatic
 maintenance's `timezone.auto` write gate. Verification reads the device's UTC
-clock with `rtc`, computes the expected offset using host IANA data and compares
-it to RTC local STATUS. Missing clock/tzdata/status or a wrong offset reports
+clock with `rtc`, computes the expected offset using the bundled firmware POSIX rule and compares
+it to RTC local STATUS. Windows needs no host tzdata. The generated Python rules
+match all 598 firmware entries; all 94 distinct rules passed 1128 monthly libc
+reference probes. Darwin and Amsterdam DST boundary regressions run with
+`zoneinfo.ZoneInfo` unavailable. Missing clock/rule/status or a wrong offset reports
 `saved, runtime unverified`, never a verified zone. PR3 writes no zone itself;
 the device remains authoritative. A changed configured location can release a
 manual pin, which the confirmation states explicitly.
@@ -255,7 +258,7 @@ sequenceDiagram
 
 ## Qualification
 
-The full GUI suite currently passes 701 tests and 29 subtests. Tests use real
+The full GUI suite currently passes 709 tests and 29 subtests. Tests use real
 console parsing and the shared service client, covering missing/outdated/current
 workbooks, permissions and cloud errors, saved operations, optional-check failure
 isolation, timezone confirmation/no-op/unavailable paths, dataset disagreement,
@@ -322,3 +325,35 @@ is recorded in [USB experiment maintenance](usb-experiment-maintenance.md).
 ![PR3 physical contract and restoration](images/usb-maintenance-sync/pr3-physical.png)
 
 [Redacted PR3 capture](images/usb-maintenance-sync/pr3-physical.txt).
+
+
+### Experiment-location physical qualification
+
+The DEV experiment began with an empty location list. A temporary Amsterdam-centre
+site was added through the API and chosen through the production current-experiment
+lookup. On PR3 image `v2.16.0-14-g19ecd20`, the USB action persisted coordinates,
+verified the configured tuple after reboot and reported effective location
+`configured`, zone Europe/Amsterdam, source `location`; no zone was written.
+An independent settled read confirmed the same result. A hub enumeration fault
+during an extra read required a cable replug; the same MAC/image was verified
+before proceeding.
+
+The official v2.16.0 firmware C/build inputs were then bench-signed/flashed using
+the reviewed bench flasher and effective-sdkconfig upload guard, with NVS and
+filesystem preserved. The legacy action explicitly confirmed Europe/Amsterdam,
+wrote coordinates plus the fallback zone, then verified the same MAC after reboot,
+post-boot coordinates within four decimals and the expected UTC offset +3600s.
+Independent final reads waited for the settled schedule before checking position.
+The original workbook SHA `943c2942…`, ID `75c59552…`, script `wb-v7`, public config
+and connected Wi-Fi were retained. The DEV location list was restored with
+`PUT []`, and a final GET proved it empty.
+
+The released bench is on **2.16.0**, with Amsterdam-centre configured coordinates
+(redacted), fallback Europe/Amsterdam and the original workbook. PR3 had proved
+`tz_source=auto`/unpinned; the NVS-safe flash and legacy action never change that
+key. Legacy firmware cannot expose it over its CLI. No Wi-Fi, topic or certificate
+writes occurred.
+
+![Experiment location qualification](images/usb-maintenance-sync/experiment-location.png)
+
+[Redacted PR3 and legacy capture](images/usb-maintenance-sync/experiment-location.txt).

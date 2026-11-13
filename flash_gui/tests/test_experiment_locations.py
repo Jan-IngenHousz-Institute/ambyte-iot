@@ -55,7 +55,7 @@ def location_bench(target):
     """Production AmbyteConsole over the USB byte transport and captured PR3 shape."""
     original=target.device.console
     state=SimpleNamespace(modern=True,version='2.16.0',stored=None,offset=3600,bad_readback=False,
-                          lost=None,after_boot=False,post_boot_position=None,pinned=False)
+                          lost=None,after_boot=False,post_boot_position=None,pinned=False,rtc=1794560400)
     group=json.loads((Path(__file__).parent/'fixtures/timezone-contract/physical-live.json').read_text())
     def console(cmd):
         if cmd.startswith('sync loc '):
@@ -68,7 +68,7 @@ def location_bench(target):
             target.device.plain.append(cmd)
             lat,lon=state.post_boot_position or state.stored or (52.173,5.819)
             return f'loc: lat={lat:.4f} lon={lon:.4f} tz=+1 deployment=-\r\nambyte> '.encode()
-        if cmd=='rtc':return b'RTC: 2026-11-13 09:00:00 (1794560400)\r\nambyte> '
+        if cmd=='rtc':return f'RTC: 2026-11-13 09:00:00 ({state.rtc})\r\nambyte> '.encode()
         if cmd=='status':
             sign='-' if state.offset<0 else '+';off=abs(state.offset)
             return f' - RTC local: 2026-11-13 10:00:00 (UTC{sign}{off//3600:02d}:{off%3600//60:02d})\r\nambyte> '.encode()
@@ -240,7 +240,7 @@ def test_setup_selection_prefills_coordinates_then_allows_manual_override():
     p=picker();p.set_options(loc.LocationOptions((AMSTERDAM,)))
     app=SimpleNamespace(setup_location_picker=p,setup_lat=Var(),setup_lon=Var(),setup_tz=Var('Europe/Berlin'))
     gui.App._use_setup_location(app)
-    assert (app.setup_lat.value,app.setup_lon.value,app.setup_tz.value)==('52.373','4.8924','')
+    assert (app.setup_lat.value,app.setup_lon.value,app.setup_tz.value)==('52.373','4.8924','Europe/Berlin')
     app.setup_lat.set('-25.3444');app.setup_lon.set('131.0369');app.setup_tz.set('Europe/Berlin')
     assert gui.timezones.setup_zone(app.setup_lat.value,app.setup_lon.value,app.setup_tz.value)[0]=='Europe/Berlin'
 
@@ -249,10 +249,10 @@ def test_setup_experiment_change_clears_only_unchanged_auto_prefill():
     from flash_gui import gui
     from flash_gui.tests.test_wifi_gui import Var
     app=SimpleNamespace(setup_location_picker=picker(),setup_lat=Var('52.373'),setup_lon=Var('4.8924'),
-        _setup_location_prefill=('52.373','4.8924'))
+        _setup_location_prefill={'setup_lat':'52.373','setup_lon':'4.8924'})
     gui.App._reset_setup_location(app)
     assert app.setup_lat.value==app.setup_lon.value==''
-    app.setup_lat.set('51');app.setup_lon.set('4');app._setup_location_prefill=('52.373','4.8924')
+    app.setup_lat.set('51');app.setup_lon.set('4');app._setup_location_prefill={'setup_lat':'52.373','setup_lon':'4.8924'}
     gui.App._reset_setup_location(app)
     assert (app.setup_lat.value,app.setup_lon.value)==('51','4')
 
@@ -328,3 +328,32 @@ def test_explicit_location_confirmation_names_the_release_of_a_manual_pin(locati
     assert 'configured readback verified after reboot' in result
     assert b.values['timezone']=='Europe/Berlin' and not b.location_state.pinned
     assert writes(b)==['sync loc 52.37300000 4.89240000','reboot']
+
+
+@pytest.mark.parametrize('lat,lon,zone',[('51','4','Europe/Berlin'),('51','','Europe/Berlin'),('','4','Europe/Berlin')])
+def test_late_single_location_reply_only_fills_empty_fields(lat,lon,zone):
+    from flash_gui import gui
+    from flash_gui.tests.test_wifi_gui import Var
+    p=picker();p.set_options(loc.LocationOptions((AMSTERDAM,)))
+    app=SimpleNamespace(setup_location_picker=p,setup_lat=Var(lat),setup_lon=Var(lon),setup_tz=Var(zone))
+    gui.App._use_setup_location(app)
+    assert app.setup_lat.value==(lat or '52.373') and app.setup_lon.value==(lon or '4.8924')
+    assert app.setup_tz.value==zone
+    gui.App._reset_setup_location(app)
+    assert app.setup_lat.value==lat and app.setup_lon.value==lon
+
+
+@pytest.mark.parametrize('site,date,offset',[
+    (ULURU,(2026,11,13,9,0,0),34200),
+    (AMSTERDAM,(2026,3,29,0,59,59),3600),
+    (AMSTERDAM,(2026,3,29,1,0,0),7200),
+    (AMSTERDAM,(2026,10,25,0,59,59),7200),
+    (AMSTERDAM,(2026,10,25,1,0,0),3600)])
+def test_legacy_verifies_bundled_offsets_with_zoneinfo_unavailable(location_bench,monkeypatch,site,date,offset):
+    import zoneinfo
+    from datetime import datetime,timezone
+    monkeypatch.setattr(zoneinfo,'ZoneInfo',lambda *a:(_ for _ in ()).throw(RuntimeError('No Windows tzdata')))
+    b=location_bench;b.location_state.modern=False
+    b.location_state.offset=offset;b.location_state.rtc=int(datetime(*date,tzinfo=timezone.utc).timestamp())
+    result=loc.set_location(b.read(),site,confirm=lambda _:True)
+    assert f'verified after reboot (UTC offset {offset:+d}s)' in result

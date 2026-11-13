@@ -11,14 +11,13 @@ location write: an acknowledgement can be lost after NVS persistence.
 from dataclasses import dataclass
 import math
 import re
-from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
 
 from . import config, firmware_update as fw, experiment_settings as experiments, wifi_settings
 from .openjii_client import location_coordinates
 from .service_client import OperationJournal
 from .tz_geo import zone_for
 from .tz_country import ZONE_COUNTRY
+from .tz_offset import offset_for
 
 
 @dataclass(frozen=True)
@@ -104,12 +103,12 @@ def _legacy_runtime(console, zone):
         stamp = console.rtc_read()
         if stamp < 1577836800:  # No trustworthy modern UTC clock.
             return None
-        expected = int(datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo(zone)).utcoffset().total_seconds())
+        expected = offset_for(zone, stamp)
         from .maintenance import _runtime_offset
         actual = _runtime_offset(console, type('Legacy', (), {'timezone': None})())
         return actual if actual == expected else None
     except Exception:
-        # Missing host tzdata / RTC / status means saved, never verified.
+        # Missing/unsupported bundled rule, RTC or status means saved, never verified.
         return None
 
 

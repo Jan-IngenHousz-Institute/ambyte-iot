@@ -261,16 +261,22 @@ class App(ttk.Frame):
     def _use_setup_location(self):
         chosen = self.setup_location_picker.selected()
         if chosen is not None:
-            self.setup_lat.set(str(chosen.latitude))
-            self.setup_lon.set(str(chosen.longitude))
-            self.setup_tz.set('')  # Resolve the selected coordinates; later manual edits remain available.
-            self._setup_location_prefill = (self.setup_lat.get(), self.setup_lon.get())
+            prefill = dict(self.__dict__.get('_setup_location_prefill') or {})
+            for name, value in (('setup_lat', chosen.latitude), ('setup_lon', chosen.longitude)):
+                variable = getattr(self, name)
+                if not variable.get().strip():
+                    variable.set(str(value))
+                    prefill[name] = variable.get()
+            # A blank zone resolves from the resulting coordinate fields. Never
+            # replace an explicit zone or an operator's edits with a late API reply.
+            self._setup_location_prefill = prefill
 
     def _reset_setup_location(self):
-        previous = self.__dict__.get('_setup_location_prefill')
-        if previous and previous == (self.setup_lat.get(), self.setup_lon.get()):
-            self.setup_lat.set('')
-            self.setup_lon.set('')
+        previous = self.__dict__.get('_setup_location_prefill') or {}
+        for name, value in previous.items():
+            variable = getattr(self, name)
+            if variable.get() == value:
+                variable.set('')
         self._setup_location_prefill = None
         self.setup_location_picker.set_options(location_settings.LocationOptions(reason='Select an experiment to read its locations.'))
 
