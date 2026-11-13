@@ -564,6 +564,7 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "lon": 131.036900,
       "accuracy_m": null,
       "configured_stale": false,
+      "solar_position": "location",
       "live_status": "ok",
       "timezone": "Australia/Darwin",
       "timezone_source": "location",
@@ -660,6 +661,7 @@ non-negative integers.
 | | `lat`, `lon` | number, degrees (6 decimals) or null | Effective coordinates; null when `source` is `none`. Never the scheduler's compiled default. |
 | | `accuracy_m` | integer, m, or null | Live-estimate horizontal accuracy; null for configured coordinates. |
 | | `configured_stale` | boolean | A live estimate in another country than the configured location won (the configured one is a stale preset). |
+| | `solar_position` | string enum | `location` (sunrise/sunset/solar triggers from the effective location) or `default` (compiled 52.173 N 5.819 E; no location known). |
 | | `live_status` | string | Last live-source outcome (`waiting`, `not_authorized`, `ok`, `candidate`, `rejected_<code>`, `no_reply`, `off`, ...); unknown values are preserved. |
 | | `timezone` | string | Zone in effect (same as the envelope `timezone`). |
 | | `timezone_source` | string enum | Why: `manual` (pinned), `location`, `configured` (fallback zone), `none`. |

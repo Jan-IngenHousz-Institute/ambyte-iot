@@ -84,6 +84,43 @@ The reasons for this rule:
 The unconfirmed candidate lives in RAM. A reboot restarts the count, which
 errs toward not changing the zone.
 
+## Sunrise, sunset and day windows follow the position
+
+Solar events depend on **where** the device is, not on its timezone. Two
+sites in one zone can be in different seasons, and a European preset at
+Uluru gets wrong-hemisphere daylight. The sun-math position
+(`time_sync_set_position`) therefore follows the **same effective location**
+as the zone, from the same decision in `timezone_command`. That covers boot,
+`set_location`, `sync loc`, an accepted live estimate, a live fix expiring,
+and `loc_live off`; a periodic re-evaluation every 6 h picks up the last two
+without any other input.
+
+- **Without a location**, the compiled default (52.173 N, 5.819 E) stays.
+  identity and STATUS report `location.source: none` and
+  `solar_position: default`.
+- **A pin holds the zone only**; the position still follows the location.
+- **Solar triggers move with the position.** A position change bumps
+  `time_sync`'s position generation, and the schedule model (`sched_due`)
+  then re-resolves every armed solar due that is still ahead, just as an
+  offset edge re-projects wall triggers. Dues already passed keep their
+  grace accounting. `day`/`night` windows need nothing, because gates are
+  evaluated on every poll.
+- **Noise does not move it.** Within one zone, a live estimate replaces the
+  fix only when it moved more than both 1 km and the smaller uncertainty,
+  or is at least twice as precise. IP answers wandering inside their
+  ±5–50 km never re-anchor sunrise; a Wi-Fi fix replacing an IP fix does.
+
+Accuracy: about 1 km of east–west error shifts sunrise by
+roughly 2–4 seconds (east–west: 4 min per degree of longitude). IP-level ±50 km is one to two minutes of solar-time error.
+A CGNAT-city estimate 1,000+ km off is tens of minutes, still far better
+than the NL default on another continent. Where a configured site exists in
+the same country, the country rule keeps it, and so its exact sunrise.
+
+The **timezone** only matters for wall-clock crons, the nightly maintenance
+window and `timestamp_local`. Schedule `$tz` now reports the zone in effect,
+not the configured fallback; `$lat` and `$lon` report the effective (or
+default) position.
+
 ## The on-device map
 
 `tools/gen_tz_geo.py` builds a region quadtree from timezone-boundary-builder
@@ -218,13 +255,16 @@ rewritten.
 
 - **identity** (`timezone.auto` capability) adds two keys:
   - `location{set, source, lat, lon, accuracy_m, configured_stale,
-    configured{set, lat, lon}, live{set, lat, lon, accuracy_m, age_s, status}}`
+    solar_position, configured{set, lat, lon}, live{set, lat, lon,
+    accuracy_m, age_s, status}}`, where `solar_position` is `location` or
+    `default`
   - `timezone{configured, active, source: manual|location|configured|none,
     pinned, resolved, utc_offset_seconds}`
   - Coordinates are only ever persisted or live ones, never the scheduler's
     compiled default.
 - **STATUS** (`health.location`) carries `{source, lat, lon, accuracy_m,
-  configured_stale, live_status, timezone, timezone_source, pinned}`.
+  configured_stale, solar_position, live_status, timezone, timezone_source,
+  pinned}`.
   Measurement envelopes are unchanged: per-record location would carry the
   publish-time location on backlogged records.
 - **MQTT** `set_timezone`:
