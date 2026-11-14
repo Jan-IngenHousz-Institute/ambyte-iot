@@ -159,6 +159,17 @@ and unknown conversions are counted in the record's `unsupported_fmt` and shown
 as a marker such as `<%a>`. After an unknown conversion, formatting stops,
 because the sizes of the remaining arguments cannot be known.
 
+The formatter's work is bounded by its output buffer, never by its arguments
+(review round 2):
+- A precision is checked before the byte it allows is read, so `%.*s` over a
+  slice with no terminator reads exactly `precision` bytes, and `%.0s` reads
+  none.
+- Width and precision, from digits or from `*`, are normalised in a 64-bit
+  type, so `INT_MIN` is not undefined behaviour, and clamped to 256. An
+  oversize field counts in `unsupported_fmt`.
+- Padding stops as soon as the buffer is full, so `%*d` with `INT_MAX` costs
+  microseconds, not 2^31 iterations, on the logging task.
+
 The **downstream sinks keep their pre-existing behaviour**: `sd_log_vprintf`
 and the IDF console still format with newlib on the logging task, exactly as
 they did before this feature. That pre-existing behaviour is out of scope here.
@@ -249,7 +260,7 @@ sequenceDiagram
             W-->>O: ok=false detail=sd_absent / sd_io_lost / sd_busy
         else card usable
             W->>S: sdcard_io_begin()
-            W->>W: gen_before = boot.mount.rotation
+            W->>W: gen_before = boot.nonce.mount.rotation
             alt rotation seq odd (sd_logger is renaming)
                 W-->>O: ok=false detail=rotation_in_progress gen
             else expect_gen given and != gen_before
@@ -286,7 +297,11 @@ sequenceDiagram
   on its own schedule, regardless of the maintenance gate. A basename can
   therefore name different bytes between two chunks, even bytes of the same
   size (review finding 5). Every reply carries
-  `gen = "<boot_count>.<SD mount generation>.<sd_logger rotation seq>"`. The
+  `gen = "<boot_count>.<boot nonce>.<SD mount generation>.<sd_logger rotation seq>"`.
+  The boot nonce is 8 hex digits, random per boot (`diag_boot_nonce()`, drawn
+  with `esp_random()` on first use, when Wi-Fi is up). It keeps `gen` unique
+  across reboots even when NVS is unavailable and `boot_count` reads 0 (review
+  round 2). The
   rotation sequence is a seqlock: it is odd while `rotate_files()` renames and
   even otherwise, and it only increases. The mount generation changes on every
   remount, including a card swap or a park/unpark. One read is bracketed by
@@ -295,6 +310,10 @@ sequenceDiagram
   `rotation_in_progress`. A request may carry `expect_gen`, and a mismatch is
   refused with `file_rotated`. Appending to the live `ambyte.log` does not
   change `gen`; only renames and remounts do.
+- **Short reads are refused.** If `fread` returns fewer bytes than `fstat`
+  promised, without an error, the file shrank under the reader. That is a
+  truncation the rotation seqlock does not see. The chunk is refused with
+  `short_read`, never returned with a wrong `eof`.
 - **No partial successes.** Every cJSON operation of a success reply is checked.
   Any allocation failure turns the whole reply into `no_mem`. Refusals are
   written into a stack buffer without allocating, so they always go out (review
@@ -318,6 +337,10 @@ fleet_command.py log-read --devices ... --name ambyte.1.log --offset 0 --length 
   chunk is pinned and sent as `expect_gen` with every later chunk. A
   `file_rotated` refusal restarts the whole read once, from the original offset.
   A second one fails, and a reply with a different `gen` is never spliced on.
+  An explicit `--expect-gen` is sent with the first request too, and it is
+  never traded for another generation: a mismatch fails the read without a
+  restart. Only `eof: true` completes a read; an empty chunk before EOF is a
+  failure (no progress).
   Each chunk is also checked for the requested name and offset, data that
   decodes to exactly `length` bytes inside `size`, and a file that did not
   shrink. `no_mem` halves the chunk size; `busy` (a QoS1 duplicate) and

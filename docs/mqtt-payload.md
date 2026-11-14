@@ -1061,11 +1061,11 @@ topic, QoS 1, not retained, with a unique `id`. Details:
 ```jsonc
 // request → reply
 {"type":"log_list","id":"r1"}
-{"type":"log_list_result","id":"r1","ok":true,"detail":"ok","dir":"/sdcard/logs","gen":"412.3.18",
+{"type":"log_list_result","id":"r1","ok":true,"detail":"ok","dir":"/sdcard/logs","gen":"412.9c41e07a.3.18",
  "files":[{"name":"ambyte.1.log","size":1048570},{"name":"ambyte.log","size":20311}],"omitted":0}
 
 {"type":"log_read","id":"r2","name":"ambyte.log","offset":-4096,"length":4096}
-{"type":"log_read_result","id":"r2","ok":true,"detail":"ok","name":"ambyte.log","gen":"412.3.18","size":20311,
+{"type":"log_read_result","id":"r2","ok":true,"detail":"ok","name":"ambyte.log","gen":"412.9c41e07a.3.18","size":20311,
  "offset":16215,"length":4096,"eof":true,"encoding":"base64","data":"MjAyNi0xMS0xNCAw…"}
 ```
 
@@ -1076,8 +1076,10 @@ topic, QoS 1, not retained, with a unique `id`. Details:
   resolved absolute offset and `length` the bytes returned; `eof` is true when
   `offset + length >= size`.
 - `data`: standard padded base64 of the raw bytes.
-- `gen`: `"<boot_count>.<SD mount generation>.<sd_logger rotation seq>"`,
+- `gen`: `"<boot_count>.<boot nonce, 8 hex>.<SD mount generation>.<sd_logger rotation seq>"`,
   present on every success and on refusals made after the card was checked.
+  The nonce is random per boot, so `gen` never repeats across reboots, even
+  when `boot_count` is 0 (NVS unavailable).
   It changes on a log rotation (rename), a remount or card swap, and a reboot,
   but not when `ambyte.log` is appended to. Send the first chunk's `gen` as
   `expect_gen` on later chunks; a mismatch is refused with `file_rotated`. A
@@ -1090,6 +1092,7 @@ topic, QoS 1, not retained, with a unique `id`. Details:
   `queue_unavailable`, `maintenance_active`, `sd_parked`, `sd_absent`,
   `sd_io_lost`, `sd_busy` (unmount pending), `dir_unavailable`, `not_found`,
   `open_failed`, `not_a_file`, `stat_failed`, `seek_failed`, `read_failed`,
+  `short_read` (the file shrank between `fstat` and `fread`),
   `offset_past_eof` (with `size`), `file_rotated` (with the current `gen`),
   `rotation_in_progress`, `no_mem`.
 
