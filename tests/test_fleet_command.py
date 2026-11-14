@@ -159,9 +159,9 @@ class LogCommands(unittest.TestCase):
                 self.assertEqual(err.exception.code, 2)
 
     @staticmethod
-    def chunk(name, data, offset, size, eof, **extra):
+    def chunk(name, data, offset, size, eof, gen="7.1.4", **extra):
         import base64
-        reply = {"type": "log_read_result", "ok": True, "detail": "ok", "name": name, "offset": offset,
+        reply = {"type": "log_read_result", "ok": True, "detail": "ok", "name": name, "gen": gen, "offset": offset,
                  "length": len(data), "size": size, "eof": eof, "encoding": "base64",
                  "data": base64.b64encode(data).decode()}
         reply.update(extra)
@@ -176,7 +176,7 @@ class LogCommands(unittest.TestCase):
         self.assertEqual((bytes(st.data), st.start, st.size), (b"a" * 4096 + b"b" * 904, 15000, 20000))
         bad = [
             (self.chunk("ambyte.1.log", b"x", 0, 1, True), "asked for"),            # other file
-            (self.chunk("ambyte.log", b"x", 7, 9, True), "offset 7"),                # wrong offset
+            (self.chunk("ambyte.log", b"x", 7, 8, True), "offset 7"),                # wrong offset
             (dict(self.chunk("ambyte.log", b"xy", 0, 9, True), length=3), "decodes"),  # length mismatch
             (dict(self.chunk("ambyte.log", b"x", 0, 9, True), data="!!"), "malformed"),
             ({"type": "log_read_result", "ok": False, "detail": "sd_parked"}, "sd_parked"),
@@ -188,8 +188,161 @@ class LogCommands(unittest.TestCase):
                 self.assertIn(why, st.error)
         st = self.fc.LogStitcher("ambyte.log", 0, 4)
         st.feed(self.chunk("ambyte.log", b"abcd", 0, 100, False))
-        self.assertEqual(st.feed(self.chunk("ambyte.log", b"", 4, 3, True)), "error")   # rotated under us
+        self.assertEqual(st.feed(self.chunk("ambyte.log", b"e", 4, 5, True)), "error")   # rotated under us
         self.assertIn("shrank", st.error)
+
+    def test_stitcher_pins_gen_and_refuses_same_size_replacement(self):
+        # Review finding 5: AAAA from one file, BBBB from its same-size
+        # successor under the same basename. The second chunk carries another
+        # gen; it must never be spliced on.
+        st = self.fc.LogStitcher("ambyte.1.log", 0, 4)
+        self.assertNotIn("expect_gen", st.request("i"))
+        self.assertEqual(st.feed(self.chunk("ambyte.1.log", b"AAAA", 0, 8, False, gen="7.1.4")), "continue")
+        self.assertEqual(st.request("i")["expect_gen"], "7.1.4")
+        self.assertEqual(st.feed(self.chunk("ambyte.1.log", b"BBBB", 4, 8, True, gen="7.1.6")), "error")
+        self.assertIn("changed identity", st.error)
+        self.assertFalse(st.done)
+
+    def test_stitcher_restarts_once_on_file_rotated(self):
+        st = self.fc.LogStitcher("ambyte.1.log", -8, 4)
+        st.feed(self.chunk("ambyte.1.log", b"AAAA", 0, 8, False, gen="7.1.4"))
+        self.assertEqual(st.feed({"type": "log_read_result", "ok": False, "detail": "file_rotated",
+                                  "name": "ambyte.1.log", "gen": "7.1.6"}), "restart")
+        req = st.request("i")
+        self.assertEqual((req["offset"], "expect_gen" in req, bytes(st.data)), (-8, False, b""))
+        st.feed(self.chunk("ambyte.1.log", b"BBBB", 0, 8, False, gen="7.1.6"))
+        self.assertEqual(st.feed({"ok": False, "detail": "file_rotated"}), "error")   # only once
+        self.assertIn("file_rotated", st.error)
+        st = self.fc.LogStitcher("ambyte.log", 0, 4)
+        self.assertEqual(st.feed({"ok": False, "detail": "rotation_in_progress"}), "retry")
+
+    def test_incomplete_success_replies_are_rejected(self):
+        # Review finding 4: what a device out of memory mid-reply produced.
+        bad_lists = [
+            {"type": "log_list_result", "ok": True, "gen": "1.1.0"},
+            {"type": "log_list_result", "ok": True, "gen": "1.1.0", "files": []},
+            {"type": "log_list_result", "ok": True, "gen": "1.1.0", "files": [{"size": 5}], "omitted": 0},
+            {"type": "log_list_result", "ok": True, "gen": "1.1.0", "files": [{"name": "a.log"}], "omitted": 0},
+            {"type": "log_list_result", "ok": True, "files": [], "omitted": 0},
+        ]
+        for reply in bad_lists:
+            with self.subTest(reply=reply):
+                self.assertIsNotNone(self.fc.log_reply_problem(reply))
+        self.assertIsNone(self.fc.log_reply_problem({"type": "log_list_result", "ok": True, "gen": "1.1.0",
+                                                     "files": [{"name": "a.log", "size": 5}], "omitted": 0}))
+        good = self.chunk("ambyte.log", b"hello", 0, 5, True)
+        self.assertIsNone(self.fc.log_reply_problem(good))
+        for k in ("data", "length", "eof", "encoding", "name", "size", "gen"):
+            with self.subTest(missing=k):
+                self.assertIsNotNone(self.fc.log_reply_problem({x: v for x, v in good.items() if x != k}))
+        self.assertIsNotNone(self.fc.log_reply_problem(dict(good, length=4)))
+        self.assertIsNotNone(self.fc.log_reply_problem(dict(good, eof=False)))
+        rc, _ = self.run_main(["log-list", "--devices", self.CLIENT, "--wait", "1"], lambda req: [bad_lists[2]])
+        self.assertEqual(rc, 1)
+        rc, _ = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--wait", "1"],
+                              lambda req: [dict(good, data="aGVs")])
+        self.assertEqual(rc, 1)
+
+    def test_out_dry_run_publishes_nothing_and_writes_nothing(self):
+        # Review finding 1: --out used to dispatch to the stitcher before the
+        # dry-run check and published for real.
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("no AWS in a dry run")), \
+             patch.object(self.fc.fleet_deploy, "mqtt_connection", side_effect=AssertionError("no MQTT in a dry run")):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = self.fc.main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--tail", "65536",
+                                   "--out", f"{tmp}/device-log.txt", "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(f"{tmp}/device-log.txt"))
+        text = out.getvalue()
+        self.assertIn(f"target={self.CLIENT}", text)
+        self.assertIn('"offset": -65536', text)
+        self.assertIn("nothing published", text)
+
+    def test_workflow_dry_run_reaches_the_cli_as_dry_run(self):
+        # The workflow always adds --out for log-read; with dry_run=true the
+        # exact argv it builds must run the CLI's no-publish path.
+        import os
+        import pathlib
+        import shlex
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp) / "python"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+            fake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                       GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND="log-read", DEVICES=self.CLIENT,
+                       TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                       FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90", DRY_RUN="true",
+                       LOG_NAME="ambyte.log", LOG_TAIL="65536")
+            r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines()
+        self.assertEqual(argv[0], "tools/fleet_deploy/fleet_command.py")
+        argv = argv[1:]
+        self.assertIn("--dry-run", argv)
+        self.assertIn("--out", argv)
+        from unittest.mock import patch
+        with patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("no AWS in a dry run")), \
+             patch.object(self.fc.fleet_deploy, "mqtt_connection", side_effect=AssertionError("no MQTT in a dry run")), \
+             tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                rc = self.fc.main(argv)
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(f"{tmp}/device-log.txt"))
+        self.assertTrue(shlex.join(argv))
+
+    def test_log_read_out_restarts_on_rotation_and_fails_on_a_second(self):
+        import tempfile
+
+        def make_device(rotations):
+            """Same-size replacement of the file after each first chunk, up to `rotations` times."""
+            state = {"n": 0, "left": rotations, "served": 0}
+            content = lambda: bytes([ord("A") + state["n"]]) * 9000
+            gen = lambda: f"7.1.{4 + 2 * state['n']}"
+            def device(req):
+                if "expect_gen" in req and req["expect_gen"] != gen():
+                    yield {"type": "log_read_result", "ok": False, "detail": "file_rotated",
+                           "name": req["name"], "gen": gen()}
+                    state["served"] = 0
+                    return
+                c = content()
+                start = req["offset"] if req["offset"] >= 0 else max(0, len(c) + req["offset"])
+                data = c[start:start + req["length"]]
+                yield self.chunk(req["name"], data, start, len(c), start + len(data) >= len(c), gen=gen())
+                state["served"] += 1
+                if state["served"] == 1 and state["left"] > 0:
+                    state["left"] -= 1
+                    state["n"] += 1
+            return device
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, sent = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.1.log",
+                                      "--out", f"{tmp}/f", "--wait", "1"], make_device(1))
+            self.assertEqual(rc, 0)
+            with open(f"{tmp}/f", "rb") as fh:
+                self.assertEqual(fh.read(), b"B" * 9000)          # never AAAA + BBBB
+        self.assertEqual([r.get("expect_gen") for r in sent], [None, "7.1.4", None, "7.1.6"])
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, _ = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.1.log",
+                                   "--out", f"{tmp}/f", "--wait", "1"], make_device(2))
+        self.assertEqual(rc, 1)                                  # restarts only once
 
     def test_stitcher_backs_off_on_no_mem_and_retries_busy(self):
         st = self.fc.LogStitcher("ambyte.log", 0, 8192)
@@ -265,7 +418,7 @@ class LogCommands(unittest.TestCase):
     def test_log_list_and_single_read_results(self):
         import json
         import tempfile
-        listing = {"type": "log_list_result", "ok": True, "detail": "ok", "dir": "/sdcard/logs",
+        listing = {"type": "log_list_result", "ok": True, "detail": "ok", "dir": "/sdcard/logs", "gen": "7.1.4",
                    "files": [{"name": "ambyte.log", "size": 12}], "omitted": 0}
         with tempfile.TemporaryDirectory() as tmp:
             rc, sent = self.run_main(["log-list", "--devices", self.CLIENT, "--wait", "1",

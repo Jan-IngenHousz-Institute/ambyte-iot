@@ -197,7 +197,10 @@ AWS session. Three commands:
   ambyte.log --tail 65536 --out ambyte.log` stitches 8 KiB chunks of one
   device's file into a local file until EOF; without `--out` one request
   (`--offset`, `--length` ≤ 8192) per device lands in `results.json` as base64.
-  A refusal (`sd_parked`, `sd_absent`, …) or a missing reply fails the run.
+  A refusal (`sd_parked`, `sd_absent`, …), an incomplete reply or a missing
+  reply fails the run. The stitcher pins the file's `gen` from the first chunk
+  and restarts once if sd_logger rotates the file mid-read. `--dry-run`
+  (also with `--out`) publishes nothing and writes nothing.
   See [docs/remote-diagnostics.md](../../docs/remote-diagnostics.md).
 
 ```bash

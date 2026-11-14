@@ -79,59 +79,133 @@ def log_read_window(args):
     return (-tail if tail else offset), length
 
 
+def _is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def log_reply_problem(reply):
+    """Why an ok:true log_list/log_read reply cannot be trusted, or None. Pure.
+
+    A device that ran out of memory mid-reply must never be taken for a
+    complete answer (review finding 4): every listed file needs a valid name
+    and a size, and read data must decode to exactly `length` bytes inside
+    the reported file size.
+    """
+    if reply.get("ok") is not True:
+        return None
+    t = reply.get("type")
+    if not isinstance(reply.get("gen"), str) or not reply.get("gen"):
+        return "missing gen"
+    if t == "log_list_result":
+        files = reply.get("files")
+        if not isinstance(files, list):
+            return "files missing"
+        for f in files:
+            if not isinstance(f, dict) or not valid_log_name(f.get("name")) or not _is_count(f.get("size")):
+                return f"incomplete file entry {f!r}"
+        if not _is_count(reply.get("omitted")):
+            return "omitted missing"
+        return None
+    if t == "log_read_result":
+        if not valid_log_name(reply.get("name")):
+            return "name missing"
+        if not all(_is_count(reply.get(k)) for k in ("size", "offset", "length")):
+            return "size/offset/length missing"
+        if not isinstance(reply.get("eof"), bool) or reply.get("encoding") != "base64":
+            return "eof/encoding missing"
+        try:
+            raw = base64.b64decode(reply.get("data"), validate=True)
+        except (TypeError, ValueError) as exc:
+            return f"data is not base64: {exc}"
+        if len(raw) != reply["length"]:
+            return f"data decodes to {len(raw)} bytes, reply says {reply['length']}"
+        if reply["offset"] + reply["length"] > reply["size"]:
+            return "chunk extends past the reported file size"
+        if reply["eof"] != (reply["offset"] + reply["length"] >= reply["size"]):
+            return "eof inconsistent with offset/length/size"
+        return None
+    return f"unexpected type {t!r}"
+
+
 class LogStitcher:
     """Joins consecutive log_read_result chunks of ONE file into bytes.
 
     Each reply is checked against the request it answers: the right name, the
     requested absolute offset (a negative/tail first request is resolved by the
     device), base64 that decodes to exactly `length` bytes, and a file that did
-    not shrink between chunks (sd_logger rotation renames ambyte.log away, so a
-    smaller size means the bytes after our offset belong to another file).
+    not shrink between chunks.
+
+    Rotation (review finding 5): sd_logger renames ambyte.log -> ambyte.1.log
+    -> ... on its own schedule, so a basename can name different bytes between
+    two chunks, even of the same size. The device reports `gen` (boot, SD
+    mount, rotation sequence); the first chunk pins it and every later request
+    carries it as `expect_gen`. A "file_rotated" refusal restarts the read once
+    from the original offset; a second one fails the command. A reply whose
+    gen differs from the pinned one is never accepted.
     """
 
     MIN_CHUNK = 1024
+    RETRY_DETAILS = NON_TERMINAL_DETAILS + ("rotation_in_progress",)
 
     def __init__(self, name, offset, length, max_chunks=400):
-        self.name, self.next_offset, self.length = name, offset, length
+        self.name, self.first_offset, self.next_offset, self.length = name, offset, offset, length
         self.max_chunks = max_chunks
         self.data = bytearray()
-        self.start = self.size = self.error = None
+        self.start = self.size = self.error = self.gen = None
         self.chunks = 0
+        self.restarts = 0
         self.done = False
 
     def request(self, req_id):
-        return {"type": "log_read", "id": req_id, "name": self.name,
-                "offset": self.next_offset, "length": self.length}
+        msg = {"type": "log_read", "id": req_id, "name": self.name,
+               "offset": self.next_offset, "length": self.length}
+        if self.gen is not None:
+            msg["expect_gen"] = self.gen
+        return msg
+
+    def _restart(self):
+        self.data = bytearray()
+        self.start = self.size = self.gen = None
+        self.next_offset = self.first_offset
+        self.chunks = 0
+        self.restarts += 1
 
     def feed(self, reply):
-        """Returns 'continue', 'retry' (same offset again), 'done' or 'error'."""
+        """Returns 'continue', 'retry' (same offset again), 'restart', 'done' or 'error'."""
         if reply.get("ok") is not True:
             detail = reply.get("detail")
             if detail == "no_mem" and self.length > self.MIN_CHUNK:
                 self.length = max(self.MIN_CHUNK, self.length // 2)   # fragmented heap: smaller reply
                 return "retry"
-            if detail in NON_TERMINAL_DETAILS:
+            if detail in self.RETRY_DETAILS:
                 return "retry"
+            if detail == "file_rotated" and self.restarts == 0:
+                self._restart()
+                return "restart"
             self.error = f"device refused: {detail}"
             return "error"
-        try:
-            offset, length, size = int(reply["offset"]), int(reply["length"]), int(reply["size"])
-            raw = base64.b64decode(reply["data"], validate=True)
-        except (KeyError, TypeError, ValueError) as exc:
-            self.error = f"malformed reply: {exc}"
+        if reply.get("type") != "log_read_result":
+            self.error = f"unexpected reply type {reply.get('type')!r}"
             return "error"
+        problem = log_reply_problem(reply)
+        if problem:
+            self.error = f"malformed reply: {problem}"
+            return "error"
+        offset, length, size = reply["offset"], reply["length"], reply["size"]
+        raw = base64.b64decode(reply["data"], validate=True)
         if reply.get("name") != self.name:
             self.error = f"reply for {reply.get('name')!r}, asked for {self.name!r}"
         elif self.next_offset >= 0 and offset != self.next_offset:
             self.error = f"reply at offset {offset}, asked for {self.next_offset}"
-        elif len(raw) != length:
-            self.error = f"data decodes to {len(raw)} bytes, reply says {length}"
+        elif self.gen is not None and reply["gen"] != self.gen:
+            self.error = f"{self.name} changed identity (gen {self.gen} -> {reply['gen']}) during the read"
         elif self.size is not None and size < self.size:
             self.error = f"{self.name} shrank from {self.size} to {size} bytes (rotated during the read)"
         if self.error:
             return "error"
         if self.start is None:
             self.start = offset
+            self.gen = reply["gen"]
         self.size = size
         self.data += raw
         self.next_offset = offset + length
@@ -191,7 +265,10 @@ def build_message(args, req_id):
         if not valid_log_name(getattr(args, "name", "")):
             raise SystemExit("log-read needs --name: a plain file name from log-list (e.g. ambyte.log)")
         offset, length = log_read_window(args)
-        return {"type": "log_read", "id": req_id, "name": args.name, "offset": offset, "length": length}
+        msg = {"type": "log_read", "id": req_id, "name": args.name, "offset": offset, "length": length}
+        if getattr(args, "expect_gen", ""):
+            msg["expect_gen"] = args.expect_gen
+        return msg
     if args.cmd == "ambit-versions":
         return {"type": "ambit_versions", "id": req_id}
     if args.cmd == "ambit-flash":
@@ -247,8 +324,8 @@ def summarise(dev, reply):
                 f"files: {files or '-'}" + (f" omitted={reply.get('omitted')}" if reply.get("omitted") else ""))
     if t == "log_read_result":
         return (f"log_read ok={reply.get('ok')} detail={reply.get('detail')} name={reply.get('name')} "
-                f"offset={reply.get('offset')} length={reply.get('length')} size={reply.get('size')} "
-                f"eof={reply.get('eof')}")
+                f"gen={reply.get('gen')} offset={reply.get('offset')} length={reply.get('length')} "
+                f"size={reply.get('size')} eof={reply.get('eof')}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -269,6 +346,8 @@ def main(argv=None):
                     help=f"log-read: bytes per request, 1..{LOG_READ_MAX} (default {LOG_READ_DEFAULT}; {LOG_READ_MAX} with --out)")
     ap.add_argument("--tail", type=int, default=0, help="log-read: start this many bytes before the end")
     ap.add_argument("--out", default=None, help="log-read: stitch chunks until EOF into this local file (one device)")
+    ap.add_argument("--expect-gen", dest="expect_gen", default="",
+                    help="log-read: refuse unless the file still has this gen (from an earlier reply)")
     ap.add_argument("--expect-offset", type=int, default=None, help="timezone commands: require this UTC offset in seconds at verification")
     ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin)")
     ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
@@ -305,6 +384,19 @@ def main(argv=None):
             ap.error("log-read needs --name: a plain file name from log-list (e.g. ambyte.log)")
         if args.out and (not args.devices.strip() or len(parse_devices(args.devices)) != 1):
             ap.error("log-read --out stitches one file from exactly one explicit --devices target")
+        if args.out and args.dry_run:
+            # Before ANY session or transport: the stitcher publishes for real
+            # (review finding 1 — the workflow always passes --out).
+            dev = parse_devices(args.devices)[0]
+            offset, length = log_read_window(args)
+            first = LogStitcher(args.name, offset, length).request(f"fc-log-read-x-{int(time.time())}-0")
+            print(f"log-read (dry run): target={dev}")
+            print("first request:", json.dumps(first))
+            print(f"plan: read {args.name} from offset {offset} in chunks of up to {length} bytes until EOF, "
+                  f"pin the device's gen from the first reply and send it as expect_gen, "
+                  f"restart once on file_rotated, write the bytes to {args.out}")
+            print("dry run: nothing published, nothing written")
+            return 0
     if args.wait <= 0:
         # ambit-versions quiesces 65 s before sweeping; ambit-flash adds the
         # release download, ~10-60 s per channel and the MQTT reconnect.
@@ -441,6 +533,11 @@ def main(argv=None):
                   if args.cmd in ("log-list", "log-read") and (r.get("type") != REPLY_TYPES[args.cmd] or r.get("ok") is not True)]
     if log_failed:
         print(f"{args.cmd} refused on: {log_failed}")
+    log_malformed = {d: log_reply_problem(r) for d, r in replies.items()
+                     if args.cmd in ("log-list", "log-read") and d not in log_failed and log_reply_problem(r)}
+    if log_malformed:
+        print(f"{args.cmd} incomplete reply from: {json.dumps(log_malformed)}")
+        log_failed += sorted(log_malformed)
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -532,8 +629,12 @@ def stitch_log(args, session, dev, req_id):
                 st.error = f"no reply to chunk {chunk_id} within {args.wait} s"
                 break
             outcome = st.feed(reply)
-            chunk_log.append({k: reply.get(k) for k in ("id", "ok", "detail", "offset", "length", "size", "eof")})
+            chunk_log.append({k: reply.get(k) for k in ("id", "ok", "detail", "gen", "offset", "length", "size", "eof")})
             print(f"  {dev}: {summarise(dev, reply)}", flush=True)
+            if outcome == "restart":
+                print(f"  {dev}: {args.name} was rotated during the read; restarting once from offset {offset}")
+                retries = 0
+                continue
             if outcome != "retry":
                 retries = 0
                 continue
@@ -556,6 +657,7 @@ def stitch_log(args, session, dev, req_id):
             # No file data in the results: the bytes are in --out.
             json.dump({"command": "log-read", "request_id": req_id, "payload": first_payload, "devices": [dev],
                        "log": {"name": args.name, "start": st.start, "bytes": len(st.data), "size": st.size,
+                               "gen": st.gen, "restarts": st.restarts,
                                "chunks": st.chunks, "complete": complete, "error": st.error, "out": args.out},
                        "replies": chunk_log, "no_reply": [] if chunk_log else [dev]},
                       fh, indent=1, sort_keys=True)
