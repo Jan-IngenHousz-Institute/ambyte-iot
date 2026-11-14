@@ -154,7 +154,10 @@ the cursor. The hook:
 `f F e E g G`. Floating point is rendered with integer arithmetic on the
 double. That is exact for the integer part below 2^64 and correct to the printed
 precision. Exact binary ties round half-up, so the last digit can differ from
-newlib's round-half-even. `%a`, `%n` (never written through), wide `%lc/%ls`
+newlib's round-half-even. Float precision is at most 17 fractional digits (18
+significant for `%g`). A larger precision is clamped and counted in
+`unsupported_fmt`, so the output never silently has fewer digits than asked
+for. `%a`, `%n` (never written through), wide `%lc/%ls`
 and unknown conversions are counted in the record's `unsupported_fmt` and shown
 as a marker such as `<%a>`. After an unknown conversion, formatting stops,
 because the sizes of the remaining arguments cannot be known.

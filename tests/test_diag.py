@@ -284,6 +284,22 @@ class DiagHost(unittest.TestCase):
         self.assertTrue(last.startswith("slice|9"), last)
         self.assertEqual(rec["unsupported_fmt"], 3)
 
+    def test_float_precision_is_clamped_and_counted(self):
+        """Review round 3: never fewer digits than asked without saying so."""
+        got = {r[1]: (r[2], int(r[3])) for r in
+               (l.split("\t") for l in self.run_case("fmt_prec").splitlines()) if r[0] == "PREC"}
+        seventeen = "1." + "5" + "0" * 16
+        self.assertEqual(got, {
+            "%.18e|end": (seventeen + "e+00|end", 1),
+            "%.200f|end": (seventeen + "|end", 1),
+            "%.30g|end": ("1.5|end", 1),
+            "%#.30g|end": (seventeen + "|end", 1),        # 18 significant digits
+            "%.17e|end": (seventeen + "e+00|end", 0),     # at the limit: exact, not counted
+            "%.17f|end": (seventeen + "|end", 0),
+            "%.18g|end": ("1.5|end", 0),
+            "%.200e|end": ("2.5" + "0" * 16 + "e+10|end", 1),
+        })
+
     def test_formatter_reads_and_works_within_bounds(self):
         """Review round 2, findings 1 and 2."""
         out = self.run_case("fmt_bounds")

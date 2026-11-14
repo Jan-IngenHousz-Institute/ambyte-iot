@@ -16,8 +16,9 @@
  * (rendered with integer arithmetic on the double: exact for the integer
  * part below 2^64 and correct to the printed precision; exact binary ties
  * round half-up where newlib rounds half-even, so "%.2f" of 85.125 is 85.13
- * here; |x| ≥ 2^64 under %f is printed in e-form). Fractional digits beyond
- * 17 are zero padding.
+ * here; |x| ≥ 2^64 under %f is printed in e-form). Float precision is at
+ * most 17 fractional digits (18 significant for %g/%G): a larger precision
+ * is clamped to that and counted in *unsupported.
  *
  * Not supported, counted in *unsupported and rendered as a visible marker:
  * %a/%A (marker "<%a>", the double is consumed), %n (never written; the

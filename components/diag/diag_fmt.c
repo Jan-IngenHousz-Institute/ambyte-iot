@@ -190,7 +190,7 @@ static size_t strip_zeros(char *body, size_t n, size_t exp_at)
     return k;
 }
 
-static void emit_double(fw_t *w, int flags, int width, int prec, char conv, double v)
+static void emit_double(fw_t *w, int flags, int width, int prec, char conv, double v, uint32_t *unsupported)
 {
     const bool upper = conv == 'F' || conv == 'E' || conv == 'G';
     union { double d; uint64_t u; } bits = {.d = v};
@@ -210,17 +210,23 @@ static void emit_double(fw_t *w, int flags, int width, int prec, char conv, doub
     const bool alt = (flags & F_ALT) != 0;
     char body[64];
     size_t n = 0;
-    size_t pad_zeros_after = 0;                   /* precision beyond FMT_MAX_FRAC */
     char c = conv | 0x20;                         /* lower-case conversion letter */
     if (c == 'f' && a >= FMT_U64_LIMIT) c = 'e';  /* too wide for the integer path */
+    /* The renderer computes at most 17 fractional digits (18 significant for
+     * %g) — beyond a double's precision anyway. A larger request is clamped
+     * and counted rather than silently printing fewer digits than asked
+     * (review round 3). */
+    const int prec_max = c == 'g' ? FMT_MAX_FRAC + 1 : FMT_MAX_FRAC;
+    if (prec > prec_max) {
+        prec = prec_max;
+        if (unsupported) (*unsupported)++;
+    }
     if (c == 'f') {
         n = fixed(a, prec, alt, body, NULL);
-        if (prec > FMT_MAX_FRAC) pad_zeros_after = (size_t)(prec - FMT_MAX_FRAC);
     } else if (c == 'e') {
-        n = sci(a, prec > FMT_MAX_FRAC ? FMT_MAX_FRAC : prec, alt, upper, body, NULL);
+        n = sci(a, prec, alt, upper, body, NULL);
     } else {                                      /* g */
         int P = prec == 0 ? 1 : prec;
-        if (P > FMT_MAX_FRAC + 1) P = FMT_MAX_FRAC + 1;
         int x = 0;
         char probe[64];
         (void)sci(a, P - 1, alt, upper, probe, &x);
@@ -236,16 +242,7 @@ static void emit_double(fw_t *w, int flags, int width, int prec, char conv, doub
             if (!alt) n = strip_zeros(body, n, exp_at);
         }
     }
-    if (pad_zeros_after == 0) {
-        emit(w, flags, width, true, prefix, plen, 0, body, n);
-        return;
-    }
-    /* Rare: %.40f — fold the extra zeros into the body for one padded field. */
-    char wide[64 + 64];
-    size_t k = 0;
-    for (size_t i = 0; i < n; i++) wide[k++] = body[i];
-    for (size_t i = 0; i < pad_zeros_after && k < sizeof wide; i++) wide[k++] = '0';
-    emit(w, flags, width, true, prefix, plen, 0, wide, k);
+    emit(w, flags, width, true, prefix, plen, 0, body, n);
 }
 
 /* ── the formatter ─────────────────────────────────────────────────────── */
@@ -366,7 +363,7 @@ size_t diag_vsnformat(char *out, size_t cap, const char *fmt, va_list ap, uint32
         }
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
             const double v = len == LEN_BIGL ? (double)va_arg(ap, long double) : va_arg(ap, double);
-            emit_double(&w, flags, width, prec, conv, v);
+            emit_double(&w, flags, width, prec, conv, v, unsupported);
             break;
         }
         case 'a': case 'A':

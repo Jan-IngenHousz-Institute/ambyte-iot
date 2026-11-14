@@ -455,6 +455,23 @@ static void sc_fmt_bounds(void)
     printf("HUGE over=%u ms=%.3f neg=%s\n", over, ms, big);
 }
 
+/* Review round 3: float precision beyond the renderer's 17 digits is
+ * clamped and counted, never silently shortened. Full-size buffer. */
+static void sc_fmt_prec(void)
+{
+    const struct { const char *fmt; double v; } cases[] = {
+        {"%.18e|end", 1.5}, {"%.200f|end", 1.5}, {"%.30g|end", 1.5}, {"%#.30g|end", 1.5},
+        {"%.17e|end", 1.5}, {"%.17f|end", 1.5}, {"%.18g|end", 1.5}, {"%.200e|end", 2.5e10},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        char out[256];
+        uint32_t u = 0;
+        size_t n = fmt_into(out, sizeof out, &u, cases[i].fmt, cases[i].v);
+        assert(n == strlen(out));
+        printf("PREC\t%s\t%s\t%u\n", cases[i].fmt, out, u);
+    }
+}
+
 /* An E line with a float through the real hook: formatted without newlib,
  * and %n / %a lines counted in unsupported_fmt. */
 static void sc_hook_fmt(void)
@@ -492,6 +509,7 @@ int main(int argc, char **argv)
     else if (!strcmp(s, "fmt_trunc")) sc_fmt_trunc();
     else if (!strcmp(s, "hook_fmt")) sc_hook_fmt();
     else if (!strcmp(s, "fmt_bounds")) sc_fmt_bounds();
+    else if (!strcmp(s, "fmt_prec")) sc_fmt_prec();
     else return 2;
     return 0;
 }
