@@ -740,7 +740,7 @@ old one. See [remote-diagnostics.md](remote-diagnostics.md) §B.
 |---|---|---|
 | `present` | boolean | The partition holds a dump (verified or not). |
 | `error` | string | Present when the dump or partition could not be read/verified (`ESP_ERR_INVALID_CRC`, `invalid_size`, `no_partition`, …). The summary leaves are then absent. With `present:false` it explains why absence could not be checked. |
-| `id` | 16-hex string | Stable identity of the dump image: size and checksum tail. A string, not a number (u64). |
+| `id` | 16-hex string | Stable identity of the dump: image size (upper 8 hex) and the CRC32 IDF stored over the image (lower 8 hex). A size word out of range gets `ffffffff` + a CRC32 of the whole partition instead. A string, not a number (u64). |
 | `first_seen_boot` | integer | `boot_count` on which this `id` was first seen (persisted in NVS). |
 | `app_elf_sha256` | 16-hex string | Prefix of the crashing image's ELF SHA-256: pick the matching `firmware.elf` for `addr2line`. |
 | `task` | string | FreeRTOS task that crashed. |
@@ -1030,7 +1030,8 @@ record per 60 s; each record is under 4 KiB. Mechanism and rate limits:
       "msg": "ch2: ping timeout", "repeat": 14 }
   ],
   "dropped": 0,
-  "rate_limited": 3
+  "rate_limited": 3,
+  "unsupported_fmt": 0
 }
 ```
 
@@ -1046,6 +1047,7 @@ record per 60 s; each record is under 4 KiB. Mechanism and rate limits:
 | `lines[].repeat` | integer ≥ 1 | Identical consecutive occurrences coalesced into this line. |
 | `dropped` | integer | Occurrences lost since the previous record: ring full, ISR context, recursion, too many concurrent loggers. |
 | `rate_limited` | integer | Occurrences refused by the token buckets since the previous record. |
+| `unsupported_fmt` | integer | Lines since the previous record whose format used a conversion the allocation-free formatter does not render (`%a`, `%n`, wide `%lc/%ls`, unknown); the message shows a marker such as `<%a>`. |
 
 Every captured occurrence is counted exactly once: in one line's `repeat`, or
 in `dropped` / `rate_limited` of exactly one record.
@@ -1059,11 +1061,11 @@ topic, QoS 1, not retained, with a unique `id`. Details:
 ```jsonc
 // request → reply
 {"type":"log_list","id":"r1"}
-{"type":"log_list_result","id":"r1","ok":true,"detail":"ok","dir":"/sdcard/logs",
+{"type":"log_list_result","id":"r1","ok":true,"detail":"ok","dir":"/sdcard/logs","gen":"412.3.18",
  "files":[{"name":"ambyte.1.log","size":1048570},{"name":"ambyte.log","size":20311}],"omitted":0}
 
 {"type":"log_read","id":"r2","name":"ambyte.log","offset":-4096,"length":4096}
-{"type":"log_read_result","id":"r2","ok":true,"detail":"ok","name":"ambyte.log","size":20311,
+{"type":"log_read_result","id":"r2","ok":true,"detail":"ok","name":"ambyte.log","gen":"412.3.18","size":20311,
  "offset":16215,"length":4096,"eof":true,"encoding":"base64","data":"MjAyNi0xMS0xNCAw…"}
 ```
 
@@ -1074,12 +1076,22 @@ topic, QoS 1, not retained, with a unique `id`. Details:
   resolved absolute offset and `length` the bytes returned; `eof` is true when
   `offset + length >= size`.
 - `data`: standard padded base64 of the raw bytes.
+- `gen`: `"<boot_count>.<SD mount generation>.<sd_logger rotation seq>"`,
+  present on every success and on refusals made after the card was checked.
+  It changes on a log rotation (rename), a remount or card swap, and a reboot,
+  but not when `ambyte.log` is appended to. Send the first chunk's `gen` as
+  `expect_gen` on later chunks; a mismatch is refused with `file_rotated`. A
+  rename during one read also refuses with `file_rotated`, and the bytes are
+  discarded.
+- An `ok:true` reply is always complete. If memory runs out while building it,
+  the whole reply becomes `no_mem`.
 - `ok:false` details: `invalid_id`, `invalid_name`, `invalid_offset`,
-  `invalid_length`, `busy` (another log op in flight, or a QoS 1 duplicate),
+  `invalid_length`, `invalid_expect_gen`, `busy` (another log op in flight, or a QoS 1 duplicate),
   `queue_unavailable`, `maintenance_active`, `sd_parked`, `sd_absent`,
   `sd_io_lost`, `sd_busy` (unmount pending), `dir_unavailable`, `not_found`,
   `open_failed`, `not_a_file`, `stat_failed`, `seek_failed`, `read_failed`,
-  `offset_past_eof` (with `size`), `no_mem`.
+  `offset_past_eof` (with `size`), `file_rotated` (with the current `gen`),
+  `rotation_in_progress`, `no_mem`.
 
 ## OTA admission failure details
 

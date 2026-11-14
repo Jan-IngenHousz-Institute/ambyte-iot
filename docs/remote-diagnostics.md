@@ -35,6 +35,12 @@ NVS write per boot). RTC_NOINIT was rejected: it does not survive the power-on
 resets that matter most. `boot_count: 0` means NVS was unavailable; an
 unreadable counter is never restarted at 1.
 
+**Known limitation (accepted).** `app_main` waits 5 s before
+`nvs_flash_init()`, and the counter is bumped right after it. A boot that dies
+inside those first ~5 s (a very fast brownout loop) is therefore not counted.
+The next boot that survives still reports `reset_reason`, and its crash summary
+is unaffected. The boot order was deliberately left unchanged.
+
 How to read it: a `brownout` with a rising `boot_count` every ten minutes is a
 supply collapse under the measurement load; `panic`/`*_wdt` points at
 `health.crash`; `sw` is an orderly `esp_restart()` (OTA, watchdogs, nightly
@@ -48,7 +54,10 @@ stateDiagram-v2
     Boot --> Blank: partition size word 0xFFFFFFFF
     Boot --> Identify: dump present
     Blank --> Cached: {"present":false}
-    Identify --> FirstSeen: id = size + CRC of the checksum tail
+    Boot --> Garbage: size word out of range
+    Garbage --> FirstSeen: fallback id = ffffffff + CRC32 of the whole partition
+    Garbage --> Cached: present true + error invalid_size + first_seen_boot
+    Identify --> FirstSeen: id = image size + the stored CRC32 word
     FirstSeen --> FirstSeen: NVS crash_id equal, keep crash_boot
     FirstSeen --> NewDump: different id, store id + this boot_count
     NewDump --> Verify
@@ -71,6 +80,16 @@ stateDiagram-v2
   the next panic replaces it. `first_seen_boot` (persisted in NVS keyed by the
   dump's identity) tells a stale dump from weeks ago apart from a new one:
   compare it with `boot_count`.
+- Identity: the image size combined with the checksum IDF itself stored at
+  the end of the image (the raw CRC32 word over the whole dump). Two dumps
+  share it only if their CRCs do. The stored word survives later bit rot of
+  the payload, so a dump that starts failing `image_check` keeps its id and its
+  `first_seen_boot`. A header whose size word is out of range has no checksum
+  position, so it gets a separate fallback id: `ffffffff` followed by a CRC32
+  over the whole partition, bounded by the partition size. A first version
+  hashed the last 32 bytes including the CRC, and two same-size dumps that
+  differed only in those bytes collided (review finding 3). The host test
+  reproduces that pair and runs the production `diag_boot.c`.
 - Decoding: `pc` and `backtrace` are `0x…` strings for `addr2line` against
   the ELF whose SHA-256 starts with `app_elf_sha256` (the release's
   `firmware.elf`); `exc_cause` is the Xtensa EXCCAUSE (28 = LoadProhibited,
@@ -84,7 +103,8 @@ flowchart LR
     H -->|every line, first| S[sd_log_vprintf: SD ring + console]
     H -->|level E only| G{recursion guard}
     G -->|re-entered or ISR| D1[dropped++]
-    G -->|ok| F[format into stack buffer: tag + 160 B msg]
+    G -->|ok| F[diag_fmt into stack buffer, no allocation: tag + 160 B msg]
+    F -->|%a, %n, wide, unknown conversion| UF[unsupported_fmt++, marker in msg]
     F --> P{portMUX}
     P -->|same as newest unsealed line| R[repeat++]
     P -->|ring full| D2[dropped++]
@@ -117,6 +137,10 @@ the cursor. The hook:
 
 - takes **no lock but its own portMUX** (`g_diag_log_mux`, a spinlock held
   for a compare, a token refill and a ~200-byte copy, with no calls out);
+- formats with **`diag_fmt`**, its own bounded formatter, which never allocates.
+  It never uses newlib's `vsnprintf`: with full (non-nano) formatting, newlib
+  goes `_svfprintf_r → _dtoa_r → _Balloc → malloc` for every `%f/%e/%g`
+  (review finding 2);
 - never calls event_log, never allocates, never blocks, never sleeps, and does
   not call `time()`/`gettimeofday()` (IDF takes a `_lock` there): lines are
   stamped with `esp_timer` uptime, which is lock-free;
@@ -125,10 +149,37 @@ the cursor. The hook:
   so it cannot deadlock. The esp-mqtt task logging an error does the same: a
   bounded copy into RAM, no event_log, no socket wait.
 
-`vsnprintf` into a stack buffer is the same call `sd_log_vprintf` and the console
-sink already make on every line. Its frame lives in a separate non-inlined
-function that runs after the downstream sinks have returned, so the worst-case
-stack depth of a logging task grows only by the hook's own small frame.
+**Formatting without the heap.** `diag_fmt` handles flags, width and precision
+(digits or `*`), the `hh h l ll j z t L` lengths, `d i u o x X c s p %`, and
+`f F e E g G`. Floating point is rendered with integer arithmetic on the
+double. That is exact for the integer part below 2^64 and correct to the printed
+precision. Exact binary ties round half-up, so the last digit can differ from
+newlib's round-half-even. `%a`, `%n` (never written through), wide `%lc/%ls`
+and unknown conversions are counted in the record's `unsupported_fmt` and shown
+as a marker such as `<%a>`. After an unknown conversion, formatting stops,
+because the sizes of the remaining arguments cannot be known.
+
+The **downstream sinks keep their pre-existing behaviour**: `sd_log_vprintf`
+and the IDF console still format with newlib on the logging task, exactly as
+they did before this feature. That pre-existing behaviour is out of scope here.
+The capture itself adds no heap use.
+
+**Machine-checked.** The hook lives in its own object (`diag_log_hook.c`, with
+`diag_fmt.c`), separate from the drain (`diag_log.c`, which renders JSON with
+newlib in task context). `tools/check_diag_hook_symbols.py` reads the undefined
+symbols of those two objects and refuses any allocator, any printf-family call,
+any newlib `_r` routine, FreeRTOS queues and semaphores, event_log and libc
+time. Anything off its allow-list is refused too. PR CI runs it on the Xtensa
+objects of the firmware build, and `tests/test_diag.py` runs it on host
+objects, including negative cases. On target, the hook objects reference only
+the spinlock, `esp_timer_get_time`, the task handle, string primitives and
+libgcc soft-float helpers. The same CI step checks them with
+`check_sensor_no_fpu.py`: doubles are soft-float on the S3, so logging a float
+never pins a task to an FPU core.
+
+The formatting frame lives in a separate non-inlined function that runs after
+the downstream sinks have returned, so the worst-case stack depth of a logging
+task grows only by the hook's own small frame.
 
 **Drops are counted, never waited for.** Each ESP_LOGE occurrence ends in
 exactly one place: a ring line (counted in its `repeat`), `dropped` (ring
@@ -183,7 +234,7 @@ sequenceDiagram
     participant M as esp-mqtt task (router)
     participant W as Maintenance worker
     participant S as SD card (FAT)
-    O->>M: log_read {id, name, offset, length}
+    O->>M: log_read {id, name, offset, length, expect_gen?}
     M->>M: validate id, name allow-list, integer offset/length
     alt invalid or another log op in flight
         M-->>O: log_read_result ok=false (invalid_name / busy / ...)
@@ -198,11 +249,23 @@ sequenceDiagram
             W-->>O: ok=false detail=sd_absent / sd_io_lost / sd_busy
         else card usable
             W->>S: sdcard_io_begin()
-            W->>S: opendir: name must be an entry of /sdcard/logs
-            W->>S: fopen "rb", fstat, fseek, fread at most 8192 B
-            W->>S: sdcard_io_end()
-            W->>W: maintenance_end()
-            W-->>O: ok=true size offset length eof data(base64)
+            W->>W: gen_before = boot.mount.rotation
+            alt rotation seq odd (sd_logger is renaming)
+                W-->>O: ok=false detail=rotation_in_progress gen
+            else expect_gen given and != gen_before
+                W-->>O: ok=false detail=file_rotated gen (name now holds other bytes)
+            else
+                W->>S: opendir: name must be an entry of /sdcard/logs
+                W->>S: fopen "rb", fstat, fseek, fread at most 8192 B
+                W->>W: gen_after
+                alt gen_after != gen_before (rename during this read)
+                    W-->>O: ok=false detail=file_rotated gen (bytes discarded)
+                else unchanged
+                    W->>S: sdcard_io_end()
+                    W->>W: maintenance_end()
+                    W-->>O: ok=true gen size offset length eof data(base64)
+                end
+            end
         end
     end
 ```
@@ -219,6 +282,23 @@ sequenceDiagram
   refusal is immediate, and the reply is published only after
   `sdcard_io_end()`, so a slow MQTT write can never delay a low-battery
   unmount.
+- **File identity (`gen`).** sd_logger renames `ambyte.log → ambyte.1.log → …`
+  on its own schedule, regardless of the maintenance gate. A basename can
+  therefore name different bytes between two chunks, even bytes of the same
+  size (review finding 5). Every reply carries
+  `gen = "<boot_count>.<SD mount generation>.<sd_logger rotation seq>"`. The
+  rotation sequence is a seqlock: it is odd while `rotate_files()` renames and
+  even otherwise, and it only increases. The mount generation changes on every
+  remount, including a card swap or a park/unpark. One read is bracketed by
+  `gen` samples before `opendir` and after `fclose`. If they differ, the bytes
+  are discarded (`file_rotated`), and an odd sample refuses with
+  `rotation_in_progress`. A request may carry `expect_gen`, and a mismatch is
+  refused with `file_rotated`. Appending to the live `ambyte.log` does not
+  change `gen`; only renames and remounts do.
+- **No partial successes.** Every cJSON operation of a success reply is checked.
+  Any allocation failure turns the whole reply into `no_mem`. Refusals are
+  written into a stack buffer without allocating, so they always go out (review
+  finding 4).
 - **Encoding.** `data` is standard padded base64. It was chosen over escaped
   text because its size is bounded at 4/3 of the raw bytes (≈ 11 KiB on the
   wire at the 8192-byte cap), while escaped text can grow up to 6×.
@@ -234,13 +314,24 @@ fleet_command.py log-read --devices ... --name ambyte.1.log --offset 0 --length 
 - Without `--out`: one request to each listed device; the replies (with base64
   `data`) go to `--results-json`.
 - With `--out FILE` (exactly one explicit device): consecutive chunks with
-  correlated ids `<request>-<n>` are stitched until EOF. Each chunk is checked
-  for the requested name and offset, a byte count that matches the decoded
-  data, and a file that did not shrink between chunks (rotation). `no_mem`
-  halves the chunk size; `busy` (a QoS1 duplicate) is retried. The bytes read
-  so far are always written; the command fails unless the file is complete.
-- A missing reply, a refusal (`sd_parked`, …) or an inconsistent chunk fails
-  the command, like every other fleet command.
+  correlated ids `<request>-<n>` are stitched until EOF. The `gen` of the first
+  chunk is pinned and sent as `expect_gen` with every later chunk. A
+  `file_rotated` refusal restarts the whole read once, from the original offset.
+  A second one fails, and a reply with a different `gen` is never spliced on.
+  Each chunk is also checked for the requested name and offset, data that
+  decodes to exactly `length` bytes inside `size`, and a file that did not
+  shrink. `no_mem` halves the chunk size; `busy` (a QoS1 duplicate) and
+  `rotation_in_progress` are retried. The bytes read so far are always written,
+  and the command fails unless the file is complete.
+- Every `ok:true` reply is checked for completeness before it counts: a listing
+  needs a valid `name` and `size` for every file, plus `omitted` and `gen`, and
+  read data must decode to `length`. A missing reply, a refusal (`sd_parked`,
+  …), an incomplete reply or an inconsistent chunk fails the command, like
+  every other fleet command.
+- `--dry-run` with `--out` prints the target, the first request and the
+  stitching plan before any AWS session or MQTT connection exists. It publishes
+  nothing and writes nothing (review finding 1). The workflow always passes
+  `--out` for `log-read`, so its `dry_run` input relies on exactly this path.
 
 Actions → **Fleet command** offers `log-list` and `log-read` (inputs
 `log_name`, `log_tail_bytes`) behind the same per-environment approval gate as
@@ -251,19 +342,41 @@ every other command. `log-read` there always stitches into the run artifact
 
 Host tests run the production code:
 
-- `tests/test_diag.py`: the reset table (and its match with the pinned IDF
-  enum); crash JSON present, absent and corrupt; parsing, truncation and UTF-8
-  safety; coalescing exactly-once across a failed store; full ring; the
-  recursion and ISR guards; pre-sync `utc_ms: null`; worst-case records split
-  under 4 KiB; sliding-window bucket caps; 12 concurrent producers plus a
-  drainer under ASan and ThreadSanitizer with exact accounting.
+- `tests/test_diag.py`:
+  - the reset table, and its match with the pinned IDF enum;
+  - crash JSON present, absent and corrupt;
+  - parsing, truncation and UTF-8 safety;
+  - coalescing exactly-once across a failed store, and a full ring;
+  - the recursion and ISR guards, and pre-sync `utc_ms: null`;
+  - worst-case records split under 4 KiB, and sliding-window bucket caps;
+  - 12 concurrent producers plus a drainer under ASan and ThreadSanitizer, with
+    exact accounting;
+  - `diag_fmt` against host libc for every integer and string form, floats to
+    the printed precision, unsupported conversions, and truncation;
+  - a float error line through the real hook;
+  - the hook-object symbol check, including negative cases.
+  - `DiagBoot` runs the production `diag_boot.c` across simulated boots: boot
+    counter, NVS failure, a valid dump with its summary and a stable
+    `first_seen_boot`, the reviewer's same-size collision pair, a corrupt
+    dump (never parsed, identity kept), garbage headers (fallback identity) and
+    a missing partition.
 - `tests/test_log_command.py`: `log_command.c` with the pinned-IDF cJSON on a
-  real directory, covering name validation (`..`, `/`, unknown names), negative
-  offsets, past EOF, the length cap, binary safety, every SD and maintenance
-  refusal, busy and a full worker queue, and a read-only proof (file hashes
-  unchanged).
-- `tests/test_fleet_command.py`: payloads, the stitcher, and mocked-transport
-  runs (correlated ids, QoS duplicates, missing replies, refusals).
+  real directory:
+  - name validation (`..`, `/`, unknown names), negative offsets, past EOF and
+    the length cap;
+  - binary safety, every SD and maintenance refusal, busy and a full worker
+    queue;
+  - a read-only proof (file hashes unchanged);
+  - `gen`, `expect_gen` and rotation during a read;
+  - failure of every single allocation in turn for list and read: never a
+    partial success, gate and SD reference always released, no leaks.
+- `tests/test_fleet_command.py`:
+  - payloads, the stitcher, and mocked-transport runs (correlated ids, QoS
+    duplicates, missing replies, refusals);
+  - incomplete-reply rejection;
+  - gen pinning, with same-size replacement that restarts once and then fails;
+  - `--dry-run` with `--out`, from the CLI and from the workflow's own run
+    script.
 
 **Hardware qualification follows the release.** PR builds are unsigned and the
 dev bench accepts only production-signed images, so the bench captures
