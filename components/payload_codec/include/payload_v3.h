@@ -188,6 +188,15 @@ typedef struct {
     uint32_t heap_int_largest_kb;
     bool wd_armed;
     const char *last_wd_reboot_reason;
+    /* Additive (remote diagnostics, 2026-11): why THIS boot started
+     * (diag_reset_reason_name: poweron | brownout | panic | ... | unknown) and
+     * the NVS boot counter (0 = unavailable). Emitted inside health.runtime
+     * after last_wd_reboot_reason when reset_reason != NULL. */
+    const char *reset_reason;
+    uint32_t boot_count;
+    /* Pre-rendered health.crash object (diag_crash_json); inserted verbatim
+     * after health.runtime when non-NULL. Caller guarantees valid JSON. */
+    const char *crash_json;
 
     bool clock_valid;
     const char *clock_source;
@@ -307,8 +316,8 @@ bool payload_v3_build_device(char *out, size_t cap,
                              char *error, size_t error_cap);
 
 /* Schema routing is intentionally strict: only the firmware-owned v3
- * families (trace/3, spectrum/1, spectrum/2, telemetry/1, device/1) bypass the
- * legacy v2 sample builder. */
+ * families (trace/3, spectrum/1, spectrum/2, telemetry/1, device/1, log/1)
+ * bypass the legacy v2 sample builder. */
 bool payload_v3_is_canonical_object(const char *json);
 
 bool payload_v3_can_fetch_retained(bool trigger_valid, size_t segment_count);

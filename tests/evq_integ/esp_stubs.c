@@ -542,3 +542,20 @@ void sd_diag_get(sd_diag_block_t *out) { sd_diag_host_init(); *out = g_sd_diag; 
 void sd_diag_persist(bool force) { (void)force; }
 
 uint32_t esp_random(void) { static uint32_t word = 0x164003u; word = word * 1664525u + 1013904223u; return word; }
+
+/* components/diag boot getters (diag_boot.c reads NVS + the coredump partition
+ * on the target). Worst-width values, so every heartbeat built in this harness
+ * carries the largest reset_reason / boot_count / health.crash the firmware can
+ * produce (16-frame backtrace, fully escaped task name, u32-max counters). */
+const char *diag_reset_reason(void) { return "pwr_glitch"; }
+uint32_t diag_boot_count(void) { return 4294967295u; }
+const char *diag_crash_json(void)
+{
+    return "{\"present\":true,\"id\":\"ffffffffffffffff\",\"first_seen_boot\":4294967295,\"app_elf_sha256\":\"ffffffffffffffff\",\"task\":\"\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\",\"pc\":\"0xffffffff\",\"exc_cause\":4294967295,\"exc_vaddr\":\"0xffffffff\",\"backtrace\":[\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\"],\"bt_corrupted\":true}";
+}
+
+/* diag_log_priv.h: downstream sink before install() (diag_boot.c on target). */
+#include <stdarg.h>
+#include <stdio.h>
+int diag_log_fallback_sink(const char *fmt, va_list ap);
+int diag_log_fallback_sink(const char *fmt, va_list ap) { return vprintf(fmt, ap); }

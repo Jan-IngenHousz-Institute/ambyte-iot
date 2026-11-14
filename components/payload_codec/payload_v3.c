@@ -921,8 +921,17 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   input->heap_dma_largest_kb, input->heap_int_free_kb,
                   input->heap_int_largest_kb, input->wd_armed ? "true" : "false");
         jw_string(&w, input->last_wd_reboot_reason);
+        if (input->reset_reason != NULL) {
+            jw_append(&w, ",\"reset_reason\":");
+            jw_string(&w, input->reset_reason);
+            jw_append(&w, ",\"boot_count\":%lu", (unsigned long)input->boot_count);
+        }
     }
-    jw_append(&w, "},\"clock\":{");
+    jw_append(&w, "}");
+    if (input->crash_json != NULL) {
+        jw_append(&w, ",\"crash\":%s", input->crash_json);
+    }
+    jw_append(&w, ",\"clock\":{");
     if (input->clock_valid) {
         jw_append(&w, "\"source\":"); jw_string(&w, input->clock_source);
         jw_append(&w, ",\"suspect\":%s", input->clock_suspect ? "true" : "false");
@@ -1009,7 +1018,9 @@ bool payload_v3_is_canonical_object(const char *json)
            SCHEMA_PREFIX("{\"schema\":\"ambit.spectrum/1\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambit.spectrum/2\"") ||
            SCHEMA_PREFIX("{\"schema\":\"ambyte.telemetry/1\"") ||
-           SCHEMA_PREFIX("{\"schema\":\"ambit.device/1\"");
+           SCHEMA_PREFIX("{\"schema\":\"ambit.device/1\"") ||
+           /* ambyte.log/1 (diag_log.c): captured ESP_LOGE lines. */
+           SCHEMA_PREFIX("{\"schema\":\"ambyte.log/1\"");
 #undef SCHEMA_PREFIX
 }
 

@@ -68,6 +68,15 @@ PRODUCTION_SOURCES = [
     "components/payload_codec/payload_scalar.c",
     "components/payload_codec/payload_gzip.c",
     "components/ambit_announcement/ambit_announcement.c",
+    # Remote diagnostics: the real capture ring + record renderer behind
+    # cmd_store_log_event (diag_boot.c's NVS/coredump getters are stubbed in
+    # esp_stubs.c).
+    "components/diag/diag_log.c",
+    "components/diag/diag_log_hook.c",
+    "components/diag/diag_fmt.c",
+    "components/diag/diag_json.c",
+    "components/diag/diag_crash.c",
+    "components/diag/diag_reset.c",
 ]
 HARNESS_SOURCES = ["tests/evq_integ/harness.c"]
 IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "tests/evq_host/sha256.c",
@@ -80,7 +89,7 @@ INCLUDES = [
     "components/sd_card", "components/clock_trust/include", "components/fleet_jitter/include",
     "components/timezone/include", "components/ota_update/include",
     "components/wifi_manager/include", "components/ambit_announcement/include",
-    "tests/evq_host",
+    "tests/evq_host", "components/diag/include", "components/diag",
 ]
 
 STATE_SCENARIOS = [

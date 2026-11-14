@@ -44,6 +44,7 @@
 
 /* The production drain + watchdog predicate, as one translation unit. */
 #include "sync_runner.c"
+#include "diag.h"
 
 void h_set_clock_source(const char *s);
 
@@ -1695,6 +1696,8 @@ static void sc_worst(void)
         w.psram_free_kb = w.psram_largest_kb = w.psram_size_kb = UINT32_MAX;
         w.heap_dma_largest_kb = w.heap_int_free_kb = w.heap_int_largest_kb = UINT32_MAX;
         w.wd_armed = true; w.last_wd_reboot_reason = wd;
+        /* Remote diagnostics: worst-width reset_reason/boot_count/health.crash (esp_stubs.c). */
+        w.reset_reason = diag_reset_reason(); w.boot_count = diag_boot_count(); w.crash_json = diag_crash_json();
         w.clock_valid = true; w.clock_source = src; w.clock_suspect = true;
         w.software_valid = true; w.firmware = fw; w.script_valid = true; w.script_sha256 = sha;
         w.script_version = ver; w.script_built_against_fw = bld; w.script_installed_on_fw = ins; w.script_metadata_verified = true;

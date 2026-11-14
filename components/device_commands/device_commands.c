@@ -15,6 +15,7 @@
 #include "ambit_protocol.h"
 #include "ambit_announcement.h"
 #include "clock_trust.h"
+#include "diag.h"
 #include "envelope_provenance.h"
 #include "telemetry_publish.h"
 #include "payload_gzip.h"
@@ -1894,6 +1895,11 @@ static cmd_result_t emit_status_event(bool direct)
         .heap_int_largest_kb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024U,
         .wd_armed = wd_armed,
         .last_wd_reboot_reason = wd_reason,
+        /* Remote diagnostics (2026-11): cached once at boot by diag_boot_init,
+         * so the heartbeat path never touches NVS or the coredump partition. */
+        .reset_reason = diag_reset_reason(),
+        .boot_count = diag_boot_count(),
+        .crash_json = diag_crash_json(),
         .clock_valid = true,
         .clock_source = clock_source,
         .clock_suspect = clock_suspect,
@@ -2067,6 +2073,66 @@ cmd_result_t cmd_store_status_event(void)
 cmd_result_t cmd_publish_status_event(void)
 {
     return emit_status_event(true);
+}
+
+/* ── ambyte.log/1: captured error lines (diag_log.h) ──────────────────────
+ * Producer, not publisher: the record joins the FIFO like any measurement and
+ * leaves through the windowed QoS1 publisher (at-least-once; a duplicate after
+ * a lost PUBACK is acceptable, a skip never happens). The 4 KiB build buffer
+ * is a transient heap block in the watchdog task — never touched by the hook,
+ * which only ever sees diag_log's static ring. */
+cmd_result_t cmd_store_log_event(void)
+{
+    if (!s_initialized || s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
+    }
+    const int64_t up_us = esp_timer_get_time();
+    const int64_t utc_ms = now_ms();
+    /* Same 2024 validity floor as SNTP/publisher: a clock below it has never
+     * been set, and lines must then carry utc_ms:null rather than 1970. */
+    const bool clock_valid = utc_ms >= CLOCK_TRUST_VALID_FLOOR_S * 1000LL;
+    if (clock_valid) diag_log_note_clock_valid(up_us);
+
+    diag_log_batch_t batch;
+    if (!diag_log_seal(&batch, up_us)) {
+        return make_result(ESP_ERR_NOT_FOUND, "no log lines to store");
+    }
+    char *payload = malloc(DIAG_LOG_RECORD_CAP + 1U);
+    if (payload == NULL) {
+        diag_log_unseal();
+        return make_result(ESP_ERR_NO_MEM, "log record buffer alloc failed");
+    }
+    int64_t mid = 0;
+    esp_err_t err = s_cfg.next_id(&mid);
+    if (err != ESP_OK) {
+        free(payload);
+        diag_log_unseal();
+        return make_result(err, "next_id failed: %s", esp_err_to_name(err));
+    }
+    const diag_log_render_ctx_t ctx = {
+        .measure_id = mid, .device = s_mac_str, .observed_utc_ms = utc_ms,
+        .boot_count = diag_boot_count(), .now_uptime_us = up_us,
+        .clock_valid = clock_valid, .now_utc_ms = utc_ms,
+    };
+    if (diag_log_render(&batch, &ctx, payload, DIAG_LOG_RECORD_CAP + 1U) < 0) {
+        free(payload);
+        diag_log_unseal();
+        return make_result(ESP_ERR_INVALID_SIZE, "log record render failed");
+    }
+    const measurement_event_desc_t d = {
+        .measure_id = mid, .device = s_mac_str, .tag = MEASUREMENT_TAG_LOG,
+        .start_ms = utc_ms, .end_ms = utc_ms, .payload_json = payload,
+    };
+    err = s_cfg.store_event(&d);
+    free(payload);
+    if (err != ESP_OK) {
+        diag_log_unseal();          /* every line stays for the next minute */
+        return make_result(err, "log record store failed: %s", esp_err_to_name(err));
+    }
+    diag_log_commit(&batch, up_us);
+    return make_result(ESP_OK, "LOG id=%lld lines=%u dropped=%u rate_limited=%u",
+                       (long long)mid, (unsigned)batch.used, (unsigned)batch.dropped,
+                       (unsigned)batch.rate_limited);
 }
 
 /* Last battery voltage latched from any successful charger read (power gate /

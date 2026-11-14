@@ -5,7 +5,9 @@ name: Fleet command (ping / inventory / replay)
 # SD-archive survey (`inventory`) or the archive re-send (`replay`).
 # Read-only by default; `replay` with mode run/cancel changes device state and
 # goes through the same environment gate as an OTA. Results land in the run
-# summary and in a results artifact.
+# summary and in a results artifact. `log-list` / `log-read` read the SD log
+# directory (read-only, still behind the environment gate); log-read stitches
+# one device's file into the artifact (device-log.txt).
 
 on:
   workflow_dispatch:
@@ -18,7 +20,7 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay, get-timezone, set-timezone]
+        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read]
         default: ping
       timezone:
         description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
@@ -28,6 +30,14 @@ on:
         description: "Optional timezone verification: exact UTC offset in seconds (Darwin = 34200)"
         type: string
         default: ""
+      log_name:
+        description: "log-read only: file name from log-list (e.g. ambyte.log); needs exactly one device"
+        type: string
+        default: ""
+      log_tail_bytes:
+        description: "log-read only: read this many bytes from the end (0 = the whole file)"
+        type: string
+        default: "65536"
       devices:
         description: "Exact client ids (ambyte_<MAC> or AMBYTE_<MAC>, case matters) or MACs, comma/space separated; empty = discover active devices"
         type: string
@@ -135,9 +145,11 @@ jobs:
           CHUNK: ${{ inputs.chunk }}
           WAIT: ${{ inputs.wait_seconds }}
           DRY_RUN: ${{ inputs.dry_run }}
+          LOG_NAME: ${{ inputs.log_name }}
+          LOG_TAIL: ${{ inputs.log_tail_bytes }}
         run: |
           set -uo pipefail
-          for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT; do
+          for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT LOG_TAIL; do
             [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "::error::${v} must be a non-negative integer"; exit 2; }
           done
           if [[ "${COMMAND}" == "set-timezone" && -z "${DEVICES//[[:space:]]/}" ]]; then
@@ -156,6 +168,11 @@ jobs:
           [[ -n "${EXPECT_OFFSET}" ]] && ARGS+=(--expect-offset "${EXPECT_OFFSET}")
           [[ -n "${EXPECT_FW}" ]] && ARGS+=(--expect-fw "${EXPECT_FW}")
           [[ "${COMMAND}" == "replay" ]] && ARGS+=(--mode "${MODE}" --token "${TOKEN}")
+          if [[ "${COMMAND}" == "log-read" ]]; then
+            # fleet_command validates the name and refuses anything but one explicit device.
+            ARGS+=(--name "${LOG_NAME}" --out device-log.txt)
+            [[ "${LOG_TAIL}" != "0" ]] && ARGS+=(--tail "${LOG_TAIL}")
+          fi
           [[ "${DRY_RUN}" == "true" ]] && ARGS+=(--dry-run)
           set +e
           python tools/fleet_deploy/fleet_command.py "${ARGS[@]}" | tee command.log
@@ -178,4 +195,5 @@ jobs:
           path: |
             results.json
             command.log
+            device-log.txt
           if-no-files-found: ignore

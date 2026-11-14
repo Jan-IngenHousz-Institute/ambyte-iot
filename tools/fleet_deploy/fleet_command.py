@@ -15,6 +15,14 @@ client-id spelling rules: `ambyte_` and `AMBYTE_` are different MQTT routes.
     fleet_command.py ambit-versions --devices ambyte_10:00:3B:72:22:38
     fleet_command.py ambit-flash --devices ... --version 1.4.0 --channel 0 \
         --manifest-url https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.4.0/manifest.json
+    fleet_command.py log-list --devices ambyte_28:37:2F:FF:FC:80
+    fleet_command.py log-read --devices ... --name ambyte.log --tail 65536 --out ambyte.log
+    fleet_command.py log-read --devices ... --name ambyte.1.log --offset 0 --length 8192
+
+log-list / log-read (firmware with remote diagnostics) read the SD log
+directory (/sdcard/logs) without changing anything on the device. One
+log-read request returns at most 8192 bytes (base64 in `data`); --out stitches
+consecutive chunks of one device's file into a local file until EOF.
 
 Replies are written to --results-json (per device) and summarised on stdout.
 Exit status: 0 when every targeted device replied (and, for ping with
@@ -27,6 +35,7 @@ read-only. An ambit-flash pauses measurement and MQTT on the device for the
 download plus ~10-60 s per channel; replies wait for its terminal report.
 """
 import argparse
+import base64
 import json
 import queue
 import re
@@ -40,6 +49,183 @@ except ImportError:
 
 READ_ONLY_MODES = ("count", "status")
 WINDOW_KEYS = ("from_id", "to_id", "from_ms", "to_ms")
+# log_read limits mirror components/command_router/include/log_command.h.
+LOG_READ_DEFAULT = 4096
+LOG_READ_MAX = 8192
+LOG_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
+# A busy/queue refusal can be a QoS 1 duplicate of a request whose real answer
+# is still coming: never terminal on its own (same rule as the timezone commands).
+NON_TERMINAL_DETAILS = ("busy", "queue_unavailable")
+REPLY_TYPES = {"get-timezone": "timezone_result", "set-timezone": "set_timezone_result",
+               "log-list": "log_list_result", "log-read": "log_read_result"}
+
+
+def valid_log_name(name):
+    """Same allow-list as the firmware: a plain basename, no '/', no '..'."""
+    return isinstance(name, str) and bool(LOG_NAME_RE.fullmatch(name)) and ".." not in name
+
+
+def log_read_window(args):
+    """(offset, length) of the first log_read request. Pure."""
+    tail = getattr(args, "tail", 0) or 0
+    offset = getattr(args, "offset", 0) or 0
+    if tail < 0:
+        raise SystemExit("--tail must be a positive byte count")
+    if tail and offset:
+        raise SystemExit("--tail and --offset are mutually exclusive")
+    length = getattr(args, "length", 0) or (LOG_READ_MAX if getattr(args, "out", None) else LOG_READ_DEFAULT)
+    if not 1 <= length <= LOG_READ_MAX:
+        raise SystemExit(f"--length must be 1..{LOG_READ_MAX} bytes per request")
+    return (-tail if tail else offset), length
+
+
+def _is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def log_reply_problem(reply):
+    """Why an ok:true log_list/log_read reply cannot be trusted, or None. Pure.
+
+    A device that ran out of memory mid-reply must never be taken for a
+    complete answer (review finding 4): every listed file needs a valid name
+    and a size, and read data must decode to exactly `length` bytes inside
+    the reported file size.
+    """
+    if reply.get("ok") is not True:
+        return None
+    t = reply.get("type")
+    if not isinstance(reply.get("gen"), str) or not reply.get("gen"):
+        return "missing gen"
+    if t == "log_list_result":
+        files = reply.get("files")
+        if not isinstance(files, list):
+            return "files missing"
+        for f in files:
+            if not isinstance(f, dict) or not valid_log_name(f.get("name")) or not _is_count(f.get("size")):
+                return f"incomplete file entry {f!r}"
+        if not _is_count(reply.get("omitted")):
+            return "omitted missing"
+        return None
+    if t == "log_read_result":
+        if not valid_log_name(reply.get("name")):
+            return "name missing"
+        if not all(_is_count(reply.get(k)) for k in ("size", "offset", "length")):
+            return "size/offset/length missing"
+        if not isinstance(reply.get("eof"), bool) or reply.get("encoding") != "base64":
+            return "eof/encoding missing"
+        try:
+            raw = base64.b64decode(reply.get("data"), validate=True)
+        except (TypeError, ValueError) as exc:
+            return f"data is not base64: {exc}"
+        if len(raw) != reply["length"]:
+            return f"data decodes to {len(raw)} bytes, reply says {reply['length']}"
+        if reply["offset"] + reply["length"] > reply["size"]:
+            return "chunk extends past the reported file size"
+        if reply["eof"] != (reply["offset"] + reply["length"] >= reply["size"]):
+            return "eof inconsistent with offset/length/size"
+        if reply["length"] == 0 and not reply["eof"]:
+            # Review round 2, finding 5: an empty chunk before EOF makes no
+            # progress and must never complete a stitched read.
+            return "empty chunk before EOF (no progress)"
+        return None
+    return f"unexpected type {t!r}"
+
+
+class LogStitcher:
+    """Joins consecutive log_read_result chunks of ONE file into bytes.
+
+    Each reply is checked against the request it answers: the right name, the
+    requested absolute offset (a negative/tail first request is resolved by the
+    device), base64 that decodes to exactly `length` bytes, and a file that did
+    not shrink between chunks.
+
+    Rotation (review finding 5): sd_logger renames ambyte.log -> ambyte.1.log
+    -> ... on its own schedule, so a basename can name different bytes between
+    two chunks, even of the same size. The device reports `gen` (boot, SD
+    mount, rotation sequence); the first chunk pins it and every later request
+    carries it as `expect_gen`. A "file_rotated" refusal restarts the read once
+    from the original offset; a second one fails the command. A reply whose
+    gen differs from the pinned one is never accepted.
+    """
+
+    MIN_CHUNK = 1024
+    RETRY_DETAILS = NON_TERMINAL_DETAILS + ("rotation_in_progress",)
+
+    def __init__(self, name, offset, length, max_chunks=400, expect_gen=None):
+        self.name, self.first_offset, self.next_offset, self.length = name, offset, offset, length
+        self.max_chunks = max_chunks
+        self.data = bytearray()
+        self.start = self.size = self.error = None
+        # An operator-supplied --expect-gen pins the identity from the very
+        # first request and is never traded for another generation: a
+        # mismatch fails, it does not restart (review round 2, finding 3).
+        self.gen = expect_gen or None
+        self.user_pinned = self.gen is not None
+        self.chunks = 0
+        self.restarts = 0
+        self.done = False
+
+    def request(self, req_id):
+        msg = {"type": "log_read", "id": req_id, "name": self.name,
+               "offset": self.next_offset, "length": self.length}
+        if self.gen is not None:
+            msg["expect_gen"] = self.gen
+        return msg
+
+    def _restart(self):
+        self.data = bytearray()
+        self.start = self.size = self.gen = None
+        self.next_offset = self.first_offset
+        self.chunks = 0
+        self.restarts += 1
+
+    def feed(self, reply):
+        """Returns 'continue', 'retry' (same offset again), 'restart', 'done' or 'error'."""
+        if reply.get("ok") is not True:
+            detail = reply.get("detail")
+            if detail == "no_mem" and self.length > self.MIN_CHUNK:
+                self.length = max(self.MIN_CHUNK, self.length // 2)   # fragmented heap: smaller reply
+                return "retry"
+            if detail in self.RETRY_DETAILS:
+                return "retry"
+            if detail == "file_rotated" and self.restarts == 0 and not self.user_pinned:
+                self._restart()
+                return "restart"
+            self.error = f"device refused: {detail}"
+            return "error"
+        if reply.get("type") != "log_read_result":
+            self.error = f"unexpected reply type {reply.get('type')!r}"
+            return "error"
+        problem = log_reply_problem(reply)
+        if problem:
+            self.error = f"malformed reply: {problem}"
+            return "error"
+        offset, length, size = reply["offset"], reply["length"], reply["size"]
+        raw = base64.b64decode(reply["data"], validate=True)
+        if reply.get("name") != self.name:
+            self.error = f"reply for {reply.get('name')!r}, asked for {self.name!r}"
+        elif self.next_offset >= 0 and offset != self.next_offset:
+            self.error = f"reply at offset {offset}, asked for {self.next_offset}"
+        elif self.gen is not None and reply["gen"] != self.gen:
+            self.error = f"{self.name} changed identity (gen {self.gen} -> {reply['gen']}) during the read"
+        elif self.size is not None and size < self.size:
+            self.error = f"{self.name} shrank from {self.size} to {size} bytes (rotated during the read)"
+        if self.error:
+            return "error"
+        if self.start is None:
+            self.start = offset
+            self.gen = reply["gen"]
+        self.size = size
+        self.data += raw
+        self.next_offset = offset + length
+        self.chunks += 1
+        if reply["eof"]:                          # only EOF completes a stitched read
+            self.done = True
+            return "done"
+        if self.chunks >= self.max_chunks:
+            self.error = f"gave up after {self.chunks} chunks"
+            return "error"
+        return "continue"
 
 
 def parse_devices(spec):
@@ -81,6 +267,16 @@ def build_message(args, req_id):
             msg.update(window)
             if args.mode == "run":
                 msg["chunk"] = args.chunk
+        return msg
+    if args.cmd == "log-list":
+        return {"type": "log_list", "id": req_id}
+    if args.cmd == "log-read":
+        if not valid_log_name(getattr(args, "name", "")):
+            raise SystemExit("log-read needs --name: a plain file name from log-list (e.g. ambyte.log)")
+        offset, length = log_read_window(args)
+        msg = {"type": "log_read", "id": req_id, "name": args.name, "offset": offset, "length": length}
+        if getattr(args, "expect_gen", ""):
+            msg["expect_gen"] = args.expect_gen
         return msg
     if args.cmd == "ambit-versions":
         return {"type": "ambit_versions", "id": req_id}
@@ -131,6 +327,14 @@ def summarise(dev, reply):
         return (f"timezone={reply.get('timezone')} active={reply.get('active_timezone')} "
                 f"offset_s={reply.get('utc_offset_seconds')} applied={reply.get('applied')} "
                 f"ok={reply.get('ok')} detail={reply.get('detail')}")
+    if t == "log_list_result":
+        files = " ".join(f"{f.get('name')}={f.get('size')}" for f in reply.get("files") or [])
+        return (f"log_list ok={reply.get('ok')} detail={reply.get('detail')} dir={reply.get('dir')} "
+                f"files: {files or '-'}" + (f" omitted={reply.get('omitted')}" if reply.get("omitted") else ""))
+    if t == "log_read_result":
+        return (f"log_read ok={reply.get('ok')} detail={reply.get('detail')} name={reply.get('name')} "
+                f"gen={reply.get('gen')} offset={reply.get('offset')} length={reply.get('length')} "
+                f"size={reply.get('size')} eof={reply.get('eof')}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -143,7 +347,16 @@ def summarise(dev, reply):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash", "get-timezone", "set-timezone"])
+    ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash",
+                                    "get-timezone", "set-timezone", "log-list", "log-read"])
+    ap.add_argument("--name", default="", help="log-read: file name from log-list (e.g. ambyte.log)")
+    ap.add_argument("--offset", type=int, default=0, help="log-read: byte offset; negative = from the end")
+    ap.add_argument("--length", type=int, default=0,
+                    help=f"log-read: bytes per request, 1..{LOG_READ_MAX} (default {LOG_READ_DEFAULT}; {LOG_READ_MAX} with --out)")
+    ap.add_argument("--tail", type=int, default=0, help="log-read: start this many bytes before the end")
+    ap.add_argument("--out", default=None, help="log-read: stitch chunks until EOF into this local file (one device)")
+    ap.add_argument("--expect-gen", dest="expect_gen", default="",
+                    help="log-read: refuse unless the file still has this gen (from an earlier reply)")
     ap.add_argument("--expect-offset", type=int, default=None, help="timezone commands: require this UTC offset in seconds at verification")
     ap.add_argument("--timezone", default="", help="set-timezone: canonical IANA name (e.g. Australia/Darwin)")
     ap.add_argument("--url", default="", help="dev-bench OTA only; HTTPS URL (never printed)")
@@ -170,6 +383,34 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "set-timezone" and (not args.devices.strip() or not parse_devices(args.devices)):
         ap.error("set-timezone requires an explicit --devices list; fleet-wide discovery is refused")
+    if args.cmd == "log-read":
+        # Validate before any AWS access: a bad name or window must cost nothing.
+        try:
+            log_read_window(args)
+        except SystemExit as exc:
+            ap.error(str(exc))
+        if not valid_log_name(args.name):
+            ap.error("log-read needs --name: a plain file name from log-list (e.g. ambyte.log)")
+        if args.expect_gen and (len(args.expect_gen) >= 48 or not re.fullmatch(r"[0-9a-f.]+", args.expect_gen)):
+            ap.error("--expect-gen must be a gen string from an earlier log reply (e.g. 412.9c41e07a.3.18)")
+        if args.out and (not args.devices.strip() or len(parse_devices(args.devices)) != 1):
+            ap.error("log-read --out stitches one file from exactly one explicit --devices target")
+        if args.out and args.dry_run:
+            # Before ANY session or transport: the stitcher publishes for real
+            # (review finding 1 — the workflow always passes --out).
+            dev = parse_devices(args.devices)[0]
+            offset, length = log_read_window(args)
+            first = LogStitcher(args.name, offset, length, expect_gen=args.expect_gen or None).request(
+                f"fc-log-read-x-{int(time.time())}-0")
+            print(f"log-read (dry run): target={dev}")
+            print("first request:", json.dumps(first))
+            pin = (f"require gen {args.expect_gen} on every chunk and fail on file_rotated"
+                   if args.expect_gen else
+                   "pin the device's gen from the first reply, send it as expect_gen, restart once on file_rotated")
+            print(f"plan: read {args.name} from offset {offset} in chunks of up to {length} bytes until EOF, "
+                  f"{pin}, write the bytes to {args.out}")
+            print("dry run: nothing published, nothing written")
+            return 0
     if args.wait <= 0:
         # ambit-versions quiesces 65 s before sweeping; ambit-flash adds the
         # release download, ~10-60 s per channel and the MQTT reconnect.
@@ -208,6 +449,8 @@ def main(argv=None):
         raise SystemExit("no target devices")
     req_id = f"fc-{args.cmd}-{args.mode if args.cmd == 'replay' else 'x'}-{int(time.time())}"
     payload = build_message(args, req_id)
+    if args.cmd == "log-read" and args.out:
+        return stitch_log(args, session, devices[0], req_id)
     mutating = (args.cmd == "replay" and args.mode not in READ_ONLY_MODES) or args.cmd in ("ambit-flash", "set-timezone")
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
@@ -264,11 +507,10 @@ def main(argv=None):
                         # published just before the terminal one can land after it.
                         deadline = min(deadline, time.monotonic() + 5)
                 continue
-            if args.cmd in ("get-timezone", "set-timezone"):
-                want_type = "timezone_result" if args.cmd == "get-timezone" else "set_timezone_result"
-                if data.get("type") != want_type:
+            if args.cmd in REPLY_TYPES:
+                if data.get("type") != REPLY_TYPES[args.cmd]:
                     continue
-                if data.get("detail") in ("busy", "queue_unavailable"):
+                if data.get("detail") in NON_TERMINAL_DETAILS:
                     # A QoS 1 duplicate can be refused while the original
                     # request is still queued. Keep that evidence, but wait for
                     # the actual terminal rather than exiting on a false fail.
@@ -276,7 +518,7 @@ def main(argv=None):
                     replies.setdefault(dev, data)
                     continue
                 replies[dev] = data
-                if len(replies) >= len(devices) and all(r.get("detail") not in ("busy", "queue_unavailable") for r in replies.values()):
+                if len(replies) >= len(devices) and all(r.get("detail") not in NON_TERMINAL_DETAILS for r in replies.values()):
                     break
                 continue
             # keep the first terminal-looking reply; progress replies of a run keep coming
@@ -299,6 +541,17 @@ def main(argv=None):
             or (args.cmd == "set-timezone" and (r.get("saved") is not True or r.get("timezone") != args.timezone))]
         if timezone_failed:
             print(f"timezone not verified on: {timezone_failed}")
+    # log-list / log-read: a refusal (sd_parked, sd_absent, busy, ...) is a
+    # failed command, with the device's detail in the results.
+    log_failed = [d for d, r in replies.items()
+                  if args.cmd in ("log-list", "log-read") and (r.get("type") != REPLY_TYPES[args.cmd] or r.get("ok") is not True)]
+    if log_failed:
+        print(f"{args.cmd} refused on: {log_failed}")
+    log_malformed = {d: log_reply_problem(r) for d, r in replies.items()
+                     if args.cmd in ("log-list", "log-read") and d not in log_failed and log_reply_problem(r)}
+    if log_malformed:
+        print(f"{args.cmd} incomplete reply from: {json.dumps(log_malformed)}")
+        log_failed += sorted(log_malformed)
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -329,9 +582,100 @@ def main(argv=None):
                        "request_id": req_id, "payload": payload, "devices": devices,
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
                        "firmware": fw_hist, "replay_states": states, "progress": progress,
-                       "timezone_failures": timezone_failed},
+                       "timezone_failures": timezone_failed, "log_failures": log_failed},
                       fh, indent=1, sort_keys=True)
-    return 1 if (missing or bad_fw or flash_failed or timezone_failed) else 0
+    return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed) else 0
+
+
+def stitch_log(args, session, dev, req_id):
+    """log-read --out: sequential chunk requests to ONE device until EOF.
+
+    Every chunk has its own correlated id (`<req_id>-<n>`); a reply for any
+    other id is ignored. A chunk with no reply within --wait fails the command
+    (after a bounded retry when the only answers were busy/queue refusals).
+    The bytes read so far are always written, and the results JSON records
+    whether the file is complete.
+    """
+    from awscrt import mqtt
+
+    offset, length = log_read_window(args)
+    st = LogStitcher(args.name, offset, length, expect_gen=args.expect_gen or None)
+    by_identity = fleet_deploy.device_index([dev])
+    q = queue.Queue()
+    conn = fleet_deploy.mqtt_connection(session, fleet_deploy.STATUS_TOPIC,
+                                        lambda topic, payload, **kw: q.put((time.time(), topic, payload)),
+                                        client_id="fleet-deploy-command")
+    chunk_log = []
+    first_payload = None
+    n = 0
+    retries = 0
+    print(f"log-read: {dev} {args.name} from offset {offset} in chunks of {length} -> {args.out} (request id {req_id})")
+    try:
+        while not st.done and st.error is None:
+            chunk_id = f"{req_id}-{n}"
+            payload = st.request(chunk_id)
+            first_payload = first_payload or payload
+            fut, _ = conn.publish(topic=fleet_deploy.COMMAND_TOPIC_FMT.format(device=dev),
+                                  payload=json.dumps(payload), qos=mqtt.QoS.AT_LEAST_ONCE)
+            fut.result(timeout=10)
+            n += 1
+            terminal, refused = None, None
+            deadline = time.monotonic() + args.wait
+            while time.monotonic() < deadline and terminal is None:
+                try:
+                    _, topic, raw = q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                if data.get("id") != chunk_id or data.get("type") != "log_read_result":
+                    continue
+                if fleet_deploy.requested_device_from_status_topic(topic, by_identity) != dev:
+                    continue
+                if data.get("ok") is not True and data.get("detail") in NON_TERMINAL_DETAILS:
+                    refused = data              # maybe a QoS 1 duplicate: keep waiting
+                    continue
+                terminal = data
+            reply = terminal or refused
+            if reply is None:
+                st.error = f"no reply to chunk {chunk_id} within {args.wait} s"
+                break
+            outcome = st.feed(reply)
+            chunk_log.append({k: reply.get(k) for k in ("id", "ok", "detail", "gen", "offset", "length", "size", "eof")})
+            print(f"  {dev}: {summarise(dev, reply)}", flush=True)
+            if outcome == "restart":
+                print(f"  {dev}: {args.name} was rotated during the read; restarting once from offset {offset}")
+                retries = 0
+                continue
+            if outcome != "retry":
+                retries = 0
+                continue
+            retries += 1                        # consecutive refusals of the same offset
+            if retries > 5:
+                st.error = f"gave up after {retries} retries (last: {reply.get('detail')})"
+                break
+            time.sleep(2)
+    finally:
+        conn.disconnect().result(timeout=10)
+
+    with open(args.out, "wb") as fh:
+        fh.write(st.data)
+    complete = st.done and st.error is None
+    print(f"{'complete' if complete else 'INCOMPLETE'}: {len(st.data)} bytes of {args.name} "
+          f"(offset {st.start}, file size {st.size}) in {st.chunks} chunk(s) -> {args.out}"
+          + (f"; {st.error}" if st.error else ""))
+    if args.results_json:
+        with open(args.results_json, "w") as fh:
+            # No file data in the results: the bytes are in --out.
+            json.dump({"command": "log-read", "request_id": req_id, "payload": first_payload, "devices": [dev],
+                       "log": {"name": args.name, "start": st.start, "bytes": len(st.data), "size": st.size,
+                               "gen": st.gen, "restarts": st.restarts,
+                               "chunks": st.chunks, "complete": complete, "error": st.error, "out": args.out},
+                       "replies": chunk_log, "no_reply": [] if chunk_log else [dev]},
+                      fh, indent=1, sort_keys=True)
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

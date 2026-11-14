@@ -25,6 +25,9 @@ esp_err_t sdcard_init_default(void);
 esp_err_t sdcard_mount(void);
 esp_err_t sdcard_unmount(void);
 bool sdcard_is_mounted(void);
+// Successful mounts since boot (lock-free). Changes on every remount, including
+// a low-battery park/unpark and a card swap.
+uint32_t sdcard_mount_generation(void);
 
 // Free bytes on the mounted FATFS volume (via esp_vfs_fat_info). Returns an error
 // if the card is not mounted. Lets callers distinguish a full card from a dead one

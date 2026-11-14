@@ -249,6 +249,14 @@ cmd_result_t cmd_store_status_event(void);
  * gate. Uses the shared ID allocator but never claims or ACKs a stored event. */
 cmd_result_t cmd_publish_status_event(void);
 
+/* Drain captured ESP_LOGE lines (diag_log.h) into ONE ambyte.log/1 event (tag
+ * LOG) through the normal producer API: next_id + store_event, so the id is
+ * allocated under event_log's mutex and the cursor is never touched. Task
+ * context only — called from the sync_runner watchdog task's 60 s tick. At
+ * most one record per 60 s; ESP_ERR_NOT_FOUND = nothing to report (or too
+ * soon). A failed store keeps every line for the next attempt. */
+cmd_result_t cmd_store_log_event(void);
+
 /* Last battery voltage (mV) latched from any successful charger read;
  * 0 = never read. Cheap probe (no I2C) for the status-LED blinker. */
 uint32_t device_commands_last_battery_mv(void);

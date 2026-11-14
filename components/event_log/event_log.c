@@ -1650,6 +1650,11 @@ void event_log_set_sd_parked(bool parked)
     if (!parked) evq_keeper_notify();
 }
 
+bool event_log_sd_parked(void)
+{
+    return s_sd_parked;
+}
+
 esp_err_t event_log_prepare_shutdown(void)
 {
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;

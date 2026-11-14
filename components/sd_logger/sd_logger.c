@@ -290,12 +290,38 @@ static void log_path(char *buf, size_t cap, int idx)
     else          snprintf(buf, cap, "%s/%s.%d.log", SD_LOGGER_DIR, SD_LOGGER_BASENAME, idx);
 }
 
+/* Rotation seqlock for the read-only remote reader (log_read, review finding
+ * 5). sd_logger renames ambyte.log → ambyte.1.log → … on its own schedule,
+ * independent of the maintenance gate, so a multi-chunk remote read could
+ * otherwise splice two different files that happen to share a basename and a
+ * size. The counter is ODD while rotate_files() is renaming and EVEN when the
+ * names are stable; it only ever increases (RAM, reset at boot: the reader
+ * pairs it with boot_count and the SD mount generation). A reader samples it
+ * before and after one bounded read and refuses if it moved or was odd.
+ * Written only by the writer task; read lock-free. */
+static uint32_t s_rot_seq;
+
+uint32_t sd_logger_rotation_seq(void)
+{
+    return __atomic_load_n(&s_rot_seq, __ATOMIC_ACQUIRE);
+}
+
+static bool rotate_files_inner(void);
+
+static bool rotate_files(void)
+{
+    __atomic_fetch_add(&s_rot_seq, 1, __ATOMIC_ACQ_REL);   /* odd: names are moving */
+    bool ok = rotate_files_inner();
+    __atomic_fetch_add(&s_rot_seq, 1, __ATOMIC_ACQ_REL);   /* even: stable again */
+    return ok;
+}
+
 /* ambyte.log → ambyte.1.log → … → ambyte.(MAX-1).log; the oldest is deleted.
  * FAT rename never replaces an existing target (EEXIST), so a step that fails
  * leaves every file intact; ENOENT (a not-yet-created file) is harmless.
  * Returns false on the first real failure — the caller backs off instead of
  * retrying on every write. */
-static bool rotate_files(void)
+static bool rotate_files_inner(void)
 {
     char a[SD_CARD_PATH_MAX], b[SD_CARD_PATH_MAX];
     struct stat st;
@@ -613,6 +639,8 @@ static void writer_task(void *arg)
 }
 
 /* ── public API ───────────────────────────────────────────────────────── */
+
+const char *sd_logger_dir(void) { return SD_LOGGER_DIR; }
 
 esp_err_t sd_logger_init(void)
 {
