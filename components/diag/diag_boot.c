@@ -20,6 +20,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_rom_crc.h"
 #include "esp_system.h"
 #include "nvs.h"
@@ -38,6 +39,21 @@ static char        s_crash_json[DIAG_CRASH_JSON_CAP] = "{\"present\":false,\"err
 const char *diag_reset_reason(void) { return s_reset; }
 uint32_t    diag_boot_count(void)   { return s_boot_count; }
 const char *diag_crash_json(void)   { return s_crash_json; }
+
+uint32_t diag_boot_nonce(void)
+{
+    static uint32_t nonce;
+    uint32_t v = __atomic_load_n(&nonce, __ATOMIC_ACQUIRE);
+    if (v != 0) return v;
+    uint32_t fresh = esp_random();
+    if (fresh == 0) fresh = 1;
+    uint32_t expected = 0;
+    /* First caller wins; a concurrent second draw is discarded. */
+    if (!__atomic_compare_exchange_n(&nonce, &expected, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return fresh;
+}
 
 /* Downstream sink for the few instructions before install() stores the
  * previous one (diag_log_priv.h): plain stdout, outside the hook object. */

@@ -21,14 +21,33 @@ static void put(fw_t *w, char c)
     if (w->cap > 0 && w->len + 1 < w->cap) w->out[w->len++] = c;
 }
 
+/* Both loops stop as soon as the buffer is full: the work per conversion is
+ * bounded by the output capacity, never by a caller-supplied width. */
 static void put_n(fw_t *w, const char *s, size_t n)
 {
-    for (size_t i = 0; i < n; i++) put(w, s[i]);
+    for (size_t i = 0; i < n && w->len + 1 < w->cap; i++) w->out[w->len++] = s[i];
 }
 
 static void put_rep(fw_t *w, char c, size_t n)
 {
-    for (size_t i = 0; i < n; i++) put(w, c);
+    for (size_t i = 0; i < n && w->len + 1 < w->cap; i++) w->out[w->len++] = c;
+}
+
+/* Widths and precisions beyond this can never be shown by the capture (its
+ * whole line buffer is smaller), so they are clamped — and counted as
+ * unsupported — instead of driving ~2^31 iterations of padding on the
+ * logging task (review round 2, finding 2). */
+#define FMT_FIELD_MAX 256
+
+/* Width / precision as parsed: a non-negative value already clamped to
+ * FMT_FIELD_MAX. Negation happens in a 64-bit type, so INT_MIN is not UB. */
+static int clamp_field(long long v, uint32_t *unsupported)
+{
+    if (v > FMT_FIELD_MAX) {
+        if (unsupported) (*unsupported)++;
+        return FMT_FIELD_MAX;
+    }
+    return (int)v;
 }
 
 enum { F_LEFT = 1, F_PLUS = 2, F_SPACE = 4, F_ALT = 8, F_ZERO = 16 };
@@ -252,22 +271,26 @@ size_t diag_vsnformat(char *out, size_t cap, const char *fmt, va_list ap, uint32
         }
         int width = 0;
         if (*p == '*') {
-            width = va_arg(ap, int);
-            if (width < 0) { flags |= F_LEFT; width = -width; }
+            long long wv = va_arg(ap, int);
+            if (wv < 0) { flags |= F_LEFT; wv = -wv; }   /* -INT_MIN fits in long long */
+            width = clamp_field(wv, unsupported);
             p++;
         } else {
-            while (*p >= '0' && *p <= '9') { if (width < 10000) width = width * 10 + (*p - '0'); p++; }
+            long long wv = 0;
+            while (*p >= '0' && *p <= '9') { if (wv <= FMT_FIELD_MAX) wv = wv * 10 + (*p - '0'); p++; }
+            width = clamp_field(wv, unsupported);
         }
         int prec = -1;
         if (*p == '.') {
             p++;
             if (*p == '*') {
-                prec = va_arg(ap, int);
-                if (prec < 0) prec = -1;
+                const long long pv = va_arg(ap, int);
+                prec = pv < 0 ? -1 : clamp_field(pv, unsupported);   /* negative = none (C) */
                 p++;
             } else {
-                prec = 0;
-                while (*p >= '0' && *p <= '9') { if (prec < 10000) prec = prec * 10 + (*p - '0'); p++; }
+                long long pv = 0;
+                while (*p >= '0' && *p <= '9') { if (pv <= FMT_FIELD_MAX) pv = pv * 10 + (*p - '0'); p++; }
+                prec = clamp_field(pv, unsupported);
             }
         }
         int len = LEN_NONE;
@@ -334,7 +357,10 @@ size_t diag_vsnformat(char *out, size_t cap, const char *fmt, va_list ap, uint32
             const char *s = va_arg(ap, const char *);
             if (s == NULL) s = "(null)";
             size_t n = 0;
-            while (s[n] && (prec < 0 || n < (size_t)prec)) n++;
+            /* Bound FIRST, then dereference: with "%.*s" the argument need not
+             * be NUL-terminated, and s[prec] may be past the end of a buffer
+             * (review round 2, finding 1). */
+            while ((prec < 0 || n < (size_t)prec) && s[n]) n++;
             emit(&w, flags, width, false, "", 0, 0, s, n);
             break;
         }

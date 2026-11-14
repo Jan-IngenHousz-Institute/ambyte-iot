@@ -4,6 +4,8 @@
  * pthread equivalents. Each scenario prints machine-readable lines that
  * tests/test_diag.py checks; internal invariants are asserted in C. */
 #include <assert.h>
+#include <limits.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -414,6 +416,45 @@ static void sc_fmt_trunc(void)
     puts("TRUNC ok");
 }
 
+/* Review round 2, findings 1-2: bounded reads and bounded work. */
+static void sc_fmt_bounds(void)
+{
+    char out[8];
+    uint32_t u = 0;
+    /* %.*s over an exact-length buffer with NO terminator (ASan: any read of
+     * buf[3] is a heap-buffer-overflow). */
+    char *abc = malloc(3);
+    memcpy(abc, "abc", 3);
+    char big[64];
+    size_t n = fmt_into(big, sizeof big, &u, "[%.*s]", 3, abc);
+    assert(n == 5 && strcmp(big, "[abc]") == 0 && u == 0);
+    n = fmt_into(big, sizeof big, &u, "[%.2s|%-5.3s]", abc, abc);
+    assert(strcmp(big, "[ab|abc  ]") == 0);
+    char *empty = malloc(1);                  /* precision 0 must not read [0] */
+    free(empty);
+    n = fmt_into(big, sizeof big, &u, "[%.0s]", empty);   /* dangling: never dereferenced */
+    assert(strcmp(big, "[]") == 0);
+    free(abc);
+    puts("BOUNDS ok");
+
+    /* INT_MIN / INT_MAX widths and precisions: no UB (UBSan halts), no
+     * 2^31-iteration loops once the buffer is full, counted as unsupported. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint32_t over = 0;
+    fmt_into(out, sizeof out, &over, "%*d", INT_MIN, 1);
+    fmt_into(out, sizeof out, &over, "%*d", INT_MAX, 1);
+    fmt_into(out, sizeof out, &over, "%.*d", INT_MAX, 1);
+    fmt_into(out, sizeof out, &over, "%-*s", INT_MAX, "x");
+    fmt_into(out, sizeof out, &over, "%.*f", INT_MAX, 1.5);
+    fmt_into(out, sizeof out, &over, "%*.*e", INT_MIN, INT_MAX, 2.5);
+    fmt_into(out, sizeof out, &over, "%999999999999d", 7);
+    fmt_into(big, sizeof big, &u, "%.*s|%*d", INT_MIN, "neg", -3, 4);   /* negative precision = none */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("HUGE over=%u ms=%.3f neg=%s\n", over, ms, big);
+}
+
 /* An E line with a float through the real hook: formatted without newlib,
  * and %n / %a lines counted in unsupported_fmt. */
 static void sc_hook_fmt(void)
@@ -423,6 +464,10 @@ static void sc_hook_fmt(void)
     int written_by_sink = -1;                                  /* the libc sink honours %n; diag never does */
     LOGE("weird", "count=%n done", &written_by_sink);
     LOGE("weird", "hex float %a", 0.5);
+    char *slice = malloc(5);                  /* not NUL-terminated */
+    memcpy(slice, "slice", 5);
+    LOGE("bounds", "%.*s|%*d", 5, slice, INT_MIN, 9);
+    free(slice);
     diag_log_stats_t st;
     diag_log_stats(&st);
     printf("STATS unsupported=%u buffered=%u\n", st.unsupported_fmt, st.buffered);
@@ -446,6 +491,7 @@ int main(int argc, char **argv)
     else if (!strcmp(s, "fmt")) sc_fmt();
     else if (!strcmp(s, "fmt_trunc")) sc_fmt_trunc();
     else if (!strcmp(s, "hook_fmt")) sc_hook_fmt();
+    else if (!strcmp(s, "fmt_bounds")) sc_fmt_bounds();
     else return 2;
     return 0;
 }

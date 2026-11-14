@@ -12,11 +12,13 @@
  *     → {"type":"log_list_result","id","ok","detail","dir","gen",
  *        "files":[{"name","size"}],"omitted"}
  *   {"type":"log_read","id":…,"name":"ambyte.log","offset":…,"length":…,
- *    "expect_gen":"412.3.18"}                      (expect_gen optional)
+ *    "expect_gen":"412.9c41e07a.3.18"}             (expect_gen optional)
  *     → {"type":"log_read_result","id","ok","detail","name","gen","size",
  *        "offset","length","eof","encoding":"base64","data"}
  *
- * - `gen` = "<boot_count>.<sd mount generation>.<sd_logger rotation seq>":
+ * - `gen` = "<boot_count>.<boot nonce, 8 hex>.<sd mount generation>.<sd_logger
+ *   rotation seq>" (the nonce keeps it unique across reboots even when the
+ *   NVS boot counter is unavailable and reads 0):
  *   it changes whenever a rename may have given a basename to different bytes
  *   (sd_logger rotation, a card swap or remount, a reboot). A multi-chunk
  *   reader pins the gen of its first chunk and sends it as `expect_gen`; the
@@ -72,12 +74,13 @@ extern "C" {
 #define LOG_LIST_MAX_FILES   32
 
 typedef struct {
-    uint32_t boot;       /* NVS boot counter */
+    uint32_t boot;       /* NVS boot counter (0 = NVS unavailable) */
+    uint32_t nonce;      /* random per boot: unique even when boot is 0 */
     uint32_t mount;      /* sdcard_mount_generation() */
     uint32_t rotation;   /* sd_logger_rotation_seq(): odd while renaming */
 } log_gen_t;
 
-#define LOG_GEN_MAX 40   /* "4294967295.4294967295.4294967295" + NUL */
+#define LOG_GEN_MAX 48   /* "4294967295.ffffffff.4294967295.4294967295" + NUL */
 
 typedef struct {
     void (*reply)(const char *json);

@@ -37,7 +37,7 @@ class LogCommand(unittest.TestCase):
                         f"-I{ROOT / 'components/command_router/include'}", f"-I{cjson}",
                         str(ROOT / "tests/log_command_host.c"),
                         str(ROOT / "components/command_router/log_command.c"),
-                        str(cjson / "cJSON.c"), "-lm", "-o", str(cls.bin)], check=True)
+                        str(cjson / "cJSON.c"), "-Wl,--wrap=fread", "-lm", "-o", str(cls.bin)], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -73,7 +73,7 @@ class LogCommand(unittest.TestCase):
         self.assertEqual(reply["files"], [{"name": "ambyte.1.log", "size": 80}, {"name": "ambyte.log", "size": 20000},
                                           {"name": "binary.log", "size": 256}, {"name": "empty.log", "size": 0}])
         self.assertEqual(reply["omitted"], 3)                   # subdir, .hidden, "we ird.log"
-        self.assertEqual(reply["gen"], "7.1.4")
+        self.assertEqual(reply["gen"], "7.9c41e07a.1.4")
 
     def test_reads_offsets_tail_eof_cap_and_errors(self):
         before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.dir.iterdir() if p.is_file()}
@@ -87,7 +87,7 @@ class LogCommand(unittest.TestCase):
 
         r1 = replies["r1"]
         self.assertEqual((r1["ok"], r1["offset"], r1["length"], r1["size"], r1["eof"]), (True, 0, 4096, 20000, False))
-        self.assertEqual(r1["gen"], "7.1.4")
+        self.assertEqual(r1["gen"], "7.9c41e07a.1.4")
         self.assertEqual(data(r1), self.main[:4096])
         self.assertEqual(data(replies["r2"]), self.main[5000:5100])
         r3 = replies["r3"]                                       # negative offset = tail
@@ -135,20 +135,46 @@ class LogCommand(unittest.TestCase):
 
     def test_gen_pins_the_file_identity_across_chunks(self):
         r = {x["id"]: x for x in self.run_case("gen")}
-        self.assertEqual((r["g1"]["ok"], r["g1"]["gen"]), (True, "7.1.4"))
+        self.assertEqual((r["g1"]["ok"], r["g1"]["gen"]), (True, "7.9c41e07a.1.4"))
         self.assertEqual((r["g2"]["ok"], r["g2"]["offset"]), (True, 16))          # expect_gen matches
         # Review finding 5: same basename, another file after a rotation.
-        self.assertEqual((r["g3"]["ok"], r["g3"]["detail"], r["g3"]["gen"]), (False, "file_rotated", "7.1.6"))
+        self.assertEqual((r["g3"]["ok"], r["g3"]["detail"], r["g3"]["gen"]), (False, "file_rotated", "7.9c41e07a.1.6"))
         self.assertNotIn("data", r["g3"])
-        self.assertEqual((r["g4"]["detail"], r["g4"]["gen"]), ("file_rotated", "7.2.6"))   # remount / swap
+        self.assertEqual((r["g4"]["detail"], r["g4"]["gen"]), ("file_rotated", "7.9c41e07a.2.6"))   # remount / swap
         # A rename between the before/after samples of ONE read discards it.
-        self.assertEqual((r["g5"]["ok"], r["g5"]["detail"], r["g5"]["gen"]), (False, "file_rotated", "7.2.8"))
+        self.assertEqual((r["g5"]["ok"], r["g5"]["detail"], r["g5"]["gen"]), (False, "file_rotated", "7.9c41e07a.2.8"))
         self.assertNotIn("data", r["g5"])
         self.assertEqual((r["g6"]["detail"], r["g7"]["detail"]), ("rotation_in_progress", "rotation_in_progress"))
         self.assertEqual((r["g8"]["ok"], r["g8"]["detail"]), (False, "file_rotated"))
         self.assertNotIn("files", r["g8"])
-        self.assertEqual((r["g9"]["ok"], r["g9"]["gen"]), (True, "7.2.12"))
+        self.assertEqual((r["g9"]["ok"], r["g9"]["gen"]), (True, "7.9c41e07a.2.12"))
         self.assertEqual((r["g10"]["detail"], r["g11"]["detail"]), ("invalid_expect_gen", "invalid_expect_gen"))
+
+    def test_short_read_is_refused_not_returned(self):
+        """Review round 2, finding 5: fewer bytes than fstat promised, no error."""
+        short, normal = self.run_case("short")
+        self.assertEqual((short["ok"], short["detail"]), (False, "short_read"))
+        self.assertNotIn("data", short)
+        self.assertEqual((normal["ok"], normal["length"]), (True, 100))
+
+    def test_gen_differs_across_reboots_without_a_boot_counter(self):
+        """Review round 2, finding 4: two boots, NVS unavailable (boot_count 0),
+        and an equal-size but different file: the second boot refuses the
+        first boot's expect_gen instead of splicing."""
+        def boot(nonce, request):
+            r = subprocess.run([self.bin, str(self.dir), "boot", nonce, request],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            (reply,) = [json.loads(l[6:]) for l in r.stdout.splitlines() if l.startswith("REPLY ")]
+            return reply
+        (self.dir / "ambyte.1.log").write_bytes(b"A" * 80)
+        first = boot("1111aaaa", '{"type":"log_read","id":"b1","name":"ambyte.1.log","length":40}')
+        self.assertEqual((first["ok"], first["gen"]), (True, "0.1111aaaa.1.0"))
+        (self.dir / "ambyte.1.log").write_bytes(b"B" * 80)                 # reboot, rotated, same size
+        second = boot("2222bbbb", json.dumps({"type": "log_read", "id": "b2", "name": "ambyte.1.log",
+                                             "offset": 40, "expect_gen": first["gen"]}))
+        self.assertEqual((second["ok"], second["detail"], second["gen"]), (False, "file_rotated", "0.2222bbbb.1.0"))
+        self.assertNotIn("data", second)
 
     def test_allocation_failures_never_yield_a_partial_success(self):
         """Review finding 4: fail the 1st, 2nd, ... allocation of each command."""

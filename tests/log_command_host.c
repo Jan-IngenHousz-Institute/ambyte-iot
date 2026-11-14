@@ -19,13 +19,24 @@ static void reply(const char *json) { printf("REPLY %s\n", json); }
 /* gen fake: {boot, mount, rotation}. g_rotate_on_call > 0 makes the Nth
  * gen() call (and every later one) see a completed rotation — the "renamed
  * while we read" case. */
-static log_gen_t g_gen = {.boot = 7, .mount = 1, .rotation = 4};
+static log_gen_t g_gen = {.boot = 7, .nonce = 0x9c41e07au, .mount = 1, .rotation = 4};
 static int g_gen_calls, g_rotate_on_call;
 static void gen(log_gen_t *out)
 {
     g_gen_calls++;
     if (g_rotate_on_call && g_gen_calls == g_rotate_on_call) g_gen.rotation += 2;
     *out = g_gen;
+}
+
+/* Short read without an error (a file truncated between fstat and fread):
+ * the test build links with -Wl,--wrap=fread. */
+static bool g_short_read;
+size_t __real_fread(void *ptr, size_t size, size_t n, FILE *f);
+size_t __wrap_fread(void *ptr, size_t size, size_t n, FILE *f);
+size_t __wrap_fread(void *ptr, size_t size, size_t n, FILE *f)
+{
+    size_t got = __real_fread(ptr, size, n, f);
+    return g_short_read && got > 1 ? got / 2 : got;
 }
 
 /* Allocation-failure injection over every cJSON_malloc (log_command routes
@@ -182,13 +193,13 @@ int main(int argc, char **argv)
          * an odd rotation sequence (rename in progress) refuses. */
         req_run("{\"type\":\"log_read\",\"id\":\"g1\",\"name\":\"ambyte.1.log\",\"length\":16}");
         req_run("{\"type\":\"log_read\",\"id\":\"g2\",\"name\":\"ambyte.1.log\",\"offset\":16,"
-                "\"expect_gen\":\"7.1.4\"}");
+                "\"expect_gen\":\"7.9c41e07a.1.4\"}");
         g_gen.rotation = 6;                 /* sd_logger rotated: same name, other bytes */
         req_run("{\"type\":\"log_read\",\"id\":\"g3\",\"name\":\"ambyte.1.log\",\"offset\":16,"
-                "\"expect_gen\":\"7.1.4\"}");
+                "\"expect_gen\":\"7.9c41e07a.1.4\"}");
         g_gen.mount = 2;                    /* card swapped / remounted */
         req_run("{\"type\":\"log_read\",\"id\":\"g4\",\"name\":\"ambyte.1.log\","
-                "\"expect_gen\":\"7.1.6\"}");
+                "\"expect_gen\":\"7.9c41e07a.1.6\"}");
         g_gen_calls = 0; g_rotate_on_call = 2;   /* the "after" sample sees a rename */
         req_run("{\"type\":\"log_read\",\"id\":\"g5\",\"name\":\"ambyte.1.log\"}");
         g_rotate_on_call = 0;
@@ -202,6 +213,17 @@ int main(int argc, char **argv)
         req_run("{\"type\":\"log_list\",\"id\":\"g9\"}");
         request("{\"type\":\"log_read\",\"id\":\"g10\",\"name\":\"ambyte.log\",\"expect_gen\":17}");
         request("{\"type\":\"log_read\",\"id\":\"g11\",\"name\":\"ambyte.log\",\"expect_gen\":\"\"}");
+    } else if (!strcmp(s, "short")) {
+        g_short_read = true;
+        req_run("{\"type\":\"log_read\",\"id\":\"s1\",\"name\":\"ambyte.log\",\"length\":100}");
+        g_short_read = false;
+        req_run("{\"type\":\"log_read\",\"id\":\"s2\",\"name\":\"ambyte.log\",\"length\":100}");
+    } else if (!strcmp(s, "boot")) {
+        /* One process = one boot whose NVS counter is unavailable (0), with
+         * the given per-boot nonce. argv[3] = nonce hex, argv[4] = request. */
+        assert(argc == 5);
+        g_gen = (log_gen_t){.boot = 0, .nonce = (uint32_t)strtoul(argv[3], NULL, 16), .mount = 1, .rotation = 0};
+        req_run(argv[4]);
     } else if (!strcmp(s, "alloc")) {
         /* argv[3] = which allocation fails (1-based), argv[4] = request. */
         assert(argc == 5);

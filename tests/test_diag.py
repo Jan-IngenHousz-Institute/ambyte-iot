@@ -37,6 +37,8 @@ def _cc():
 def _build(out, sanitize):
     cmd = [_cc(), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE", "-DDIAG_LOG_HOST",
            "-Wall", "-Wextra", "-Werror", "-O1", "-g", "-fno-omit-frame-pointer", f"-fsanitize={sanitize}",
+           # Any UB (e.g. negating INT_MIN) aborts the scenario instead of printing a warning.
+           *(["-fno-sanitize-recover=all"] if "undefined" in sanitize else []),
            "-pthread", f"-I{HOST / 'include'}", f"-I{DIAG / 'include'}", f"-I{DIAG}",
            *(str(s) for s in SOURCES), "-o", str(out)]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -272,11 +274,26 @@ class DiagHost(unittest.TestCase):
 
     def test_float_error_line_through_the_hook(self):
         out = self.run_case("hook_fmt")
-        self.assertIn("STATS unsupported=2 buffered=3", out)
+        self.assertIn("STATS unsupported=3 buffered=4", out)
         (rec,) = self.records(out)
-        self.assertEqual([l["msg"] for l in rec["lines"]],
+        self.assertEqual([l["msg"] for l in rec["lines"]][:3],
                          ["temperature 85.13 out of range (3)", "count= done", "hex float <%a>"])
-        self.assertEqual(rec["unsupported_fmt"], 2)
+        # Round 2: a non-terminated slice and an INT_MIN width through the real
+        # hook (ASan + fatal UBSan): exact slice, width clamped to 256 left-aligned.
+        last = rec["lines"][3]["msg"]
+        self.assertTrue(last.startswith("slice|9"), last)
+        self.assertEqual(rec["unsupported_fmt"], 3)
+
+    def test_formatter_reads_and_works_within_bounds(self):
+        """Review round 2, findings 1 and 2."""
+        out = self.run_case("fmt_bounds")
+        self.assertIn("BOUNDS ok", out)
+        m = re.search(r"HUGE over=(\d+) ms=([0-9.]+) neg=(.*)", out)
+        # INT_MIN/INT_MAX widths and precisions: every oversize field counted,
+        # and the whole set costs microseconds, not 2^31 iterations each.
+        self.assertGreaterEqual(int(m.group(1)), 8)
+        self.assertLess(float(m.group(2)), 50.0)
+        self.assertEqual(m.group(3), "neg|4  ")
 
     def _host_objects(self, sources, extra=()):
         cc = _cc()
@@ -388,6 +405,12 @@ class DiagBoot(unittest.TestCase):
         self.assertEqual((out["boot_count"], out["reset_reason"], out["crash"]), (4, "brownout", {"present": False}))
         broken = self.boot(blank, extra=("nvs-broken",))
         self.assertEqual(broken["boot_count"], 0)                    # unknown, never a fresh 1
+        # Review round 2, finding 4: two boots that both have boot_count 0
+        # still get different per-boot nonces (gen = boot.nonce.mount.rotation).
+        again = self.boot(blank, extra=("nvs-broken",))
+        self.assertEqual(again["boot_count"], 0)
+        self.assertNotEqual(broken["nonce"], again["nonce"])
+        self.assertTrue(broken["nonce"] and again["nonce"])
 
     def test_valid_dump_summary_and_first_seen_survives_boots(self):
         img = self.image(self.payload())

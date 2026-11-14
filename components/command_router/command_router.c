@@ -557,11 +557,13 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     cJSON_Delete(root);
 }
 
-/* Identity of the names under /sdcard/logs (log_command.h `gen`): a reboot,
- * a remount/card swap or an sd_logger rotation each change it. */
+/* Identity of the names under /sdcard/logs (log_command.h `gen`): a reboot
+ * (boot counter + per-boot random nonce), a remount/card swap or an sd_logger
+ * rotation each change it. */
 static void log_gen(log_gen_t *out)
 {
     out->boot = diag_boot_count();
+    out->nonce = diag_boot_nonce();
     out->mount = sdcard_mount_generation();
     out->rotation = sd_logger_rotation_seq();
 }

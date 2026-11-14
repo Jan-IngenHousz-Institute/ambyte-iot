@@ -104,13 +104,13 @@ static void gen_now(log_gen_t *g)
 
 static void gen_string(const log_gen_t *g, char *out, size_t cap)
 {
-    snprintf(out, cap, "%lu.%lu.%lu", (unsigned long)g->boot, (unsigned long)g->mount,
-             (unsigned long)g->rotation);
+    snprintf(out, cap, "%lu.%08lx.%lu.%lu", (unsigned long)g->boot, (unsigned long)g->nonce,
+             (unsigned long)g->mount, (unsigned long)g->rotation);
 }
 
 static bool gen_equal(const log_gen_t *a, const log_gen_t *b)
 {
-    return a->boot == b->boot && a->mount == b->mount && a->rotation == b->rotation;
+    return a->boot == b->boot && a->nonce == b->nonce && a->mount == b->mount && a->rotation == b->rotation;
 }
 
 /* ── allocation-free refusals ──────────────────────────────────────────── */
@@ -334,10 +334,15 @@ static outcome_t do_read(const request_t *r, const log_gen_t *before)
             return refuse("seek_failed");
         }
         got = fread(raw, 1, (size_t)len, f);
-        if (got < (size_t)len && ferror(f)) {
+        if (got < (size_t)len) {
+            /* fstat promised `len` bytes at `start`. Fewer without an error
+             * means the file shrank under us (a truncation the rotation
+             * seqlock does not see): never return it as a valid chunk, whose
+             * eof flag would be wrong (review round 2, finding 5). */
+            const bool err = ferror(f) != 0;
             fclose(f);
             cJSON_free(raw);
-            return refuse("read_failed");
+            return refuse(err ? "read_failed" : "short_read");
         }
     }
     fclose(f);

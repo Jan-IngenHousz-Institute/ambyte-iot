@@ -34,6 +34,13 @@ const char *diag_reset_reason(void);
 uint32_t    diag_boot_count(void);
 /* Pre-rendered health.crash object (always a complete JSON object). */
 const char *diag_crash_json(void);
+/* Random 32-bit value fixed for this boot, never 0 (review round 2, finding
+ * 4). Identifies the boot even when boot_count is 0 (NVS unavailable), so a
+ * remote log reader's `gen` can never repeat across reboots. Drawn on first
+ * use, not in diag_boot_init: esp_random() is only fully random once the RF
+ * subsystem runs, and the first user is a log_read/log_list command, which
+ * arrived over Wi-Fi. */
+uint32_t    diag_boot_nonce(void);
 
 #ifdef __cplusplus
 }

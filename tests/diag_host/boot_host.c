@@ -19,6 +19,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_rom_crc.h"
 #include "nvs.h"
 
@@ -31,6 +32,17 @@ void *diag_port_task(void) { return (void *)1; }
 vprintf_like_t esp_log_set_vprintf(vprintf_like_t func) { (void)func; return NULL; }
 
 /* ── platform facts ────────────────────────────────────────────────────── */
+uint32_t esp_random(void)
+{
+    uint32_t v = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f != NULL) {
+        if (fread(&v, sizeof v, 1, f) != 1) v = 0;
+        fclose(f);
+    }
+    return v;
+}
+
 static int g_reset = 1;
 esp_reset_reason_t esp_reset_reason(void) { return (esp_reset_reason_t)g_reset; }
 
@@ -194,7 +206,10 @@ int main(int argc, char **argv)
     if (argc > 3) g_reset = atoi(argv[3]);
     g_nvs_broken = argc > 4 && strcmp(argv[4], "nvs-broken") == 0;
     diag_boot_init();
-    printf("{\"boot_count\":%lu,\"reset_reason\":\"%s\",\"crash\":%s,\"summary_calls\":%d}\n",
-           (unsigned long)diag_boot_count(), diag_reset_reason(), diag_crash_json(), g_summary_calls);
+    const uint32_t nonce = diag_boot_nonce();
+    if (diag_boot_nonce() != nonce || nonce == 0) return 3;    /* fixed for the boot, never 0 */
+    printf("{\"boot_count\":%lu,\"reset_reason\":\"%s\",\"crash\":%s,\"summary_calls\":%d,\"nonce\":%lu}\n",
+           (unsigned long)diag_boot_count(), diag_reset_reason(), diag_crash_json(), g_summary_calls,
+           (unsigned long)nonce);
     return 0;
 }
