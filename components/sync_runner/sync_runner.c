@@ -711,6 +711,19 @@ static void sync_runner_wd_task(void *arg)
         if (periodic) {
             last_periodic = now_tick;
 
+            /* Captured ESP_LOGE lines → at most one ambyte.log/1 record per
+             * minute (diag_log.h). This task is the drainer because it is
+             * already the low-rate producer of the stored heartbeat: the store
+             * allocates its id under event_log's mutex and never moves the
+             * cursor, so delivery ownership stays with sync_runner_task. The
+             * capture hook itself never reaches here — it only fills a ring. */
+            cmd_result_t lr = cmd_store_log_event();
+            if (lr.status == ESP_OK) {
+                ESP_LOGI(TAG, "%s", lr.message);
+            } else if (lr.status != ESP_ERR_NOT_FOUND && lr.status != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "log record: %s", lr.message);
+            }
+
             /* The same independent task that owns liveness policy also owns
              * this low-rate durability tick. Backdating above creates a floor
              * on the first valid minute of a new installation; after that only

@@ -18,6 +18,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"        /* esp_reset_reason */
+#include "diag_reset.h"        /* the one reset-reason table */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -726,23 +727,6 @@ static void boot_absent_clear_all(void)
     }
 }
 
-/* Human-readable reset cause for the boot-sync guard log. */
-static const char *reset_reason_str(esp_reset_reason_t r)
-{
-    switch (r) {
-    case ESP_RST_POWERON:   return "power-on";
-    case ESP_RST_EXT:       return "external";
-    case ESP_RST_SW:        return "software";
-    case ESP_RST_PANIC:     return "panic";
-    case ESP_RST_INT_WDT:   return "int-wdt";
-    case ESP_RST_TASK_WDT:  return "task-wdt";
-    case ESP_RST_WDT:       return "other-wdt";
-    case ESP_RST_DEEPSLEEP: return "deep-sleep";
-    case ESP_RST_BROWNOUT:  return "brownout";
-    default:                return "other";
-    }
-}
-
 /* Read one channel's running fw version via cmd 33/2. do_query does its own
  * wake, so this works regardless of a cached ping failure (a bare unit's boot
  * ping is fail-cached for 5 min — the post-flash verify must not consult it). */
@@ -772,7 +756,7 @@ int ambit_flash_boot_sync(void)
         rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) {
         ESP_LOGW(TAG, "boot sync: last reset was %s — skipping AMBIT auto-flash this "
                       "boot to avoid a mid-flash re-brick loop; retries on a clean boot",
-                 reset_reason_str(rr));
+                 diag_reset_reason_name(rr));   /* the shared wire spelling (diag_reset.h) */
         return -1;
     }
 

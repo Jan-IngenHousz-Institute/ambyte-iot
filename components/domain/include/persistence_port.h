@@ -39,6 +39,8 @@ typedef enum {
 #define MEASUREMENT_TAG_TELEMETRY   "TELEMETRY"     /* ambyte.telemetry/1         */
 #define MEASUREMENT_TAG_DEVICE_INFO "DEVICE_INFO"   /* sensor identity + calib.,
                                                      * stable tuple changes      */
+#define MEASUREMENT_TAG_LOG         "LOG"           /* ambyte.log/1: captured
+                                                     * ESP_LOGE lines (diag_log) */
 
 /* One row per measurement *event*. All quantities measured together (a BME280
  * read's T/H/P, or an AMBIT run's leaf_temp/fluor/fluoRef arrays) live in one

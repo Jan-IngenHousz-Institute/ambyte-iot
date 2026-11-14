@@ -23,3 +23,8 @@ void h_enter_critical(portMUX_TYPE *m);
 void h_exit_critical(portMUX_TYPE *m);
 #define portENTER_CRITICAL(m) h_enter_critical(m)
 #define portEXIT_CRITICAL(m)  h_exit_critical(m)
+/* components/diag (diag_log.c) uses the ISR-safe variants; the shim never
+ * runs anything in interrupt context. */
+#define portENTER_CRITICAL_SAFE(m) h_enter_critical(m)
+#define portEXIT_CRITICAL_SAFE(m)  h_exit_critical(m)
+static inline BaseType_t xPortInIsrContext(void) { return 0; }

@@ -1,5 +1,7 @@
 #include "command_router.h"
 #include "command_router_pong.h"
+#include "diag.h"
+#include "log_command.h"
 #include "timezone_command.h"
 
 #include <math.h>
@@ -17,6 +19,7 @@
 #include "evlog_inventory.h"
 #include "evlog_replay.h"
 #include "sd_card.h"
+#include "sd_logger.h"
 #include "ota_update.h"
 #include "ambit_ota.h"
 #include "script_update.h"
@@ -47,7 +50,8 @@ static void handle_ping(const char *id)
     char reply[448];
     const long long up_ms = (long long)(esp_timer_get_time() / 1000);
     if (!command_router_pong_json(reply, sizeof reply, id, s_cfg.device_id,
-                                  s_cfg.firmware_version, up_ms)) return;
+                                  s_cfg.firmware_version, up_ms,
+                                  diag_reset_reason(), diag_boot_count())) return;
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);
 }
@@ -264,6 +268,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         handle_evlog_inventory(root, id);
     } else if (strcmp(type, "evlog_replay") == 0) {
         handle_evlog_replay(root, id);
+    } else if (log_command_handle(root)) {
+        /* log_list / log_read: validated here, read on the maintenance worker. */
     } else if (strcmp(type, "ota_update") == 0) {
         const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
         const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;
@@ -562,6 +568,16 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
         .maintenance_begin = cfg->maintenance_begin, .maintenance_end = cfg->maintenance_end,
     };
     timezone_command_init(&timezone_config);
+    /* Read-only remote SD log access (log_command.h). The SD probes are the
+     * same ones every SD reader honours: park state, mount, I/O-loss latch and
+     * the unmount gate (sdcard_io_begin/end). */
+    const log_command_config_t log_config = {
+        .reply = publish_reply, .submit = cfg->submit,
+        .maintenance_begin = cfg->maintenance_begin, .maintenance_end = cfg->maintenance_end,
+        .dir = sd_logger_dir(), .sd_mounted = sdcard_is_mounted, .sd_parked = event_log_sd_parked,
+        .sd_io_lost = sdcard_io_lost, .io_begin = sdcard_io_begin, .io_end = sdcard_io_end,
+    };
+    log_command_init(&log_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",
              s_cfg.status_topic ? s_cfg.status_topic : "(none)");
     return ESP_OK;

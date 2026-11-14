@@ -99,6 +99,9 @@ esp_err_t event_log_sd_service(void);
 void      event_log_sd_notify(void);
 bool      event_log_sd_service_pending(void);
 void      event_log_set_sd_parked(bool parked);
+/* Lock-free read of the low-battery park flag (remote log reads refuse
+ * with "sd_parked" instead of reporting a merely absent card). */
+bool      event_log_sd_parked(void);
 esp_err_t event_log_free_bytes(uint64_t *out_free);
 
 /* ── Archive replay support (evlog_replay) ──

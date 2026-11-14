@@ -27,6 +27,7 @@
 #include "ambit_announcement_nvs.h"
 #include "script_update.h"
 #include "device_commands.h"
+#include "diag.h"
 #include "power_policy.h"
 #include "esp_err.h"
 #include "esp_app_desc.h"
@@ -121,6 +122,8 @@ void sntp_sync_time(struct timeval *tv)
     }
     sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
     clock_trust_note_sntp();
+    /* Captured error lines from now on carry utc_ms (diag_log.h). */
+    diag_log_note_clock_valid(esp_timer_get_time());
 
     /* Make the correction survive a reboot/power interruption. The RTC setter
      * is UTC-pure (no process-global TZ changes) and reads the calendar back;
@@ -1063,6 +1066,11 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "SD logger failed to start");
     }
     HIL_TRACE("sd_logger_init");
+    /* Error-line capture (diag_log.h) chains onto sd_logger's hook installed
+     * just above: esp_log -> diag -> sd_logger -> console. Installed this
+     * early so boot-time errors reach the ring; it needs neither NVS nor the
+     * event log (the sync_runner watchdog drains it once persistence is up). */
+    diag_log_install();
 
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
@@ -1076,6 +1084,10 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
     sd_diag_boot_nvs();
+    /* Boot counter + reset reason + coredump summary, read ONCE here in task
+     * context and cached for every heartbeat / pong (diag.h). Read-only on the
+     * coredump partition; never blocks boot. */
+    diag_boot_init();
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── Power management (Phase 2, DFS-only) ─────────────────────────
@@ -1412,6 +1424,11 @@ void app_main(void)
 
     /* ── I2C + Sensors ────────────────────────────────────────────── */
     err = app_init_i2c_and_sensors();
+    if (time(NULL) >= (time_t)CLOCK_TRUST_VALID_FLOOR_S) {
+        /* RTC (or flash-time bootstrap) gave a real clock: error lines
+         * captured from here on are UTC-stamped; earlier ones stay null. */
+        diag_log_note_clock_valid(esp_timer_get_time());
+    }
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "I2C startup failed: %s", esp_err_to_name(err));
         /* Aborting boot, but Wi-Fi is already connecting: open the gate so the

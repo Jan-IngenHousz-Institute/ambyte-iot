@@ -614,6 +614,8 @@ static void writer_task(void *arg)
 
 /* ── public API ───────────────────────────────────────────────────────── */
 
+const char *sd_logger_dir(void) { return SD_LOGGER_DIR; }
+
 esp_err_t sd_logger_init(void)
 {
     if (s_started) return ESP_OK;

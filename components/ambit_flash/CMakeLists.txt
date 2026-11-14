@@ -5,7 +5,7 @@ idf_component_register(
     REQUIRES uart_sensors
     # event_log: only for evq_hil_io_w.h (verification-build fault wrappers).
     # json + mbedtls: release manifest.json parse and region SHA-256 (ambit_fw_manifest.c).
-    PRIV_REQUIRES driver esp_timer esp_serial_flasher sd_card device_commands nvs_flash event_log json mbedtls
+    PRIV_REQUIRES driver esp_timer esp_serial_flasher sd_card device_commands nvs_flash event_log json mbedtls diag
 )
 # esp_serial_flasher is vendored at components/esp_serial_flasher (source only — the
 # registry tarball's deep test/ paths blow past Windows MAX_PATH). We use our own
