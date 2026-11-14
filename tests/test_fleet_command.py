@@ -118,6 +118,176 @@ class BuildMessage(unittest.TestCase):
         self.assertIn("AMBYTE_28:37:2F:FF:E7:50", devs)
 
 
+class LogCommands(unittest.TestCase):
+    """log-list / log-read: payloads, the chunk stitcher and the mocked transport."""
+
+    CLIENT = "ambyte_14:63:93:37:A1:E8"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+
+    def setUp(self):
+        self.fc = _load()
+
+    def test_log_payloads(self):
+        self.assertEqual(self.fc.build_message(_args(cmd="log-list"), "r"), {"type": "log_list", "id": "r"})
+        msg = self.fc.build_message(_args(cmd="log-read", name="ambyte.log", offset=0, length=0, tail=0, out=None), "r")
+        self.assertEqual(msg, {"type": "log_read", "id": "r", "name": "ambyte.log", "offset": 0, "length": 4096})
+        msg = self.fc.build_message(_args(cmd="log-read", name="ambyte.1.log", offset=0, length=0, tail=65536, out="x"), "r")
+        self.assertEqual((msg["offset"], msg["length"]), (-65536, 8192))
+        msg = self.fc.build_message(_args(cmd="log-read", name="ambyte.log", offset=-10, length=100, tail=0, out=None), "r")
+        self.assertEqual((msg["offset"], msg["length"]), (-10, 100))
+
+    def test_log_read_refuses_bad_names_and_windows(self):
+        for name in ("", "../secret", "/sdcard/events/ev-000001.log", "a/b", "..", ".hidden", "x" * 65, "we ird"):
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="log-read", name=name, offset=0, length=0, tail=0, out=None), "r")
+        for kw in (dict(length=8193), dict(length=-1), dict(tail=-5), dict(tail=10, offset=5)):
+            base = dict(cmd="log-read", name="ambyte.log", offset=0, length=0, tail=0, out=None)
+            base.update(kw)
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(**base), "r")
+
+    def test_bad_log_read_never_touches_aws(self):
+        from unittest.mock import patch
+        cases = (["log-read", "--devices", self.CLIENT, "--name", "../x"],
+                 ["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--length", "9000"],
+                 ["log-read", "--name", "ambyte.log", "--out", "f"],            # --out needs one explicit device
+                 ["log-read", "--devices", f"{self.CLIENT},28:37:2F:FF:E7:50", "--name", "ambyte.log", "--out", "f"])
+        with patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")):
+            for argv in cases:
+                with self.subTest(argv=argv), self.assertRaises(SystemExit) as err:
+                    self.fc.main(argv)
+                self.assertEqual(err.exception.code, 2)
+
+    @staticmethod
+    def chunk(name, data, offset, size, eof, **extra):
+        import base64
+        reply = {"type": "log_read_result", "ok": True, "detail": "ok", "name": name, "offset": offset,
+                 "length": len(data), "size": size, "eof": eof, "encoding": "base64",
+                 "data": base64.b64encode(data).decode()}
+        reply.update(extra)
+        return reply
+
+    def test_stitcher_tail_chunks_and_consistency_checks(self):
+        st = self.fc.LogStitcher("ambyte.log", -5000, 4096)
+        self.assertEqual(st.request("i")["offset"], -5000)
+        self.assertEqual(st.feed(self.chunk("ambyte.log", b"a" * 4096, 15000, 20000, False)), "continue")
+        self.assertEqual(st.request("i")["offset"], 19096)       # absolute after the device resolved the tail
+        self.assertEqual(st.feed(self.chunk("ambyte.log", b"b" * 904, 19096, 20000, True)), "done")
+        self.assertEqual((bytes(st.data), st.start, st.size), (b"a" * 4096 + b"b" * 904, 15000, 20000))
+        bad = [
+            (self.chunk("ambyte.1.log", b"x", 0, 1, True), "asked for"),            # other file
+            (self.chunk("ambyte.log", b"x", 7, 9, True), "offset 7"),                # wrong offset
+            (dict(self.chunk("ambyte.log", b"xy", 0, 9, True), length=3), "decodes"),  # length mismatch
+            (dict(self.chunk("ambyte.log", b"x", 0, 9, True), data="!!"), "malformed"),
+            ({"type": "log_read_result", "ok": False, "detail": "sd_parked"}, "sd_parked"),
+        ]
+        for reply, why in bad:
+            st = self.fc.LogStitcher("ambyte.log", 0, 4096)
+            with self.subTest(why=why):
+                self.assertEqual(st.feed(reply), "error")
+                self.assertIn(why, st.error)
+        st = self.fc.LogStitcher("ambyte.log", 0, 4)
+        st.feed(self.chunk("ambyte.log", b"abcd", 0, 100, False))
+        self.assertEqual(st.feed(self.chunk("ambyte.log", b"", 4, 3, True)), "error")   # rotated under us
+        self.assertIn("shrank", st.error)
+
+    def test_stitcher_backs_off_on_no_mem_and_retries_busy(self):
+        st = self.fc.LogStitcher("ambyte.log", 0, 8192)
+        self.assertEqual(st.feed({"ok": False, "detail": "no_mem"}), "retry")
+        self.assertEqual(st.request("i")["length"], 4096)
+        self.assertEqual(st.feed({"ok": False, "detail": "busy"}), "retry")
+        self.assertEqual(st.request("i")["offset"], 0)
+
+    def fake_transport(self, handler):
+        import json
+        from types import SimpleNamespace
+        future = SimpleNamespace(result=lambda **kw: None)
+        sent = []
+        def connection(session, subscription, receive, **kwargs):
+            def publish(*, topic, payload, qos):
+                request = json.loads(payload)
+                sent.append(request)
+                for reply in handler(request):
+                    receive(self.STATUS, json.dumps({"id": request["id"], **reply}).encode())
+                return future, 1
+            return SimpleNamespace(publish=publish, disconnect=lambda: future)
+        aws = SimpleNamespace(mqtt=SimpleNamespace(QoS=SimpleNamespace(AT_LEAST_ONCE=1)))
+        return connection, aws, sent
+
+    def run_main(self, argv, handler):
+        from unittest.mock import patch
+        connection, aws, sent = self.fake_transport(handler)
+        with patch.dict(sys.modules, awscrt=aws), patch.object(self.fc.fleet_deploy, "boto_session", return_value=object()), \
+             patch.object(self.fc.fleet_deploy, "mqtt_connection", connection), patch.object(self.fc.time, "sleep", lambda _: None):
+            return self.fc.main(argv), sent
+
+    def test_log_read_out_stitches_until_eof_with_correlated_ids(self):
+        import json
+        import tempfile
+        content = bytes((i * 31) % 256 for i in range(20000))
+        state = {"n": 0}
+        def device(req):
+            self.assertEqual(req["type"], "log_read")
+            state["n"] += 1
+            if state["n"] == 2:                          # a QoS duplicate refusal first, then the answer
+                yield {"type": "log_read_result", "ok": False, "detail": "busy", "name": req["name"]}
+            start = max(0, len(content) + req["offset"]) if req["offset"] < 0 else req["offset"]
+            data = content[start:start + req["length"]]
+            yield {"type": "log_read_result", "id": "other", "ok": True}   # uncorrelated: ignored
+            yield self.chunk(req["name"], data, start, len(content), start + len(data) >= len(content))
+        with tempfile.TemporaryDirectory() as tmp:
+            out, res = f"{tmp}/ambyte.log", f"{tmp}/results.json"
+            rc, sent = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--tail", "18000",
+                                      "--out", out, "--wait", "1", "--results-json", res], device)
+            self.assertEqual(rc, 0)
+            with open(out, "rb") as fh:
+                self.assertEqual(fh.read(), content[-18000:])
+            with open(res) as fh:
+                results = json.load(fh)
+        self.assertTrue(results["log"]["complete"])
+        self.assertEqual(results["log"]["chunks"], 3)
+        self.assertNotIn("data", json.dumps(results))      # bytes live in --out only
+        self.assertEqual([r["offset"] for r in sent], [-18000, 10192, 18384])
+        self.assertEqual(len({r["id"] for r in sent}), 3)
+
+    def test_log_read_out_missing_reply_fails_and_keeps_partial(self):
+        import tempfile
+        def device(req):
+            if req["offset"] == 0:
+                yield self.chunk("ambyte.log", b"x" * 8192, 0, 9000, False)
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, _ = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log",
+                                   "--out", f"{tmp}/f", "--wait", "1"], device)
+            self.assertEqual(rc, 1)
+            with open(f"{tmp}/f", "rb") as fh:
+                self.assertEqual(len(fh.read()), 8192)
+
+    def test_log_list_and_single_read_results(self):
+        import json
+        import tempfile
+        listing = {"type": "log_list_result", "ok": True, "detail": "ok", "dir": "/sdcard/logs",
+                   "files": [{"name": "ambyte.log", "size": 12}], "omitted": 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, sent = self.run_main(["log-list", "--devices", self.CLIENT, "--wait", "1",
+                                      "--results-json", f"{tmp}/r.json"], lambda req: [listing])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sent[0]["type"], "log_list")
+            with open(f"{tmp}/r.json") as fh:
+                self.assertEqual(json.load(fh)["replies"][self.CLIENT]["files"], listing["files"])
+        refused = {"type": "log_list_result", "ok": False, "detail": "sd_parked", "dir": "/sdcard/logs"}
+        rc, _ = self.run_main(["log-list", "--devices", self.CLIENT, "--wait", "1"], lambda req: [refused])
+        self.assertEqual(rc, 1)                                 # a refusal fails the command
+        rc, _ = self.run_main(["log-list", "--devices", self.CLIENT, "--wait", "1"], lambda req: [])
+        self.assertEqual(rc, 1)                                 # a missing reply fails the command
+        busy_then_ok = lambda req: [{"type": "log_read_result", "ok": False, "detail": "busy"},
+                                    self.chunk("ambyte.log", b"hello", 0, 5, True)]
+        rc, sent = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--wait", "1"],
+                                 busy_then_ok)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0], {"type": "log_read", "id": sent[0]["id"], "name": "ambyte.log",
+                                   "offset": 0, "length": 4096})
+
+
 class OptionalAwsDependencies(unittest.TestCase):
     def test_command_and_bench_helpers_import_without_aws_packages(self):
         # Fresh interpreter: an earlier test's cached SDK import cannot hide

@@ -194,7 +194,7 @@ class DevTransportTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):self.command.main(["ota","--devices",targets,"--token","t","--url","https://example.test/app"])
                 session.assert_not_called()
         workflow=(ROOT/".github/workflows/fleet-command.yml").read_text()
-        self.assertIn("options: [ping, inventory, replay, get-timezone, set-timezone]",workflow)
+        self.assertIn("options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read]",workflow)
         choices=workflow.split("      command:",1)[1].split("      timezone:",1)[0]
         self.assertNotIn("ota", choices.split("options: [",1)[1].split("]",1)[0].replace(" ", "").split(","))
 

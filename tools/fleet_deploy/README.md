@@ -192,6 +192,13 @@ AWS session. Three commands:
 - `replay` — `evlog_replay` with `--mode status|count|run|cancel` and `--token`.
   `count` and `status` are read-only; `run` (needs a bounded window and a
   `--chunk`) and `cancel` change device state.
+- `log-list` / `log-read` — read-only access to the SD log directory
+  (`/sdcard/logs`, firmware with remote diagnostics). `log-read --name
+  ambyte.log --tail 65536 --out ambyte.log` stitches 8 KiB chunks of one
+  device's file into a local file until EOF; without `--out` one request
+  (`--offset`, `--length` ≤ 8192) per device lands in `results.json` as base64.
+  A refusal (`sd_parked`, `sd_absent`, …) or a missing reply fails the run.
+  See [docs/remote-diagnostics.md](../../docs/remote-diagnostics.md).
 
 ```bash
 python tools/fleet_deploy/fleet_command.py ping --profile jii-infra-494 \
