@@ -108,6 +108,7 @@ whose conditions all hold for the row it is publishing**:
 | `ambit.spectrum/1` | `[ambyte-spectrum]` |
 | `ambit.spectrum/2` | whatever the workbook's `when:` matches — a `schema == ambit.spectrum/1` branch does NOT match it |
 | `ambyte.telemetry/1` | `[ambyte-telemetry]` |
+| `ambyte.log/1` (§17) | whatever the workbook's `when:` matches; no released workbook has a branch for it, so these rows land in `clean_data` with no macro, by design |
 | a v2 backlog row (no `schema` key) | key omitted entirely |
 
 Consequences for consumers:
@@ -557,8 +558,11 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "heap_int_free_kb": 121,
       "heap_int_largest_kb": 64,
       "wd_armed": true,
-      "last_wd_reboot_reason": ""
+      "last_wd_reboot_reason": "",
+      "reset_reason": "brownout",
+      "boot_count": 412
     },
+    "crash": { "present": false },
     "clock": { "source": "rtc", "suspect": false },
     "software": {
       "firmware": "1.6.6",
@@ -584,8 +588,10 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
 
 `observations` and `health` are REQUIRED objects, even when empty. A failed
 BME280 read produces `"observations": {}`; it does not suppress the health
-snapshot or emit null-valued scalars. The seven health members shown above are
-REQUIRED containers; their leaves are omitted when the source is unavailable.
+snapshot or emit null-valued scalars. The seven health members shown above
+other than `crash` are REQUIRED containers; their leaves are omitted when the
+source is unavailable. `health.crash` (§9.5) is additive since the remote
+diagnostics release and is then always present.
 This stable grouping lets the platform project environment and health views
 from the same raw row, with the same `measure_id` and observation time, without
 republishing or duplicating that row.
@@ -650,6 +656,9 @@ non-negative integers.
 | | `heap_int_largest_kb` | integer, KiB | Largest free internal-heap block. |
 | | `wd_armed` | boolean | Connectivity watchdog is armed. |
 | | `last_wd_reboot_reason` | string | Persisted watchdog reboot reason, empty when none is known. |
+| | `reset_reason` | string enum | Why THIS boot started (`esp_reset_reason()`): `poweron`, `brownout`, `panic`, `int_wdt`, `task_wdt`, `other_wdt`, `sw`, `deepsleep`, `ext`, `sdio`, `usb`, `jtag`, `efuse`, `pwr_glitch`, `cpu_lockup`, `unknown`. Additive (remote diagnostics); unknown future values are preserved. |
+| | `boot_count` | integer | NVS boot counter, incremented once per boot; `0` = counter unavailable (NVS error). Additive. |
+| `crash` | see §9.5 | object | Summary of the stored coredump. Additive. |
 | `clock` | `source` | string enum | `clock_src`; `rtc`, `hwm` (persisted high-water mark), or `sntp`. Unknown future values are preserved. |
 | | `suspect` | boolean | `clock_suspect`; wall clock may be wrong. |
 | `software` | `firmware` | string | `app_version`; running Ambyte firmware version. |
@@ -704,6 +713,41 @@ state learned outside the heartbeat, without heartbeat-initiated UART I/O.
 - At every path, the gateway BME280 is gateway-level context only. Its values
   are never copied into `ambit.trace/3.series`, once per attached channel, or
   into `ambit.device/1`.
+
+### 9.5 `health.crash` (additive, remote diagnostics)
+
+Summary of the coredump partition, read and CRC-verified once per boot and
+cached. The partition is never erased by the firmware, so the same dump is
+reported on every boot until the next panic overwrites it. Compare
+`first_seen_boot` with `health.runtime.boot_count` to tell a new crash from an
+old one. See [remote-diagnostics.md](remote-diagnostics.md) §B.
+
+```jsonc
+"crash": { "present": false }                       // blank partition
+"crash": {                                           // verified dump
+  "present": true, "id": "0000c4f2a1b2c3d4", "first_seen_boot": 409,
+  "app_elf_sha256": "9f2c1e0a7b3d5e61", "task": "mqtt_task",
+  "pc": "0x4201a3f4", "exc_cause": 28, "exc_vaddr": "0x00000010",
+  "backtrace": ["0x4201a3f1", "0x42019b2e", "0x4037c5d2"], "bt_corrupted": false
+}
+"crash": {                                           // present but unreadable
+  "present": true, "id": "0000c4f2deadbeef", "first_seen_boot": 409,
+  "error": "ESP_ERR_INVALID_CRC"
+}
+```
+
+| leaf | type | meaning |
+|---|---|---|
+| `present` | boolean | The partition holds a dump (verified or not). |
+| `error` | string | Present when the dump or partition could not be read/verified (`ESP_ERR_INVALID_CRC`, `invalid_size`, `no_partition`, …). The summary leaves are then absent. With `present:false` it explains why absence could not be checked. |
+| `id` | 16-hex string | Stable identity of the dump image: size and checksum tail. A string, not a number (u64). |
+| `first_seen_boot` | integer | `boot_count` on which this `id` was first seen (persisted in NVS). |
+| `app_elf_sha256` | 16-hex string | Prefix of the crashing image's ELF SHA-256: pick the matching `firmware.elf` for `addr2line`. |
+| `task` | string | FreeRTOS task that crashed. |
+| `pc`, `exc_vaddr` | `0x%08x` string | Program counter and Xtensa EXCVADDR. |
+| `exc_cause` | integer | Xtensa EXCCAUSE (28 LoadProhibited, 29 StoreProhibited, 0 IllegalInstruction, …). |
+| `backtrace` | array of `0x%08x` strings | Up to 16 return addresses, innermost first. |
+| `bt_corrupted` | boolean | IDF flagged the backtrace as corrupted. |
 
 ## 10. Attached AMBIT device object (normative, Ambyte only)
 
@@ -954,6 +998,7 @@ unstorable. `protocol.cmd` (≤ ~522 B) stays in the record's command column.
 | 2026-08-10 | New firmware's lossless v2 trace fallback and the existing `ambit.spec`, `ambit.temp`, and `db.store_event` v2 families are permanent; platform dual-read support has no retirement date. |
 | 2026-08-12 | Transport gzip of the v3 `sample` (`_sample_encoding: "gzip+base64"`, §14a) ships behind the NVS flag `publish_gzip`, default OFF, fail-open to plain JSON; the compressed text is byte-identical to the plain `sample` array so Silver's existing decoder needs no change. Chosen over SenML JSON/CBOR after exact same-trace benchmarks (920 B vs 1,740/1,900 B gzipped). |
 | 2026-08-12 | Measurements publish on the lean 7-segment topic (`topic_root` verbatim, §13), complying with openJII `e38cdd45b`; the hardcoded `/1234` legacy protocolId suffix is removed. Attribution is payload-only (`protocol.id`). |
+| 2026-11-14 | Remote diagnostics: `health.runtime.reset_reason` + `boot_count` and `health.crash` are additive telemetry fields; captured `ESP_LOGE` lines become a separate persisted family `ambyte.log/1` (tag `LOG`) on the normal QoS1 path rather than a field of the heartbeat, so a log burst never grows or delays the health row. `log_read` data is base64 (bounded 4/3 growth) rather than escaped text (up to 6×). |
 
 ## 16. On-disk record
 
@@ -962,6 +1007,79 @@ whether the stored `metadata`/`payload` columns move to the v3 field names is
 an implementation decision of the builder change (documented in
 [components/event_log/include/event_log.h](../components/event_log/include/event_log.h)
 when it lands).
+
+## 17. Ambyte log object `ambyte.log/1` (Ambyte only, remote diagnostics)
+
+Captured `ESP_LOGE` lines, batched into ordinary event-log records (envelope
+tag `LOG`) and delivered on the normal at-least-once QoS1 path. At most one
+record per 60 s; each record is under 4 KiB. Mechanism and rate limits:
+[remote-diagnostics.md](remote-diagnostics.md) §C.
+
+```jsonc
+{
+  "schema": "ambyte.log/1",
+  "measure_id": 51234,
+  "device": "28:37:2F:FF:E7:04",
+  "tag": "LOG",
+  "time": { "observed_utc": 1794650161000 },
+  "boot_count": 412,
+  "lines": [
+    { "uptime_ms": 2114, "utc_ms": null, "level": "E", "tag": "APP_MAIN",
+      "msg": "SD card init failed: ESP_ERR_TIMEOUT", "repeat": 1 },
+    { "uptime_ms": 61876, "utc_ms": 1794650122876, "level": "E", "tag": "uart_sensors",
+      "msg": "ch2: ping timeout", "repeat": 14 }
+  ],
+  "dropped": 0,
+  "rate_limited": 3
+}
+```
+
+| field | type | meaning |
+|---|---|---|
+| `schema`, `measure_id`, `device`, `tag`, `time.observed_utc` | | As `ambyte.telemetry/1` (§9.1); `tag` is exactly `LOG`; `observed_utc` is when the record was built. |
+| `boot_count` | integer | The boot the `uptime_ms` values belong to (`0` = unknown). |
+| `lines[].uptime_ms` | integer, ms | Monotonic uptime of the first occurrence. |
+| `lines[].utc_ms` | integer epoch ms or `null` | Wall-clock time, back-computed from the drain-time clock; `null` for lines captured before the clock was first known valid (RTC/SNTP). |
+| `lines[].level` | string | `E` (only errors are captured). |
+| `lines[].tag` | string | ESP-IDF log tag (≤ 23 bytes); empty when the line had no IDF prefix. |
+| `lines[].msg` | string | Formatted message, ≤ 160 bytes, valid UTF-8 (invalid bytes become U+FFFD). |
+| `lines[].repeat` | integer ≥ 1 | Identical consecutive occurrences coalesced into this line. |
+| `dropped` | integer | Occurrences lost since the previous record: ring full, ISR context, recursion, too many concurrent loggers. |
+| `rate_limited` | integer | Occurrences refused by the token buckets since the previous record. |
+
+Every captured occurrence is counted exactly once: in one line's `repeat`, or
+in `dropped` / `rate_limited` of exactly one record.
+
+## 18. Remote diagnostics commands (status topic)
+
+Command replies, not persisted events (§12). Publish on the device's command
+topic, QoS 1, not retained, with a unique `id`. Details:
+[remote-diagnostics.md](remote-diagnostics.md) §D.
+
+```jsonc
+// request → reply
+{"type":"log_list","id":"r1"}
+{"type":"log_list_result","id":"r1","ok":true,"detail":"ok","dir":"/sdcard/logs",
+ "files":[{"name":"ambyte.1.log","size":1048570},{"name":"ambyte.log","size":20311}],"omitted":0}
+
+{"type":"log_read","id":"r2","name":"ambyte.log","offset":-4096,"length":4096}
+{"type":"log_read_result","id":"r2","ok":true,"detail":"ok","name":"ambyte.log","size":20311,
+ "offset":16215,"length":4096,"eof":true,"encoding":"base64","data":"MjAyNi0xMS0xNCAw…"}
+```
+
+- `name`: plain basename found in the log directory; 1–64 chars of
+  `[A-Za-z0-9._-]`, no leading `.`, no `..`.
+- `offset`: integer; `< 0` counts from the end (clamped to 0). `length`:
+  integer 1–8192 (larger is clamped), default 4096. The reply's `offset` is the
+  resolved absolute offset and `length` the bytes returned; `eof` is true when
+  `offset + length >= size`.
+- `data`: standard padded base64 of the raw bytes.
+- `ok:false` details: `invalid_id`, `invalid_name`, `invalid_offset`,
+  `invalid_length`, `busy` (another log op in flight, or a QoS 1 duplicate),
+  `queue_unavailable`, `maintenance_active`, `sd_parked`, `sd_absent`,
+  `sd_io_lost`, `sd_busy` (unmount pending), `dir_unavailable`, `not_found`,
+  `open_failed`, `not_a_file`, `stat_failed`, `seek_failed`, `read_failed`,
+  `offset_past_eof` (with `size`), `no_mem`.
 
 ## OTA admission failure details
 
@@ -977,6 +1095,16 @@ and bounded refusal persistence is attempted. It never implies a new boot slot
 or applied-ID latch. Firmware URL query credentials are not diagnostic fields.
 See [Signed images](signed-images.md) for the compatibility rule.
 
+
+### Restart reason in pong (remote diagnostics, additive)
+
+The pong also carries `reset_reason` (the §9.2 enum) and `boot_count`
+immediately after `uptime_ms`. Every earlier key keeps its value and encoding:
+
+```json
+{"type":"pong","id":"…","device_id":"…","fw":"2.18.0","uptime_ms":42,
+ "reset_reason":"brownout","boot_count":412,"signed":true,"storage":{…}}
+```
 
 ### Running-image metadata in pong (A5 additive)
 
