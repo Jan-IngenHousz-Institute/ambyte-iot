@@ -22,10 +22,13 @@
  * ── The hook runs on ANY task ─────────────────────────────────────────────
  * Including the esp-mqtt task (which may touch only the portMUX latch table
  * and the completion queue — repo CLAUDE.md task boundaries) and tasks that
- * hold event_log's s_mtx. So the hook:
+ * hold event_log's s_mtx. So the hook (diag_log_hook.c, its own object so the
+ * claim is checkable — tools/check_diag_hook_symbols.py):
  *   - never locks s_mtx, never calls event_log, never allocates, never blocks:
- *     it formats into a stack buffer and copies under ONE portMUX (spinlock,
- *     a few hundred bytes of memcpy/strcmp, no calls out);
+ *     it formats into a stack buffer with diag_fmt (allocation-free; newlib's
+ *     full vsnprintf would malloc in _dtoa_r for any %f/%e/%g) and copies
+ *     under ONE portMUX (spinlock, a few hundred bytes of memcpy/strcmp, no
+ *     calls out);
  *   - does not call time()/gettimeofday() (IDF takes a _lock there); lines are
  *     stamped with esp_timer uptime only and converted to UTC by the drainer;
  *   - drops and counts when the ring is full, in ISR context, or on
@@ -101,6 +104,7 @@ typedef struct {
     uint32_t used;           /* entries actually rendered (≤ n) */
     uint32_t dropped;        /* counter snapshots at seal time */
     uint32_t rate_limited;
+    uint32_t unsupported_fmt;
 } diag_log_batch_t;
 
 typedef struct {
@@ -128,6 +132,7 @@ typedef struct {
     uint32_t buffered;        /* lines waiting in the ring */
     uint32_t dropped;         /* not yet reported in a record */
     uint32_t rate_limited;
+    uint32_t unsupported_fmt; /* lines whose format used a %a/%n/wide/unknown conversion */
     uint32_t total_captured;  /* since boot: lines admitted (excl. repeats) */
     uint32_t total_repeats;   /* since boot: occurrences coalesced */
     uint32_t total_records;   /* since boot: records committed */

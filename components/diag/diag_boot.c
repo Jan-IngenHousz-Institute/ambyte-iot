@@ -10,6 +10,7 @@
  *   crash_boot  u32  boot_count on which crash_id was first seen
  */
 #include "diag.h"
+#include "diag_log_priv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,13 @@ static char        s_crash_json[DIAG_CRASH_JSON_CAP] = "{\"present\":false,\"err
 const char *diag_reset_reason(void) { return s_reset; }
 uint32_t    diag_boot_count(void)   { return s_boot_count; }
 const char *diag_crash_json(void)   { return s_crash_json; }
+
+/* Downstream sink for the few instructions before install() stores the
+ * previous one (diag_log_priv.h): plain stdout, outside the hook object. */
+int diag_log_fallback_sink(const char *fmt, va_list ap)
+{
+    return vprintf(fmt, ap);
+}
 
 void diag_log_install(void)
 {
@@ -68,18 +76,74 @@ static uint32_t bump_boot_count(nvs_handle_t h, bool nvs_ok)
 }
 
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
-/* Stable identity of the dump image without hashing 64 KiB: its size and a
- * CRC of its last ≤32 bytes, which hold the image checksum IDF wrote over the
- * whole dump (CRC32 here; SHA-256 if that Kconfig is ever chosen). Two
- * different dumps collide only if both size and checksum tail do. Works for a
- * corrupt image too, so a corrupt dump still has a first_seen_boot. */
+/* Width of the checksum IDF appends to the image (core_dump_flash.c reads it
+ * from size - checksum_size). CRC32 in this tree. */
+#if CONFIG_ESP_COREDUMP_CHECKSUM_SHA256
+#define DIAG_CRASH_CKSUM_LEN 32U
+#else
+#define DIAG_CRASH_CKSUM_LEN 4U
+#endif
+/* Upper word of a fallback identity. A real image size never reaches it
+ * (it is ≤ the 64 KiB partition), so the two id spaces cannot meet. */
+#define DIAG_CRASH_ID_FALLBACK 0xFFFFFFFFull
+
+/* Stable identity of a dump whose size word is sane: the image size and the
+ * checksum IDF stored over the whole image (the raw CRC32 word; for SHA-256 a
+ * CRC of the 32 stored bytes). Two different dumps share it only if their
+ * checksums do. The first version hashed the last 32 bytes INCLUDING the
+ * stored CRC and collided for same-size dumps that differed only in those
+ * bytes (review finding 3, reproduced with stored CRCs 0x970e5812/0x21dc7909).
+ * The stored checksum survives later bit rot of the payload, so a dump that
+ * fails image_check keeps its identity and its first_seen_boot. */
 static uint64_t crash_identity(const esp_partition_t *part, uint32_t size)
 {
-    uint8_t tail[32];
-    const uint32_t n = size < sizeof tail ? size : (uint32_t)sizeof tail;
-    if (n == 0 || esp_partition_read(part, size - n, tail, n) != ESP_OK) return 0;
-    const uint64_t id = ((uint64_t)size << 32) | esp_rom_crc32_le(0, tail, n);
+    uint8_t ck[DIAG_CRASH_CKSUM_LEN];
+    if (size < sizeof(uint32_t) + DIAG_CRASH_CKSUM_LEN ||
+        esp_partition_read(part, size - DIAG_CRASH_CKSUM_LEN, ck, sizeof ck) != ESP_OK) {
+        return 0;
+    }
+    uint32_t low;
+    if (DIAG_CRASH_CKSUM_LEN == 4U) {
+        low = (uint32_t)ck[0] | (uint32_t)ck[1] << 8 | (uint32_t)ck[2] << 16 | (uint32_t)ck[3] << 24;
+    } else {
+        low = esp_rom_crc32_le(0, ck, sizeof ck);
+    }
+    const uint64_t id = ((uint64_t)size << 32) | low;
     return id != 0 ? id : 1;
+}
+
+/* Identity when the size word itself is garbage (no checksum position is
+ * known): CRC32 over every byte of the partition, bounded by its size. One
+ * 64 KiB read per boot, only in this already-broken case. */
+static uint64_t fallback_identity(const esp_partition_t *part)
+{
+    uint8_t buf[256];
+    uint32_t crc = 0;
+    for (uint32_t off = 0; off < part->size; off += sizeof buf) {
+        const uint32_t n = part->size - off < sizeof buf ? part->size - off : (uint32_t)sizeof buf;
+        if (esp_partition_read(part, off, buf, n) != ESP_OK) return 0;
+        crc = esp_rom_crc32_le(crc, buf, n);
+    }
+    return (DIAG_CRASH_ID_FALLBACK << 32) | crc;
+}
+
+/* first_seen_boot bookkeeping, keyed by the dump identity. */
+static void note_first_seen(diag_crash_t *c, nvs_handle_t h, bool nvs_ok, uint32_t boot)
+{
+    if (c->id == 0) return;
+    uint64_t seen_id = 0;
+    uint32_t seen_boot = 0;
+    if (nvs_ok && nvs_get_u64(h, DIAG_KEY_CRASH_ID, &seen_id) == ESP_OK && seen_id == c->id &&
+        nvs_get_u32(h, DIAG_KEY_CRASH_BT, &seen_boot) == ESP_OK) {
+        c->first_seen_valid = true;
+        c->first_seen_boot = seen_boot;
+    } else if (nvs_ok && boot != 0 &&
+               nvs_set_u64(h, DIAG_KEY_CRASH_ID, c->id) == ESP_OK &&
+               nvs_set_u32(h, DIAG_KEY_CRASH_BT, boot) == ESP_OK &&
+               nvs_commit(h) == ESP_OK) {
+        c->first_seen_valid = true;
+        c->first_seen_boot = boot;
+    }
 }
 
 static void read_crash(diag_crash_t *c, nvs_handle_t h, bool nvs_ok, uint32_t boot)
@@ -103,26 +167,14 @@ static void read_crash(diag_crash_t *c, nvs_handle_t h, bool nvs_ok, uint32_t bo
     }
     if (size == 0xFFFFFFFFu) return;     /* blank: no dump */
     c->present = true;
-    if (size < sizeof(uint32_t) || size > part->size) {
+    if (size < sizeof(uint32_t) + DIAG_CRASH_CKSUM_LEN || size > part->size) {
         c->error = "invalid_size";
+        c->id = fallback_identity(part);
+        note_first_seen(c, h, nvs_ok, boot);
         return;
     }
     c->id = crash_identity(part, size);
-    if (c->id != 0) {
-        uint64_t seen_id = 0;
-        uint32_t seen_boot = 0;
-        if (nvs_ok && nvs_get_u64(h, DIAG_KEY_CRASH_ID, &seen_id) == ESP_OK && seen_id == c->id &&
-            nvs_get_u32(h, DIAG_KEY_CRASH_BT, &seen_boot) == ESP_OK) {
-            c->first_seen_valid = true;
-            c->first_seen_boot = seen_boot;
-        } else if (nvs_ok && boot != 0 &&
-                   nvs_set_u64(h, DIAG_KEY_CRASH_ID, c->id) == ESP_OK &&
-                   nvs_set_u32(h, DIAG_KEY_CRASH_BT, boot) == ESP_OK &&
-                   nvs_commit(h) == ESP_OK) {
-            c->first_seen_valid = true;
-            c->first_seen_boot = boot;
-        }
-    }
+    note_first_seen(c, h, nvs_ok, boot);
     /* Verify BEFORE parsing: esp_core_dump_get_summary() walks ELF headers
      * straight out of the mmapped partition with no bounds checks, so a
      * corrupt image could fault the parser. Only a CRC-clean image is parsed. */

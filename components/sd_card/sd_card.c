@@ -141,6 +141,16 @@ static esp_err_t sdcard_init_locked(void)
     return ESP_OK;
 }
 
+/* Successful mounts since boot. A remote log reader pins it across chunks: a
+ * card swapped (or parked and remounted) between two chunks means the next
+ * chunk may come from a different volume with the same file names. */
+static uint32_t s_mount_gen;
+
+uint32_t sdcard_mount_generation(void)
+{
+    return __atomic_load_n(&s_mount_gen, __ATOMIC_ACQUIRE);
+}
+
 static esp_err_t sdcard_mount_locked(bool quiet)
 {
     if (s_sdcard.mounted) {
@@ -174,6 +184,7 @@ static esp_err_t sdcard_mount_locked(bool quiet)
     }
 
     s_sdcard.mounted = true;
+    __atomic_fetch_add(&s_mount_gen, 1, __ATOMIC_ACQ_REL);   /* new volume (or the same card remounted) */
     sdcard_io_reset();          /* a clean (re)mount re-arms writers — not only the monitor path (audit E4) */
 
     /* Log card identity + capacity once per mount: a bad batch is traceable and a

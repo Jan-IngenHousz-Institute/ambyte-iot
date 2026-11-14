@@ -9,11 +9,22 @@
  * commands make it readable over MQTT, bounded and strictly read-only:
  *
  *   {"type":"log_list","id":…}
- *     → {"type":"log_list_result","id","ok","detail","dir",
+ *     → {"type":"log_list_result","id","ok","detail","dir","gen",
  *        "files":[{"name","size"}],"omitted"}
- *   {"type":"log_read","id":…,"name":"ambyte.log","offset":…,"length":…}
- *     → {"type":"log_read_result","id","ok","detail","name","size","offset",
- *        "length","eof","encoding":"base64","data"}
+ *   {"type":"log_read","id":…,"name":"ambyte.log","offset":…,"length":…,
+ *    "expect_gen":"412.3.18"}                      (expect_gen optional)
+ *     → {"type":"log_read_result","id","ok","detail","name","gen","size",
+ *        "offset","length","eof","encoding":"base64","data"}
+ *
+ * - `gen` = "<boot_count>.<sd mount generation>.<sd_logger rotation seq>":
+ *   it changes whenever a rename may have given a basename to different bytes
+ *   (sd_logger rotation, a card swap or remount, a reboot). A multi-chunk
+ *   reader pins the gen of its first chunk and sends it as `expect_gen`; the
+ *   device refuses "file_rotated" on a mismatch. Each single read is also
+ *   bracketed: gen is sampled before opendir and after fclose, and a change
+ *   (or an odd rotation seq = rename in progress) discards the bytes
+ *   ("file_rotated" / "rotation_in_progress"). Appending to the live
+ *   ambyte.log does not change gen; only renames do.
  *
  * - `name` is a plain basename that must be FOUND in the log directory:
  *   1–64 chars of [A-Za-z0-9._-], no leading '.', no "..", so no '/', no other
@@ -35,8 +46,15 @@
  * truncated or deleted (sd_logger's FAT writer is untouched; FATFS_FS_LOCK=0
  * lets a reader open the file the writer holds).
  *
+ * Allocation failures never produce a partial success: every reply field is
+ * checked, and any failure turns the whole reply into a "no_mem" refusal.
+ * Refusals are built in a stack buffer without allocating, so they can always
+ * be sent (review finding 4).
+ *
  * Every SD/maintenance probe is injected so tests/log_command_host runs this
- * production file against a real temporary directory.
+ * production file against a real temporary directory. All heap use goes
+ * through cJSON_malloc/cJSON_free, so the test's cJSON hooks can fail any
+ * single allocation.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -54,6 +72,14 @@ extern "C" {
 #define LOG_LIST_MAX_FILES   32
 
 typedef struct {
+    uint32_t boot;       /* NVS boot counter */
+    uint32_t mount;      /* sdcard_mount_generation() */
+    uint32_t rotation;   /* sd_logger_rotation_seq(): odd while renaming */
+} log_gen_t;
+
+#define LOG_GEN_MAX 40   /* "4294967295.4294967295.4294967295" + NUL */
+
+typedef struct {
     void (*reply)(const char *json);
     bool (*submit)(void (*run)(void *), void *arg);
     bool (*maintenance_begin)(void);
@@ -64,6 +90,7 @@ typedef struct {
     bool (*sd_io_lost)(void);
     bool (*io_begin)(void);        /* false = unmount pending / card lost */
     void (*io_end)(void);
+    void (*gen)(log_gen_t *out);   /* identity of the names under dir right now */
 } log_command_config_t;
 
 void log_command_init(const log_command_config_t *config);

@@ -32,6 +32,11 @@ esp_err_t sd_logger_init(void);
  * Exposed for the read-only remote reader (command_router log_list/log_read),
  * so the reader can never drift from the writer's path. */
 const char *sd_logger_dir(void);
+/* Rotation sequence: odd while the writer is renaming the log files, even
+ * when the names are stable; monotonically increasing within one boot. A
+ * reader that sees the same even value before and after a read knows no
+ * rename touched the file in between. Lock-free. */
+uint32_t sd_logger_rotation_seq(void);
 
 /* Low-battery park handshake (used by app_main's persistence guard around a
  * deliberate unmount). pause() signals the writer task to drain the RAM ring to

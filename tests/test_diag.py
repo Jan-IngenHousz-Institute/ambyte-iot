@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,8 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOST = ROOT / "tests/diag_host"
 DIAG = ROOT / "components/diag"
-SOURCES = [HOST / "diag_host.c", DIAG / "diag_reset.c", DIAG / "diag_crash.c",
-           DIAG / "diag_json.c", DIAG / "diag_log.c"]
+SOURCES = [HOST / "diag_host.c", DIAG / "diag_reset.c", DIAG / "diag_crash.c", DIAG / "diag_fmt.c",
+           DIAG / "diag_json.c", DIAG / "diag_log.c", DIAG / "diag_log_hook.c"]
+HOOK_OBJECTS = (DIAG / "diag_log_hook.c", DIAG / "diag_fmt.c")
 
 MIN_BURST, MIN_REFILL_S = 20, 6
 HOUR_BURST, HOUR_REFILL_S = 60, 15
@@ -70,7 +72,7 @@ class DiagHost(unittest.TestCase):
             self.assertEqual(r["schema"], "ambyte.log/1")
             self.assertEqual(r["tag"], "LOG")
             self.assertEqual(set(r), {"schema", "measure_id", "device", "tag", "time", "boot_count",
-                                      "lines", "dropped", "rate_limited"})
+                                      "lines", "dropped", "rate_limited", "unsupported_fmt"})
             for line in r["lines"]:
                 self.assertEqual(set(line), {"uptime_ms", "utc_ms", "level", "tag", "msg", "repeat"})
                 self.assertEqual(line["level"], "E")
@@ -228,15 +230,217 @@ class DiagHost(unittest.TestCase):
         self.assertLess(app.index("app_init_nvs()"), app.index("diag_boot_init()"))
         sync = (ROOT / "components/sync_runner/sync_runner.c").read_text()
         self.assertIn("cmd_store_log_event()", sync)
-        # Everything up to the drain section runs on the logging task: code
-        # (comments stripped) must not reach event_log, the heap, a blocking
-        # lock or the libc clock (IDF's time() takes a _lock).
-        hook = (DIAG / "diag_log.c").read_text().split("/* ── drain (task context)")[0]
-        code = re.sub(r"/\*.*?\*/", "", hook, flags=re.S)
-        code = re.sub(r"//[^\n]*", "", code)
-        for forbidden in ("event_log", "malloc", "calloc", "xSemaphore", "time(", "gettimeofday", "vTaskDelay"):
-            self.assertNotIn(forbidden, code, forbidden)
         self.assertIn('"{\\"schema\\":\\"ambyte.log/1\\""', (ROOT / "components/payload_codec/payload_v3.c").read_text())
+
+
+    # ── review finding 2: the hook never reaches newlib printf / the heap ──
+    def test_formatter_matches_libc_for_integers_and_strings(self):
+        rows = [l.split("\t") for l in self.run_case("fmt").splitlines()]
+        ints = [r for r in rows if r[0] == "INT"]
+        self.assertGreater(len(ints), 8)
+        for kind, fmt, ours, libc, unsupported in ints:
+            with self.subTest(fmt=fmt):
+                self.assertEqual(ours, libc)
+                self.assertEqual(unsupported, "0")
+
+    def test_formatter_renders_floats_without_allocation(self):
+        rows = [l.split("\t") for l in self.run_case("fmt").splitlines()]
+        for kind, fmt, ours, libc, unsupported in (r for r in rows if r[0] == "FLT"):
+            with self.subTest(fmt=fmt, ours=ours, libc=libc):
+                self.assertEqual(unsupported, "0")
+                if "e" in ours and "e" not in libc and "E" not in libc:
+                    # 1e300 does not fit the integer path: e-form, same value.
+                    self.assertAlmostEqual(float(ours) / 1e300, 1.0, places=9)
+                    continue
+                # Same shape (width, sign, padding, exponent form) and value to
+                # the printed precision.
+                self.assertEqual(len(ours), len(libc))
+                num = lambda t: float(re.sub(r"[^0-9eE+.\-]", "", t.split("|")[0]) or "0")
+                self.assertAlmostEqual(num(ours), num(libc), delta=abs(num(libc)) * 1e-9 + 10 ** -(
+                    len(libc.split(".")[-1].split("e")[0].split("E")[0].rstrip("|°C ")) if "." in libc else 0))
+        special = next(r for r in rows if r[0] == "SPECIAL")
+        self.assertEqual(special[2].lower(), special[3].lower())
+
+    def test_formatter_unsupported_conversions_are_counted_and_visible(self):
+        odd = {r[1]: (r[2], r[3]) for r in (l.split("\t") for l in self.run_case("fmt").splitlines()) if r[0] == "ODD"}
+        self.assertEqual(odd["a=%a b=%d"], ("a=<%a> b=7", "1"))
+        self.assertEqual(odd["n=%n then %d"], ("n= then 9", "1"))
+        self.assertEqual(odd["w=%ls %lc end %d"], ("w=<%ls> <%lc> end 3", "2"))
+        self.assertEqual(odd["bad %q %d"], ("bad %q<?>", "1"))     # stops: arg sizes unknowable
+        self.assertEqual(odd["trailing %"], ("trailing %<?>", "1"))
+        self.assertIn("TRUNC ok", self.run_case("fmt_trunc"))
+
+    def test_float_error_line_through_the_hook(self):
+        out = self.run_case("hook_fmt")
+        self.assertIn("STATS unsupported=2 buffered=3", out)
+        (rec,) = self.records(out)
+        self.assertEqual([l["msg"] for l in rec["lines"]],
+                         ["temperature 85.13 out of range (3)", "count= done", "hex float <%a>"])
+        self.assertEqual(rec["unsupported_fmt"], 2)
+
+    def _host_objects(self, sources, extra=()):
+        cc = _cc()
+        objs = []
+        for src in sources:
+            obj = Path(self.tmp.name) / (Path(src).stem + ".o")
+            # No sanitizers: their runtime hooks would hide what the code itself calls.
+            subprocess.run([cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-DDIAG_LOG_HOST", "-O1", "-c",
+                            f"-I{DIAG / 'include'}", f"-I{DIAG}", *extra, str(src), "-o", str(obj)],
+                           check=True, capture_output=True, text=True)
+            objs.append(obj)
+        return objs
+
+    def test_hook_objects_reference_no_allocator_or_printf(self):
+        checker = ROOT / "tools/check_diag_hook_symbols.py"
+        objs = self._host_objects(HOOK_OBJECTS)
+        r = subprocess.run([sys.executable, str(checker), *map(str, objs)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # The checker is not vacuous: the drain object (newlib vsnprintf via
+        # diag_json) and a hook that formats with vsnprintf / allocates fail it.
+        bad = Path(self.tmp.name) / "bad_hook.c"
+        bad.write_text('#include <stdarg.h>\n#include <stdio.h>\n#include <stdlib.h>\n'
+                       'void *g_keep;\nint bad_capture(const char *f, va_list ap) { char b[64]; g_keep = malloc(4);'
+                       ' return vsnprintf(b, sizeof b, f, ap); }\n')
+        for obj, needle in ((self._host_objects([bad])[0], "vsnprintf"),
+                            (self._host_objects([DIAG / "diag_json.c"])[0], "vsnprintf")):
+            r = subprocess.run([sys.executable, str(checker), str(obj)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn(needle, r.stdout)
+        self.assertIn("malloc", subprocess.run([sys.executable, str(checker), str(Path(self.tmp.name) / "bad_hook.o")],
+                                               capture_output=True, text=True).stdout)
+
+    def test_firmware_hook_objects_when_built(self):
+        objs = [ROOT / ".pio/build/esp32-s3-devkitm-1/components/diag" / f"{Path(s).name}.o" for s in HOOK_OBJECTS]
+        if not all(o.exists() for o in objs):
+            self.skipTest("firmware not built (CI runs tools/check_diag_hook_symbols.py after pio run)")
+        r = subprocess.run([sys.executable, str(ROOT / "tools/check_diag_hook_symbols.py"), *map(str, objs)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_ci_runs_the_target_symbol_check(self):
+        pr = (ROOT / ".github/workflows/pr.yml").read_text()
+        self.assertIn("tools/check_diag_hook_symbols.py", pr)
+        self.assertIn("components/diag/diag_log_hook.c.o", pr)
+
+
+
+class DiagBoot(unittest.TestCase):
+    """The production diag_boot.c (review finding 3): boot counter, coredump
+    identity and first_seen_boot across "boots" (one process each), against a
+    64 KiB partition file and a file-backed NVS."""
+
+    PART = 0x10000
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="diag-boot-")
+        cls.bin = Path(cls.tmp.name) / "boot"
+        cmd = [_cc(), "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE", "-DDIAG_LOG_HOST",
+               "-Wall", "-Wextra", "-Werror", "-O1", "-g", "-fsanitize=address,undefined",
+               f"-I{HOST / 'boot_include'}", f"-I{HOST / 'include'}", f"-I{DIAG / 'include'}", f"-I{DIAG}",
+               str(HOST / "boot_host.c"), *(str(DIAG / f) for f in (
+                   "diag_boot.c", "diag_crash.c", "diag_fmt.c", "diag_json.c", "diag_log.c",
+                   "diag_log_hook.c", "diag_reset.c")), "-o", str(cls.bin)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        self.nvs = self.dir / "nvs"
+
+    def image(self, payload, size=None):
+        """A dump the way IDF writes it: size word, payload, CRC32 over [0, size-4)."""
+        import struct
+        import zlib
+        size = size or 8 + len(payload)
+        body = struct.pack("<I", size) + payload
+        body = body[:size - 4].ljust(size - 4, b"\0")
+        img = body + struct.pack("<I", zlib.crc32(body))
+        return img.ljust(self.PART, b"\xff")
+
+    def boot(self, flash, reset=4, extra=()):
+        part = self.dir / "part"
+        if flash is None:
+            arg = "-"
+        else:
+            part.write_bytes(flash)
+            arg = str(part)
+        r = subprocess.run([self.bin, arg, str(self.nvs), str(reset), *extra],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    @staticmethod
+    def payload(tail=b"", task=b"mqtt_task"):
+        import struct
+        head = struct.pack("<I", 0x4200ABCD) + task.ljust(16, b"\0") + struct.pack("<IIIII", 28, 0x10, 1, 2, 3)
+        return (head + b"\x5a" * 4000)[:4000 - len(tail)] + tail
+
+    def test_boot_counter_and_reset_reason(self):
+        blank = b"\xff" * self.PART
+        self.assertEqual([self.boot(blank)["boot_count"] for _ in range(3)], [1, 2, 3])
+        out = self.boot(blank, reset=9)
+        self.assertEqual((out["boot_count"], out["reset_reason"], out["crash"]), (4, "brownout", {"present": False}))
+        broken = self.boot(blank, extra=("nvs-broken",))
+        self.assertEqual(broken["boot_count"], 0)                    # unknown, never a fresh 1
+
+    def test_valid_dump_summary_and_first_seen_survives_boots(self):
+        img = self.image(self.payload())
+        first = self.boot(img)
+        c = first["crash"]
+        self.assertEqual((c["present"], c["task"], c["pc"], c["exc_cause"], c["first_seen_boot"]),
+                         (True, "mqtt_task", "0x4200abcd", 28, 1))
+        self.assertEqual(c["backtrace"], ["0x00000001", "0x00000002", "0x00000003"])
+        self.assertEqual(c["app_elf_sha256"], "0123456789abcdef")
+        again = self.boot(img)
+        self.assertEqual((again["boot_count"], again["crash"]["first_seen_boot"], again["crash"]["id"]),
+                         (2, 1, c["id"]))                           # same dump: still first seen on boot 1
+        self.assertTrue(c["id"].startswith("%08x" % 4008))           # identity = size + stored checksum
+
+    def test_same_size_dumps_differing_only_at_the_end_get_new_identity(self):
+        # The reviewer's collision: equal size, payloads differ only in the
+        # last 28 bytes before the CRC. The old last-32-bytes hash collided.
+        a = self.image(self.payload(tail=b"A" * 28))
+        b = self.image(self.payload(tail=b"B" * 28))
+        self.assertEqual(len(a), len(b))
+        first = self.boot(a)["crash"]
+        second = self.boot(b)["crash"]
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual((first["first_seen_boot"], second["first_seen_boot"]), (1, 2))   # a NEW crash
+        self.assertEqual(self.boot(b)["crash"]["first_seen_boot"], 2)
+
+    def test_corrupt_dump_keeps_identity_and_is_never_parsed(self):
+        img = bytearray(self.image(self.payload()))
+        good = self.boot(bytes(img))["crash"]
+        img[100] ^= 0xFF                                             # bit rot after the write
+        bad = self.boot(bytes(img))
+        self.assertEqual(bad["summary_calls"], 0)                    # image_check before get_summary
+        self.assertEqual(bad["crash"], {"present": True, "id": good["id"], "first_seen_boot": 1,
+                                        "error": "ESP_ERR_INVALID_CRC"})
+
+    def test_partial_and_garbage_headers_get_a_fallback_identity(self):
+        import struct
+        garbage = bytearray(b"\x11" * self.PART)
+        garbage[0:4] = struct.pack("<I", 0x00200000)                 # larger than the partition
+        one = self.boot(bytes(garbage))["crash"]
+        self.assertEqual((one["present"], one["error"], one["first_seen_boot"]), (True, "invalid_size", 1))
+        self.assertTrue(one["id"].startswith("ffffffff"))            # separate id space
+        self.assertEqual(self.boot(bytes(garbage))["crash"]["first_seen_boot"], 1)
+        garbage[500] = 0x22                                          # different garbage, new identity
+        two = self.boot(bytes(garbage))["crash"]
+        self.assertNotEqual(two["id"], one["id"])
+        self.assertEqual(two["first_seen_boot"], 3)
+        tiny = bytearray(b"\xff" * self.PART)
+        tiny[0:4] = struct.pack("<I", 6)                             # too small to hold a checksum
+        self.assertEqual(self.boot(bytes(tiny))["crash"]["error"], "invalid_size")
+
+    def test_no_partition(self):
+        self.assertEqual(self.boot(None)["crash"], {"present": False, "error": "no_partition"})
 
 
 if __name__ == "__main__":

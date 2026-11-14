@@ -222,7 +222,15 @@ jobs:
             .pio/build/esp32-s3-devkitm-1/components/sensor_inventory/sensor_json.c.o \
             .pio/build/esp32-s3-devkitm-1/components/sensor_inventory/sensor_inventory.c.o \
             .pio/build/esp32-s3-devkitm-1/components/CLI/cli_sensors.c.o \
-            .pio/build/esp32-s3-devkitm-1/components/usb_service/*.o
+            .pio/build/esp32-s3-devkitm-1/components/usb_service/*.o \
+            .pio/build/esp32-s3-devkitm-1/components/diag/diag_log_hook.c.o \
+            .pio/build/esp32-s3-devkitm-1/components/diag/diag_fmt.c.o
+          # The error-log capture hook runs on the esp-mqtt task and on event_log
+          # s_mtx holders: its objects must reference no allocator, printf or
+          # blocking lock (docs/remote-diagnostics.md).
+          python tools/check_diag_hook_symbols.py \
+            .pio/build/esp32-s3-devkitm-1/components/diag/diag_log_hook.c.o \
+            .pio/build/esp32-s3-devkitm-1/components/diag/diag_fmt.c.o
 
       - name: Check unsigned signing intermediate and recovery config
         if: steps.scope.outputs.firmware-build-required == 'true'

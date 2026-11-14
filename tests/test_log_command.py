@@ -73,6 +73,7 @@ class LogCommand(unittest.TestCase):
         self.assertEqual(reply["files"], [{"name": "ambyte.1.log", "size": 80}, {"name": "ambyte.log", "size": 20000},
                                           {"name": "binary.log", "size": 256}, {"name": "empty.log", "size": 0}])
         self.assertEqual(reply["omitted"], 3)                   # subdir, .hidden, "we ird.log"
+        self.assertEqual(reply["gen"], "7.1.4")
 
     def test_reads_offsets_tail_eof_cap_and_errors(self):
         before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.dir.iterdir() if p.is_file()}
@@ -86,6 +87,7 @@ class LogCommand(unittest.TestCase):
 
         r1 = replies["r1"]
         self.assertEqual((r1["ok"], r1["offset"], r1["length"], r1["size"], r1["eof"]), (True, 0, 4096, 20000, False))
+        self.assertEqual(r1["gen"], "7.1.4")
         self.assertEqual(data(r1), self.main[:4096])
         self.assertEqual(data(replies["r2"]), self.main[5000:5100])
         r3 = replies["r3"]                                       # negative offset = tail
@@ -129,6 +131,66 @@ class LogCommand(unittest.TestCase):
             ("log_read_result", "maintenance_active"),
             ("log_read_result", "busy"), ("log_read_result", "ok"),
             ("log_read_result", "queue_unavailable"), ("log_read_result", "ok")])
+
+
+    def test_gen_pins_the_file_identity_across_chunks(self):
+        r = {x["id"]: x for x in self.run_case("gen")}
+        self.assertEqual((r["g1"]["ok"], r["g1"]["gen"]), (True, "7.1.4"))
+        self.assertEqual((r["g2"]["ok"], r["g2"]["offset"]), (True, 16))          # expect_gen matches
+        # Review finding 5: same basename, another file after a rotation.
+        self.assertEqual((r["g3"]["ok"], r["g3"]["detail"], r["g3"]["gen"]), (False, "file_rotated", "7.1.6"))
+        self.assertNotIn("data", r["g3"])
+        self.assertEqual((r["g4"]["detail"], r["g4"]["gen"]), ("file_rotated", "7.2.6"))   # remount / swap
+        # A rename between the before/after samples of ONE read discards it.
+        self.assertEqual((r["g5"]["ok"], r["g5"]["detail"], r["g5"]["gen"]), (False, "file_rotated", "7.2.8"))
+        self.assertNotIn("data", r["g5"])
+        self.assertEqual((r["g6"]["detail"], r["g7"]["detail"]), ("rotation_in_progress", "rotation_in_progress"))
+        self.assertEqual((r["g8"]["ok"], r["g8"]["detail"]), (False, "file_rotated"))
+        self.assertNotIn("files", r["g8"])
+        self.assertEqual((r["g9"]["ok"], r["g9"]["gen"]), (True, "7.2.12"))
+        self.assertEqual((r["g10"]["detail"], r["g11"]["detail"]), ("invalid_expect_gen", "invalid_expect_gen"))
+
+    def test_allocation_failures_never_yield_a_partial_success(self):
+        """Review finding 4: fail the 1st, 2nd, ... allocation of each command."""
+        import sys
+        sys.path.insert(0, str(ROOT / "tools/fleet_deploy"))
+        try:
+            import fleet_command
+        except ModuleNotFoundError as e:
+            self.skipTest(f"fleet_command deps missing: {e}")
+        requests = {
+            "list": '{"type":"log_list","id":"a-list"}',
+            "read": '{"type":"log_read","id":"a-read","name":"ambyte.log","offset":-5000,"length":3000}',
+            "past_eof": '{"type":"log_read","id":"a-eof","name":"ambyte.log","offset":30000}',
+        }
+        for label, req in requests.items():
+            outcomes = set()
+            for n in range(1, 200):
+                with self.subTest(request=label, failing_allocation=n):
+                    r = subprocess.run([self.bin, str(self.dir), "alloc", str(n), req],
+                                       capture_output=True, text=True, timeout=60)
+                    # ASan/LSan: no leak and no misuse on any failure path; the
+                    # driver asserts the maintenance gate and the SD reference
+                    # are released.
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    replies = [json.loads(l[6:]) for l in r.stdout.splitlines() if l.startswith("REPLY ")]
+                    self.assertLessEqual(len(replies), 1)
+                    for reply in replies:
+                        if reply["ok"] is True:
+                            self.assertIsNone(fleet_command.log_reply_problem(reply), reply)
+                        else:
+                            self.assertIn(reply["detail"], ("no_mem", "queue_unavailable", "offset_past_eof"))
+                        outcomes.add(reply["detail"])
+                    if "INJECTED 0" in r.stdout:
+                        self.assertEqual(len(replies), 1)                # the uninjected run answers
+                        break
+            else:
+                self.fail(f"{label}: allocation count never exhausted")
+            # A refusal path allocates nothing but the queued request copy, so
+            # it still answers (queue_unavailable, then its own detail).
+            expected = {"queue_unavailable", "offset_past_eof"} if label == "past_eof" \
+                else {"queue_unavailable", "no_mem", "ok"}
+            self.assertEqual(outcomes, expected, label)
 
 
 if __name__ == "__main__":

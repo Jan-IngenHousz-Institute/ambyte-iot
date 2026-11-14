@@ -22,3 +22,6 @@ typedef enum {
     ESP_RST_PWR_GLITCH,
     ESP_RST_CPU_LOCKUP,
 } esp_reset_reason_t;
+
+/* diag_boot.c reads it once per boot; tests/diag_host/boot_host.c supplies it. */
+esp_reset_reason_t esp_reset_reason(void);

@@ -15,6 +15,28 @@ static int g_queued, g_maint_held, g_io_refs, g_io_begins;
 static bool g_deny_maint, g_parked, g_mounted = true, g_lost, g_io_refuse, g_queue_full;
 
 static void reply(const char *json) { printf("REPLY %s\n", json); }
+
+/* gen fake: {boot, mount, rotation}. g_rotate_on_call > 0 makes the Nth
+ * gen() call (and every later one) see a completed rotation — the "renamed
+ * while we read" case. */
+static log_gen_t g_gen = {.boot = 7, .mount = 1, .rotation = 4};
+static int g_gen_calls, g_rotate_on_call;
+static void gen(log_gen_t *out)
+{
+    g_gen_calls++;
+    if (g_rotate_on_call && g_gen_calls == g_rotate_on_call) g_gen.rotation += 2;
+    *out = g_gen;
+}
+
+/* Allocation-failure injection over every cJSON_malloc (log_command routes
+ * all of its heap use through it). */
+static int g_alloc_n, g_fail_at;
+static bool g_armed, g_injected;
+static void *hook_malloc(size_t n)
+{
+    if (g_armed && ++g_alloc_n == g_fail_at) { g_injected = true; return NULL; }
+    return malloc(n);
+}
 static bool submit(void (*run)(void *), void *arg)
 {
     if (g_queue_full) return false;
@@ -34,7 +56,9 @@ static void request(const char *json)
 {
     cJSON *root = cJSON_Parse(json);
     assert(root);
+    g_armed = true;                         /* inject only inside the production code */
     assert(log_command_handle(root));
+    g_armed = false;
     cJSON_Delete(root);
 }
 
@@ -44,7 +68,9 @@ static void run_job(void)
     assert(g_job);
     void (*run)(void *) = g_job;
     g_job = NULL;
+    g_armed = true;
     run(g_arg);
+    g_armed = false;
     assert(g_maint_held == 0 && g_io_refs == 0);
 }
 
@@ -89,12 +115,14 @@ static void pure(void)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 3);
+    assert(argc >= 3);
     log_command_config_t cfg = {
         .reply = reply, .submit = submit, .maintenance_begin = maint_begin, .maintenance_end = maint_end,
         .dir = argv[1], .sd_mounted = mounted, .sd_parked = parked, .sd_io_lost = lost,
-        .io_begin = io_begin, .io_end = io_end,
+        .io_begin = io_begin, .io_end = io_end, .gen = gen,
     };
+    cJSON_Hooks hooks = {.malloc_fn = hook_malloc, .free_fn = free};
+    cJSON_InitHooks(&hooks);
     log_command_init(&cfg);
     const char *s = argv[2];
     if (!strcmp(s, "pure")) {
@@ -149,6 +177,39 @@ int main(int argc, char **argv)
         run_job();
         g_queue_full = true; request(rd); g_queue_full = false; /* worker queue full */
         req_run(rd);                                            /* busy flag released again */
+    } else if (!strcmp(s, "gen")) {
+        /* expect_gen honoured; a rename during the read discards the bytes;
+         * an odd rotation sequence (rename in progress) refuses. */
+        req_run("{\"type\":\"log_read\",\"id\":\"g1\",\"name\":\"ambyte.1.log\",\"length\":16}");
+        req_run("{\"type\":\"log_read\",\"id\":\"g2\",\"name\":\"ambyte.1.log\",\"offset\":16,"
+                "\"expect_gen\":\"7.1.4\"}");
+        g_gen.rotation = 6;                 /* sd_logger rotated: same name, other bytes */
+        req_run("{\"type\":\"log_read\",\"id\":\"g3\",\"name\":\"ambyte.1.log\",\"offset\":16,"
+                "\"expect_gen\":\"7.1.4\"}");
+        g_gen.mount = 2;                    /* card swapped / remounted */
+        req_run("{\"type\":\"log_read\",\"id\":\"g4\",\"name\":\"ambyte.1.log\","
+                "\"expect_gen\":\"7.1.6\"}");
+        g_gen_calls = 0; g_rotate_on_call = 2;   /* the "after" sample sees a rename */
+        req_run("{\"type\":\"log_read\",\"id\":\"g5\",\"name\":\"ambyte.1.log\"}");
+        g_rotate_on_call = 0;
+        g_gen.rotation = 9;                 /* odd: rename in progress */
+        req_run("{\"type\":\"log_read\",\"id\":\"g6\",\"name\":\"ambyte.1.log\"}");
+        req_run("{\"type\":\"log_list\",\"id\":\"g7\"}");
+        g_gen.rotation = 10;
+        g_gen_calls = 0; g_rotate_on_call = 2;
+        req_run("{\"type\":\"log_list\",\"id\":\"g8\"}");
+        g_rotate_on_call = 0;
+        req_run("{\"type\":\"log_list\",\"id\":\"g9\"}");
+        request("{\"type\":\"log_read\",\"id\":\"g10\",\"name\":\"ambyte.log\",\"expect_gen\":17}");
+        request("{\"type\":\"log_read\",\"id\":\"g11\",\"name\":\"ambyte.log\",\"expect_gen\":\"\"}");
+    } else if (!strcmp(s, "alloc")) {
+        /* argv[3] = which allocation fails (1-based), argv[4] = request. */
+        assert(argc == 5);
+        g_fail_at = atoi(argv[3]);
+        request(argv[4]);
+        if (g_job) run_job();
+        assert(g_maint_held == 0 && g_io_refs == 0);
+        printf("INJECTED %d\n", g_injected ? 1 : 0);
     } else {
         return 2;
     }

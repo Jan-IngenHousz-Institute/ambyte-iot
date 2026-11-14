@@ -72,6 +72,8 @@ PRODUCTION_SOURCES = [
     # cmd_store_log_event (diag_boot.c's NVS/coredump getters are stubbed in
     # esp_stubs.c).
     "components/diag/diag_log.c",
+    "components/diag/diag_log_hook.c",
+    "components/diag/diag_fmt.c",
     "components/diag/diag_json.c",
     "components/diag/diag_crash.c",
     "components/diag/diag_reset.c",

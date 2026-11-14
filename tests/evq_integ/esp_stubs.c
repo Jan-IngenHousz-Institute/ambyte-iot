@@ -553,3 +553,9 @@ const char *diag_crash_json(void)
 {
     return "{\"present\":true,\"id\":\"ffffffffffffffff\",\"first_seen_boot\":4294967295,\"app_elf_sha256\":\"ffffffffffffffff\",\"task\":\"\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\",\"pc\":\"0xffffffff\",\"exc_cause\":4294967295,\"exc_vaddr\":\"0xffffffff\",\"backtrace\":[\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\"],\"bt_corrupted\":true}";
 }
+
+/* diag_log_priv.h: downstream sink before install() (diag_boot.c on target). */
+#include <stdarg.h>
+#include <stdio.h>
+int diag_log_fallback_sink(const char *fmt, va_list ap);
+int diag_log_fallback_sink(const char *fmt, va_list ap) { return vprintf(fmt, ap); }

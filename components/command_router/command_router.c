@@ -557,6 +557,15 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     cJSON_Delete(root);
 }
 
+/* Identity of the names under /sdcard/logs (log_command.h `gen`): a reboot,
+ * a remount/card swap or an sd_logger rotation each change it. */
+static void log_gen(log_gen_t *out)
+{
+    out->boot = diag_boot_count();
+    out->mount = sdcard_mount_generation();
+    out->rotation = sd_logger_rotation_seq();
+}
+
 esp_err_t command_router_init(const command_router_config_t *cfg)
 {
     if (cfg == NULL) {
@@ -576,6 +585,7 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
         .maintenance_begin = cfg->maintenance_begin, .maintenance_end = cfg->maintenance_end,
         .dir = sd_logger_dir(), .sd_mounted = sdcard_is_mounted, .sd_parked = event_log_sd_parked,
         .sd_io_lost = sdcard_io_lost, .io_begin = sdcard_io_begin, .io_end = sdcard_io_end,
+        .gen = log_gen,
     };
     log_command_init(&log_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",

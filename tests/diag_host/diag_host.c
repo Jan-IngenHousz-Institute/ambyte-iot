@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "diag_crash.h"
+#include "diag_fmt.h"
 #include "diag_log.h"
 #include "diag_log_port.h"
 #include "diag_reset.h"
@@ -34,6 +35,10 @@ static int sink(const char *fmt, va_list ap)
     atomic_fetch_add(&g_forwarded, 1);
     return vsnprintf(tmp, sizeof tmp, fmt, ap);
 }
+
+/* Downstream fallback (diag_log_priv.h): defined outside the hook object. */
+int diag_log_fallback_sink(const char *fmt, va_list ap);
+int diag_log_fallback_sink(const char *fmt, va_list ap) { return sink(fmt, ap); }
 
 static int logv(const char *fmt, ...)
 {
@@ -310,6 +315,120 @@ static void sc_concurrent(void)
     printf("TOTAL %d forwarded=%u\n", PRODUCERS * PER_THREAD, atomic_load(&g_forwarded));
 }
 
+/* ── formatter vs host libc ────────────────────────────────────────────── */
+static void cmp(const char *kind, const char *fmt, ...)
+{
+    char ours[256], libc[256];
+    uint32_t unsupported = 0;
+    va_list a, b;
+    va_start(a, fmt);
+    va_copy(b, a);
+    size_t n = diag_vsnformat(ours, sizeof ours, fmt, a, &unsupported);
+    vsnprintf(libc, sizeof libc, fmt, b);
+    va_end(b);
+    va_end(a);
+    assert(n == strlen(ours));
+    printf("%s\t%s\t%s\t%s\t%u\n", kind, fmt, ours, libc, unsupported);
+}
+
+static void ours_only(const char *fmt, ...)
+{
+    char out[64];
+    uint32_t unsupported = 0;
+    va_list a;
+    va_start(a, fmt);
+    size_t n = diag_vsnformat(out, sizeof out, fmt, a, &unsupported);
+    va_end(a);
+    assert(n == strlen(out));
+    printf("ODD\t%s\t%s\t%u\n", fmt, out, unsupported);
+}
+
+static void sc_fmt(void)
+{
+    /* Exact against libc: integers, strings, chars, widths, flags, lengths. */
+    cmp("INT", "E (%lu) %s: plain", 4294967295UL, "tag");
+    cmp("INT", "%d|%i|%u|%x|%X|%o", -42, 7, 3000000000U, 0xbeefU, 0xbeefU, 8U);
+    cmp("INT", "%5d|%-5d|%05d|%+d|% d|%.3d|%.0d|%8.3d", 42, 42, -42, 42, 42, 7, 0, -7);
+    cmp("INT", "%#x|%#X|%#o|%#x|%#o", 255U, 255U, 8U, 0U, 0U);
+    cmp("INT", "%hhd|%hhu|%hd|%hu", 300, 300, 70000, 70000);
+    cmp("INT", "%ld|%lu|%lld|%llu|%llx", -1L, 1UL, -9223372036854775807LL - 1, 18446744073709551615ULL,
+        0x123456789abcdefULL);
+    cmp("INT", "%zu|%zd|%jd|%ju|%td", (size_t)123, (ptrdiff_t)-5, (intmax_t)-6, (uintmax_t)7, (ptrdiff_t)8);
+    cmp("INT", "%s|%10s|%-10s|%.3s|%*s|%-*s|%.*s", "abc", "abc", "abc", "abcdef", 6, "ab", 6, "ab", 2, "xyz");
+    cmp("INT", "%c|%3c|%-3c|%%|100%%", 'a', 'b', 'c');
+    cmp("INT", "%*d|%-*d", -6, 1, 4, 2);
+    /* Floats: libc output beside ours for a numeric comparison in Python. */
+    cmp("FLT", "%f", 3.14159265);
+    cmp("FLT", "%.2f", -0.005);
+    cmp("FLT", "%.3f", 2.0005);
+    cmp("FLT", "%10.4f", 1234.5678);
+    cmp("FLT", "%-10.1f|", 9.96);
+    cmp("FLT", "%08.2f", -3.5);
+    cmp("FLT", "%+.1f", 2.25);
+    cmp("FLT", "%.0f", 7.6);
+    cmp("FLT", "%f", 1e15);
+    cmp("FLT", "%.1f", 123456789012.34);
+    cmp("FLT", "%e", 12345.678);
+    cmp("FLT", "%.3E", 0.000123456);
+    cmp("FLT", "%e", 0.0);
+    cmp("FLT", "%e", 9.9999999);
+    cmp("FLT", "%g", 0.0001);
+    cmp("FLT", "%g", 123456789.0);
+    cmp("FLT", "%g", 100.0);
+    cmp("FLT", "%.3g", 3.14159);
+    cmp("FLT", "%G", 1e-10);
+    cmp("FLT", "%#g", 1.5);
+    cmp("FLT", "%f", 1e300);
+    cmp("FLT", "%Lf", (long double)2.5);
+    cmp("FLT", "%.2f°C", 21.345);
+    cmp("SPECIAL", "%f|%F|%e|%g", 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0, 1.0 / 0.0);
+    /* Not supported: counted, consumed, visible. */
+    int n_target = 0;
+    ours_only("a=%a b=%d", 1.5, 7);
+    ours_only("n=%n then %d", &n_target, 9);
+    ours_only("w=%ls %lc end %d", (void *)0, 65, 3);
+    ours_only("bad %q %d", 1, 2);
+    ours_only("trailing %");
+    assert(n_target == 0);                                     /* %n never writes */
+}
+
+static size_t fmt_into(char *out, size_t cap, uint32_t *u, const char *fmt, ...)
+{
+    va_list a;
+    va_start(a, fmt);
+    size_t n = diag_vsnformat(out, cap, fmt, a, u);
+    va_end(a);
+    return n;
+}
+
+static void sc_fmt_trunc(void)
+{
+    char out[8];
+    uint32_t u = 0;
+    size_t n = fmt_into(out, sizeof out, &u, "%s-%d", "abcdefghij", 12345);
+    assert(n == 7 && strcmp(out, "abcdefg") == 0);
+    n = fmt_into(out, 1, &u, "%d", 5);
+    assert(n == 0 && out[0] == '\0');
+    n = fmt_into(out, sizeof out, &u, "%f", 1e300);   /* e-form fallback, cut */
+    assert(n == 7 && u == 0);
+    puts("TRUNC ok");
+}
+
+/* An E line with a float through the real hook: formatted without newlib,
+ * and %n / %a lines counted in unsupported_fmt. */
+static void sc_hook_fmt(void)
+{
+    reset_all();
+    LOGE("bme280", "temperature %.2f out of range (%d)", 85.125, 3);
+    int written_by_sink = -1;                                  /* the libc sink honours %n; diag never does */
+    LOGE("weird", "count=%n done", &written_by_sink);
+    LOGE("weird", "hex float %a", 0.5);
+    diag_log_stats_t st;
+    diag_log_stats(&st);
+    printf("STATS unsupported=%u buffered=%u\n", st.unsupported_fmt, st.buffered);
+    drain_once(false, 0, true);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -324,6 +443,9 @@ int main(int argc, char **argv)
     else if (!strcmp(s, "size")) sc_size();
     else if (!strcmp(s, "bucket")) sc_bucket();
     else if (!strcmp(s, "concurrent")) sc_concurrent();
+    else if (!strcmp(s, "fmt")) sc_fmt();
+    else if (!strcmp(s, "fmt_trunc")) sc_fmt_trunc();
+    else if (!strcmp(s, "hook_fmt")) sc_hook_fmt();
     else return 2;
     return 0;
 }
