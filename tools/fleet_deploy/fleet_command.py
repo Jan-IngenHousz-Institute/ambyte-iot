@@ -123,6 +123,10 @@ def log_reply_problem(reply):
             return "chunk extends past the reported file size"
         if reply["eof"] != (reply["offset"] + reply["length"] >= reply["size"]):
             return "eof inconsistent with offset/length/size"
+        if reply["length"] == 0 and not reply["eof"]:
+            # Review round 2, finding 5: an empty chunk before EOF makes no
+            # progress and must never complete a stitched read.
+            return "empty chunk before EOF (no progress)"
         return None
     return f"unexpected type {t!r}"
 
@@ -147,11 +151,16 @@ class LogStitcher:
     MIN_CHUNK = 1024
     RETRY_DETAILS = NON_TERMINAL_DETAILS + ("rotation_in_progress",)
 
-    def __init__(self, name, offset, length, max_chunks=400):
+    def __init__(self, name, offset, length, max_chunks=400, expect_gen=None):
         self.name, self.first_offset, self.next_offset, self.length = name, offset, offset, length
         self.max_chunks = max_chunks
         self.data = bytearray()
-        self.start = self.size = self.error = self.gen = None
+        self.start = self.size = self.error = None
+        # An operator-supplied --expect-gen pins the identity from the very
+        # first request and is never traded for another generation: a
+        # mismatch fails, it does not restart (review round 2, finding 3).
+        self.gen = expect_gen or None
+        self.user_pinned = self.gen is not None
         self.chunks = 0
         self.restarts = 0
         self.done = False
@@ -179,7 +188,7 @@ class LogStitcher:
                 return "retry"
             if detail in self.RETRY_DETAILS:
                 return "retry"
-            if detail == "file_rotated" and self.restarts == 0:
+            if detail == "file_rotated" and self.restarts == 0 and not self.user_pinned:
                 self._restart()
                 return "restart"
             self.error = f"device refused: {detail}"
@@ -210,7 +219,7 @@ class LogStitcher:
         self.data += raw
         self.next_offset = offset + length
         self.chunks += 1
-        if reply.get("eof") or length == 0:
+        if reply["eof"]:                          # only EOF completes a stitched read
             self.done = True
             return "done"
         if self.chunks >= self.max_chunks:
@@ -382,6 +391,8 @@ def main(argv=None):
             ap.error(str(exc))
         if not valid_log_name(args.name):
             ap.error("log-read needs --name: a plain file name from log-list (e.g. ambyte.log)")
+        if args.expect_gen and (len(args.expect_gen) >= 48 or not re.fullmatch(r"[0-9a-f.]+", args.expect_gen)):
+            ap.error("--expect-gen must be a gen string from an earlier log reply (e.g. 412.9c41e07a.3.18)")
         if args.out and (not args.devices.strip() or len(parse_devices(args.devices)) != 1):
             ap.error("log-read --out stitches one file from exactly one explicit --devices target")
         if args.out and args.dry_run:
@@ -389,12 +400,15 @@ def main(argv=None):
             # (review finding 1 — the workflow always passes --out).
             dev = parse_devices(args.devices)[0]
             offset, length = log_read_window(args)
-            first = LogStitcher(args.name, offset, length).request(f"fc-log-read-x-{int(time.time())}-0")
+            first = LogStitcher(args.name, offset, length, expect_gen=args.expect_gen or None).request(
+                f"fc-log-read-x-{int(time.time())}-0")
             print(f"log-read (dry run): target={dev}")
             print("first request:", json.dumps(first))
+            pin = (f"require gen {args.expect_gen} on every chunk and fail on file_rotated"
+                   if args.expect_gen else
+                   "pin the device's gen from the first reply, send it as expect_gen, restart once on file_rotated")
             print(f"plan: read {args.name} from offset {offset} in chunks of up to {length} bytes until EOF, "
-                  f"pin the device's gen from the first reply and send it as expect_gen, "
-                  f"restart once on file_rotated, write the bytes to {args.out}")
+                  f"{pin}, write the bytes to {args.out}")
             print("dry run: nothing published, nothing written")
             return 0
     if args.wait <= 0:
@@ -585,7 +599,7 @@ def stitch_log(args, session, dev, req_id):
     from awscrt import mqtt
 
     offset, length = log_read_window(args)
-    st = LogStitcher(args.name, offset, length)
+    st = LogStitcher(args.name, offset, length, expect_gen=args.expect_gen or None)
     by_identity = fleet_deploy.device_index([dev])
     q = queue.Queue()
     conn = fleet_deploy.mqtt_connection(session, fleet_deploy.STATUS_TOPIC,

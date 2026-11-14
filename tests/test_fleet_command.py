@@ -344,6 +344,89 @@ class LogCommands(unittest.TestCase):
                                    "--out", f"{tmp}/f", "--wait", "1"], make_device(2))
         self.assertEqual(rc, 1)                                  # restarts only once
 
+    def test_empty_chunk_before_eof_never_completes(self):
+        """Review round 2, finding 5."""
+        import tempfile
+        empty = {"type": "log_read_result", "ok": True, "detail": "ok", "name": "ambyte.log", "gen": "7.1.4",
+                 "size": 100, "offset": 0, "length": 0, "eof": False, "encoding": "base64", "data": ""}
+        self.assertIn("no progress", self.fc.log_reply_problem(empty))
+        st = self.fc.LogStitcher("ambyte.log", 0, 4096)
+        self.assertEqual(st.feed(empty), "error")
+        self.assertFalse(st.done)
+        with tempfile.TemporaryDirectory() as tmp:
+            res = f"{tmp}/r.json"
+            rc, _ = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log", "--out", f"{tmp}/f",
+                                   "--wait", "1", "--results-json", res], lambda req: [empty])
+            self.assertEqual(rc, 1)
+            import json
+            with open(res) as fh:
+                self.assertFalse(json.load(fh)["log"]["complete"])
+        # Exact EOF (length 0, eof true) still completes.
+        st = self.fc.LogStitcher("ambyte.log", 100, 4096)
+        self.assertEqual(st.feed(dict(empty, offset=100, eof=True)), "done")
+
+    def test_explicit_expect_gen_is_sent_and_never_traded(self):
+        """Review round 2, finding 3: --expect-gen with --out."""
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        honours = lambda req: ([{"type": "log_read_result", "ok": False, "detail": "file_rotated",
+                                 "name": req["name"], "gen": "8.1.0"}]
+                               if req.get("expect_gen") not in (None, "8.1.0") else
+                               [self.chunk(req["name"], b"x" * 10, 0, 10, True, gen="8.1.0")])
+        ignores = lambda req: [self.chunk(req["name"], b"x" * 10, 0, 10, True, gen="8.1.0")]
+        for label, device in (("device refuses", honours), ("device ignores expect_gen", ignores)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    rc, sent = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log",
+                                              "--expect-gen", "7.1.0", "--out", f"{tmp}/f", "--wait", "1"], device)
+                self.assertEqual(rc, 1, out.getvalue())
+                self.assertEqual(sent[0]["expect_gen"], "7.1.0")           # first request carries it
+                self.assertTrue(all(r.get("expect_gen") == "7.1.0" for r in sent))   # never restarted onto 8.1.0
+                with open(f"{tmp}/f", "rb") as fh:
+                    self.assertEqual(fh.read(), b"")
+        st = self.fc.LogStitcher("ambyte.log", 0, 4, expect_gen="7.1.0")
+        self.assertEqual(st.feed({"ok": False, "detail": "file_rotated"}), "error")
+        # The dry-run plan shows it too.
+        from unittest.mock import patch
+        out = io.StringIO()
+        with patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("no AWS")), \
+             redirect_stdout(out), tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.fc.main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log",
+                                           "--expect-gen", "7.1.0", "--out", f"{tmp}/f", "--dry-run"]), 0)
+        self.assertIn('"expect_gen": "7.1.0"', out.getvalue())
+        self.assertIn("require gen 7.1.0", out.getvalue())
+        # A matching explicit gen reads normally.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, _ = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.log",
+                                   "--expect-gen", "8.1.0", "--out", f"{tmp}/f", "--wait", "1"], honours)
+            self.assertEqual(rc, 0)
+
+    def test_stitch_across_a_reboot_without_boot_counter(self):
+        """Review round 2, finding 4: boot_count 0 on both boots; the nonce differs."""
+        import tempfile
+        state = {"gen": "0.1111aaaa.1.0", "data": b"A" * 9000, "served": 0}
+        def device(req):
+            if "expect_gen" in req and req["expect_gen"] != state["gen"]:
+                yield {"type": "log_read_result", "ok": False, "detail": "file_rotated",
+                       "name": req["name"], "gen": state["gen"]}
+                return
+            c = state["data"]
+            start = req["offset"] if req["offset"] >= 0 else max(0, len(c) + req["offset"])
+            data = c[start:start + req["length"]]
+            yield self.chunk(req["name"], data, start, len(c), start + len(data) >= len(c), gen=state["gen"])
+            state["served"] += 1
+            if state["served"] == 1:                        # reboot: same size, other bytes
+                state.update(gen="0.2222bbbb.1.0", data=b"B" * 9000)
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, sent = self.run_main(["log-read", "--devices", self.CLIENT, "--name", "ambyte.1.log",
+                                      "--out", f"{tmp}/f", "--wait", "1"], device)
+            self.assertEqual(rc, 0)
+            with open(f"{tmp}/f", "rb") as fh:
+                self.assertEqual(fh.read(), b"B" * 9000)
+        self.assertEqual(sent[1]["expect_gen"], "0.1111aaaa.1.0")
+
     def test_stitcher_backs_off_on_no_mem_and_retries_busy(self):
         st = self.fc.LogStitcher("ambyte.log", 0, 8192)
         self.assertEqual(st.feed({"ok": False, "detail": "no_mem"}), "retry")

@@ -199,7 +199,9 @@ AWS session. Three commands:
   (`--offset`, `--length` ≤ 8192) per device lands in `results.json` as base64.
   A refusal (`sd_parked`, `sd_absent`, …), an incomplete reply or a missing
   reply fails the run. The stitcher pins the file's `gen` from the first chunk
-  and restarts once if sd_logger rotates the file mid-read. `--dry-run`
+  and restarts once if sd_logger rotates the file mid-read (an explicit
+  `--expect-gen` is sent from the first chunk and never traded); only `eof`
+  completes a read. `--dry-run`
   (also with `--out`) publishes nothing and writes nothing.
   See [docs/remote-diagnostics.md](../../docs/remote-diagnostics.md).
 
