@@ -234,24 +234,36 @@ esp_err_t evq_hil_ambit_nvsdump(uint8_t channel, const char *tag)
 /* ── full multi-region ROM flash ─────────────────────────────────────────── */
 
 
-/* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5). */
+/* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5).
+ * `may_write` (NULL = no gate) is the brownout-protection admission, passed for
+ * the FIRST region only (ambit_flash_image_gated): it is asked after this
+ * region's SD ref, fopen, seek and size check and the log line, immediately
+ * before esp_loader_flash_start sends the first erase — each of those FAT/VFS
+ * steps can block behind SD latency (review round 3 of PR #103). Refused →
+ * nothing erased, the file closed, *refused = true, ESP_LOADER_SUCCESS (so the
+ * caller resets the AMBIT back into its app on every build). Later regions
+ * pass NULL: a channel that has started erasing completes. */
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
-                                                const flash_region_t *r, uint32_t *bytes_out);
+                                                const flash_region_t *r, bool (*may_write)(void),
+                                                bool *refused, uint32_t *bytes_out);
 
 /* SD RW-gate wrapper (audit R-6): the hot-plug monitor's teardown must not free the
  * FATFS volume under this region's fread loop. Per-region ref; io_begin fails cleanly
  * if the card is gone. 1:1 begin/end by construction (no branch between). */
 static esp_loader_error_t flash_one_region(esp_loader_t *loader, const char *dir,
-                                           const flash_region_t *r, uint32_t *bytes_out)
+                                           const flash_region_t *r, bool (*may_write)(void),
+                                           bool *refused, uint32_t *bytes_out)
 {
+    *refused = false;
     if (!sdcard_io_begin()) return ESP_LOADER_ERROR_FAIL;
-    esp_loader_error_t le = flash_one_region_impl(loader, dir, r, bytes_out);
+    esp_loader_error_t le = flash_one_region_impl(loader, dir, r, may_write, refused, bytes_out);
     sdcard_io_end();
     return le;
 }
 
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
-                                                const flash_region_t *r, uint32_t *bytes_out)
+                                                const flash_region_t *r, bool (*may_write)(void),
+                                                bool *refused, uint32_t *bytes_out)
 {
     char path[192];
     snprintf(path, sizeof path, "%s/%s", dir, r->fname);
@@ -271,6 +283,14 @@ static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char
 
     ESP_LOGW(TAG, "  region %s @0x%06lx: %ld B (erasing…)", r->fname,
              (unsigned long)r->offset, fsize);
+
+    /* The last safe point of the whole flash: nothing has been erased yet. */
+    if (may_write != NULL && !may_write()) {
+        ESP_LOGW(TAG, "  region %s: not erasing - power protection began", r->fname);
+        fclose(f);
+        *refused = true;
+        return ESP_LOADER_SUCCESS;
+    }
 
     esp_loader_flash_cfg_t cfg = {
         .offset     = r->offset,
@@ -415,9 +435,9 @@ esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t bau
         ESP_LOGW(TAG, "ch%u: link raised to %lu baud", channel, (unsigned long)baud);
     }
 
-    /* The last safe point: preflight, bus wait, ROM reset, stub connect and
-     * baud change are behind us, no erase has been sent. Brownout protection
-     * that began during any of them stops the write here (ambit_flash.h). */
+    /* Early exit: preflight, bus wait, ROM reset, stub connect and baud change
+     * are behind us. The LAST admission is inside the first region, after its
+     * file is opened and sized (flash_one_region_impl). */
     if (may_write != NULL && !may_write()) {
         ESP_LOGW(TAG, "ch%u: not flashing - power protection began before the first erase", channel);
         ret = ESP_ERR_NOT_ALLOWED;
@@ -427,7 +447,14 @@ esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t bau
     ESP_LOGW(TAG, "ch%u: flashing %u regions from %s", channel, (unsigned)NUM_REGIONS, dir);
     for (size_t i = 0; i < NUM_REGIONS; i++) {
         uint32_t nb = 0;
-        le = flash_one_region(&loader, dir, &s_regions[i], &nb);
+        bool refused = false;
+        /* Gate the first region only, inside it, right before its erase. */
+        le = flash_one_region(&loader, dir, &s_regions[i], i == 0 ? may_write : NULL, &refused, &nb);
+        if (refused) {
+            ESP_LOGW(TAG, "ch%u: not flashing - power protection began before the first erase", channel);
+            ret = ESP_ERR_NOT_ALLOWED;
+            goto reset_and_done;   /* le == SUCCESS: reset into its existing app */
+        }
         if (le != ESP_LOADER_SUCCESS) {
             ESP_LOGE(TAG, "ch%u: region %s FAILED — aborting (chip may be partially written)",
                      channel, s_regions[i].fname);

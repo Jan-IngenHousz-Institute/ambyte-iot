@@ -3,17 +3,20 @@
  * Runs PRODUCTION code extracted verbatim by tests/test_power_protect.py into
  * ambit-worker-production.inc:
  *   components/ambit_flash/ambit_flash.c   the region table, boot_fail_*,
- *       flash_power_allows_write, ambit_flash_image_gated,
- *       ambit_flash_attach_flash, fw_matches;
+ *       flash_power_allows_write, flash_one_region_impl, flash_one_region,
+ *       ambit_flash_image_gated, ambit_flash_attach_flash, fw_matches;
  *   components/ambit_ota/ambit_ota.c   power_note_refusal, power_blocks_write,
  *       power_allows_write, ambit_ota_one_impl, ambit_ota_one, ambit_do_ota,
  *       ambit_do_flash, ambit_ota_run.
  * Fakes sit only at the seams: UART ping / version read / OTA stream, the ROM
- * loader (connect, regions, reset), SD, NVS, the download and the quiesce.
+ * loader (connect, flash_start = the erase, write, finish, reset), the region
+ * files (fopen / fseek / fclose over an in-memory image), SD refs, NVS, the
+ * download and the quiesce.
  * Protection switches on INSIDE a chosen blocking step (spread, ack flush,
  * quiesce, suspend, download, fetch, ping, version read, ROM probe, preflight,
- * bus wait, ROM connect) or while a channel is being written (that write must
- * finish). No erase or OTA_BEGIN may start after it.
+ * bus wait, ROM connect, the first region file's open and seek) or while a
+ * channel is being written (that write must finish). No erase or OTA_BEGIN may
+ * start after it.
  *
  * usage: ambit_worker <scenario>   (exit 0 = PASS; prints REPORT lines) */
 #include <assert.h>
@@ -88,6 +91,8 @@ static const char *sc;
 static bool pp_on;
 static unsigned skips, suspends, resumes, comms_down, comms_up, maint_depth, latches, fail_notes, delays;
 static unsigned downloads, fetches, resets, sessions, writes[UART_SENSOR_NUM_CHANNELS];
+static int sd_refs, open_files;
+static unsigned opens, erases;
 static int cur_ch = -1;
 static bool is(const char *s) { return strcmp(sc, s) == 0; }
 static void flip_if(const char *s) { if (is(s)) pp_on = true; }
@@ -130,8 +135,8 @@ static void wait_for_fleet_slot(void) { flip_if("ota_flip_during_spread"); }
 static void ambit_quiesce_for_idle(void) { workload_suspend(); flip_if("ota_flip_during_quiesce"); }
 static bool sdcard_is_mounted(void) { return true; }
 static esp_err_t sdcard_mount(void) { return ESP_OK; }
-static bool sdcard_io_begin(void) { return true; }
-static void sdcard_io_end(void) {}
+static bool sdcard_io_begin(void) { ++sd_refs; return true; }
+static void sdcard_io_end(void) { assert(sd_refs > 0); --sd_refs; }
 static esp_err_t ambit_stage_remove(const ambit_stage_t *s) { (void)s; return ESP_OK; }
 static esp_err_t http_get_to_stage(const char *url, ambit_stage_t *st)
 {
@@ -218,6 +223,44 @@ static target_chip_t esp_loader_get_target(esp_loader_t *l) { (void)l; return ES
 static esp_loader_error_t esp_loader_change_transmission_rate(esp_loader_t *l, uint32_t b) { (void)l; (void)b; return ESP_LOADER_SUCCESS; }
 static void esp_loader_reset_target(esp_loader_t *l) { (void)l; ++resets; }
 static void uart_set_baudrate(int uart, uint32_t b) { (void)uart; (void)b; }
+/* The region writer's loader calls: flash_start sends the erase (destructive). */
+#define FLASH_BLOCK 1024
+#define ESP_LOADER_ERROR_FAIL 1
+static uint8_t s_flash_buf[FLASH_BLOCK];
+typedef struct { uint32_t offset, image_size, block_size; } esp_loader_flash_cfg_t;
+static esp_loader_error_t esp_loader_flash_start(esp_loader_t *l, esp_loader_flash_cfg_t *cfg)
+{
+    (void)l;
+    assert(cur_ch >= 0 && sd_refs == 1 && open_files == 1);
+    ++erases;
+    if (cfg->offset == 0) {
+        ++writes[cur_ch];
+        if (cur_ch == 0) flip_if("flash_flip_mid_sweep");   /* begins during ch0's flash: it finishes */
+    }
+    return ESP_LOADER_SUCCESS;
+}
+static esp_loader_error_t esp_loader_flash_write(esp_loader_t *l, esp_loader_flash_cfg_t *c, const void *b, uint32_t n)
+{ (void)l; (void)c; (void)b; (void)n; return ESP_LOADER_SUCCESS; }
+static esp_loader_error_t esp_loader_flash_finish(esp_loader_t *l, esp_loader_flash_cfg_t *c)
+{ (void)l; (void)c; return ESP_LOADER_SUCCESS; }
+/* Region files: an in-memory image; the first open / first SEEK_END of the
+ * first region can block on a real FAT, so protection may begin there. */
+static char s_region_bytes[2048];
+static FILE *host_fopen(const char *path, const char *mode)
+{
+    (void)path; (void)mode;
+    if (opens++ == 0) flip_if("flash_flip_during_first_open");
+    memset(s_region_bytes, 0x5a, sizeof s_region_bytes);
+    FILE *f = fmemopen(s_region_bytes, sizeof s_region_bytes, "rb");
+    if (f) ++open_files;
+    return f;
+}
+static int host_fseek(FILE *f, long off, int whence)
+{
+    if (whence == SEEK_END && opens == 1) flip_if("flash_flip_during_first_seek");
+    return fseek(f, off, whence);
+}
+static int host_fclose(FILE *f) { assert(open_files > 0); --open_files; return fclose(f); }
 static bool boot_read_version(uint8_t ch, ambit_fw_info_t *fw) { (void)ch; *fw = (ambit_fw_info_t){1, 4, 0}; return true; }
 /* One NVS slot per channel ("bf<ch>" = "<ver>:<n>"). */
 typedef uint32_t nvs_handle_t;
@@ -238,20 +281,14 @@ static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
 static void nvs_close(nvs_handle_t h) { (void)h; }
 
 #define s_cfg ambit_cfg
+#define fopen host_fopen
+#define fseek host_fseek
+#define fclose host_fclose
 #include "ambit-worker-production.inc"
+#undef fclose
+#undef fseek
+#undef fopen
 #undef s_cfg
-
-/* The region writer (erase + write + MD5) is the destructive step. */
-static esp_loader_error_t flash_one_region(esp_loader_t *l, const char *dir, const flash_region_t *r, uint32_t *nb)
-{
-    (void)l; (void)dir; *nb = 1000;
-    assert(cur_ch >= 0);
-    if (r == &s_regions[0]) {
-        ++writes[cur_ch];
-        if (cur_ch == 0) flip_if("flash_flip_mid_sweep");   /* begins during ch0's flash: it finishes */
-    }
-    return ESP_LOADER_SUCCESS;
-}
 
 static void run(uint8_t op, uint8_t ch, bool spread, const char *manifest)
 {
@@ -264,6 +301,7 @@ static void run(uint8_t op, uint8_t ch, bool spread, const char *manifest)
     assert(maint_depth == 0);
     assert(comms_down == comms_up && suspends == resumes);   /* everything suspended came back */
     assert(cur_ch == -1);                                     /* every UART session ended */
+    assert(sd_refs == 0 && open_files == 0);                  /* every SD ref and file released */
 }
 
 static unsigned total_writes(void) { return writes[0] + writes[1] + writes[2] + writes[3]; }
@@ -309,9 +347,16 @@ int main(int argc, char **argv)
          * reset back into its application; ch1..3 never started. */
         assert(total_writes() == 0 && sessions == 1 && resets == 1);
         assert(latches == 0 && fail_notes == 0 && skips == 1);
+    } else if (is("flash_flip_during_first_open") || is("flash_flip_during_first_seek")) {
+        /* Review round 3: protection begins inside the first region's own
+         * FAT/VFS steps; the admission inside the region still stops the erase. */
+        run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");
+        assert(total_writes() == 0 && erases == 0 && opens == 1 && sessions == 1 && resets == 1);
+        assert(latches == 0 && fail_notes == 0 && skips == 1);
     } else if (is("flash_flip_mid_sweep")) {
         run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");
         assert(writes[0] == 1 && writes[1] == 0 && writes[2] == 0 && writes[3] == 0 && resets == 1);
+        assert(erases == 4);   /* ch0 started: all four regions completed, not gated again */
         assert(latches == 0 && fail_notes == 0 && skips == 1);
     /* ── attach update: a power refusal does not consume the fail cap ── */
     } else if (is("attach_flip_during_rom_connect")) {
@@ -322,17 +367,27 @@ int main(int argc, char **argv)
         assert(strcmp(nvs_bf[2], "1.4.0:1") == 0);          /* the bump was undone: 1, not 2 */
         nvs_bf[2][0] = '\0';                                /* first attempt ever, protected */
         assert(ambit_flash_attach_flash(2, &tgt) == ESP_ERR_NOT_ALLOWED && nvs_bf[2][0] == '\0');
+    } else if (is("attach_flip_during_first_open")) {
+        /* Attach and boot sync share the region writer: same last gate. */
+        const ambit_flash_target_t tgt = { 1, 4, 0, "/sdcard/ambit_fw/1.4.0" };
+        snprintf(nvs_bf[2], sizeof nvs_bf[2], "1.4.0:2");
+        sc = "flash_flip_during_first_open";   /* reuse the open seam */
+        assert(ambit_flash_attach_flash(2, &tgt) == ESP_ERR_NOT_ALLOWED);
+        sc = "attach_flip_during_first_open";
+        assert(erases == 0 && writes[2] == 0 && resets == 1 && cur_ch == -1 && sd_refs == 0 && open_files == 0);
+        assert(strcmp(nvs_bf[2], "1.4.0:2") == 0);
     } else if (is("attach_unprotected")) {
         const ambit_flash_target_t tgt = { 1, 4, 0, "/sdcard/ambit_fw/1.4.0" };
         snprintf(nvs_bf[2], sizeof nvs_bf[2], "1.4.0:1");
         assert(ambit_flash_attach_flash(2, &tgt) == ESP_OK && writes[2] == 1 && nvs_bf[2][0] == '\0');
+        assert(erases == 4 && sd_refs == 0 && open_files == 0);
     /* ── controls ── */
     } else if (is("ota_unprotected")) {
         run(AMBIT_OP_OTA, AMBIT_OTA_CH_ALL, true, "");
         assert(total_writes() == 4 && latches == 1 && skips == 0);
     } else if (is("flash_unprotected")) {
         run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");
-        assert(total_writes() == 4 && latches == 1 && skips == 0 && resets == 4);
+        assert(total_writes() == 4 && latches == 1 && skips == 0 && resets == 4 && erases == 16);
     } else {
         fprintf(stderr, "unknown scenario %s\n", sc);
         return 2;

@@ -217,8 +217,11 @@ first action after a brownout is therefore already shed.
   started. The writers carry the last check themselves: `ambit_ota_one_impl`
   after the version read, right before OTA_BEGIN; `ambit_flash_image_gated`
   after the preflight, bus wait, ROM reset, stub connect and baud change,
-  right before the first erase (refused: the AMBIT is reset back into its
-  existing application, `ESP_ERR_NOT_ALLOWED`). Only the USB console's
+  and then inside the first region, after its SD ref, `fopen`, seek, size
+  check and log line, immediately before `esp_loader_flash_start` sends the
+  first erase (refused: the file is closed, the SD ref released, the AMBIT
+  reset back into its existing application, `ESP_ERR_NOT_ALLOWED`). Later
+  regions are not gated: a channel that has started erasing completes. Only the USB console's
   `ambit_flash` uses the ungated `ambit_flash_image` (an operator at the
   bench, deliberately).
 
@@ -226,9 +229,9 @@ first action after a brownout is therefore already shed.
   |---|---|---|
   | Ambyte OTA (MQTT, Jobs) | 1. worker entry, before `accepted`; 2. after the ack flush and the spread, before the Jobs IN_PROGRESS report and the suspend; 3. after the IN_PROGRESS flush, the workload suspend and the comms suspend, immediately before `esp_https_ota_begin()`; 4. after download + image admission, before `esp_https_ota_finish()` selects the image (abort; the slot stays inactive) | `ota_status` `dropped`, detail `power_protect` (fleet_deploy's retry candidate); Jobs: retryable. Refused at 1 or 2 the execution stays QUEUED; at 3 or 4 it is already IN_PROGRESS and the same 10-min retry re-installs it. 3 and 4 resume workload and comms first |
   | AMBIT OTA | worker entry; after the ack flush and the spread; after the 65-s quiesce and the comms suspend, immediately before the download; before each channel (cheap early exit); inside `ambit_ota_one_impl` after the ping and version read, right before OTA_BEGIN | `ambit_ota_status` `failed` / `power_protect` (per channel and terminal) |
-  | `ambit_flash` | worker entry; after the ack flush (before the suspend); after the suspend, immediately before the release fetch; before each channel's ROM probe (cheap early exit); inside `ambit_flash_image_gated` right before the first erase | `ambit_flash_status` `failed` / `power_protect`; channels not started report `skipped` / `power_protect`; the per-id retry cap is not consumed |
-  | Attach update | at the decision; after the quiesce; inside `ambit_flash_image_gated` right before the first erase | held, `waiting_power`, re-checked every 10 min; the attach fail cap is not consumed (the pre-attempt bump is undone) |
-  | Boot sync | before the loop (no 30-s wait for power evidence); before each channel; inside `ambit_flash_image_gated` right before the first erase | channels left on their firmware; the boot fail cap is not consumed |
+  | `ambit_flash` | worker entry; after the ack flush (before the suspend); after the suspend, immediately before the release fetch; before each channel's ROM probe (cheap early exit); inside the first region of `ambit_flash_image_gated`, after its file open / seek / size check, right before the first erase | `ambit_flash_status` `failed` / `power_protect`; channels not started report `skipped` / `power_protect`; the per-id retry cap is not consumed |
+  | Attach update | at the decision; after the quiesce; inside the first region of `ambit_flash_image_gated`, after its file open / seek / size check, right before the first erase | held, `waiting_power`, re-checked every 10 min; the attach fail cap is not consumed (the pre-attempt bump is undone) |
+  | Boot sync | before the loop (no 30-s wait for power evidence); before each channel; inside the first region of `ambit_flash_image_gated`, after its file open / seek / size check, right before the first erase | channels left on their firmware; the boot fail cap is not consumed |
 
   `device_commands_flash_power_ok()` is also false while protected, for any
   future caller.
@@ -325,8 +328,10 @@ run fails unless every reply confirms the requested state. In Actions →
   `ambit_flash_attach_flash`) with protection beginning inside the spread,
   the ack flush, the quiesce, the suspend, the download / release fetch, a
   ping, the version read, the ROM probe, the SD preflight, the UART bus wait,
-  the ROM connect and mid-sweep (19 scenarios; with the gates removed, the 9
-  in-step scenarios fail). The Ambyte worker also covers protection during
+  the ROM connect, the first region file's open and seek, and mid-sweep (22
+  scenarios, the region writer itself included; with the round-2 gates
+  removed the 9 round-2 in-step scenarios fail, and on the round-2 head the 3
+  open/seek scenarios fail). The Ambyte worker also covers protection during
   the suspend and the second flush.
 - **Real brownout behaviour is covered by host tests only.** A bench cannot
   brown out on demand; the bench run exercises `force` and `clear`.

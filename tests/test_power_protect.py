@@ -177,9 +177,9 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
                  "ota_flip_during_download", "ota_flip_during_ping", "ota_flip_during_identity",
                  "ota_flip_mid_sweep", "flash_flip_during_ack", "flash_flip_during_suspend",
                  "flash_flip_during_fetch", "flash_flip_during_probe", "flash_flip_during_preflight",
-                 "flash_flip_during_bus_wait", "flash_flip_during_rom_connect", "flash_flip_mid_sweep",
-                 "attach_flip_during_rom_connect", "attach_unprotected", "ota_unprotected",
-                 "flash_unprotected")
+                 "flash_flip_during_bus_wait", "flash_flip_during_rom_connect", "flash_flip_during_first_open",
+                 "flash_flip_during_first_seek", "flash_flip_mid_sweep", "attach_flip_during_rom_connect",
+                 "attach_flip_during_first_open", "attach_unprotected", "ota_unprotected", "flash_unprotected")
 
     @classmethod
     def setUpClass(cls):
@@ -191,12 +191,11 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="ambit-worker-")
         tmp = Path(cls.tmp.name)
         (tmp / "ambit-worker-production.inc").write_text("\n".join(
-            [regions,
-             "static esp_loader_error_t flash_one_region(esp_loader_t *, const char *, const flash_region_t *,"
-             " uint32_t *);"]
+            [regions]
             + [function(flash, name) for name in ("boot_fail_key", "boot_fail_count", "boot_fail_bump",
                                                   "boot_fail_clear", "flash_power_allows_write",
-                                                  "boot_fail_restore", "fw_matches", "ambit_flash_image_gated",
+                                                  "boot_fail_restore", "fw_matches", "flash_one_region_impl",
+                                                  "flash_one_region", "ambit_flash_image_gated",
                                                   "ambit_flash_attach_flash")]
             + [function(ota, name) for name in ("power_note_refusal", "power_blocks_write", "power_allows_write",
                                                 "ambit_ota_one_impl", "ambit_ota_one", "ambit_do_ota",
@@ -245,7 +244,7 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
         # Round 2: protection during ch0's ROM probe / preflight / bus wait / ROM
         # connect: ch0 is skipped (never erased), not reported flash_ok.
         for name in ("flash_flip_during_probe", "flash_flip_during_preflight", "flash_flip_during_bus_wait",
-                     "flash_flip_during_rom_connect"):
+                     "flash_flip_during_rom_connect", "flash_flip_during_first_open", "flash_flip_during_first_seek"):
             with self.subTest(scenario=name):
                 got = self.reports(name)
                 self.assertIn(["ambit_flash_status", "skipped", "ch=0", "id=job-1", "detail=power_protect"], got)
@@ -345,6 +344,19 @@ class PowerProtectWiringContractTest(unittest.TestCase):
                                           "esp_loader_connect_with_stub(", "esp_loader_change_transmission_rate(",
                                           "if (may_write != NULL && !may_write()) {", "flash_one_region(")]
         self.assertEqual(order, sorted(order))
+        # Round 3: the LAST admission is inside the first region, after its file
+        # work and immediately before the first erase; later regions are ungated.
+        self.assertIn("flash_one_region(&loader, dir, &s_regions[i], i == 0 ? may_write : NULL, &refused, &nb);",
+                      gated)
+        region = flash[flash.index("static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,\n"
+                                   "                                                const flash_region_t *r, bool (*may_write)(void),\n"
+                                   "                                                bool *refused, uint32_t *bytes_out)\n{"):]
+        region = region[:region.index("\n}\n")]
+        steps = [region.index(k) for k in ('fopen(path, "rb")', "fseek(f, 0, SEEK_END)", "fseek(f, 0, SEEK_SET)",
+                                           "if (fsize <= 0)", "ESP_LOGW(TAG, \"  region %s @0x%06lx",
+                                           "if (may_write != NULL && !may_write()) {",
+                                           "esp_loader_flash_start(loader, &cfg)")]
+        self.assertEqual(steps, sorted(steps))
         # Every unattended writer is gated; the plain one is the USB console's.
         for rel in ("components/ambit_ota/ambit_ota.c", "components/ambit_flash/ambit_flash.c"):
             src = self.read(rel)

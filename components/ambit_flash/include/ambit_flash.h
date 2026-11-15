@@ -63,8 +63,9 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
 /* ambit_flash_image with a last-moment admission (brownout protection, review
  * of PR #103): `may_write` is asked AFTER every blocking step that precedes
  * the first erase (SD preflight with its SHA-256 checks, the UART bus wait,
- * the ROM reset + stub connect, the baud change) and immediately before the
- * first region is erased. false → nothing erased or written, the AMBIT is
+ * the ROM reset + stub connect, the baud change, and the first region's SD
+ * ref, fopen, seek and size check) and immediately before that region's
+ * esp_loader_flash_start sends the first erase. false → nothing erased or written, the AMBIT is
  * reset back into its existing application, ESP_ERR_NOT_ALLOWED. NULL = no
  * gate. A region that has started is never interrupted by the gate. */
 esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t baud,
