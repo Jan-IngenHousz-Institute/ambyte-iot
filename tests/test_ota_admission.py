@@ -51,6 +51,13 @@ class AdmissionTest(unittest.TestCase):
                 if path=="jobs":
                     with self.subTest(path=path,reason=reason):self.run_case(path,reason)
 
+    def test_power_protect_refuses_before_any_download(self):
+        # Brownout protection: "dropped"/power_protect before the accepted
+        # report, the download, the comms suspend or any flash write; the Jobs
+        # execution is a retryable miss (no FAILED report, stays QUEUED).
+        for path in ("https","jobs"):
+            with self.subTest(path=path):self.assertEqual(self.run_case(path,"power_protect",3),"QQQ")
+
     def test_twenty_refusal_cycles_release_allocations_and_admission(self):
         for path in ("https","jobs"):
             with self.subTest(path=path):self.assertEqual(self.run_case(path,"incompatible",20).count("D"),20)

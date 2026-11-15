@@ -9,6 +9,7 @@
 #include "ambit_fw_fetch.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
+#include "power_protect.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -1033,6 +1034,17 @@ static void ambit_do_attach(void)
             /* Fresh, positive evidence of external power only (fail-closed,
              * 2026-11-13): never on battery, never on an unreadable or frozen
              * charger - a brownout mid-flash bricks the AMBIT. */
+            if (power_protect_blocks_flash()) {
+                /* Brownout protection: held like a unit without external
+                 * power, re-checked on the same 10-min cadence. Not counted as
+                 * a refused update: it re-asks every 10 min per channel. */
+                ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but power protection is %s; "
+                              "held, re-checking in 10 min", ch + 1, inf.fw_version, tgt.major,
+                         tgt.minor, tgt.batch, pp_state_name(power_protect_state()));
+                ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_RETRY, now_ms);
+                attach_report("waiting_power", ch, inf.fw_version, &tgt);
+                break;
+            }
             const bool power = device_commands_flash_power_ok();
             if (!power) {
                 ESP_LOGW(TAG, "attach: AMBIT%u fw %s needs v%u.%u.%u but external power is not "
@@ -1098,6 +1110,21 @@ static void ambit_ota_run(void *arg)
         } else {
             report_busy(r);
         }
+        free(r);
+        return;
+    }
+    /* Brownout protection (power_protect.h): no AMBIT firmware is written on a
+     * unit that just browned out (or was forced). Refused before the accepted
+     * report, any download or quiesce, as a terminal "failed" with detail
+     * "power_protect" so fleet_command stops waiting. Read-only ops (versions,
+     * probe) still run. */
+    if ((r->op == AMBIT_OP_OTA || r->op == AMBIT_OP_FLASH) && power_protect_blocks_flash()) {
+        ESP_LOGW(TAG, "ambit op=%u id=%s refused: power protection is %s", r->op,
+                 r->id[0] ? r->id : "", pp_state_name(power_protect_state()));
+        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+        report_as(r->op == AMBIT_OP_FLASH ? "ambit_flash_status" : "ambit_ota_status", "failed",
+                  r->channel, r->id, "power_protect");
+        if (s_cfg.maintenance_end != NULL) s_cfg.maintenance_end();
         free(r);
         return;
     }

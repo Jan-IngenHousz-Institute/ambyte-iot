@@ -81,10 +81,11 @@ class IdentityTest(unittest.TestCase):
         run=subprocess.run([self.out/"pong"],capture_output=True,text=True)
         self.assertEqual(run.returncode,0,run.stderr)
         result=json.loads(run.stdout)
-        # reset_reason / boot_count are additive (remote diagnostics): every
-        # pre-existing key keeps its name and value.
+        # reset_reason / boot_count (remote diagnostics) and power_protect
+        # (brownout protection) are additive: every pre-existing key keeps its
+        # name and value.
         self.assertEqual(result,{"type":"pong","id":"ping-test","device_id":"device","fw":"2.8.0",
-            "uptime_ms":42,"reset_reason":"panic","boot_count":7,
+            "uptime_ms":42,"reset_reason":"panic","boot_count":7,"power_protect":"hold",
             "signed":True,"storage":{"readable":[1],"written":1,"fallback":1}})
 
     def response(self, scenario, *args):

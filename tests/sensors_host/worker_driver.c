@@ -57,6 +57,16 @@ static void ambit_do_ota(const ambit_ota_req_t *r) { (void)r; guarded_op(); }
 static void ambit_do_attach(void) { guarded_op(); }
 static void ambit_attach_gate_checker_done(void) {}
 static void report_busy(const ambit_ota_req_t *r) { (void)r; assert(0); }
+/* Brownout protection seam (power_protect.h): this worker test runs on a
+ * normal-state unit, so no op may take the refusal branch. */
+#define AMBIT_OP_OTA 0
+#define POWER_PROTECT_SKIP_OTA 2
+static bool power_protect_blocks_flash(void) { return false; }
+__attribute__((unused)) static int power_protect_state(void) { return 0; }
+__attribute__((unused)) static const char *pp_state_name(int s) { (void)s; return "normal"; }
+static void power_protect_note_skip(int what) { (void)what; assert(0); }
+static void report_as(const char *type, const char *state, unsigned ch, const char *id, const char *detail)
+{ (void)type; (void)state; (void)ch; (void)id; (void)detail; assert(0); }
 #include "worker-production.inc"
 static maint_job_t queue[4];
 static unsigned qcount;

@@ -29,6 +29,7 @@
 #include "ambit_fw_manifest.h"
 #include "sd_card.h"
 #include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
+#include "power_protect.h"
 #include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
 
 #define AMBIT_FW_ROOT  "/sdcard/ambit_fw"
@@ -948,6 +949,17 @@ int ambit_flash_boot_sync(void)
         } else {
             ESP_LOGW(TAG, "boot sync: all present AMBITs match v%s — nothing to flash", ver);
         }
+        return 0;
+    }
+
+    /* Brownout protection first (power_protect.h): power_protect_boot() ran
+     * before this, so a boot that IS the brownout already refuses here, and
+     * without waiting 30 s for power evidence that cannot override it. */
+    if (power_protect_blocks_flash()) {
+        ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing, but power protection is %s - "
+                      "they stay on their current firmware", n_need,
+                 pp_state_name(power_protect_state()));
+        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
         return 0;
     }
 

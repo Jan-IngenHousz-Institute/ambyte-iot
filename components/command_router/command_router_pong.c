@@ -4,7 +4,8 @@
 
 bool command_router_pong_json(char *out, size_t capacity, const char *id,
                               const char *device_id, const char *fw, int64_t uptime_ms,
-                              const char *reset_reason, uint32_t boot_count)
+                              const char *reset_reason, uint32_t boot_count,
+                              const char *power_protect)
 {
     char firmware_identity[192];
     if (!ota_running_identity_json(firmware_identity, sizeof firmware_identity)) return false;
@@ -15,9 +16,15 @@ bool command_router_pong_json(char *out, size_t capacity, const char *id,
                          reset_reason, (unsigned long)boot_count);
         if (b < 0 || (size_t)b >= sizeof boot) return false;
     }
+    char pp[40] = "";
+    if (power_protect != NULL) {
+        /* A fixed state name (power_protect_core.h): no escaping. */
+        int b = snprintf(pp, sizeof pp, "\"power_protect\":\"%s\",", power_protect);
+        if (b < 0 || (size_t)b >= sizeof pp) return false;
+    }
     int n = snprintf(out, capacity,
-             "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld,%s%s}",
+             "{\"type\":\"pong\",\"id\":\"%s\",\"device_id\":\"%s\",\"fw\":\"%s\",\"uptime_ms\":%lld,%s%s%s}",
              id ? id : "", device_id ? device_id : "", fw ? fw : "",
-             (long long)uptime_ms, boot, firmware_identity);
+             (long long)uptime_ms, boot, pp, firmware_identity);
     return n >= 0 && (size_t)n < capacity;
 }

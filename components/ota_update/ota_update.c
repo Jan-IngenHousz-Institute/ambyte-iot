@@ -1,5 +1,6 @@
 #include "ota_update.h"
 #include "ota_policy.h"
+#include "power_protect.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -300,6 +301,21 @@ static void ota_do_update(const ota_request_t *r)
         if (r->finished != NULL) {
             r->finished(r->id, false, "bad url: a GitHub web page, not a file", r->cb_ctx);
         }
+        return;
+    }
+
+    /* Brownout protection (power_protect.h): a unit that just browned out, or
+     * an operator-forced one, takes no image. Refused BEFORE the accepted
+     * report and before any download, suspend or flash write, as "dropped"
+     * (rejected before acceptance, a retry candidate: fleet_deploy keeps it
+     * apart from a failure) with detail "power_protect". A Jobs execution is
+     * retryable: it stays QUEUED and is looked at again in 10 min. */
+    if (power_protect_blocks_flash()) {
+        ESP_LOGW(TAG, "OTA id=%s refused: power protection is %s", r->id,
+                 pp_state_name(power_protect_state()));
+        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+        ota_report("dropped", r->id, "power_protect");
+        if (r->finished != NULL) r->finished(r->id, true, "power_protect", r->cb_ctx);
         return;
     }
 

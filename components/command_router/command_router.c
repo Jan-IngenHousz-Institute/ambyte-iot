@@ -2,6 +2,8 @@
 #include "command_router_pong.h"
 #include "diag.h"
 #include "log_command.h"
+#include "power_protect.h"
+#include "power_protect_command.h"
 #include "timezone_command.h"
 
 #include <math.h>
@@ -47,11 +49,13 @@ static void publish_reply(const char *json)
 
 static void handle_ping(const char *id)
 {
-    char reply[448];
+    char reply[480];
     const long long up_ms = (long long)(esp_timer_get_time() / 1000);
+    /* power_protect is the lock-free state word: safe on the esp-mqtt task. */
     if (!command_router_pong_json(reply, sizeof reply, id, s_cfg.device_id,
                                   s_cfg.firmware_version, up_ms,
-                                  diag_reset_reason(), diag_boot_count())) return;
+                                  diag_reset_reason(), diag_boot_count(),
+                                  pp_state_name(power_protect_state()))) return;
     ESP_LOGI(TAG, "ping -> pong (id=%s)", id ? id : "");
     publish_reply(reply);
 }
@@ -270,6 +274,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         handle_evlog_replay(root, id);
     } else if (log_command_handle(root)) {
         /* log_list / log_read: validated here, read on the maintenance worker. */
+    } else if (power_protect_command_handle(root)) {
+        /* power_protect status/clear/force: validated here, run on the worker. */
     } else if (strcmp(type, "ota_update") == 0) {
         const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
         const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;
@@ -590,6 +596,14 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
         .gen = log_gen,
     };
     log_command_init(&log_config);
+    /* Brownout protection operator command (power_protect_command.h). */
+    const power_protect_command_config_t pp_config = {
+        .reply = publish_reply, .submit = cfg->submit,
+        .maintenance_begin = cfg->maintenance_begin, .maintenance_end = cfg->maintenance_end,
+        .get_status = power_protect_get_status, .force = power_protect_force,
+        .clear = power_protect_clear, .state_now = power_protect_state,
+    };
+    power_protect_command_init(&pp_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",
              s_cfg.status_topic ? s_cfg.status_topic : "(none)");
     return ESP_OK;

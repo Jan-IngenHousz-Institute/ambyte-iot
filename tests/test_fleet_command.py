@@ -545,3 +545,147 @@ assert bench_signed_ota.exact_url('https://example.test/app') == 'https://exampl
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PowerProtectCommand(unittest.TestCase):
+    """power-protect: payloads, refusals before AWS, MUTATING marker, verification."""
+
+    CLIENT = "ambyte_14:63:93:39:36:48"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+
+    def setUp(self):
+        self.fc = _load()
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="power-protect", action="status", state=""), "r"),
+                         {"type": "power_protect", "id": "r", "action": "status"})
+        self.assertEqual(b(_args(cmd="power-protect", action="clear", state=""), "r"),
+                         {"type": "power_protect", "id": "r", "action": "clear"})
+        for state in ("no_flash", "hold"):
+            self.assertEqual(b(_args(cmd="power-protect", action="force", state=state), "r"),
+                             {"type": "power_protect", "id": "r", "action": "force", "state": state})
+
+    def test_bad_input_refused(self):
+        for kw in (dict(action="force", state=""), dict(action="force", state="normal"),
+                   dict(action="status", state="hold"), dict(action="clear", state="no_flash"),
+                   dict(action="reboot", state="")):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="power-protect", **kw), "r")
+
+    def test_mutating_actions_refuse_discovery_and_bad_input_before_aws(self):
+        from unittest.mock import patch
+        cases = (["power-protect", "--action", "clear"],
+                 ["power-protect", "--action", "force", "--state", "hold"],
+                 ["power-protect", "--action", "force", "--devices", self.CLIENT],
+                 ["power-protect", "--action", "status", "--state", "hold", "--devices", self.CLIENT],
+                 ["power-protect", "--action", "force", "--state", "normal", "--devices", self.CLIENT])
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    def _run(self, argv, reply_for):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        future = SimpleNamespace(result=lambda **kw: None)
+        sent = []
+
+        def connection(session, subscription, receive, **kwargs):
+            def publish(*, topic, payload, qos):
+                request = json.loads(payload)
+                sent.append(request)
+                for reply in reply_for(request):
+                    receive(self.STATUS, json.dumps(dict(reply, id=request["id"],
+                                                         type="power_protect_result")).encode())
+                return future, 1
+            return SimpleNamespace(publish=publish, disconnect=lambda: future)
+        aws = SimpleNamespace(mqtt=SimpleNamespace(QoS=SimpleNamespace(AT_LEAST_ONCE=1)))
+        out = io.StringIO()
+        with patch.dict(sys.modules, awscrt=aws), \
+             patch.object(self.fc.fleet_deploy, "boto_session", return_value=object()), \
+             patch.object(self.fc.fleet_deploy, "mqtt_connection", connection), \
+             patch.object(self.fc.time, "sleep", lambda _: None), redirect_stdout(out):
+            rc = self.fc.main([*argv, "--devices", self.CLIENT, "--wait", "1"])
+        return rc, sent, out.getvalue()
+
+    def test_status_is_read_only_and_force_is_mutating_and_verified(self):
+        status = dict(ok=True, action="status", detail="ok", state="no_flash", reason="brownout",
+                      forced=False, since_utc=1763152200, brownouts_6h=1, exit_in_s=None,
+                      skipped={"flash_runs": 3, "ambit_runs": 0, "ota": 1})
+        rc, sent, text = self._run(["power-protect"], lambda req: [status])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["action"], "status")
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("state=no_flash reason=brownout", text)
+
+        forced = dict(status, action="force", detail="applied", state="hold", reason="forced", forced=True)
+        busy = dict(ok=False, action="force", detail="busy", state="no_flash")
+        rc, sent, text = self._run(["power-protect", "--action", "force", "--state", "hold"],
+                                   lambda req: [busy, forced])     # a QoS1 duplicate first
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "power_protect", "id": sent[0]["id"], "action": "force", "state": "hold"})
+        self.assertIn("(MUTATING)", text)
+
+        cleared = dict(status, action="clear", detail="cleared", state="normal", reason="cleared", forced=False)
+        rc, _, text = self._run(["power-protect", "--action", "clear"], lambda req: [cleared])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("(MUTATING)", text)
+
+    def test_refusal_or_unconfirmed_state_fails_the_run(self):
+        refused = dict(ok=False, action="force", detail="maintenance_active", state="normal")
+        rc, _, text = self._run(["power-protect", "--action", "force", "--state", "no_flash"], lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("not confirmed", text)
+        wrong = dict(ok=True, action="force", detail="applied", state="hold", forced=True)
+        rc, _, _ = self._run(["power-protect", "--action", "force", "--state", "no_flash"], lambda req: [wrong])
+        self.assertEqual(rc, 1)
+        persist = dict(ok=False, action="clear", detail="persist_failed", state="normal", forced=False)
+        rc, _, _ = self._run(["power-protect", "--action", "clear"], lambda req: [persist])
+        self.assertEqual(rc, 1)
+
+    def test_workflow_offers_power_protect_and_passes_action_and_state(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("power-protect", inputs["command"]["options"])
+        self.assertEqual(inputs["power_protect_action"]["options"], ["status", "clear", "force"])
+        self.assertEqual(inputs["power_protect_state"]["options"], ["no_flash", "hold"])
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, state, devices):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND="power-protect", DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION=action, PP_STATE=state)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("force", "hold", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "power-protect")
+        self.assertEqual(argv[argv.index("--action") + 1], "force")
+        self.assertEqual(argv[argv.index("--state") + 1], "hold")
+        rc, argv = argv_for("status", "hold", "")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--state", argv)       # the state input only rides with force
+        rc, _ = argv_for("clear", "no_flash", " ")
+        self.assertEqual(rc, 2)                 # mutating without explicit devices

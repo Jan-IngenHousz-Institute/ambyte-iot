@@ -171,6 +171,11 @@ bool device_commands_publish_power_ok(void);
  * same) unless the build sets AMBYTE_FLASH_WITHOUT_CHARGER. */
 bool device_commands_flash_power_ok(void);
 
+/* Refresh the cached charger read (at most every 5 s) so brownout protection
+ * keeps seeing reads even when nothing else asks. The power guard task calls
+ * it on its 15 s poll. No-op without a charger. */
+void device_commands_power_tick(void);
+
 /* Observed power state, as a stable telemetry string:
  * starting | external_power | on_battery | power_unverified | no_charger. */
 const char *device_commands_publish_gate_reason(void);

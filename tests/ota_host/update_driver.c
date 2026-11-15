@@ -7,6 +7,7 @@
 #include "../../components/ota_update/ota_update.c"
 #include "iot_jobs.h"
 #include "esp_image_format.h"
+#include "power_protect.h"
 
 static char trace[1024], last_report[384];
 static size_t used;
@@ -21,6 +22,13 @@ static const esp_partition_t next = {.address=0x310000,.size=8192};
 static void (*work)(void *);
 static void *work_arg;
 static void event(char c) { assert(used+1<sizeof trace);trace[used++]=c;trace[used]=0; }
+
+/* Brownout protection seam: scenario "power_protect" runs on a protected unit. */
+static unsigned pp_skips;
+bool power_protect_blocks_flash(void) { return !strcmp(scenario,"power_protect"); }
+pp_state_t power_protect_state(void) { return power_protect_blocks_flash()?PP_STATE_NO_FLASH:PP_STATE_NORMAL; }
+void power_protect_note_skip(power_protect_skip_t w) { assert(w==POWER_PROTECT_SKIP_OTA);++pp_skips; }
+const char *pp_state_name(pp_state_t s) { return s==PP_STATE_NO_FLASH?"no_flash":"normal"; }
 
 void svc_test_enter(void) {}
 void svc_test_exit(void) {}
@@ -97,6 +105,7 @@ static esp_err_t publish(const char *topic,const char *p,size_t n,int *id)
     if(!strcmp(topic,"device/status")) {
         memcpy(last_report,p,n);last_report[n]=0;
         if(strstr(last_report,"\"state\":\"failed\""))event('E');
+        if(strstr(last_report,"\"state\":\"dropped\""))event('Q');
         if(strstr(last_report,"\"state\":\"success\""))++successes;
     } else if(strstr(topic,"/update")) {
         if (strstr(p,"\"status\":\"FAILED\"")) event('B');
@@ -156,6 +165,13 @@ int main(int argc,char **argv)
     if(health) {
         assert(restarts==1&&selections==0&&valid_marks==0&&successes==0&&latches==0);
         assert(!strcmp(trace,"KX"));
+    } else if(!strcmp(scenario,"power_protect")) {
+        /* Refused before acceptance: no download, no suspend/resume, no
+         * refusal record, no Jobs FAILED (a retryable miss stays QUEUED). */
+        assert(selections==0&&latches==0&&restarts==0&&pp_skips==cycles);
+        assert(strspn(trace,"Q")==strlen(trace)&&strlen(trace)==cycles);
+        assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
+        assert(!ota_is_admitted());
     } else if(!strcmp(scenario,"accept")) {
         assert(selections==1&&latches==1&&restarts==1);
         assert(strstr(trace,"SRMFLX"));

@@ -84,6 +84,7 @@ typedef struct {
     uint32_t skipped;
     bool     skipped_saturated; /* skipped is a lower bound when true */
     uint32_t fail_streak;
+    uint32_t power_skipped;    /* firings shed by power protection (not failures) */
     int64_t  last_run_epoch;   /* UTC seconds; -1 = never ran */
     uint32_t last_duration_ms;
 } sched_job_stats_t;

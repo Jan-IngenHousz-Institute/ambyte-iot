@@ -931,6 +931,9 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
     if (input->crash_json != NULL) {
         jw_append(&w, ",\"crash\":%s", input->crash_json);
     }
+    if (input->power_protect_json != NULL) {
+        jw_append(&w, ",\"power_protect\":%s", input->power_protect_json);
+    }
     jw_append(&w, ",\"clock\":{");
     if (input->clock_valid) {
         jw_append(&w, "\"source\":"); jw_string(&w, input->clock_source);

@@ -563,6 +563,10 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
       "boot_count": 412
     },
     "crash": { "present": false },
+    "power_protect": {
+      "state": "normal", "reason": "none", "since_utc": null, "forced": false,
+      "brownouts_6h": 0, "skipped": { "flash_runs": 0, "ambit_runs": 0, "ota": 0 }
+    },
     "clock": { "source": "rtc", "suspect": false },
     "software": {
       "firmware": "1.6.6",
@@ -591,7 +595,8 @@ BME280 read produces `"observations": {}`; it does not suppress the health
 snapshot or emit null-valued scalars. The seven health members shown above
 other than `crash` are REQUIRED containers; their leaves are omitted when the
 source is unavailable. `health.crash` (§9.5) is additive since the remote
-diagnostics release and is then always present.
+diagnostics release and is then always present. `health.power_protect` (§9.6)
+is additive since the brownout-protection release and is then always present.
 This stable grouping lets the platform project environment and health views
 from the same raw row, with the same `measure_id` and observation time, without
 republishing or duplicating that row.
@@ -748,6 +753,33 @@ old one. See [remote-diagnostics.md](remote-diagnostics.md) §B.
 | `exc_cause` | integer | Xtensa EXCCAUSE (28 LoadProhibited, 29 StoreProhibited, 0 IllegalInstruction, …). |
 | `backtrace` | array of `0x%08x` strings | Up to 16 return addresses, innermost first. |
 | `bt_corrupted` | boolean | IDF flagged the backtrace as corrupted. |
+
+### 9.6 `health.power_protect` (additive, brownout protection)
+
+The brownout protection state ([power-protect.md](power-protect.md)), rendered
+from RAM on every heartbeat (never an NVS access).
+
+```jsonc
+"power_protect": {
+  "state": "no_flash", "reason": "brownout", "since_utc": 1763152200, "forced": false,
+  "brownouts_6h": 1, "skipped": { "flash_runs": 3, "ambit_runs": 0, "ota": 1 }
+}
+```
+
+| leaf | type | meaning |
+|---|---|---|
+| `state` | string enum | `normal`, `no_flash` (actinic-bearing AMBIT work, AMBIT flashing and every OTA shed), `hold` (every `ambit/` action shed as well). |
+| `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or `battery_v` in (0, 3.40 V)), `forced`, `power_recovered` (30 min of qualifying external power), `cleared`. Unknown future values are preserved. |
+| `since_utc` | integer or null | UTC seconds when `state` was entered; `null` when the clock was not valid then (`clock.source` `hwm`, or a suspect RTC). |
+| `forced` | boolean | An operator `force`; never auto-exits, only `clear` ends it. |
+| `brownouts_6h` | integer | Recorded brownouts in the last 6 h (by UTC when both clocks are valid, else the run of consecutive brownout boots ending at this boot). |
+| `skipped.flash_runs` | integer | Schedule runs skipped since this boot because they carried actinic/flash work. |
+| `skipped.ambit_runs` | integer | Schedule runs skipped since this boot by `hold` only (no actinic content). |
+| `skipped.ota` | integer | Refused Ambyte OTA, AMBIT OTA, `ambit_flash` and AMBIT boot-sync flashing since this boot. |
+
+The counters are per boot (RAM). The state, reason, `since_utc`, `forced` and
+the brownout history persist in NVS and survive reboots. A transition is also
+reported as one `ambyte.log/1` line: `power_protect: <from> -> <to> reason=<reason>`.
 
 ## 10. Attached AMBIT device object (normative, Ambyte only)
 
@@ -998,6 +1030,7 @@ unstorable. `protocol.cmd` (≤ ~522 B) stays in the record's command column.
 | 2026-08-10 | New firmware's lossless v2 trace fallback and the existing `ambit.spec`, `ambit.temp`, and `db.store_event` v2 families are permanent; platform dual-read support has no retirement date. |
 | 2026-08-12 | Transport gzip of the v3 `sample` (`_sample_encoding: "gzip+base64"`, §14a) ships behind the NVS flag `publish_gzip`, default OFF, fail-open to plain JSON; the compressed text is byte-identical to the plain `sample` array so Silver's existing decoder needs no change. Chosen over SenML JSON/CBOR after exact same-trace benchmarks (920 B vs 1,740/1,900 B gzipped). |
 | 2026-08-12 | Measurements publish on the lean 7-segment topic (`topic_root` verbatim, §13), complying with openJII `e38cdd45b`; the hardcoded `/1234` legacy protocolId suffix is removed. Attribution is payload-only (`protocol.id`). |
+| 2026-11-15 | Brownout protection: `health.power_protect` (§9.6) and `pong.power_protect` are additive; the operator command is `power_protect` (§19). A protected unit refuses an Ambyte OTA as `ota_status` `dropped` / `power_protect` (a retry candidate, the Jobs execution stays QUEUED) and AMBIT OTA / `ambit_flash` as `failed` / `power_protect`. Skip counters are per boot so a heartbeat never writes NVS. |
 | 2026-11-14 | Remote diagnostics: `health.runtime.reset_reason` + `boot_count` and `health.crash` are additive telemetry fields; captured `ESP_LOGE` lines become a separate persisted family `ambyte.log/1` (tag `LOG`) on the normal QoS1 path rather than a field of the heartbeat, so a log burst never grows or delays the health row. `log_read` data is base64 (bounded 4/3 growth) rather than escaped text (up to 6×). |
 
 ## 16. On-disk record
@@ -1096,6 +1129,47 @@ topic, QoS 1, not retained, with a unique `id`. Details:
   `offset_past_eof` (with `size`), `file_rotated` (with the current `gen`),
   `rotation_in_progress`, `no_mem`.
 
+## 19. Brownout protection command (status topic)
+
+Command replies, not persisted events (§12). Publish on the device's command
+topic, QoS 1, **not retained** (a retained `force` would come back after every
+`clear`), with a unique `id`. Details: [power-protect.md](power-protect.md) §D.
+
+```jsonc
+{"type":"power_protect","id":"r1","action":"status"}
+{"type":"power_protect","id":"r2","action":"force","state":"hold"}   // or "no_flash"
+{"type":"power_protect","id":"r3","action":"clear"}
+// reply
+{"type":"power_protect_result","id":"r2","ok":true,"action":"force","detail":"applied",
+ "state":"hold","reason":"forced","forced":true,"since_utc":1763152200,"brownouts_6h":0,
+ "exit_in_s":null,"skipped":{"flash_runs":0,"ambit_runs":0,"ota":0}}
+```
+
+- `status` is read-only (`detail` `ok`). `clear` (`cleared`) returns to
+  `normal` and wipes the brownout history and the forced flag. `force`
+  (`applied`) sets a forced `no_flash` or `hold` that never auto-exits.
+- Every reply carries the state after the action: the §9.6 leaves plus
+  `exit_in_s`, the seconds left in a running 30-min exit window (`null` when
+  none runs).
+- An `ok:true` reply is always complete; an allocation failure turns it into
+  `no_mem`.
+- `ok:false` details: `invalid_id`, `invalid_action`, `invalid_state` (missing
+  or not `no_flash`/`hold` with `force`; present with `status`/`clear`),
+  `busy` (another power_protect op in flight, or a QoS 1 duplicate),
+  `queue_unavailable`, `maintenance_active` (`clear`/`force` while another
+  maintenance op holds the lock), `persist_failed` (the state applied in RAM,
+  the NVS write failed: it will not survive a reboot), `no_mem`. Refusals carry
+  `state` too.
+
+### Updates refused by brownout protection
+
+| report | state | detail |
+|---|---|---|
+| `ota_status` (MQTT `ota_update`, Jobs) | `dropped` | `power_protect` — before `accepted`, any download or flash write; a Jobs execution stays QUEUED and is retried in 10 min |
+| `ambit_ota_status` | `failed` | `power_protect` |
+| `ambit_flash_status` | `failed` | `power_protect` |
+| `ambit_attach_status` (attach-time update) | `waiting_power` | held, re-checked every 10 min |
+
 ## OTA admission failure details
 
 The existing non-persisted `ota_status` object and Jobs `statusDetails.reason`
@@ -1119,6 +1193,16 @@ immediately after `uptime_ms`. Every earlier key keeps its value and encoding:
 ```json
 {"type":"pong","id":"…","device_id":"…","fw":"2.18.0","uptime_ms":42,
  "reset_reason":"brownout","boot_count":412,"signed":true,"storage":{…}}
+```
+
+### Brownout protection state in pong (additive)
+
+The pong also carries `power_protect` (`normal`, `no_flash` or `hold`,
+§9.6) right after `boot_count`. Every earlier key keeps its value and encoding:
+
+```json
+{"type":"pong","id":"…","device_id":"…","fw":"2.19.0","uptime_ms":42,
+ "reset_reason":"brownout","boot_count":412,"power_protect":"no_flash","signed":true,"storage":{…}}
 ```
 
 ### Running-image metadata in pong (A5 additive)

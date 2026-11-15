@@ -554,6 +554,24 @@ const char *diag_crash_json(void)
     return "{\"present\":true,\"id\":\"ffffffffffffffff\",\"first_seen_boot\":4294967295,\"app_elf_sha256\":\"ffffffffffffffff\",\"task\":\"\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\\u0001\",\"pc\":\"0xffffffff\",\"exc_cause\":4294967295,\"exc_vaddr\":\"0xffffffff\",\"backtrace\":[\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\",\"0xffffffff\"],\"bt_corrupted\":true}";
 }
 
+/* components/power_protect (brownout protection): this harness drives the
+ * delivery pipeline, not the protection state machine (tests/power_protect_host
+ * does). The unit is never protected here, and every heartbeat carries the
+ * WIDEST health.power_protect the firmware can render (longest state and
+ * reason names, INT64_MIN since, u32-max counters), so I5's worst-case
+ * telemetry budget includes it. */
+#include "power_protect.h"
+void power_protect_on_power_read(power_read_reason_t reason, const power_reading_t *p, bool fresh_present)
+{ (void)reason; (void)p; (void)fresh_present; }
+bool power_protect_blocks_flash(void) { return false; }
+int power_protect_render_json(char *buf, size_t cap)
+{
+    int n = snprintf(buf, cap, "{\"state\":\"no_flash\",\"reason\":\"repeat_brownout\","
+                     "\"since_utc\":-9223372036854775808,\"forced\":true,\"brownouts_6h\":4294967295,"
+                     "\"skipped\":{\"flash_runs\":4294967295,\"ambit_runs\":4294967295,\"ota\":4294967295}}");
+    return (n > 0 && (size_t)n < cap) ? n : -1;
+}
+
 /* diag_log_priv.h: downstream sink before install() (diag_boot.c on target). */
 #include <stdarg.h>
 #include <stdio.h>
