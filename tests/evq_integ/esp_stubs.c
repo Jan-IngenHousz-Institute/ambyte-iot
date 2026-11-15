@@ -566,8 +566,9 @@ void power_protect_on_power_read(power_read_reason_t reason, const power_reading
 bool power_protect_blocks_flash(void) { return false; }
 int power_protect_render_json(char *buf, size_t cap)
 {
-    int n = snprintf(buf, cap, "{\"state\":\"no_flash\",\"reason\":\"repeat_brownout\","
-                     "\"since_utc\":-9223372036854775808,\"forced\":true,\"brownouts_6h\":4294967295,"
+    int n = snprintf(buf, cap, "{\"state\":\"no_flash\",\"reason\":\"brownout_unordered\","
+                     "\"since_utc\":-9223372036854775808,\"forced\":true,\"persist_fault\":true,"
+                     "\"brownouts_6h\":4294967295,"
                      "\"skipped\":{\"flash_runs\":4294967295,\"ambit_runs\":4294967295,\"ota\":4294967295}}");
     return (n > 0 && (size_t)n < cap) ? n : -1;
 }

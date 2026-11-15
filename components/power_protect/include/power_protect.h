@@ -12,11 +12,17 @@
  *   sched_runner  run_job: a job with actinic-bearing AMBIT work is skipped in
  *                 no_flash, every job with an ambit/ step in hold. A skip is
  *                 not a failure (no fail streak, no failure log).
- *   ota_update    refused before any download, ota_status "dropped",
- *                 detail "power_protect" (a Jobs execution stays QUEUED).
- *   ambit_ota     ambit_ota / ambit_flash refused, detail "power_protect";
- *                 attach updates held.
- *   ambit_flash   boot sync does not flash.
+ *   ota_update    refused at worker entry, at final admission (after the ack
+ *                 flush and fleet spread, before suspend/download) and before
+ *                 the image is selected: ota_status "dropped", detail
+ *                 "power_protect", Jobs retryable.
+ *   ambit_ota     ambit_ota / ambit_flash refused at entry, after the ack
+ *                 flush / spread, after the download, and before EACH
+ *                 channel's write (a started write finishes); attach updates
+ *                 held (re-checked after the quiesce).
+ *   ambit_flash   boot sync does not flash (re-checked before each channel).
+ * Every update path re-checks at its safe boundaries because protection can
+ * begin while a worker waits (review of PR #103).
  *   device_commands_flash_power_ok() is false (defence in depth).
  * Never touched: the event log, its cursor, the delivery pipeline, MQTT,
  * script_update, the heartbeat, log_list/log_read.
@@ -48,6 +54,7 @@ typedef struct {
     pp_reason_t reason;
     bool        forced;
     int64_t     since_utc;      /* 0 = unknown (clock was not valid) */
+    bool        persist_fault;  /* NVS copy unreadable at boot or last write failed */
     uint32_t    brownouts_6h;
     pp_skips_t  skipped;
     int64_t     exit_in_s;      /* seconds left in a running exit window; -1 = none */

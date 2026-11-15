@@ -38,11 +38,13 @@ register file.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> normal
+    [*] --> normal: no persisted state (first install)
+    [*] --> no_flash: persisted state unreadable (state_unreadable, persist_fault)
     normal --> no_flash: brownout boot (first of an episode)
     normal --> no_flash: fresh read with input, system_v below 3.30 V or battery_v in (0, 3.40 V)
     normal --> hold: brownout boot linked to the previous one (recovered within the episode)
     no_flash --> hold: brownout boot linked to the previous one
+    no_flash --> hold: brownout boot whose order is unknown (brownout_unordered)
     no_flash --> normal: 30 min continuous qualifying external power (not forced)
     hold --> normal: 30 min continuous qualifying external power (not forced)
     normal --> no_flash: force no_flash
@@ -69,6 +71,12 @@ stateDiagram-v2
   from `no_flash`, and also straight from `normal` when the unit had
   recovered and browns out again within the episode. A unit that went down
   twice in 6 h has shown that its power cannot carry even the reduced load.
+- `→ hold` also when the unit is already in `no_flash` and the new brownout
+  cannot be ordered against the previous one at all: no valid clock AND a
+  `boot_count` of 0 on either side (diag's counter is 0 when NVS is
+  unavailable). Reason `brownout_unordered`. Without it a battery unit with no
+  clock and no counter would brown out in `no_flash` forever. A `normal` unit
+  in the same situation enters `no_flash` (a new episode).
 - A brownout that is not linked leaves an already protected state as it is
   (the history entry is still recorded).
 
@@ -102,9 +110,13 @@ flowchart TD
     V -->|yes| T{"cur.utc − prev.utc under 6 h?"}
     T -->|yes| L["linked: escalate to hold"]
     T -->|no| N
-    V -->|"no (a clock invalid, or it went backwards)"| F{"prev.boot == cur.boot − 1?<br/>(the previous boot also ended in a brownout)"}
+    V -->|"no (a clock invalid, or it went backwards)"| K{"both boot_counts known (non-zero)?"}
+    K -->|yes| F{"prev.boot == cur.boot − 1?<br/>(the previous boot also ended in a brownout)"}
     F -->|yes| L
     F -->|no| N
+    K -->|no| U{"already in no_flash?"}
+    U -->|yes| H["unordered: escalate to hold (brownout_unordered)"]
+    U -->|no| N
 ```
 
 The clock is **valid** when it is past 2024 and its source is `sntp`, or `rtc`
@@ -117,9 +129,15 @@ deliberately narrow ("the previous boot also ended in a brownout"): it links
 the Uluru 2-3-4 sequence even with no clock at all, and never links two
 brownouts with a normal boot in between.
 
+When neither works (no valid clock and a `boot_count` of 0 on either side),
+the order is unknown and the unit assumes the worst: an already protected
+unit escalates to `hold` (`brownout_unordered`).
+
 `brownouts_6h` counts the history the same way: an entry with a valid UTC,
-read with a valid clock, counts when it is within 6 h; any other entry counts
-when it belongs to the run of consecutive brownout boots ending at this boot.
+read with a valid clock, counts when it is within 6 h; otherwise, with both
+boot counts known, it counts when it belongs to the run of consecutive
+brownout boots ending at this boot; an entry whose age cannot be established
+at all counts (conservative) until `clear` wipes the history.
 
 ### Persistence
 
@@ -127,9 +145,23 @@ NVS namespace `pwr_protect`, key `state`: one 113-byte blob (version, state,
 reason, forced flag, `since_utc`, the history, CRC32), explicit
 little-endian bytes rather than a struct dump. It is written **only** on a
 state transition, a recorded brownout (at most once per boot), `force` and
-`clear`. Never per charger read, never per heartbeat. A blob that fails its
-version, length, CRC or range checks is ignored (logged): the unit starts at
-`normal`, and this boot's own brownout still protects it. RTC_NOINIT alone was
+`clear`. Never per charger read, never per heartbeat.
+
+At boot the blob is either:
+
+- **absent** (`ESP_ERR_NVS_NOT_FOUND` for the namespace or the key: first
+  install, never protected) → `normal`;
+- **unreadable** (`nvs_open` or `nvs_get_blob` failed otherwise, or the blob
+  fails its version, length, CRC or range checks) → `no_flash`, reason
+  `state_unreadable`, not forced, `persist_fault: true`, logged. A corrupted
+  forced `hold` must not come back at full load after a watchdog reboot. It
+  exits like any automatic state: the 30-min window or `clear`. Nothing is
+  written at boot; the next persisting event (a transition, a brownout record,
+  `force`, `clear`) rewrites the blob and clears `persist_fault`.
+
+`persist_fault` is also raised when a write fails at run time (the new state
+holds in RAM but would not survive a reboot) and cleared by the next
+successful write. RTC_NOINIT alone was
 not an option: a brownout is a power-on-class reset, exactly the reset this
 state has to survive.
 
@@ -174,21 +206,28 @@ first action after a brownout is therefore already shed.
   the first shed the runner therefore resets the AMBITs exactly as a runner
   stop does (`sched_runner_cleanup_lights`, a no-op unless a persistent run
   was attempted). CHIP_EN power-down is out of scope.
-- **Updates.** The Ambyte OTA is refused in the worker before the `accepted`
-  report, any download, suspend or flash write: `ota_status` state
-  `dropped` (fleet_deploy's "retry candidate", not a failure) with detail
-  `power_protect`. A Jobs execution is a retryable miss: it stays QUEUED and
-  is looked at again in 10 min. `ambit_ota` and `ambit_flash` answer
-  `failed` / `power_protect` before their `accepted` report. Attach updates
-  are held with `waiting_power` and re-checked every 10 min. Boot sync skips
-  flashing without waiting for power evidence. `device_commands_flash_power_ok()`
-  is also false while protected, for any future caller.
+- **Updates are checked at every safe boundary**, not just at worker entry:
+  the charger refresh keeps running while a worker waits (500 ms ack flush,
+  up to 15 min of fleet spread, a download, earlier channels' writes) and can
+  enter `no_flash` meanwhile. A write that has started is never interrupted
+  (that is what bricks an AMBIT); the next one is not started.
+
+  | Path | Boundaries | Refusal |
+  |---|---|---|
+  | Ambyte OTA (MQTT, Jobs) | 1. worker entry, before `accepted`; 2. final admission after the ack flush and the spread, before the Jobs IN_PROGRESS report, the suspend and the download; 3. after download + image admission, before `esp_https_ota_finish()` selects the image (abort; the slot stays inactive) | `ota_status` `dropped`, detail `power_protect` (fleet_deploy's retry candidate); Jobs: retryable. Refused at 1 or 2 the execution stays QUEUED; at 3 it is already IN_PROGRESS and the same 10-min retry re-installs it |
+  | AMBIT OTA | worker entry; after the ack flush and the spread; after the download; before each channel's stream | `ambit_ota_status` `failed` / `power_protect` (per channel and terminal) |
+  | `ambit_flash` | worker entry; after the ack flush (before suspend and the release fetch); before each channel's ROM flash | `ambit_flash_status` `failed` / `power_protect`; channels not started report `skipped` / `power_protect`; the per-id retry cap is not consumed |
+  | Attach update | at the decision, and again after the quiesce, right before the write | held, `waiting_power`, re-checked every 10 min |
+  | Boot sync | before the loop (no 30-s wait for power evidence) and before each channel | channels left on their firmware |
+
+  `device_commands_flash_power_ok()` is also false while protected, for any
+  future caller.
 - Self-reboot paths are unchanged: a reboot does not clear the state.
 
 ## C. Reporting
 
 - **Heartbeat:** `health.power_protect = {state, reason, since_utc|null,
-  forced, brownouts_6h, skipped: {flash_runs, ambit_runs, ota}}` in every
+  forced, persist_fault, brownouts_6h, skipped: {flash_runs, ambit_runs, ota}}` in every
   `ambyte.telemetry/1`, rendered from RAM (no NVS access). `skipped` counts
   since this boot.
 - **pong:** `power_protect: normal | no_flash | hold`.
@@ -228,7 +267,7 @@ sequenceDiagram
 {"type":"power_protect","id":"r2","action":"force","state":"hold"}
 {"type":"power_protect","id":"r3","action":"clear"}
 // → {"type":"power_protect_result","id","ok","action","detail","state","reason",
-//    "forced","since_utc","brownouts_6h","exit_in_s","skipped":{…}}
+//    "forced","persist_fault","since_utc","brownouts_6h","exit_in_s","skipped":{…}}
 ```
 
 - `status` is read-only. `clear` returns to `normal` and wipes the brownout
@@ -259,13 +298,19 @@ run fails unless every reply confirms the requested state. In Actions →
   command codec: every transition and exit timer, window restarts on invalid,
   stale, `no_input`, input-absent, out-of-threshold reads and read gaps,
   `battery_v == 0`, forced states, `clear`, escalation with a valid and an
-  invalid clock (the Uluru 2-3-4 replay), the blob round trip and corruption,
+  invalid clock (the Uluru 2-3-4 replay), an unknown boot counter (0 twice,
+  0 then known, known then 0), the blob round trip and corruption, unreadable
+  state after non-brownout reboots and after open/read failures,
   NVS writes only on transitions, the command codec and its allocation
   failures.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.
 - `tests/ota_host/update_driver.c` runs the production OTA worker refusal on
-  the https and Jobs paths.
+  the https and Jobs paths, including protection that begins after the ack
+  flush and during the download.
+- `tests/power_protect_host/ambit_worker_driver.c` runs the production AMBIT
+  worker functions (extracted verbatim) with protection beginning during the
+  spread, the ack flush, the download / release fetch and mid-sweep.
 - **Real brownout behaviour is covered by host tests only.** A bench cannot
   brown out on demand; the bench run exercises `force` and `clear`.

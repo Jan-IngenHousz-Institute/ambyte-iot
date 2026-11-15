@@ -14,6 +14,20 @@ void pp_core_init(pp_core_t *c)
     c->p.reason = PP_REASON_NONE;
 }
 
+void pp_load_unreadable(pp_core_t *c, pp_clock_t clk)
+{
+    /* Review of PR #103: defaulting to normal let a unit in a (forced) hold
+     * whose blob was corrupted resume full load on its next non-brownout
+     * reboot. We cannot know what was stored, so assume the protected side
+     * that still lets the unit measure and recover by itself: no_flash, not
+     * forced (the 30-min window or clear ends it). */
+    pp_core_init(c);
+    c->p.state = PP_STATE_NO_FLASH;
+    c->p.reason = PP_REASON_STATE_UNREADABLE;
+    c->p.since_utc = clk.valid ? clk.utc : 0;
+    c->persist_fault = true;
+}
+
 /* ── names ─────────────────────────────────────────────────────────────── */
 
 const char *pp_state_name(pp_state_t s)
@@ -36,6 +50,8 @@ const char *pp_reason_name(pp_reason_t r)
     case PP_REASON_FORCED:          return "forced";
     case PP_REASON_POWER_RECOVERED: return "power_recovered";
     case PP_REASON_CLEARED:         return "cleared";
+    case PP_REASON_STATE_UNREADABLE: return "state_unreadable";
+    case PP_REASON_BROWNOUT_UNORDERED: return "brownout_unordered";
     case PP_REASON_COUNT:           break;
     }
     return "none";
@@ -174,17 +190,22 @@ static pp_event_t transition(pp_core_t *c, pp_state_t to, pp_reason_t why, pp_cl
     return ev;
 }
 
-bool pp_brownouts_linked(const pp_brownout_t *prev, const pp_brownout_t *cur)
+pp_link_t pp_brownout_link(const pp_brownout_t *prev, const pp_brownout_t *cur)
 {
-    if (prev == NULL || cur == NULL) return false;
+    if (prev == NULL || cur == NULL) return PP_LINK_NO;
     if (prev->utc != 0 && cur->utc != 0 && cur->utc >= prev->utc) {
         /* Both clocks valid and ordered: UTC alone decides, both ways. */
-        return cur->utc - prev->utc < PP_BROWNOUT_LINK_S;
+        return cur->utc - prev->utc < PP_BROWNOUT_LINK_S ? PP_LINK_YES : PP_LINK_NO;
     }
     /* Clock-invalid fallback (also a clock that went backwards between the
      * two, which proves one of them wrong): "the previous boot also ended in a
      * brownout". The Uluru 15 Nov sequence (boots 2, 3, 4) links either way. */
-    return prev->boot != 0 && cur->boot != 0 && cur->boot == prev->boot + 1u;
+    if (prev->boot != 0 && cur->boot != 0) {
+        return cur->boot == prev->boot + 1u ? PP_LINK_YES : PP_LINK_NO;
+    }
+    /* diag's boot counter can legitimately be 0 (NVS unavailable). With no
+     * clock either, nothing orders the two brownouts. */
+    return PP_LINK_UNORDERED;
 }
 
 /* ── inputs ────────────────────────────────────────────────────────────── */
@@ -201,7 +222,7 @@ pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock
     if (prev != NULL && boot != 0 && prev->boot == boot) {
         return no_event(c);   /* this boot's brownout is already recorded */
     }
-    const bool linked = pp_brownouts_linked(prev, &cur);
+    const pp_link_t link = pp_brownout_link(prev, &cur);
 
     if (c->p.hist_n == PP_HIST_MAX) {
         memmove(&c->p.hist[0], &c->p.hist[1], (PP_HIST_MAX - 1) * sizeof c->p.hist[0]);
@@ -211,12 +232,16 @@ pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock
 
     const pp_state_t from = (pp_state_t)c->p.state;
     pp_event_t ev;
-    if (linked && from != PP_STATE_HOLD) {
+    if (link == PP_LINK_YES && from != PP_STATE_HOLD) {
         /* A second brownout in one episode: escalate, from no_flash and also
          * straight from normal (a unit that had recovered and browns out again
          * within 6 h has shown its power cannot carry the reduced load either).
          * A forced no_flash escalates too; the forced flag stays. */
         ev = transition(c, PP_STATE_HOLD, PP_REASON_REPEAT_BROWNOUT, clk);
+    } else if (link == PP_LINK_UNORDERED && from == PP_STATE_NO_FLASH) {
+        /* Already protected after an earlier brownout, and nothing can tell
+         * whether this one belongs to the same episode: assume it does. */
+        ev = transition(c, PP_STATE_HOLD, PP_REASON_BROWNOUT_UNORDERED, clk);
     } else if (from == PP_STATE_NORMAL) {
         ev = transition(c, PP_STATE_NO_FLASH, PP_REASON_BROWNOUT, clk);
     } else {
@@ -307,10 +332,16 @@ uint32_t pp_brownouts_6h(const pp_core_t *c, pp_clock_t clk, uint32_t cur_boot)
     uint32_t n = 0;
     for (unsigned i = 0; i < c->p.hist_n; i++) {
         const pp_brownout_t *e = &c->p.hist[i];
-        /* Same precedence as pp_brownouts_linked: UTC decides whenever both
-         * sides have a valid, ordered one; the boot chain is the fallback. */
-        const bool by_utc = clk.valid && e->utc != 0 && clk.utc >= e->utc;
-        if (by_utc ? clk.utc - e->utc < PP_BROWNOUT_LINK_S : chain[i]) n++;
+        /* Same precedence as pp_brownout_link: UTC decides whenever both sides
+         * have a valid, ordered one; the boot chain is the fallback; an entry
+         * neither can date counts (conservative). */
+        if (clk.valid && e->utc != 0 && clk.utc >= e->utc) {
+            if (clk.utc - e->utc < PP_BROWNOUT_LINK_S) n++;
+        } else if (e->boot != 0 && cur_boot != 0) {
+            if (chain[i]) n++;
+        } else {
+            n++;
+        }
     }
     return n;
 }
@@ -322,8 +353,8 @@ int64_t pp_window_remaining_ms(const pp_core_t *c, int64_t mono_ms)
     return left > 0 ? left : 0;
 }
 
-int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, uint32_t brownouts_6h,
-                   const pp_skips_t *skips)
+int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, bool persist_fault,
+                   uint32_t brownouts_6h, const pp_skips_t *skips)
 {
     if (buf == NULL || cap == 0 || p == NULL) return -1;
     const pp_skips_t z = {0, 0, 0};
@@ -333,9 +364,10 @@ int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, uint32_t browno
     /* Every string is a fixed enum name: no escaping needed. */
     const int n = snprintf(buf, cap,
         "{\"state\":\"%s\",\"reason\":\"%s\",\"since_utc\":%s,\"forced\":%s,"
-        "\"brownouts_6h\":%lu,\"skipped\":{\"flash_runs\":%lu,\"ambit_runs\":%lu,\"ota\":%lu}}",
+        "\"persist_fault\":%s,\"brownouts_6h\":%lu,"
+        "\"skipped\":{\"flash_runs\":%lu,\"ambit_runs\":%lu,\"ota\":%lu}}",
         pp_state_name((pp_state_t)p->state), pp_reason_name((pp_reason_t)p->reason), since,
-        p->forced ? "true" : "false", (unsigned long)brownouts_6h,
+        p->forced ? "true" : "false", persist_fault ? "true" : "false", (unsigned long)brownouts_6h,
         (unsigned long)skips->flash_runs, (unsigned long)skips->ambit_runs,
         (unsigned long)skips->ota);
     if (n < 0 || (size_t)n >= cap) {

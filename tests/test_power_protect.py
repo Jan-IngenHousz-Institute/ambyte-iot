@@ -96,19 +96,25 @@ class PowerProtectHostTest(unittest.TestCase):
     def test_heartbeat_object(self):
         out = self.run_case("render_json")
         obj = json.loads(re.search(r"^JSON (.*)$", out, re.M).group(1))
-        self.assertEqual(set(obj), {"state", "reason", "since_utc", "forced", "brownouts_6h", "skipped"})
+        self.assertEqual(set(obj), {"state", "reason", "since_utc", "forced", "persist_fault", "brownouts_6h",
+                                    "skipped"})
+        self.assertIs(obj["persist_fault"], False)
         self.assertEqual(obj["skipped"], {"flash_runs": 2, "ambit_runs": 1, "ota": 1})
         worst = re.search(r"^WORST (\d+) (.*)$", out, re.M)
         self.assertLess(int(worst.group(1)), 256)
-        json.loads(worst.group(2))
+        self.assertEqual(json.loads(worst.group(2))["reason"], "brownout_unordered")   # the longest name
+        unreadable = json.loads(re.search(r"^JSON_UNREADABLE (.*)$", self.run_case("unreadable_state_is_protected"),
+                                          re.M).group(1))
+        self.assertEqual((unreadable["state"], unreadable["reason"], unreadable["forced"], unreadable["persist_fault"]),
+                         ("no_flash", "state_unreadable", False, True))
 
     def test_command_flow_replies(self):
         status, forced, cleared, status2 = self.replies("cmd_flow")
         self.assertEqual(status["type"], "power_protect_result")
         self.assertEqual((status["id"], status["ok"], status["action"], status["detail"]),
                          ("s1", True, "status", "ok"))
-        self.assertEqual((status["state"], status["reason"], status["forced"], status["brownouts_6h"]),
-                         ("no_flash", "brownout", False, 1))
+        self.assertEqual((status["state"], status["reason"], status["forced"], status["brownouts_6h"],
+                          status["persist_fault"]), ("no_flash", "brownout", False, 1, False))
         self.assertIsInstance(status["since_utc"], (int, float))
         self.assertIsNone(status["exit_in_s"])
         self.assertEqual(status["skipped"], {"flash_runs": 0, "ambit_runs": 0, "ota": 0})
@@ -136,7 +142,8 @@ class PowerProtectHostTest(unittest.TestCase):
 
     def test_persist_failure_is_reported(self):
         (r,) = self.replies("cmd_persist_failed")
-        self.assertEqual((r["ok"], r["detail"], r["state"], r["forced"]), (False, "persist_failed", "no_flash", True))
+        self.assertEqual((r["ok"], r["detail"], r["state"], r["forced"], r["persist_fault"]),
+                         (False, "persist_failed", "no_flash", True, True))
 
     def test_allocation_failures_never_report_partial_success(self):
         replies = self.replies("cmd_no_mem")
@@ -150,6 +157,70 @@ class PowerProtectHostTest(unittest.TestCase):
                 self.assertEqual(r["detail"], "ok")
                 self.assertIn("skipped", r)
                 self.assertEqual(set(r["skipped"]), {"flash_runs", "ambit_runs", "ota"})
+                self.assertIn("persist_fault", r)
+
+
+class AmbitWorkerProtectionTest(unittest.TestCase):
+    """Review of PR #103, finding 1, AMBIT side: the PRODUCTION worker functions
+    (extracted verbatim) re-check protection at every safe boundary: after the
+    ack flush / fleet spread, after the download or release fetch, and before
+    each channel's write. A write that has started finishes; no later one
+    starts. The Ambyte side runs in tests/test_ota_admission.py."""
+
+    SCENARIOS = ("ota_protected_at_entry", "ota_flip_during_spread", "ota_flip_during_download",
+                 "ota_flip_mid_sweep", "flash_flip_during_ack", "flash_flip_during_fetch",
+                 "flash_flip_mid_sweep", "ota_unprotected", "flash_unprotected")
+
+    @classmethod
+    def setUpClass(cls):
+        from test_schedule_light_cleanup import function
+        ota = (ROOT / "components/ambit_ota/ambit_ota.c").read_text()
+        cls.tmp = tempfile.TemporaryDirectory(prefix="ambit-worker-")
+        tmp = Path(cls.tmp.name)
+        (tmp / "ambit-worker-production.inc").write_text("\n".join(
+            function(ota, name) for name in ("power_blocks_write", "ambit_do_ota", "ambit_do_flash",
+                                             "ambit_ota_run")))
+        cc = os.environ.get("CC") or shutil.which("clang") or "cc"
+        cls.bin = tmp / "ambit_worker"
+        cmd = [cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+               "-Wno-unused-function", f"-I{tmp}", str(HOST / "ambit_worker_driver.c"), "-o", str(cls.bin)]
+        if "clang" in Path(cc).name:
+            cmd[1:1] = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(r.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def reports(self, name):
+        r = subprocess.run([str(self.bin), name], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"PASS {name}", r.stdout)
+        return [l.split()[1:] for l in r.stdout.splitlines() if l.startswith("REPORT ")]
+
+    def test_every_scenario(self):
+        for name in self.SCENARIOS:
+            with self.subTest(scenario=name):
+                self.reports(name)
+
+    def test_refusals_are_terminal_power_protect(self):
+        for name, kind in (("ota_protected_at_entry", "ambit_ota_status"), ("ota_flip_during_spread", "ambit_ota_status"),
+                           ("ota_flip_during_download", "ambit_ota_status"), ("ota_flip_mid_sweep", "ambit_ota_status"),
+                           ("flash_flip_during_ack", "ambit_flash_status"), ("flash_flip_during_fetch", "ambit_flash_status"),
+                           ("flash_flip_mid_sweep", "ambit_flash_status")):
+            with self.subTest(scenario=name):
+                last = self.reports(name)[-1]
+                self.assertEqual(last[:2], [kind, "failed"])
+                self.assertEqual(last[-1], "detail=power_protect")
+        # Entry refusal comes before any ack; later ones after it.
+        self.assertEqual(len(self.reports("ota_protected_at_entry")), 1)
+        self.assertEqual(self.reports("ota_flip_during_spread")[0][:2], ["ambit_ota_status", "accepted"])
+        sweep = self.reports("flash_flip_mid_sweep")
+        self.assertIn(["ambit_flash_status", "flash_ok", "ch=0", "id=job-1", "detail=-"], sweep)
+        for ch in (1, 2, 3):
+            self.assertIn(["ambit_flash_status", "skipped", f"ch={ch}", "id=job-1", "detail=power_protect"], sweep)
 
 
 class PowerProtectWiringContractTest(unittest.TestCase):
@@ -199,21 +270,36 @@ class PowerProtectWiringContractTest(unittest.TestCase):
         self.assertNotIn("event_log", shed)
         self.assertNotIn("store_event", shed)
 
-    def test_updates_refused_before_any_download(self):
+    def test_updates_refused_at_every_boundary(self):
+        # Review of PR #103: one entry check is not enough; the worker re-checks
+        # after the ack flush / fleet spread and before selecting the image.
         ota = self.read("components/ota_update/ota_update.c")
         fn = ota[ota.index("static void ota_do_update(const ota_request_t *r)"):]
-        self.assertLess(fn.index("if (power_protect_blocks_flash()) {"), fn.index('ota_report("accepted"'))
-        self.assertIn('ota_report("dropped", r->id, "power_protect");', fn)
-        self.assertIn('r->finished(r->id, true, "power_protect", r->cb_ctx);', fn)
+        fn = fn[:fn.index("\n}\n")]
+        entry = fn.index("if (refuse_for_power(r)) return;")
+        accepted = fn.index('ota_report("accepted"')
+        spread = fn.index("if (r->fleet_spread) wait_for_fleet_slot();")
+        final = fn.index("if (refuse_for_power(r)) return;   /* 2. final admission */")
+        started = fn.index("r->started(r->id, r->cb_ctx);")
+        suspend = fn.index("s_cfg.workload_suspend();")
+        self.assertTrue(entry < accepted < spread < final < started < suspend)
+        self.assertLess(fn.index("power_late = true;"), fn.index("err = esp_https_ota_finish(h);"))
+        refuse = ota[ota.index("static bool refuse_for_power(const ota_request_t *r)"):]
+        refuse = refuse[:refuse.index("\n}\n")]
+        self.assertIn('ota_report("dropped", r->id, "power_protect");', refuse)
+        self.assertIn('r->finished(r->id, true, "power_protect", r->cb_ctx);', refuse)
         amb = self.read("components/ambit_ota/ambit_ota.c")
         run = amb[amb.index("static void ambit_ota_run(void *arg)"):]
-        self.assertLess(run.index("power_protect_blocks_flash()"), run.index("case AMBIT_OP_OTA"
-                                                                             if "case AMBIT_OP_OTA" in run
-                                                                             else "default:"))
-        self.assertIn('"power_protect");', run)
+        self.assertLess(run.index("power_blocks_write("), run.index("switch (r->op)"))
+        attach = amb[amb.index("static void ambit_do_attach(void)"):]
+        attach = attach[:attach.index("\n}\n")]
+        self.assertLess(attach.rindex("if (power_protect_blocks_flash()) {"),
+                        attach.index("esp_err_t e = ambit_flash_attach_flash(ch, &tgt);"))
         flash = self.read("components/ambit_flash/ambit_flash.c")
         self.assertLess(flash.index("if (power_protect_blocks_flash()) {"),
                         flash.index("if (!device_commands_flash_power_ok()) {"))
+        loop = flash[flash.index("int flashed = 0;"):]
+        self.assertLess(loop.index("if (power_protect_blocks_flash()) {"), loop.index("boot_fail_bump(ch, ver, fails[ch]);"))
 
     def test_command_and_pong_are_wired(self):
         src = self.read("components/command_router/command_router.c")

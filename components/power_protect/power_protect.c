@@ -84,8 +84,13 @@ static esp_err_t apply(const pp_event_t *ev)
     const esp_err_t err = persist(&s_core.p);
     if (err != ESP_OK) {
         /* RAM keeps the new state for this boot; only the next boot would
-         * miss it. Warn (not error): the transition line already went out. */
+         * miss it. Warn (not error): the transition line already went out.
+         * health.power_protect.persist_fault says so until a write succeeds. */
         ESP_LOGW(TAG, "state not persisted: %s", esp_err_to_name(err));
+        s_core.persist_fault = true;
+    } else if (s_core.persist_fault) {
+        ESP_LOGW(TAG, "persisted state repaired");
+        s_core.persist_fault = false;
     }
     return err;
 }
@@ -106,23 +111,34 @@ void power_protect_boot(void)
     s_mtx = xSemaphoreCreateMutexStatic(&s_mtx_storage);
     pp_core_init(&s_core);
 
+    /* ABSENT (first install, or never protected) = normal. UNREADABLE (a
+     * failed open or read, or a blob failing version/length/CRC/range checks)
+     * = no_flash + persist_fault (pp_load_unreadable): defaulting to normal let
+     * a corrupted forced hold resume full load on a watchdog reboot (review of
+     * PR #103). Nothing is written here; the next persisting event repairs it. */
     nvs_handle_t h;
-    if (nvs_open(PP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+    esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
+    const char *unreadable = NULL;
+    if (err == ESP_OK) {
         uint8_t blob[PP_BLOB_LEN];
         size_t len = sizeof blob;
-        const esp_err_t err = nvs_get_blob(h, PP_NVS_KEY, blob, &len);
+        err = nvs_get_blob(h, PP_NVS_KEY, blob, &len);
         nvs_close(h);
         if (err == ESP_OK && !pp_decode(&s_core.p, blob, len)) {
-            /* Unreadable state: start at normal rather than guess; this boot's
-             * own brownout (if any) still protects it below. */
-            ESP_LOGW(TAG, "persisted state unreadable (%u B) - starting at normal", (unsigned)len);
+            unreadable = "corrupt";
         } else if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "persisted state read failed: %s - starting at normal", esp_err_to_name(err));
+            unreadable = esp_err_to_name(err);
         }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        unreadable = esp_err_to_name(err);
+    }
+    const pp_clock_t clk = clock_now();
+    if (unreadable != NULL) {
+        ESP_LOGW(TAG, "persisted state unreadable (%s) - starting at no_flash", unreadable);
+        pp_load_unreadable(&s_core, clk);
     }
 
     const bool brownout = esp_reset_reason() == ESP_RST_BROWNOUT;
-    const pp_clock_t clk = clock_now();
     lock();
     const pp_event_t ev = pp_on_boot(&s_core, brownout, diag_boot_count(), clk);
     (void)apply(&ev);
@@ -190,6 +206,7 @@ void power_protect_get_status(power_protect_status_t *out)
     out->reason = (pp_reason_t)s_core.p.reason;
     out->forced = s_core.p.forced;
     out->since_utc = s_core.p.since_utc;
+    out->persist_fault = s_core.persist_fault;
     out->brownouts_6h = pp_brownouts_6h(&s_core, clock_now(), diag_boot_count());
     const int64_t left = pp_window_remaining_ms(&s_core, mono_ms());
     out->exit_in_s = left < 0 ? -1 : left / 1000;
@@ -202,12 +219,13 @@ int power_protect_render_json(char *buf, size_t cap)
     if (!lock()) {
         pp_persist_t normal;
         memset(&normal, 0, sizeof normal);
-        return pp_render_json(buf, cap, &normal, 0, &skips);
+        return pp_render_json(buf, cap, &normal, false, 0, &skips);
     }
     const pp_persist_t p = s_core.p;
+    const bool fault = s_core.persist_fault;
     const uint32_t recent = pp_brownouts_6h(&s_core, clock_now(), diag_boot_count());
     unlock();
-    return pp_render_json(buf, cap, &p, recent, &skips);
+    return pp_render_json(buf, cap, &p, fault, recent, &skips);
 }
 
 esp_err_t power_protect_force(pp_state_t state)

@@ -58,6 +58,17 @@ class AdmissionTest(unittest.TestCase):
         for path in ("https","jobs"):
             with self.subTest(path=path):self.assertEqual(self.run_case(path,"power_protect",3),"QQQ")
 
+    def test_power_protect_rechecked_after_the_wait_and_before_selection(self):
+        # Review of PR #103: protection that begins while the worker waits (ack
+        # flush, fleet spread) or downloads must still stop the image. Before the
+        # fix the after-ack case ran to PCSRMFLX (selected + rebooted).
+        for path in ("https","jobs"):
+            with self.subTest(path=path,when="after_ack"):
+                self.assertEqual(self.run_case(path,"pp_after_ack"),"Q")
+            with self.subTest(path=path,when="during_download"):
+                self.assertEqual(self.run_case(path,"pp_during_download"),
+                                 ("VPCH" if path=="jobs" else "PC")+"SRMAWNQ")
+
     def test_twenty_refusal_cycles_release_allocations_and_admission(self):
         for path in ("https","jobs"):
             with self.subTest(path=path):self.assertEqual(self.run_case(path,"incompatible",20).count("D"),20)

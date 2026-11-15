@@ -991,6 +991,14 @@ int ambit_flash_boot_sync(void)
         if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
             continue;
         }
+        /* Brownout protection can begin while earlier channels flash (~30-60 s
+         * each): re-check before starting the next one; a started flash ends. */
+        if (power_protect_blocks_flash()) {
+            ESP_LOGW(TAG, "boot sync: power protection is %s - not flashing ch%u or later",
+                     pp_state_name(power_protect_state()), ch);
+            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+            break;
+        }
         /* (b) Count the attempt in NVS BEFORE touching the chip. ambit_flash_image
          * erases the AMBIT app region before writing, so a host reset mid-flash
          * (brownout/WDT/panic) both bricks the unit AND never reaches the post-flash

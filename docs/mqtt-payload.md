@@ -565,7 +565,7 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
     "crash": { "present": false },
     "power_protect": {
       "state": "normal", "reason": "none", "since_utc": null, "forced": false,
-      "brownouts_6h": 0, "skipped": { "flash_runs": 0, "ambit_runs": 0, "ota": 0 }
+      "persist_fault": false, "brownouts_6h": 0, "skipped": { "flash_runs": 0, "ambit_runs": 0, "ota": 0 }
     },
     "clock": { "source": "rtc", "suspect": false },
     "software": {
@@ -762,17 +762,18 @@ from RAM on every heartbeat (never an NVS access).
 ```jsonc
 "power_protect": {
   "state": "no_flash", "reason": "brownout", "since_utc": 1763152200, "forced": false,
-  "brownouts_6h": 1, "skipped": { "flash_runs": 3, "ambit_runs": 0, "ota": 1 }
+  "persist_fault": false, "brownouts_6h": 1, "skipped": { "flash_runs": 3, "ambit_runs": 0, "ota": 1 }
 }
 ```
 
 | leaf | type | meaning |
 |---|---|---|
 | `state` | string enum | `normal`, `no_flash` (actinic-bearing AMBIT work, AMBIT flashing and every OTA shed), `hold` (every `ambit/` action shed as well). |
-| `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or `battery_v` in (0, 3.40 V)), `forced`, `power_recovered` (30 min of qualifying external power), `cleared`. Unknown future values are preserved. |
+| `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or `battery_v` in (0, 3.40 V)), `forced`, `power_recovered` (30 min of qualifying external power), `cleared`, `state_unreadable` (the persisted state existed but could not be read: started protected), `brownout_unordered` (a further brownout that neither a valid clock nor the boot counter could order: escalated to `hold`). Unknown future values are preserved. |
 | `since_utc` | integer or null | UTC seconds when `state` was entered; `null` when the clock was not valid then (`clock.source` `hwm`, or a suspect RTC). |
 | `forced` | boolean | An operator `force`; never auto-exits, only `clear` ends it. |
-| `brownouts_6h` | integer | Recorded brownouts in the last 6 h (by UTC when both clocks are valid, else the run of consecutive brownout boots ending at this boot). |
+| `persist_fault` | boolean | The stored copy is not trustworthy: it was unreadable at boot (then `reason: state_unreadable`), or the last write failed. Cleared by the next successful write. |
+| `brownouts_6h` | integer | Recorded brownouts in the last 6 h: by UTC when both clocks are valid; else, with boot counts known, the run of consecutive brownout boots ending at this boot; an entry neither can date counts (conservative) until `clear`. |
 | `skipped.flash_runs` | integer | Schedule runs skipped since this boot because they carried actinic/flash work. |
 | `skipped.ambit_runs` | integer | Schedule runs skipped since this boot by `hold` only (no actinic content). |
 | `skipped.ota` | integer | Refused Ambyte OTA, AMBIT OTA, `ambit_flash` and AMBIT boot-sync flashing since this boot. |
@@ -1141,7 +1142,7 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
 {"type":"power_protect","id":"r3","action":"clear"}
 // reply
 {"type":"power_protect_result","id":"r2","ok":true,"action":"force","detail":"applied",
- "state":"hold","reason":"forced","forced":true,"since_utc":1763152200,"brownouts_6h":0,
+ "state":"hold","reason":"forced","forced":true,"persist_fault":false,"since_utc":1763152200,"brownouts_6h":0,
  "exit_in_s":null,"skipped":{"flash_runs":0,"ambit_runs":0,"ota":0}}
 ```
 
@@ -1165,9 +1166,9 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
 
 | report | state | detail |
 |---|---|---|
-| `ota_status` (MQTT `ota_update`, Jobs) | `dropped` | `power_protect` — before `accepted`, any download or flash write; a Jobs execution stays QUEUED and is retried in 10 min |
-| `ambit_ota_status` | `failed` | `power_protect` |
-| `ambit_flash_status` | `failed` | `power_protect` |
+| `ota_status` (MQTT `ota_update`, Jobs) | `dropped` | `power_protect`. Checked at worker entry (before `accepted`), at final admission after the ack flush and fleet spread (before the suspend and download: a Jobs execution stays QUEUED, retried in 10 min), and before the image is selected (download discarded; the IN_PROGRESS execution is retried the same way). May therefore follow an `accepted`. |
+| `ambit_ota_status` | `failed` | `power_protect`, terminal and per channel not started (checked at entry, after the ack flush / spread, after the download, before each channel) |
+| `ambit_flash_status` | `failed` | `power_protect` (entry, after the ack flush, before each channel); channels not started report `skipped` / `power_protect`; a started channel always finishes |
 | `ambit_attach_status` (attach-time update) | `waiting_power` | held, re-checked every 10 min |
 
 ## OTA admission failure details

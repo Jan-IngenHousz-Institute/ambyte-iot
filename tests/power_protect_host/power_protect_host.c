@@ -65,10 +65,11 @@ static uint8_t g_blob[256];
 static size_t  g_blob_len;       /* 0 = not found */
 static int     g_writes;
 static bool    g_fail_writes;
+static esp_err_t g_open_err = ESP_OK, g_get_err = ESP_OK;   /* injected read-side failures */
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
 {
     CHECK(strcmp(ns, "pwr_protect") == 0, "namespace %s", ns);
-    (void)mode;
+    if (mode == NVS_READONLY && g_open_err != ESP_OK) return g_open_err;
     *out = 7;
     return ESP_OK;
 }
@@ -76,6 +77,7 @@ esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out, size_t *len)
 {
     (void)h;
     CHECK(strcmp(key, "state") == 0, "key %s", key);
+    if (g_get_err != ESP_OK) return g_get_err;
     if (g_blob_len == 0) return ESP_ERR_NVS_NOT_FOUND;
     if (*len < g_blob_len) return ESP_ERR_INVALID_SIZE;
     memcpy(out, g_blob, g_blob_len);
@@ -475,11 +477,125 @@ static void persistence_roundtrip(void)
     reboot(ESP_RST_POWERON, 4, true);
     CHECK(memcmp(&before.hist, &s_core.p.hist, sizeof before.hist) == 0 && s_core.p.state == before.state &&
           s_core.p.since_utc == before.since_utc && s_core.p.reason == before.reason, "glue round trip");
-    /* A corrupted blob starts at normal, logged; this boot's brownout still counts. */
+    /* A corrupted blob starts at no_flash (state_unreadable), logged; this
+     * boot's brownout is still recorded, and that write repairs the blob. */
     g_blob[5] ^= 1;
-    const int warn = g_wlines;
+    const int warn = g_wlines, w = g_writes;
     reboot(ESP_RST_BROWNOUT, 5, true);
-    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.hist_n == 1 && g_wlines > warn, "corrupt -> fresh start");
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE &&
+          s_core.p.hist_n == 1 && g_wlines > warn, "corrupt -> no_flash");
+    CHECK(g_writes == w + 1 && !s_core.persist_fault, "the brownout record repaired the blob");
+}
+
+/* Finding 2 of the PR #103 review: an unreadable persisted state must not
+ * resume full load on a NON-brownout reboot. */
+static void unreadable_state_is_protected(void)
+{
+    /* forced hold, one stored byte flipped, a watchdog (sw) reboot */
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "force");
+    g_blob[20] ^= 0x10;
+    const int w = g_writes;
+    reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE && !s_core.p.forced,
+          "state %d reason %d", st(), s_core.p.reason);
+    CHECK(s_core.persist_fault && g_writes == w, "flagged, nothing written at boot");
+    char json[PP_JSON_CAP];
+    CHECK(power_protect_render_json(json, sizeof json) > 0 && strstr(json, "\"persist_fault\":true") &&
+          strstr(json, "\"reason\":\"state_unreadable\""), "%s", json);
+    printf("JSON_UNREADABLE %s\n", json);
+    power_protect_status_t s;
+    power_protect_get_status(&s);
+    CHECK(s.persist_fault && s.state == PP_STATE_NO_FLASH, "status");
+    /* Still unreadable on the next boot (not repaired yet): still protected. */
+    reboot(ESP_RST_INT_WDT, 3, true);
+    CHECK(st() == PP_STATE_NO_FLASH && g_writes == w, "no write until a transition");
+    /* Exits through the normal 30-min window; that transition repairs NVS. */
+    good_reads(READS_30MIN + 2, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL && g_writes == w + 1 && !s_core.persist_fault, "recovered + repaired");
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "repaired blob reads back");
+    /* ... or through clear. */
+    g_blob[30] ^= 1;
+    reboot(ESP_RST_SW, 5, true);
+    CHECK(st() == PP_STATE_NO_FLASH && power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL &&
+          !s_core.persist_fault, "clear repairs");
+    /* A stored blob of the wrong size is unreadable too. */
+    g_blob_len = PP_BLOB_LEN - 1;
+    reboot(ESP_RST_SW, 6, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.persist_fault, "short blob");
+}
+
+static void read_failures_are_protected(void)
+{
+    /* A previously protected unit whose NVS read fails, open or get. */
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD, "hold stored");
+    g_get_err = ESP_FAIL;
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE && s_core.persist_fault,
+          "get_blob failure");
+    g_get_err = ESP_OK;
+    g_open_err = ESP_FAIL;
+    reboot(ESP_RST_POWERON, 5, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.persist_fault, "nvs_open failure");
+    /* Namespace missing (first install) is ABSENT, not unreadable. */
+    g_open_err = ESP_ERR_NVS_NOT_FOUND;
+    reboot(ESP_RST_POWERON, 6, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "absent namespace");
+    g_open_err = ESP_OK;
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 7, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "absent key");
+    /* A failed write raises the flag; the next good one clears it. */
+    g_fail_writes = true;
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) != ESP_OK && s_core.persist_fault, "write failure flagged");
+    g_fail_writes = false;
+    CHECK(power_protect_clear() == ESP_OK && !s_core.persist_fault, "next write clears it");
+}
+
+/* Finding 3 of the PR #103 review: no clock AND no boot counter. */
+static void unknown_boot_counter(void)
+{
+    reboot(ESP_RST_BROWNOUT, 0, false);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_BROWNOUT, "first");
+    reboot(ESP_RST_BROWNOUT, 0, false);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_BROWNOUT_UNORDERED && s_core.p.hist_n == 2,
+          "state %d hist %u", st(), (unsigned)s_core.p.hist_n);
+    CHECK(strcmp(g_last_e, "power_protect: no_flash -> hold reason=brownout_unordered") == 0, "%s", g_last_e);
+    power_protect_status_t s;
+    power_protect_get_status(&s);
+    CHECK(s.brownouts_6h == 2, "unknown-age entries count: %u", (unsigned)s.brownouts_6h);
+    /* Counter recovered (0 then nonzero), and lost (nonzero then 0). */
+    for (int k = 0; k < 2; k++) {
+        g_blob_len = 0;
+        reboot(ESP_RST_BROWNOUT, k == 0 ? 0 : 7, false);
+        CHECK(st() == PP_STATE_NO_FLASH, "k=%d first", k);
+        reboot(ESP_RST_BROWNOUT, k == 0 ? 5 : 0, false);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_BROWNOUT_UNORDERED, "k=%d escalates", k);
+        power_protect_get_status(&s);
+        CHECK(s.brownouts_6h == 2, "k=%d count %u", k, (unsigned)s.brownouts_6h);
+    }
+    /* A valid clock still orders brownouts with a counter of 0: UTC decides. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 0, true);
+    advance_s(7 * 3600);
+    reboot(ESP_RST_BROWNOUT, 0, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "7 h apart by UTC: not linked");
+    advance_s(3600);
+    reboot(ESP_RST_BROWNOUT, 0, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_REPEAT_BROWNOUT, "1 h apart: linked");
+    /* Unordered only escalates a PROTECTED unit: after a recovery it is a
+     * fresh episode (no_flash), and no periodic write ever happens. */
+    good_reads(READS_30MIN + 2, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL, "recovered");
+    g_src = "hwm";
+    const int w = g_writes;
+    good_reads(500, 4100, 3900);
+    CHECK(g_writes == w, "no periodic writes");
+    reboot(ESP_RST_BROWNOUT, 0, false);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_BROWNOUT, "normal -> no_flash only");
 }
 
 static void no_writes_on_reads_or_reports(void)
@@ -511,21 +627,31 @@ static void render_json(void)
     CHECK(power_protect_render_json(json, sizeof json) > 0, "render");
     char want[PP_JSON_CAP];
     snprintf(want, sizeof want, "{\"state\":\"no_flash\",\"reason\":\"brownout\",\"since_utc\":%lld,"
-             "\"forced\":false,\"brownouts_6h\":1,\"skipped\":{\"flash_runs\":2,\"ambit_runs\":1,\"ota\":1}}",
+             "\"forced\":false,\"persist_fault\":false,\"brownouts_6h\":1,"
+             "\"skipped\":{\"flash_runs\":2,\"ambit_runs\":1,\"ota\":1}}",
              (long long)g_utc);
     CHECK(strcmp(json, want) == 0, "%s", json);
     printf("JSON %s\n", json);
     /* Unknown since -> null; worst case fits PP_JSON_CAP; too small -> -1, empty. */
     pp_persist_t p;
     memset(&p, 0, sizeof p);
-    CHECK(pp_render_json(json, sizeof json, &p, 0, NULL) > 0 && strstr(json, "\"since_utc\":null"), "%s", json);
-    p.state = PP_STATE_NO_FLASH; p.reason = PP_REASON_REPEAT_BROWNOUT; p.forced = true;
+    CHECK(pp_render_json(json, sizeof json, &p, false, 0, NULL) > 0 && strstr(json, "\"since_utc\":null"), "%s", json);
+    /* Worst case: the longest state and reason names, every number at its widest. */
+    size_t longest = 0;
+    pp_reason_t widest = PP_REASON_NONE;
+    for (int r = 0; r < PP_REASON_COUNT; r++) {
+        if (strlen(pp_reason_name((pp_reason_t)r)) > longest) {
+            longest = strlen(pp_reason_name((pp_reason_t)r));
+            widest = (pp_reason_t)r;
+        }
+    }
+    p.state = PP_STATE_NO_FLASH; p.reason = (uint8_t)widest; p.forced = true;
     p.since_utc = INT64_MIN;
     const pp_skips_t max = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
-    const int n = pp_render_json(json, sizeof json, &p, UINT32_MAX, &max);
+    const int n = pp_render_json(json, sizeof json, &p, true, UINT32_MAX, &max);
     CHECK(n > 0 && (size_t)n < PP_JSON_CAP, "worst case %d", n);
     printf("WORST %d %s\n", n, json);
-    CHECK(pp_render_json(json, 40, &p, 0, NULL) == -1 && json[0] == '\0', "no partial object");
+    CHECK(pp_render_json(json, 40, &p, false, 0, NULL) == -1 && json[0] == '\0', "no partial object");
 }
 
 /* ── scenarios: the MQTT command codec, wired to the real glue ─────────── */
@@ -687,6 +813,9 @@ static const scenario_t k_scenarios[] = {
     {"persistence_roundtrip", persistence_roundtrip},
     {"no_writes_on_reads_or_reports", no_writes_on_reads_or_reports},
     {"render_json", render_json},
+    {"unreadable_state_is_protected", unreadable_state_is_protected},
+    {"read_failures_are_protected", read_failures_are_protected},
+    {"unknown_boot_counter", unknown_boot_counter},
     {"cmd_flow", cmd_flow},
     {"cmd_refusals", cmd_refusals},
     {"cmd_persist_failed", cmd_persist_failed},

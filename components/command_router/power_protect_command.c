@@ -102,6 +102,7 @@ static char *render(const request_t *r, bool ok, const char *detail,
         cJSON_AddStringToObject(j, "state", pp_state_name(st->state)) &&
         cJSON_AddStringToObject(j, "reason", pp_reason_name(st->reason)) &&
         cJSON_AddBoolToObject(j, "forced", st->forced) &&
+        cJSON_AddBoolToObject(j, "persist_fault", st->persist_fault) &&
         (st->since_utc != 0 ? cJSON_AddNumberToObject(j, "since_utc", (double)st->since_utc) != NULL
                             : cJSON_AddNullToObject(j, "since_utc") != NULL) &&
         cJSON_AddNumberToObject(j, "brownouts_6h", st->brownouts_6h) &&

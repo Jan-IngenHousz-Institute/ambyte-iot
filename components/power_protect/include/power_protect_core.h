@@ -39,7 +39,12 @@
  *     one is 0 ≤ Δ < 6 h after the previous → linked; Δ ≥ 6 h → not linked;
  *   - otherwise (either clock invalid, or the clock went backwards) fall back
  *     to "the previous boot also ended in a brownout": the previous brownout
- *     was recorded on boot_count − 1.
+ *     was recorded on boot_count − 1;
+ *   - and when even that is impossible (a boot_count is 0: diag's counter was
+ *     unavailable) the order is UNKNOWN: a unit already protected treats it as
+ *     linked (hold, reason brownout_unordered); a normal one enters no_flash.
+ *     Without this, battery units with no clock and no counter would brown out
+ *     in no_flash forever (review of PR #103).
  * Exit (only when not forced):
  *   protected -> normal after 30 min of CONTINUOUS qualifying reads: valid,
  *   input present, frames changing (power_policy's flash evidence), system
@@ -53,7 +58,11 @@
  * Persistence: the pp_persist_t below, as a versioned, CRC-checked blob. The
  * caller writes it ONLY when an event says persist (state transitions, a
  * recorded brownout — at most one per boot — force and clear); reads and
- * heartbeats never write.
+ * heartbeats never write. An ABSENT blob (first install) starts at normal; an
+ * UNREADABLE one (corrupt, or the read itself failed) starts at no_flash,
+ * reason state_unreadable, with persist_fault set (pp_load_unreadable): a
+ * corrupted forced hold must not come back at full load. The next persisting
+ * event repairs the blob.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -95,6 +104,8 @@ typedef enum {
     PP_REASON_FORCED,           /* "forced": operator power_protect force */
     PP_REASON_POWER_RECOVERED,  /* "power_recovered": the 30-min window passed */
     PP_REASON_CLEARED,          /* "cleared": operator power_protect clear */
+    PP_REASON_STATE_UNREADABLE, /* "state_unreadable": the persisted state could not be read */
+    PP_REASON_BROWNOUT_UNORDERED, /* "brownout_unordered": a further brownout, order unknown */
     PP_REASON_COUNT
 } pp_reason_t;
 
@@ -120,6 +131,9 @@ typedef struct {
     int64_t  window_start_ms;  /* monotonic */
     bool     have_read;
     int64_t  last_read_ms;     /* monotonic, last read seen while protected */
+    /* The NVS copy is not trustworthy: unreadable at boot, or the last write
+     * failed. Cleared by the next successful write (the glue owns it). */
+    bool     persist_fault;
 } pp_core_t;
 
 /* A clock sample: valid = trustworthy UTC (see power_protect.c). */
@@ -146,6 +160,10 @@ typedef struct {
 
 void pp_core_init(pp_core_t *c);
 
+/* The persisted state exists but could not be read: no_flash, reason
+ * state_unreadable, not forced, empty history, persist_fault set. RAM only. */
+void pp_load_unreadable(pp_core_t *c, pp_clock_t clk);
+
 /* Blob codec. Encoded size is fixed: PP_BLOB_LEN. decode validates version,
  * length, CRC and every range; false leaves *out untouched. */
 #define PP_BLOB_VERSION 1u
@@ -166,13 +184,20 @@ pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_read
 pp_event_t pp_force(pp_core_t *c, pp_state_t state, pp_clock_t clk);
 pp_event_t pp_clear(pp_core_t *c, pp_clock_t clk);
 
-/* Two brownouts belong to one episode (the rule above). */
-bool pp_brownouts_linked(const pp_brownout_t *prev, const pp_brownout_t *cur);
+/* Do two brownouts belong to one episode (the rule above)? */
+typedef enum {
+    PP_LINK_NO = 0,
+    PP_LINK_YES,
+    PP_LINK_UNORDERED,   /* neither UTC nor boot_count can order them */
+} pp_link_t;
+pp_link_t pp_brownout_link(const pp_brownout_t *prev, const pp_brownout_t *cur);
 
 /* Recorded brownouts in the last 6 h. An entry with a valid UTC, read with a
- * valid `clk`, counts when it is within 6 h. Any other entry (either clock
- * invalid) counts when it belongs to the run of consecutive brownout boots
- * ending at `cur_boot`: the same fallback the escalation rule uses. */
+ * valid `clk`, counts when it is within 6 h. Otherwise, with both boot counts
+ * known, it counts when it belongs to the run of consecutive brownout boots
+ * ending at `cur_boot` (the escalation fallback). An entry whose age cannot be
+ * established at all (no UTC basis, a boot_count of 0) counts: conservative,
+ * until `clear` wipes the history. */
 uint32_t pp_brownouts_6h(const pp_core_t *c, pp_clock_t clk, uint32_t cur_boot);
 
 /* Remaining ms of a running exit window; -1 when none runs. */
@@ -187,11 +212,12 @@ const char *pp_reason_name(pp_reason_t r);
 bool pp_force_state_parse(const char *s, pp_state_t *out);
 
 /* health.power_protect object: {"state","reason","since_utc"|null,"forced",
- * "brownouts_6h","skipped":{"flash_runs","ambit_runs","ota"}}. Returns the
- * length, or -1 when it does not fit (nothing partial is ever returned). */
+ * "persist_fault","brownouts_6h","skipped":{"flash_runs","ambit_runs","ota"}}.
+ * Returns the length, or -1 when it does not fit (nothing partial is ever
+ * returned). */
 #define PP_JSON_CAP 256u
-int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, uint32_t brownouts_6h,
-                   const pp_skips_t *skips);
+int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, bool persist_fault,
+                   uint32_t brownouts_6h, const pp_skips_t *skips);
 
 #ifdef __cplusplus
 }

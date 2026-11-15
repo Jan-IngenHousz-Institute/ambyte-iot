@@ -283,6 +283,19 @@ static esp_err_t partition_sha256_matches(const esp_partition_t *part, size_t le
 
 /* ── one OTA download ──────────────────────────────────────────────────── */
 
+/* Brownout protection refusal at a boundary where comms are up and nothing is
+ * suspended (see the three boundaries in ota_do_update). */
+static bool refuse_for_power(const ota_request_t *r)
+{
+    if (!power_protect_blocks_flash()) return false;
+    ESP_LOGW(TAG, "OTA id=%s refused: power protection is %s", r->id,
+             pp_state_name(power_protect_state()));
+    power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+    ota_report("dropped", r->id, "power_protect");
+    if (r->finished != NULL) r->finished(r->id, true, "power_protect", r->cb_ctx);
+    return true;
+}
+
 static void ota_do_update(const ota_request_t *r)
 {
     ESP_LOGW(TAG, "OTA requested id=%s url_length=%u", r->id, (unsigned)strlen(r->url));
@@ -305,22 +318,25 @@ static void ota_do_update(const ota_request_t *r)
     }
 
     /* Brownout protection (power_protect.h): a unit that just browned out, or
-     * an operator-forced one, takes no image. Refused BEFORE the accepted
-     * report and before any download, suspend or flash write, as "dropped"
-     * (rejected before acceptance, a retry candidate: fleet_deploy keeps it
-     * apart from a failure) with detail "power_protect". A Jobs execution is
-     * retryable: it stays QUEUED and is looked at again in 10 min. */
-    if (power_protect_blocks_flash()) {
-        ESP_LOGW(TAG, "OTA id=%s refused: power protection is %s", r->id,
-                 pp_state_name(power_protect_state()));
-        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
-        ota_report("dropped", r->id, "power_protect");
-        if (r->finished != NULL) r->finished(r->id, true, "power_protect", r->cb_ctx);
-        return;
-    }
+     * an operator-forced one, takes no image. Checked at THREE boundaries,
+     * because the charger refresh keeps running while this worker waits and can
+     * enter no_flash on a fresh low reading (review of PR #103):
+     *   1. here, before the accepted report;
+     *   2. final admission, after the ack flush and the (up to 15 min) fleet
+     *      spread, before the Jobs IN_PROGRESS report, the suspend and the
+     *      download;
+     *   3. after the download and admission, before esp_https_ota_finish()
+     *      selects the image (the written slot stays inactive: aborting there
+     *      is safe; nothing is interrupted mid-write).
+     * Refusal: ota_status "dropped" (rejected before acceptance, a retry
+     * candidate: fleet_deploy keeps it apart from a failure), detail
+     * "power_protect", no refusal record, finished(retryable): a Jobs
+     * execution refused at 1 or 2 stays QUEUED and is looked at again in
+     * 10 min; refused at 3 it is already IN_PROGRESS and the same retry
+     * re-installs it (AWS's in-progress timeout still bounds it). */
+    if (refuse_for_power(r)) return;
 
     ota_report("accepted", r->id, NULL);
-    if (r->started != NULL) r->started(r->id, r->cb_ctx);
     vTaskDelay(pdMS_TO_TICKS(500));   /* let the accepted report flush before comms drop */
 
     /* The command path is a fleet-wide fan-out with no pacing of its own. A job
@@ -328,6 +344,12 @@ static void ota_do_update(const ota_request_t *r)
      * URL expires within the hour, so the 15-minute spread would only eat into
      * that window. */
     if (r->fleet_spread) wait_for_fleet_slot();
+
+    if (refuse_for_power(r)) return;   /* 2. final admission */
+    if (r->started != NULL) {
+        r->started(r->id, r->cb_ctx);
+        vTaskDelay(pdMS_TO_TICKS(500));   /* let IN_PROGRESS flush before comms drop */
+    }
 
     /* Quiesce the heap for the download (the board can't hold two TLS sessions):
      * stop the schedule runner (its transient action allocations
@@ -356,6 +378,7 @@ static void ota_do_update(const ota_request_t *r)
     const char *check_detail = NULL;   /* set when a job-path identity check refuses the image */
     char check_buf[128];
     bool policy_refusal = false;
+    bool power_late = false;
     esp_err_t err = esp_https_ota_begin(&cfg, &h);
     if (err == ESP_OK) {
         if (err == ESP_OK && r->expected_version[0] != '\0') {
@@ -405,6 +428,11 @@ static void ota_do_update(const ota_request_t *r)
                 complete = false;
             }
         }
+        if (err == ESP_OK && complete && power_protect_blocks_flash()) {
+            /* 3. Protection began during the download: do not select it. */
+            power_late = true;
+            complete = false;
+        }
         if (err == ESP_OK && complete) {
             err = esp_https_ota_finish(h);   /* validates image + sets boot partition */
         } else {
@@ -422,6 +450,19 @@ static void ota_do_update(const ota_request_t *r)
         ESP_LOGW(TAG, "OTA image written + boot set — rebooting into the new image");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();   /* no return */
+    }
+
+    if (power_late) {
+        /* Refusal 3: the image was downloaded but never selected. Resume, then
+         * report like the earlier refusals (no refusal record: not a policy
+         * failure of the image). */
+        ESP_LOGW(TAG, "OTA id=%s not selected: power protection began during the download", r->id);
+        if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
+        if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
+        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+        if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) ota_report("dropped", r->id, "power_protect");
+        if (r->finished != NULL) r->finished(r->id, true, "power_protect", r->cb_ctx);
+        return;
     }
 
     /* Failed: not booting the new image — bring comms back and report. The id is

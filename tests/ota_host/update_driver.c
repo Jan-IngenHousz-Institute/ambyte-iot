@@ -23,9 +23,18 @@ static void (*work)(void *);
 static void *work_arg;
 static void event(char c) { assert(used+1<sizeof trace);trace[used++]=c;trace[used]=0; }
 
-/* Brownout protection seam: scenario "power_protect" runs on a protected unit. */
-static unsigned pp_skips;
-bool power_protect_blocks_flash(void) { return !strcmp(scenario,"power_protect"); }
+/* Brownout protection seam. "power_protect": protected from the start.
+ * "pp_after_ack": protection begins after the first 500 ms (the ack flush),
+ * i.e. while the worker waits — the review's reproduction of PR #103.
+ * "pp_during_download": protection begins inside esp_https_ota_perform. */
+static unsigned pp_skips, in_progress;
+static bool pp_on;
+bool power_protect_blocks_flash(void)
+{
+    if(!strcmp(scenario,"power_protect"))return true;
+    if(!strcmp(scenario,"pp_after_ack"))return now>=500000;
+    return pp_on;
+}
 pp_state_t power_protect_state(void) { return power_protect_blocks_flash()?PP_STATE_NO_FLASH:PP_STATE_NORMAL; }
 void power_protect_note_skip(power_protect_skip_t w) { assert(w==POWER_PROTECT_SKIP_OTA);++pp_skips; }
 const char *pp_state_name(pp_state_t s) { return s==PP_STATE_NO_FLASH?"no_flash":"normal"; }
@@ -79,7 +88,7 @@ esp_err_t esp_crt_bundle_attach(void *p){(void)p;return ESP_OK;}
 esp_err_t esp_https_ota_begin(const esp_https_ota_config_t *cfg,esp_https_ota_handle_t *out)
 {assert(strncmp(cfg->http_config->url,"https://",8)==0);*out=(void*)1;return ESP_OK;}
 esp_err_t esp_https_ota_perform(esp_https_ota_handle_t h)
-{assert(h);event('P');return !strcmp(scenario,"legacy_error")?ESP_ERR_INVALID_VERSION:ESP_OK;}
+{assert(h);event('P');if(!strcmp(scenario,"pp_during_download"))pp_on=true;return !strcmp(scenario,"legacy_error")?ESP_ERR_INVALID_VERSION:ESP_OK;}
 bool esp_https_ota_is_complete_data_received(esp_https_ota_handle_t h)
 {assert(h);event('C');return strcmp(scenario,"incomplete")!=0;}
 int esp_https_ota_get_image_len_read(esp_https_ota_handle_t h)
@@ -109,7 +118,7 @@ static esp_err_t publish(const char *topic,const char *p,size_t n,int *id)
         if(strstr(last_report,"\"state\":\"success\""))++successes;
     } else if(strstr(topic,"/update")) {
         if (strstr(p,"\"status\":\"FAILED\"")) event('B');
-        else assert(strstr(p,"\"status\":\"IN_PROGRESS\""));
+        else {assert(strstr(p,"\"status\":\"IN_PROGRESS\""));++in_progress;}
     }
     return ESP_OK;
 }
@@ -170,6 +179,20 @@ int main(int argc,char **argv)
          * refusal record, no Jobs FAILED (a retryable miss stays QUEUED). */
         assert(selections==0&&latches==0&&restarts==0&&pp_skips==cycles);
         assert(strspn(trace,"Q")==strlen(trace)&&strlen(trace)==cycles);
+        assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
+        assert(!ota_is_admitted());
+    } else if(!strcmp(scenario,"pp_after_ack")) {
+        /* Final admission catches it: no suspend (no W/N), no download, no
+         * Jobs IN_PROGRESS (the execution stays QUEUED), no FAILED. */
+        assert(selections==0&&latches==0&&restarts==0&&pp_skips==1&&in_progress==0);
+        assert(!strcmp(trace,"Q"));
+        assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
+        assert(!ota_is_admitted());
+    } else if(!strcmp(scenario,"pp_during_download")) {
+        /* Downloaded and admitted, never selected: abort, resume, dropped. */
+        assert(selections==0&&latches==0&&restarts==0&&pp_skips==1);
+        assert(in_progress==(strcmp(argv[1],"jobs")?0u:1u));
+        assert(strstr(trace,"AWNQ")&&!strchr(trace,'F')&&!strchr(trace,'D')&&!strchr(trace,'B'));
         assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
         assert(!ota_is_admitted());
     } else if(!strcmp(scenario,"accept")) {
