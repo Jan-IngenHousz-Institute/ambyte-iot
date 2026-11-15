@@ -1,11 +1,32 @@
 schema: jii.ambyte-schedule/v1-draft
 id: urn:jii:schedule:default-multichannel
-version: 0.1.0-draft
+version: 0.2.0-draft
 name: default-multichannel
-description: SS every minute, spectra and MPF by day, with traces around sunrise and sunset.
+description: SS every minute, calibrated spectra (AMBIT cmd 35) and MPF by day, with traces around sunrise and sunset.
 
 # Site facts such as location, timezone, deployment, and MAC live in NVS.
 # This schedule is identical across sites.
+#
+# Every spectrum is the raw three-tier read (`raw: true`, AMBIT cmd 35, stored
+# as `ambit.spectrum/2`) since 0.2.0-draft. cmd 31's PAR is the legacy
+# integer-weighted sum times `spec_coef`, and the Calibratron has not written
+# `spec_coef` since 2026-08-18: it writes cmd 35's tier-3 slope/intercept
+# instead and leaves `spec_coef` at 1.0. Every AMBIT calibrated since then
+# therefore reported cmd-31 PAR about 4.3x too high -- 103 of 108 AMBITs in one
+# field deployment on 2026-11-15, where the same switch shipped first as a
+# workbook and all 8 canary AMBITs reported their tier-3 calibration stored on
+# the device.
+# Requirements, both enforced rather than assumed (as in qe_multichannel.yaml):
+#   - ambyte firmware with the `raw` input (>= 2.6.0). Older firmware's strict
+#     compiler rejects the unknown input and keeps its current schedule, so
+#     deliver this file with a `gte 2.6.0` version filter.
+#   - AMBIT fw >= 1.2.0 per channel. An older AMBIT falls back to cmd 31 on
+#     that channel only and stores /1 there (the schema tag says which).
+# A workbook processing this schedule needs a `schema == ambit.spectrum/2`
+# route. /1 and /2 `par` are different quantities: never average them.
+#
+# components/sched_runner/default.yaml, the copy the firmware embeds as its
+# fallback, still reads cmd 31 until a firmware release adopts this change.
 
 protocols:
   SS:
@@ -57,7 +78,10 @@ jobs:
       window: day
     steps:
       # With no channels list, every AMBIT that answers a ping is measured.
+      # raw: AMBIT cmd 35, the calibrated PAR (see the header).
       - uses: ambit/spectrum
+        with:
+          raw: true
 
   saturating_flash:
     schedule:
