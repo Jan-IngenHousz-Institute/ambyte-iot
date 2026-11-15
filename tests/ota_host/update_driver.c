@@ -26,13 +26,17 @@ static void event(char c) { assert(used+1<sizeof trace);trace[used++]=c;trace[us
 /* Brownout protection seam. "power_protect": protected from the start.
  * "pp_after_ack": protection begins after the first 500 ms (the ack flush),
  * i.e. while the worker waits — the review's reproduction of PR #103.
- * "pp_during_download": protection begins inside esp_https_ota_perform. */
+ * "pp_during_download": protection begins inside esp_https_ota_perform.
+ * Round 2: "pp_during_suspend" begins inside the workload suspend;
+ * "pp_after_second_flush" once now >= 1 s, i.e. during the Jobs IN_PROGRESS
+ * flush / the comms-suspend settle, after the final admission passed. */
 static unsigned pp_skips, in_progress;
 static bool pp_on;
 bool power_protect_blocks_flash(void)
 {
     if(!strcmp(scenario,"power_protect"))return true;
     if(!strcmp(scenario,"pp_after_ack"))return now>=500000;
+    if(!strcmp(scenario,"pp_after_second_flush"))return now>=1000000;
     return pp_on;
 }
 pp_state_t power_protect_state(void) { return power_protect_blocks_flash()?PP_STATE_NO_FLASH:PP_STATE_NORMAL; }
@@ -104,6 +108,7 @@ int mbedtls_sha256_finish(mbedtls_sha256_context *c,unsigned char *o){(void)c;me
 void mbedtls_sha256_free(mbedtls_sha256_context *c){(void)c;}
 esp_err_t fleet_jitter_slot_for_sta_mac(uint32_t slots,uint32_t *out){assert(slots==900);*out=0;return ESP_OK;}
 static bool connected(void){return !health;}
+static void workload_suspend(void){if(!strcmp(scenario,"pp_during_suspend"))pp_on=true;}
 static void workload_resume(void){event('W');}
 static void comms_resume(void){event('N');}
 bool ota_refusal_save(const char *id,const char *source,const char *reason)
@@ -153,7 +158,8 @@ int main(int argc,char **argv)
     if(!strcmp(scenario,"candidate_bad"))next_bytes[0x120]=0;
     if(!strcmp(scenario,"persist_fail")){next_bytes[0x120+16]=6;next_bytes[0x120+20]=2;}
     ota_update_config_t cfg={.publish=publish,.is_connected=connected,.status_topic="device/status",
-        .device_id="test",.submit=submit,.workload_resume=workload_resume,.comms_resume=comms_resume};
+        .device_id="test",.submit=submit,.workload_suspend=workload_suspend,.workload_resume=workload_resume,
+        .comms_resume=comms_resume};
     assert(ota_update_init(&cfg)==ESP_OK);
     if(!setjmp(reset)) {
         if(health)ota_update_run_boot_confirm();
@@ -186,6 +192,14 @@ int main(int argc,char **argv)
          * Jobs IN_PROGRESS (the execution stays QUEUED), no FAILED. */
         assert(selections==0&&latches==0&&restarts==0&&pp_skips==1&&in_progress==0);
         assert(!strcmp(trace,"Q"));
+        assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
+        assert(!ota_is_admitted());
+    } else if(!strcmp(scenario,"pp_during_suspend")||!strcmp(scenario,"pp_after_second_flush")) {
+        /* Admitted, suspended, then refused immediately before
+         * esp_https_ota_begin: no download at all, resumed, dropped. */
+        assert(selections==0&&latches==0&&restarts==0&&pp_skips==1);
+        assert(in_progress==(strcmp(argv[1],"jobs")?0u:1u));
+        assert(!strcmp(trace,"WNQ"));
         assert(strstr(last_report,"\"state\":\"dropped\"")&&strstr(last_report,"\"detail\":\"power_protect\""));
         assert(!ota_is_admitted());
     } else if(!strcmp(scenario,"pp_during_download")) {

@@ -65,6 +65,11 @@ class AdmissionTest(unittest.TestCase):
         for path in ("https","jobs"):
             with self.subTest(path=path,when="after_ack"):
                 self.assertEqual(self.run_case(path,"pp_after_ack"),"Q")
+            for when in ("pp_during_suspend","pp_after_second_flush"):
+                # Round 2: admitted, then protection during the suspend or the
+                # second flush; refused right before esp_https_ota_begin.
+                with self.subTest(path=path,when=when):
+                    self.assertEqual(self.run_case(path,when),"WNQ")
             with self.subTest(path=path,when="during_download"):
                 self.assertEqual(self.run_case(path,"pp_during_download"),
                                  ("VPCH" if path=="jobs" else "PC")+"SRMAWNQ")

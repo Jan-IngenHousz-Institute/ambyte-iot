@@ -208,17 +208,27 @@ first action after a brownout is therefore already shed.
   was attempted). CHIP_EN power-down is out of scope.
 - **Updates are checked at every safe boundary**, not just at worker entry:
   the charger refresh keeps running while a worker waits (500 ms ack flush,
-  up to 15 min of fleet spread, a download, earlier channels' writes) and can
-  enter `no_flash` meanwhile. A write that has started is never interrupted
-  (that is what bricks an AMBIT); the next one is not started.
+  up to 15 min of fleet spread, the 65-s AMBIT quiesce, the suspend, a
+  download, a ROM probe, the SD preflight, the ROM connect, earlier channels'
+  writes) and can enter `no_flash` meanwhile. The rule: **the last admission
+  sits immediately before the destructive step, after every blocking probe,
+  identity read, preflight, quiesce or flush.** A write that has started is
+  never interrupted (that is what bricks an AMBIT); the next one is not
+  started. The writers carry the last check themselves: `ambit_ota_one_impl`
+  after the version read, right before OTA_BEGIN; `ambit_flash_image_gated`
+  after the preflight, bus wait, ROM reset, stub connect and baud change,
+  right before the first erase (refused: the AMBIT is reset back into its
+  existing application, `ESP_ERR_NOT_ALLOWED`). Only the USB console's
+  `ambit_flash` uses the ungated `ambit_flash_image` (an operator at the
+  bench, deliberately).
 
   | Path | Boundaries | Refusal |
   |---|---|---|
-  | Ambyte OTA (MQTT, Jobs) | 1. worker entry, before `accepted`; 2. final admission after the ack flush and the spread, before the Jobs IN_PROGRESS report, the suspend and the download; 3. after download + image admission, before `esp_https_ota_finish()` selects the image (abort; the slot stays inactive) | `ota_status` `dropped`, detail `power_protect` (fleet_deploy's retry candidate); Jobs: retryable. Refused at 1 or 2 the execution stays QUEUED; at 3 it is already IN_PROGRESS and the same 10-min retry re-installs it |
-  | AMBIT OTA | worker entry; after the ack flush and the spread; after the download; before each channel's stream | `ambit_ota_status` `failed` / `power_protect` (per channel and terminal) |
-  | `ambit_flash` | worker entry; after the ack flush (before suspend and the release fetch); before each channel's ROM flash | `ambit_flash_status` `failed` / `power_protect`; channels not started report `skipped` / `power_protect`; the per-id retry cap is not consumed |
-  | Attach update | at the decision, and again after the quiesce, right before the write | held, `waiting_power`, re-checked every 10 min |
-  | Boot sync | before the loop (no 30-s wait for power evidence) and before each channel | channels left on their firmware |
+  | Ambyte OTA (MQTT, Jobs) | 1. worker entry, before `accepted`; 2. after the ack flush and the spread, before the Jobs IN_PROGRESS report and the suspend; 3. after the IN_PROGRESS flush, the workload suspend and the comms suspend, immediately before `esp_https_ota_begin()`; 4. after download + image admission, before `esp_https_ota_finish()` selects the image (abort; the slot stays inactive) | `ota_status` `dropped`, detail `power_protect` (fleet_deploy's retry candidate); Jobs: retryable. Refused at 1 or 2 the execution stays QUEUED; at 3 or 4 it is already IN_PROGRESS and the same 10-min retry re-installs it. 3 and 4 resume workload and comms first |
+  | AMBIT OTA | worker entry; after the ack flush and the spread; after the 65-s quiesce and the comms suspend, immediately before the download; before each channel (cheap early exit); inside `ambit_ota_one_impl` after the ping and version read, right before OTA_BEGIN | `ambit_ota_status` `failed` / `power_protect` (per channel and terminal) |
+  | `ambit_flash` | worker entry; after the ack flush (before the suspend); after the suspend, immediately before the release fetch; before each channel's ROM probe (cheap early exit); inside `ambit_flash_image_gated` right before the first erase | `ambit_flash_status` `failed` / `power_protect`; channels not started report `skipped` / `power_protect`; the per-id retry cap is not consumed |
+  | Attach update | at the decision; after the quiesce; inside `ambit_flash_image_gated` right before the first erase | held, `waiting_power`, re-checked every 10 min; the attach fail cap is not consumed (the pre-attempt bump is undone) |
+  | Boot sync | before the loop (no 30-s wait for power evidence); before each channel; inside `ambit_flash_image_gated` right before the first erase | channels left on their firmware; the boot fail cap is not consumed |
 
   `device_commands_flash_power_ok()` is also false while protected, for any
   future caller.
@@ -310,7 +320,13 @@ run fails unless every reply confirms the requested state. In Actions →
   the https and Jobs paths, including protection that begins after the ack
   flush and during the download.
 - `tests/power_protect_host/ambit_worker_driver.c` runs the production AMBIT
-  worker functions (extracted verbatim) with protection beginning during the
-  spread, the ack flush, the download / release fetch and mid-sweep.
+  worker functions and writers (extracted verbatim: `ambit_do_ota`,
+  `ambit_do_flash`, `ambit_ota_one_impl`, `ambit_flash_image_gated`,
+  `ambit_flash_attach_flash`) with protection beginning inside the spread,
+  the ack flush, the quiesce, the suspend, the download / release fetch, a
+  ping, the version read, the ROM probe, the SD preflight, the UART bus wait,
+  the ROM connect and mid-sweep (19 scenarios; with the gates removed, the 9
+  in-step scenarios fail). The Ambyte worker also covers protection during
+  the suspend and the second flush.
 - **Real brownout behaviour is covered by host tests only.** A bench cannot
   brown out on demand; the bench run exercises `force` and `clear`.

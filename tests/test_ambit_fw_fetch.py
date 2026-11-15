@@ -399,7 +399,7 @@ class SourceContractTest(unittest.TestCase):
         fetch = fn.index("ambit_fw_fetch(")
         self.assertLess(fn.index("s_cfg.comms_suspend()"), fetch)
         self.assertLess(fetch, fn.index("ambit_flash_probe("))
-        self.assertLess(fetch, fn.index("ambit_flash_image("))
+        self.assertLess(fetch, fn.index("ambit_flash_image_gated("))   # power-gated writer (power-protect.md)
         self.assertIn("!sd_ok || !fetch_ok", fn)
 
     def test_plain_http_manifest_urls_are_refused(self):

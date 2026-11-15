@@ -161,25 +161,46 @@ class PowerProtectHostTest(unittest.TestCase):
 
 
 class AmbitWorkerProtectionTest(unittest.TestCase):
-    """Review of PR #103, finding 1, AMBIT side: the PRODUCTION worker functions
-    (extracted verbatim) re-check protection at every safe boundary: after the
-    ack flush / fleet spread, after the download or release fetch, and before
-    each channel's write. A write that has started finishes; no later one
-    starts. The Ambyte side runs in tests/test_ota_admission.py."""
+    """Review of PR #103, AMBIT side. Round 1: re-check after the ack flush /
+    fleet spread, after the download or release fetch, before each channel.
+    Round 2: the admission must sit at the LAST safe point before the first
+    destructive step, after every blocking probe, identity read, preflight,
+    quiesce or flush: protection beginning INSIDE the quiesce, the suspend, a
+    ping, the version read, the ROM probe, the SD preflight, the UART bus wait
+    or the ROM connect must still stop the erase / OTA_BEGIN. The PRODUCTION
+    worker functions and writers (ambit_ota_one_impl, ambit_flash_image_gated,
+    ambit_flash_attach_flash) are extracted verbatim; a write that has started
+    finishes, no later one starts, and a power refusal never consumes the
+    attach/boot-sync fail cap. The Ambyte side runs in tests/test_ota_admission.py."""
 
-    SCENARIOS = ("ota_protected_at_entry", "ota_flip_during_spread", "ota_flip_during_download",
-                 "ota_flip_mid_sweep", "flash_flip_during_ack", "flash_flip_during_fetch",
-                 "flash_flip_mid_sweep", "ota_unprotected", "flash_unprotected")
+    SCENARIOS = ("ota_protected_at_entry", "ota_flip_during_spread", "ota_flip_during_quiesce",
+                 "ota_flip_during_download", "ota_flip_during_ping", "ota_flip_during_identity",
+                 "ota_flip_mid_sweep", "flash_flip_during_ack", "flash_flip_during_suspend",
+                 "flash_flip_during_fetch", "flash_flip_during_probe", "flash_flip_during_preflight",
+                 "flash_flip_during_bus_wait", "flash_flip_during_rom_connect", "flash_flip_mid_sweep",
+                 "attach_flip_during_rom_connect", "attach_unprotected", "ota_unprotected",
+                 "flash_unprotected")
 
     @classmethod
     def setUpClass(cls):
         from test_schedule_light_cleanup import function
         ota = (ROOT / "components/ambit_ota/ambit_ota.c").read_text()
+        flash = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
+        regions = flash[flash.index("typedef struct {\n    uint32_t    offset;"):]
+        regions = regions[:regions.index("\n", regions.index("#define NUM_REGIONS")) + 1]
         cls.tmp = tempfile.TemporaryDirectory(prefix="ambit-worker-")
         tmp = Path(cls.tmp.name)
         (tmp / "ambit-worker-production.inc").write_text("\n".join(
-            function(ota, name) for name in ("power_blocks_write", "ambit_do_ota", "ambit_do_flash",
-                                             "ambit_ota_run")))
+            [regions,
+             "static esp_loader_error_t flash_one_region(esp_loader_t *, const char *, const flash_region_t *,"
+             " uint32_t *);"]
+            + [function(flash, name) for name in ("boot_fail_key", "boot_fail_count", "boot_fail_bump",
+                                                  "boot_fail_clear", "flash_power_allows_write",
+                                                  "boot_fail_restore", "fw_matches", "ambit_flash_image_gated",
+                                                  "ambit_flash_attach_flash")]
+            + [function(ota, name) for name in ("power_note_refusal", "power_blocks_write", "power_allows_write",
+                                                "ambit_ota_one_impl", "ambit_ota_one", "ambit_do_ota",
+                                                "ambit_do_flash", "ambit_ota_run")]))
         cc = os.environ.get("CC") or shutil.which("clang") or "cc"
         cls.bin = tmp / "ambit_worker"
         cmd = [cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
@@ -206,10 +227,10 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
                 self.reports(name)
 
     def test_refusals_are_terminal_power_protect(self):
-        for name, kind in (("ota_protected_at_entry", "ambit_ota_status"), ("ota_flip_during_spread", "ambit_ota_status"),
-                           ("ota_flip_during_download", "ambit_ota_status"), ("ota_flip_mid_sweep", "ambit_ota_status"),
-                           ("flash_flip_during_ack", "ambit_flash_status"), ("flash_flip_during_fetch", "ambit_flash_status"),
-                           ("flash_flip_mid_sweep", "ambit_flash_status")):
+        for name in self.SCENARIOS:
+            if name.startswith("attach_") or name.endswith("_unprotected"):
+                continue
+            kind = "ambit_flash_status" if name.startswith("flash_") else "ambit_ota_status"
             with self.subTest(scenario=name):
                 last = self.reports(name)[-1]
                 self.assertEqual(last[:2], [kind, "failed"])
@@ -221,6 +242,19 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
         self.assertIn(["ambit_flash_status", "flash_ok", "ch=0", "id=job-1", "detail=-"], sweep)
         for ch in (1, 2, 3):
             self.assertIn(["ambit_flash_status", "skipped", f"ch={ch}", "id=job-1", "detail=power_protect"], sweep)
+        # Round 2: protection during ch0's ROM probe / preflight / bus wait / ROM
+        # connect: ch0 is skipped (never erased), not reported flash_ok.
+        for name in ("flash_flip_during_probe", "flash_flip_during_preflight", "flash_flip_during_bus_wait",
+                     "flash_flip_during_rom_connect"):
+            with self.subTest(scenario=name):
+                got = self.reports(name)
+                self.assertIn(["ambit_flash_status", "skipped", "ch=0", "id=job-1", "detail=power_protect"], got)
+                self.assertNotIn("flash_ok", [g[1] for g in got])
+        for name in ("ota_flip_during_ping", "ota_flip_during_identity"):
+            with self.subTest(scenario=name):
+                got = self.reports(name)
+                self.assertIn(["ambit_ota_status", "failed", "ch=0", "id=job-1", "detail=power_protect"], got)
+                self.assertNotIn("success", [g[1] for g in got])
 
 
 class PowerProtectWiringContractTest(unittest.TestCase):
@@ -283,6 +317,10 @@ class PowerProtectWiringContractTest(unittest.TestCase):
         started = fn.index("r->started(r->id, r->cb_ctx);")
         suspend = fn.index("s_cfg.workload_suspend();")
         self.assertTrue(entry < accepted < spread < final < started < suspend)
+        # Round 2: admitted again after the suspend, immediately before the download.
+        last = fn.index("bool power_late = power_protect_blocks_flash();")
+        self.assertTrue(suspend < fn.index("s_cfg.comms_suspend();") < last
+                        < fn.index("power_late ? ESP_FAIL : esp_https_ota_begin(&cfg, &h);"))
         self.assertLess(fn.index("power_late = true;"), fn.index("err = esp_https_ota_finish(h);"))
         refuse = ota[ota.index("static bool refuse_for_power(const ota_request_t *r)"):]
         refuse = refuse[:refuse.index("\n}\n")]
@@ -295,7 +333,25 @@ class PowerProtectWiringContractTest(unittest.TestCase):
         attach = attach[:attach.index("\n}\n")]
         self.assertLess(attach.rindex("if (power_protect_blocks_flash()) {"),
                         attach.index("esp_err_t e = ambit_flash_attach_flash(ch, &tgt);"))
+        # Round 2: the writers themselves admit at the last safe point.
+        impl = amb[amb.index("static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage, bool *power_refused)\n{"):]
+        impl = impl[:impl.index("\n}\n")]
+        self.assertTrue(impl.index('ambit_log_version(ch, "before");') < impl.index("power_protect_blocks_flash()")
+                        < impl.index("ambit_stream_image(ch, stage)"))
         flash = self.read("components/ambit_flash/ambit_flash.c")
+        gated = flash[flash.index("esp_err_t ambit_flash_image_gated("):]
+        gated = gated[:gated.index("\nreset_and_done:")]
+        order = [gated.index(k) for k in ("ambit_flash_preflight(", "uart_sensors_flash_session_begin(",
+                                          "esp_loader_connect_with_stub(", "esp_loader_change_transmission_rate(",
+                                          "if (may_write != NULL && !may_write()) {", "flash_one_region(")]
+        self.assertEqual(order, sorted(order))
+        # Every unattended writer is gated; the plain one is the USB console's.
+        for rel in ("components/ambit_ota/ambit_ota.c", "components/ambit_flash/ambit_flash.c"):
+            src = self.read(rel)
+            calls = [l for l in src.splitlines() if "ambit_flash_image(" in l and "ambit_flash_image(uint8_t" not in l
+                     and not l.strip().startswith(("*", "/*"))]
+            self.assertEqual(calls, [], rel)
+        self.assertIn("ambit_flash_image((uint8_t)ch, dir, baud, &r);", self.read("components/CLI/CLI.c"))
         self.assertLess(flash.index("if (power_protect_blocks_flash()) {"),
                         flash.index("if (!device_commands_flash_power_ok()) {"))
         loop = flash[flash.index("int flashed = 0;"):]

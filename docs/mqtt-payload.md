@@ -1166,9 +1166,9 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
 
 | report | state | detail |
 |---|---|---|
-| `ota_status` (MQTT `ota_update`, Jobs) | `dropped` | `power_protect`. Checked at worker entry (before `accepted`), at final admission after the ack flush and fleet spread (before the suspend and download: a Jobs execution stays QUEUED, retried in 10 min), and before the image is selected (download discarded; the IN_PROGRESS execution is retried the same way). May therefore follow an `accepted`. |
-| `ambit_ota_status` | `failed` | `power_protect`, terminal and per channel not started (checked at entry, after the ack flush / spread, after the download, before each channel) |
-| `ambit_flash_status` | `failed` | `power_protect` (entry, after the ack flush, before each channel); channels not started report `skipped` / `power_protect`; a started channel always finishes |
+| `ota_status` (MQTT `ota_update`, Jobs) | `dropped` | `power_protect`. Checked at worker entry (before `accepted`), after the ack flush and fleet spread (before IN_PROGRESS and the suspend: a Jobs execution stays QUEUED, retried in 10 min), immediately before the download starts, and before the image is selected (the IN_PROGRESS execution is retried the same way). May therefore follow an `accepted`. |
+| `ambit_ota_status` | `failed` | `power_protect`, terminal and per channel not started (checked at entry, after the ack flush / spread, after the quiesce right before the download, and per channel right before OTA_BEGIN) |
+| `ambit_flash_status` | `failed` | `power_protect` (entry, after the ack flush, after the suspend right before the release fetch, and per channel right before the first erase, after its probe / preflight / ROM connect); channels not started report `skipped` / `power_protect`; a started channel always finishes |
 | `ambit_attach_status` (attach-time update) | `waiting_power` | held, re-checked every 10 min |
 
 ## OTA admission failure details

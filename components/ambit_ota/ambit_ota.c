@@ -481,22 +481,31 @@ __attribute__((cold)) static bool ambit_stream_image(uint8_t ch, const ambit_sta
  * reboots into the new (PENDING_VERIFY) image — confirm it ONLY if it answers.
  * If it doesn't answer or the confirm fails, the C3 bootloader rolls back to the
  * previous image on its next reboot. Returns true only when confirmed healthy. */
-static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage);
+static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage, bool *power_refused);
 
 /* SD RW-gate wrapper (audit R-6): guard the fopen + fread stream of the AMBIT image
  * from SD against a monitor teardown freeing the volume mid-stream. */
-static bool ambit_ota_one(uint8_t ch, const ambit_stage_t *st)
+static bool ambit_ota_one(uint8_t ch, const ambit_stage_t *st, bool *power_refused)
 {
+    *power_refused = false;
     if (!sdcard_io_begin()) return false;
-    bool ok = ambit_ota_one_impl(ch, st);
+    bool ok = ambit_ota_one_impl(ch, st, power_refused);
     sdcard_io_end();
     return ok;
 }
 
-static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage)
+static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage, bool *power_refused)
 {
     ambit_log_version(ch, "before");
 
+    /* The last safe point (review of PR #103): the version read above blocks
+     * on the UART, the caller's ping and the SD gate before it; ambit_stage_
+     * stream sends OTA_BEGIN as its first act. Protection that began during
+     * any of them stops the stream here, before the AMBIT erases anything. */
+    if (power_protect_blocks_flash()) {
+        *power_refused = true;
+        return false;
+    }
     if (!ambit_stream_image(ch, stage)) return false;
 
     ESP_LOGW(TAG, "OTA_END ok — AMBIT%u rebooting; waiting %d ms then re-checking",
@@ -558,16 +567,27 @@ static void ambit_quiesce_for_idle(void)
  * enter no_flash on a fresh low reading. Never asked mid-write: a flash that
  * has started runs to its end (aborting it is what bricks an AMBIT). Counted
  * once per refused operation (`*counted`). */
+static void power_note_refusal(const char *what, const char *id, bool *counted)
+{
+    if (*counted) return;
+    *counted = true;
+    ESP_LOGW(TAG, "%s id=%s: no AMBIT write, power protection is %s", what,
+             id != NULL && id[0] ? id : "(none)", pp_state_name(power_protect_state()));
+    power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+}
+
 static bool power_blocks_write(const char *what, const char *id, bool *counted)
 {
     if (!power_protect_blocks_flash()) return false;
-    if (!*counted) {
-        *counted = true;
-        ESP_LOGW(TAG, "%s id=%s: no AMBIT write, power protection is %s", what,
-                 id != NULL && id[0] ? id : "(none)", pp_state_name(power_protect_state()));
-        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
-    }
+    power_note_refusal(what, id, counted);
     return true;
+}
+
+/* ambit_flash_image_gated's last-moment admission (after preflight, bus wait,
+ * ROM reset and stub connect; before the first erase). */
+static bool power_allows_write(void)
+{
+    return !power_protect_blocks_flash();
 }
 
 static void ambit_do_ota(const ambit_ota_req_t *r)
@@ -623,7 +643,11 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
 
     bool ok = false;
     const char *detail = NULL;
-    if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
+    if (power_blocks_write("AMBIT OTA", r->id, &power_stop)) {
+        /* Began during the 65-s quiesce or the comms suspend: no download.
+         * Resume and report through the common path below. */
+        detail = "power_protect";
+    } else if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
         ESP_LOGE(TAG, "SD not available — cannot stage the AMBIT image");
         detail = "SD not available";
     } else {
@@ -652,7 +676,13 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
                         continue;
                     }
                     present++;
-                    bool ok_c = ambit_ota_one(c, &stage);
+                    bool power = false;
+                    bool ok_c = ambit_ota_one(c, &stage, &power);
+                    if (power) {   /* began during the ping or version read */
+                        power_note_refusal("AMBIT OTA", r->id, &power_stop);
+                        res[c] = OTA_POWER;
+                        continue;
+                    }
                     res[c] = ok_c ? OTA_OK : OTA_FAIL;
                     if (ok_c) ok_count++;
                 }
@@ -663,8 +693,14 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
             } else if (power_blocks_write("AMBIT OTA", r->id, &power_stop)) {
                 detail = "power_protect";   /* entered protection during the download */
             } else {
-                ok = ambit_ota_one(r->channel, &stage);
-                if (!ok) detail = "stream/confirm failed";
+                bool power = false;
+                ok = ambit_ota_one(r->channel, &stage, &power);
+                if (power) {
+                    power_note_refusal("AMBIT OTA", r->id, &power_stop);
+                    detail = "power_protect";
+                } else if (!ok) {
+                    detail = "stream/confirm failed";
+                }
             }
             /* Stage served its purpose (success or failure): remove it under the
              * gate. Single-named, never renamed; a failed remove is cleared by
@@ -910,6 +946,8 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
     if (!sd_ok) {
         ESP_LOGE(TAG, "SD not available — no region images to flash");
         detail = "sd_unavailable";
+    } else if (power_blocks_write("AMBIT flash", r->id, &power_stop)) {
+        /* Began during the suspend: no fetch, no write; resume below. */
     } else if (r->manifest_url[0] != '\0') {
         /* Remote release fetch (ambit_fw_fetch.h): runs inside the MQTT blackout
          * because the board cannot hold the broker's TLS session and a download's
@@ -929,8 +967,8 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         }
     }
 
-    if (!sd_ok || !fetch_ok) {
-        /* Nothing to flash from: every AMBIT is left exactly as it was. */
+    if (!sd_ok || !fetch_ok || power_stop) {
+        /* Nothing to flash from (or protected): every AMBIT is left as it was. */
     } else if (all) {
         int attempted = 0, ok_count = 0;
         for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
@@ -953,9 +991,16 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
                 res[c] = FL_ABSENT;
                 continue;
             }
-            attempted++;
             ambit_flash_image_result_t fr;
-            esp_err_t ferr = ambit_flash_image(c, dir, 0, &fr);
+            /* Gated at the last safe point: after this probe and the image's
+             * own preflight / ROM connect, before the first erase. */
+            esp_err_t ferr = ambit_flash_image_gated(c, dir, 0, power_allows_write, &fr);
+            if (ferr == ESP_ERR_NOT_ALLOWED) {
+                power_note_refusal("AMBIT flash", r->id, &power_stop);
+                res[c] = FL_POWER;
+                continue;
+            }
+            attempted++;
             res[c] = (ferr == ESP_OK) ? FL_OK : FL_FAIL;
             if (ferr == ESP_OK) {
                 ok_count++;
@@ -973,8 +1018,10 @@ static void ambit_do_flash(const ambit_ota_req_t *r)
         res[r->channel] = FL_POWER;   /* entered protection during the fetch */
     } else {
         ambit_flash_image_result_t fr;
-        esp_err_t ferr = ambit_flash_image(r->channel, dir, 0, &fr);
+        esp_err_t ferr = ambit_flash_image_gated(r->channel, dir, 0, power_allows_write, &fr);
+        if (ferr == ESP_ERR_NOT_ALLOWED) power_note_refusal("AMBIT flash", r->id, &power_stop);
         res[r->channel] = (ferr == ESP_OK) ? FL_OK
+                        : (ferr == ESP_ERR_NOT_ALLOWED) ? FL_POWER
                         : (ferr == ESP_ERR_TIMEOUT) ? FL_BUSY : FL_FAIL;
         ok = (ferr == ESP_OK);
         if (ok) cmd_ambit_device_info_invalidate(r->channel);
@@ -1131,6 +1178,13 @@ static void ambit_do_attach(void)
                 break;
             }
             esp_err_t e = ambit_flash_attach_flash(ch, &tgt);
+            if (e == ESP_ERR_NOT_ALLOWED) {
+                /* Protection began during the preflight / ROM connect: nothing
+                 * written, not an attempt. Held exactly as above. */
+                ambit_attach_gate_resolve(ch, inf.device_id, inf.fw_version, AMBIT_ATTACH_RETRY, now_ms);
+                attach_report("waiting_power", ch, inf.fw_version, &tgt);
+                break;
+            }
             /* Either way the identity changed or must be re-read: the next gate
              * call checks the AMBIT as it is now (normally CLEAR after a success;
              * after a failure it retries until the shared fail cap gives up). */

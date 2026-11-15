@@ -322,17 +322,18 @@ static void ota_do_update(const ota_request_t *r)
      * because the charger refresh keeps running while this worker waits and can
      * enter no_flash on a fresh low reading (review of PR #103):
      *   1. here, before the accepted report;
-     *   2. final admission, after the ack flush and the (up to 15 min) fleet
-     *      spread, before the Jobs IN_PROGRESS report, the suspend and the
-     *      download;
-     *   3. after the download and admission, before esp_https_ota_finish()
+     *   2. after the ack flush and the (up to 15 min) fleet spread, before the
+     *      Jobs IN_PROGRESS report and the suspend;
+     *   3. after the IN_PROGRESS flush and the workload/comms suspend,
+     *      immediately before esp_https_ota_begin() starts the download;
+     *   4. after the download and admission, before esp_https_ota_finish()
      *      selects the image (the written slot stays inactive: aborting there
      *      is safe; nothing is interrupted mid-write).
      * Refusal: ota_status "dropped" (rejected before acceptance, a retry
      * candidate: fleet_deploy keeps it apart from a failure), detail
      * "power_protect", no refusal record, finished(retryable): a Jobs
      * execution refused at 1 or 2 stays QUEUED and is looked at again in
-     * 10 min; refused at 3 it is already IN_PROGRESS and the same retry
+     * 10 min; refused at 3 or 4 it is already IN_PROGRESS and the same retry
      * re-installs it (AWS's in-progress timeout still bounds it). */
     if (refuse_for_power(r)) return;
 
@@ -378,8 +379,12 @@ static void ota_do_update(const ota_request_t *r)
     const char *check_detail = NULL;   /* set when a job-path identity check refuses the image */
     char check_buf[128];
     bool policy_refusal = false;
-    bool power_late = false;
-    esp_err_t err = esp_https_ota_begin(&cfg, &h);
+    /* 3. Last admission before the download (review round 2 of PR #103):
+     * the IN_PROGRESS flush, the workload suspend (up to 10 s) and the comms
+     * suspend + 500 ms all ran since boundary 2. Refused here, the common
+     * power_late path below resumes and reports, as for boundary 4. */
+    bool power_late = power_protect_blocks_flash();
+    esp_err_t err = power_late ? ESP_FAIL : esp_https_ota_begin(&cfg, &h);
     if (err == ESP_OK) {
         if (err == ESP_OK && r->expected_version[0] != '\0') {
             /* Cheap identity pre-filter before downloading the whole image. Full
@@ -429,7 +434,7 @@ static void ota_do_update(const ota_request_t *r)
             }
         }
         if (err == ESP_OK && complete && power_protect_blocks_flash()) {
-            /* 3. Protection began during the download: do not select it. */
+            /* 4. Protection began during the download: do not select it. */
             power_late = true;
             complete = false;
         }
@@ -453,10 +458,10 @@ static void ota_do_update(const ota_request_t *r)
     }
 
     if (power_late) {
-        /* Refusal 3: the image was downloaded but never selected. Resume, then
-         * report like the earlier refusals (no refusal record: not a policy
-         * failure of the image). */
-        ESP_LOGW(TAG, "OTA id=%s not selected: power protection began during the download", r->id);
+        /* Refusal 3 or 4: nothing downloaded, or downloaded but never
+         * selected. Resume, then report like the earlier refusals (no refusal
+         * record: not a policy failure of the image). */
+        ESP_LOGW(TAG, "OTA id=%s stopped: power protection began after admission", r->id);
         if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
         if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
         power_protect_note_skip(POWER_PROTECT_SKIP_OTA);

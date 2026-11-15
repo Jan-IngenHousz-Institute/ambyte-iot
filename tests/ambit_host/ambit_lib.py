@@ -71,7 +71,15 @@ def slice_flash(rev: str | None) -> str:
     regions = t[t.index("typedef struct {\n    uint32_t    offset;"):t.index("#define NUM_REGIONS")]
     num = t[t.index("#define NUM_REGIONS"):].split("\n", 1)[0]
     root = t[t.index("#define AMBIT_FW_ROOT"):].split("\n", 1)[0]
-    fn_start = t.index("esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,")
+    # Since brownout protection the body lives in ambit_flash_image_gated (the
+    # plain function is a wrapper); older revisions have it in ambit_flash_image.
+    gated = "esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t baud,"
+    if gated in t:
+        fn_start = t.index(gated)
+        call = "ambit_flash_image_gated(channel, dir, 0, NULL, &r)"
+    else:
+        fn_start = t.index("esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,")
+        call = "ambit_flash_image(channel, dir, 0, &r)"
     cut = t.index("uart_sensors_flash_session_begin(channel, BUS_WAIT_MS);", fn_start)
     cut = t.index("\n", cut) + 1
     fn = t[fn_start:cut]
@@ -80,6 +88,7 @@ def slice_flash(rev: str | None) -> str:
         helper = _func(t, "static long region_file_size(")
     body = f"""/* GENERATED slice of components/ambit_flash/ambit_flash.c @ {rev or 'working tree'} */
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -103,7 +112,7 @@ esp_err_t uart_sensors_flash_session_begin(uint8_t ch, uint32_t wait_ms);
 esp_err_t slice_flash_image(uint8_t channel, const char *dir)
 {{
     ambit_flash_image_result_t r;
-    return ambit_flash_image(channel, dir, 0, &r);
+    return {call};
 }}
 """
     return body

@@ -53,9 +53,22 @@ typedef struct {
  * `baud` = link speed after the stub connect (0 => default). Takes the shared UART
  * bus for the whole operation — quiesce measurement first (a busy bus returns ESP_ERR_TIMEOUT).
  * `out` may be NULL. Returns ESP_OK only when all four regions verified.
+ *
+ * Ungated: the USB console's `ambit_flash` (an operator at the bench) uses it
+ * deliberately. Every unattended path uses ambit_flash_image_gated.
  */
 esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
                             ambit_flash_image_result_t *out);
+
+/* ambit_flash_image with a last-moment admission (brownout protection, review
+ * of PR #103): `may_write` is asked AFTER every blocking step that precedes
+ * the first erase (SD preflight with its SHA-256 checks, the UART bus wait,
+ * the ROM reset + stub connect, the baud change) and immediately before the
+ * first region is erased. false → nothing erased or written, the AMBIT is
+ * reset back into its existing application, ESP_ERR_NOT_ALLOWED. NULL = no
+ * gate. A region that has started is never interrupted by the gate. */
+esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t baud,
+                                  bool (*may_write)(void), ambit_flash_image_result_t *out);
 
 /* A firmware image discovered on the SD card: its version + directory. */
 typedef struct {

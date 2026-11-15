@@ -164,7 +164,7 @@ class WiringContractTest(unittest.TestCase):
     def test_attach_flash_shares_the_boot_fail_cap(self):
         fl = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
         fn = fl.split("esp_err_t ambit_flash_attach_flash(", 1)[1].split("\n}\n", 1)[0]
-        self.assertLess(fn.index("boot_fail_bump(ch, ver, fails);"), fn.index("ambit_flash_image("))
+        self.assertLess(fn.index("boot_fail_bump(ch, ver, fails);"), fn.index("ambit_flash_image_gated("))
         decide = fl.split("ambit_attach_decision_t ambit_flash_attach_decide(", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("boot_fail_count(ch, ver) >= BOOT_FAIL_MAX", decide)
         self.assertIn("AMBIT_ATTACH_DECIDE_NEWER", decide)
