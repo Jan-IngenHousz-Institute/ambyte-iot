@@ -3380,18 +3380,26 @@ static uint16_t ambit_crc16_ccitt(const uint8_t *data, size_t len)
     return crc;
 }
 
-/* Send one OTA command (cmd[8] + optional extra) and read the 1-byte status. */
+/* Send one OTA command (cmd[8] + optional extra) and read the 1-byte status.
+ * `admit` != NULL routes through the admitted query port (fail-closed if it is
+ * not wired); a refusal comes back as ESP_ERR_NOT_ALLOWED with nothing sent. */
 static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
                                   const uint8_t *extra, size_t extra_len,
-                                  uint8_t *status, uint32_t timeout_ms)
+                                  uint8_t *status, uint32_t timeout_ms,
+                                  bool (*admit)(void))
 {
-    if (!s_initialized || s_cfg.uart_query == NULL) {
+    if (!s_initialized || (admit == NULL ? s_cfg.uart_query == NULL : s_cfg.uart_query_admitted == NULL)) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
     uart_sensor_response_t resp;
     memset(&resp, 0, sizeof(resp));
-    esp_err_t err = s_cfg.uart_query(ch, cmd, extra, extra_len,
-                                     1 /* 1-byte status */, &resp, timeout_ms);
+    esp_err_t err = admit == NULL
+        ? s_cfg.uart_query(ch, cmd, extra, extra_len, 1 /* 1-byte status */, &resp, timeout_ms)
+        : s_cfg.uart_query_admitted(ch, cmd, extra, extra_len, 1, &resp, timeout_ms, admit);
+    if (err == ESP_ERR_NOT_ALLOWED) {
+        uart_sensor_response_free(&resp);
+        return make_result(err, "AMBIT%u OTA cmd %u refused: power protection", ch + 1, cmd[0]);
+    }
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < 1) {
         uart_sensor_response_free(&resp);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
@@ -3403,14 +3411,20 @@ static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
     return make_result(ESP_OK, "AMBIT%u OTA cmd %u status=%u", ch + 1, cmd[0], st);
 }
 
-cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status)
+cmd_result_t cmd_ambit_ota_begin_admitted(uint8_t ch, uint32_t image_size, uint8_t *status,
+                                          bool (*admit)(void))
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_BEGIN,
                        (uint8_t)image_size,         (uint8_t)(image_size >> 8),
                        (uint8_t)(image_size >> 16), (uint8_t)(image_size >> 24),
                        0, 0, 0 };
     /* begin() erases the target OTA partition (~hundreds of ms) — allow time. */
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000, admit);
+}
+
+cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status)
+{
+    return cmd_ambit_ota_begin_admitted(ch, image_size, status, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
@@ -3426,23 +3440,23 @@ cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
     uint16_t crc = ambit_crc16_ccitt(chunk, len);
     extra[len]     = (uint8_t)crc;
     extra[len + 1] = (uint8_t)(crc >> 8);
-    return ambit_ota_cmd(ch, cmd, extra, (size_t)len + 2, status, 5000);
+    return ambit_ota_cmd(ch, cmd, extra, (size_t)len + 2, status, 5000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_END, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 10000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 10000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_ABORT, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_CONFIRM, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000, NULL);
 }

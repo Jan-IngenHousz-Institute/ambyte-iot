@@ -236,16 +236,26 @@ esp_err_t evq_hil_ambit_nvsdump(uint8_t channel, const char *tag)
 
 /* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5).
  * `may_write` (NULL = no gate) is the brownout-protection admission, passed for
- * the FIRST region only (ambit_flash_image_gated): it is asked after this
- * region's SD ref, fopen, seek and size check and the log line, immediately
- * before esp_loader_flash_start sends the first erase — each of those FAT/VFS
- * steps can block behind SD latency (review round 3 of PR #103). Refused →
- * nothing erased, the file closed, *refused = true, ESP_LOADER_SUCCESS (so the
- * caller resets the AMBIT back into its app on every build). Later regions
- * pass NULL: a channel that has started erasing completes. */
+ * the FIRST region only (ambit_flash_image_gated). Its LAST check is inside the
+ * loader: esp_loader_flash_start_admitted asks it after init_flash_params (SPI
+ * attach, flash-size detection, SPI parameters — UART round trips; the first
+ * flash_start always does them) and immediately before the flash-begin erase
+ * command, with no I/O in between (review round 4 of PR #103). It is also
+ * asked earlier, after this region's SD ref / fopen / seek / size check, as an
+ * early exit. Refused → nothing erased, the file closed, *refused = true,
+ * ESP_LOADER_SUCCESS (so the caller resets the AMBIT back into its app on
+ * every build). Later regions pass NULL: a channel that has started erasing
+ * completes. */
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
                                                 const flash_region_t *r, bool (*may_write)(void),
                                                 bool *refused, uint32_t *bytes_out);
+
+/* esp_loader's admission takes (void *ctx); ctx points at the bool(*)(void). */
+static bool admit_trampoline(void *ctx)
+{
+    bool (*const *fn)(void) = ctx;
+    return (*fn)();
+}
 
 /* SD RW-gate wrapper (audit R-6): the hot-plug monitor's teardown must not free the
  * FATFS volume under this region's fread loop. Per-region ref; io_begin fails cleanly
@@ -284,7 +294,7 @@ static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char
     ESP_LOGW(TAG, "  region %s @0x%06lx: %ld B (erasing…)", r->fname,
              (unsigned long)r->offset, fsize);
 
-    /* The last safe point of the whole flash: nothing has been erased yet. */
+    /* Early exit; the last check is inside the loader, right before the erase. */
     if (may_write != NULL && !may_write()) {
         ESP_LOGW(TAG, "  region %s: not erasing - power protection began", r->fname);
         fclose(f);
@@ -297,7 +307,16 @@ static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char
         .image_size = (uint32_t)fsize,
         .block_size = FLASH_BLOCK,
     };
-    esp_loader_error_t le = esp_loader_flash_start(loader, &cfg);
+    bool loader_refused = false;
+    esp_loader_error_t le = esp_loader_flash_start_admitted(loader, &cfg,
+                                                            may_write != NULL ? admit_trampoline : NULL,
+                                                            (void *)&may_write, &loader_refused);
+    if (le == ESP_LOADER_SUCCESS && loader_refused) {
+        ESP_LOGW(TAG, "  region %s: not erasing - power protection began during the flash setup", r->fname);
+        fclose(f);
+        *refused = true;
+        return ESP_LOADER_SUCCESS;
+    }
     if (le != ESP_LOADER_SUCCESS) {
         ESP_LOGE(TAG, "  flash_start(%s) failed (%d)", r->fname, le);
         fclose(f);

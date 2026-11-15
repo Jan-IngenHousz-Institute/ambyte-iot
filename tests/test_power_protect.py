@@ -160,6 +160,86 @@ class PowerProtectHostTest(unittest.TestCase):
                 self.assertIn("persist_fault", r)
 
 
+class DestructivePrimitivesTest(unittest.TestCase):
+    """Review round 4 of PR #103: gate the exact primitive that starts the
+    destruction, with no blocking I/O between the admission and it. Runs the
+    PRODUCTION bodies, verbatim: the vendored loader's init_flash_params +
+    esp_loader_flash_start(_admitted) (the first flash_start always does SPI
+    attach, flash-ID detection and SPI parameters before the erase) and
+    uart_sensors' do_query_admitted / do_query (channel wait + wake before the
+    OTA_BEGIN send). Protection begins inside each blocking step."""
+
+    ROM = ("rom_flip_during_spi_attach", "rom_flip_during_detect", "rom_flip_during_spi_params")
+    UART = ("uart_flip_during_channel_wait", "uart_flip_during_wake")
+    CONTROLS = ("rom_admitted", "rom_ungated_wrapper", "uart_admitted", "uart_ungated_query")
+
+    @classmethod
+    def setUpClass(cls):
+        from test_schedule_light_cleanup import function
+        loader = (ROOT / "components/esp_serial_flasher/src/esp_loader.c").read_text()
+        uart = (ROOT / "components/uart_sensors/uart_sensors.c").read_text()
+        cls.tmp = tempfile.TemporaryDirectory(prefix="primitives-")
+        tmp = Path(cls.tmp.name)
+        (tmp / "primitives-production.inc").write_text("\n".join(
+            [function(loader, n) for n in ("init_flash_params", "esp_loader_flash_start_admitted",
+                                           "esp_loader_flash_start")]
+            + [function(uart, n) for n in ("do_query_admitted", "do_query")]))
+        cc = os.environ.get("CC") or shutil.which("clang") or "cc"
+        cls.bin = tmp / "primitives"
+        cmd = [cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+               "-Wno-unused-function", f"-I{tmp}", str(HOST / "loader_driver.c"), "-o", str(cls.bin)]
+        if "clang" in Path(cc).name:
+            cmd[1:1] = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(r.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_every_scenario(self):
+        for name in self.ROM + self.UART + self.CONTROLS:
+            with self.subTest(scenario=name):
+                r = subprocess.run([str(self.bin), name], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"PASS {name}", r.stdout)
+
+    def test_nothing_blocking_between_admission_and_primitive(self):
+        loader = (ROOT / "components/esp_serial_flasher/src/esp_loader.c").read_text()
+        fn = loader[loader.index("esp_loader_error_t esp_loader_flash_start_admitted("):]
+        fn = fn[:fn.index("\n}\n")]
+        gate = fn.index("if (admit != NULL && !admit(ctx)) {")
+        self.assertLess(fn.index("RETURN_ON_ERROR(init_flash_params(loader));"), gate)
+        tail = fn[gate:]
+        self.assertIn("return loader_flash_begin_cmd(", tail)
+        for call in ("init_flash_params", "loader_spi_parameters", "esp_loader_flash_detect_size",
+                     "send_cmd", "->read(", "->write("):
+            self.assertNotIn(call, tail)
+        wrapper = loader[loader.index("esp_loader_error_t esp_loader_flash_start(esp_loader_t *loader, esp_loader_flash_cfg_t *cfg)\n{"):]
+        self.assertIn("return esp_loader_flash_start_admitted(loader, cfg, NULL, NULL, NULL);",
+                      wrapper[:wrapper.index("\n}\n")])
+        uart = (ROOT / "components/uart_sensors/uart_sensors.c").read_text()
+        q = uart[uart.index("static esp_err_t do_query_admitted("):]
+        q = q[:q.index("\n}\n")]
+        self.assertTrue(q.index("channel_acquire(") < q.index("ambit_wake(") < q.index("if (admit != NULL && !admit())")
+                        < q.index("err = ambit_send_cmd(port, cmd, extra, extra_len);"))
+        between = q[q.index("if (admit != NULL && !admit())"):q.index("err = ambit_send_cmd(port, cmd, extra, extra_len);")]
+        for call in ("ambit_", "uart_", "channel_", "vTaskDelay", "now_us"):   # no I/O between them
+            self.assertNotIn(call, between)
+        dc = (ROOT / "components/device_commands/device_commands.c").read_text()
+        begin = dc[dc.index("cmd_result_t cmd_ambit_ota_begin_admitted("):]
+        self.assertIn("return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000, admit);", begin[:begin.index("\n}\n")])
+        self.assertIn("s_cfg.uart_query_admitted(ch, cmd, extra, extra_len, 1, &resp, timeout_ms, admit)", dc)
+        self.assertIn(".uart_query_admitted    = uart_available ? uart_sensors_get_admitted_query_fn() : NULL,",
+                      (ROOT / "main/app_main.c").read_text())
+        ota = (ROOT / "components/ambit_ota/ambit_ota.c").read_text()
+        self.assertIn("cmd_ambit_ota_begin_admitted(x->ch, (uint32_t)len, &status, power_allows_write)", ota)
+        flash = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
+        self.assertIn("esp_loader_flash_start_admitted(loader, &cfg,", flash)
+        self.assertNotIn("esp_loader_flash_start(loader, &cfg)", flash)
+
+
 class AmbitWorkerProtectionTest(unittest.TestCase):
     """Review of PR #103, AMBIT side. Round 1: re-check after the ack flush /
     fleet spread, after the download or release fetch, before each channel.
@@ -174,7 +254,8 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
     attach/boot-sync fail cap. The Ambyte side runs in tests/test_ota_admission.py."""
 
     SCENARIOS = ("ota_protected_at_entry", "ota_flip_during_spread", "ota_flip_during_quiesce",
-                 "ota_flip_during_download", "ota_flip_during_ping", "ota_flip_during_identity",
+                 "ota_flip_during_mount", "ota_flip_during_download", "ota_flip_during_ping",
+                 "ota_flip_during_identity", "ota_flip_during_wake", "flash_flip_during_spi_setup",
                  "ota_flip_mid_sweep", "flash_flip_during_ack", "flash_flip_during_suspend",
                  "flash_flip_during_fetch", "flash_flip_during_probe", "flash_flip_during_preflight",
                  "flash_flip_during_bus_wait", "flash_flip_during_rom_connect", "flash_flip_during_first_open",
@@ -188,17 +269,32 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
         flash = (ROOT / "components/ambit_flash/ambit_flash.c").read_text()
         regions = flash[flash.index("typedef struct {\n    uint32_t    offset;"):]
         regions = regions[:regions.index("\n", regions.index("#define NUM_REGIONS")) + 1]
+        sink_ctx = ota[ota.index("typedef struct {\n    uint8_t  ch;\n    uint16_t seq;"):]
+        sink_ctx = sink_ctx[:sink_ctx.index("} ota_sink_ctx_t;") + len("} ota_sink_ctx_t;")]
+
+        def cold_function(src, name):
+            m = re.search(r"^__attribute__\(\(cold\)\) static [\w ]+?\b" + name + r"\([^;]*?\)\s*\{", src, re.M)
+            assert m, name
+            depth, end = 1, m.end()
+            while depth:
+                depth += (src[end] == "{") - (src[end] == "}")
+                end += 1
+            return src[m.start():end]
         cls.tmp = tempfile.TemporaryDirectory(prefix="ambit-worker-")
         tmp = Path(cls.tmp.name)
         (tmp / "ambit-worker-production.inc").write_text("\n".join(
             [regions]
             + [function(flash, name) for name in ("boot_fail_key", "boot_fail_count", "boot_fail_bump",
                                                   "boot_fail_clear", "flash_power_allows_write",
-                                                  "boot_fail_restore", "fw_matches", "flash_one_region_impl",
+                                                  "boot_fail_restore", "fw_matches", "admit_trampoline",
+                                                  "flash_one_region_impl",
                                                   "flash_one_region", "ambit_flash_image_gated",
                                                   "ambit_flash_attach_flash")]
-            + [function(ota, name) for name in ("power_note_refusal", "power_blocks_write", "power_allows_write",
-                                                "ambit_ota_one_impl", "ambit_ota_one", "ambit_do_ota",
+            + [function(ota, name) for name in ("power_note_refusal", "power_blocks_write", "power_allows_write")]
+            + [sink_ctx]
+            + [cold_function(ota, name) for name in ("ota_sink_begin", "ota_sink_data", "ota_sink_end",
+                                                     "ota_sink_abort", "ambit_stream_image")]
+            + [function(ota, name) for name in ("ambit_ota_one_impl", "ambit_ota_one", "ambit_do_ota",
                                                 "ambit_do_flash", "ambit_ota_run")]))
         cc = os.environ.get("CC") or shutil.which("clang") or "cc"
         cls.bin = tmp / "ambit_worker"
@@ -244,12 +340,13 @@ class AmbitWorkerProtectionTest(unittest.TestCase):
         # Round 2: protection during ch0's ROM probe / preflight / bus wait / ROM
         # connect: ch0 is skipped (never erased), not reported flash_ok.
         for name in ("flash_flip_during_probe", "flash_flip_during_preflight", "flash_flip_during_bus_wait",
-                     "flash_flip_during_rom_connect", "flash_flip_during_first_open", "flash_flip_during_first_seek"):
+                     "flash_flip_during_rom_connect", "flash_flip_during_first_open", "flash_flip_during_first_seek",
+                     "flash_flip_during_spi_setup"):
             with self.subTest(scenario=name):
                 got = self.reports(name)
                 self.assertIn(["ambit_flash_status", "skipped", "ch=0", "id=job-1", "detail=power_protect"], got)
                 self.assertNotIn("flash_ok", [g[1] for g in got])
-        for name in ("ota_flip_during_ping", "ota_flip_during_identity"):
+        for name in ("ota_flip_during_ping", "ota_flip_during_identity", "ota_flip_during_wake"):
             with self.subTest(scenario=name):
                 got = self.reports(name)
                 self.assertIn(["ambit_ota_status", "failed", "ch=0", "id=job-1", "detail=power_protect"], got)
@@ -336,7 +433,7 @@ class PowerProtectWiringContractTest(unittest.TestCase):
         impl = amb[amb.index("static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage, bool *power_refused)\n{"):]
         impl = impl[:impl.index("\n}\n")]
         self.assertTrue(impl.index('ambit_log_version(ch, "before");') < impl.index("power_protect_blocks_flash()")
-                        < impl.index("ambit_stream_image(ch, stage)"))
+                        < impl.index("ambit_stream_image(ch, stage, power_refused)"))
         flash = self.read("components/ambit_flash/ambit_flash.c")
         gated = flash[flash.index("esp_err_t ambit_flash_image_gated("):]
         gated = gated[:gated.index("\nreset_and_done:")]
@@ -355,7 +452,7 @@ class PowerProtectWiringContractTest(unittest.TestCase):
         steps = [region.index(k) for k in ('fopen(path, "rb")', "fseek(f, 0, SEEK_END)", "fseek(f, 0, SEEK_SET)",
                                            "if (fsize <= 0)", "ESP_LOGW(TAG, \"  region %s @0x%06lx",
                                            "if (may_write != NULL && !may_write()) {",
-                                           "esp_loader_flash_start(loader, &cfg)")]
+                                           "esp_loader_flash_start_admitted(loader, &cfg,")]
         self.assertEqual(steps, sorted(steps))
         # Every unattended writer is gated; the plain one is the USB console's.
         for rel in ("components/ambit_ota/ambit_ota.c", "components/ambit_flash/ambit_flash.c"):

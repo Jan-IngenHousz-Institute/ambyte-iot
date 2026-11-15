@@ -1594,6 +1594,7 @@ void app_main(void)
         .current_timezone       = timezone_current_name,
         .timezone_snapshot      = timezone_snapshot,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
+        .uart_query_admitted    = uart_available ? uart_sensors_get_admitted_query_fn() : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,

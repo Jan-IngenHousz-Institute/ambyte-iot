@@ -235,6 +235,30 @@ first action after a brownout is therefore already shed.
 
   `device_commands_flash_power_ok()` is also false while protected, for any
   future caller.
+
+### Destructive primitives and their gates
+
+The final admission is attached to the exact primitive that starts each
+destructive or heavy operation, with **no blocking I/O between the admission
+and the primitive** (review round 4 of PR #103). Every earlier check in the
+table above is an early exit; this table is the contract.
+
+| Operation | Primitive that starts it | Final admission, immediately before it | Refusal |
+|---|---|---|---|
+| AMBIT ROM flash: `ambit_flash` command, attach update, boot sync (first region only; a started channel completes) | `loader_flash_begin_cmd`, the flash-begin erase command (`esp_serial_flasher/src/esp_loader.c`) | `esp_loader_flash_start_admitted(…, admit, …)` (local patch in the vendored loader): `admit` runs after `init_flash_params` (SPI attach, flash-ID size detection, SPI parameters: UART round trips; the first `flash_start` after a stub connect always does them), the size checks, MD5 init and the timer arm; then `loader_flash_begin_cmd` | nothing erased; `*refused`; region file closed, SD ref released; `ESP_ERR_NOT_ALLOWED`; AMBIT reset back into its app; UART session ended |
+| AMBIT OTA (`ambit_ota` command; DATA/END of a begun update stay ungated) | sending `OTA_BEGIN` (the AMBIT erases its inactive slot): `ambit_send_cmd` in `uart_sensors.c` | `do_query_admitted(…, admit)` (via `cmd_ambit_ota_begin_admitted` and the `uart_query_admitted` port): `admit` runs after `channel_acquire` and the `ambit_wake` handshake; then `ambit_send_cmd` | nothing sent; channel released normally, not marked disconnected; `ESP_ERR_NOT_ALLOWED`; channel `failed` / `power_protect` |
+| AMBIT OTA image download | `http_get_to_stage` | `power_blocks_write` after the 65-s quiesce, the comms suspend and the SD mount (an `else if` chain: the mount runs in the preceding condition) | no download; resume; `failed` / `power_protect` |
+| `ambit_flash` release fetch | `ambit_fw_fetch` | `power_blocks_write` after the workload/comms suspend and the SD mount | no fetch, no write; resume; `failed` / `power_protect` |
+| Ambyte OTA download (MQTT, Jobs) | `esp_https_ota_begin` (TLS connect + HTTP GET; the image is written only to the inactive slot) | `power_late = power_protect_blocks_flash()` on the line before, after the IN_PROGRESS flush and the workload/comms suspend | no download; resume; `dropped` / `power_protect`; Jobs retryable |
+| Ambyte OTA image selection | `esp_https_ota_finish` (sets the boot partition) | `power_protect_blocks_flash()` right before it, after the download and image admission | abort (slot stays inactive); resume; `dropped` / `power_protect` |
+| USB console `ambit_flash` | `esp_loader_flash_start` (unchanged upstream behaviour) | none, deliberately: an operator at the bench | none |
+
+Evidence: `tests/power_protect_host/loader_driver.c` runs the vendored
+`init_flash_params` + `esp_loader_flash_start(_admitted)` and the production
+`do_query_admitted` / `do_query` verbatim, switching protection on inside the
+SPI attach, the size detection, the SPI parameters, the channel wait and the
+wake: no erase, no OTA_BEGIN send; the ungated wrappers keep upstream
+behaviour. With the two primitive gates removed those 5 scenarios fail.
 - Self-reboot paths are unchanged: a reboot does not clear the state.
 
 ## C. Reporting
@@ -319,6 +343,8 @@ run fails unless every reply confirms the requested state. In Actions →
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.
+- `tests/power_protect_host/loader_driver.c`: the loader and UART primitives
+  (table above).
 - `tests/ota_host/update_driver.c` runs the production OTA worker refusal on
   the https and Jobs paths, including protection that begins after the ack
   flush and during the download.
@@ -328,8 +354,9 @@ run fails unless every reply confirms the requested state. In Actions →
   `ambit_flash_attach_flash`) with protection beginning inside the spread,
   the ack flush, the quiesce, the suspend, the download / release fetch, a
   ping, the version read, the ROM probe, the SD preflight, the UART bus wait,
-  the ROM connect, the first region file's open and seek, and mid-sweep (22
-  scenarios, the region writer itself included; with the round-2 gates
+  the ROM connect, the first region file's open and seek, the loader's flash
+  setup, the OTA_BEGIN wake, an SD mount on a present-but-unmounted card, and
+  mid-sweep (26 scenarios, the region writer and the OTA sink included; with the round-2 gates
   removed the 9 round-2 in-step scenarios fail, and on the round-2 head the 3
   open/seek scenarios fail). The Ambyte worker also covers protection during
   the suspend and the second flush.

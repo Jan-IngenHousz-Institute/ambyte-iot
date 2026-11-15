@@ -6,8 +6,12 @@
  *       flash_power_allows_write, flash_one_region_impl, flash_one_region,
  *       ambit_flash_image_gated, ambit_flash_attach_flash, fw_matches;
  *   components/ambit_ota/ambit_ota.c   power_note_refusal, power_blocks_write,
- *       power_allows_write, ambit_ota_one_impl, ambit_ota_one, ambit_do_ota,
- *       ambit_do_flash, ambit_ota_run.
+ *       power_allows_write, the OTA sink (ota_sink_ctx_t, ota_sink_begin/data/
+ *       end/abort), ambit_stream_image, ambit_ota_one_impl, ambit_ota_one,
+ *       ambit_do_ota, ambit_do_flash, ambit_ota_run.
+ * The loader and UART primitives themselves (esp_loader_flash_start_admitted,
+ * do_query_admitted) run verbatim in loader_driver.c; here they are seams
+ * that block (setup / wake), then ask the admission exactly as they do.
  * Fakes sit only at the seams: UART ping / version read / OTA stream, the ROM
  * loader (connect, flash_start = the erase, write, finish, reset), the region
  * files (fopen / fseek / fclose over an in-memory image), SD refs, NVS, the
@@ -133,8 +137,8 @@ static void flash_fail_clear(void) {}
 static void wait_for_fleet_slot(void) { flip_if("ota_flip_during_spread"); }
 /* The real one suspends the workload and waits 65 s. */
 static void ambit_quiesce_for_idle(void) { workload_suspend(); flip_if("ota_flip_during_quiesce"); }
-static bool sdcard_is_mounted(void) { return true; }
-static esp_err_t sdcard_mount(void) { return ESP_OK; }
+static bool sdcard_is_mounted(void) { return !is("ota_flip_during_mount"); }
+static esp_err_t sdcard_mount(void) { flip_if("ota_flip_during_mount"); return ESP_OK; }   /* can block */
 static bool sdcard_io_begin(void) { ++sd_refs; return true; }
 static void sdcard_io_end(void) { assert(sd_refs > 0); --sd_refs; }
 static esp_err_t ambit_stage_remove(const ambit_stage_t *s) { (void)s; return ESP_OK; }
@@ -157,13 +161,42 @@ static bool ambit_log_version(uint8_t ch, const char *when)
     if (ch == 0 && strcmp(when, "before") == 0) flip_if("ota_flip_during_identity");
     return true;
 }
-/* OTA_BEGIN + data + end: the destructive part. */
-static bool ambit_stream_image(uint8_t ch, const ambit_stage_t *st)
+/* ambit_stage.c's streamer: begin (OTA_BEGIN) → data → end. */
+#define AMBIT_OTA_CHUNK_MAX 128
+#define AMBIT_OTA_MAX_RETRY 3
+typedef struct {
+    void *ctx;
+    bool (*begin)(void *ctx, size_t len);
+    bool (*data)(void *ctx, const uint8_t *buf, size_t n);
+    bool (*end)(void *ctx);
+    void (*abort)(void *ctx);
+} ambit_stage_sink_t;
+static unsigned ota_aborts, ota_data;
+static bool ambit_stage_stream(const ambit_stage_t *st, const ambit_stage_sink_t *sink, uint8_t *buf, size_t cap)
 {
-    (void)st; ++writes[ch];
-    if (ch == 1) flip_if("ota_flip_mid_sweep");   /* begins while ch1 streams: it finishes */
-    return true;
+    if (!sink->begin(sink->ctx, st->len)) return false;
+    memset(buf, 0x5a, cap);
+    if (!sink->data(sink->ctx, buf, cap)) { sink->abort(sink->ctx); return false; }
+    return sink->end(sink->ctx);
 }
+/* device_commands → uart_sensors do_query_admitted: channel wait + wake
+ * (blocking; protection may begin there), then the admission, then the send
+ * of OTA_BEGIN (the destructive primitive). */
+static cmd_result_t cmd_ambit_ota_begin_admitted(uint8_t ch, uint32_t size, uint8_t *status, bool (*admit)(void))
+{
+    (void)size;
+    assert(admit != NULL);                         /* the update path is always admitted */
+    if (ch == 0) flip_if("ota_flip_during_wake");
+    if (!admit()) return (cmd_result_t){ESP_ERR_NOT_ALLOWED, ""};
+    ++writes[ch];
+    if (ch == 1) flip_if("ota_flip_mid_sweep");   /* begins while ch1 updates: it finishes */
+    *status = 0;
+    return (cmd_result_t){ESP_OK, ""};
+}
+static cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq, const uint8_t *b, uint8_t n, uint8_t *st)
+{ (void)ch; (void)seq; (void)b; (void)n; ++ota_data; *st = 0; return (cmd_result_t){ESP_OK, ""}; }
+static cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *st) { (void)ch; *st = 0; return (cmd_result_t){ESP_OK, ""}; }
+static cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *st) { (void)ch; ++ota_aborts; *st = 0; return (cmd_result_t){ESP_OK, ""}; }
 static cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *st) { (void)ch; *st = 0; return (cmd_result_t){ESP_OK, ""}; }
 static void cmd_ambit_device_info_invalidate(uint8_t ch) { (void)ch; }
 static cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *i) { (void)ch; i->valid = true; return (cmd_result_t){ESP_OK, ""}; }
@@ -228,10 +261,19 @@ static void uart_set_baudrate(int uart, uint32_t b) { (void)uart; (void)b; }
 #define ESP_LOADER_ERROR_FAIL 1
 static uint8_t s_flash_buf[FLASH_BLOCK];
 typedef struct { uint32_t offset, image_size, block_size; } esp_loader_flash_cfg_t;
-static esp_loader_error_t esp_loader_flash_start(esp_loader_t *l, esp_loader_flash_cfg_t *cfg)
+/* The vendored loader's admitted start: flash setup (SPI attach, size detect,
+ * SPI params: UART round trips, protection may begin there), then the
+ * admission, then the erase. */
+static esp_loader_error_t esp_loader_flash_start_admitted(esp_loader_t *l, esp_loader_flash_cfg_t *cfg,
+                                                          bool (*admit)(void *), void *ctx, bool *refused)
 {
     (void)l;
     assert(cur_ch >= 0 && sd_refs == 1 && open_files == 1);
+    *refused = false;
+    if (cfg->offset == 0) flip_if("flash_flip_during_spi_setup");
+    if (admit != NULL && !admit(ctx)) { *refused = true; return ESP_LOADER_SUCCESS; }
+    assert(cfg->offset != 0 || admit != NULL);     /* the first region is always admitted */
+    assert(cfg->offset == 0 || admit == NULL);     /* later regions never are */
     ++erases;
     if (cfg->offset == 0) {
         ++writes[cur_ch];
@@ -324,9 +366,14 @@ int main(int argc, char **argv)
     } else if (is("ota_flip_during_download")) {
         run(AMBIT_OP_OTA, 2, false, "");
         assert(downloads == 1 && total_writes() == 0 && latches == 0 && skips == 1);
-    } else if (is("ota_flip_during_ping") || is("ota_flip_during_identity")) {
+    } else if (is("ota_flip_during_ping") || is("ota_flip_during_identity") || is("ota_flip_during_wake")) {
         run(AMBIT_OP_OTA, AMBIT_OTA_CH_ALL, false, "");
         assert(downloads == 1 && total_writes() == 0 && latches == 0 && skips == 1);
+        assert(ota_data == 0 && ota_aborts == 0);   /* nothing begun, nothing to abort */
+    } else if (is("ota_flip_during_mount")) {
+        /* Round 4: a present but unmounted card; protection begins during the mount. */
+        run(AMBIT_OP_OTA, AMBIT_OTA_CH_ALL, false, "");
+        assert(downloads == 0 && total_writes() == 0 && suspends == 1 && comms_down == 1 && skips == 1);
     } else if (is("ota_flip_mid_sweep")) {
         run(AMBIT_OP_OTA, AMBIT_OTA_CH_ALL, false, "");
         /* ch0 and ch1 (started before protection) finished; ch2, ch3 never started. */
@@ -352,6 +399,11 @@ int main(int argc, char **argv)
          * FAT/VFS steps; the admission inside the region still stops the erase. */
         run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");
         assert(total_writes() == 0 && erases == 0 && opens == 1 && sessions == 1 && resets == 1);
+        assert(latches == 0 && fail_notes == 0 && skips == 1);
+    } else if (is("flash_flip_during_spi_setup")) {
+        /* Round 4: protection begins inside the loader's flash setup. */
+        run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");
+        assert(total_writes() == 0 && erases == 0 && sessions == 1 && resets == 1);
         assert(latches == 0 && fail_notes == 0 && skips == 1);
     } else if (is("flash_flip_mid_sweep")) {
         run(AMBIT_OP_FLASH, AMBIT_OTA_CH_ALL, false, "");

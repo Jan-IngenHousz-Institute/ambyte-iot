@@ -73,6 +73,7 @@ void uart_sensors_invalidate_ping_cache(void);
 
 /* Port-adapter getters — return function pointers wired into device_commands */
 uart_sensor_query_fn       uart_sensors_get_query_fn(void);
+uart_sensor_admitted_query_fn uart_sensors_get_admitted_query_fn(void);
 uart_sensor_ping_fn        uart_sensors_get_ping_fn(void);
 uart_sensor_status_fn      uart_sensors_get_status_fn(void);
 uart_sensor_text_query_fn  uart_sensors_get_text_query_fn(void);

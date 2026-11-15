@@ -473,6 +473,21 @@ static esp_loader_error_t init_flash_params(esp_loader_t *loader)
 
 esp_loader_error_t esp_loader_flash_start(esp_loader_t *loader, esp_loader_flash_cfg_t *cfg)
 {
+    return esp_loader_flash_start_admitted(loader, cfg, NULL, NULL, NULL);
+}
+
+/* LOCAL PATCH (ambyte-iot, brownout protection, PR #103): esp_loader_flash_start
+ * with an admission asked at the last safe point. init_flash_params (SPI attach,
+ * flash-size detection, SPI parameters: UART round trips) runs first; `admit` is
+ * asked after it and the local checks, immediately before loader_flash_begin_cmd
+ * (the erase), with no I/O in between. Refused: nothing erased, *refused = true,
+ * ESP_LOADER_SUCCESS. admit == NULL is exactly upstream esp_loader_flash_start. */
+esp_loader_error_t esp_loader_flash_start_admitted(esp_loader_t *loader, esp_loader_flash_cfg_t *cfg,
+                                                   bool (*admit)(void *ctx), void *ctx, bool *refused)
+{
+    if (refused != NULL) {
+        *refused = false;
+    }
 
     if (loader->_protocol_type == ESP_LOADER_PROTOCOL_SPI) {
         return ESP_LOADER_ERROR_UNSUPPORTED_FUNC;
@@ -507,6 +522,12 @@ esp_loader_error_t esp_loader_flash_start(esp_loader_t *loader, esp_loader_flash
     const uint32_t blocks_to_write = (cfg->image_size + cfg->block_size - 1) / cfg->block_size;
     const uint32_t erase_size = calc_erase_size(loader->_target, loader->_stub_running, cfg->offset, cfg->image_size);
     loader->_port->ops->start_timer(loader->_port, timeout_per_mb(erase_size, ERASE_FLASH_TIMEOUT_PER_MB));
+    if (admit != NULL && !admit(ctx)) {
+        if (refused != NULL) {
+            *refused = true;
+        }
+        return ESP_LOADER_SUCCESS;   /* nothing erased (LOCAL PATCH) */
+    }
     return loader_flash_begin_cmd(loader, &cfg->_state._sequence_number, cfg->offset, erase_size, cfg->block_size, blocks_to_write, encryption_in_cmd);
 }
 

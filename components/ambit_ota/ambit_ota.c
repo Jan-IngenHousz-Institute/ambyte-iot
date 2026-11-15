@@ -396,14 +396,25 @@ typedef struct {
     uint16_t seq;
     size_t   sent, total;
     int      last_decile;
+    bool     power_refused;   /* OTA_BEGIN refused by brownout protection */
 } ota_sink_ctx_t;
+
+static bool power_allows_write(void);
 
 __attribute__((cold)) static bool ota_sink_begin(void *vctx, size_t len)
 {
     ota_sink_ctx_t *x = vctx;
     uint8_t status = 0xFF;
     x->total = len;
-    cmd_result_t r = cmd_ambit_ota_begin(x->ch, (uint32_t)len, &status);
+    /* The destructive primitive: OTA_BEGIN makes the AMBIT erase its inactive
+     * slot. Admitted inside the UART transaction, after the channel wait and
+     * the wake, immediately before the send (review round 4 of PR #103). */
+    cmd_result_t r = cmd_ambit_ota_begin_admitted(x->ch, (uint32_t)len, &status, power_allows_write);
+    if (r.status == ESP_ERR_NOT_ALLOWED) {
+        ESP_LOGW(TAG, "AMBIT%u OTA_BEGIN not sent: power protection began", x->ch + 1);
+        x->power_refused = true;
+        return false;   /* nothing begun: ambit_stage_stream sends no abort */
+    }
     if (r.status != ESP_OK || status != 0) {
         ESP_LOGE(TAG, "OTA_BEGIN failed (%s, status=%u)", esp_err_to_name(r.status), status);
         return false;
@@ -465,14 +476,16 @@ __attribute__((cold)) static void ota_sink_abort(void *vctx)
 
 /* Stream the verified stage to channel `ch`: ambit_stage_stream re-hashes the
  * bytes it reads and aborts instead of OTA_END on any mismatch. */
-__attribute__((cold)) static bool ambit_stream_image(uint8_t ch, const ambit_stage_t *st)
+__attribute__((cold)) static bool ambit_stream_image(uint8_t ch, const ambit_stage_t *st, bool *power_refused)
 {
     ota_sink_ctx_t x = { .ch = ch, .last_decile = -1 };
     const ambit_stage_sink_t sink = {
         .ctx = &x, .begin = ota_sink_begin, .data = ota_sink_data, .end = ota_sink_end, .abort = ota_sink_abort,
     };
     uint8_t buf[AMBIT_OTA_CHUNK_MAX];
-    return ambit_stage_stream(st, &sink, buf, sizeof buf);
+    const bool ok = ambit_stage_stream(st, &sink, buf, sizeof buf);
+    *power_refused = x.power_refused;
+    return ok;
 }
 
 /* ── one channel: stream the staged image + confirm after reboot ──────────── */
@@ -498,15 +511,14 @@ static bool ambit_ota_one_impl(uint8_t ch, const ambit_stage_t *stage, bool *pow
 {
     ambit_log_version(ch, "before");
 
-    /* The last safe point (review of PR #103): the version read above blocks
-     * on the UART, the caller's ping and the SD gate before it; ambit_stage_
-     * stream sends OTA_BEGIN as its first act. Protection that began during
-     * any of them stops the stream here, before the AMBIT erases anything. */
+    /* Early exit after the version read (and the caller's ping and SD gate).
+     * The LAST check is inside the OTA_BEGIN transaction itself (ota_sink_begin
+     * → cmd_ambit_ota_begin_admitted), after its channel wait and wake. */
     if (power_protect_blocks_flash()) {
         *power_refused = true;
         return false;
     }
-    if (!ambit_stream_image(ch, stage)) return false;
+    if (!ambit_stream_image(ch, stage, power_refused)) return false;
 
     ESP_LOGW(TAG, "OTA_END ok — AMBIT%u rebooting; waiting %d ms then re-checking",
              ch + 1, AMBIT_OTA_REBOOT_WAIT_MS);
@@ -650,6 +662,10 @@ static void ambit_do_ota(const ambit_ota_req_t *r)
     } else if (!sdcard_is_mounted() && sdcard_mount() != ESP_OK) {
         ESP_LOGE(TAG, "SD not available — cannot stage the AMBIT image");
         detail = "SD not available";
+    } else if (power_blocks_write("AMBIT OTA", r->id, &power_stop)) {
+        /* Began during the SD mount (it can block on a present, unmounted
+         * card): the admission immediately before the download. */
+        detail = "power_protect";
     } else {
         ambit_stage_t stage;
         esp_err_t err = http_get_to_stage(url, &stage);   /* download once, verified */

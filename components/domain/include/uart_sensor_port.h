@@ -88,6 +88,19 @@ typedef esp_err_t (*uart_sensor_query_fn)(uint8_t channel,
                                           uart_sensor_response_t *response,
                                           uint32_t timeout_ms);
 
+/* uart_sensor_query_fn with an admission (brownout protection, PR #103):
+ * `admit` is asked after the channel is acquired and the AMBIT woken (both
+ * block), immediately before the command is sent. false → nothing sent, the
+ * channel released normally (not marked disconnected), ESP_ERR_NOT_ALLOWED.
+ * For commands that START a destructive operation (OTA_BEGIN); NULL = no gate. */
+typedef esp_err_t (*uart_sensor_admitted_query_fn)(uint8_t channel,
+                                                   const uint8_t cmd[8],
+                                                   const uint8_t *extra, size_t extra_len,
+                                                   size_t expect_raw,
+                                                   uart_sensor_response_t *response,
+                                                   uint32_t timeout_ms,
+                                                   bool (*admit)(void));
+
 typedef esp_err_t (*uart_sensor_ping_fn)(uint8_t channel, bool *connected);
 
 typedef esp_err_t (*uart_sensor_status_fn)(uint8_t channel,
