@@ -923,9 +923,12 @@ static esp_err_t do_query_admitted(uint8_t channel,
     /* 1b. Admission (brownout protection, uart_sensor_admitted_query_fn): the
      * channel wait and the wake handshake above both block, so the decision is
      * taken here, with nothing between it and the send. A refusal is not a
-     * link fault: the channel is released without being marked disconnected. */
+     * link fault, and the wake just succeeded: leave the channel CONNECTED.
+     * channel_acquire set BUSY, and channel_release turns a leftover BUSY into
+     * DISCONNECTED, so the final state must be set here (review round 5). */
     if (admit != NULL && !admit()) {
         err = ESP_ERR_NOT_ALLOWED;
+        s_ch[channel].state = UART_SENSOR_CONNECTED;
         goto out;
     }
 

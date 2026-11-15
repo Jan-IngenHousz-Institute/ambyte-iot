@@ -82,17 +82,35 @@ typedef int uart_port_t;
 #define UART_QUERY_ACK_ONLY ((size_t)-1)
 #define AMBIT_CMD_DONE 161
 #define AMBIT_CMD_OTA_BEGIN 25
-typedef enum { UART_SENSOR_DISCONNECTED = 0, UART_SENSOR_CONNECTED = 1, UART_SENSOR_UNKNOWN = 2 } uart_sensor_state_t;
+typedef enum { UART_SENSOR_DISCONNECTED = 0, UART_SENSOR_CONNECTED = 1, UART_SENSOR_BUSY = 2 } uart_sensor_state_t;
 typedef struct { esp_err_t status; uint8_t *raw; size_t raw_len; } uart_sensor_response_t;
 __attribute__((format(printf, 2, 3))) static void host_log(const char *tag, const char *fmt, ...) { (void)tag; (void)fmt; }
 #define ESP_LOGW(tag, ...) host_log(tag, __VA_ARGS__)
 static bool s_inited = true;
-static struct { int uart_num; uart_sensor_state_t state; bool ping_ok; int64_t ping_ts; } s_ch[UART_SENSOR_NUM_CHANNELS];
+static struct {
+    int uart_num, tx_pin, rx_pin;
+    bool shared;
+    uart_sensor_state_t state;
+    bool ping_ok;
+    int64_t ping_ts;
+} s_ch[UART_SENSOR_NUM_CHANNELS];
 static int locks;
 static unsigned sends, begin_sends, wakes;
 static int64_t now_us(void) { return 1; }
-static esp_err_t channel_acquire(uint8_t ch, uint32_t ms) { (void)ch; (void)ms; assert(locks == 0); ++locks; flip_if("uart_flip_during_channel_wait"); return ESP_OK; }
-static void channel_release(uint8_t ch) { (void)ch; assert(locks == 1); --locks; }
+/* channel_acquire / channel_release are PRODUCTION (extracted): acquire sets
+ * BUSY, release turns a leftover BUSY into DISCONNECTED. Seams below them. */
+typedef unsigned TickType_t;
+#define ESP_ERR_TIMEOUT 0x107
+#define pdTRUE 1
+#define UART_NUM_0 0
+#define UART_PIN_NO_CHANGE (-1)
+#define ESP_LOGD(tag, ...) host_log(tag, __VA_ARGS__)
+static int s_ch_mtx[UART_SENSOR_NUM_CHANNELS], s_uart0_mtx;
+static int xSemaphoreTake(int m, TickType_t t)
+{ (void)m; (void)t; ++locks; flip_if("uart_flip_during_channel_wait"); return pdTRUE; }
+static void xSemaphoreGive(int m) { (void)m; assert(locks > 0); --locks; }
+static void uart_flush_input(int p) { (void)p; }
+static void uart_set_pin(int p, int t, int r, int a, int b) { (void)p; (void)t; (void)r; (void)a; (void)b; }
 static esp_err_t ambit_wake(uart_port_t p, int64_t d) { (void)p; (void)d; ++wakes; flip_if("uart_flip_during_wake"); return ESP_OK; }
 static esp_err_t ambit_send_cmd(uart_port_t p, const uint8_t cmd[8], const uint8_t *x, size_t n)
 { (void)p; (void)x; (void)n; ++sends; if (cmd[0] == AMBIT_CMD_OTA_BEGIN) ++begin_sends; return ESP_OK; }
@@ -120,6 +138,7 @@ static esp_err_t uart_begin(bool gated)
     const uint8_t cmd[8] = { AMBIT_CMD_OTA_BEGIN, 0, 16, 0, 0, 0, 0, 0 };
     uart_sensor_response_t r;
     s_ch[0].state = UART_SENSOR_CONNECTED;
+    s_ch[0].shared = is("uart_flip_during_channel_wait");   /* exercise the UART0 remap branch too */
     assert(!pp_on);
     return gated ? do_query_admitted(0, cmd, NULL, 0, 1, &r, 15000, admit)
                  : do_query(0, cmd, NULL, 0, 1, &r, 15000);
@@ -149,9 +168,12 @@ int main(int argc, char **argv)
         const esp_err_t rc = uart_begin(true);
         assert(rc == ESP_ERR_NOT_ALLOWED && begin_sends == 0 && sends == 0 && wakes == (is("uart_flip_during_wake") || is("uart_flip_during_channel_wait") ? 1u : 0u));
         assert(locks == 0);                                   /* channel released normally */
-        assert(s_ch[0].state == UART_SENSOR_CONNECTED);       /* a refusal is not a link fault */
+        /* With the production acquire (BUSY) / release (BUSY -> DISCONNECTED):
+         * a refusal after a good wake must leave the channel CONNECTED. */
+        assert(s_ch[0].state == UART_SENSOR_CONNECTED);
     } else if (is("uart_admitted")) {
         assert(uart_begin(true) == ESP_OK && begin_sends == 1 && locks == 0);
+        assert(s_ch[0].state == UART_SENSOR_CONNECTED);
     } else if (is("uart_ungated_query")) {
         /* do_query (DATA / END / every other command) is unchanged. */
         sc = "uart_flip_during_wake";

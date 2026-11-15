@@ -183,7 +183,7 @@ class DestructivePrimitivesTest(unittest.TestCase):
         (tmp / "primitives-production.inc").write_text("\n".join(
             [function(loader, n) for n in ("init_flash_params", "esp_loader_flash_start_admitted",
                                            "esp_loader_flash_start")]
-            + [function(uart, n) for n in ("do_query_admitted", "do_query")]))
+            + [function(uart, n) for n in ("channel_acquire", "channel_release", "do_query_admitted", "do_query")]))
         cc = os.environ.get("CC") or shutil.which("clang") or "cc"
         cls.bin = tmp / "primitives"
         cmd = [cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
