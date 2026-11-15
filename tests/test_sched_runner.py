@@ -25,6 +25,7 @@ INCLUDES = [
 COMPONENT_SRCS = sorted((ROOT / "components/sched_spec").glob("*.c")) + [
     ROOT / "components/time_sync/time_sync.c",
     ROOT / "components/sched_runner/sched_runner_json.c",
+    ROOT / "components/sched_runner/sched_runner_shed.c",
 ]
 
 

@@ -7,7 +7,9 @@ name: Fleet command (ping / inventory / replay)
 # goes through the same environment gate as an OTA. Results land in the run
 # summary and in a results artifact. `log-list` / `log-read` read the SD log
 # directory (read-only, still behind the environment gate); log-read stitches
-# one device's file into the artifact (device-log.txt).
+# one device's file into the artifact (device-log.txt). `power-protect` reads
+# (status) or changes (clear / force, MUTATING, explicit devices only) the
+# brownout protection state (docs/power-protect.md).
 
 on:
   workflow_dispatch:
@@ -20,7 +22,7 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read]
+        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read, power-protect]
         default: ping
       timezone:
         description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
@@ -38,6 +40,16 @@ on:
         description: "log-read only: read this many bytes from the end (0 = the whole file)"
         type: string
         default: "65536"
+      power_protect_action:
+        description: "power-protect only: status (read-only), clear or force (MUTATING; needs an explicit device list)"
+        type: choice
+        options: [status, clear, force]
+        default: status
+      power_protect_state:
+        description: "power-protect force only: no_flash or hold (a forced state never auto-exits; clear ends it)"
+        type: choice
+        options: [no_flash, hold]
+        default: no_flash
       devices:
         description: "Exact client ids (ambyte_<MAC> or AMBYTE_<MAC>, case matters) or MACs, comma/space separated; empty = discover active devices"
         type: string
@@ -147,6 +159,8 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           LOG_NAME: ${{ inputs.log_name }}
           LOG_TAIL: ${{ inputs.log_tail_bytes }}
+          PP_ACTION: ${{ inputs.power_protect_action }}
+          PP_STATE: ${{ inputs.power_protect_state }}
         run: |
           set -uo pipefail
           for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT LOG_TAIL; do
@@ -154,6 +168,10 @@ jobs:
           done
           if [[ "${COMMAND}" == "set-timezone" && -z "${DEVICES//[[:space:]]/}" ]]; then
             echo "::error::set-timezone requires an explicit device list; discovery is refused"
+            exit 2
+          fi
+          if [[ "${COMMAND}" == "power-protect" && "${PP_ACTION}" != "status" && -z "${DEVICES//[[:space:]]/}" ]]; then
+            echo "::error::power-protect ${PP_ACTION} requires an explicit device list; discovery is refused"
             exit 2
           fi
           if [[ -n "${EXPECT_OFFSET}" && ! "${EXPECT_OFFSET}" =~ ^-?[0-9]+$ ]]; then
@@ -168,6 +186,10 @@ jobs:
           [[ -n "${EXPECT_OFFSET}" ]] && ARGS+=(--expect-offset "${EXPECT_OFFSET}")
           [[ -n "${EXPECT_FW}" ]] && ARGS+=(--expect-fw "${EXPECT_FW}")
           [[ "${COMMAND}" == "replay" ]] && ARGS+=(--mode "${MODE}" --token "${TOKEN}")
+          if [[ "${COMMAND}" == "power-protect" ]]; then
+            ARGS+=(--action "${PP_ACTION}")
+            [[ "${PP_ACTION}" == "force" ]] && ARGS+=(--state "${PP_STATE}")
+          fi
           if [[ "${COMMAND}" == "log-read" ]]; then
             # fleet_command validates the name and refuses anything but one explicit device.
             ARGS+=(--name "${LOG_NAME}" --out device-log.txt)

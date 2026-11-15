@@ -92,6 +92,12 @@ holds bench boards.
   NVS, never the SD; `exact=false` after a power-on). Bench-only `evq_hil fault io`
   (env evq-hil) injects per-writer faults; its resets are CPU resets, never power cuts.
   Host evidence: tests/sdlog_host, tests/ambit_host, tests/evq_host X group.
+- **Brownout protection (2026-11)**: `components/power_protect` sheds whole schedule jobs and
+  refuses updates (docs/power-protect.md). A shed run is NOT a failure (no fail streak) and
+  never touches the event log or its cursor; its NVS blob is written only on transitions,
+  brownout records, force and clear — never per read or heartbeat. Only fresh (changing),
+  valid, input-present charger frames may move it; battery-only units can only react to
+  `ESP_RST_BROWNOUT`.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

@@ -39,6 +39,82 @@ static inline sched_fail_log_t sched_fail_log_decision(bool failed,
                : SCHED_FAIL_LOG_NONE;
 }
 
+/* ── Brownout protection: shedding (power_protect.h, 2026-11) ──────────────
+ * Uluru units browned out at the every-10-minute MPF slots, when four AMBITs fire
+ * saturating flashes at once, and rebooted straight back into the same load.
+ * In no_flash a job carrying actinic/flash work is skipped; in hold every job
+ * with an ambit/ step is. The WHOLE job is skipped, never single steps: a job
+ * that lights the actinic LED and then measures (the qE light phase) would
+ * otherwise store a dark measurement labelled as a lit one.
+ *
+ * "Actinic-bearing" is decided from the COMPILED program, never from a name:
+ *   - ambit/trace whose protocol has any segment with actinic != 0 (MPF's
+ *     saturating segments are raw-DAC negatives, the qE light phase positive
+ *     PAR; both light the LED);
+ *   - ambit/actinic with level != 0 (WRENCH: negative = raw DAC, positive =
+ *     PAR; only 0 is "off").
+ * An unresolvable reference (cannot happen after compile) counts as
+ * actinic-bearing: the safe side. sched_runner_shed.c, host-tested. */
+typedef enum {
+    SCHED_SHED_NONE = 0,
+    SCHED_SHED_FLASH,  /* carries actinic/flash work; shed in no_flash and hold */
+    SCHED_SHED_AMBIT,  /* other ambit/ work; shed in hold only */
+} sched_shed_t;
+
+bool sched_step_is_actinic(const sched_program_t *prog, const sched_step_t *step);
+sched_shed_t sched_job_shed(const sched_program_t *prog, const sched_job_t *job,
+                            bool block_flash, bool block_ambit);
+
+/* Per-job execution accounting, pure so the host test proves the rule the
+ * ticket sets: a SHED run is not a failure. It never touches runs, failures
+ * or fail_streak (so the failure-streak throttle neither logs it nor resets
+ * a real streak), and it is counted on its own (power_skipped). Shed runs log
+ * like failures: the first of a streak and every 300th; the next real run
+ * logs the resumption. */
+typedef enum {
+    SCHED_RUN_OK = 0,
+    SCHED_RUN_FAILED,
+    SCHED_RUN_SHED,
+} sched_run_outcome_t;
+
+typedef struct {
+    uint32_t runs, failures, fail_streak;
+    uint32_t power_skipped;   /* runs shed by power protection, ever */
+    uint32_t shed_streak;     /* consecutive shed runs */
+} sched_job_counts_t;
+
+typedef struct {
+    sched_fail_log_t fail_log;   /* SCHED_FAIL_LOG_* for this outcome */
+    uint32_t fail_streak;        /* streak the fail log line reports */
+    bool     shed_log;           /* log this shed run */
+    uint32_t resumed_after;      /* > 0: first real run after this many sheds */
+} sched_account_t;
+
+static inline sched_account_t sched_job_account(sched_job_counts_t *c, sched_run_outcome_t o)
+{
+    sched_account_t a = { SCHED_FAIL_LOG_NONE, 0, false, 0 };
+    if (o == SCHED_RUN_SHED) {
+        if (c->power_skipped < UINT32_MAX) c->power_skipped++;
+        if (c->shed_streak < UINT32_MAX) c->shed_streak++;
+        a.shed_log = c->shed_streak == 1 || c->shed_streak % SCHED_FAIL_STREAK_LOG_EVERY == 0;
+        return a;
+    }
+    a.resumed_after = c->shed_streak;
+    c->shed_streak = 0;
+    if (o == SCHED_RUN_FAILED) {
+        c->failures++;
+        c->fail_streak++;
+        a.fail_streak = c->fail_streak;
+        a.fail_log = sched_fail_log_decision(true, c->fail_streak);
+    } else {
+        c->runs++;
+        a.fail_streak = c->fail_streak;
+        a.fail_log = sched_fail_log_decision(false, c->fail_streak);
+        c->fail_streak = 0;
+    }
+    return a;
+}
+
 /* Lifecycle transition model. The firmware keeps one instance under its
  * portMUX; keeping the transition rules pure makes the stop-success → immediate
  * start contract host-testable without pretending to emulate FreeRTOS.

@@ -155,3 +155,10 @@ esp_err_t ota_image_admit(const esp_partition_t *p, size_t n, char *s, size_t c)
 { (void)p; (void)n; (void)s; (void)c; abort(); }
 bool ota_refusal_save(const char *id, const char *source, const char *reason)
 { (void)id; (void)source; (void)reason; abort(); }
+/* Brownout protection (power_protect.h): this admission-only test runs on a
+ * normal-state unit; the refusal path is tests/ota_host/update_driver.c's. */
+#include "power_protect.h"
+bool power_protect_blocks_flash(void) { return false; }
+pp_state_t power_protect_state(void) { return PP_STATE_NORMAL; }
+void power_protect_note_skip(power_protect_skip_t what) { (void)what; abort(); }
+const char *pp_state_name(pp_state_t s) { (void)s; return "normal"; }

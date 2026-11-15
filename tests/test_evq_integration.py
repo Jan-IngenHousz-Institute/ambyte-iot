@@ -90,6 +90,7 @@ INCLUDES = [
     "components/timezone/include", "components/ota_update/include",
     "components/wifi_manager/include", "components/ambit_announcement/include",
     "tests/evq_host", "components/diag/include", "components/diag",
+    "components/power_protect/include",
 ]
 
 STATE_SCENARIOS = [

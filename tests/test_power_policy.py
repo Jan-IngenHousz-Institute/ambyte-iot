@@ -114,7 +114,8 @@ class PowerWiringContractTest(unittest.TestCase):
         src = self.read("components/device_commands/device_commands.c")
         body = src[src.index("bool device_commands_flash_power_ok(void)"):]
         body = body[:body.index("\n}\n")]
-        self.assertIn("return AMBYTE_FLASH_WITHOUT_CHARGER != 0;", body)
+        # Brownout protection refuses even a charger-less dev build.
+        self.assertIn("return AMBYTE_FLASH_WITHOUT_CHARGER != 0 && !power_protect_blocks_flash();", body)
         self.assertIn("#define AMBYTE_FLASH_WITHOUT_CHARGER 0", src)
         self.assertIn("return power_gate_flash_ok(&s_pub_gate);", body)
 

@@ -27,9 +27,9 @@ file(WRITE "${SCHED_EMBED_DIR}/default_yaml_embed.h"
 "static const unsigned default_yaml_size = ${SCHED_DEFAULT_LEN};\n")
 
 idf_component_register(
-    SRCS "sched_runner.c" "sched_runner_actions.c" "sched_runner_json.c"
+    SRCS "sched_runner.c" "sched_runner_actions.c" "sched_runner_json.c" "sched_runner_shed.c"
     INCLUDE_DIRS "include"
     REQUIRES sched_spec ambit_trace device_commands event_log time_sync timezone device_config
-    PRIV_REQUIRES esp_timer mbedtls uart_sensors
+    PRIV_REQUIRES esp_timer mbedtls uart_sensors power_protect
 )
 target_include_directories(${COMPONENT_LIB} PRIVATE "${SCHED_EMBED_DIR}")

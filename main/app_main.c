@@ -29,6 +29,7 @@
 #include "device_commands.h"
 #include "diag.h"
 #include "power_policy.h"
+#include "power_protect.h"
 #include "esp_err.h"
 #include "esp_app_desc.h"
 #include "esp_event.h"
@@ -784,6 +785,10 @@ static void app_power_guard_task(void *arg)
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(PWRGUARD_POLL_MS));
+        /* Brownout protection's exit window needs CONTINUOUS reads (a 60 s gap
+         * restarts it): refresh device_commands' cached read from here too,
+         * whoever else does or does not ask. */
+        device_commands_power_tick();
 
         power_reading_t p = {0};
         const power_read_reason_t reason = power_read_reason_from_err(s_pwrguard_read(&p));
@@ -1424,6 +1429,14 @@ void app_main(void)
 
     /* ── I2C + Sensors ────────────────────────────────────────────── */
     err = app_init_i2c_and_sensors();
+    /* ── Brownout protection (power_protect.h) ──────────────────────────
+     * Here, on BOTH sides of the I2C check: NVS and diag are up, the RTC and
+     * clock_trust have just decided how far the clock can be trusted (the
+     * brownout history needs that), and nothing that sheds has started yet:
+     * AMBIT boot sync, the schedule runner and the MQTT command path (held
+     * behind the boot gate) all come later. So the first action after a
+     * brownout is already shed. */
+    power_protect_boot();
     if (time(NULL) >= (time_t)CLOCK_TRUST_VALID_FLOOR_S) {
         /* RTC (or flash-time bootstrap) gave a real clock: error lines
          * captured from here on are UTC-stamped; earlier ones stay null. */
@@ -1581,6 +1594,7 @@ void app_main(void)
         .current_timezone       = timezone_current_name,
         .timezone_snapshot      = timezone_snapshot,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
+        .uart_query_admitted    = uart_available ? uart_sensors_get_admitted_query_fn() : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,

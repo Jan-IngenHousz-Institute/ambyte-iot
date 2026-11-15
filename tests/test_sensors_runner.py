@@ -21,6 +21,7 @@ class SensorRunnerTest(unittest.TestCase):
                 "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                 "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections", *(f"-I{p}" for p in includes),
                 str(ROOT / "tests/sensors_host/runner_driver.c"),
+                str(ROOT / "components/sched_runner/sched_runner_shed.c"),
                 str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
                 *(str(p) for p in (ROOT / "components/sched_spec").glob("*.c")),
                 str(ROOT / "components/time_sync/time_sync.c"), "-lm", "-o", str(tmp / "runner")],
@@ -29,3 +30,4 @@ class SensorRunnerTest(unittest.TestCase):
             run = subprocess.run([tmp / "runner"], capture_output=True, timeout=15)
             self.assertEqual(run.returncode, 0, run.stderr.decode())
             self.assertIn(b"complete_job_veto=1", run.stdout)
+            self.assertIn(b"power_shed=1", run.stdout)

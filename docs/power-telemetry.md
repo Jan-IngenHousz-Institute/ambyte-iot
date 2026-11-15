@@ -2,14 +2,15 @@
 
 The MP2731 charger (I2C 0x4B) is the only source of the device's power facts:
 battery, system and input voltage, charge and input current, and whether
-external power is present. Three firmware decisions run on those facts. Since
-2026-11-13 only two of them can refuse anything:
+external power is present. Four firmware decisions run on those facts. Since
+2026-11-13 the publish gate refuses nothing:
 
 | Consumer | Where | Rule |
 |---|---|---|
 | Publish gate | `device_commands_publish_power_ok` → `power_publish_ok` | **Never closes** while a charger is fitted, whatever the reading. The charger is still read every 5 s so the heartbeat can report the power state (`publish_gate_reason`) |
 | AMBIT flashing (boot sync, attach update) | `device_commands_flash_power_ok` → `power_gate_flash_ok` | **Fail-closed.** Allowed only on fresh, positive evidence of external power: the latest read is valid with input present, AND two consecutive present frames had different ADC values (within the last 6 present reads). Any valid-absent, `no_input` or invalid read resets that evidence. Refused on battery, on `no_input`, on any invalid read, on a frozen frame, and without a charger monitor (unless the build sets `AMBYTE_FLASH_WITHOUT_CHARGER`) |
 | Low-battery SD park guard | `app_power_guard_task` → `power_guard_step`, every 15 s | Parks only on **fresh** evidence: 3 consecutive changing, valid frames below 3300 mV on battery. Un-parks at ≥ 3600 mV or external power (4 reads), or after 12 reads without evidence. In practice it cannot fire on this hardware (below) |
+| Brownout protection (exit window, low-voltage entry) | `power_protect_on_power_read`, every charger read | Uses the same fresh-external-power evidence as AMBIT flashing: only a valid, input-present, changing frame counts. See [power-protect.md](power-protect.md) |
 
 Every heartbeat reports what the charger said and the observed power state:
 `health.power.valid`, `reason`, `status_reg`, `fault_reg`, and

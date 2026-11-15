@@ -17,6 +17,7 @@
 #include "clock_trust.h"
 #include "diag.h"
 #include "envelope_provenance.h"
+#include "power_protect.h"
 #include "telemetry_publish.h"
 #include "payload_gzip.h"
 #include "payload_v3.h"
@@ -108,6 +109,13 @@ static const char *current_timezone(void)
 static ambit_announcement_tracker_t s_ambit_announcements;
 static SemaphoreHandle_t s_ambit_announcement_mutex;
 static StaticSemaphore_t s_ambit_announcement_mutex_control;
+/* Serialises power_state_refresh: the blinker, the sync runner, the status
+ * report and (since brownout protection) the power-guard tick all refresh the
+ * cached read, and two interleaved power_gate_step calls could fake the
+ * changing-frame evidence that AMBIT flashing and power_protect's exit window
+ * trust. Never taken on the esp-mqtt task. */
+static SemaphoreHandle_t   s_power_mtx;
+static StaticSemaphore_t   s_power_mtx_control;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
@@ -429,6 +437,10 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
         s_ambit_announcement_mutex = xSemaphoreCreateMutexStatic(
             &s_ambit_announcement_mutex_control);
         if (s_ambit_announcement_mutex == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (s_power_mtx == NULL) {
+        s_power_mtx = xSemaphoreCreateMutexStatic(&s_power_mtx_control);
+        if (s_power_mtx == NULL) return ESP_ERR_NO_MEM;
     }
     ambit_announcement_init(&s_ambit_announcements, s_cfg.announcement_store);
     if (s_ack_queue == NULL) {
@@ -878,6 +890,7 @@ static uint32_t s_last_batt_mv = 0;
  * power-state tracker. Never decides publishing. */
 static void power_state_refresh(void)
 {
+    if (s_power_mtx == NULL || xSemaphoreTake(s_power_mtx, portMAX_DELAY) != pdTRUE) return;
     if (!s_pub_gate_inited) {
         power_gate_init(&s_pub_gate);
         s_pub_gate_inited = true;
@@ -888,6 +901,7 @@ static void power_state_refresh(void)
      * every read for 100 s while the cached flash evidence stayed valid. */
     const int64_t now = mono_ms();
     if (!power_refresh_due(s_pub_gate_eval_ms, now, PUB_GATE_EVAL_INTERVAL_MS)) {
+        xSemaphoreGive(s_power_mtx);
         return;
     }
     s_pub_gate_eval_ms = now != 0 ? now : 1;
@@ -902,6 +916,11 @@ static void power_state_refresh(void)
         ESP_LOGI(TAG, "power state: %s (reading=%s; publishing continues)",
                  power_gate_reason_name(s_pub_gate.reason), power_read_reason_name(reason));
     }
+    /* Brownout protection (power_protect.h) sees every read, with the same
+     * fresh-external-power evidence the AMBIT flash gate uses: its 30-min exit
+     * window and its low-voltage trigger both demand changing frames. */
+    power_protect_on_power_read(reason, reason == POWER_READ_OK ? &p : NULL,
+                                power_gate_flash_ok(&s_pub_gate));
     if (s_pub_gate.reason == POWER_GATE_REASON_POWER_UNVERIFIED &&
         s_pub_gate.invalid_streak >= POWER_POLICY_INVALID_FAILOPEN_N &&
         (s_pub_gate_warn_ms == 0 || (now - s_pub_gate_warn_ms) >= PUB_GATE_WARN_INTERVAL_MS)) {
@@ -910,6 +929,7 @@ static void power_state_refresh(void)
                  (unsigned)s_pub_gate.invalid_streak, power_read_reason_name(reason));
         s_pub_gate_warn_ms = now;
     }
+    xSemaphoreGive(s_power_mtx);
 }
 
 bool device_commands_publish_power_ok(void)
@@ -926,11 +946,21 @@ bool device_commands_publish_power_ok(void)
 bool device_commands_flash_power_ok(void)
 {
     if (!s_initialized || s_cfg.read_power == NULL) {
-        /* No charger reading = no evidence: refuse (fail-closed). */
-        return AMBYTE_FLASH_WITHOUT_CHARGER != 0;
+        /* No charger reading = no evidence: refuse (fail-closed). A protected
+         * unit refuses too, even on a build that flashes without a charger. */
+        return AMBYTE_FLASH_WITHOUT_CHARGER != 0 && !power_protect_blocks_flash();
     }
     power_state_refresh();
+    /* Defence in depth: each flash path also checks power protection itself
+     * (with its own refusal detail), but no future caller of this gate may
+     * flash an AMBIT on a unit that just browned out. */
+    if (power_protect_blocks_flash()) return false;
     return power_gate_flash_ok(&s_pub_gate);
+}
+
+void device_commands_power_tick(void)
+{
+    if (s_initialized && s_cfg.read_power != NULL) power_state_refresh();
 }
 
 const char *device_commands_publish_gate_reason(void)
@@ -1967,7 +1997,7 @@ static cmd_result_t emit_status_event(bool direct)
      * Rendered into one transient heap block (freed after the payload is
      * built): no resident DRAM. */
     enum { DIAG_JSON_CAP = 768, SDLOG_JSON_CAP = 384 };
-    char *diag_mem = malloc(DIAG_JSON_CAP + SDLOG_JSON_CAP);
+    char *diag_mem = malloc(DIAG_JSON_CAP + SDLOG_JSON_CAP + PP_JSON_CAP);
     if (diag_mem != NULL) {
         sd_diag_persist(false);
         sd_diag_block_t db;
@@ -1979,6 +2009,11 @@ static cmd_result_t emit_status_event(bool direct)
         if (s_cfg.sdlog_render != NULL && s_cfg.sdlog_render(sdlog, SDLOG_JSON_CAP) > 0) {
             input.sdlog_json = sdlog;
         }
+        /* health.power_protect (power_protect.h): rendered from RAM, never an
+         * NVS access. In this transient block, not on the 7.5 KiB watchdog
+         * stack; omitted (never truncated) if the block or the render fails. */
+        char *pp = sdlog + SDLOG_JSON_CAP;
+        if (power_protect_render_json(pp, PP_JSON_CAP) > 0) input.power_protect_json = pp;
     }
 
     char channels[PAYLOAD_V3_MAX_ATTACHED][12];
@@ -2030,7 +2065,7 @@ static cmd_result_t emit_status_event(bool direct)
                                            build_error, sizeof build_error);
     }
     free(diag_mem);                    /* rendered into the payload (or unused) */
-    input.sd_diag_json = input.sdlog_json = NULL;
+    input.sd_diag_json = input.sdlog_json = input.power_protect_json = NULL;
     if (!built) {
         free(payload);
         return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
@@ -3345,18 +3380,26 @@ static uint16_t ambit_crc16_ccitt(const uint8_t *data, size_t len)
     return crc;
 }
 
-/* Send one OTA command (cmd[8] + optional extra) and read the 1-byte status. */
+/* Send one OTA command (cmd[8] + optional extra) and read the 1-byte status.
+ * `admit` != NULL routes through the admitted query port (fail-closed if it is
+ * not wired); a refusal comes back as ESP_ERR_NOT_ALLOWED with nothing sent. */
 static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
                                   const uint8_t *extra, size_t extra_len,
-                                  uint8_t *status, uint32_t timeout_ms)
+                                  uint8_t *status, uint32_t timeout_ms,
+                                  bool (*admit)(void))
 {
-    if (!s_initialized || s_cfg.uart_query == NULL) {
+    if (!s_initialized || (admit == NULL ? s_cfg.uart_query == NULL : s_cfg.uart_query_admitted == NULL)) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
     }
     uart_sensor_response_t resp;
     memset(&resp, 0, sizeof(resp));
-    esp_err_t err = s_cfg.uart_query(ch, cmd, extra, extra_len,
-                                     1 /* 1-byte status */, &resp, timeout_ms);
+    esp_err_t err = admit == NULL
+        ? s_cfg.uart_query(ch, cmd, extra, extra_len, 1 /* 1-byte status */, &resp, timeout_ms)
+        : s_cfg.uart_query_admitted(ch, cmd, extra, extra_len, 1, &resp, timeout_ms, admit);
+    if (err == ESP_ERR_NOT_ALLOWED) {
+        uart_sensor_response_free(&resp);
+        return make_result(err, "AMBIT%u OTA cmd %u refused: power protection", ch + 1, cmd[0]);
+    }
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < 1) {
         uart_sensor_response_free(&resp);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
@@ -3368,14 +3411,20 @@ static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
     return make_result(ESP_OK, "AMBIT%u OTA cmd %u status=%u", ch + 1, cmd[0], st);
 }
 
-cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status)
+cmd_result_t cmd_ambit_ota_begin_admitted(uint8_t ch, uint32_t image_size, uint8_t *status,
+                                          bool (*admit)(void))
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_BEGIN,
                        (uint8_t)image_size,         (uint8_t)(image_size >> 8),
                        (uint8_t)(image_size >> 16), (uint8_t)(image_size >> 24),
                        0, 0, 0 };
     /* begin() erases the target OTA partition (~hundreds of ms) — allow time. */
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000, admit);
+}
+
+cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status)
+{
+    return cmd_ambit_ota_begin_admitted(ch, image_size, status, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
@@ -3391,23 +3440,23 @@ cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
     uint16_t crc = ambit_crc16_ccitt(chunk, len);
     extra[len]     = (uint8_t)crc;
     extra[len + 1] = (uint8_t)(crc >> 8);
-    return ambit_ota_cmd(ch, cmd, extra, (size_t)len + 2, status, 5000);
+    return ambit_ota_cmd(ch, cmd, extra, (size_t)len + 2, status, 5000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_END, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 10000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 10000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_ABORT, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000, NULL);
 }
 
 cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status)
 {
     uint8_t cmd[8] = { AMBIT_CMD_OTA_CONFIRM, 0, 0, 0, 0, 0, 0, 0 };
-    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000, NULL);
 }

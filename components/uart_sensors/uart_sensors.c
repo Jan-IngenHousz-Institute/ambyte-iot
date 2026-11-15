@@ -889,12 +889,13 @@ done:
     return timing_refused ? SENSOR_RECOVERY_REFUSED : result;
 }
 
-static esp_err_t do_query(uint8_t channel,
-                          const uint8_t cmd[8],
-                          const uint8_t *extra, size_t extra_len,
-                          size_t expect_raw,
-                          uart_sensor_response_t *response,
-                          uint32_t timeout_ms)
+static esp_err_t do_query_admitted(uint8_t channel,
+                                   const uint8_t cmd[8],
+                                   const uint8_t *extra, size_t extra_len,
+                                   size_t expect_raw,
+                                   uart_sensor_response_t *response,
+                                   uint32_t timeout_ms,
+                                   bool (*admit)(void))
 {
     if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS) {
         return ESP_ERR_INVALID_STATE;
@@ -916,6 +917,18 @@ static esp_err_t do_query(uint8_t channel,
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "ch%u: wake failed", channel);
         s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+        goto out;
+    }
+
+    /* 1b. Admission (brownout protection, uart_sensor_admitted_query_fn): the
+     * channel wait and the wake handshake above both block, so the decision is
+     * taken here, with nothing between it and the send. A refusal is not a
+     * link fault, and the wake just succeeded: leave the channel CONNECTED.
+     * channel_acquire set BUSY, and channel_release turns a leftover BUSY into
+     * DISCONNECTED, so the final state must be set here (review round 5). */
+    if (admit != NULL && !admit()) {
+        err = ESP_ERR_NOT_ALLOWED;
+        s_ch[channel].state = UART_SENSOR_CONNECTED;
         goto out;
     }
 
@@ -956,10 +969,20 @@ static esp_err_t do_query(uint8_t channel,
 out:
     if (err != ESP_OK) {
         response->status = err;
-        s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+        if (err != ESP_ERR_NOT_ALLOWED) s_ch[channel].state = UART_SENSOR_DISCONNECTED;
     }
     channel_release(channel);
     return err;
+}
+
+static esp_err_t do_query(uint8_t channel,
+                          const uint8_t cmd[8],
+                          const uint8_t *extra, size_t extra_len,
+                          size_t expect_raw,
+                          uart_sensor_response_t *response,
+                          uint32_t timeout_ms)
+{
+    return do_query_admitted(channel, cmd, extra, extra_len, expect_raw, response, timeout_ms, NULL);
 }
 
 /* ── Public: ping ──────────────────────────────────────────────────── */
@@ -1308,6 +1331,7 @@ static esp_err_t do_stream_query(uint8_t channel,
 /* ── Port-adapter getters ──────────────────────────────────────────── */
 
 uart_sensor_query_fn       uart_sensors_get_query_fn(void)       { return do_query;      }
+uart_sensor_admitted_query_fn uart_sensors_get_admitted_query_fn(void) { return do_query_admitted; }
 uart_sensor_ping_fn        uart_sensors_get_ping_fn(void)        { return do_ping;       }
 uart_sensor_status_fn      uart_sensors_get_status_fn(void)      { return do_status;     }
 uart_sensor_text_query_fn  uart_sensors_get_text_query_fn(void)  { return do_text_query; }

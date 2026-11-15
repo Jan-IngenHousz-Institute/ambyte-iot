@@ -84,6 +84,9 @@ typedef struct {
 
     /* UART sensor ports (Phase 7) */
     uart_sensor_query_fn                uart_query;        /* AMBIT binary */
+    /* Same, with a last-moment admission before the send (OTA_BEGIN under
+     * brownout protection). NULL → admitted commands fail closed. */
+    uart_sensor_admitted_query_fn       uart_query_admitted;
     uart_sensor_ping_fn                 uart_ping;
     uart_sensor_status_fn               uart_status;
     uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
@@ -170,6 +173,11 @@ bool device_commands_publish_power_ok(void);
  * no charger monitor (a real unit whose charger failed its boot probe looks the
  * same) unless the build sets AMBYTE_FLASH_WITHOUT_CHARGER. */
 bool device_commands_flash_power_ok(void);
+
+/* Refresh the cached charger read (at most every 5 s) so brownout protection
+ * keeps seeing reads even when nothing else asks. The power guard task calls
+ * it on its 15 s poll. No-op without a charger. */
+void device_commands_power_tick(void);
 
 /* Observed power state, as a stable telemetry string:
  * starting | external_power | on_battery | power_unverified | no_charger. */
@@ -403,6 +411,12 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
  * 6 no-begin). The CRC16 over each chunk is computed here. Orchestrated by
  * components/ambit_ota; not for schedule actions. */
 cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status);
+/* OTA_BEGIN (the AMBIT erases its inactive slot) with an admission asked inside
+ * the UART transaction, after the channel wait and the wake, immediately
+ * before the command is sent. Refused → status ESP_ERR_NOT_ALLOWED, nothing
+ * sent. DATA / END / ABORT of an update that has begun stay ungated. */
+cmd_result_t cmd_ambit_ota_begin_admitted(uint8_t ch, uint32_t image_size, uint8_t *status,
+                                          bool (*admit)(void));
 cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
                                 const uint8_t *chunk, uint8_t len, uint8_t *status);
 cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status);

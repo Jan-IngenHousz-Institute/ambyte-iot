@@ -346,6 +346,18 @@ esp_loader_error_t esp_loader_connect_secure_download_mode(esp_loader_t *loader,
 esp_loader_error_t esp_loader_flash_start(esp_loader_t *loader, esp_loader_flash_cfg_t *cfg);
 
 /**
+  * @brief LOCAL PATCH (ambyte-iot, brownout protection): esp_loader_flash_start()
+  *        with an admission. `admit(ctx)` is called after the flash parameters are
+  *        initialised (SPI attach, size detection, SPI parameters) and immediately
+  *        before the flash-begin (erase) command, with no I/O in between. If it
+  *        returns false nothing is erased, `*refused` (if non-NULL) is set and
+  *        ESP_LOADER_SUCCESS is returned. admit == NULL behaves exactly like
+  *        esp_loader_flash_start().
+  */
+esp_loader_error_t esp_loader_flash_start_admitted(esp_loader_t *loader, esp_loader_flash_cfg_t *cfg,
+                                                   bool (*admit)(void *ctx), void *ctx, bool *refused);
+
+/**
   * @brief Writes supplied data to target's flash memory.
   *
   * @param loader[in,out]  Pointer to initialized loader context.

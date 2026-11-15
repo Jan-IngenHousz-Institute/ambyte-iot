@@ -197,6 +197,10 @@ typedef struct {
     /* Pre-rendered health.crash object (diag_crash_json); inserted verbatim
      * after health.runtime when non-NULL. Caller guarantees valid JSON. */
     const char *crash_json;
+    /* Pre-rendered health.power_protect object (power_protect_render_json,
+     * brownout protection 2026-11); inserted verbatim after health.crash when
+     * non-NULL. Caller guarantees valid JSON (≤ PP_JSON_CAP). */
+    const char *power_protect_json;
 
     bool clock_valid;
     const char *clock_source;

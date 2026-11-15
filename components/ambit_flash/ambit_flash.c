@@ -29,6 +29,7 @@
 #include "ambit_fw_manifest.h"
 #include "sd_card.h"
 #include "device_commands.h"   /* cmd_uart_ping, cmd_ambit_get_info */
+#include "power_protect.h"
 #include "ambit_protocol.h"    /* AMBIT_INFO_FW, ambit_fw_info_t */
 
 #define AMBIT_FW_ROOT  "/sdcard/ambit_fw"
@@ -233,24 +234,46 @@ esp_err_t evq_hil_ambit_nvsdump(uint8_t channel, const char *tag)
 /* ── full multi-region ROM flash ─────────────────────────────────────────── */
 
 
-/* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5). */
+/* Stream one region file to flash: start (erase) -> write blocks -> finish (MD5).
+ * `may_write` (NULL = no gate) is the brownout-protection admission, passed for
+ * the FIRST region only (ambit_flash_image_gated). Its LAST check is inside the
+ * loader: esp_loader_flash_start_admitted asks it after init_flash_params (SPI
+ * attach, flash-size detection, SPI parameters — UART round trips; the first
+ * flash_start always does them) and immediately before the flash-begin erase
+ * command, with no I/O in between (review round 4 of PR #103). It is also
+ * asked earlier, after this region's SD ref / fopen / seek / size check, as an
+ * early exit. Refused → nothing erased, the file closed, *refused = true,
+ * ESP_LOADER_SUCCESS (so the caller resets the AMBIT back into its app on
+ * every build). Later regions pass NULL: a channel that has started erasing
+ * completes. */
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
-                                                const flash_region_t *r, uint32_t *bytes_out);
+                                                const flash_region_t *r, bool (*may_write)(void),
+                                                bool *refused, uint32_t *bytes_out);
+
+/* esp_loader's admission takes (void *ctx); ctx points at the bool(*)(void). */
+static bool admit_trampoline(void *ctx)
+{
+    bool (*const *fn)(void) = ctx;
+    return (*fn)();
+}
 
 /* SD RW-gate wrapper (audit R-6): the hot-plug monitor's teardown must not free the
  * FATFS volume under this region's fread loop. Per-region ref; io_begin fails cleanly
  * if the card is gone. 1:1 begin/end by construction (no branch between). */
 static esp_loader_error_t flash_one_region(esp_loader_t *loader, const char *dir,
-                                           const flash_region_t *r, uint32_t *bytes_out)
+                                           const flash_region_t *r, bool (*may_write)(void),
+                                           bool *refused, uint32_t *bytes_out)
 {
+    *refused = false;
     if (!sdcard_io_begin()) return ESP_LOADER_ERROR_FAIL;
-    esp_loader_error_t le = flash_one_region_impl(loader, dir, r, bytes_out);
+    esp_loader_error_t le = flash_one_region_impl(loader, dir, r, may_write, refused, bytes_out);
     sdcard_io_end();
     return le;
 }
 
 static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char *dir,
-                                                const flash_region_t *r, uint32_t *bytes_out)
+                                                const flash_region_t *r, bool (*may_write)(void),
+                                                bool *refused, uint32_t *bytes_out)
 {
     char path[192];
     snprintf(path, sizeof path, "%s/%s", dir, r->fname);
@@ -271,12 +294,29 @@ static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char
     ESP_LOGW(TAG, "  region %s @0x%06lx: %ld B (erasing…)", r->fname,
              (unsigned long)r->offset, fsize);
 
+    /* Early exit; the last check is inside the loader, right before the erase. */
+    if (may_write != NULL && !may_write()) {
+        ESP_LOGW(TAG, "  region %s: not erasing - power protection began", r->fname);
+        fclose(f);
+        *refused = true;
+        return ESP_LOADER_SUCCESS;
+    }
+
     esp_loader_flash_cfg_t cfg = {
         .offset     = r->offset,
         .image_size = (uint32_t)fsize,
         .block_size = FLASH_BLOCK,
     };
-    esp_loader_error_t le = esp_loader_flash_start(loader, &cfg);
+    bool loader_refused = false;
+    esp_loader_error_t le = esp_loader_flash_start_admitted(loader, &cfg,
+                                                            may_write != NULL ? admit_trampoline : NULL,
+                                                            (void *)&may_write, &loader_refused);
+    if (le == ESP_LOADER_SUCCESS && loader_refused) {
+        ESP_LOGW(TAG, "  region %s: not erasing - power protection began during the flash setup", r->fname);
+        fclose(f);
+        *refused = true;
+        return ESP_LOADER_SUCCESS;
+    }
     if (le != ESP_LOADER_SUCCESS) {
         ESP_LOGE(TAG, "  flash_start(%s) failed (%d)", r->fname, le);
         fclose(f);
@@ -317,6 +357,12 @@ static esp_loader_error_t flash_one_region_impl(esp_loader_t *loader, const char
 
 esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
                             ambit_flash_image_result_t *out)
+{
+    return ambit_flash_image_gated(channel, dir, baud, NULL, out);
+}
+
+esp_err_t ambit_flash_image_gated(uint8_t channel, const char *dir, uint32_t baud,
+                                  bool (*may_write)(void), ambit_flash_image_result_t *out)
 {
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -408,10 +454,26 @@ esp_err_t ambit_flash_image(uint8_t channel, const char *dir, uint32_t baud,
         ESP_LOGW(TAG, "ch%u: link raised to %lu baud", channel, (unsigned long)baud);
     }
 
+    /* Early exit: preflight, bus wait, ROM reset, stub connect and baud change
+     * are behind us. The LAST admission is inside the first region, after its
+     * file is opened and sized (flash_one_region_impl). */
+    if (may_write != NULL && !may_write()) {
+        ESP_LOGW(TAG, "ch%u: not flashing - power protection began before the first erase", channel);
+        ret = ESP_ERR_NOT_ALLOWED;
+        goto reset_and_done;   /* back into its existing application, untouched */
+    }
+
     ESP_LOGW(TAG, "ch%u: flashing %u regions from %s", channel, (unsigned)NUM_REGIONS, dir);
     for (size_t i = 0; i < NUM_REGIONS; i++) {
         uint32_t nb = 0;
-        le = flash_one_region(&loader, dir, &s_regions[i], &nb);
+        bool refused = false;
+        /* Gate the first region only, inside it, right before its erase. */
+        le = flash_one_region(&loader, dir, &s_regions[i], i == 0 ? may_write : NULL, &refused, &nb);
+        if (refused) {
+            ESP_LOGW(TAG, "ch%u: not flashing - power protection began before the first erase", channel);
+            ret = ESP_ERR_NOT_ALLOWED;
+            goto reset_and_done;   /* le == SUCCESS: reset into its existing app */
+        }
         if (le != ESP_LOADER_SUCCESS) {
             ESP_LOGE(TAG, "ch%u: region %s FAILED — aborting (chip may be partially written)",
                      channel, s_regions[i].fname);
@@ -659,6 +721,22 @@ static void boot_fail_bump(uint8_t ch, const char *ver, int prev)
         nvs_commit(h);
     }
     nvs_close(h);
+}
+
+/* Brownout protection gate for ambit_flash_image_gated (power_protect.h). */
+static bool flash_power_allows_write(void)
+{
+    return !power_protect_blocks_flash();
+}
+
+static void boot_fail_clear(uint8_t ch);
+
+/* Undo the pre-attempt bump when the write gate refused before any erase:
+ * a power refusal is not a failed flash and must not consume the cap. */
+static void boot_fail_restore(uint8_t ch, const char *ver, int prev)
+{
+    if (prev <= 0) boot_fail_clear(ch);
+    else boot_fail_bump(ch, ver, prev - 1);
 }
 
 static void boot_fail_clear(uint8_t ch)
@@ -951,6 +1029,17 @@ int ambit_flash_boot_sync(void)
         return 0;
     }
 
+    /* Brownout protection first (power_protect.h): power_protect_boot() ran
+     * before this, so a boot that IS the brownout already refuses here, and
+     * without waiting 30 s for power evidence that cannot override it. */
+    if (power_protect_blocks_flash()) {
+        ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing, but power protection is %s - "
+                      "they stay on their current firmware", n_need,
+                 pp_state_name(power_protect_state()));
+        power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+        return 0;
+    }
+
     /* Power gate (AMBIT flash) - fresh, positive evidence of external power
      * (fail-closed): the latest charger read valid with input present AND its
      * ADC frame changing between reads. The publish gate no longer says anything about power (it
@@ -979,6 +1068,14 @@ int ambit_flash_boot_sync(void)
         if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
             continue;
         }
+        /* Brownout protection can begin while earlier channels flash (~30-60 s
+         * each): re-check before starting the next one; a started flash ends. */
+        if (power_protect_blocks_flash()) {
+            ESP_LOGW(TAG, "boot sync: power protection is %s - not flashing ch%u or later",
+                     pp_state_name(power_protect_state()), ch);
+            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+            break;
+        }
         /* (b) Count the attempt in NVS BEFORE touching the chip. ambit_flash_image
          * erases the AMBIT app region before writing, so a host reset mid-flash
          * (brownout/WDT/panic) both bricks the unit AND never reaches the post-flash
@@ -990,7 +1087,16 @@ int ambit_flash_boot_sync(void)
                  ch, ver, fails[ch] + 1, BOOT_FAIL_MAX);
         ambit_flash_image_result_t res;
         bool verified = false;
-        if (ambit_flash_image(ch, tgt.dir, 0, &res) == ESP_OK) {
+        const esp_err_t ferr = ambit_flash_image_gated(ch, tgt.dir, 0, flash_power_allows_write, &res);
+        if (ferr == ESP_ERR_NOT_ALLOWED) {
+            /* Protection began during the preflight / ROM connect: nothing was
+             * erased. Not an attempt; stop here like the check above. */
+            boot_fail_restore(ch, ver, fails[ch]);
+            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+            ESP_LOGW(TAG, "boot sync: power protection began - ch%u and later not flashed", ch);
+            break;
+        }
+        if (ferr == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
             for (int try = 0; try < BOOT_VERIFY_TRIES && !verified; try++) {
                 ambit_fw_info_t fw;
@@ -1067,7 +1173,13 @@ esp_err_t ambit_flash_attach_flash(uint8_t ch, const ambit_flash_target_t *tgt)
     boot_fail_bump(ch, ver, fails);
     ESP_LOGW(TAG, "attach: flashing ch%u -> v%s (attempt %d/%d)", ch, ver, fails + 1, BOOT_FAIL_MAX);
     ambit_flash_image_result_t res;
-    esp_err_t err = ambit_flash_image(ch, tgt->dir, 0, &res);
+    esp_err_t err = ambit_flash_image_gated(ch, tgt->dir, 0, flash_power_allows_write, &res);
+    if (err == ESP_ERR_NOT_ALLOWED) {
+        /* Brownout protection began before the first erase: nothing written,
+         * not an attempt (the caller holds the channel as waiting_power). */
+        boot_fail_restore(ch, ver, fails);
+        return err;
+    }
     bool verified = false;
     if (err == ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));

@@ -59,6 +59,7 @@
 #include "device_commands.h"
 #include "sensor_inventory.h"
 #include "device_config.h"
+#include "power_protect.h"
 #include "sched_runner.h"
 #include "sched_runner_priv.h"
 #include "time_sync.h"
@@ -177,7 +178,7 @@ static sched_source_t  s_source = { SCHED_SOURCE_NONE, "", "" }; /* s_state_mux 
 /* Runner-owned execution counters under s_stats_mux; the due model's skipped
  * reaches status through the snapshot below. */
 typedef struct {
-    uint32_t runs, failures, fail_streak;
+    sched_job_counts_t n;      /* runs / failures / fail_streak / power_skipped */
     int64_t  last_run_epoch;
     uint32_t last_duration_ms;
 } job_rt_t;
@@ -349,11 +350,48 @@ static void maybe_run_deferred(int j)
     }
 }
 
+/* Brownout protection (power_protect.h): skip the whole job when the current
+ * state sheds it. Runner task only. Before any UART traffic, before the
+ * sensor-inventory bracket, and never near the event log: a shed run stores
+ * nothing, so the cursor and the delivery pipeline cannot notice it. Counted
+ * as SHED (sched_job_account): no failure, no fail streak, no failure log. */
+static bool shed_job(int j, const char *name)
+{
+    const pp_state_t st = power_protect_state();
+    const sched_shed_t shed = sched_job_shed(&s_prog, &s_prog.jobs[j], pp_blocks_flash(st),
+                                             pp_blocks_ambit(st));
+    if (shed == SCHED_SHED_NONE) return false;
+    /* A persisted actinic run (qE light phase, `persist: true`) can leave the
+     * LED lit after its job; the job that would switch it off carries flash
+     * segments itself and is shed. Reset the AMBITs once, exactly as a runner
+     * stop does, rather than leave that load on for the whole episode. No-op
+     * unless a persistent trigger was attempted. */
+    sched_runner_cleanup_lights();
+    taskENTER_CRITICAL(&s_stats_mux);
+    const sched_account_t a = sched_job_account(&s_rt[j].n, SCHED_RUN_SHED);
+    const uint32_t skips = s_rt[j].n.shed_streak;
+    taskEXIT_CRITICAL(&s_stats_mux);
+    /* The firing was shed: a queued overlap firing of it is shed with it,
+     * never replayed once protection lifts. */
+    taskENTER_CRITICAL(&s_dispatch_mux);
+    s_deferred &= ~(1u << j);
+    taskEXIT_CRITICAL(&s_dispatch_mux);
+    power_protect_note_skip(shed == SCHED_SHED_FLASH ? POWER_PROTECT_SKIP_FLASH_RUN
+                                                     : POWER_PROTECT_SKIP_AMBIT_RUN);
+    if (a.shed_log) {
+        ESP_LOGW(TAG, "%s: skipped by power protection (%s, %s work; %lu in a row)", name,
+                 pp_state_name(st), shed == SCHED_SHED_FLASH ? "flash" : "ambit",
+                 (unsigned long)skips);
+    }
+    return true;
+}
+
 static void run_job(int j)
 {
     const sched_job_t *job = &s_prog.jobs[j];
     const char *name = sched_pool_str(&s_prog, job->name_off);
     if (s_should_stop) return;
+    if (shed_job(j, name)) return;
     /* Covers every action, inter-channel gap and timed actinic sleep. */
     sensor_inventory_run_begin();
 
@@ -363,11 +401,11 @@ static void run_job(int j)
     /* Snapshot the counters the $job.* placeholders resolve from. */
     s_act_ctx.job_idx     = j;
     s_act_ctx.job_name    = name;
-    s_act_ctx.runs        = s_rt[j].runs;
-    s_act_ctx.failures    = s_rt[j].failures;
+    s_act_ctx.runs        = s_rt[j].n.runs;
+    s_act_ctx.failures    = s_rt[j].n.failures;
     s_act_ctx.skipped     = s_due.jobs[j].skipped;
     s_act_ctx.skipped_saturated = s_due.jobs[j].skipped_saturated != 0;
-    s_act_ctx.fail_streak = s_rt[j].fail_streak;
+    s_act_ctx.fail_streak = s_rt[j].n.fail_streak;
     s_act_ctx.fail_detail[0] = '\0';
 
     const int64_t t0_us = esp_timer_get_time();
@@ -394,22 +432,20 @@ static void run_job(int j)
 
     sched_fail_log_t decision = SCHED_FAIL_LOG_NONE;
     uint32_t streak = 0;
+    uint32_t resumed_after = 0;
     if (!s_should_stop) {
         taskENTER_CRITICAL(&s_stats_mux);
         s_rt[j].last_duration_ms = dur_ms;
         s_rt[j].last_run_epoch   = epoch;
-        if (failed) {
-            s_rt[j].failures++;
-            s_rt[j].fail_streak++;
-            streak   = s_rt[j].fail_streak;
-            decision = sched_fail_log_decision(true, streak);
-        } else {
-            s_rt[j].runs++;
-            streak   = s_rt[j].fail_streak;
-            decision = sched_fail_log_decision(false, streak);
-            s_rt[j].fail_streak = 0;
-        }
+        const sched_account_t a = sched_job_account(&s_rt[j].n, failed ? SCHED_RUN_FAILED : SCHED_RUN_OK);
         taskEXIT_CRITICAL(&s_stats_mux);
+        decision = a.fail_log;
+        streak = a.fail_streak;
+        resumed_after = a.resumed_after;
+    }
+    if (resumed_after > 0) {
+        ESP_LOGW(TAG, "%s: running again after %lu power-protect skips", name,
+                 (unsigned long)resumed_after);
     }
     /* THE single failure-log path (T3 review blocker 4): actions write
      * fail_detail and stay silent on routine failures, so a persistently
@@ -470,7 +506,7 @@ esp_err_t sched_runner_dispatch(const char *job_name)
             break;
         case SCHED_OVERLAP_REJECT:
             taskENTER_CRITICAL(&s_stats_mux);
-            s_rt[j].failures++;
+            s_rt[j].n.failures++;
             taskEXIT_CRITICAL(&s_stats_mux);
             outcome = D_REJECTED;
             break;
@@ -901,9 +937,10 @@ esp_err_t sched_runner_stats(const char *job_name, sched_job_stats_t *out)
     }
     int j = (int)(job - s_prog.jobs);
     taskENTER_CRITICAL(&s_stats_mux);
-    out->runs             = s_rt[j].runs;
-    out->failures         = s_rt[j].failures;
-    out->fail_streak      = s_rt[j].fail_streak;
+    out->runs             = s_rt[j].n.runs;
+    out->failures         = s_rt[j].n.failures;
+    out->fail_streak      = s_rt[j].n.fail_streak;
+    out->power_skipped    = s_rt[j].n.power_skipped;
     out->last_run_epoch   = s_rt[j].last_run_epoch;
     out->last_duration_ms = s_rt[j].last_duration_ms;
     taskEXIT_CRITICAL(&s_stats_mux);
@@ -1070,9 +1107,10 @@ esp_err_t sched_runner_job_status(int idx, sched_job_status_t *out)
     const char *name = sched_pool_str(&s_prog, job->name_off);
     snprintf(out->name, sizeof(out->name), "%s", name ? name : "?");
     taskENTER_CRITICAL(&s_stats_mux);
-    out->stats.runs             = s_rt[idx].runs;
-    out->stats.failures         = s_rt[idx].failures;
-    out->stats.fail_streak      = s_rt[idx].fail_streak;
+    out->stats.runs             = s_rt[idx].n.runs;
+    out->stats.failures         = s_rt[idx].n.failures;
+    out->stats.fail_streak      = s_rt[idx].n.fail_streak;
+    out->stats.power_skipped    = s_rt[idx].n.power_skipped;
     out->stats.last_run_epoch   = s_rt[idx].last_run_epoch;
     out->stats.last_duration_ms = s_rt[idx].last_duration_ms;
     taskEXIT_CRITICAL(&s_stats_mux);

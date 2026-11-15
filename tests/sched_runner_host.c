@@ -329,8 +329,207 @@ static void test_build_map_json(void)
     free(p);
 }
 
+/* ── brownout protection: shedding (sched_runner_shed.c) ─────────────── */
+
+static sched_program_t *compile_file(const char *path, int line)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        printf("FAIL %d: open %s\n", line, path);
+        s_checks++;
+        s_fails++;
+        return NULL;
+    }
+    static char buf[SCHED_YAML_MAX_FILE_BYTES + 1];
+    const size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return compile_or_fail(buf, line);
+}
+
+static const sched_job_t *job_named(const sched_program_t *p, const char *name)
+{
+    const sched_job_t *j = sched_find_job(p, name);
+    if (j == NULL) printf("missing job %s\n", name);
+    return j;
+}
+
+/* (no_flash, hold) decisions for one job. */
+#define SHED(p, name, nf, hold)                                                          \
+    do {                                                                                 \
+        const sched_job_t *j_ = job_named(p, name);                                      \
+        CHECK(j_ != NULL && sched_job_shed(p, j_, false, false) == SCHED_SHED_NONE);      \
+        CHECK(j_ != NULL && sched_job_shed(p, j_, true, false) == (nf));                  \
+        CHECK(j_ != NULL && sched_job_shed(p, j_, true, true) == (hold));                 \
+    } while (0)
+
+static const char *k_shed_yaml =
+    "schema: jii.ambyte-schedule/v1-draft\n"
+    "name: shed\n"
+    "protocols:\n"
+    "  DARK:\n"
+    "    - pulses: 10\n"
+    "      freq: 10\n"
+    "      actinic: 0\n"
+    "  LIT:\n"
+    "    - pulses: 10\n"
+    "      freq: 10\n"
+    "      actinic: 0\n"
+    "    - pulses: 10\n"
+    "      freq: 10\n"
+    "      actinic: 500\n"
+    "  FLASH:\n"
+    "    - pulses: 10\n"
+    "      freq: 100\n"
+    "      actinic: -250\n"
+    "jobs:\n"
+    "  dark_named_mpf:\n"          /* a name says nothing: content decides */
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: DARK\n"
+    "          tag: MPF\n"
+    "  lit:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: LIT\n"
+    "  flash:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: FLASH\n"
+    "  actinic_off:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/actinic\n"
+    "        with:\n"
+    "          level: 0\n"
+    "          duration: 1s\n"
+    "  actinic_par:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/actinic\n"
+    "        with:\n"
+    "          level: 200\n"
+    "          duration: 1s\n"
+    "  actinic_dac:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/actinic\n"
+    "        with:\n"
+    "          level: -40\n"
+    "          duration: 1s\n"
+    "  leaf:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: ambit/leaf-temp\n"
+    "  mixed:\n"                    /* store-event then a flash: the whole job goes */
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: db/store-event\n"
+    "        with:\n"
+    "          kind: before\n"
+    "      - uses: ambit/trace\n"
+    "        with:\n"
+    "          protocol: FLASH\n"
+    "  bookkeeping:\n"
+    "    schedule:\n"
+    "      cron: \"* * * * *\"\n"
+    "    steps:\n"
+    "      - uses: device/log\n"
+    "        with:\n"
+    "          message: hi\n"
+    "      - uses: db/store-event\n"
+    "        with:\n"
+    "          kind: k\n"
+    "      - uses: device/sleep\n"
+    "        with:\n"
+    "          duration: 1s\n";
+
+static void test_shed_by_content_and_state(void)
+{
+    /* The shipped default schedule: SS (actinic 0 everywhere) and spectra keep
+     * running in no_flash; MPF and the sunrise/sunset MPF are shed; hold sheds
+     * every ambit/ job but never the status report. */
+    sched_program_t *d = compile_file("components/sched_runner/default.yaml", __LINE__);
+    if (d != NULL) {
+        SHED(d, "steady_state",     SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+        SHED(d, "spectra",          SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+        SHED(d, "saturating_flash", SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+        SHED(d, "dark_edge",        SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+        SHED(d, "health",           SCHED_SHED_NONE,  SCHED_SHED_NONE);
+        free(d);
+    }
+    /* The released qE schedule: the qe job lights the LED and flashes. */
+    sched_program_t *q = compile_file("schedule/qe_multichannel.yaml", __LINE__);
+    if (q != NULL) {
+        SHED(q, "qe",               SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+        SHED(q, "steady_state",     SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+        SHED(q, "spectra",          SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+        SHED(q, "saturating_flash", SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+        SHED(q, "health",           SCHED_SHED_NONE,  SCHED_SHED_NONE);
+        free(q);
+    }
+    sched_program_t *p = COMPILE_OK(k_shed_yaml);
+    if (p == NULL) return;
+    SHED(p, "dark_named_mpf", SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+    SHED(p, "lit",            SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+    SHED(p, "flash",          SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+    SHED(p, "actinic_off",    SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+    SHED(p, "actinic_par",    SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+    SHED(p, "actinic_dac",    SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+    SHED(p, "leaf",           SCHED_SHED_NONE,  SCHED_SHED_AMBIT);
+    SHED(p, "mixed",          SCHED_SHED_FLASH, SCHED_SHED_FLASH);
+    SHED(p, "bookkeeping",    SCHED_SHED_NONE,  SCHED_SHED_NONE);
+    CHECK(sched_job_shed(NULL, NULL, true, true) == SCHED_SHED_NONE);
+    free(p);
+}
+
+/* A shed run is not a failure: it never touches runs / failures /
+ * fail_streak, never produces a failure log, and a real failure streak spans
+ * an episode of skips unbroken. */
+static void test_shed_is_not_a_failure(void)
+{
+    sched_job_counts_t c;
+    memset(&c, 0, sizeof c);
+    sched_account_t a = sched_job_account(&c, SCHED_RUN_FAILED);
+    CHECK(a.fail_log == SCHED_FAIL_LOG_FAILURE && c.fail_streak == 1 && c.failures == 1);
+    int shed_logs = 0;
+    for (int i = 0; i < 1000; i++) {
+        a = sched_job_account(&c, SCHED_RUN_SHED);
+        CHECK(a.fail_log == SCHED_FAIL_LOG_NONE);
+        if (a.shed_log) shed_logs++;
+    }
+    CHECK(shed_logs == 4);                       /* 1, 300, 600, 900 */
+    CHECK(c.runs == 0 && c.failures == 1 && c.fail_streak == 1);
+    CHECK(c.power_skipped == 1000 && c.shed_streak == 1000);
+    a = sched_job_account(&c, SCHED_RUN_FAILED);  /* the streak continues: 2, not 1 */
+    CHECK(c.fail_streak == 2 && a.fail_log == SCHED_FAIL_LOG_NONE && a.resumed_after == 1000);
+    CHECK(c.shed_streak == 0);
+    a = sched_job_account(&c, SCHED_RUN_OK);
+    CHECK(a.fail_log == SCHED_FAIL_LOG_RECOVERY && a.fail_streak == 2 && c.runs == 1 && c.fail_streak == 0);
+    a = sched_job_account(&c, SCHED_RUN_SHED);
+    CHECK(a.shed_log && c.shed_streak == 1 && c.power_skipped == 1001);
+    a = sched_job_account(&c, SCHED_RUN_OK);
+    CHECK(a.resumed_after == 1 && a.fail_log == SCHED_FAIL_LOG_NONE && c.runs == 2);
+}
+
 int main(void)
 {
+    test_shed_by_content_and_state();
+    test_shed_is_not_a_failure();
     test_fail_throttle();
     test_lifecycle_immediate_restart();
     test_lifecycle_retains_completion_proof();

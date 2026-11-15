@@ -18,11 +18,20 @@ client-id spelling rules: `ambyte_` and `AMBYTE_` are different MQTT routes.
     fleet_command.py log-list --devices ambyte_28:37:2F:FF:FC:80
     fleet_command.py log-read --devices ... --name ambyte.log --tail 65536 --out ambyte.log
     fleet_command.py log-read --devices ... --name ambyte.1.log --offset 0 --length 8192
+    fleet_command.py power-protect --action status --devices ambyte_28:37:2F:FF:FC:80
+    fleet_command.py power-protect --action force --state hold --devices ...
+    fleet_command.py power-protect --action clear --devices ...
 
 log-list / log-read (firmware with remote diagnostics) read the SD log
 directory (/sdcard/logs) without changing anything on the device. One
 log-read request returns at most 8192 bytes (base64 in `data`); --out stitches
 consecutive chunks of one device's file into a local file until EOF.
+
+power-protect (firmware with brownout protection, docs/power-protect.md) reads
+(`status`) or changes (`clear`, `force --state no_flash|hold`) the device's
+brownout protection state. clear and force are MUTATING and need an explicit
+--devices list: a forced state never auto-exits, and clear wipes the brownout
+history the next escalation would have used.
 
 Replies are written to --results-json (per device) and summarised on stdout.
 Exit status: 0 when every targeted device replied (and, for ping with
@@ -57,7 +66,25 @@ LOG_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")
 # is still coming: never terminal on its own (same rule as the timezone commands).
 NON_TERMINAL_DETAILS = ("busy", "queue_unavailable")
 REPLY_TYPES = {"get-timezone": "timezone_result", "set-timezone": "set_timezone_result",
-               "log-list": "log_list_result", "log-read": "log_read_result"}
+               "log-list": "log_list_result", "log-read": "log_read_result",
+               "power-protect": "power_protect_result"}
+# power_protect (components/command_router/include/power_protect_command.h).
+POWER_PROTECT_ACTIONS = ("status", "clear", "force")
+POWER_PROTECT_FORCE_STATES = ("no_flash", "hold")
+
+
+def power_protect_problem(args, reply):
+    """Why a power_protect_result does not show the requested outcome, or None. Pure."""
+    if reply.get("type") != "power_protect_result" or reply.get("ok") is not True:
+        return f"refused: {reply.get('detail')}"
+    action = getattr(args, "action", "status")
+    if reply.get("action") != action:
+        return f"answered {reply.get('action')!r}, asked {action!r}"
+    if action == "force" and (reply.get("state") != args.state or reply.get("forced") is not True):
+        return f"state {reply.get('state')} forced={reply.get('forced')}, asked forced {args.state}"
+    if action == "clear" and (reply.get("state") != "normal" or reply.get("forced") is not False):
+        return f"state {reply.get('state')} forced={reply.get('forced')} after clear"
+    return None
 
 
 def valid_log_name(name):
@@ -278,6 +305,19 @@ def build_message(args, req_id):
         if getattr(args, "expect_gen", ""):
             msg["expect_gen"] = args.expect_gen
         return msg
+    if args.cmd == "power-protect":
+        action = getattr(args, "action", "status")
+        state = getattr(args, "state", "") or ""
+        if action not in POWER_PROTECT_ACTIONS:
+            raise SystemExit("power-protect --action must be status, clear or force")
+        msg = {"type": "power_protect", "id": req_id, "action": action}
+        if action == "force":
+            if state not in POWER_PROTECT_FORCE_STATES:
+                raise SystemExit("power-protect --action force needs --state no_flash or hold")
+            msg["state"] = state
+        elif state:
+            raise SystemExit("power-protect --state is only valid with --action force")
+        return msg
     if args.cmd == "ambit-versions":
         return {"type": "ambit_versions", "id": req_id}
     if args.cmd == "ambit-flash":
@@ -335,6 +375,13 @@ def summarise(dev, reply):
         return (f"log_read ok={reply.get('ok')} detail={reply.get('detail')} name={reply.get('name')} "
                 f"gen={reply.get('gen')} offset={reply.get('offset')} length={reply.get('length')} "
                 f"size={reply.get('size')} eof={reply.get('eof')}")
+    if t == "power_protect_result":
+        sk = reply.get("skipped") or {}
+        return (f"power_protect ok={reply.get('ok')} action={reply.get('action')} detail={reply.get('detail')} "
+                f"state={reply.get('state')} reason={reply.get('reason')} forced={reply.get('forced')} "
+                f"since_utc={reply.get('since_utc')} brownouts_6h={reply.get('brownouts_6h')} "
+                f"exit_in_s={reply.get('exit_in_s')} skipped(flash={sk.get('flash_runs')} "
+                f"ambit={sk.get('ambit_runs')} ota={sk.get('ota')})")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -348,7 +395,11 @@ def summarise(dev, reply):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash",
-                                    "get-timezone", "set-timezone", "log-list", "log-read"])
+                                    "get-timezone", "set-timezone", "log-list", "log-read", "power-protect"])
+    ap.add_argument("--action", default="status", choices=POWER_PROTECT_ACTIONS,
+                    help="power-protect: status (read-only), clear or force (MUTATING)")
+    ap.add_argument("--state", default="", choices=("",) + POWER_PROTECT_FORCE_STATES,
+                    help="power-protect --action force: no_flash or hold")
     ap.add_argument("--name", default="", help="log-read: file name from log-list (e.g. ambyte.log)")
     ap.add_argument("--offset", type=int, default=0, help="log-read: byte offset; negative = from the end")
     ap.add_argument("--length", type=int, default=0,
@@ -383,6 +434,15 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "set-timezone" and (not args.devices.strip() or not parse_devices(args.devices)):
         ap.error("set-timezone requires an explicit --devices list; fleet-wide discovery is refused")
+    if args.cmd == "power-protect":
+        # Validate before any AWS access: a bad action/state must cost nothing.
+        try:
+            build_message(args, "validate")
+        except SystemExit as exc:
+            ap.error(str(exc))
+        if args.action != "status" and (not args.devices.strip() or not parse_devices(args.devices)):
+            ap.error(f"power-protect {args.action} requires an explicit --devices list; "
+                     "fleet-wide discovery is refused")
     if args.cmd == "log-read":
         # Validate before any AWS access: a bad name or window must cost nothing.
         try:
@@ -451,7 +511,9 @@ def main(argv=None):
     payload = build_message(args, req_id)
     if args.cmd == "log-read" and args.out:
         return stitch_log(args, session, devices[0], req_id)
-    mutating = (args.cmd == "replay" and args.mode not in READ_ONLY_MODES) or args.cmd in ("ambit-flash", "set-timezone")
+    mutating = ((args.cmd == "replay" and args.mode not in READ_ONLY_MODES)
+                or args.cmd in ("ambit-flash", "set-timezone")
+                or (args.cmd == "power-protect" and args.action != "status"))
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
           f"request id {req_id}{' (MUTATING)' if mutating else ''}")
@@ -552,6 +614,12 @@ def main(argv=None):
     if log_malformed:
         print(f"{args.cmd} incomplete reply from: {json.dumps(log_malformed)}")
         log_failed += sorted(log_malformed)
+    # power-protect: a refusal, or a reply that does not show the requested
+    # state, is a failed command.
+    pp_failed = {d: power_protect_problem(args, r) for d, r in replies.items()
+                 if args.cmd == "power-protect" and power_protect_problem(args, r)}
+    if pp_failed:
+        print(f"power-protect not confirmed on: {json.dumps(pp_failed)}")
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -582,9 +650,10 @@ def main(argv=None):
                        "request_id": req_id, "payload": payload, "devices": devices,
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
                        "firmware": fw_hist, "replay_states": states, "progress": progress,
-                       "timezone_failures": timezone_failed, "log_failures": log_failed},
+                       "timezone_failures": timezone_failed, "log_failures": log_failed,
+                       "power_protect_failures": pp_failed},
                       fh, indent=1, sort_keys=True)
-    return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed) else 0
+    return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed or pp_failed) else 0
 
 
 def stitch_log(args, session, dev, req_id):
