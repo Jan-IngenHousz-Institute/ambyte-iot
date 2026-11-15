@@ -16,7 +16,7 @@ The initial catalog contains:
 
 | Name | Purpose |
 | --- | --- |
-| `default.yaml` | Multi-channel steady-state, spectra, saturating-flash, edge, and health jobs |
+| `default.yaml` | Multi-channel steady-state, spectra, saturating-flash, edge, and health jobs; spectra read calibrated PAR with AMBIT cmd 35 (see [PAR: cmd 31 and cmd 35](#par-cmd-31-and-cmd-35)) |
 | `legacy_1hz_spec.yaml` | Channel-0 spectra at 1 Hz around daylight and 10-minute fallback outside it |
 | `qe_multichannel.yaml` | `default.yaml` plus a PAR read before every MPF and a twice-daily qE induction/relaxation sequence (10:00 and 16:00 local) |
 | `actions.schema.json` | JSON Schema generated from the firmware action table |
@@ -216,6 +216,56 @@ command and boot-time LED shutdown used here.
 `db/store-event` scalar values may use device placeholders: `$deployment`,
 `$lat`, `$lon`, `$tz`, `$boot_epoch`, `$uptime_ms`, `$sd_ready`, and the current
 job's `$job.runs`, `$job.failures`, `$job.skipped`, and `$job.fail_streak`.
+
+### PAR: cmd 31 and cmd 35
+
+`ambit/spectrum` reads PAR one of two ways, and they are different quantities.
+Every catalog schedule except `legacy_1hz_spec.yaml` uses `raw: true`.
+
+```mermaid
+flowchart LR
+    S["ambit/spectrum step"] --> R{"with: raw"}
+    R -- "false (schema default)" --> C31["AMBIT cmd 31<br/>PAR = legacy sum × spec_coef"]
+    R -- "true (default.yaml, qe_multichannel.yaml)" --> FW{"AMBIT fw ≥ 1.2.0?"}
+    FW -- yes --> C35["AMBIT cmd 35<br/>PAR = par_slope × tier-2 + par_intercept<br/>+ quality flags"]
+    FW -- no --> C31
+    C31 --> P1["ambit.spectrum/1"]
+    C35 --> P2["ambit.spectrum/2<br/>quality.tier3_stored, par_weight_fit"]
+```
+
+The Calibratron has written cmd 35's tier-3 `par_slope`/`par_intercept` instead
+of `spec_coef` since 2026-08-18 and leaves `spec_coef` at 1.0. On every AMBIT
+calibrated since then, cmd 31's PAR reads about 4.3× too high; cmd 35 applies
+the stored calibration on the AMBIT. Read `quality.tier3_stored` on each
+`/2` row: `false` means the AMBIT was never swept and its `par` magnitude is not
+calibrated. `par_weight_fit` stays `false` until the tier-2 weights are fitted
+on AMBIT optics, so cmd-35 PAR is reported as provisional either way.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant G as Ambyte (fw ≥ 2.6.0)
+    participant A as AMBIT
+    Op->>G: script_update default.yaml (version filter gte 2.6.0)
+    G->>G: compile, swap /littlefs/schedule.yaml
+    loop every 5 min in daylight (spectra job)
+        G->>A: cmd 35 get_spec_raw
+        A-->>G: raw counts, exposure, flags, tier-3 PAR
+        G->>G: store ambit.spectrum/2
+    end
+    Note over Op,G: fw < 2.6.0 rejects the unknown `raw` input<br/>and keeps its current schedule
+```
+
+The first `/2` rows from a field canary (ambyte 2.18.0, AMBIT 1.4.0) show every
+AMBIT, including three calibrated before 2026-08-18, with its tier-3 calibration
+stored:
+
+![First ambit.spectrum/2 rows after the switch](images/schedule-par-cmd35/canary-spectrum2.png)
+
+Deliver a `raw: true` schedule with a `gte 2.6.0` firmware filter, and give
+the receiving workbook a `schema == ambit.spectrum/2` route. The firmware's
+embedded fallback, `components/sched_runner/default.yaml`, is a separate copy
+and still reads cmd 31 until a firmware release adopts the change.
 
 ## Examples
 
