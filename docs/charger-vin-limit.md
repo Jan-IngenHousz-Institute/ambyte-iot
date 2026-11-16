@@ -110,7 +110,7 @@ sequenceDiagram
     opt MQTT request
         R->>W: Enqueue bounded copy
     end
-    R->>D: CLI calls directly; MQTT worker calls later
+    R->>D: CLI calls directly, MQTT worker calls later
     D->>D: Acquire shared I2C bus mutex
     opt Set
         D->>I: Write REG01 with bit 7 clear
