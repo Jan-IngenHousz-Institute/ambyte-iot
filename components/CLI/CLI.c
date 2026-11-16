@@ -407,6 +407,19 @@ static int cli_cmd_mp2731_regs(int argc, char **argv)
     return 0;
 }
 
+static int cli_cmd_telemetry_preview(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) { printf("Usage: telemetry_preview\r\n"); return 1; }
+    char *json = NULL;
+    cmd_result_t r = cmd_preview_status_json(&json);
+    if (r.status != ESP_OK) { printf("telemetry_preview failed: %s\r\n", r.message); return 1; }
+    printf("PREVIEW ONLY: synthetic measure_id=0; no store, publish or range acknowledgement\r\n");
+    printf("%s\r\n", json);
+    free(json);
+    return 0;
+}
+
 static int cli_cmd_record_env(int argc, char **argv)
 {
     (void)argv;
@@ -2334,6 +2347,11 @@ static esp_err_t cli_register_commands(void)
         .help = "print peripheral readiness and current RTC time",
         .func = cli_cmd_status,
     };
+    static const esp_console_cmd_t telemetry_preview_cmd = {
+        .command = "telemetry_preview",
+        .help = "print canonical telemetry locally; no store/publish/range reset",
+        .func = cli_cmd_telemetry_preview,
+    };
     static const esp_console_cmd_t rtc_cmd = {
         .command = "rtc",
         .help = "rtc | rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC)",
@@ -2537,6 +2555,9 @@ static esp_err_t cli_register_commands(void)
     if (err != ESP_OK) {
         return err;
     }
+
+    err = esp_console_cmd_register(&telemetry_preview_cmd);
+    if (err != ESP_OK) return err;
 
     err = esp_console_cmd_register(&red_cmd);
     if (err != ESP_OK) {

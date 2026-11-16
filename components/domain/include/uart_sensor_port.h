@@ -46,6 +46,10 @@ typedef struct {
     uint8_t          *raw;
     size_t            raw_len;
 
+    /* False until ownership is acquired; true once a wake exchange starts.
+     * A later admission veto is separately ESP_ERR_NOT_ALLOWED. Retained by
+     * response_free for failure accounting. */
+    bool              exchange_attempted;
     esp_err_t         status;
 } uart_sensor_response_t;
 

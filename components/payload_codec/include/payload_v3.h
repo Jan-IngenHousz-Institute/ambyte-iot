@@ -15,8 +15,9 @@ extern "C" {
 #define PAYLOAD_V3_TICK_FACTOR_MAX 100.0
 /* Heartbeat (TELEMETRY) build buffer. 4096 B until the storage.evq block
  * (~1 KiB at worst-case values) was added; tests/evq_integ asserts the
- * worst-case heartbeat fits with margin, and the builder fails closed. */
-#define PAYLOAD_V3_TELEMETRY_CAP 6144U
+ * worst-case heartbeat fits with margin, and the builder fails closed.
+ * Charger readback adds a bounded 2 KiB transient object: total cap 8192 B. */
+#define PAYLOAD_V3_TELEMETRY_CAP 8192U
 /* AMBIT cmd 31 (and cmd 35) return a fixed ten-bin spectrum plus a PAR scalar. */
 #define PAYLOAD_V3_SPECTRUM_BINS 10U
 /* Every producer MUST size its output buffer with this, not a hand-guessed
@@ -111,6 +112,8 @@ typedef struct {
     int last_puback_reason;
     int64_t refusal_hold_s;
 
+    /* Optional complete JSON object from the injected charger diagnostic port. */
+    const char *charger_diagnostics_json;
     bool power_valid;
     /* Charger read verdict (power_read_reason_name: ok | no_input | adc_timeout |
      * implausible | i2c_error | unavailable). NULL = no charger wired: the power
@@ -129,6 +132,9 @@ typedef struct {
     uint32_t charge_ma;
     bool input_present;
     uint8_t charge_status;
+
+    bool measurement_stats_valid;
+    uint64_t measurements_stored, measurement_store_failures, sensor_command_failures;
 
     bool storage_db_valid;
     bool db_online;

@@ -1,0 +1,16 @@
+MP2731 register dumps bracketing telemetry_preview · 2026-11-16
+
+Physical console capture: MAC 28:37:2F:FF:E7:04
+Firmware: schedule-v1.4.0-3-g057e67e
+Signed binary SHA256: 6259d5e4247a886f279021e73db7d609a404a6bb2a3fdcadf337102e1691eb75
+
+mp2731_regs
+MP2731 t=14300 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DA 10=88 11=56 12=00 13=0B 14=08 15=60 16=EE 17=00
+
+ambyte>  
+ambyte>  
+mp2731_regs
+MP2731 t=15100 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=D7 10=88 11=56 12=00 13=0B 14=08 15=60 16=EE 17=00
+
+ambyte>  
+ambyte>  

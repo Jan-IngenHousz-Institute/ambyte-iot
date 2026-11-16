@@ -1,0 +1,16 @@
+{
+  "source_commit": "057e67eb90d91e68063c5525ed56da351d186f79",
+  "signed_image_sha256": "6259d5e4247a886f279021e73db7d609a404a6bb2a3fdcadf337102e1691eb75",
+  "firmware": "schedule-v1.4.0-3-g057e67e",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "development_boundary": "Existing endpoint matches documented development account endpoint in docs/evq-sd-overflow-hil-contract.md. AWS SSO live verification unavailable (expired). No production endpoint configured.",
+  "capture_date": "2026-11-16",
+  "charger_settings_changed": false,
+  "nvs_erased": false,
+  "physical_transitions_unqualified": [
+    "weak solar source",
+    "panel heat",
+    "input removal",
+    "charging to idle"
+  ]
+}

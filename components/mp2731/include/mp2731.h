@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 #include "mp2731_core.h"
@@ -37,7 +38,13 @@ esp_err_t mp2731_last_frame(mp2731_frame_t *out);
 
 /* Diagnostics only (CLI `mp2731_regs`): one raw register read, no side effects.
  * Works whenever the I2C bus is up, ready or not. */
-#define MP2731_REG_DUMP_COUNT 0x17u   /* REG00..REG16 */
+#define MP2731_REG_DUMP_COUNT 0x18u   /* REG00..REG17, includes safety timer */
+
+/* Read-only heartbeat diagnostics, including partial register scans. Returns a
+ * complete JSON object length or -1. Ack only after storage/submission succeeds. */
+#define MP2731_DIAGNOSTICS_JSON_CAP 2048u
+int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id, bool seal);
+void mp2731_ack_diagnostics(uint64_t window_id);
 esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out);
 
 /* Diagnostics only (CLI `mp2731_regs probe`): start one conversion and poll

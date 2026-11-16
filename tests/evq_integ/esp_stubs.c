@@ -539,7 +539,8 @@ void sd_diag_refusal(sd_diag_refusal_t r, int64_t id, int err, uint8_t blocked, 
     sd_diag_core_refusal(&g_sd_diag, r, id, err, blocked, sd_state, 0, 1);
 }
 void sd_diag_get(sd_diag_block_t *out) { sd_diag_host_init(); *out = g_sd_diag; }
-void sd_diag_persist(bool force) { (void)force; }
+unsigned h_sd_persists;
+void sd_diag_persist(bool force) { (void)force; h_sd_persists++; }
 
 uint32_t esp_random(void) { static uint32_t word = 0x164003u; word = word * 1664525u + 1013904223u; return word; }
 

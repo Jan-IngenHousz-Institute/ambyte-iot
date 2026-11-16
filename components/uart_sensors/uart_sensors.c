@@ -897,11 +897,11 @@ static esp_err_t do_query_admitted(uint8_t channel,
                                    uint32_t timeout_ms,
                                    bool (*admit)(void))
 {
+    if (response == NULL) return ESP_ERR_INVALID_ARG;
+    memset(response, 0, sizeof(*response));
     if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    memset(response, 0, sizeof(*response));
 
     esp_err_t err = channel_acquire(channel, pdMS_TO_TICKS(timeout_ms));
     if (err != ESP_OK) {
@@ -912,6 +912,9 @@ static esp_err_t do_query_admitted(uint8_t channel,
     uart_port_t port = s_ch[channel].uart_num;
     int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
 
+    /* 1. Wake: ownership has been admitted; subsequent transport failures
+     * represent an attempted sensor exchange, including an unanswered wake. */
+    response->exchange_attempted = true;
     /* 1. Wake */
     err = ambit_wake(port, deadline);
     if (err != ESP_OK) {

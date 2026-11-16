@@ -102,6 +102,7 @@ typedef struct {
     uint8_t  ctrl_found;   /* REG03 as found before the read */
     uint8_t  status;       /* REG0C */
     uint8_t  fault;        /* REG0D */
+    bool     status_valid; /* both live status/fault bytes completed, independent of ADC */
     uint8_t  vbat, vsys, vin, icc, iin;
     bool     converted;    /* ADC_START fell within MP2731_ADC_TIMEOUT_MS */
     uint32_t conv_ms;      /* polled time until it fell (or the timeout) */

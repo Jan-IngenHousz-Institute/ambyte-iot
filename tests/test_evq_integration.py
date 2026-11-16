@@ -197,7 +197,7 @@ class EvqIntegration(unittest.TestCase):
             # production power gate never closes, so I7 drives its closed-gate
             # delivery mechanics from a harness-controlled decision instead.
             extra = (["-Dpayload_v3_build_telemetry=h_capture_build_telemetry",
-                      "-Dpower_publish_ok=h_power_publish_ok"]
+                      "-Dpower_publish_ok=h_power_publish_ok", "-Dmalloc=h_dc_malloc", "-Dfree=h_dc_free"]
                      if src.endswith("device_commands.c") else [])
             jobs.append((src, base + PRODUCTION_WNO + prelude + dflags + extra + inc))
         for src in HARNESS_SOURCES:
@@ -476,6 +476,16 @@ class EvqIntegration(unittest.TestCase):
         "pending_inexact": {"pending_exact": False},
     }
 
+    def test_charger_unavailable_env_is_not_a_failure(self):
+        results = self.run_row("charger-no-env", "charger_no_env")
+        self.assert_clean_and_repeatable(results, "charger without BME port")
+        self.assertIn("CHARGER_NO_ENV=ok", results[0]["stdout"])
+
+    def test_charger_diagnostics_failures_preserve_heartbeat_and_ranges(self):
+        results = self.run_row("charger", "charger_diagnostics")
+        self.assert_clean_and_repeatable(results, "charger diagnostics")
+        self.assertIn("CHARGER_DIAGNOSTICS=ok", results[0]["stdout"])
+
     def test_I5_status_heartbeat_every_state(self):
         snaps, _, worst_tel, worst_emit = self._snapshots()
         for name, want in self.EXPECT.items():
@@ -516,7 +526,7 @@ class EvqIntegration(unittest.TestCase):
         self.assertEqual(len(worst_tel), 2)
         for w in worst_tel:
             with self.subTest(worst=w["variant"]):
-                self.assertEqual(w["cap"], 6144)
+                self.assertEqual(w["cap"], 8192)
                 if w["fits"]:
                     self.assertLess(w["worst_len"], w["cap"])
                     self.assertEqual(w["payload"]["schema"], "ambyte.telemetry/1")

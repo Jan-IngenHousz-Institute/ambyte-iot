@@ -1,3 +1,4 @@
+#include "charger_diagnostics_port.h"
 #include "device_commands.h"
 #include "power_policy.h"
 #include "event_log.h"
@@ -779,6 +780,34 @@ cmd_result_t cmd_set_rtc(int64_t epoch_utc)
     return make_result(ESP_OK, "%s", iso);
 }
 
+/* Per-boot accounting, independent of schedule reloads and delivery retries.
+ * These describe committed observations and failed sensor command attempts;
+ * a power-shed job, a busy admission and a poll timeout are not read failures. */
+static portMUX_TYPE s_measurement_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_measurements_stored, s_measurement_store_failures, s_sensor_command_failures;
+
+static void measurement_count(uint64_t *counter)
+{
+    portENTER_CRITICAL(&s_measurement_mux);
+    if (*counter < UINT64_MAX) (*counter)++;
+    portEXIT_CRITICAL(&s_measurement_mux);
+}
+
+static void sensor_command_failed(const uart_sensor_response_t *response, esp_err_t result)
+{
+    /* NOT_ALLOWED is a late admission veto, even though its wake succeeded. */
+    if (response->exchange_attempted && result != ESP_ERR_NOT_ALLOWED)
+        measurement_count(&s_sensor_command_failures);
+}
+
+static esp_err_t read_env_counted(measurement_t *out)
+{
+    if (s_cfg.read_env == NULL) return ESP_ERR_NOT_SUPPORTED;
+    const esp_err_t err = s_cfg.read_env(out);
+    if (err != ESP_OK) measurement_count(&s_sensor_command_failures);
+    return err;
+}
+
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time)
 {
     bool bme_ok = false;
@@ -786,7 +815,7 @@ cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_tim
 
     if (s_initialized && s_cfg.read_env != NULL) {
         measurement_t m;
-        bme_ok = (s_cfg.read_env(&m) == ESP_OK);
+        bme_ok = (read_env_counted(&m) == ESP_OK);
     }
 
     if (s_initialized && s_cfg.read_clock != NULL) {
@@ -817,7 +846,7 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres)
         return make_result(ESP_ERR_NOT_SUPPORTED, "env sensor not available");
     }
     measurement_t m;
-    esp_err_t err = s_cfg.read_env(&m);
+    esp_err_t err = read_env_counted(&m);
     if (err != ESP_OK) {
         return make_result(err, "env read failed: %s", esp_err_to_name(err));
     }
@@ -981,7 +1010,7 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading)
 
     int64_t start_ms = now_ms();
     measurement_t m;
-    esp_err_t err = s_cfg.read_env(&m);
+    esp_err_t err = read_env_counted(&m);
     int64_t end_ms = now_ms();
     if (err != ESP_OK) {
         return make_result(err, "env read failed: %s", esp_err_to_name(err));
@@ -1022,6 +1051,7 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading)
         .payload_json = payload,
     };
     err = s_cfg.store_event(&d);
+    measurement_count(err == ESP_OK ? &s_measurements_stored : &s_measurement_store_failures);
     if (err != ESP_OK) {
         return make_result(err, "store failed: %s", esp_err_to_name(err));
     }
@@ -1125,6 +1155,8 @@ cmd_result_t cmd_store_event(const measurement_event_desc_t *desc)
         return make_result(ESP_ERR_INVALID_ARG, "store_event: null arg");
     }
     esp_err_t err = s_cfg.store_event(desc);
+    if (strcmp(desc->tag, MEASUREMENT_TAG_MEASUREMENT) == 0)
+        measurement_count(err == ESP_OK ? &s_measurements_stored : &s_measurement_store_failures);
     if (err != ESP_OK) {
         return make_result(err, "store_event(%s) failed: %s",
                            desc->cmd_raw ? desc->cmd_raw : "", esp_err_to_name(err));
@@ -1821,7 +1853,7 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
      * keys/format as the device.bme280 measurement event (cmd_record_env). */
     if (s_cfg.read_env != NULL) {
         measurement_t m;
-        if (s_cfg.read_env(&m) == ESP_OK) {
+        if (read_env_counted(&m) == ESP_OK) {
             out->env_valid         = true;
             out->temperature_c     = m.temperature_c;
             out->humidity_percent  = m.humidity_percent;
@@ -1837,21 +1869,30 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
  * silence it. cmd_status_report performs the BME280 read exactly once; this
  * function groups that observation beside health in ONE stored row. It never
  * stores the old companion environment event and never wakes a UART channel. */
-static cmd_result_t emit_status_event(bool direct)
+static cmd_result_t emit_status_event(bool direct, char **preview_out)
 {
-    if (!s_initialized || (!direct && s_cfg.store_event == NULL) || s_cfg.next_id == NULL) {
+    const bool preview = preview_out != NULL;
+    if (preview) *preview_out = NULL;
+    if (!s_initialized || (!preview && ((!direct && s_cfg.store_event == NULL) || s_cfg.next_id == NULL))) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
     }
+    /* Required memory FIRST. Optional diagnostics must not consume the last
+     * block large enough for the gateway's only firmware-owned liveness row. */
+    char *payload = malloc(PAYLOAD_V3_TELEMETRY_CAP);
+    if (payload == NULL) return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
 
     device_status_snapshot_t s;
     cmd_result_t r = cmd_status_report(&s);
     if (r.status != ESP_OK) {
+        free(payload);
         return r;
     }
 
+    /* Preview uses synthetic id 0 and never reserves an event-store id. */
     int64_t mid = 0;
-    esp_err_t err = s_cfg.next_id(&mid);
+    esp_err_t err = preview ? ESP_OK : s_cfg.next_id(&mid);
     if (err != ESP_OK) {
+        free(payload);
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
 
@@ -1947,6 +1988,13 @@ static cmd_result_t emit_status_event(bool direct)
         .db_online = s.db_online,
     };
 
+    portENTER_CRITICAL(&s_measurement_mux);
+    input.measurement_stats_valid = true;
+    input.measurements_stored = s_measurements_stored;
+    input.measurement_store_failures = s_measurement_store_failures;
+    input.sensor_command_failures = s_sensor_command_failures;
+    portEXIT_CRITICAL(&s_measurement_mux);
+
     if (s_cfg.sd_health != NULL) {
         bool io_lost = false;
         uint64_t free_bytes = 0;
@@ -1999,7 +2047,7 @@ static cmd_result_t emit_status_event(bool direct)
     enum { DIAG_JSON_CAP = 768, SDLOG_JSON_CAP = 384 };
     char *diag_mem = malloc(DIAG_JSON_CAP + SDLOG_JSON_CAP + PP_JSON_CAP);
     if (diag_mem != NULL) {
-        sd_diag_persist(false);
+        if (!preview) sd_diag_persist(false);
         sd_diag_block_t db;
         sd_diag_get(&db);
         /* A worst-case counter set can exceed the slice: then the heartbeat
@@ -2015,6 +2063,18 @@ static cmd_result_t emit_status_event(bool direct)
         char *pp = sdlog + SDLOG_JSON_CAP;
         if (power_protect_render_json(pp, PP_JSON_CAP) > 0) input.power_protect_json = pp;
     }
+
+    /* The 2 KiB diagnostic object is transient heap memory, not watchdog stack.
+     * No failed scan/build/send may consume the pending voltage range. */
+    uint64_t charger_window_id = 0;
+    char *charger_json = NULL;
+    if (s_cfg.render_charger_diagnostics != NULL) {
+        charger_json = malloc(CHARGER_DIAGNOSTICS_JSON_CAP);
+        if (charger_json != NULL &&
+            s_cfg.render_charger_diagnostics(charger_json, CHARGER_DIAGNOSTICS_JSON_CAP, &charger_window_id, !preview) > 0)
+            input.charger_diagnostics_json = charger_json;
+    }
+    bool charger_included = input.charger_diagnostics_json != NULL;
 
     char channels[PAYLOAD_V3_MAX_ATTACHED][12];
     /* One info record PER SLOT, not one reused local. payload_v3_attached_sensor_t
@@ -2044,11 +2104,6 @@ static cmd_result_t emit_status_event(bool direct)
         };
     }
 
-    char *payload = malloc(PAYLOAD_V3_TELEMETRY_CAP);
-    if (payload == NULL) {
-        free(diag_mem);
-        return make_result(ESP_ERR_NO_MEM, "telemetry buffer alloc failed");
-    }
     char build_error[96];
     bool built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                             build_error, sizeof build_error);
@@ -2064,11 +2119,24 @@ static cmd_result_t emit_status_event(bool direct)
         built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
                                            build_error, sizeof build_error);
     }
+    if (!built && input.charger_diagnostics_json != NULL) {
+        /* Diagnostic growth or damage must never silence gateway liveness. */
+        input.charger_diagnostics_json = NULL;
+        charger_included = false;
+        built = payload_v3_build_telemetry(payload, PAYLOAD_V3_TELEMETRY_CAP, &input,
+                                           build_error, sizeof build_error);
+    }
+    free(charger_json);
     free(diag_mem);                    /* rendered into the payload (or unused) */
     input.sd_diag_json = input.sdlog_json = input.power_protect_json = NULL;
     if (!built) {
         free(payload);
         return make_result(ESP_ERR_INVALID_SIZE, "telemetry build failed: %s", build_error);
+    }
+
+    if (preview) {
+        *preview_out = payload; /* caller frees; no store/publish/ack below */
+        return make_result(ESP_OK, "preview only: synthetic measure_id=0");
     }
 
     measurement_event_desc_t d = {
@@ -2095,6 +2163,8 @@ static cmd_result_t emit_status_event(bool direct)
     if (err != ESP_OK) {
         return make_result(err, "telemetry delivery failed: %s", esp_err_to_name(err));
     }
+    if (charger_included && s_cfg.ack_charger_diagnostics != NULL)
+        s_cfg.ack_charger_diagnostics(charger_window_id);
     return make_result(ESP_OK, "TELEMETRY id=%lld gate=%s Vbat=%umV",
                        (long long)mid, s.publish_gate_open ? "OPEN" : "CLOSED",
                        (unsigned)(s.power_valid ? s.power.battery_mv : 0));
@@ -2102,12 +2172,18 @@ static cmd_result_t emit_status_event(bool direct)
 
 cmd_result_t cmd_store_status_event(void)
 {
-    return emit_status_event(false);
+    return emit_status_event(false, NULL);
 }
 
 cmd_result_t cmd_publish_status_event(void)
 {
-    return emit_status_event(true);
+    return emit_status_event(true, NULL);
+}
+
+cmd_result_t cmd_preview_status_json(char **out)
+{
+    if (out == NULL) return make_result(ESP_ERR_INVALID_ARG, "preview: null output");
+    return emit_status_event(false, out);
 }
 
 /* ── ambyte.log/1: captured error lines (diag_log.h) ──────────────────────
@@ -2796,6 +2872,7 @@ cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp)
                                      AMBIT_RESP_TEMP_SIZE, &resp, 5000);
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_TEMP_SIZE) {
         uart_sensor_response_free(&resp);
+        sensor_command_failed(&resp, err);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
                            "AMBIT%u get_temp failed", ch + 1);
     }
@@ -2825,6 +2902,7 @@ cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par)
                                      AMBIT_RESP_SPEC_SIZE, &resp, 5000);
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_SPEC_SIZE) {
         uart_sensor_response_free(&resp);
+        sensor_command_failed(&resp, err);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
                            "AMBIT%u get_spec failed", ch + 1);
     }
@@ -2867,6 +2945,7 @@ cmd_result_t cmd_ambit_get_spec_raw(uint8_t ch, ambit_spec_raw_t *out)
                                      AMBIT_RESP_SPEC_RAW_SIZE, &resp, 5000);
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_SPEC_RAW_SIZE) {
         uart_sensor_response_free(&resp);
+        sensor_command_failed(&resp, err);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
                            "AMBIT%u get_spec_raw failed (needs AMBIT fw >= 1.2.0)", ch + 1);
     }
@@ -2917,6 +2996,7 @@ cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
                                      AMBIT_RESP_TEMP_RAW_SIZE, &resp, 5000);
     if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_TEMP_RAW_SIZE) {
         uart_sensor_response_free(&resp);
+        sensor_command_failed(&resp, err);
         return make_result(err != ESP_OK ? err : ESP_FAIL,
                            "AMBIT%u get_temp_raw failed", ch + 1);
     }
@@ -3175,6 +3255,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
                                      0, response, timeout_ms);
     if (err != ESP_OK) {
         sensor_inventory_run_window(ch, epoch, ambit_run_window_ms(run_arr, arr_len));
+        sensor_command_failed(response, err);
         return make_result(err, "AMBIT%u run failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
@@ -3183,6 +3264,7 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
      * with CMD_END and no arrays; transport success alone is not a measurement.
      * Keep the wire protocol intact while making this visible to every caller. */
     if (response->array_count == 0U) {
+        sensor_command_failed(response, err);
         return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u run returned no result arrays", ch + 1);
     }
     return make_result(ESP_OK, "AMBIT%u run: %u arrays",
@@ -3211,6 +3293,7 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
     if (err != ESP_OK) {
         uint32_t period = (uint32_t)interval * 100u;
         sensor_inventory_run_window(ch, epoch, 15500u + (uint32_t)length * (period > 100u ? period : 100u));
+        sensor_command_failed(response, err);
         return make_result(err, "AMBIT%u run_mpf failed: %s",
                            ch + 1, esp_err_to_name(err));
     }
@@ -3250,6 +3333,7 @@ cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_l
     uart_sensor_response_free(&resp);
     sensor_inventory_run_window(ch, epoch, ambit_run_window_ms(run_arr, arr_len));
     if (err != ESP_OK) {
+        sensor_command_failed(&resp, err);
         return make_result(err, "AMBIT%u trigger failed: %s", ch + 1, esp_err_to_name(err));
     }
     return make_result(ESP_OK, "AMBIT%u triggered", ch + 1);
@@ -3297,9 +3381,11 @@ cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
     memset(response, 0, sizeof(*response));
     esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, 0, response, timeout_ms);
     if (err != ESP_OK) {
+        sensor_command_failed(response, err);
         return make_result(err, "AMBIT%u fetch failed: %s", ch + 1, esp_err_to_name(err));
     }
     if (response->array_count == 0U) {
+        sensor_command_failed(response, err);
         return make_result(ESP_ERR_INVALID_RESPONSE, "AMBIT%u fetch: no retained result", ch + 1);
     }
     sensor_inventory_complete_epoch(ch, epoch);

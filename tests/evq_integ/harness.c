@@ -428,6 +428,20 @@ static esp_err_t p_sd_health(bool *io_lost, uint64_t *free_bytes, int64_t *skipp
     return ESP_OK;
 }
 
+static unsigned dc_next_calls, dc_store_calls, dc_query_calls;
+static bool dc_store_fail, dc_exchange;
+static esp_err_t dc_query_error = ESP_ERR_TIMEOUT;
+static esp_err_t dc_next(int64_t *id) { dc_next_calls++; return event_log_get_next_id_fn()(id); }
+static esp_err_t dc_store(const measurement_event_desc_t *d)
+{ dc_store_calls++; return dc_store_fail ? ESP_FAIL : event_log_get_store_event_fn()(d); }
+static esp_err_t dc_query(uint8_t ch, const uint8_t *cmd, const uint8_t *extra, size_t len,
+                         size_t expected, uart_sensor_response_t *out, uint32_t timeout)
+{
+    (void)ch; (void)cmd; (void)extra; (void)len; (void)expected; (void)timeout;
+    dc_query_calls++; memset(out, 0, sizeof(*out)); out->exchange_attempted = dc_exchange;
+    return dc_query_error;
+}
+
 /* Sensing/power/identity ports (knobs). */
 static bool g_input_present;
 static power_reading_t g_power = { .battery_mv = 4100, .system_mv = 4000, .input_mv = 5000,
@@ -452,8 +466,46 @@ bool h_power_publish_ok(const power_gate_t *g)
     }
     return open;
 }
+/* Only the production device_commands TU uses these allocation ports. */
+static size_t dc_budget = SIZE_MAX, dc_bytes;
+static struct { void *p; size_t n; } dc_allocs[32];
+void *h_dc_malloc(size_t n)
+{
+    if (n > dc_budget - dc_bytes) return NULL;
+    void *p = malloc(n);
+    if (!p) return NULL;
+    for (unsigned i = 0; i < 32; i++) if (!dc_allocs[i].p) {
+        dc_allocs[i].p = p; dc_allocs[i].n = n; dc_bytes += n; return p;
+    }
+    abort();
+}
+void h_dc_free(void *p)
+{
+    if (!p) return;
+    for (unsigned i = 0; i < 32; i++) if (dc_allocs[i].p == p) {
+        dc_bytes -= dc_allocs[i].n; dc_allocs[i].p = NULL; break;
+    }
+    free(p);
+}
+extern unsigned h_sd_persists;
+static uint64_t g_diag_windows, g_diag_acks;
+static bool g_diag_unavailable, g_diag_build_fail, g_env_fail;
+static int p_render_charger(char *out, size_t cap, uint64_t *window, bool seal)
+{
+    if (g_diag_unavailable) return -1;
+    if (seal) g_diag_windows++;
+    *window = g_diag_windows;
+    return snprintf(out, cap, "{\"read_mask\":65535,\"read_error\":-1,\"registers\":{\"0C\":3},"
+                              "\"adc_freshness\":\"unverified\"}");
+}
+static void p_ack_charger(uint64_t window)
+{
+    CHECK(window == g_diag_windows, "wrong charger window acknowledged");
+    g_diag_acks++;
+}
+
 static float g_env[3] = { 21.5f, 48.25f, 101325.0f };
-static esp_err_t p_read_env(measurement_t *m) { m->temperature_c = g_env[0]; m->humidity_percent = g_env[1]; m->pressure_pa = g_env[2]; return ESP_OK; }
+static esp_err_t p_read_env(measurement_t *m) { if (g_env_fail) return ESP_FAIL; m->temperature_c = g_env[0]; m->humidity_percent = g_env[1]; m->pressure_pa = g_env[2]; return ESP_OK; }
 static script_identity_t g_script = { .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
                                       .version = "schedule-v0.0.0-test", .built_against_fw = "0.0.0",
                                       .installed_on_fw = "0.0.0", .release_metadata_verified = true };
@@ -498,8 +550,11 @@ bool h_capture_build_telemetry(char *out, size_t cap, const payload_v3_telemetry
 bool h_capture_build_telemetry(char *out, size_t cap, const payload_v3_telemetry_input_t *in, char *err, size_t ecap)
 {
     g_cap_calls++;
+    if (g_diag_build_fail && in->charger_diagnostics_json) { snprintf(err, ecap, "injected charger overflow"); return false; }
     g_cap_nstr = 0;
     g_cap = *in;
+    static char charger_copy[2048];
+    if (in->charger_diagnostics_json) { snprintf(charger_copy, sizeof charger_copy, "%s", in->charger_diagnostics_json); g_cap.charger_diagnostics_json = charger_copy; }
     g_cap.device = cap_dup(in->device);
     g_cap.last_disc_reason = cap_dup(in->last_disc_reason);
     g_cap.evq_sd_state = cap_dup(in->evq_sd_state);
@@ -537,6 +592,8 @@ typedef struct {
     bool     power_port;
     size_t   flash_total;
     uint64_t sd_total;
+    bool diagnostics;
+    bool no_env;
     uint32_t cid;               /* card at boot (0 = CID_A) */
 } boot_t;
 
@@ -580,10 +637,13 @@ static void boot(const boot_t *o)
 
     g_power_port = o->power_port;
     device_commands_config_t cfg = {
-        .read_env = p_read_env,
+        .read_env = o->no_env ? NULL : p_read_env,
+        .uart_query = dc_query,
+        .render_charger_diagnostics = o->diagnostics ? p_render_charger : NULL,
+        .ack_charger_diagnostics = p_ack_charger,
         .read_power = o->power_port ? p_read_power : NULL,
-        .next_id = event_log_get_next_id_fn(),
-        .store_event = event_log_get_store_event_fn(),
+        .next_id = dc_next,
+        .store_event = dc_store,
         .claim_next_event = p_claim,
         .mark_event_synced = p_synced,
         .mark_event_pending = p_pending,
@@ -1689,6 +1749,15 @@ static void sc_worst(void)
         w.connectivity_valid = true; w.wifi = w.provisioned = w.publish_gate = true;
         w.mqtt_reconnects = UINT32_MAX; w.last_disc_reason = disc; w.conn_age_s = INT64_MIN;
         w.pending = INT64_MIN; w.publish_refused = UINT32_MAX; w.last_puback_reason = INT_MIN; w.refusal_hold_s = INT64_MIN;
+        /* Bound the entire optional charger object at its production cap.
+         * Use valid JSON of maximum admitted length, including the terminator. */
+        static char charger_worst[2048];
+        memcpy(charger_worst, "{\"padding\":\"", 12);
+        memset(charger_worst + 12, 'W', sizeof charger_worst - 15);
+        memcpy(charger_worst + sizeof charger_worst - 3, "\"}", 3);
+        w.charger_diagnostics_json = charger_worst;
+        w.measurement_stats_valid = true;
+        w.measurements_stored = w.measurement_store_failures = w.sensor_command_failures = UINT64_MAX;
         w.power_valid = true; w.battery_v = w.input_v = w.system_v = 65.535; w.input_ma = w.charge_ma = 65535;
         w.input_present = true; w.charge_status = 255;
         w.storage_db_valid = w.db_online = true; w.storage_sd_valid = true; w.sd_free_kb = UINT64_MAX;
@@ -2309,6 +2378,118 @@ static void sc_index_cap_replay(void)
     ev_common();
 }
 
+static void sc_charger_diagnostics(void)
+{
+    boot(&(boot_t){.card = true, .keeper = false, .diagnostics = true});
+    CHECK(produce() == ESP_OK && produce() == ESP_OK, "commit observations");
+    B.connected = false;
+    CHECK(cmd_publish_status_event().status != ESP_OK, "disconnected submission should fail");
+    CHECK(g_diag_acks == 0, "failed send consumed charger range");
+    B.connected = true;
+    CHECK(cmd_publish_status_event().status == ESP_OK, "partial scan must not fail heartbeat");
+    CHECK(g_diag_acks == 1, "successful send did not acknowledge range");
+    CHECK(g_cap.charger_diagnostics_json != NULL, "diagnostics not wired to codec");
+    CHECK(g_cap.measurements_stored == 2, "heartbeat counted as observation");
+    g_diag_unavailable = true;
+    CHECK(cmd_publish_status_event().status == ESP_OK, "missing diagnostics silenced heartbeat");
+    CHECK(g_diag_acks == 1, "omitted diagnostics consumed range");
+    g_diag_unavailable = false;
+    g_diag_build_fail = true;
+    CHECK(cmd_publish_status_event().status == ESP_OK, "oversize diagnostics silenced heartbeat");
+    CHECK(g_diag_acks == 1, "fallback without diagnostics consumed range");
+    g_diag_build_fail = false;
+    g_env_fail = true;
+    CHECK(cmd_read_env(NULL, NULL, NULL).status == ESP_FAIL, "failed sensor read");
+    CHECK(cmd_record_env(NULL, NULL).status == ESP_FAIL, "failed stored sensor read");
+    bool ready; device_status_snapshot_t snapshot;
+    CHECK(cmd_device_status(&ready, NULL, NULL).status == ESP_OK && !ready, "failed status BME read");
+    CHECK(cmd_status_report(&snapshot).status == ESP_OK, "failed report BME read");
+    CHECK(cmd_publish_status_event().status == ESP_OK, "BME failure silenced direct heartbeat");
+    CHECK(cmd_store_status_event().status == ESP_OK, "BME failure silenced stored heartbeat");
+    CHECK(g_cap.sensor_command_failures == 6, "BME attempts not counted once across all callers");
+    g_env_fail = false;
+    /* Same TIMEOUT code: channel ownership isn't a sensor exchange. */
+    CHECK(cmd_ambit_get_temp(0, NULL, NULL).status != ESP_OK, "ownership timeout");
+    dc_exchange = true;
+    CHECK(cmd_ambit_get_temp(0, NULL, NULL).status != ESP_OK, "wake timeout");
+    dc_query_error = ESP_ERR_NOT_ALLOWED;
+    CHECK(cmd_ambit_get_spec(0, NULL, NULL).status != ESP_OK, "late admission veto");
+    dc_query_error = ESP_OK; /* malformed response despite transport success */
+    CHECK(cmd_ambit_get_spec(0, NULL, NULL).status != ESP_OK, "malformed sensor response");
+    CHECK(cmd_record_env(NULL, NULL).status == ESP_OK, "stored BME280 observation");
+    /* Oversize observation is refused by the real event store, counted once. */
+    char *large = malloc(100000);
+    memset(large, 'W', 99999); large[99999] = 0;
+    int64_t mid = 0;
+    CHECK(cmd_next_measure_id(&mid).status == ESP_OK, "id for refused observation");
+    measurement_event_desc_t desc = {.measure_id = mid, .device = "test", .tag = MEASUREMENT_TAG_MEASUREMENT,
+                                    .payload_json = large};
+    CHECK(cmd_store_event(&desc).status != ESP_OK, "oversize store should fail");
+    free(large);
+    CHECK(cmd_store_status_event().status == ESP_OK, "stored diagnostics snapshot");
+    CHECK(g_diag_acks == 4, "successful store did not acknowledge range");
+    CHECK(g_cap.measurements_stored == 3 && g_cap.measurement_store_failures == 1 &&
+          g_cap.sensor_command_failures == 8, "wrong per-boot measurement counters");
+    const uint64_t acks = g_diag_acks, windows = g_diag_windows;
+    const unsigned persists = h_sd_persists;
+    const size_t pubs = g_npub;
+    const evlog_health_t before = health();
+    char *preview = NULL;
+    CHECK(cmd_preview_status_json(&preview).status == ESP_OK && preview, "preview failed");
+    CHECK(strstr(preview, "\"measure_id\":0") != NULL, "preview synthetic id");
+    h_dc_free(preview);
+    CHECK(health().next_id == before.next_id && health().pending == before.pending &&
+          h_sd_persists == persists && g_npub == pubs && g_diag_acks == acks &&
+          g_diag_windows == windows, "preview changed delivery state");
+    CHECK(dc_bytes == 0, "preview leaked");
+    /* Real malloc failures: required buffer fits, neither optional buffer does. */
+    dc_budget = PAYLOAD_V3_TELEMETRY_CAP;
+    CHECK(cmd_publish_status_event().status == ESP_OK, "optional OOM silenced direct heartbeat");
+    CHECK(g_cap.charger_diagnostics_json == NULL && g_diag_acks == acks, "OOM acknowledged omitted range");
+    CHECK(cmd_store_status_event().status == ESP_OK, "optional OOM silenced stored heartbeat");
+    CHECK(g_diag_acks == acks && dc_bytes == 0, "stored OOM ack/leak");
+    CHECK(cmd_preview_status_json(&preview).status == ESP_OK && preview, "optional OOM silenced preview");
+    h_dc_free(preview);
+    dc_budget = PAYLOAD_V3_TELEMETRY_CAP - 1;
+    const size_t oom_pubs = g_npub; const evlog_health_t oom_before = health();
+    preview = (char *)1;
+    CHECK(cmd_preview_status_json(&preview).status == ESP_ERR_NO_MEM && preview == NULL, "preview OOM");
+    CHECK(cmd_publish_status_event().status == ESP_ERR_NO_MEM, "required OOM direct");
+    CHECK(cmd_store_status_event().status == ESP_ERR_NO_MEM, "required OOM stored");
+    CHECK(health().next_id == oom_before.next_id && health().pending == oom_before.pending &&
+          g_npub == oom_pubs && g_diag_acks == acks && dc_bytes == 0, "required OOM side effects");
+    dc_budget = SIZE_MAX;
+    const unsigned calls_next = dc_next_calls, calls_store = dc_store_calls, calls_persist = h_sd_persists;
+    const size_t calls_publish = g_npub;
+    const uint64_t calls_ack = g_diag_acks, preview_windows = g_diag_windows;
+    CHECK(cmd_preview_status_json(&preview).status == ESP_OK && preview, "preview shared builder");
+    h_dc_free(preview);
+    g_diag_build_fail = true;
+    CHECK(cmd_preview_status_json(&preview).status == ESP_OK && preview, "preview fallback");
+    h_dc_free(preview); g_diag_build_fail = false;
+    CHECK(dc_next_calls == calls_next && dc_store_calls == calls_store && h_sd_persists == calls_persist &&
+          g_npub == calls_publish && g_diag_acks == calls_ack && g_diag_windows == preview_windows, "preview mutated delivery state");
+    dc_store_fail = true;
+    CHECK(cmd_store_status_event().status == ESP_FAIL && g_diag_acks == calls_ack, "failed store consumed range");
+    dc_store_fail = false;
+    CHECK(dc_bytes == 0, "delivery buffers leaked");
+    EV("CHARGER_DIAGNOSTICS", "ok");
+}
+
+static void sc_charger_no_env(void)
+{
+    boot(&(boot_t){.card = true, .no_env = true});
+    B.connected = true;
+    bool ready; device_status_snapshot_t snapshot;
+    CHECK(cmd_read_env(NULL, NULL, NULL).status == ESP_ERR_NOT_SUPPORTED, "missing BME port");
+    CHECK(cmd_record_env(NULL, NULL).status == ESP_ERR_NOT_SUPPORTED, "missing BME record port");
+    CHECK(cmd_device_status(&ready, NULL, NULL).status == ESP_OK && !ready, "missing BME status");
+    CHECK(cmd_status_report(&snapshot).status == ESP_OK, "missing BME report");
+    CHECK(cmd_publish_status_event().status == ESP_OK, "missing BME heartbeat");
+    CHECK(g_cap.sensor_command_failures == 0, "unavailable BME counted as failure");
+    EV("CHARGER_NO_ENV", "ok");
+}
+
 static void *volatile g_leak_sink;
 
 /* ════════════════════════ main ══════════════════════════════════════════ */
@@ -2331,7 +2512,9 @@ int main(int argc, char **argv)
        (unsigned)EVQ_KEEPER_PERIOD_MS, (unsigned)EVQ_INDEX_CAP, (unsigned)AMBYTE_PUBLISH_MAX_BYTES,
        (unsigned)PAYLOAD_V3_TELEMETRY_CAP, (unsigned)PUBLISH_WINDOW_SLOTS, (unsigned)PUBLISH_WINDOW_BYTES);
     const char *s = g_scenario;
-    if (!strcmp(s, "I1")) sc_I1();
+    if (!strcmp(s, "charger_no_env")) sc_charger_no_env();
+    else if (!strcmp(s, "charger_diagnostics")) sc_charger_diagnostics();
+    else if (!strcmp(s, "I1")) sc_I1();
     else if (!strcmp(s, "I2")) sc_I2();
     else if (!strcmp(s, "I3")) sc_I3();
     else if (!strcmp(s, "I4")) sc_I4();

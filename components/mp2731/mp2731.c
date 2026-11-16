@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "i2c_bus.h"
 #include "mp2731_core.h"
+#include "mp2731_diagnostics.h"
 
 #define TAG "mp2731"
 
@@ -28,6 +29,33 @@ static bool s_ready = false;
 static SemaphoreHandle_t s_read_mtx;
 static mp2731_frame_t    s_last_frame;    /* diagnostics (CLI), under s_read_mtx */
 static esp_err_t         s_last_err = ESP_ERR_INVALID_STATE;
+static mp2731_history_t s_history;
+static portMUX_TYPE s_history_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_overlap_epoch;
+static unsigned s_power_reads_active;
+
+static uint64_t history_begin(void)
+{
+    portENTER_CRITICAL(&s_history_mux);
+    if (s_power_reads_active != 0u) s_overlap_epoch++;
+    s_power_reads_active++;
+    const uint64_t epoch = s_overlap_epoch;
+    portEXIT_CRITICAL(&s_history_mux);
+    return epoch;
+}
+
+static void history_finish(uint64_t epoch, esp_err_t err, const power_reading_t *p,
+                            const mp2731_frame_t *f)
+{
+    portENTER_CRITICAL(&s_history_mux);
+    if (epoch != s_overlap_epoch || s_power_reads_active > 1u)
+        s_history.previous_status_valid = false;
+    s_power_reads_active--;
+    /* Timestamp inside the critical section: delayed task completions are
+     * ordered here, never allowed to move history backwards. No bus calls. */
+    mp2731_history_observe(&s_history, esp_timer_get_time() / 1000, err, p, f);
+    portEXIT_CRITICAL(&s_history_mux);
+}
 
 static esp_err_t mp2731_read_reg(uint8_t reg, uint8_t *out)
 {
@@ -134,11 +162,14 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     if (!s_ready || s_read_mtx == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    const uint64_t epoch = history_begin();
     if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;   /* classified i2c_error: no evidence either way */
+        history_finish(epoch, ESP_ERR_TIMEOUT, NULL, NULL);
+        return ESP_ERR_TIMEOUT;
     }
     mp2731_frame_t f;
     const esp_err_t err = mp2731_core_read(&s_bus, out, &f);
+    history_finish(epoch, err, out, &f);
     s_last_frame = f;
     s_last_err = err;
     xSemaphoreGive(s_read_mtx);
@@ -207,4 +238,35 @@ esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out)
 power_read_fn mp2731_get_power_read_fn(void)
 {
     return mp2731_read_power;
+}
+
+/* Slow register scans belong to telemetry, never the 5 s power-control path.
+ * Keep the same read mutex as ADC conversions so scans cannot interleave with
+ * a conversion sequence. A partial scan is still useful evidence. */
+int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id, bool seal)
+{
+    if (!s_ready || s_read_mtx == NULL || window_id == NULL) return -1;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) return -1;
+    charger_diagnostics_t d;
+    const int64_t now = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_history_mux);
+    if (seal) mp2731_history_snapshot(&s_history, &d, now);
+    else mp2731_history_peek(&s_history, &d, now);
+    portEXIT_CRITICAL(&s_history_mux);
+    d.scan_start_ms = now;
+    (void)mp2731_diagnostics_read(&s_bus, &d);
+    d.scan_end_ms = esp_timer_get_time() / 1000;
+    *window_id = d.window_id;
+    xSemaphoreGive(s_read_mtx);
+    return mp2731_diagnostics_render(&d, out, cap);
+}
+
+void mp2731_ack_diagnostics(uint64_t window_id)
+{
+    if (s_read_mtx == NULL) return;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) return;
+    portENTER_CRITICAL(&s_history_mux);
+    mp2731_history_ack(&s_history, window_id);
+    portEXIT_CRITICAL(&s_history_mux);
+    xSemaphoreGive(s_read_mtx);
 }

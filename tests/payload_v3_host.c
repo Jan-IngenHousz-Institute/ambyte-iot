@@ -397,6 +397,11 @@ static void print_telemetry_fixture(void)
     assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
     printf("TELEMETRY_POWER_I2C=%s\n", output);
 
+    input.charger_diagnostics_json = "{\"read_mask\":16777215,\"registers\":{\"10\":102,\"17\":128},\"adc_freshness\":\"unverified\",\"safety_timer_expired\":true}";
+    assert(payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
+    printf("TELEMETRY_CHARGER=%s\n", output);
+    input.charger_diagnostics_json = NULL;
+
     input.air_temperature = NAN;
     assert(!payload_v3_build_telemetry(output, sizeof output, &input, error, sizeof error));
 
