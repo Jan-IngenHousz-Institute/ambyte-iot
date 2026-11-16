@@ -93,10 +93,20 @@ shared I2C bus mutex across write and readback. Concurrent CLI/MQTT requests
 therefore cannot interleave within a write/readback transaction. Registers other
 than REG01 are untouched by these commands.
 
+If `vin_limit` reports `ESP_ERR_INVALID_RESPONSE`, use `mp2731_regs 1 0` to
+inspect the raw byte, including a reset-bit or out-of-range value that cannot
+be returned as a valid decoded limit.
+
 The command changes only the live charger register. It writes neither ESP NVS
-nor charger OTP, and the firmware does not reapply an override at boot. Charger
-reset/power loss can restore the OTP default; input-power reset behavior depends
-on the chip's OTP configuration. An ESP reboot alone need not reset the charger.
+nor charger OTP, and the firmware does not reapply an override at boot. An ESP
+reboot alone need not reset the charger.
+
+The datasheet marks VIN_MIN as **not reset by the I2C watchdog**. It also says
+that VIN power-on reset can restore VIN_MIN from OTP. On a panel-only unit,
+nightly loss of input can therefore reset the experiment's setting. Re-read
+`vin_limit` after dawn or any input power cycle; do not assume the previous
+day's setting still applies. Input-removal/reapplication behavior has not been
+physically qualified by this test.
 
 ```mermaid
 sequenceDiagram
@@ -143,7 +153,32 @@ setting, reset-bit exclusion, bad values/ids, absent hardware, delayed dispatch,
 queue refusal, bus errors, and readback mismatch. The device command ports are
 shimmed in this host harness; firmware build verification covers their wiring.
 
-Hardware qualification is pending. On a bench unit, record the initial limit,
-set a test value, confirm both CLI and MQTT readback, capture `status` under the
-same lighting/load conditions, and restore the recorded limit. No physical-unit
-capture or charging improvement is claimed by the host tests.
+Physical USB qualification on 2026-11-16 used source
+`ce2d42d31c634c5e8cb9366399794c9c0660e935`, compiled as
+`2.20.0-vin-ce2d42d`. The actual console confirmed `help vin_limit`, the initial
+4300 mV (`REG01=0x06`), setting 4000 mV with verified `REG01=0x03`, and readback.
+Both `4050` and `-1` were rejected with CLI return code 1. After 62 seconds the
+limit still read 4000 mV; the original 4300 mV/full `REG01=0x06` was restored
+and independently checked in the raw register dump. That dump also shows
+`REG0D=0x80` (WATCHDOG_FAULT), while the voltage limit remained set through the
+62-second wait. The capture also ran `status`. Firmware SHA and capture facts are in the
+[bench manifest](images/charger-vin-limit/bench-manifest.json).
+
+After qualification, the bench was returned to the production-signed official
+v2.20.0 release. Its raw register dump confirmed the complete `REG01=0x06` byte;
+all 13 captured configuration values and the installed schedule SHA were
+unchanged. NVS was preserved and no cloud command was sent.
+
+These images render real USB replies; the adjacent text files retain the
+same excerpts. ANSI escapes, trailing whitespace, and leading asynchronous
+telemetry-log fragments are omitted from the excerpts. No endpoint,
+credentials, or site topic is included.
+
+![Actual CLI help, read, set and verified readback](images/charger-vin-limit/cli-usage.png)
+
+![Actual rejected inputs, delayed readback and restoration](images/charger-vin-limit/cli-validation-and-restore.png)
+
+MQTT is host-tested only. Live MQTT commands, input-removal/reapplication,
+status under controlled load, and weak-solar charging behavior remain unqualified
+on hardware. The CLI test demonstrates register control and watchdog persistence
+on this bench; it does not establish a charging improvement.
