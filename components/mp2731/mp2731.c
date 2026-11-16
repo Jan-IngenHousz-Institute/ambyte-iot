@@ -17,6 +17,7 @@
 
 /* Register map, datasheet citations and the read algorithm live in
  * mp2731_core.{h,c} (host-testable); this file is only the I2C adapter. */
+#define MP2731_REG_VIN_LIMIT 0x01u
 
 #define MP2731_I2C_TIMEOUT_TICKS pdMS_TO_TICKS(1000)
 
@@ -153,6 +154,55 @@ static void bus_delay(void *ctx, uint32_t ms)
 static const mp2731_bus_t s_bus = {
     .read = bus_read, .write = bus_write, .delay_ms = bus_delay, .ctx = NULL,
 };
+
+esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    uint8_t reg = 0;
+    esp_err_t err = mp2731_read_reg(MP2731_REG_VIN_LIMIT, &reg);
+    if (err != ESP_OK) return err;
+    const uint16_t mv = POWER_VIN_LIMIT_MIN_MV + (reg & 0x7FU) * POWER_VIN_LIMIT_STEP_MV;
+    if ((reg & 0x80U) != 0 || mv > POWER_VIN_LIMIT_MAX_MV) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    *out = (power_vin_limit_t){.mv = mv, .reg01 = reg};
+    return ESP_OK;
+}
+
+esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
+{
+    if (out == NULL || !power_vin_limit_valid_mv(mv)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    i2c_port_t port = I2C_NUM_MAX;
+    esp_err_t err = i2c_bus_get_port(&port);
+    if (err != ESP_OK) return err;
+    err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
+    if (err != ESP_OK) return err;
+
+    /* REG01[6:0] = (VIN_MIN - 3.7 V) / 100 mV. Bit 7 is REGISTER RESET:
+     * deliberately write it as zero, rather than copying a transient reset
+     * bit from a read-modify-write. Hold the bus through readback so a CLI and
+     * MQTT set cannot interleave and acknowledge each other's values. */
+    const uint8_t value = (mv - POWER_VIN_LIMIT_MIN_MV) / POWER_VIN_LIMIT_STEP_MV;
+    const uint8_t buf[2] = {MP2731_REG_VIN_LIMIT, value};
+    err = i2c_master_write_to_device(port, MP2731_I2C_ADDR, buf, sizeof(buf),
+                                    MP2731_I2C_TIMEOUT_TICKS);
+    uint8_t readback = 0;
+    if (err == ESP_OK) {
+        const uint8_t reg = MP2731_REG_VIN_LIMIT;
+        err = i2c_master_write_read_device(port, MP2731_I2C_ADDR, &reg, 1,
+                                          &readback, 1, MP2731_I2C_TIMEOUT_TICKS);
+        if (err == ESP_OK && readback != value) err = ESP_ERR_INVALID_RESPONSE;
+    }
+    (void)i2c_bus_unlock();
+    if (err == ESP_OK) *out = (power_vin_limit_t){.mv = mv, .reg01 = readback};
+    return err;
+}
 
 esp_err_t mp2731_read_power(power_reading_t *out)
 {

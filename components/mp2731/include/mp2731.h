@@ -52,6 +52,13 @@ esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out);
  * write (bit7 set = the chip latched ADC_START); *done_us = time until bit7
  * fell, UINT32_MAX if it never did within MP2731_ADC_TIMEOUT_MS. */
 esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us);
+/* Read/set REG01 VIN_MIN (input voltage limit): 3700..15200 mV in 100 mV
+ * steps. out is required. Set keeps the register-reset bit clear and verifies
+ * the written value under the same I2C lock. No NVS/OTP write or boot override:
+ * this changes the live charger register only. A charger reset can restore its
+ * OTP default; an ESP reboot alone need not reset the charger. */
+esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out);
+esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
 
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);

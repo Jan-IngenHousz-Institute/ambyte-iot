@@ -24,8 +24,11 @@ extern "C" {
  * `evlog_inventory` report describing the SD archive (arc-*.log) with optional
  * `from_id`/`to_id`/`from_ms`/`to_ms` window and `list` (per-file rows, default
  * true). It never touches the event store, the cursor or the card contents.
- * State-changing commands carry a unique `id`; the router persists the last applied
- * id in NVS and no-ops a repeat (idempotency — safe with a retained trigger).
+ * `get_vin_limit` / `set_vin_limit` (integer `mv`) read/write the live charger
+ * input limit on the resident worker; replies carry verified REG01 readback.
+ * VIN-limit commands require a nonempty id of at most 64 bytes, use no NVS
+ * dedupe/override, and repeated sets write the same desired register value.
+ * Update components own their individual idempotency policies.
  */
 
 typedef struct {

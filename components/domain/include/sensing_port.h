@@ -95,6 +95,27 @@ static inline const char *power_read_reason_name(power_read_reason_t r)
 
 typedef esp_err_t (*power_read_fn)(power_reading_t *out);
 
+/* Charger input-voltage regulation threshold, distinct from measured VIN and
+ * the firmware's external-power detection threshold. REG01 is returned so bench
+ * scripts can compare the decoded limit with the actual hardware readback. */
+#define POWER_VIN_LIMIT_MIN_MV  3700U
+#define POWER_VIN_LIMIT_MAX_MV 15200U
+#define POWER_VIN_LIMIT_STEP_MV  100U
+
+static inline bool power_vin_limit_valid_mv(uint32_t mv)
+{
+    return mv >= POWER_VIN_LIMIT_MIN_MV && mv <= POWER_VIN_LIMIT_MAX_MV &&
+           (mv - POWER_VIN_LIMIT_MIN_MV) % POWER_VIN_LIMIT_STEP_MV == 0;
+}
+
+typedef struct {
+    uint16_t mv;
+    uint8_t reg01;
+} power_vin_limit_t;
+
+typedef esp_err_t (*power_get_vin_limit_fn)(power_vin_limit_t *out);
+typedef esp_err_t (*power_set_vin_limit_fn)(uint16_t mv, power_vin_limit_t *out);
+
 #ifdef __cplusplus
 }
 #endif

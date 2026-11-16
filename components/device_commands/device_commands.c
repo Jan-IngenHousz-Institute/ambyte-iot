@@ -872,6 +872,35 @@ cmd_result_t cmd_read_power(power_reading_t *out)
                        p.battery_mv, p.input_mv, p.system_mv, p.input_ma, p.charge_ma);
 }
 
+cmd_result_t cmd_get_vin_limit(power_vin_limit_t *out)
+{
+    if (out == NULL) return make_result(ESP_ERR_INVALID_ARG, "VIN limit: output required");
+    if (!s_initialized || s_cfg.get_vin_limit == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger VIN limit not available");
+    }
+    esp_err_t err = s_cfg.get_vin_limit(out);
+    if (err != ESP_OK) {
+        return make_result(err, "VIN limit read failed: %s", esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "VIN limit=%u mV REG01=0x%02X", out->mv, out->reg01);
+}
+
+cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
+{
+    if (out == NULL || !power_vin_limit_valid_mv(mv)) {
+        return make_result(ESP_ERR_INVALID_ARG, "VIN limit must be 3700..15200 mV in 100 mV steps");
+    }
+    if (!s_initialized || s_cfg.set_vin_limit == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger VIN limit not available");
+    }
+    esp_err_t err = s_cfg.set_vin_limit(mv, out);
+    if (err != ESP_OK) {
+        return make_result(err, "VIN limit set/readback failed: %s; query before retrying",
+                           esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "VIN limit=%u mV REG01=0x%02X (verified)", out->mv, out->reg01);
+}
+
 /* Return current UTC milliseconds since epoch, sourced from the IDF's internal
  * clock (settimeofday'd from the RTC at boot — see components/pcf2131tfy_rtc).
  * Cheap: one syscall, no I2C transactions. */
