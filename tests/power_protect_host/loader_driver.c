@@ -74,6 +74,7 @@ static void start_timer(port_t *p, uint32_t ms) { (void)p; (void)ms; }
 typedef int esp_err_t;
 typedef int uart_port_t;
 #define ESP_OK 0
+#define ESP_ERR_INVALID_ARG 0x102
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NOT_ALLOWED 0x10D
 #define TAG "uart"
@@ -83,7 +84,7 @@ typedef int uart_port_t;
 #define AMBIT_CMD_DONE 161
 #define AMBIT_CMD_OTA_BEGIN 25
 typedef enum { UART_SENSOR_DISCONNECTED = 0, UART_SENSOR_CONNECTED = 1, UART_SENSOR_BUSY = 2 } uart_sensor_state_t;
-typedef struct { esp_err_t status; uint8_t *raw; size_t raw_len; } uart_sensor_response_t;
+typedef struct { esp_err_t status; uint8_t *raw; size_t raw_len; bool exchange_attempted; } uart_sensor_response_t;
 __attribute__((format(printf, 2, 3))) static void host_log(const char *tag, const char *fmt, ...) { (void)tag; (void)fmt; }
 #define ESP_LOGW(tag, ...) host_log(tag, __VA_ARGS__)
 static bool s_inited = true;
