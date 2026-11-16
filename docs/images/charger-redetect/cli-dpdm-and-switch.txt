@@ -1,0 +1,41 @@
+charger_redetect dpdm, usage refusal and the RAM-only auto switch
+Real USB console - 2026-11-16 - bench 28:37:2F:FF:E7:04 (dev fleet, laptop USB, battery full)
+Firmware v2.21.0-dirty (bench-signed build of feat/charger-redetect bd6f956)
+Unrelated asynchronous log lines (sync_runner, sched, mqtt) omitted; prompts normalized.
+
+ambyte> help charger_redetect
+charger_redetect
+  charger_redetect [bg_en|dpdm] | charger_redetect auto [on|off]  re-run
+  charger input detection (REG09 BG_EN pulse / REG0B DP/DM) with before/after
+  registers; auto = RAM-only automatic re-detect switch
+
+ambyte> charger_redetect auto
+auto re-detect ON (state idle, disabled_reason none, attempts 0, charging 0, last none, next in 0s)
+
+ambyte> charger_redetect dpdm
+charger_redetect dpdm: pulsing, then reading REG00..REG17 for ~5 s...
+W (45765) mp2731: charger re-detect (manual dpdm): REG0B 0xC0->0xC0 REG0C 0x31: ESP_OK
+re-detect dpdm: REG0B 0xC0->0xC0->0xC0 (bit5 read back 0: self-cleared or ignored)
+  before t=   -15 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 D3 D4 88 55 09 15 08 60 EE 00
+  after  t=     1 ms  REG0C=0x01 VIN_STAT=0 CHG_STAT=0 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 01 80 D3 D4 88 55 09 15 08 60 EE 00
+  +1.5s  t=  1496 ms  REG0C=0x39 VIN_STAT=1 CHG_STAT=3 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 39 80 D3 D4 88 55 09 15 08 60 EE 00
+  +5s    t=  4996 ms  REG0C=0x39 VIN_STAT=1 CHG_STAT=3 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 39 80 D2 DB 88 55 00 09 08 60 EE 00
+
+ambyte> mp2731_regs 1 0 read
+MP2731 t=50090 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DB 10=89 11=56 12=00 13=0C 14=08 15=60 16=EE 17=00
+
+ambyte> charger_redetect bogus
+Usage: charger_redetect [bg_en|dpdm] | charger_redetect auto [on|off]
+Command returned non-zero error code: 0x1 (ERROR)
+
+ambyte> charger_redetect auto off
+W (51345) mp2731: charger re-detect: automatic re-detection OFF by operator (RAM only)
+auto re-detect OFF (state disabled, disabled_reason operator, attempts 0, charging 0, last none, next in 0s)
+
+ambyte> charger_redetect auto on
+W (51545) mp2731: charger re-detect: automatic re-detection ON by operator (RAM only)
+auto re-detect ON (state idle, disabled_reason none, attempts 0, charging 0, last none, next in 0s)

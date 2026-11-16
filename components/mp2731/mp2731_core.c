@@ -166,3 +166,78 @@ done:
     if (frame != NULL) *frame = f;
     return err;
 }
+
+esp_err_t mp2731_core_bg_en_pulse(const mp2731_bus_t *bus, mp2731_pulse_t *out)
+{
+    memset(out, 0, sizeof *out);
+    uint8_t v = 0;
+    esp_err_t err = rd(bus, MP2731_REG_BANDGAP, &v);
+    if (err != ESP_OK) return err;
+    out->before = v;
+    /* Read-modify-write: the reserved bits keep whatever the chip holds. */
+    out->set_attempted = true;
+    err = bus->write(bus->ctx, MP2731_REG_BANDGAP, (uint8_t)(v | MP2731_BG_EN_BIT));
+    if (err == ESP_OK) err = rd(bus, MP2731_REG_BANDGAP, &out->set_rb);
+    if (err == ESP_OK) {
+        out->latched = (out->set_rb & MP2731_BG_EN_BIT) != 0u;
+        if (!out->latched) {
+            /* Nothing to undo: the bit is 0. No 1->0 edge happened, so the
+             * detection was NOT reset; never report that as a re-detect. */
+            out->after = out->set_rb;
+            out->cleared = true;
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    /* Clear even after a bus error: the write may have landed, and a BG_EN
+     * left at 1 (bandgap "Disabled") is the one state this must not leave. */
+    const uint8_t clear = (uint8_t)((err == ESP_OK ? out->set_rb : (v | MP2731_BG_EN_BIT)) &
+                                    (uint8_t)~MP2731_BG_EN_BIT);
+    esp_err_t clear_err = ESP_FAIL;
+    for (uint8_t i = 0; i < 1u + MP2731_BG_EN_CLEAR_RETRIES; i++) {
+        out->clear_writes++;
+        clear_err = bus->write(bus->ctx, MP2731_REG_BANDGAP, clear);
+        uint8_t rb = 0;
+        if (clear_err == ESP_OK) clear_err = rd(bus, MP2731_REG_BANDGAP, &rb);
+        if (clear_err == ESP_OK) {
+            out->after = rb;
+            if ((rb & MP2731_BG_EN_BIT) == 0u) { out->cleared = true; break; }
+        }
+    }
+    if (err != ESP_OK) return err;             /* the set path failed */
+    if (!out->cleared) return clear_err != ESP_OK ? clear_err : ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+
+esp_err_t mp2731_core_dpdm_force(const mp2731_bus_t *bus, mp2731_pulse_t *out)
+{
+    memset(out, 0, sizeof *out);
+    uint8_t v = 0;
+    esp_err_t err = rd(bus, MP2731_REG_USB_DET, &v);
+    if (err != ESP_OK) return err;
+    out->before = v;
+    const uint8_t w = (uint8_t)((v & (uint8_t)~MP2731_USB_DET_WRITE0) | MP2731_USB_DET_EN_BIT);
+    err = bus->write(bus->ctx, MP2731_REG_USB_DET, w);
+    if (err == ESP_OK) err = rd(bus, MP2731_REG_USB_DET, &out->set_rb);
+    if (err != ESP_OK) return err;
+    out->latched = (out->set_rb & MP2731_USB_DET_EN_BIT) != 0u;
+    out->after = out->set_rb;
+    out->cleared = !out->latched;
+    return ESP_OK;
+}
+
+esp_err_t mp2731_core_dpdm_restore(const mp2731_bus_t *bus, uint8_t *final, bool *wrote)
+{
+    *wrote = false;
+    uint8_t v = 0;
+    esp_err_t err = rd(bus, MP2731_REG_USB_DET, &v);
+    if (err != ESP_OK) return err;
+    if ((v & MP2731_USB_DET_EN_BIT) != 0u) {
+        *wrote = true;
+        err = bus->write(bus->ctx, MP2731_REG_USB_DET,
+                         (uint8_t)(v & (uint8_t)~(MP2731_USB_DET_EN_BIT | MP2731_USB_DET_WRITE0)));
+        if (err == ESP_OK) err = rd(bus, MP2731_REG_USB_DET, &v);
+        if (err != ESP_OK) return err;
+    }
+    *final = v;
+    return (v & MP2731_USB_DET_EN_BIT) != 0u ? ESP_ERR_INVALID_STATE : ESP_OK;
+}

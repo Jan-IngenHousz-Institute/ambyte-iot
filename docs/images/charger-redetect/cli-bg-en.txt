@@ -1,0 +1,36 @@
+charger_redetect bg_en on USB: BG_EN latches with the I2C watchdog expired (REG0D=0x80)
+Real USB console - 2026-11-16 - bench 28:37:2F:FF:E7:04 (dev fleet, laptop USB, battery full)
+Firmware v2.21.0-dirty (bench-signed build of feat/charger-redetect bd6f956)
+Unrelated asynchronous log lines (sync_runner, sched, mqtt) omitted; prompts normalized.
+
+ambyte> mp2731_regs 1 0 read
+MP2731 t=34070 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DA 10=89 11=55 12=00 13=0E 14=08 15=60 16=EE 17=00
+
+ambyte> charger_redetect
+charger_redetect bg_en: pulsing, then reading REG00..REG17 for ~5 s...
+W (35155) mp2731: charger re-detect (manual bg_en): REG09 0x00->0x08->0x00 REG0C 0x39: ESP_OK
+re-detect bg_en: REG09 0x00->0x08->0x00 (1 latched, 0 verified)
+  before t=   -17 ms  REG0C=0x39 VIN_STAT=1 CHG_STAT=3 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 39 80 D2 DA 89 55 00 0E 08 60 EE 00
+  after  t=     0 ms  REG0C=0x01 VIN_STAT=0 CHG_STAT=0 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 01 80 D2 DA 89 55 00 0E 08 60 EE 00
+  +1.5s  t=  1491 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 D2 DA 89 55 00 0E 08 60 EE 00
+  +5s    t=  4991 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 D3 D3 88 54 07 16 08 60 EE 00
+
+ambyte> mp2731_regs 1 0 read
+MP2731 t=39470 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=31 0D=80 0E=D3 0F=D3 10=88 11=54 12=08 13=1C 14=08 15=60 16=EE 17=00
+
+ambyte> charger_redetect bg_en
+charger_redetect bg_en: pulsing, then reading REG00..REG17 for ~5 s...
+W (40565) mp2731: charger re-detect (manual bg_en): REG09 0x00->0x08->0x00 REG0C 0x31: ESP_OK
+re-detect bg_en: REG09 0x00->0x08->0x00 (1 latched, 0 verified)
+  before t=   -18 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 D3 D3 88 54 08 1C 08 60 EE 00
+  after  t=     0 ms  REG0C=0x01 VIN_STAT=0 CHG_STAT=0 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 01 80 D3 D3 88 54 08 1C 08 60 EE 00
+  +1.5s  t=  1491 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 00 D1 88 56 00 09 08 60 EE 00
+  +5s    t=  4991 ms  REG0C=0x31 VIN_STAT=1 CHG_STAT=2 VINPPM=0 REG0D=0x80
+         regs 48 06 DC 10 5B A6 22 A0 95 00 58 C0 31 80 D3 D4 88 55 09 15 08 60 EE 00

@@ -6,6 +6,7 @@
 #include "power_protect_command.h"
 #include "timezone_command.h"
 #include "vin_limit_command.h"
+#include "charger_redetect_command.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -489,6 +490,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         }
     } else if (vin_limit_command_handle(root)) {
         /* Only validation and a bounded enqueue run on the MQTT task. */
+    } else if (charger_redetect_command_handle(root)) {
+        /* Same: validation + enqueue only; the ~5 s pulse runs on the worker. */
     } else if (timezone_command_handle(root)) {
         /* Bounded input was copied to the resident maintenance worker. */
     } else if (strcmp(type, "set_location") == 0) {
@@ -609,6 +612,8 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
     power_protect_command_init(&pp_config);
     vin_limit_command_config_t vin_config = {.reply = publish_reply, .submit = cfg->submit};
     vin_limit_command_init(&vin_config);
+    charger_redetect_command_config_t redetect_config = {.reply = publish_reply, .submit = cfg->submit};
+    charger_redetect_command_init(&redetect_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",
              s_cfg.status_topic ? s_cfg.status_topic : "(none)");
     return ESP_OK;

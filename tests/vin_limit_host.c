@@ -24,6 +24,8 @@ static int read_mutex;
 static int64_t clock_us;
 
 const char *esp_err_to_name(esp_err_t err) { return err == ESP_OK ? "ESP_OK" : "test_error"; }
+#include "esp_system.h"
+esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 void vTaskDelay(TickType_t ticks) { clock_us += (int64_t)ticks * 1000; }
 int64_t esp_timer_get_time(void) { return clock_us; }
 void esp_rom_delay_us(unsigned us) { clock_us += us; }

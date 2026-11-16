@@ -132,6 +132,55 @@ bool mp2731_core_plausible(const power_reading_t *p);
  * all-zero register file is NOT this (INPUT_FAULT would be 0). */
 bool mp2731_core_no_input(uint8_t status, uint8_t fault);
 
+/* ── Re-detection pulses (docs/charger-redetect.md) ────────────────────────
+ * REG09 bit 3 BG_EN (POR 0, "Reset by REG_RST: Y, by WTD: Y"; bits 7:4 and
+ * 2:0 reserved): "Setting this bit from 1 to 0 will reset the input plug-in
+ * detection and safety timer" (REG09 table); "Writing the BG_EN bit from 1 to
+ * 0 or re-inserting the input re-enables the input detection, clears the
+ * safety timer fault and restarts the safety timer" (Safety Timer). The
+ * register table names the 1 state "Disabled" (bandgap off): keep it for the
+ * shortest possible time - set, read back, clear, read back, nothing between.
+ *
+ * REG0B bit 5 USB_DET_EN (POR 0, reset by WTD): "1: Force DP/DM detection";
+ * the text adds "in the host mode". Unlike DM/DP (bits 4/3, "resets to 0
+ * after 1 is written") the table does NOT say bit 5 self-clears, and this
+ * fleet runs in the charger's default mode (I2C watchdog expired, REG0D bit
+ * 7), so the chip may ignore it. Bits 4/3/0 are written 0 (writing 1 drives
+ * DM/DP or pulls D+ to 0 V); bits 7:6 and 2:1 are preserved. */
+#define MP2731_REG_BANDGAP     0x09u
+#define MP2731_BG_EN_BIT       0x08u
+#define MP2731_REG_USB_DET     0x0Bu
+#define MP2731_USB_DET_EN_BIT  0x20u
+#define MP2731_USB_DET_WRITE0  0x19u  /* DM, DP, FAST_CHG_RESET: never written 1 */
+/* Extra clear attempts when BG_EN reads back 1 after the clear. */
+#define MP2731_BG_EN_CLEAR_RETRIES 3u
+
+typedef struct {
+    uint8_t before;     /* register before the write */
+    uint8_t set_rb;     /* readback after setting the bit */
+    uint8_t after;      /* final readback */
+    bool    latched;    /* the bit read back as 1 after setting it */
+    bool    cleared;    /* final readback has the bit clear */
+    uint8_t clear_writes;
+    bool    set_attempted;  /* a write setting the bit was issued: it may have landed */
+} mp2731_pulse_t;
+
+/* BG_EN 0 -> 1 (verify) -> 0 (verify, with retries). Returns ESP_OK only when
+ * the 1 latched AND the 0 read back: the 1->0 edge provably happened.
+ * ESP_ERR_INVALID_RESPONSE = the 1 never latched (no edge, nothing written
+ * after it); ESP_ERR_INVALID_STATE = BG_EN still 1 after every clear; any
+ * other error = bus. On a bus error after the 1 latched the clear is still
+ * attempted. The caller holds the bus for the whole sequence. */
+esp_err_t mp2731_core_bg_en_pulse(const mp2731_bus_t *bus, mp2731_pulse_t *out);
+
+/* USB_DET_EN := 1 with the rules above. ESP_OK when the write and readback
+ * completed; `latched` tells whether the bit stayed 1 (0 = self-cleared or
+ * ignored: indistinguishable from the register alone). */
+esp_err_t mp2731_core_dpdm_force(const mp2731_bus_t *bus, mp2731_pulse_t *out);
+/* If USB_DET_EN still reads 1, write it back to 0 (the POR value). *cleared
+ * reports the final state; *wrote whether a write was needed. */
+esp_err_t mp2731_core_dpdm_restore(const mp2731_bus_t *bus, uint8_t *final, bool *wrote);
+
 #ifdef __cplusplus
 }
 #endif

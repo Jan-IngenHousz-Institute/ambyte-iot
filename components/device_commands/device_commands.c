@@ -901,6 +901,64 @@ cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
     return make_result(ESP_OK, "VIN limit=%u mV REG01=0x%02X (verified)", out->mv, out->reg01);
 }
 
+cmd_result_t cmd_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out)
+{
+    if (out == NULL || (method != POWER_REDETECT_BG_EN && method != POWER_REDETECT_DPDM)) {
+        return make_result(ESP_ERR_INVALID_ARG, "charger re-detect: method must be bg_en or dpdm");
+    }
+    if (!s_initialized || s_cfg.charger_redetect == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger re-detect not available");
+    }
+    const char *name = method == POWER_REDETECT_BG_EN ? "bg_en" : "dpdm";
+    const esp_err_t err = s_cfg.charger_redetect(method, out);
+    switch (err) {
+    case ESP_OK:
+        if (method == POWER_REDETECT_BG_EN) {
+            return make_result(ESP_OK, "re-detect bg_en: REG09 0x%02X->0x%02X->0x%02X (1 latched, 0 verified)",
+                               out->reg_before, out->reg_set, out->reg_after);
+        }
+        return make_result(ESP_OK, "re-detect dpdm: REG0B 0x%02X->0x%02X->0x%02X (bit5 %s%s)",
+                           out->reg_before, out->reg_set, out->reg_after,
+                           out->latched ? "latched" : "read back 0: self-cleared or ignored",
+                           out->restored ? ", restored to 0" : "");
+    case ESP_ERR_NOT_ALLOWED:
+        return make_result(err, "re-detect %s refused: maintenance (OTA/AMBIT flash) in progress", name);
+    case ESP_ERR_TIMEOUT:
+        return make_result(err, "re-detect %s busy: another re-detect or charger read holds the charger", name);
+    case ESP_ERR_INVALID_RESPONSE:
+        return make_result(err, "re-detect bg_en FAILED: BG_EN=1 never latched (REG09 0x%02X->0x%02X), "
+                                "so no 1->0 edge happened", out->reg_before, out->reg_set);
+    case ESP_ERR_INVALID_STATE:
+        if (out->snapshots == 0) return make_result(err, "re-detect %s: charger not ready", name);
+        return make_result(err, "re-detect %s FAILED: bit still set at the end (REG%02X 0x%02X); "
+                                "the driver retries the clear on every read", name, out->reg, out->reg_after);
+    default:
+        return make_result(err, "re-detect %s failed: %s", name, esp_err_to_name(err));
+    }
+}
+
+cmd_result_t cmd_charger_redetect_auto(int set, power_redetect_auto_t *out)
+{
+    if (out == NULL || set < -1 || set > 1) {
+        return make_result(ESP_ERR_INVALID_ARG, "charger re-detect auto: expected query, on or off");
+    }
+    if (!s_initialized || s_cfg.charger_redetect_auto == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger re-detect not available");
+    }
+    const esp_err_t err = s_cfg.charger_redetect_auto(set, out);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return make_result(err, "auto re-detect stays off: BG_EN not yet proven cleared");
+    }
+    if (err != ESP_OK) {
+        return make_result(err, "auto re-detect failed: %s", esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "auto re-detect %s (state %s, disabled_reason %s, attempts %u, "
+                               "charging %u, last %s, next in %us)",
+                       out->enabled ? "ON" : "OFF", out->state, out->disabled_reason,
+                       (unsigned)out->attempts, (unsigned)out->charging, out->last_outcome,
+                       (unsigned)out->next_in_s);
+}
+
 /* Return current UTC milliseconds since epoch, sourced from the IDF's internal
  * clock (settimeofday'd from the RTC at boot — see components/pcf2131tfy_rtc).
  * Cheap: one syscall, no I2C transactions. */

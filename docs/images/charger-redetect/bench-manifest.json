@@ -1,0 +1,30 @@
+{
+  "source_commit": "bd6f956",
+  "firmware": "v2.21.0-dirty (bench-signed; -dirty = git describe at build time, sources match bd6f956)",
+  "signed_image_sha256": "37ffc32006fb7656f681e4d3cd596fda522bafd6e0f1468cfd6d125a0562083d",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "power_source": "laptop USB, battery full (REG0C 0x39 = nonstandard adapter, charge done)",
+  "reg0d_watchdog_fault": true,
+  "bg_en_latched_with_watchdog_expired": true,
+  "bg_en_pulses": 3,
+  "esp_reset_during_pulses": false,
+  "dpdm_bit5_readback": "self-cleared/0 immediately; detection still re-ran (REG0C 0x31 -> 0x01 -> 0x39)",
+  "auto_policy_on_hardware": "not exercised: USB VIN 5.1 V is below the 5.5 V floor by design",
+  "mqtt_on_hardware": false,
+  "nvs_erased": false,
+  "cloud_commands_sent": false,
+  "restoration": {
+    "firmware": "2.21.0",
+    "signed_image_sha256": "f0cf093e56aa707fee166dc695b51945c5d18b60a079bafb9cef59065aad8b55",
+    "reg01": 6,
+    "reg09": 0,
+    "reg0b": 192,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_unchanged": true,
+    "nvs_erased": false,
+    "cloud_commands_sent": false,
+    "release_tag": "v2.21.0",
+    "signed": true
+  }
+}

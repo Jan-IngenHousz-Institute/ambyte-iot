@@ -8,7 +8,9 @@ stored status cadence is configurable).
 
 The MP2731's accepted power frame is still reported under `health.power`.
 The new object is diagnostic evidence only: it cannot open a flash gate, release
-brownout protection or hold back measurement publishing. The serial
+brownout protection or hold back measurement publishing. Since the re-detection
+change, the driver's own re-detection policy reads the same power reads (not
+this scan), and its state is reported under `charger.redetect`. The serial
 `mp2731_regs` command also includes REG17 now.
 
 `telemetry_preview` uses the same canonical payload builder with synthetic `measure_id=0`, labeled outside the JSON. It allocates no persistent ID, stores/publishes nothing, skips SD diagnostic persistence and peeks without sealing or acknowledging charger windows. Its live BME/power reads can advance per-boot RAM counters/history. The caller owns the returned preview buffer. This command does not suppress autonomous firmware publishing; bench connectivity must separately target a development endpoint.
@@ -102,6 +104,16 @@ new reads after a snapshot survive its acknowledgement. Concurrent reporters
 may cause overlapping windows, never erasure of newer observations. Direct
 submission success is not proof of an accepted broker PUBACK: a lost message can
 lose that interval's range; cumulative counters remain available in the next one.
+
+## Re-detection
+
+`charger.redetect` carries the per-boot state and counters of the automatic
+charger re-detection (BG_EN pulse when the chip ignores a live panel), plus the
+number of manual pulses. It is the one part of this object that comes from a
+control path, not from read-only evidence. Fields, thresholds and the
+qualification are in [charger-redetect.md](charger-redetect.md). The object is
+appended last and dropped (never truncated) if the charger object would exceed
+its 2048 B buffer.
 
 ## Measurement accounting
 

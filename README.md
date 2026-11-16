@@ -451,6 +451,14 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
   register only; re-read it after input power cycles or dawn. See
   [charger VIN-limit commands](docs/charger-vin-limit.md)
   for request/reply examples, range, lifetime, and experiment guidance.
+- **Charger re-detection:** a charger can ignore a live panel for hours
+  (VIN_STAT "no input" with 7 V on VIN). `charger_redetect [bg_en|dpdm]` pulses
+  the MP2731's input detection with before/after register scans; the driver also
+  does it automatically (BG_EN pulse after 3 min of "no input, not charging"
+  with VIN >= 5.5 V and >= VSYS + 1 V, VSYS < 4.1 V, no fault, safety timer
+  never defeated; 10-20-40-60 min backoff, 24 per boot). `charger_redetect auto
+  off` / MQTT `charger_redetect_auto` switches it off in RAM. See
+  [docs/charger-redetect.md](docs/charger-redetect.md).
 - **DFS clock scaling (Phase 2):** `esp_pm` dynamic frequency scaling `AMBYTE_PM_MIN_FREQ_MHZ=40` … `MAX=160` MHz (defined in `app_main.c` — PlatformIO `-D` flags don't reach IDF component sources). CPU coasts at the min during idle gaps. Light-sleep stays **off**. DFS is safe: AMBIT UART pinned to XTAL, SD/SPI holds its own APB lock, measurement windows hold a `NO_LIGHT_SLEEP` PM lock. `min=40` is HW-validated (1 h soak). Requires `CONFIG_PM_ENABLE`.
 - **PM-independent quick wins:** Wi-Fi power-save, MQTT keepalive tuning, ping cache, BME280 forced mode.
 

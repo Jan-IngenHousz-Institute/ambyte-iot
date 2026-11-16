@@ -5,6 +5,7 @@ typedef int BaseType_t;
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdMS_TO_TICKS(ms) (ms)
+#define portMAX_DELAY 0xffffffffu
 typedef struct {int held;} portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED {0}
 void h_critical_enter(portMUX_TYPE *m);
