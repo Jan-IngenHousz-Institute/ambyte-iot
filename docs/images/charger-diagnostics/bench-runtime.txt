@@ -1,0 +1,26 @@
+Production heartbeat callers and reboot · real bench evidence
+
+Firmware: schedule-v1.4.0-3-g057e67e
+MAC: 28:37:2F:FF:E7:04
+
+I (27352) sync_runner: TELEMETRY id=249304 gate=OPEN Vbat=4180mV
+I (27352) sync_runner: watchdog stack high-water=2504 B
+I (70152) heartbeat: stack free minimum: 5508 bytes
+
+Explicit reboot (from captured JSON):
+{
+  "boot_count_before": 16,
+  "boot_count_after": 17,
+  "history_reads_before": 5,
+  "history_reads_after": 2
+}
+
+Post-task heap (from production-preview JSON):
+{
+  "uptime_s": 89,
+  "boot_count": 18,
+  "heap_int_free_kb": 43,
+  "heap_int_largest_kb": 13,
+  "psram_free_kb": 1224,
+  "psram_largest_kb": 1215
+}

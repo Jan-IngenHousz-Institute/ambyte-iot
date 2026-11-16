@@ -1,0 +1,37 @@
+telemetry_preview · selected captured charger fields, pretty-printed
+
+{
+  "read_mask": 16777215,
+  "read_error": 0,
+  "adc_freshness": "unverified",
+  "iin_limit_ma": 500,
+  "vin_min_mv": 4300,
+  "charge_ntc_enabled": true,
+  "ntc_pct": 53.312,
+  "ntc_fault": 0,
+  "thermal_regulation": false,
+  "thermal_shutdown": false,
+  "safety_timer_expired": false,
+  "history": {
+    "last_read_ms": 14568,
+    "last_adc_change_ms": 14568,
+    "reads": 3,
+    "read_errors": 0,
+    "status_reads": 3,
+    "adc_changes": 2,
+    "charging_ms": 0,
+    "observed_ms": 1250,
+    "unobserved_ms": 13318,
+    "charge_stops": 0,
+    "status_or": 57,
+    "fault_or": 128,
+    "last_stop": null
+  },
+  "battery_window": {
+    "id": 0,
+    "start_ms": 0,
+    "end_ms": 14836,
+    "min_mv": 4200,
+    "max_mv": 4200
+  }
+}

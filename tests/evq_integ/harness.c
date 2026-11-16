@@ -2479,6 +2479,7 @@ static void sc_charger_diagnostics(void)
 static void sc_charger_no_env(void)
 {
     boot(&(boot_t){.card = true, .no_env = true});
+    B.connected = true;
     bool ready; device_status_snapshot_t snapshot;
     CHECK(cmd_read_env(NULL, NULL, NULL).status == ESP_ERR_NOT_SUPPORTED, "missing BME port");
     CHECK(cmd_record_env(NULL, NULL).status == ESP_ERR_NOT_SUPPORTED, "missing BME record port");

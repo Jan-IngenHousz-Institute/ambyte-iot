@@ -477,8 +477,8 @@ class EvqIntegration(unittest.TestCase):
     }
 
     def test_charger_unavailable_env_is_not_a_failure(self):
-        results = self.run_row("charger", "charger_no_env")
-        self.assert_clean_and_repeatable(results, "unavailable BME")
+        results = self.run_row("charger-no-env", "charger_no_env")
+        self.assert_clean_and_repeatable(results, "charger without BME port")
         self.assertIn("CHARGER_NO_ENV=ok", results[0]["stdout"])
 
     def test_charger_diagnostics_failures_preserve_heartbeat_and_ranges(self):

@@ -132,10 +132,50 @@ python -m pytest tests/test_charger_diagnostics.py tests/test_payload_v3.py test
 pio run -e esp32-s3-devkitm-1
 ```
 
-Hardware qualification remains pending. On a bench unit, compare the heartbeat's
-registers with `mp2731_regs` on the same firmware, confirm REG17 is included,
-observe a controlled charging-to-idle transition, and verify the subsequent
-history/range and boot identity. Exercise input removal and a reporting failure.
-Do not disable NTC/thermal protection or change charger settings for this check.
-No field rollout is part of this change. No terminal capture from hardware is
-claimed or fabricated.
+Physical bench qualification on **2026-11-16** used USB MAC
+`28:37:2F:FF:E7:04`, signed image `schedule-v1.4.0-3-g057e67e`, code commit
+`057e67eb90d91e68063c5525ed56da351d186f79`. The SHA-256 captured **after**
+`tools/bench_flash.py` regenerated and signed the flashed image is
+`6259d5e4247a886f279021e73db7d609a404a6bb2a3fdcadf337102e1691eb75`.
+NVS, certificates, installed schedule and existing event backlog were preserved.
+The existing MQTT endpoint exactly matches the development endpoint documented
+in [the HIL contract](evq-sd-overflow-hil-contract.md); this is a repository
+endpoint/account mapping, not a live AWS account check (the local SSO session
+was expired). Autonomous reporting stayed on that development endpoint.
+
+| Physical check | Result |
+| --- | --- |
+| Full raw register scans around the preview | REG00–REG17 present; JSON mask `0xFFFFFF`, error 0. Sequential volatile values were bracketed, not assumed atomic. |
+| Configuration before/after flash and preview | All 13 stable configuration registers unchanged; readback 500 mA / 4300 mV, NTC enabled. |
+| NTC decode | Raw 136 gives 53.312% of reference. No conversion to panel/battery temperature is claimed. |
+| Repeated preview | Synthetic id 0; unchanged window id, prior extrema retained; live read count advanced. |
+| Explicit reboot | Boot counter 16 → 17, RAM read counter 5 → 2. USB reconnection can also reset this native-USB bench. |
+| Real stored telemetry caller | Successful boot telemetry; watchdog task minimum stack headroom 2504 B. |
+| Real direct heartbeat caller | Successful report at uptime 70 s; task minimum stack headroom 5508 B. |
+| Heap after production callers | See captured runtime values below; neither caller required a stack increase in this change. |
+
+The host suites passed 31 targeted tests, including production telemetry across
+storage states, automatic delivery, actual allocator failures and real driver
+adapters under ASan/UBSan. The unavailable-BME scenario was rerun after correcting
+its disconnected-broker fixture and now asserts the harness exit status too.
+A fresh Astra implementation review found no outstanding production-code issues;
+the initial independent review findings were fixed before the bench run.
+
+These are terminal-style renderings of real captured output or explicitly
+labeled JSON excerpts, with their text beside each image:
+
+![Register dumps around the preview](images/charger-diagnostics/bench-registers.png)
+![Selected charger JSON from the preview](images/charger-diagnostics/bench-telemetry.png)
+![Production task stack and reboot evidence](images/charger-diagnostics/bench-runtime.png)
+
+[Image identity](images/charger-diagnostics/image-manifest.json),
+[raw/JSON comparison](images/charger-diagnostics/comparison.json), and
+[selected captured JSON](images/charger-diagnostics/bench-capture.json) preserve
+the evidence behind these checks. The old crash object already present on this
+bench was retained; it was not treated as a crash caused by this image.
+
+**Unqualified physical cases:** controlled weak-panel operation, panel heat,
+input removal and a charging-to-idle transition. The available bench remained on
+its existing strong supply with a charged battery. Injected host failures qualify
+the software boundaries, not those physical stimuli. No field rollout or charger
+setting change is part of this change.

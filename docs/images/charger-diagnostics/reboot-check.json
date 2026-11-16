@@ -1,0 +1,30 @@
+{
+  "before": {
+    "uptime_s": 25,
+    "psram_free_kb": 1294,
+    "psram_largest_kb": 1279,
+    "psram_size_kb": 2048,
+    "heap_dma_largest_kb": 30,
+    "heap_int_free_kb": 55,
+    "heap_int_largest_kb": 30,
+    "wd_armed": true,
+    "last_wd_reboot_reason": "",
+    "reset_reason": "usb",
+    "boot_count": 16
+  },
+  "after": {
+    "uptime_s": 13,
+    "psram_free_kb": 1294,
+    "psram_largest_kb": 1279,
+    "psram_size_kb": 2048,
+    "heap_dma_largest_kb": 30,
+    "heap_int_free_kb": 54,
+    "heap_int_largest_kb": 30,
+    "wd_armed": true,
+    "last_wd_reboot_reason": "",
+    "reset_reason": "usb",
+    "boot_count": 17
+  },
+  "history_reads_before": 5,
+  "history_reads_after": 2
+}
