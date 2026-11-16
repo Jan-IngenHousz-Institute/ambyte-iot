@@ -60,6 +60,22 @@ esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us);
 esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out);
 esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
 
+/* Charger input re-detection (docs/charger-redetect.md, mp2731_redetect.h).
+ * Manual: one BG_EN pulse (REG09 bit 3, 1 then 0, both verified) or one forced
+ * DP/DM detection (REG0B bit 5, restored to 0 if the chip leaves it set),
+ * with REG00..REG17 scanned before, immediately after, at +1.5 s and +5 s.
+ * Blocks the caller ~5 s (the read mutex is released while waiting). Returns
+ * ESP_ERR_NOT_ALLOWED under the maintenance lock, ESP_ERR_TIMEOUT when busy,
+ * ESP_ERR_INVALID_RESPONSE when BG_EN=1 never latched (no 1->0 edge),
+ * ESP_ERR_INVALID_STATE when BG_EN stayed 1 (cleared again on later reads).
+ * Writes nothing else; no NVS, no OTP. */
+esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out);
+/* Automatic re-detection switch: set -1 query, 0 off, 1 on. RAM only. */
+esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out);
+/* Maintenance-lock probe (OTA / AMBIT flash): vetoes automatic and manual
+ * pulses. Set once by the composition root; NULL = never vetoed. */
+void mp2731_redetect_set_veto(bool (*veto)(void));
+
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);
 

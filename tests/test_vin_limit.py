@@ -23,9 +23,10 @@ typedef int esp_err_t;
 #define ESP_ERR_TIMEOUT 0x107
 #define ESP_ERR_INVALID_RESPONSE 0x108
 #define ESP_ERR_NOT_FINISHED 0x10c
+#define ESP_ERR_NOT_ALLOWED 0x10d
 const char *esp_err_to_name(esp_err_t err);
 """,
-    "esp_log.h": "#define ESP_LOGI(...) ((void)0)\n#define ESP_LOGW(...) ((void)0)\n",
+    "esp_log.h": "#define ESP_LOGI(...) ((void)0)\n#define ESP_LOGW(...) ((void)0)\n#define ESP_LOGE(...) ((void)0)\n",
     "freertos/FreeRTOS.h": """#pragma once
 #include <stdint.h>
 typedef uint32_t TickType_t;
@@ -33,6 +34,7 @@ typedef int BaseType_t;
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdMS_TO_TICKS(ms) (ms)
+#define portMAX_DELAY 0xffffffffu
 typedef struct { int held; } portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED {0}
 void h_critical_enter(portMUX_TYPE *m);
@@ -95,6 +97,7 @@ class VinLimitTest(unittest.TestCase):
             str(ROOT / "components/mp2731/mp2731.c"),
             str(ROOT / "components/mp2731/mp2731_core.c"),
             str(ROOT / "components/mp2731/mp2731_diagnostics.c"),
+            str(ROOT / "components/mp2731/mp2731_redetect.c"),
             str(ROOT / "components/CLI/cli_vin_limit.c"),
             str(ROOT / "components/command_router/vin_limit_command.c"),
             str(cjson / "cJSON.c"), "-lm", "-o", str(cls.binary),

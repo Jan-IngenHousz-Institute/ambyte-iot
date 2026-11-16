@@ -37,6 +37,8 @@ typedef struct {
     power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
     power_get_vin_limit_fn      get_vin_limit;
     power_set_vin_limit_fn      set_vin_limit;
+    power_redetect_fn           charger_redetect;      /* NULL = no charger */
+    power_redetect_auto_fn      charger_redetect_auto; /* NULL = no charger */
 
     /* Persistence ports — one row per measurement event (event-document model) */
     measurement_next_id_fn            next_id;
@@ -206,6 +208,12 @@ cmd_result_t cmd_read_power(power_reading_t *out);
  * 100 mV steps and returns the verified hardware readback. out is required. */
 cmd_result_t cmd_get_vin_limit(power_vin_limit_t *out);
 cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
+
+/* Charger input re-detection (docs/charger-redetect.md): one manual BG_EN or
+ * DP/DM pulse with before/after register snapshots in *out (blocks ~5 s), and
+ * the RAM-only automatic re-detection switch (set -1 query, 0 off, 1 on). */
+cmd_result_t cmd_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out);
+cmd_result_t cmd_charger_redetect_auto(int set, power_redetect_auto_t *out);
 
 /* Drive a PWM signal on GPIO4 via LEDC. duty_pct is 0..100 (float precision);
  * freq_hz is the PWM frequency in Hz (e.g. 10000). When enable is false the

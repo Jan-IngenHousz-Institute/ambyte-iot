@@ -623,6 +623,9 @@ static esp_err_t app_init_i2c_and_sensors(void)
     if (mp2731_init() == ESP_OK) {
         ESP_LOGI(APP_TAG, "MP2731 charger initialized");
     }
+    /* Charger re-detection never pulses under the maintenance lock (OTA /
+     * AMBIT flash): docs/charger-redetect.md. Set before any power read. */
+    mp2731_redetect_set_veto(app_maintenance_active);
 
     return ESP_OK;
 }
@@ -1567,6 +1570,8 @@ void app_main(void)
         .ack_charger_diagnostics = mp2731_ack_diagnostics,
         .get_vin_limit          = mp2731_is_ready() ? mp2731_get_vin_limit : NULL,
         .set_vin_limit          = mp2731_is_ready() ? mp2731_set_vin_limit : NULL,
+        .charger_redetect       = mp2731_is_ready() ? mp2731_charger_redetect : NULL,
+        .charger_redetect_auto  = mp2731_is_ready() ? mp2731_redetect_auto : NULL,
         .set_status             = ambyte_status_get_set_fn(),
         /* The SD monitor can mount a card that was absent at boot, so keep both
          * probes wired for the whole session. They fail closed while unmounted. */

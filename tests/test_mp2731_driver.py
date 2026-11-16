@@ -16,7 +16,7 @@ class Mp2731DriverTest(unittest.TestCase):
                 f'-I{ROOT}/tests/mp2731_driver_stubs',f'-I{ROOT}/tests/host_stubs',
                 f'-I{ROOT}/components/domain/include',f'-I{ROOT}/components/mp2731/include',
                 str(ROOT/'tests/mp2731_driver_host.c'),str(ROOT/'components/mp2731/mp2731_core.c'),
-                str(ROOT/'components/mp2731/mp2731_diagnostics.c'),'-o',str(exe)],check=True)
+                str(ROOT/'components/mp2731/mp2731_diagnostics.c'),str(ROOT/'components/mp2731/mp2731_redetect.c'),'-o',str(exe)],check=True)
             result=subprocess.run([str(exe)],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('DRIVER_HISTORY_OK',result.stdout)

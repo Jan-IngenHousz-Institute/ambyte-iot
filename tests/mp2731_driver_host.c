@@ -10,6 +10,7 @@
 #include "../components/mp2731/mp2731.c"
 
 static int64_t clock_us;
+esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 static int mutex_held;
 static int fail_reg = -1;
 static bool timeout_next, nested_timeout;

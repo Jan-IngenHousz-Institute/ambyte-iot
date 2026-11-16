@@ -28,6 +28,10 @@ extern "C" {
  * input limit on the resident worker; replies carry verified REG01 readback.
  * VIN-limit commands require a nonempty id of at most 64 bytes, use no NVS
  * dedupe/override, and repeated sets write the same desired register value.
+ * `charger_redetect` (`method` bg_en|dpdm, default bg_en) pulses the charger's
+ * input detection on the worker and replies with before/after register scans;
+ * `charger_redetect_auto` (`enabled` bool, omitted = query) flips the RAM-only
+ * automatic re-detection. Same id rules as VIN-limit, no NVS.
  * Update components own their individual idempotency policies.
  */
 

@@ -116,6 +116,60 @@ typedef struct {
 typedef esp_err_t (*power_get_vin_limit_fn)(power_vin_limit_t *out);
 typedef esp_err_t (*power_set_vin_limit_fn)(uint16_t mv, power_vin_limit_t *out);
 
+/* Charger input re-detection (docs/charger-redetect.md). A manual pulse
+ * reports the full REG00..REG17 file before, immediately after, and twice
+ * after the write (detection settles), so the operator sees what the chip
+ * did - not what the firmware hoped. RAM only: no NVS, no OTP, and only the
+ * one bit of REG09 (bg_en) or REG0B (dpdm) is written. */
+typedef enum {
+    POWER_REDETECT_BG_EN = 0,   /* REG09 bit 3: 1 then 0, resets input detection */
+    POWER_REDETECT_DPDM  = 1,   /* REG0B bit 5: force DP/DM detection */
+} power_redetect_method_t;
+
+#define POWER_CHARGER_REG_COUNT   24u   /* REG00..REG17 */
+#define POWER_REDETECT_SNAPSHOTS   4u   /* before, immediate, +1.5 s, +5 s */
+/* Settle points after the write. DP/DM detection is bounded by the 500 ms DCD
+ * timer plus a 50 ms adapter timer and the primary/secondary comparisons
+ * (tens of ms): 1.5 s is three DCD timeouts, so VIN_STAT has settled. The
+ * datasheet gives no time for buck soft-start to CHG_STAT; 5 s (10x DCD)
+ * leaves room for the converter to start and charging to report. */
+#define POWER_REDETECT_SETTLE1_MS 1500
+#define POWER_REDETECT_SETTLE2_MS 5000
+
+typedef struct {
+    int32_t  t_ms;    /* relative to the register write; the "before" scan is negative */
+    uint32_t mask;    /* bit N = register N read; a scan stops at the first bus error */
+    uint8_t  regs[POWER_CHARGER_REG_COUNT];
+} power_charger_snapshot_t;
+
+typedef struct {
+    power_redetect_method_t method;
+    uint8_t  reg;          /* 0x09 or 0x0B */
+    uint8_t  reg_before;   /* register before the write */
+    uint8_t  reg_set;      /* readback right after setting the bit */
+    uint8_t  reg_after;    /* final readback (bg_en: after the clear; dpdm: after restore) */
+    bool     latched;      /* the bit read back as 1 */
+    bool     cleared;      /* the bit is 0 at the end */
+    bool     restored;     /* dpdm: the chip left bit 5 set; firmware wrote it back to 0 */
+    uint8_t  snapshots;    /* valid entries in snap[] */
+    power_charger_snapshot_t snap[POWER_REDETECT_SNAPSHOTS];
+} power_redetect_report_t;
+
+typedef esp_err_t (*power_redetect_fn)(power_redetect_method_t method, power_redetect_report_t *out);
+
+/* Automatic re-detection switch (RAM only, default on, back on at every boot). */
+typedef struct {
+    bool        enabled;
+    const char *state;            /* static strings, see mp2731_redetect.h */
+    const char *disabled_reason;
+    const char *last_outcome;
+    uint32_t    attempts, charging;
+    uint32_t    next_in_s;
+} power_redetect_auto_t;
+
+/* set: -1 query, 0 disable, 1 enable. */
+typedef esp_err_t (*power_redetect_auto_fn)(int set, power_redetect_auto_t *out);
+
 #ifdef __cplusplus
 }
 #endif
