@@ -178,6 +178,51 @@ credentials, or site topic is included.
 
 ![Actual rejected inputs, delayed readback and restoration](images/charger-vin-limit/cli-validation-and-restore.png)
 
+### Laptop USB comparison: 4300 and 6000 mV
+
+To test an electrical response with the threshold clearly above USB voltage,
+a run alternated 4300 → 6000 → 4300 → 6000 → restored 4300 mV on the same
+signed image. Each phase collected four `status` readings two seconds apart,
+each followed by `mp2731_regs 1 0 read`. The battery baseline was 4.20 V. Each
+6000 mV phase lasted approximately 10 seconds before returning to 4300 mV.
+
+| Observation, eight status samples per limit | 4300 mV limit | 6000 mV limit |
+| --- | --- | --- |
+| Verified REG01 | `0x06` | `0x17` |
+| Reported Vsys, median (range) | 4.35 V (4.32–4.42 V) | 4.15 V (4.12–4.18 V) |
+| Reported input current, median (range) | 179 mA (119–239 mA) | 106 mA (106–119 mA) |
+| Reported VIN | 5.04–5.16 V | 5.16 V |
+| Charge current | 0 mA | 0 mA |
+| REG14 input voltage regulation flag | Clear | Set |
+
+The system-voltage reduction appeared in both 6000 mV phases and recovered in
+the intervening 4300 mV phase; the final restored reading was 4.38 V. The
+reported input current also decreased, but did not approach zero. This is
+evidence of a response beyond the status flag. It is consistent with the
+battery supporting the system when the requested input floor cannot be met;
+battery discharge current was not independently measured, so its share of the
+load is not established.
+
+Every follow-up production read reported `ok`, with conversion completion at
+the first 5 ms poll. The raw five-channel ADC frames changed at both limits
+(seven distinct frames out of eight samples at each), rather than remaining
+bit-identical throughout a phase. Status and raw dumps use separate, sequential
+reads. All measurements still come from the charger ADC, without an independent
+meter. One 6000 mV status sample reported Vbat 4.34 V; the other values and that
+sample are retained without correction in the evidence. No charging benefit
+or actual 4 V source operation is established.
+
+Full REG01 `0x06` and official v2.20.0 were restored again. The final register
+dump, all 13 configuration values and the loaded schedule identity matched the
+run's baseline; NVS was preserved and no cloud or Wi-Fi configuration write
+was made.
+
+![Real 6 V threshold step, electrical readings and recovery](images/charger-vin-limit/cli-usb-6v.png)
+
+[All status samples and raw registers](images/charger-vin-limit/usb-6v-samples.json)
+and the [6 V test manifest](images/charger-vin-limit/usb-6v-manifest.json) preserve
+the source image, ADC evidence, statistics and restoration checks.
+
 MQTT is host-tested only. Live MQTT commands, input-removal/reapplication,
 status under controlled load, and weak-solar charging behavior remain unqualified
 on hardware. The CLI test demonstrates register control and watchdog persistence
