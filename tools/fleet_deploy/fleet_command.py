@@ -21,6 +21,8 @@ client-id spelling rules: `ambyte_` and `AMBYTE_` are different MQTT routes.
     fleet_command.py power-protect --action status --devices ambyte_28:37:2F:FF:FC:80
     fleet_command.py power-protect --action force --state hold --devices ...
     fleet_command.py power-protect --action clear --devices ...
+    fleet_command.py vin-limit --devices ambyte_28:37:2F:FF:FC:80
+    fleet_command.py vin-limit --vin-action set --mv 4000 --devices ...
 
 log-list / log-read (firmware with remote diagnostics) read the SD log
 directory (/sdcard/logs) without changing anything on the device. One
@@ -32,6 +34,14 @@ power-protect (firmware with brownout protection, docs/power-protect.md) reads
 brownout protection state. clear and force are MUTATING and need an explicit
 --devices list: a forced state never auto-exits, and clear wipes the brownout
 history the next escalation would have used.
+
+vin-limit (firmware >= 2.21.0, docs/charger-vin-limit.md) reads (`get`) or
+changes (`set --mv N`) the MP2731 input voltage regulation threshold. set is
+MUTATING and needs an explicit --devices list. It writes the live charger
+register only: nothing is stored on the gateway, so the charger keeps the value
+until it is set again or loses all power. A set is confirmed only when the
+reply carries the requested millivolts and the matching REG01 readback; a lost
+reply does not prove the write failed, so read the limit again before retrying.
 
 Replies are written to --results-json (per device) and summarised on stdout.
 Exit status: 0 when every targeted device replied (and, for ping with
@@ -71,6 +81,43 @@ REPLY_TYPES = {"get-timezone": "timezone_result", "set-timezone": "set_timezone_
 # power_protect (components/command_router/include/power_protect_command.h).
 POWER_PROTECT_ACTIONS = ("status", "clear", "force")
 POWER_PROTECT_FORCE_STATES = ("no_flash", "hold")
+# vin_limit: bounds mirror components/domain/include/sensing_port.h
+# (POWER_VIN_LIMIT_MIN_MV / MAX_MV / STEP_MV); the firmware rejects anything
+# else, checking here keeps a typo from costing a field round trip.
+VIN_LIMIT_ACTIONS = ("get", "set")
+VIN_LIMIT_MIN_MV = 3700
+VIN_LIMIT_MAX_MV = 15200
+VIN_LIMIT_STEP_MV = 100
+VIN_LIMIT_REPLY = {"get": "vin_limit_result", "set": "set_vin_limit_result"}
+
+
+def valid_vin_limit_mv(mv):
+    return (isinstance(mv, int) and not isinstance(mv, bool)
+            and VIN_LIMIT_MIN_MV <= mv <= VIN_LIMIT_MAX_MV
+            and (mv - VIN_LIMIT_MIN_MV) % VIN_LIMIT_STEP_MV == 0)
+
+
+def expected_reply_type(args):
+    """Reply type that answers this command, or None when any reply does. Pure."""
+    if args.cmd == "vin-limit":
+        return VIN_LIMIT_REPLY[getattr(args, "vin_action", "get")]
+    return REPLY_TYPES.get(args.cmd)
+
+
+def vin_limit_problem(args, reply):
+    """Why a VIN-limit reply does not show the requested outcome, or None. Pure."""
+    action = getattr(args, "vin_action", "get")
+    if reply.get("type") != VIN_LIMIT_REPLY[action] or reply.get("ok") is not True:
+        return f"refused: {reply.get('detail')}"
+    mv, reg01 = reply.get("mv"), reply.get("reg01")
+    if not valid_vin_limit_mv(mv) or not isinstance(reg01, int) or isinstance(reg01, bool):
+        return f"reply without a confirmed readback: mv={mv!r} reg01={reg01!r}"
+    # REG01 bit 7 is REGISTER RESET; the limit lives in bits 6:0.
+    if reg01 & 0x80 or VIN_LIMIT_MIN_MV + (reg01 & 0x7F) * VIN_LIMIT_STEP_MV != mv:
+        return f"reg01={reg01:#04x} does not encode {mv} mV"
+    if action == "set" and mv != args.mv:
+        return f"reads {mv} mV, asked {args.mv} mV"
+    return None
 
 
 def power_protect_problem(args, reply):
@@ -318,6 +365,19 @@ def build_message(args, req_id):
         elif state:
             raise SystemExit("power-protect --state is only valid with --action force")
         return msg
+    if args.cmd == "vin-limit":
+        action = getattr(args, "vin_action", "get")
+        mv = getattr(args, "mv", None)
+        if action not in VIN_LIMIT_ACTIONS:
+            raise SystemExit("vin-limit --vin-action must be get or set")
+        if action == "get":
+            if mv is not None:
+                raise SystemExit("vin-limit --mv is only valid with --vin-action set")
+            return {"type": "get_vin_limit", "id": req_id}
+        if not valid_vin_limit_mv(mv):
+            raise SystemExit(f"vin-limit set needs --mv: whole millivolts {VIN_LIMIT_MIN_MV}..{VIN_LIMIT_MAX_MV} "
+                             f"in {VIN_LIMIT_STEP_MV} mV steps (e.g. 4000)")
+        return {"type": "set_vin_limit", "id": req_id, "mv": mv}
     if args.cmd == "ambit-versions":
         return {"type": "ambit_versions", "id": req_id}
     if args.cmd == "ambit-flash":
@@ -382,6 +442,10 @@ def summarise(dev, reply):
                 f"since_utc={reply.get('since_utc')} brownouts_6h={reply.get('brownouts_6h')} "
                 f"exit_in_s={reply.get('exit_in_s')} skipped(flash={sk.get('flash_runs')} "
                 f"ambit={sk.get('ambit_runs')} ota={sk.get('ota')})")
+    if t in ("vin_limit_result", "set_vin_limit_result"):
+        reg01 = reply.get("reg01")
+        return (f"{t} ok={reply.get('ok')} mv={reply.get('mv')} "
+                f"reg01={f'{reg01:#04x}' if isinstance(reg01, int) else reg01} detail={reply.get('detail')}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -395,7 +459,13 @@ def summarise(dev, reply):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash",
-                                    "get-timezone", "set-timezone", "log-list", "log-read", "power-protect"])
+                                    "get-timezone", "set-timezone", "log-list", "log-read", "power-protect",
+                                    "vin-limit"])
+    ap.add_argument("--vin-action", dest="vin_action", default="get", choices=VIN_LIMIT_ACTIONS,
+                    help="vin-limit: get (read-only) or set (MUTATING)")
+    ap.add_argument("--mv", type=int, default=None,
+                    help=f"vin-limit --vin-action set: millivolts, {VIN_LIMIT_MIN_MV}..{VIN_LIMIT_MAX_MV} "
+                         f"in {VIN_LIMIT_STEP_MV} mV steps")
     ap.add_argument("--action", default="status", choices=POWER_PROTECT_ACTIONS,
                     help="power-protect: status (read-only), clear or force (MUTATING)")
     ap.add_argument("--state", default="", choices=("",) + POWER_PROTECT_FORCE_STATES,
@@ -443,6 +513,14 @@ def main(argv=None):
         if args.action != "status" and (not args.devices.strip() or not parse_devices(args.devices)):
             ap.error(f"power-protect {args.action} requires an explicit --devices list; "
                      "fleet-wide discovery is refused")
+    if args.cmd == "vin-limit":
+        # Validate before any AWS access: a bad value must cost nothing.
+        try:
+            build_message(args, "validate")
+        except SystemExit as exc:
+            ap.error(str(exc))
+        if args.vin_action == "set" and (not args.devices.strip() or not parse_devices(args.devices)):
+            ap.error("vin-limit set requires an explicit --devices list; fleet-wide discovery is refused")
     if args.cmd == "log-read":
         # Validate before any AWS access: a bad name or window must cost nothing.
         try:
@@ -513,7 +591,9 @@ def main(argv=None):
         return stitch_log(args, session, devices[0], req_id)
     mutating = ((args.cmd == "replay" and args.mode not in READ_ONLY_MODES)
                 or args.cmd in ("ambit-flash", "set-timezone")
-                or (args.cmd == "power-protect" and args.action != "status"))
+                or (args.cmd == "power-protect" and args.action != "status")
+                or (args.cmd == "vin-limit" and args.vin_action == "set"))
+    reply_type = expected_reply_type(args)
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
           f"request id {req_id}{' (MUTATING)' if mutating else ''}")
@@ -569,8 +649,8 @@ def main(argv=None):
                         # published just before the terminal one can land after it.
                         deadline = min(deadline, time.monotonic() + 5)
                 continue
-            if args.cmd in REPLY_TYPES:
-                if data.get("type") != REPLY_TYPES[args.cmd]:
+            if reply_type:
+                if data.get("type") != reply_type:
                     continue
                 if data.get("detail") in NON_TERMINAL_DETAILS:
                     # A QoS 1 duplicate can be refused while the original
@@ -620,6 +700,12 @@ def main(argv=None):
                  if args.cmd == "power-protect" and power_protect_problem(args, r)}
     if pp_failed:
         print(f"power-protect not confirmed on: {json.dumps(pp_failed)}")
+    # vin-limit: a refusal, or a set whose readback is not the requested value,
+    # is a failed command.
+    vin_failed = {d: vin_limit_problem(args, r) for d, r in replies.items()
+                  if args.cmd == "vin-limit" and vin_limit_problem(args, r)}
+    if vin_failed:
+        print(f"vin-limit not confirmed on: {json.dumps(vin_failed)}")
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -651,9 +737,10 @@ def main(argv=None):
                        "replies": replies, "no_reply": missing, "not_expected_fw": bad_fw,
                        "firmware": fw_hist, "replay_states": states, "progress": progress,
                        "timezone_failures": timezone_failed, "log_failures": log_failed,
-                       "power_protect_failures": pp_failed},
+                       "power_protect_failures": pp_failed, "vin_limit_failures": vin_failed},
                       fh, indent=1, sort_keys=True)
-    return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed or pp_failed) else 0
+    return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed or pp_failed
+                 or vin_failed) else 0
 
 
 def stitch_log(args, session, dev, req_id):
