@@ -476,6 +476,11 @@ class EvqIntegration(unittest.TestCase):
         "pending_inexact": {"pending_exact": False},
     }
 
+    def test_charger_diagnostics_failures_preserve_heartbeat_and_ranges(self):
+        results = self.run_row("charger", "charger_diagnostics")
+        self.assert_clean_and_repeatable(results, "charger diagnostics")
+        self.assertIn("CHARGER_DIAGNOSTICS=ok", results[0]["stdout"])
+
     def test_I5_status_heartbeat_every_state(self):
         snaps, _, worst_tel, worst_emit = self._snapshots()
         for name, want in self.EXPECT.items():
@@ -516,7 +521,7 @@ class EvqIntegration(unittest.TestCase):
         self.assertEqual(len(worst_tel), 2)
         for w in worst_tel:
             with self.subTest(worst=w["variant"]):
-                self.assertEqual(w["cap"], 6144)
+                self.assertEqual(w["cap"], 8192)
                 if w["fits"]:
                     self.assertLess(w["worst_len"], w["cap"])
                     self.assertEqual(w["payload"]["schema"], "ambyte.telemetry/1")

@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "i2c_bus.h"
 #include "mp2731_core.h"
+#include "mp2731_diagnostics.h"
 
 #define TAG "mp2731"
 
@@ -28,6 +29,7 @@ static bool s_ready = false;
 static SemaphoreHandle_t s_read_mtx;
 static mp2731_frame_t    s_last_frame;    /* diagnostics (CLI), under s_read_mtx */
 static esp_err_t         s_last_err = ESP_ERR_INVALID_STATE;
+static mp2731_history_t  s_history; /* guarded by s_read_mtx, resets each boot */
 
 static esp_err_t mp2731_read_reg(uint8_t reg, uint8_t *out)
 {
@@ -139,6 +141,7 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     }
     mp2731_frame_t f;
     const esp_err_t err = mp2731_core_read(&s_bus, out, &f);
+    mp2731_history_observe(&s_history, esp_timer_get_time() / 1000, err, out, &f);
     s_last_frame = f;
     s_last_err = err;
     xSemaphoreGive(s_read_mtx);
@@ -207,4 +210,30 @@ esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out)
 power_read_fn mp2731_get_power_read_fn(void)
 {
     return mp2731_read_power;
+}
+
+/* Slow register scans belong to telemetry, never the 5 s power-control path.
+ * Keep the same read mutex as ADC conversions so scans cannot interleave with
+ * a conversion sequence. A partial scan is still useful evidence. */
+int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id)
+{
+    if (!s_ready || s_read_mtx == NULL || window_id == NULL) return -1;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) return -1;
+    charger_diagnostics_t d;
+    const int64_t now = esp_timer_get_time() / 1000;
+    mp2731_history_snapshot(&s_history, &d, now);
+    d.scan_start_ms = now;
+    (void)mp2731_diagnostics_read(&s_bus, &d);
+    d.scan_end_ms = esp_timer_get_time() / 1000;
+    *window_id = d.window_id;
+    xSemaphoreGive(s_read_mtx);
+    return mp2731_diagnostics_render(&d, out, cap);
+}
+
+void mp2731_ack_diagnostics(uint64_t window_id)
+{
+    if (s_read_mtx == NULL) return;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) return;
+    mp2731_history_ack(&s_history, window_id);
+    xSemaphoreGive(s_read_mtx);
 }

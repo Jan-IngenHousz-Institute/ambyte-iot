@@ -852,6 +852,17 @@ bool payload_v3_build_telemetry(char *out, size_t cap,
                   input->input_ma, input->charge_ma,
                   input->input_present ? "true" : "false", input->charge_status);
     }
+    if (input->charger_diagnostics_json != NULL) {
+        if (input->power_reason != NULL || input->power_valid) jw_append(&w, ",");
+        jw_append(&w, "\"charger\":%s", input->charger_diagnostics_json);
+    }
+    if (input->measurement_stats_valid) {
+        jw_append(&w, "},\"measurements\":{\"stored\":%llu,\"store_failures\":%llu,"
+                      "\"sensor_command_failures\":%llu",
+                  (unsigned long long)input->measurements_stored,
+                  (unsigned long long)input->measurement_store_failures,
+                  (unsigned long long)input->sensor_command_failures);
+    }
     jw_append(&w, "},\"storage\":{");
     bool storage_comma = false;
     if (input->storage_db_valid) {

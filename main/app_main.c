@@ -1563,6 +1563,8 @@ void app_main(void)
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
         .set_clock              = pcf2131tfy_rtc_set_epoch,
         .read_power             = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
+        .render_charger_diagnostics = mp2731_is_ready() ? mp2731_render_diagnostics : NULL,
+        .ack_charger_diagnostics = mp2731_ack_diagnostics,
         .set_status             = ambyte_status_get_set_fn(),
         /* The SD monitor can mount a card that was absent at boot, so keep both
          * probes wired for the whole session. They fail closed while unmounted. */

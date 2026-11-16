@@ -635,7 +635,7 @@ non-negative integers.
 | | `last_disc_reason` | string | `last_disc_reason`; most recent Wi-Fi/MQTT disconnect reason, empty when none is known. |
 | | `conn_age_s` | integer, s | `conn_age_s`; current MQTT connection age, `-1` when unavailable. |
 | | `pending` | integer | `pending`; persisted events awaiting acknowledgement. |
-| `power` | `valid` | boolean | The charger frame below is a fresh, plausible measurement. When `false` the numeric leaves are omitted, never zero-filled. Present whenever a charger is fitted (additive, 2026-11-13). |
+| `power` | `valid` | boolean | The charger reader accepted the ADC frame as plausible; this does not prove that its ADC values changed or are fresh. When `false` the numeric leaves are omitted, never zero-filled. Present whenever a charger is fitted (additive, 2026-11-13). |
 | | `reason` | string enum | Read verdict: `ok`, `no_input` (live status says no external input; the charger ADC does not run then, so no voltages), `adc_timeout`, `implausible` (e.g. all-zero, or charge current while not charging: a stale frame), `i2c_error`, `unavailable`. |
 | | `status_reg` | integer 0–255 | Raw MP2731 REG0C (VIN_STAT, CHG_STAT, …), also on rejected frames; omitted after a bus error. |
 | | `fault_reg` | integer 0–255 | Raw MP2731 REG0D (watchdog, input, thermal, NTC faults), same rules as `status_reg`. |
@@ -646,6 +646,10 @@ non-negative integers.
 | | `charge_ma` | integer, mA | Battery charge current. |
 | | `input_present` | boolean | External input-power detection. |
 | | `charge_status` | integer | Raw MP2731 charge-state enum; preserve 0–3 without reinterpretation. |
+| | `charger` | object, optional | Read-only REG00–REG17 scan, NTC ratio, protection/limiting flags and per-boot sampled history; [charger-diagnostics.md](charger-diagnostics.md) defines units and missing-data rules. ADC freshness remains unverified. |
+| `measurements` | `stored` | integer | Observation records committed since boot; excludes heartbeat, identity, logs and replay. |
+| | `store_failures` | integer | Failed observation-store attempts since boot; retries count as separate attempts. |
+| | `sensor_command_failures` | integer | Failed attempted BME280 reads and AMBIT measurement/temperature/spectrum/trigger/fetch commands since boot. A poll timeout, power-shed run or busy admission does not increment it. These are command attempts, not a count of unique lost measurements. |
 | `storage` | `db_online` | boolean | Event log is available. |
 | | `sd_free_kb` | integer, KiB | Free SD-card space. |
 | | `sd_skipped` | integer | Records skipped as unreadable. |

@@ -32,6 +32,8 @@ typedef struct {
     sensor_read_fn              read_env;
     clock_read_fn               read_clock;
     clock_set_fn                set_clock;    /* set RTC+system clock from a UTC epoch; NULL = unsupported */
+    int                       (*render_charger_diagnostics)(char *out, size_t cap, uint64_t *window_id);
+    void                      (*ack_charger_diagnostics)(uint64_t window_id);
     power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
 
     /* Persistence ports — one row per measurement event (event-document model) */

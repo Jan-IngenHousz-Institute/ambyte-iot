@@ -360,6 +360,14 @@ class PayloadV3Test(unittest.TestCase):
         self.assertEqual(self.records["TELEMETRY_POWER_I2C"]["health"]["power"],
                          {"valid": False, "reason": "i2c_error"})
 
+    def test_charger_diagnostics_survive_invalid_analog_values(self) -> None:
+        power = self.records["TELEMETRY_CHARGER"]["health"]["power"]
+        self.assertFalse(power["valid"])
+        self.assertNotIn("battery_v", power)
+        self.assertTrue(power["charger"]["safety_timer_expired"])
+        self.assertEqual(power["charger"]["registers"], {"10":102, "17":128})
+        self.assertEqual(power["charger"]["adc_freshness"], "unverified")
+
     def test_device_object_exact_contract(self) -> None:
         device = self.records["DEVICE"]
         self.assertEqual(device["schema"], "ambit.device/1")
@@ -426,7 +434,9 @@ class PayloadV3Test(unittest.TestCase):
         self.assertIn("cmd_ambit_device_info_cached", heartbeat)
         self.assertNotIn("ambit_info_fetch", heartbeat)
         self.assertIn("input.attached_count = 0", heartbeat)
-        self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 2)
+        self.assertEqual(heartbeat.count("payload_v3_build_telemetry"), 3)
+        self.assertIn("input.charger_diagnostics_json = NULL", heartbeat)
+        self.assertIn("s_cfg.ack_charger_diagnostics(charger_window_id)", heartbeat)
         # attached_sensors borrows pointers into the info structs, so each slot
         # needs its OWN record. One loop-scoped `ai` made every slot alias the
         # last channel's strings (2026-09 soak: one sensor_id on both UARTs).
