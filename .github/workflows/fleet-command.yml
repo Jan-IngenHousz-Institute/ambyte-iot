@@ -11,7 +11,9 @@ name: Fleet command (ping / inventory / replay)
 # (status) or changes (clear / force, MUTATING, explicit devices only) the
 # brownout protection state (docs/power-protect.md). `vin-limit` reads (get) or
 # changes (set, MUTATING, explicit devices only) the charger's input voltage
-# limit on firmware >= 2.21.0 (docs/charger-vin-limit.md).
+# limit on firmware >= 2.21.0 (docs/charger-vin-limit.md). `iin-limit` does the
+# same for the charger's input current limit register on firmware >= 2.23.0
+# (docs/charger-iin-limit.md).
 
 on:
   workflow_dispatch:
@@ -24,7 +26,7 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read, power-protect, vin-limit]
+        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read, power-protect, vin-limit, iin-limit]
         default: ping
       timezone:
         description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
@@ -59,6 +61,15 @@ on:
         default: get
       vin_limit_mv:
         description: "vin-limit set only: charger input voltage limit in mV, 3700-15200 in 100 mV steps (e.g. 4000)"
+        type: string
+        default: ""
+      iin_limit_action:
+        description: "iin-limit only: get (read-only) or set (MUTATING; needs an explicit device list; firmware >= 2.23.0)"
+        type: choice
+        options: [get, set]
+        default: get
+      iin_limit_ma:
+        description: "iin-limit set only: charger input current limit register in mA, 100-3250 in 50 mA steps (e.g. 1000; default 500)"
         type: string
         default: ""
       devices:
@@ -174,6 +185,8 @@ jobs:
           PP_STATE: ${{ inputs.power_protect_state }}
           VIN_ACTION: ${{ inputs.vin_limit_action }}
           VIN_MV: ${{ inputs.vin_limit_mv }}
+          IIN_ACTION: ${{ inputs.iin_limit_action }}
+          IIN_MA: ${{ inputs.iin_limit_ma }}
         run: |
           set -uo pipefail
           for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT LOG_TAIL; do
@@ -197,6 +210,16 @@ jobs:
               exit 2
             fi
           fi
+          if [[ "${COMMAND}" == "iin-limit" && "${IIN_ACTION:-get}" == "set" ]]; then
+            if [[ -z "${DEVICES//[[:space:]]/}" ]]; then
+              echo "::error::iin-limit set requires an explicit device list; discovery is refused"
+              exit 2
+            fi
+            if [[ ! "${IIN_MA:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::iin-limit set needs iin_limit_ma in whole milliamps (e.g. 1000)"
+              exit 2
+            fi
+          fi
           if [[ -n "${EXPECT_OFFSET}" && ! "${EXPECT_OFFSET}" =~ ^-?[0-9]+$ ]]; then
             echo "::error::expect_offset must be integer seconds"
             exit 2
@@ -216,6 +239,10 @@ jobs:
           if [[ "${COMMAND}" == "vin-limit" ]]; then
             ARGS+=(--vin-action "${VIN_ACTION:-get}")
             [[ "${VIN_ACTION:-get}" == "set" ]] && ARGS+=(--mv "${VIN_MV}")
+          fi
+          if [[ "${COMMAND}" == "iin-limit" ]]; then
+            ARGS+=(--iin-action "${IIN_ACTION:-get}")
+            [[ "${IIN_ACTION:-get}" == "set" ]] && ARGS+=(--ma "${IIN_MA}")
           fi
           if [[ "${COMMAND}" == "log-read" ]]; then
             # fleet_command validates the name and refuses anything but one explicit device.

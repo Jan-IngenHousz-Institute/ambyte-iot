@@ -838,3 +838,142 @@ class VinLimit(unittest.TestCase):
         self.assertEqual(argv_for("set", "", self.CLIENT)[0], 2)  # set without a value
         self.assertEqual(argv_for("set", "4.0", self.CLIENT)[0], 2)
 
+
+
+class IinLimit(unittest.TestCase):
+    """iin-limit: get is read-only; set is explicit, validated and verified by REG00 readback."""
+    CLIENT = "ambyte_28:37:2F:FF:FC:80"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+
+    def setUp(self):
+        self.fc = _load()
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="iin-limit", iin_action="get", ma=None), "r"),
+                         {"type": "get_iin_limit", "id": "r"})
+        for ma in (100, 150, 500, 1000, 1500, 3250):
+            self.assertEqual(b(_args(cmd="iin-limit", iin_action="set", ma=ma), "r"),
+                             {"type": "set_iin_limit", "id": "r", "ma": ma})
+
+    def test_bad_input_refused(self):
+        for kw in (dict(iin_action="set", ma=None), dict(iin_action="set", ma=1025),
+                   dict(iin_action="set", ma=50), dict(iin_action="set", ma=3300),
+                   dict(iin_action="set", ma=0), dict(iin_action="set", ma=-1000),
+                   dict(iin_action="set", ma=True), dict(iin_action="set", ma="1000"),
+                   dict(iin_action="set", ma=1000.0), dict(iin_action="get", ma=1000),
+                   dict(iin_action="reset", ma=None)):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="iin-limit", **kw), "r")
+
+    def test_set_refuses_discovery_and_bad_input_before_aws(self):
+        from unittest.mock import patch
+        cases = (["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                 ["iin-limit", "--iin-action", "set", "--devices", self.CLIENT],
+                 ["iin-limit", "--iin-action", "set", "--ma", "1025", "--devices", self.CLIENT],
+                 ["iin-limit", "--iin-action", "set", "--ma", "1000", "--devices", " "],
+                 ["iin-limit", "--ma", "1000", "--devices", self.CLIENT])
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    _run = VinLimit._run
+
+    def test_get_is_read_only_and_set_is_mutating_and_verified(self):
+        got = dict(type="iin_limit_result", ok=True, ma=500, reg00=0x48, en_ilim=True, hiz=False,
+                   detail="IIN register limit=500 mA REG00=0x48 EN_ILIM=1 HIZ=0")
+        rc, sent, text = self._run(["iin-limit"], lambda req: [got])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "get_iin_limit", "id": sent[0]["id"]})
+        self.assertLessEqual(len(sent[0]["id"].encode()), 64)     # firmware id limit
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("register_ma=500 reg00=0x48 en_ilim=True hiz=False", text)
+
+        done = dict(type="set_iin_limit_result", ok=True, ma=1000, reg00=0x52, en_ilim=True, hiz=False,
+                    detail="IIN register limit=1000 mA REG00=0x52 (verified)")
+        busy = dict(type="set_iin_limit_result", ok=False, detail="busy")
+        rc, sent, text = self._run(["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                                   lambda req: [busy, done])      # a QoS1 duplicate first
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "set_iin_limit", "id": sent[0]["id"], "ma": 1000})
+        self.assertIn("(MUTATING)", text)
+        # HIZ/EN_ILIM are reported state, not part of the limit: still confirmed.
+        hiz = dict(done, reg00=0x92, en_ilim=False, hiz=True)
+        self.assertEqual(self._run(["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                                   lambda req: [hiz])[0], 0)
+
+    def test_refusal_wrong_readback_or_wrong_reply_type_fails_the_run(self):
+        set_argv = ["iin-limit", "--iin-action", "set", "--ma", "1000"]
+        refused = dict(type="set_iin_limit_result", ok=False, detail="ESP_ERR_INVALID_RESPONSE")
+        rc, _, text = self._run(set_argv, lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("iin-limit not confirmed", text)
+        other = dict(type="set_iin_limit_result", ok=True, ma=500, reg00=0x48, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [other])[0], 1)          # reads another value
+        mismatch = dict(type="set_iin_limit_result", ok=True, ma=1000, reg00=0x48, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [mismatch])[0], 1)       # reg00 != ma
+        for bad in (dict(ma=1000, reg00=0x152), dict(ma=1000, reg00=True), dict(ma=1000, reg00="0x52"),
+                    dict(ma=1000.5, reg00=0x52), dict()):
+            reply = dict(type="set_iin_limit_result", ok=True, detail="x", **bad)
+            with self.subTest(**bad):
+                self.assertEqual(self._run(set_argv, lambda req: [reply])[0], 1)
+        # A VIN reply or a get reply never answers an IIN set: the run times out.
+        for wrong in (dict(type="iin_limit_result", ok=True, ma=1000, reg00=0x52, detail="x"),
+                      dict(type="set_vin_limit_result", ok=True, mv=4000, reg01=3, detail="x")):
+            rc, _, text = self._run(set_argv, lambda req: [wrong])
+            self.assertEqual(rc, 1)
+            self.assertIn("replies 0/1", text)
+
+    def test_workflow_offers_iin_limit_and_passes_action_and_ma(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("iin-limit", inputs["command"]["options"])
+        self.assertEqual(inputs["iin_limit_action"]["options"], ["get", "set"])
+        self.assertEqual(inputs["iin_limit_action"]["default"], "get")
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        self.assertEqual(step["env"]["IIN_ACTION"], "${{ inputs.iin_limit_action }}")
+        self.assertEqual(step["env"]["IIN_MA"], "${{ inputs.iin_limit_ma }}")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, ma, devices, command="iin-limit"):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND=command, DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION="status", PP_STATE="no_flash",
+                           VIN_ACTION="get", VIN_MV="", IIN_ACTION=action, IIN_MA=ma)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("set", "1000", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "iin-limit")
+        self.assertEqual(argv[argv.index("--iin-action") + 1], "set")
+        self.assertEqual(argv[argv.index("--ma") + 1], "1000")
+        self.assertNotIn("--mv", argv)
+        rc, argv = argv_for("get", "1000", "")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--ma", argv)          # the value only rides with set
+        self.assertEqual(argv_for("set", "1000", " ")[0], 2)      # mutating without explicit devices
+        self.assertEqual(argv_for("set", "", self.CLIENT)[0], 2)  # set without a value
+        self.assertEqual(argv_for("set", "1.0", self.CLIENT)[0], 2)
+        # The IIN inputs never leak into another command's arguments.
+        rc, argv = argv_for("set", "1000", self.CLIENT, command="vin-limit")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--iin-action", argv)
+        self.assertNotIn("--ma", argv)
