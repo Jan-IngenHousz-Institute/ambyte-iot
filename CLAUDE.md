@@ -20,7 +20,7 @@ holds bench boards.
 - Serial console: 115200 on `/dev/ttyACM0` (USB-JTAG; opening the port can reset the device).
   Useful CLI: `status`, `netwd [test]`, `inflight`, `evlog`, `cfg`, `wifi_join <ssid> <pass>`,
   `schedule <status|run|start|stop|reload|actions|validate|release|install>`,
-  `record_env`, `ambit_spec <ch>`, `ambit_spec_raw <ch>` (cmd 35), `ping_uart <ch>`, `reboot`,
+  `record_env`, `charger_redetect [bg_en|dpdm|auto [on|off]]`, `ambit_spec <ch>`, `ambit_spec_raw <ch>` (cmd 35), `ping_uart <ch>`, `reboot`,
   `selftest` (factory PCBA test; host runner: `python -m flash_gui.factory_test`)
 
 ## Architecture (delivery pipeline invariants — do not break)
@@ -98,6 +98,14 @@ holds bench boards.
   brownout records, force and clear — never per read or heartbeat. Only fresh (changing),
   valid, input-present charger frames may move it; battery-only units can only react to
   `ESP_RST_BROWNOUT`.
+- **Charger re-detection (2026-11)**: the MP2731 driver pulses REG09 BG_EN (1 then 0,
+  both read back, under ONE I2C bus hold, reserved bits preserved) when the chip says
+  "no input, not charging" beside a live panel (docs/charger-redetect.md). The
+  decision is the pure `mp2731_redetect.c`, fed by the existing power reads (no task).
+  It never fires on an expired safety timer (the pulse would clear that fault), while
+  charging/done, on a full battery, under the maintenance lock, or over a BG_EN not
+  proven back at 0. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
+  boot that reset during an open attempt.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
   absolute veto. `wd test` must never write production latches.

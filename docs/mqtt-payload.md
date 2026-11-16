@@ -646,7 +646,7 @@ non-negative integers.
 | | `charge_ma` | integer, mA | Battery charge current. |
 | | `input_present` | boolean | External input-power detection. |
 | | `charge_status` | integer | Raw MP2731 charge-state enum; preserve 0–3 without reinterpretation. |
-| | `charger` | object, optional | Read-only REG00–REG17 scan, NTC ratio, protection/limiting flags and per-boot sampled history; [charger-diagnostics.md](charger-diagnostics.md) defines units and missing-data rules. ADC freshness remains unverified. |
+| | `charger` | object, optional | Read-only REG00–REG17 scan, NTC ratio, protection/limiting flags and per-boot sampled history; [charger-diagnostics.md](charger-diagnostics.md) defines units and missing-data rules. ADC freshness remains unverified. Additive: `charger.redetect` (automatic re-detection state and per-boot counters, see [charger-redetect.md](charger-redetect.md)); dropped, never truncated, when the object would not fit. |
 | `measurements` | `stored` | integer | Observation records committed since boot; excludes heartbeat, identity, logs and replay. |
 | | `store_failures` | integer | Failed observation-store attempts since boot; retries count as separate attempts. |
 | | `sensor_command_failures` | integer | Failed attempted BME280 reads and AMBIT measurement/temperature/spectrum/trigger/fetch commands since boot. A poll timeout, power-shed run or busy admission does not increment it. These are command attempts, not a count of unique lost measurements. |

@@ -1,0 +1,22 @@
+{
+  "source": "telemetry_preview after one manual charger_redetect in the same boot (synthetic measure_id 0, nothing published)",
+  "charger_object_bytes": 1232,
+  "redetect": {
+    "auto": true,
+    "state": "idle",
+    "disabled_reason": null,
+    "attempts": 0,
+    "charging": 0,
+    "detected": 0,
+    "no_change": 0,
+    "failed": 0,
+    "blocked": 0,
+    "vetoed": 0,
+    "manual": 1,
+    "dwell_s": 0,
+    "backoff_s": 0,
+    "next_in_s": 0,
+    "last_block": null,
+    "last": null
+  }
+}
