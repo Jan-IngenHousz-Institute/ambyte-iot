@@ -59,6 +59,14 @@ esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us);
  * OTP default; an ESP reboot alone need not reset the charger. */
 esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out);
 esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
+/* Read/set REG00 IIN_LIM (input current limit REGISTER): 100..3250 mA in
+ * 50 mA steps. out is required. Set is one read-modify-write-readback under a
+ * single I2C bus hold that keeps EN_HIZ (bit 7) and EN_ILIM (bit 6) exactly as
+ * read; it succeeds only when the full byte reads back as written. With
+ * EN_ILIM set the ILIM-pin resistor may cap the input below the register.
+ * Live register only, like the VIN limit (docs/charger-iin-limit.md). */
+esp_err_t mp2731_get_iin_limit(power_iin_limit_t *out);
+esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
 
 /* Charger input re-detection (docs/charger-redetect.md, mp2731_redetect.h).
  * Manual: one BG_EN pulse (REG09 bit 3, 1 then 0, both verified) or one forced

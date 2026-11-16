@@ -28,6 +28,10 @@ extern "C" {
  * input limit on the resident worker; replies carry verified REG01 readback.
  * VIN-limit commands require a nonempty id of at most 64 bytes, use no NVS
  * dedupe/override, and repeated sets write the same desired register value.
+ * `get_iin_limit` / `set_iin_limit` (integer `ma`) do the same for the charger
+ * input current limit REGISTER (REG00[5:0]); the set preserves REG00 bits 7:6
+ * (HIZ, EN_ILIM) and replies carry verified REG00 plus `en_ilim`/`hiz`. Same
+ * id rules and single-flight `busy` as VIN-limit, and independent of it.
  * `charger_redetect` (`method` bg_en|dpdm, default bg_en) pulses the charger's
  * input detection on the worker and replies with before/after register scans;
  * `charger_redetect_auto` (`enabled` bool, omitted = query) flips the RAM-only

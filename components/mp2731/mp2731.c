@@ -21,6 +21,7 @@
 /* Register map, datasheet citations and the read algorithm live in
  * mp2731_core.{h,c} (host-testable); this file is only the I2C adapter. */
 #define MP2731_REG_VIN_LIMIT 0x01u
+#define MP2731_REG_IIN_LIMIT 0x00u
 
 #define MP2731_I2C_TIMEOUT_TICKS pdMS_TO_TICKS(1000)
 
@@ -415,6 +416,71 @@ esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
     }
     (void)i2c_bus_unlock();
     if (err == ESP_OK) *out = (power_vin_limit_t){.mv = mv, .reg01 = readback};
+    return err;
+}
+
+static uint16_t iin_limit_ma(uint8_t reg00)
+{
+    return (uint16_t)(POWER_IIN_LIMIT_MIN_MA + (reg00 & POWER_IIN_LIMIT_REG_MASK) * POWER_IIN_LIMIT_STEP_MA);
+}
+
+esp_err_t mp2731_get_iin_limit(power_iin_limit_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    uint8_t reg = 0;
+    esp_err_t err = mp2731_read_reg(MP2731_REG_IIN_LIMIT, &reg);
+    if (err != ESP_OK) return err;
+    /* All 64 codes decode inside 100..3250 mA, and bits 7:6 (HIZ, EN_ILIM)
+     * are legitimate state rather than a corrupt value: report, never refuse. */
+    *out = (power_iin_limit_t){.ma = iin_limit_ma(reg), .reg00 = reg};
+    return ESP_OK;
+}
+
+esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out)
+{
+    if (out == NULL || !power_iin_limit_valid_ma(ma)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    i2c_port_t port = I2C_NUM_MAX;
+    esp_err_t err = i2c_bus_get_port(&port);
+    if (err != ESP_OK) return err;
+    err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
+    if (err != ESP_OK) return err;
+
+    /* REG00 = EN_HIZ(7) | EN_ILIM(6) | IIN_LIM[5:0], IIN_LIM = 100 mA + 50 mA
+     * steps (MP2731 Rev 1.2 p.30). Unlike REG01 there is no reset bit to keep
+     * clear: bits 7:6 are live controls this command must never change, so the
+     * write is a read-modify-write that copies them from the read. HIZ=1 would
+     * switch the converter off; clearing EN_ILIM would drop the ILIM-pin cap,
+     * the board's hardware safety limit. One bus hold spans read, write and
+     * readback so no other bus user can interleave a REG00 change, and a CLI
+     * and an MQTT set cannot acknowledge each other's values. A readback that
+     * differs in ANY bit (a watchdog reset of 7:6 in the window included) is
+     * reported as a failure, never as success. */
+    const uint8_t reg = MP2731_REG_IIN_LIMIT;
+    uint8_t before = 0;
+    uint8_t value = 0;
+    uint8_t readback = 0;
+    err = i2c_master_write_read_device(port, MP2731_I2C_ADDR, &reg, 1, &before, 1,
+                                       MP2731_I2C_TIMEOUT_TICKS);
+    if (err == ESP_OK) {
+        value = (uint8_t)((before & (uint8_t)~POWER_IIN_LIMIT_REG_MASK) |
+                          ((ma - POWER_IIN_LIMIT_MIN_MA) / POWER_IIN_LIMIT_STEP_MA));
+        const uint8_t buf[2] = {MP2731_REG_IIN_LIMIT, value};
+        err = i2c_master_write_to_device(port, MP2731_I2C_ADDR, buf, sizeof(buf),
+                                         MP2731_I2C_TIMEOUT_TICKS);
+    }
+    if (err == ESP_OK) {
+        err = i2c_master_write_read_device(port, MP2731_I2C_ADDR, &reg, 1, &readback, 1,
+                                           MP2731_I2C_TIMEOUT_TICKS);
+        if (err == ESP_OK && readback != value) err = ESP_ERR_INVALID_RESPONSE;
+    }
+    (void)i2c_bus_unlock();
+    if (err == ESP_OK) *out = (power_iin_limit_t){.ma = ma, .reg00 = readback};
     return err;
 }
 

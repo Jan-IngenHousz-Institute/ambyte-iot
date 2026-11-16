@@ -901,6 +901,46 @@ cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
     return make_result(ESP_OK, "VIN limit=%u mV REG01=0x%02X (verified)", out->mv, out->reg01);
 }
 
+/* "register limit", never "input current": with EN_ILIM the ILIM-pin resistor
+ * caps the input at the lower of the two, and nothing here measures which. */
+static cmd_result_t iin_limit_result(const power_iin_limit_t *l, const char *suffix)
+{
+    const bool en_ilim = (l->reg00 & POWER_IIN_EN_ILIM_BIT) != 0;
+    const bool hiz = (l->reg00 & POWER_IIN_HIZ_BIT) != 0;
+    return make_result(ESP_OK, "IIN register limit=%u mA REG00=0x%02X EN_ILIM=%d HIZ=%d%s%s",
+                       l->ma, l->reg00, en_ilim, hiz, suffix,
+                       en_ilim ? "; ILIM pin may cap the input lower" : "");
+}
+
+cmd_result_t cmd_get_iin_limit(power_iin_limit_t *out)
+{
+    if (out == NULL) return make_result(ESP_ERR_INVALID_ARG, "IIN limit: output required");
+    if (!s_initialized || s_cfg.get_iin_limit == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger IIN limit not available");
+    }
+    esp_err_t err = s_cfg.get_iin_limit(out);
+    if (err != ESP_OK) {
+        return make_result(err, "IIN limit read failed: %s", esp_err_to_name(err));
+    }
+    return iin_limit_result(out, "");
+}
+
+cmd_result_t cmd_set_iin_limit(uint16_t ma, power_iin_limit_t *out)
+{
+    if (out == NULL || !power_iin_limit_valid_ma(ma)) {
+        return make_result(ESP_ERR_INVALID_ARG, "IIN limit must be 100..3250 mA in 50 mA steps");
+    }
+    if (!s_initialized || s_cfg.set_iin_limit == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "charger IIN limit not available");
+    }
+    esp_err_t err = s_cfg.set_iin_limit(ma, out);
+    if (err != ESP_OK) {
+        return make_result(err, "IIN limit set/readback failed: %s; query before retrying",
+                           esp_err_to_name(err));
+    }
+    return iin_limit_result(out, " (verified)");
+}
+
 cmd_result_t cmd_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out)
 {
     if (out == NULL || (method != POWER_REDETECT_BG_EN && method != POWER_REDETECT_DPDM)) {

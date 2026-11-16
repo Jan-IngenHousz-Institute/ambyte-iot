@@ -37,6 +37,8 @@ typedef struct {
     power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
     power_get_vin_limit_fn      get_vin_limit;
     power_set_vin_limit_fn      set_vin_limit;
+    power_get_iin_limit_fn      get_iin_limit;
+    power_set_iin_limit_fn      set_iin_limit;
     power_redetect_fn           charger_redetect;      /* NULL = no charger */
     power_redetect_auto_fn      charger_redetect_auto; /* NULL = no charger */
 
@@ -208,6 +210,12 @@ cmd_result_t cmd_read_power(power_reading_t *out);
  * 100 mV steps and returns the verified hardware readback. out is required. */
 cmd_result_t cmd_get_vin_limit(power_vin_limit_t *out);
 cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
+
+/* Live charger input current limit REGISTER (REG00[5:0]); no NVS override.
+ * Set validates 100..3250 mA in 50 mA steps, preserves REG00 bits 7:6 (HIZ,
+ * EN_ILIM) and returns the verified hardware readback. out is required. */
+cmd_result_t cmd_get_iin_limit(power_iin_limit_t *out);
+cmd_result_t cmd_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
 
 /* Charger input re-detection (docs/charger-redetect.md): one manual BG_EN or
  * DP/DM pulse with before/after register snapshots in *out (blocks ~5 s), and

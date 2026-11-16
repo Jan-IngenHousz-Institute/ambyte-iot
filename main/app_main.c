@@ -1570,6 +1570,8 @@ void app_main(void)
         .ack_charger_diagnostics = mp2731_ack_diagnostics,
         .get_vin_limit          = mp2731_is_ready() ? mp2731_get_vin_limit : NULL,
         .set_vin_limit          = mp2731_is_ready() ? mp2731_set_vin_limit : NULL,
+        .get_iin_limit          = mp2731_is_ready() ? mp2731_get_iin_limit : NULL,
+        .set_iin_limit          = mp2731_is_ready() ? mp2731_set_iin_limit : NULL,
         .charger_redetect       = mp2731_is_ready() ? mp2731_charger_redetect : NULL,
         .charger_redetect_auto  = mp2731_is_ready() ? mp2731_redetect_auto : NULL,
         .set_status             = ambyte_status_get_set_fn(),
