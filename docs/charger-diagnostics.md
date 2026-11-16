@@ -11,6 +11,8 @@ The new object is diagnostic evidence only: it cannot open a flash gate, release
 brownout protection or hold back measurement publishing. The serial
 `mp2731_regs` command also includes REG17 now.
 
+`telemetry_preview` uses the same canonical payload builder with synthetic `measure_id=0`, labeled outside the JSON. It allocates no persistent ID, stores/publishes nothing, skips SD diagnostic persistence and peeks without sealing or acknowledging charger windows. Its live BME/power reads can advance per-boot RAM counters/history. The caller owns the returned preview buffer. This command does not suppress autonomous firmware publishing; bench connectivity must separately target a development endpoint.
+
 ```mermaid
 sequenceDiagram
     participant R as Existing power readers
@@ -18,14 +20,14 @@ sequenceDiagram
     participant H as Heartbeat
     participant I as Existing MQTT ingest
     R->>D: Existing ADC/status read
-    D->>D: Update per-boot history under read mutex
+    D->>D: Update RAM history under short critical section
     H->>D: Read REG00 through REG17 and snapshot history
     D-->>H: Partial read mask, raw bytes, counters, battery range
     H->>I: Existing canonical telemetry envelope
     alt Stored or submitted successfully
         H->>D: Acknowledge snapshot window id
         D->>D: Clear included range, retain newer samples
-    else Scan, allocation, build or submission failure
+    else Omitted diagnostics, build or submission failure
         D->>D: Retain range for next report
         H->>I: Keep liveness independent of optional diagnostics
     end
@@ -59,7 +61,7 @@ interpretations beyond the decoded subset.
 
 The scan shares the ADC-read mutex. It performs **reads only**, once per status
 report, and stops on the first I²C failure. A scan failure does not invalidate
-otherwise usable power readings or fail the heartbeat. If the driver mutex or
+otherwise usable power readings or fail the heartbeat. A partial scan included in a successfully stored/submitted report acknowledges its battery window; the scan error alone does not retain that window. If the driver mutex or
 transient allocation cannot be obtained, `charger` is omitted rather than
 presented as normal. A buffer failure retries the heartbeat without this optional
 object and retains its voltage window.
@@ -69,7 +71,7 @@ object and retains its voltage window.
 `charger.history` counts **observed** states from every existing successful or
 rejected power read whose status/fault registers completed. It adds no polling
 task or I²C traffic between reports. Status and fault bytes remain live evidence
-when the ADC frame is unusable.
+when the ADC frame is unusable. A partial bus failure after REG0C/REG0D still contributes flags and `status_reads`, but breaks duration/stop continuity. Lock timeouts count as failed power attempts too; diagnostic-scan lock timeouts do not. Concurrent power attempts conservatively break continuity even if they later succeed; timestamps are ordered at completion under a short critical section, without I²C or blocking inside it.
 
 | Field | Meaning |
 | --- | --- |
@@ -78,7 +80,7 @@ when the ADC frame is unusable.
 | `read_errors` | Non-OK power results, including `no_input` (a verdict, not necessarily a broken bus). |
 | `status_reads` | Attempts with usable live status/fault bytes. |
 | `adc_changes` | Changes between accepted five-channel ADC frames; changes are evidence, while equality cannot distinguish a stable value from a stale frame. |
-| `charging_ms` | Sampled estimate: elapsed monotonic milliseconds credited to the preceding trickle/constant-current state between consecutive usable status reads at most 15 s apart. Includes no estimate through an error or longer gap. |
+| `charging_ms` | Sampled estimate: elapsed monotonic milliseconds credited to the preceding trickle/constant-current state between consecutive usable status reads at most 15 s apart. A bus failure, overlapping attempt or longer gap breaks continuity. NO_INPUT, ADC_TIMEOUT and IMPLAUSIBLE verdicts remain eligible when both live status registers completed. |
 | `observed_ms`, `unobserved_ms` | Covered and uncovered durations between power-read attempts, including boot-to-first-read as uncovered. Neither includes the unsampled tail after the latest attempt. |
 | `charge_stops` | Observed transitions from trickle/constant current to idle/done across the same continuity rule. Charge completion counts as a stop. |
 | `last_stop` | `null` until observed; then `uptime_ms`, `status_reg`, `fault_reg` at that read. A timer/config scan at a later heartbeat is separate evidence. |

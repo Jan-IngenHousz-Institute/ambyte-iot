@@ -43,7 +43,7 @@ esp_err_t mp2731_last_frame(mp2731_frame_t *out);
 /* Read-only heartbeat diagnostics, including partial register scans. Returns a
  * complete JSON object length or -1. Ack only after storage/submission succeeds. */
 #define MP2731_DIAGNOSTICS_JSON_CAP 2048u
-int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id);
+int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id, bool seal);
 void mp2731_ack_diagnostics(uint64_t window_id);
 esp_err_t mp2731_read_raw(uint8_t reg, uint8_t *out);
 

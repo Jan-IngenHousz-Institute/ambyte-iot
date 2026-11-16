@@ -20,12 +20,17 @@ void mp2731_history_observe(mp2731_history_t *h, int64_t now_ms,
                             const mp2731_frame_t *f)
 {
     h->totals.reads++;
-    h->totals.last_read_ms = now_ms;
     if (result != ESP_OK) h->totals.read_errors++;
-    const bool status_valid = result == ESP_OK || result == POWER_ERR_NO_INPUT ||
-        result == POWER_ERR_ADC_TIMEOUT || result == POWER_ERR_IMPLAUSIBLE;
+    const bool status_valid = f != NULL && f->status_valid;
+    /* Live flags survive partial ADC bus failures, but such a failure cannot
+     * support elapsed-time or stop inference. Rejected ADC verdicts still have
+     * complete live status: NO_INPUT, ADC_TIMEOUT and IMPLAUSIBLE are eligible. */
+    const bool eligible = status_valid && (result == ESP_OK || result == POWER_ERR_NO_INPUT ||
+        result == POWER_ERR_ADC_TIMEOUT || result == POWER_ERR_IMPLAUSIBLE);
+    if (now_ms < h->previous_ms) now_ms = h->previous_ms;
+    h->totals.last_read_ms = now_ms;
     const int64_t dt = now_ms - h->previous_ms;
-    const bool continuous = status_valid && h->previous_status_valid &&
+    const bool continuous = eligible && h->previous_status_valid &&
                             dt >= 0 && dt <= HISTORY_MAX_GAP_MS;
     if (dt > 0) {
         if (continuous) {
@@ -51,7 +56,7 @@ void mp2731_history_observe(mp2731_history_t *h, int64_t now_ms,
         }
         h->previous_charge = charge;
     }
-    h->previous_status_valid = status_valid;
+    h->previous_status_valid = eligible;
     h->previous_ms = now_ms;
     if (result == ESP_OK) {
         const uint8_t adc[] = {f->vbat, f->vsys, f->vin, f->icc, f->iin};
@@ -88,6 +93,20 @@ void mp2731_history_snapshot(mp2731_history_t *h, charger_diagnostics_t *out,
     out->battery_range_valid = h->pending_range_valid;
     out->battery_min_mv = h->pending_min_mv;
     out->battery_max_mv = h->pending_max_mv;
+}
+
+void mp2731_history_peek(const mp2731_history_t *h, charger_diagnostics_t *out, int64_t now_ms)
+{
+    *out = h->totals;
+    out->window_start_ms = h->window_start_ms;
+    out->window_end_ms = now_ms;
+    out->battery_range_valid = h->pending_range_valid;
+    out->battery_min_mv = h->pending_min_mv;
+    out->battery_max_mv = h->pending_max_mv;
+    if (h->active_range_valid) {
+        range_add(&out->battery_range_valid, &out->battery_min_mv, &out->battery_max_mv, h->active_min_mv);
+        range_add(&out->battery_range_valid, &out->battery_min_mv, &out->battery_max_mv, h->active_max_mv);
+    }
 }
 
 void mp2731_history_ack(mp2731_history_t *h, uint64_t window_id)

@@ -5,7 +5,7 @@
 #include "charger_diagnostics_port.h"
 #include "mp2731_core.h"
 
-/* Caller serializes this RAM-only tracker with the driver's read mutex. */
+/* Caller serializes this RAM-only tracker with the driver's short history critical section. */
 typedef struct {
     charger_diagnostics_t totals;
     bool previous_status_valid, previous_adc_valid;
@@ -22,6 +22,7 @@ void mp2731_history_observe(mp2731_history_t *h, int64_t now_ms,
                             const mp2731_frame_t *f);
 void mp2731_history_snapshot(mp2731_history_t *h, charger_diagnostics_t *out,
                              int64_t now_ms);
+void mp2731_history_peek(const mp2731_history_t *h, charger_diagnostics_t *out, int64_t now_ms);
 void mp2731_history_ack(mp2731_history_t *h, uint64_t window_id);
 /* Stops on the first bus failure to bound heartbeat latency on a dead bus.
  * Partial bytes retain their read mask. No writes, delays or ADC triggers. */

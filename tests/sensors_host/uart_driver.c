@@ -466,6 +466,27 @@ int main(void)
     assert(refresh_starts==no_tx_before);tx_failed=false;absent=false;
     unsigned previous = refresh_starts;
     uart_sensor_query_fn query = uart_sensors_get_query_fn();
+    /* Admission to the UART owner is distinct from a wire attempt. */
+    uint8_t diagnostic_cmd[8] = {23}; uart_sensor_response_t diagnostic_response = {0};
+    assert(query(9, diagnostic_cmd, NULL, 0, 1, &diagnostic_response, 50) != ESP_OK);
+    assert(!diagnostic_response.exchange_attempted);
+    assert(uart_sensors_flash_session_begin(0, 100) == ESP_OK);
+    assert(query(0, diagnostic_cmd, NULL, 0, 1, &diagnostic_response, 50) != ESP_OK);
+    assert(!diagnostic_response.exchange_attempted);
+    uart_sensors_flash_session_end(0);
+    absent = true;
+    assert(query(0, diagnostic_cmd, NULL, 0, 1, &diagnostic_response, 50) != ESP_OK);
+    assert(diagnostic_response.exchange_attempted);
+    uart_sensor_response_free(&diagnostic_response);
+    assert(diagnostic_response.exchange_attempted);
+    absent = false; tx_failed = true;
+    assert(query(0, diagnostic_cmd, NULL, 0, 1, &diagnostic_response, 50) != ESP_OK);
+    assert(diagnostic_response.exchange_attempted); uart_sensor_response_free(&diagnostic_response);
+    tx_failed = false;
+    mode = 2;
+    assert(query(0, diagnostic_cmd, NULL, 0, 1, &diagnostic_response, 50) != ESP_OK);
+    assert(diagnostic_response.exchange_attempted); uart_sensor_response_free(&diagnostic_response);
+    mode = 0;
     const unsigned opcodes[] = {20,21,22,23,24,25,26,27,33};
     for (unsigned i = 0; i < sizeof opcodes / sizeof opcodes[0]; ++i) {
         uint8_t cmd[8] = {(uint8_t)opcodes[i], 2}; uart_sensor_response_t response = {0};

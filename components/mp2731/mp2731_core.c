@@ -134,8 +134,9 @@ esp_err_t mp2731_core_read(const mp2731_bus_t *bus, power_reading_t *out,
     }
 
     if ((err = rd(bus, MP2731_REG_STATUS, &f.status)) != ESP_OK ||
-        (err = rd(bus, MP2731_REG_FAULT, &f.fault)) != ESP_OK ||
-        (err = rd(bus, MP2731_REG_VBAT, &f.vbat)) != ESP_OK ||
+        (err = rd(bus, MP2731_REG_FAULT, &f.fault)) != ESP_OK) goto done;
+    f.status_valid = true;
+    if ((err = rd(bus, MP2731_REG_VBAT, &f.vbat)) != ESP_OK ||
         (err = rd(bus, MP2731_REG_VSYS, &f.vsys)) != ESP_OK ||
         (err = rd(bus, MP2731_REG_VIN, &f.vin)) != ESP_OK ||
         (err = rd(bus, MP2731_REG_ICHARGE, &f.icc)) != ESP_OK ||

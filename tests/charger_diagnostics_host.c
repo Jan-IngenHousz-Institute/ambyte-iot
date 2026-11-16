@@ -16,7 +16,7 @@ static void observe(mp2731_history_t *h, int64_t ms, esp_err_t err, uint8_t stat
                     uint8_t fault, uint16_t mv)
 {
     power_reading_t p = {.battery_mv = mv};
-    mp2731_frame_t f = {.status = status, .fault = fault, .vbat = (uint8_t)(mv / 20u)};
+    mp2731_frame_t f = {.status_valid = err != ESP_FAIL, .status = status, .fault = fault, .vbat = (uint8_t)(mv / 20u)};
     mp2731_history_observe(h, ms, err, &p, &f);
 }
 int main(void)
@@ -58,6 +58,17 @@ int main(void)
     assert(mp2731_diagnostics_read(&bus, &d) == ESP_OK);
     assert(chip.reads == 24 && d.read_mask == 0xFFFFFFu && d.registers[23] == 0x80);
     char json[CHARGER_DIAGNOSTICS_JSON_CAP];
+    charger_diagnostics_t worst = d;
+    worst.reads = worst.read_errors = worst.status_reads = worst.adc_changes = UINT64_MAX;
+    worst.charging_ms = worst.observed_ms = worst.unobserved_ms = worst.charge_stops = UINT64_MAX;
+    worst.window_id = UINT64_MAX;
+    worst.scan_start_ms = worst.scan_end_ms = worst.last_read_ms = worst.last_adc_change_ms = INT64_MAX;
+    worst.last_stop_ms = worst.window_start_ms = worst.window_end_ms = INT64_MAX;
+    worst.last_stop_valid = worst.battery_range_valid = true;
+    worst.battery_min_mv = worst.battery_max_mv = UINT16_MAX;
+    worst.last_stop_status = worst.last_stop_fault = worst.status_or = worst.fault_or = UINT8_MAX;
+    assert(mp2731_diagnostics_render(&worst, json, sizeof json) > 0);
+    printf("MAXIMUM=%s\n", json);
     assert(mp2731_diagnostics_render(&d, json, sizeof json) > 0);
     printf("FULL=%s\n", json);
     assert(mp2731_diagnostics_render(&d, json, 12) == -1 && json[0] == '\0');
