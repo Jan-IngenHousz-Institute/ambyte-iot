@@ -43,7 +43,7 @@ sequenceDiagram
 | `read_mask` | Bit N set only if register N was read successfully. Full mask = 16777215 (`0xFFFFFF`). |
 | `read_error` | ESP error code, zero for a complete scan. On first failure, stop the scan to bound latency on a failing bus. |
 | `registers` | Object keyed by uppercase two-digit hexadecimal addresses `00` through `17`, values integer 0–255. Missing reads are omitted, never zero-filled. Includes control, charge profile, watchdog/timer configuration, status/fault, ADC, limiting and JEITA registers. |
-| `iin_limit_ma` | REG00[5:0] × 50 + 100 mA. Register ceiling only; an enabled hardware ILIM may be lower. |
+| `iin_limit_ma` | REG00[5:0] × 50 + 100 mA. Register ceiling only; an enabled hardware ILIM may be lower. Settable with `iin_limit` / `set_iin_limit` ([charger-iin-limit.md](charger-iin-limit.md)). |
 | `external_ilim_enabled`, `high_impedance` | REG00 bits 6 and 7. |
 | `vin_min_mv` | REG01[6:0] × 100 + 3700 mV. Actual readback, not a claimed default. |
 | `charge_ntc_enabled`, `aico_enabled` | REG02 bits 4 and 0. |

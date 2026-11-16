@@ -1,0 +1,70 @@
+IIN limit: 500 -> 1000 -> 500 mA on laptop USB (battery charged)
+Real USB replies - 2026-11-16 - 28:37:2F:FF:E7:04
+Firmware: v2.21.0-2-g674161f-dirty (bench-signed) | Source: 843aa1072cfd
+Prompts normalized; first status sample of each phase shown, all samples in bench-samples.json.
+
+> help iin_limit
+iin_limit
+  iin_limit | iin_limit set <mA>  read/set charger input current limit REGISTER
+  (100..3250, step 50; ILIM pin may cap lower)
+> iin_limit
+IIN register limit=500 mA REG00=0x48 EN_ILIM=1 HIZ=0; ILIM pin may cap the input lower
+> vin_limit
+VIN limit=4300 mV REG01=0x06
+> status
+- Power: Vbat 4.18 V, Vin 5.16 V, Vsys 4.40 V, Iin 119 mA, Icharge 0 mA
+source: external, charge: charged, publish gate: OPEN
+> mp2731_regs 1 0 read
+MP2731 t=14610 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D1 0F=DC 10=88 11=56 12=00 13=09 14=08 15=60 16=EE 17=00
+  (excerpt) 00=48 01=06 0C=39 0D=80 14=08
+
+> iin_limit set 1000
+IIN register limit=1000 mA REG00=0x52 EN_ILIM=1 HIZ=0 (verified); ILIM pin may cap the input lower
+> iin_limit
+IIN register limit=1000 mA REG00=0x52 EN_ILIM=1 HIZ=0; ILIM pin may cap the input lower
+> status
+- Power: Vbat 4.18 V, Vin 5.10 V, Vsys 4.36 V, Iin 199 mA, Icharge 0 mA
+source: external, charge: charged, publish gate: OPEN
+> mp2731_regs 1 0 read
+MP2731 t=65450 read=ok conv=done/5ms 00=52 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=D8 10=88 11=55 12=00 13=0E 14=12 15=60 16=EE 17=00
+  (excerpt) 00=52 01=06 0C=39 0D=80 14=12
+
+> status
+- Power: Vbat 4.18 V, Vin 5.16 V, Vsys 4.28 V, Iin 106 mA, Icharge 0 mA
+source: external, charge: charged, publish gate: OPEN
+> mp2731_regs 1 0 read
+MP2731 t=166570 read=ok conv=done/5ms 00=52 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D1 0F=DC 10=88 11=56 12=00 13=09 14=12 15=60 16=EE 17=00
+  (excerpt) 00=52 01=06 0C=39 0D=80 14=12
+
+> iin_limit set 500
+IIN register limit=500 mA REG00=0x48 EN_ILIM=1 HIZ=0 (verified); ILIM pin may cap the input lower
+> iin_limit set 1025
+iin_limit: expected 100..3250 mA in 50 mA steps
+Command returned non-zero error code: 0x1 (ERROR)
+> iin_limit set -1
+iin_limit: expected 100..3250 mA in 50 mA steps
+Command returned non-zero error code: 0x1 (ERROR)
+> iin_limit set 3300
+iin_limit: expected 100..3250 mA in 50 mA steps
+Command returned non-zero error code: 0x1 (ERROR)
+> iin_limit set 1000mA
+iin_limit: expected 100..3250 mA in 50 mA steps
+Command returned non-zero error code: 0x1 (ERROR)
+> iin_limit
+IIN register limit=500 mA REG00=0x48 EN_ILIM=1 HIZ=0; ILIM pin may cap the input lower
+> mp2731_regs 1 0 read
+MP2731 t=192800 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DA 10=88 11=56 12=00 13=0A 14=08 15=60 16=EE 17=00
+  (excerpt) 00=48 01=06 0C=39 0D=80 14=08
+> status
+- Power: Vbat 4.18 V, Vin 5.16 V, Vsys 4.38 V, Iin 119 mA, Icharge 0 mA
+source: external, charge: charged, publish gate: OPEN
+> mp2731_regs 1 0 read
+MP2731 t=193200 read=ok conv=done/5ms 00=48 01=06 02=DC 03=10 04=5B 05=A6 06=22 07=A0 08=95 09=00 0A=58 0B=C0 0C=39 0D=80 0E=D2 0F=DD 10=88 11=55 12=00 13=09 14=08 15=60 16=EE 17=00
+  (excerpt) 00=48 01=06 0C=39 0D=80 14=08
+
+Summary (annotations, not console replies):
+500 mA: 6 samples over 42.0 s, Iin 106-199 mA (median 146.0), Icharge 0, REG14=08.
+1000 mA: 15 samples over 117.9 s, Iin 106-239 mA (median 119), Icharge 0, REG14=12.
+Battery charge done throughout: the input current is the unit's own load at both limits.
+IINPPM (REG14 bit 6) never set; IIN_DPM followed the register (0x08 -> 0x12).
+REG00 restored to 0x48; WATCHDOG_FAULT (REG0D=0x80) present throughout.
