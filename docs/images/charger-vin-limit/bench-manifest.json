@@ -1,0 +1,26 @@
+{
+  "source_commit": "ce2d42d31c634c5e8cb9366399794c9c0660e935",
+  "firmware": "2.20.0-vin-ce2d42d",
+  "signed_image_sha256": "fe76d8a16de7a92f60420cb74aaaf867794041459985865795a912eb390ef4d3",
+  "reg01_before": 6,
+  "reg01_test": 3,
+  "reg01_restored": 6,
+  "watchdog_wait_seconds": 62.000120400000014,
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "nvs_erased": false,
+  "cloud_commands_sent": false,
+  "input_power_cycle_qualified": false,
+  "capture_source": "physical USB console; ANSI and trailing whitespace removed; leading asynchronous log fragments omitted",
+  "restoration": {
+    "firmware": "2.20.0",
+    "signed": true,
+    "reg01_final": 6,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_sha256_unchanged": true,
+    "cloud_commands_sent": false,
+    "nvs_erased": false,
+    "signed_image_sha256": "6e7b7602cc37471d8be6d6fe9a79084d14499bd8a4d5f6598d07257774549815",
+    "release_tag": "v2.20.0"
+  }
+}

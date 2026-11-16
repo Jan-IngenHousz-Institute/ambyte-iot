@@ -1565,6 +1565,8 @@ void app_main(void)
         .read_power             = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
         .render_charger_diagnostics = mp2731_is_ready() ? mp2731_render_diagnostics : NULL,
         .ack_charger_diagnostics = mp2731_ack_diagnostics,
+        .get_vin_limit          = mp2731_is_ready() ? mp2731_get_vin_limit : NULL,
+        .set_vin_limit          = mp2731_is_ready() ? mp2731_set_vin_limit : NULL,
         .set_status             = ambyte_status_get_set_fn(),
         /* The SD monitor can mount a card that was absent at boot, so keep both
          * probes wired for the whole session. They fail closed while unmounted. */

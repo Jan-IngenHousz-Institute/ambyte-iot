@@ -445,6 +445,12 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
 ## Power management
 
 - **Publish gate:** `device_commands_publish_power_ok()` is always true since 2026-11-13 ("keep sending always"): the MP2731 ADC does not convert without input, so its frames on battery are stale and no power reading may hold field data back. The cost is battery: units publish through the night. The charger is still read (cached 5 s) to report `publish_gate_reason` and to gate AMBIT flashing, which is fail-closed on fresh, positive evidence of external power (`device_commands_flash_power_ok`). See [docs/power-telemetry.md](docs/power-telemetry.md).
+- **Charger diagnostics:** `vin_limit` reads REG01; `vin_limit set 4000` sets a
+  4.0 V input limit with verified readback. MQTT exposes `get_vin_limit` and
+  `set_vin_limit` (`mv` in integer millivolts). This changes the live charger
+  register only; re-read it after input power cycles or dawn. See
+  [charger VIN-limit commands](docs/charger-vin-limit.md)
+  for request/reply examples, range, lifetime, and experiment guidance.
 - **DFS clock scaling (Phase 2):** `esp_pm` dynamic frequency scaling `AMBYTE_PM_MIN_FREQ_MHZ=40` … `MAX=160` MHz (defined in `app_main.c` — PlatformIO `-D` flags don't reach IDF component sources). CPU coasts at the min during idle gaps. Light-sleep stays **off**. DFS is safe: AMBIT UART pinned to XTAL, SD/SPI holds its own APB lock, measurement windows hold a `NO_LIGHT_SLEEP` PM lock. `min=40` is HW-validated (1 h soak). Requires `CONFIG_PM_ENABLE`.
 - **PM-independent quick wins:** Wi-Fi power-save, MQTT keepalive tuning, ping cache, BME280 forced mode.
 

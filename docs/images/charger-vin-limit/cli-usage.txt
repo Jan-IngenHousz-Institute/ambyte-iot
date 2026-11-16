@@ -1,0 +1,28 @@
+VIN limit: help, read, set and verified readback
+Real USB bench capture - 2026-11-16
+Firmware: 2.20.0-vin-ce2d42d
+Source: ce2d42d31c63
+Bench: 28:37:2F:FF:E7:04 | USB console 115200 baud
+
+help vin_limit
+vin_limit
+  vin_limit | vin_limit set <mV>  read/set charger input voltage limit
+  (3700..15200, step 100)
+
+ambyte>
+ambyte>
+
+vin_limit
+VIN limit=4300 mV REG01=0x06
+ambyte>
+ambyte>
+
+vin_limit set 4000
+VIN limit=4000 mV REG01=0x03 (verified)
+ambyte>
+ambyte>
+
+vin_limit
+VIN limit=4000 mV REG01=0x03
+ambyte>
+ambyte>

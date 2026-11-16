@@ -35,6 +35,8 @@ typedef struct {
     int                       (*render_charger_diagnostics)(char *out, size_t cap, uint64_t *window_id, bool seal);
     void                      (*ack_charger_diagnostics)(uint64_t window_id);
     power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
+    power_get_vin_limit_fn      get_vin_limit;
+    power_set_vin_limit_fn      set_vin_limit;
 
     /* Persistence ports — one row per measurement event (event-document model) */
     measurement_next_id_fn            next_id;
@@ -199,6 +201,11 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
  * result message carries a human-readable summary. ESP_ERR_NOT_SUPPORTED when
  * no power monitor is wired in. */
 cmd_result_t cmd_read_power(power_reading_t *out);
+
+/* Live charger register only; no NVS override. Set validates 3700..15200 mV in
+ * 100 mV steps and returns the verified hardware readback. out is required. */
+cmd_result_t cmd_get_vin_limit(power_vin_limit_t *out);
+cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
 
 /* Drive a PWM signal on GPIO4 via LEDC. duty_pct is 0..100 (float precision);
  * freq_hz is the PWM frequency in Hz (e.g. 10000). When enable is false the

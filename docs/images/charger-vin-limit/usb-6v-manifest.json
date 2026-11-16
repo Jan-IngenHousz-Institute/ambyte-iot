@@ -1,0 +1,97 @@
+{
+  "source_commit": "ce2d42d31c634c5e8cb9366399794c9c0660e935",
+  "firmware": "2.20.0-vin-ce2d42d",
+  "signed_image_sha256": "fe76d8a16de7a92f60420cb74aaaf867794041459985865795a912eb390ef4d3",
+  "test_utc_date": "2026-11-16",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "power_source": "laptop USB port",
+  "sample_source": "MP2731 ADC via USB status, followed by a separate conversion and raw dump; no independent meter",
+  "sequence_mv": [
+    4300,
+    6000,
+    4300,
+    6000,
+    4300
+  ],
+  "reg01_before": 6,
+  "reg01_test": 23,
+  "reg01_restored": 6,
+  "summary": {
+    "4300": {
+      "n": 8,
+      "vin_v": {
+        "min": 5.04,
+        "max": 5.16,
+        "median": 5.1
+      },
+      "battery_v": {
+        "min": 4.18,
+        "max": 4.2,
+        "median": 4.18
+      },
+      "vsys_v": {
+        "min": 4.32,
+        "max": 4.42,
+        "median": 4.35
+      },
+      "iin_ma": {
+        "min": 119,
+        "max": 239,
+        "median": 179.0
+      },
+      "icharge_ma": {
+        "min": 0,
+        "max": 0,
+        "median": 0.0
+      },
+      "raw_adc_distinct_frames": 7,
+      "all_read_ok": true,
+      "all_conversion_done_5ms": true
+    },
+    "6000": {
+      "n": 8,
+      "vin_v": {
+        "min": 5.16,
+        "max": 5.16,
+        "median": 5.16
+      },
+      "battery_v": {
+        "min": 4.14,
+        "max": 4.34,
+        "median": 4.18
+      },
+      "vsys_v": {
+        "min": 4.12,
+        "max": 4.18,
+        "median": 4.15
+      },
+      "iin_ma": {
+        "min": 106,
+        "max": 119,
+        "median": 106.0
+      },
+      "icharge_ma": {
+        "min": 0,
+        "max": 0,
+        "median": 0.0
+      },
+      "raw_adc_distinct_frames": 7,
+      "all_read_ok": true,
+      "all_conversion_done_5ms": true
+    }
+  },
+  "restoration": {
+    "firmware": "2.20.0",
+    "signed_image_sha256": "6e7b7602cc37471d8be6d6fe9a79084d14499bd8a4d5f6598d07257774549815",
+    "reg01": 6,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_unchanged": true,
+    "nvs_erased": false,
+    "cloud_commands_sent": false
+  },
+  "floor_step_seconds": [
+    10.010924738002359,
+    10.01564259800216
+  ]
+}

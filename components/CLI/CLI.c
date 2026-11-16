@@ -14,6 +14,7 @@
 #include "CLI.h"
 #include "cli_identity.h"
 #include "cli_sensors.h"
+#include "cli_vin_limit.h"
 #include "driver/i2c.h"
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
@@ -2357,6 +2358,11 @@ static esp_err_t cli_register_commands(void)
         .help = "rtc | rtc set <epoch> | rtc set <YYYY-MM-DD> <HH:MM:SS> (UTC)",
         .func = cli_cmd_rtc,
     };
+    static const esp_console_cmd_t vin_limit_cmd = {
+        .command = "vin_limit",
+        .help = "vin_limit | vin_limit set <mV>  read/set charger input voltage limit (3700..15200, step 100)",
+        .func = cli_cmd_vin_limit,
+    };
     static const esp_console_cmd_t cfg_cmd = {
         .command = "cfg",
         .help = "cfg | cfg get <key> | cfg set <key> <value>  read/write device_cfg NVS (reboot to apply)",
@@ -2548,6 +2554,10 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&rtc_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_console_cmd_register(&vin_limit_cmd);
     if (err != ESP_OK) {
         return err;
     }
