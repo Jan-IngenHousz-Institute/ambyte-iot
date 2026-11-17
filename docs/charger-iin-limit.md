@@ -134,9 +134,15 @@ readback. The write copies bits 7:6 from the read, so the command never
 changes Hi-Z or the ILIM-pin enable: setting HIZ would switch the converter
 off, and clearing EN_ILIM would remove the board's hardware current cap. If
 the readback differs from the written byte in any bit, the set fails with
-`ESP_ERR_INVALID_RESPONSE`. A failed first read writes nothing. Nothing else
-in the firmware writes REG00 (charger re-detection only reads it). Registers
-other than REG00 are untouched.
+`ESP_ERR_INVALID_RESPONSE`. A failed first read writes nothing. The only other
+REG00 writer is the [AICO re-arm](charger-aico.md): while AICO is on it writes
+the byte back exactly as read, at most hourly, in its own single bus hold, so
+it can neither interleave with this read-modify-write nor change a limit set
+here. Charger re-detection only reads REG00. Registers other than REG00 are
+untouched. Like every charger mutation, the set holds the
+[maintenance admission](charger-aico.md#maintenance-admission) for its whole
+sequence: during an OTA or AMBIT flash it is refused with
+`maintenance_active` and writes nothing.
 
 **Watchdog.** The I2C watchdog is expired on every unit read so far
 (REG0D=`0x80`, WATCHDOG_FAULT; the firmware never kicks it). Per the table,

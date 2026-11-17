@@ -48,10 +48,18 @@ AICO on (verified) REG02=0xDD IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 res
 `IIN register` is the REG00 register limit (see the
 [IIN-limit doc](charger-iin-limit.md): with `EN_ILIM` the ILIM pin may cap
 lower still); `IIN_DPM` is the limit AICO applies now. Any other argument
-prints the usage and returns 1 without touching the charger. `aico reset` is
-refused under the maintenance lock and while a charger re-detect is in
-progress or being judged; it works with AICO off too (it is then a harmless
-rewrite) and counts as a reset either way.
+prints the usage and returns 1 without touching the charger. `aico on`,
+`aico off` and `aico reset` are refused with `maintenance_active` during an
+OTA, AMBIT flash or other maintenance op ([admission](#maintenance-admission));
+`aico reset` is also refused (busy) while a charger re-detect is in progress or
+being judged. It works with AICO off too (it is then a harmless rewrite) and
+counts as a reset either way.
+
+A switch or reset is reported as done once its write reads back exactly, even
+if a status read after it (REG00/REG14/REG15) fails: the reply then says the
+status read failed (MQTT `status_valid:false`, status fields `null`), the
+reset is counted and the hour restarts. Query `aico` again for the status;
+the mutation is never repeated just because its follow-up read failed.
 
 ## MQTT
 
@@ -118,16 +126,22 @@ read mutex:
 - the first read after boot starts the clock; switching AICO on restarts it,
   so AICO always gets a full interval to learn before its first re-arm;
 - no sooner than `AICO_RESET_INTERVAL_MS` = 60 min later, one bus hold reads
-  REG02. AICO off: nothing is written, the next look is an hour later. AICO
-  on: REG00 is read, written back unchanged, read back (must match), and
-  REG14 read again;
-- a failed access is counted (`failed`) and retried after 5 min;
+  REG02. AICO off: that single read is the whole look, nothing is written,
+  the next look is an hour later. AICO on: REG00 and REG14 are read, REG00 is
+  written back unchanged and read back (must match), then REG14 and REG15 are
+  read for the log;
+- a failure before or in the write/readback is counted (`failed`) and retried
+  after 5 min. A verified rewrite is counted as a reset and starts the next
+  hour even if the REG14/REG15 reads after it fail: those are observation,
+  and failing them must not replay the rewrite every 5 min;
 - a due re-arm is **held** (counted once per wait in the policy's `vetoed`)
   while the maintenance lock is held (OTA / AMBIT flash), while a manual
   charger re-detect runs (its settle snapshots must see only the pulse), while
   an automatic re-detect's outcome window is open, and while a BG_EN is not
   proven back at 0. The rewrite and the BG_EN pulse each hold the I2C bus for
-  their whole sequence, so they can never interleave.
+  their whole sequence, so they can never interleave. The hold is a policy
+  decision taken from a snapshot; the exclusion against maintenance is the
+  admission below, held around the bus sequence.
 
 Why an hour: each re-arm costs one re-learn, and AICO can only learn through
 a fresh panel collapse, the very event the limit avoids. Without AICO the
@@ -187,6 +201,51 @@ flowchart TD
     F2 --> Q["Write may have landed - harmless: the byte is the one read"]
 ```
 
+## Maintenance admission
+
+Every charger register mutation holds one admission, kept at the composition
+root (`main/app_main.c`) under the same lock as the global maintenance flag
+(`components/domain/include/maint_gate.h`): the VIN and IIN limit sets, the
+AICO switch, manual reset and hourly re-arm, and the manual (BG_EN, DP/DM and
+its restore) and automatic charger re-detect pulses. It is taken before the
+first bus access and released after the last, on every exit path.
+
+| Situation | Result |
+| --- | --- |
+| Mutation requested while maintenance runs or is pending | Refused at once, no bus access: commands reply `maintenance_active`; automatic re-arm / re-detect are held (counted in `vetoed`) and run after maintenance ends |
+| Maintenance requested while mutations are in flight | Becomes pending and **waits** (polling every 10 ms) until they end, at most 20 s; new mutations are refused from that moment, so it cannot be starved |
+| Mutation still running after 20 s (a sick bus) | The maintenance op gives up and reports busy, exactly as for a concurrent maintenance op; mutations are admitted again |
+| Maintenance begins just after a veto probe said "free" | The admission is refused: nothing is written (the race found in review) |
+| Clearing a BG_EN left at 1 | Exempt: it restores the charger and must run even during maintenance |
+
+Maintenance waits instead of being refused because charger mutations are
+short (a few I2C transactions; the longest, a manual re-detect, ~5 s) and a
+refused OTA would be a failed device in a fleet campaign. It cannot deadlock:
+maintenance is requested only from worker tasks (OTA, AMBIT, schedule, USB
+service, command workers; never the esp-mqtt task) that hold no charger lock
+while they wait, a mutation never requests maintenance, and a mutation that
+meets maintenance active or pending is refused rather than waiting.
+
+```mermaid
+sequenceDiagram
+    participant W as Maintenance worker (OTA, AMBIT flash)
+    participant G as Admission gate (app_main)
+    participant M as Charger mutation (AICO, IIN, VIN, re-detect)
+    participant C as Charger at 0x4B
+    M->>G: mutation_begin
+    G-->>M: admitted (mutations 1)
+    M->>C: read, write, read back (one bus hold)
+    W->>G: maintenance_begin
+    G-->>W: pending - wait, new mutations refused
+    M->>C: last read
+    M->>G: mutation_end (mutations 0)
+    W->>G: poll
+    G-->>W: granted
+    M->>G: mutation_begin (another command)
+    G-->>M: refused - maintenance_active, nothing written
+    W->>G: maintenance_end
+```
+
 ## Telemetry
 
 `health.power.charger.aico` is appended to the charger object after
@@ -215,9 +274,24 @@ including manual resets. The worst case is under 192 B.
   written back exactly as read and REG02 only in bit 0, each in the same bus
   hold as its read, and never in the bus hold of a BG_EN pulse. Cases: the
   switch and its failures, the hourly re-arm restoring IIN_DPM (300 → 1000 mA),
-  the AICO-off fleet (one REG02 read an hour, no write), every veto, a re-arm
+  the AICO-off fleet (one REG02 read an hour and no other register, no write),
+  every veto, a verified re-arm or switch whose status read fails afterwards
+  (counted, not replayed), a re-arm
   due while an automatic re-detect is pending, bus failures, manual reset,
   CLI and MQTT parsing, busy and queue refusal.
+
+`CC=clang python -m pytest tests/test_charger_gate.py` runs the production
+driver with the real admission gate (`tests/charger_gate_host.c`, which plays
+the maintenance worker) over all nine mutations: VIN set, IIN set, AICO
+on/off/reset/re-arm, manual BG_EN and DP/DM re-detect, automatic re-detect.
+For each, maintenance is requested at **every** I/O step (2 to 102 steps): it
+waits, the mutation completes, a new mutation is refused while it is pending,
+and it is granted right after. With maintenance held, commands are refused
+without any bus access and automatic actions write nothing until it ends.
+Maintenance beginning right after a veto probe blocks the write. The fake
+asserts that no charger register is written while maintenance runs or outside
+an admitted mutation. Removing the admission from any one path (AICO re-arm,
+AICO reset, VIN set, manual or automatic re-detect) fails 3-4 tests.
 
 Breaking the code on purpose shows the tests catch it: dropping the REG02
 bit 7:1 copy fails 7 cases, dropping the re-detect vetoes 2, removing the
