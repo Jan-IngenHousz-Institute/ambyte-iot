@@ -1,0 +1,55 @@
+AICO: on, manual re-arm, off on laptop USB (battery charged)
+Real USB replies - 2026-11-17 - 28:37:2F:FF:E7:04
+Firmware: v2.21.0-6-g53cc326-dirty (bench-signed; sources = 728a2ee) | started from official 2.22.0
+Prompts normalized; "[log]" lines are the firmware's own log output.
+
+> help aico
+aico
+  aico | aico on | aico off | aico reset  charger AICO (REG02 bit 0, RAM only);
+  reset = rewrite REG00 now so AICO re-learns
+> aico
+AICO off REG02=0xDC IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=0 failed=0 last_reset=none next_check_in=3600s
+> mp2731_regs 1 0 read
+  (excerpt) 00=48 02=DC 14=08 15=60
+> aico on
+[log] mp2731: AICO ON by operator: REG02 0xDD (RAM-only charger register; re-armed every 60 min while on)
+AICO on (verified) REG02=0xDD IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=0 failed=0 last_reset=none next_check_in=3600s
+> aico
+AICO on REG02=0xDD IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=0 failed=0 last_reset=none next_check_in=3600s
+> mp2731_regs 1 0 read
+  (excerpt) 00=48 02=DD 14=08 15=60
+> mp2731_regs 1 0 read
+  (excerpt) 00=48 02=DD 14=08 15=60
+> aico reset
+[log] mp2731: AICO manual re-arm: REG00 0x48 rewritten, IIN_DPM 500 -> 500 mA
+AICO on, REG00 rewritten (verified) REG02=0xDD IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=1 failed=0 last_reset=uptime 50s next_check_in=3600s
+> mp2731_regs 1 0 read
+  (excerpt) 00=48 02=DD 14=08 15=60
+> aico
+AICO on REG02=0xDD IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=1 failed=0 last_reset=uptime 50s next_check_in=3600s
+> aico enable
+Usage: aico | aico on | aico off | aico reset
+Command returned non-zero error code: 0x1 (ERROR)
+> aico ON
+Usage: aico | aico on | aico off | aico reset
+Command returned non-zero error code: 0x1 (ERROR)
+> aico on now
+Usage: aico | aico on | aico off | aico reset
+Command returned non-zero error code: 0x1 (ERROR)
+> aico off
+[log] mp2731: AICO OFF by operator: REG02 0xDC (RAM-only charger register; re-armed every 60 min while on)
+AICO off (verified) REG02=0xDC IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=1 failed=0 last_reset=uptime 50s next_check_in=3573s
+> aico
+AICO off REG02=0xDC IIN register=500 mA IIN_DPM=500 mA AICO_STAT=0 resets=1 failed=0 last_reset=uptime 50s next_check_in=3573s
+> mp2731_regs 1 0 read
+  (excerpt) 00=48 02=DC 14=08 15=60
+
+telemetry_preview health.power.charger.aico (excerpt):
+  before:   {"enabled":false,"iin_dpm_ma":500,"aico_stat":false,"resets":0,"failed":0,"last_reset_ms":null}
+  AICO on:  {"enabled":true,"iin_dpm_ma":500,"aico_stat":false,"resets":1,"failed":0,"last_reset_ms":50489}
+  restored: {"enabled":false,"iin_dpm_ma":500,"aico_stat":false,"resets":1,"failed":0,"last_reset_ms":50489}
+
+Annotations (not console replies):
+Battery charged, Icharge 0, Iin 133-239 mA: no VIN_MIN event, so AICO had nothing to learn.
+REG14 IIN_DPM stayed 0x08 (500 mA) and REG15 AICO_STAT 0 throughout; the re-arm rewrote
+REG00=0x48 unchanged. REG02 restored to 0xDC; official v2.22.0 restored afterwards.

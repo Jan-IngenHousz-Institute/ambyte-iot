@@ -1,0 +1,66 @@
+{
+  "source_commit": "728a2ee (feat) / e1ce3e3 (HEAD at flash); components/ and main/ identical",
+  "firmware": "v2.21.0-6-g53cc326-dirty",
+  "version_string_note": "cached CMake describe from a reconfigure before the commit; not the source identity",
+  "bench_signed_image_sha256": "8872d29716fe11a89ab5ceb3713897f8207b121c3990ea617b93e9c25066426a",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "baseline": {
+    "firmware": "2.22.0",
+    "reg00": "48",
+    "reg01": "06",
+    "reg02": "DC",
+    "reg14": "08",
+    "reg15": "60"
+  },
+  "power_source": "laptop USB port, battery charge done",
+  "telemetry_aico": {
+    "off": {
+      "enabled": false,
+      "iin_dpm_ma": 500,
+      "aico_stat": false,
+      "resets": 0,
+      "failed": 0,
+      "last_reset_ms": null
+    },
+    "on": {
+      "enabled": true,
+      "iin_dpm_ma": 500,
+      "aico_stat": false,
+      "resets": 1,
+      "failed": 0,
+      "last_reset_ms": 50489
+    },
+    "restored": {
+      "enabled": false,
+      "iin_dpm_ma": 500,
+      "aico_stat": false,
+      "resets": 1,
+      "failed": 0,
+      "last_reset_ms": 50489
+    }
+  },
+  "restored": {
+    "verified": true,
+    "reg00": 72,
+    "reg01": 6,
+    "reg02": 220
+  },
+  "restoration": {
+    "firmware": "2.22.0",
+    "release_tag": "v2.22.0",
+    "signed": true,
+    "signed_image_sha256": "470033c3b99ebeb44c55f4b18a1cc84631fa85e5bf8e5a79a01b3cdeb41afaa4",
+    "reg00_final": 72,
+    "reg01_final": 6,
+    "reg02_final": 220,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_sha256_unchanged": true,
+    "nvs_erased": false,
+    "cloud_commands_sent": false
+  },
+  "fleet_deploy_active_during_test": "v2.22.0 to prod (LIVE) only; the bench is in the dev fleet",
+  "hourly_automatic_rearm_on_hardware": false,
+  "nvs_erased": false,
+  "cloud_commands_sent": false
+}

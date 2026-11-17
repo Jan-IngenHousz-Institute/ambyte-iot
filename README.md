@@ -458,6 +458,12 @@ uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --
   because the ILIM-pin resistor caps the input at the lower of the two. Live
   register only; mind board heat at higher limits. See
   [charger IIN-limit commands](docs/charger-iin-limit.md).
+- **Charger AICO:** `aico` / `aico on` / `aico off` (MQTT `get_aico`,
+  `set_aico` with boolean `enabled`) switch the charger's Automatic Input
+  Current Optimizer (REG02 bit 0 only, verified). While on, the firmware
+  re-arms it at most hourly by rewriting REG00 unchanged, because AICO only
+  ever lowers its learned limit. Live register only; the fleet runs with it
+  off. See [charger AICO](docs/charger-aico.md).
 - **Charger re-detection:** a charger can ignore a live panel for hours
   (VIN_STAT "no input" with 7 V on VIN). `charger_redetect [bg_en|dpdm]` pulses
   the MP2731's input detection with before/after register scans; the driver also

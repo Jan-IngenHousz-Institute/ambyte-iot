@@ -22,8 +22,9 @@ sets is a **ceiling**, not a current:
   bit 6 `IINPPM` set). A panel that cannot deliver 500 mA, or a full battery,
   gives the same input current at 1000 mA as at 500 mA.
 - With AICO disabled (REG02 bit 0, `0xDC` on the fleet), the register is the
-  active limit; with AICO enabled the chip would lower it itself (REG14[5:0]
-  `IIN_DPM`).
+  active limit; with AICO enabled the chip lowers it itself on a VIN_MIN event
+  (REG14[5:0] `IIN_DPM`). The [AICO switch and hourly re-arm](charger-aico.md)
+  build on this register: a re-arm writes REG00 back unchanged.
 
 > **Heat.** The field team reported on 14 Nov that the charger area of a board
 > got hot. At the same input voltage, 1 A doubles the charger's input power
