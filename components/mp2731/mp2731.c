@@ -56,6 +56,25 @@ static uint8_t s_prev_adc[5];
 /* BG_EN may be left at 1 (a clear failed on the bus): every later read
  * retries the clear first. The bandgap "Disabled" state must not persist. */
 static bool    s_bg_en_dirty;
+/* Same for REG0B bit 5 USB_DET_EN after a manual dpdm pulse (HAR-310 #1): a
+ * restore that could not be PROVEN (bus error, or bit 5 still reads 1) leaves
+ * this set. "Force DP/DM detection" left asserted may keep re-running input
+ * detection - dropping the input each time - through a later OTA or AMBIT
+ * flash that relies on external power. While either flag is set no pulse of
+ * any kind is allowed, AICO holds, `auto on` is refused, and every power read
+ * retries the restore first (pulse_clear_if_dirty). */
+static bool    s_dpdm_dirty;
+
+static bool charger_dirty(void)
+{
+    return s_bg_en_dirty || s_dpdm_dirty;
+}
+
+static void dirty_sync(void)
+{
+    s_crd.dirty = (uint8_t)((s_bg_en_dirty ? CRD_DIRTY_BG_EN : 0u) |
+                            (s_dpdm_dirty ? CRD_DIRTY_DPDM : 0u));
+}
 static bool    s_manual_active;
 static crd_block_t s_logged_block = CRD_BLOCK_NONE;
 
@@ -249,6 +268,11 @@ typedef enum { PULSE_BG_EN, PULSE_DPDM_FORCE, PULSE_DPDM_RESTORE, PULSE_BG_EN_CL
 
 static esp_err_t pulse_locked(pulse_op_t op, mp2731_pulse_t *out)
 {
+    /* Zeroed before ANY exit (HAR-310 #2): a get-port or bus-lock failure
+     * returns before the core runs, and callers read set_attempted / cleared
+     * to decide whether a write may have landed. Garbage there marked BG_EN
+     * dirty (or not) at random and logged a pulse that never happened. */
+    memset(out, 0, sizeof *out);
     i2c_port_t port = I2C_NUM_MAX;
     esp_err_t err = i2c_bus_get_port(&port);
     if (err != ESP_OK) return err;
@@ -302,17 +326,27 @@ static int64_t uptime_ms(void)
     return esp_timer_get_time() / 1000;
 }
 
-/* Under s_read_mtx. A BG_EN that might still be 1 is cleared before anything
- * else happens on the charger. */
-static void bg_en_clear_if_dirty(void)
+/* Under s_read_mtx. A BG_EN or USB_DET_EN that might still be 1 is cleared
+ * before anything else happens on the charger.
+ *
+ * Both recoveries are EXEMPT from the maintenance admission (mutation_begin),
+ * and must stay so: each only writes its bit back to its POR value 0 (bandgap
+ * enabled / "Not in DP/DM detection"), which can stop charger activity but
+ * never start a detection, a charge cycle or a limit change. Refusing it
+ * during an OTA or AMBIT flash would leave the hazardous state in place for
+ * exactly the operation that relies on a stable input. */
+static void pulse_clear_if_dirty(void)
 {
-    if (!s_bg_en_dirty) return;
     mp2731_pulse_t p;
-    memset(&p, 0, sizeof p);
-    if (pulse_locked(PULSE_BG_EN_CLEAR, &p) == ESP_OK && p.cleared) {
+    if (s_bg_en_dirty && pulse_locked(PULSE_BG_EN_CLEAR, &p) == ESP_OK && p.cleared) {
         s_bg_en_dirty = false;
         ESP_LOGW(TAG, "charger re-detect: BG_EN cleared (REG09 0x%02X)", p.after);
     }
+    if (s_dpdm_dirty && pulse_locked(PULSE_DPDM_RESTORE, &p) == ESP_OK && p.cleared) {
+        s_dpdm_dirty = false;
+        ESP_LOGW(TAG, "charger re-detect: USB_DET_EN restored to 0 (REG0B 0x%02X)", p.after);
+    }
+    dirty_sync();
 }
 
 /* Under s_read_mtx: the dwell is met. Precheck, pulse, record, log once. */
@@ -346,7 +380,7 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
         s_crd.veto_counted = true;
         return;
     }
-    mp2731_pulse_t p;
+    mp2731_pulse_t p = {0};
     s_redetect_marker = REDETECT_MARKER_OPEN;   /* before the write, see marker_sync */
     const esp_err_t err = pulse_locked(PULSE_BG_EN, &p);
     mutation_end();
@@ -361,10 +395,19 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
         /* The set write may have landed and no clear was verified. */
         if (p.set_attempted && !p.cleared) s_bg_en_dirty = true;
     }
+    dirty_sync();
     const int64_t dwell_s = (now - s_crd.dwell_start_ms) / 1000;
     (void)dwell_s;   /* log-only */
     crd_note_attempt(&s_crd, now, result, o->status, o->vin_mv, o->vsys_mv);
     marker_sync();
+    if (!p.set_attempted) {
+        /* The bus was never ours (get-port / lock failure): nothing was
+         * written, so this is logged as a failed attempt, never as a pulse. */
+        ESP_LOGW(TAG, "charger re-detect #%u: BG_EN pulse not started, I2C bus unavailable (%s); "
+                      "nothing written, next in >= %us", (unsigned)s_crd.attempts,
+                 esp_err_to_name(err), (unsigned)(s_crd.backoff_ms / 1000u));
+        return;
+    }
     ESP_LOGW(TAG, "charger re-detect #%u: no input and not charging for %llds with VIN %u mV, "
                   "VSYS %u mV (REG0C 0x%02X REG0D 0x%02X): BG_EN pulse REG09 0x%02X->0x%02X->0x%02X %s",
              (unsigned)s_crd.attempts, (long long)dwell_s, o->vin_mv, o->vsys_mv, o->status,
@@ -379,7 +422,7 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
 /* Under s_read_mtx, after every power read (any verdict). */
 static void redetect_after_read(esp_err_t err, const power_reading_t *p, const mp2731_frame_t *f)
 {
-    bg_en_clear_if_dirty();
+    pulse_clear_if_dirty();
     const int64_t now = uptime_ms();
     crd_obs_t o = {.now_ms = now, .status_valid = f->status_valid, .adc_ok = err == ESP_OK,
                    .status = f->status, .fault = f->fault};
@@ -391,8 +434,8 @@ static void redetect_after_read(esp_err_t err, const power_reading_t *p, const m
         o.vin_mv = p->input_mv;
         o.vsys_mv = p->system_mv;
     }
-    /* Never pulse again over a BG_EN not yet proven back at 0. */
-    const bool veto = s_bg_en_dirty || (s_redetect_veto != NULL && s_redetect_veto());
+    /* Never pulse again over a BG_EN or USB_DET_EN not yet proven back at 0. */
+    const bool veto = charger_dirty() || (s_redetect_veto != NULL && s_redetect_veto());
     const crd_action_t action = crd_step(&s_crd, &o, veto);
     if (action == CRD_RESOLVED) {
         marker_sync();
@@ -496,11 +539,12 @@ static esp_err_t aico_io(aico_op_t op, aico_io_t *io)
  * The maintenance lock (OTA / AMBIT flash run on external power: no input
  * disturbance), a manual re-detect in progress (its settle snapshots must see
  * only the pulse), an automatic re-detect whose outcome is being judged, and
- * a BG_EN not yet proven back at 0. This is the policy's HOLD; the exclusion
- * against maintenance itself is the admission taken around the I/O. */
+ * a BG_EN or USB_DET_EN not yet proven back at 0. This is the policy's HOLD;
+ * the exclusion against maintenance itself is the admission taken around the
+ * I/O. */
 static bool aico_vetoed(void)
 {
-    return s_manual_active || s_crd.pending || s_bg_en_dirty ||
+    return s_manual_active || s_crd.pending || charger_dirty() ||
            (s_redetect_veto != NULL && s_redetect_veto());
 }
 
@@ -881,13 +925,18 @@ static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power
         xSemaphoreGive(s_read_mtx);
         return ESP_ERR_TIMEOUT;
     }
+    /* A previous pulse left a bit not proven back at 0: retry its restore and
+     * refuse a new pulse until it is (fail closed, HAR-310 #1). */
+    pulse_clear_if_dirty();
+    if (charger_dirty()) {
+        xSemaphoreGive(s_read_mtx);
+        return ESP_ERR_NOT_FINISHED;
+    }
     s_manual_active = true;
     s_redetect_marker = REDETECT_MARKER_OPEN;
-    bg_en_clear_if_dirty();
     const int64_t before = uptime_ms();
     snapshot(&out->snap[0], 0);
-    mp2731_pulse_t p;
-    memset(&p, 0, sizeof p);
+    mp2731_pulse_t p = {0};
     const esp_err_t err = pulse_locked(method == POWER_REDETECT_BG_EN ? PULSE_BG_EN : PULSE_DPDM_FORCE, &p);
     const int64_t t0 = uptime_ms();
     out->snap[0].t_ms = (int32_t)(before - t0);
@@ -896,6 +945,7 @@ static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power
     if (method == POWER_REDETECT_BG_EN && err != ESP_OK && err != ESP_ERR_INVALID_RESPONSE &&
         p.set_attempted && !p.cleared) {
         s_bg_en_dirty = true;
+        dirty_sync();
     }
     crd_note_manual(&s_crd);
     xSemaphoreGive(s_read_mtx);
@@ -912,8 +962,8 @@ static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power
                  p.before, p.set_rb, out->snap[0].regs[0x0C], esp_err_to_name(err));
     }
 
-    /* Settle reads only after a write that reached the chip: a pulse that
-     * never latched or a dead bus has nothing to wait for. */
+    /* Settle snapshots are OPTIONAL evidence: only after a write that reached
+     * the chip, and a mutex timeout just skips one. They never carry cleanup. */
     esp_err_t result = err;
     const bool settle = err == ESP_OK || err == ESP_ERR_INVALID_STATE;
     const int32_t points[2] = {POWER_REDETECT_SETTLE1_MS, POWER_REDETECT_SETTLE2_MS};
@@ -923,22 +973,44 @@ static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power
         if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) continue;
         snapshot(&out->snap[out->snapshots], uptime_ms() - t0);
         out->snapshots++;
-        if (i == 1u && method == POWER_REDETECT_DPDM) {
-            /* Bit 5 has no documented self-clear: leave the chip as found. */
-            mp2731_pulse_t r;
-            memset(&r, 0, sizeof r);
-            const esp_err_t rerr = pulse_locked(PULSE_DPDM_RESTORE, &r);
-            out->restored = r.clear_writes != 0u;
-            out->reg_after = r.after;
-            out->cleared = rerr == ESP_OK;
-            if (rerr != ESP_OK && result == ESP_OK) result = rerr;
-        }
         xSemaphoreGive(s_read_mtx);
     }
+
+    /* Cleanup is UNCONDITIONAL (HAR-310 #1). Until v2.23.0 the DP/DM restore
+     * lived inside the +5 s snapshot step, so a timed-out mutex take skipped
+     * it: the command reported ESP_OK, the admission was released and
+     * maintenance could be granted with REG0B bit 5 still forcing detection.
+     * Now, whenever a USB_DET_EN write may have landed (also when it read back
+     * 0, or the force failed after issuing it), the restore runs here, still
+     * inside the admitted mutation, and must PROVE bit 5 = 0. Unproven = the
+     * command fails and s_dpdm_dirty keeps every pulse refused while every
+     * power read retries the restore. Success is never reported without it. */
+    const bool restore = method == POWER_REDETECT_DPDM && p.set_attempted;
     if (xSemaphoreTake(s_read_mtx, portMAX_DELAY) == pdTRUE) {
+        if (restore) {
+            mp2731_pulse_t r = {0};
+            const esp_err_t rerr = pulse_locked(PULSE_DPDM_RESTORE, &r);
+            out->restored = r.clear_writes != 0u;
+            out->cleared = rerr == ESP_OK && r.cleared;
+            if (rerr == ESP_OK || rerr == ESP_ERR_INVALID_STATE) out->reg_after = r.after;
+            if (!out->cleared) {
+                s_dpdm_dirty = true;
+                if (result == ESP_OK) result = rerr != ESP_OK ? rerr : ESP_ERR_INVALID_STATE;
+                ESP_LOGE(TAG, "charger re-detect (manual dpdm): USB_DET_EN restore not proven (%s, "
+                              "REG0B 0x%02X); pulses refused, restore retried on every read",
+                         esp_err_to_name(rerr), r.after);
+            }
+            dirty_sync();
+        }
         s_manual_active = false;
         marker_sync();
         xSemaphoreGive(s_read_mtx);
+    } else {
+        /* Unreachable with portMAX_DELAY on FreeRTOS; fail closed anyway. */
+        if (restore) s_dpdm_dirty = true;
+        s_manual_active = false;
+        if (result == ESP_OK) result = ESP_ERR_TIMEOUT;
+        out->cleared = out->cleared && !restore;
     }
     return result;
 }
@@ -952,9 +1024,10 @@ esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out)
     if (set == 0) {
         crd_set_disabled(&s_crd, CRD_DISABLED_OPERATOR);
     } else if (set == 1) {
-        /* Refuse while BG_EN is not proven back at 0: an operator cannot
-         * switch the pulses back on over a charger they would leave disabled. */
-        if (s_bg_en_dirty) err = ESP_ERR_INVALID_STATE;
+        /* Refuse while BG_EN or USB_DET_EN is not proven back at 0: an
+         * operator cannot switch the pulses back on over a charger they would
+         * leave disabled or stuck in forced detection. */
+        if (charger_dirty()) err = ESP_ERR_INVALID_STATE;
         else crd_set_disabled(&s_crd, CRD_ENABLED);
     }
     if (set != -1 && err == ESP_OK) {

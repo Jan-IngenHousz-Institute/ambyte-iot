@@ -75,7 +75,12 @@ esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
  * Blocks the caller ~5 s (the read mutex is released while waiting). Returns
  * ESP_ERR_NOT_ALLOWED under the maintenance lock, ESP_ERR_TIMEOUT when busy,
  * ESP_ERR_INVALID_RESPONSE when BG_EN=1 never latched (no 1->0 edge),
- * ESP_ERR_INVALID_STATE when BG_EN stayed 1 (cleared again on later reads).
+ * ESP_ERR_INVALID_STATE when BG_EN stayed 1 (cleared again on later reads),
+ * or when the DP/DM restore read bit 5 back as 1. The DP/DM restore runs on
+ * every exit after a USB_DET_EN write may have landed, inside the admission;
+ * a restore that cannot be proven fails the call and marks the bit dirty
+ * (HAR-310). ESP_ERR_NOT_FINISHED: refused because a previous pulse left
+ * BG_EN or USB_DET_EN not proven back at 0 (retried before every read).
  * Writes nothing else; no NVS, no OTP. */
 esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out);
 /* Automatic re-detection switch: set -1 query, 0 off, 1 on. RAM only. */

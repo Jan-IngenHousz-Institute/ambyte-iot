@@ -69,6 +69,7 @@ static int64_t clock_us = 1000000;
 static int mutex_held, locked, sessions, writes, bus_ops;
 static bool dpdm_keep;
 static unsigned conversions;
+static int takes, take_fail_at = -1;  /* HAR-310: the Nth read-mutex take times out (one-shot) */
 
 esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 void h_critical_enter(portMUX_TYPE *m) { assert(!m->held); m->held = 1; }
@@ -76,7 +77,9 @@ void h_critical_exit(portMUX_TYPE *m) { assert(m->held); m->held = 0; }
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &mutex_held; }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait)
 {
-    (void)wait; assert(m == &mutex_held && !mutex_held); mutex_held = 1; return pdTRUE;
+    (void)wait; assert(m == &mutex_held && !mutex_held);
+    if (++takes == take_fail_at) { take_fail_at = -1; return pdFALSE; }
+    mutex_held = 1; return pdTRUE;
 }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t m) { assert(m == &mutex_held && mutex_held); mutex_held = 0; return pdTRUE; }
 int64_t esp_timer_get_time(void) { return clock_us; }
@@ -210,6 +213,25 @@ int main(int argc, char **argv)
         maint_gate_mutation_end(&t);
         CHECK(t.mutations == 0, "end never underflows");
         CHECK(maint_gate_poll(&t) == MAINT_GATE_BUSY, "poll without a request");
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "dpdm_cleanup")) {
+        /* HAR-310 #1, the Codex repro: maintenance is requested during a
+         * manual dpdm and the +5 s snapshot's mutex take times out (takes:
+         * 1 pulse, 2 +1.5 s, 3 +5 s). When maintenance is finally granted,
+         * REG0B bit 5 must already be back at 0, restored inside the
+         * admitted mutation (the write CHECK above enforces the inside). */
+        fresh();
+        inject_at = 1; takes = 0; take_fail_at = 3;
+        const esp_err_t r = m_dpdm();
+        CHECK(injected == MAINT_GATE_WAIT && g.pending, "maintenance waited for the pulse");
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_GRANTED, "granted after the mutation ended");
+        CHECK(!(regs[0x0B] & 0x20), "maintenance granted with REG0B bit 5 asserted (0x%02X, return %d)",
+              regs[0x0B], r);
+        CHECK(r == ESP_OK && rep.cleared && rep.snapshots == 3, "verified cleanup, one snapshot missing");
+        maint_gate_end(&g);
+        CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
         puts("OK");
         return 0;
     }

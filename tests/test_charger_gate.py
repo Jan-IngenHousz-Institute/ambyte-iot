@@ -55,6 +55,9 @@ class GateTest(unittest.TestCase):
     def test_abandoned_request_readmits_mutations(self):
         self.run_case("abandon")
 
+    def test_dpdm_restore_happens_before_maintenance_even_if_a_snapshot_times_out(self):
+        self.run_case("dpdm_cleanup")
+
     def test_pure_gate_semantics(self):
         self.run_case("gate")
 
