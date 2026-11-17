@@ -58,6 +58,21 @@ class GateTest(unittest.TestCase):
     def test_dpdm_restore_happens_before_maintenance_even_if_a_snapshot_times_out(self):
         self.run_case("dpdm_cleanup")
 
+    def test_failed_dpdm_restore_quarantines_maintenance_until_recovery(self):
+        self.run_case("quarantine_dpdm")
+
+    def test_failed_dpdm_restore_with_maintenance_pending_drains_then_grants(self):
+        self.run_case("quarantine_dpdm_pending")
+
+    def test_dirty_bg_en_from_a_manual_pulse_quarantines_maintenance(self):
+        self.run_case("quarantine_bg_en")
+
+    def test_dirty_bg_en_from_an_automatic_pulse_quarantines_maintenance(self):
+        self.run_case("quarantine_bg_en_auto")
+
+    def test_no_bg_en_or_usb_det_en_write_from_any_read_path_under_granted_maintenance(self):
+        self.run_case("no_edge_under_maintenance")
+
     def test_pure_gate_semantics(self):
         self.run_case("gate")
 

@@ -28,7 +28,13 @@
  * campaign. The wait cannot deadlock: maintenance requesters run on worker
  * tasks that hold no charger lock (read mutex, I2C bus) while they wait, a
  * mutation never requests maintenance, and a mutation that finds maintenance
- * active or pending is refused instead of waiting. */
+ * active or pending is refused instead of waiting.
+ *
+ * A mutation's admission may outlive the call that took it: the MP2731
+ * driver keeps a failing re-detect pulse's admission as a QUARANTINE while
+ * BG_EN or USB_DET_EN is not proven back at 0 (mp2731.c, PR #112 review), and
+ * releases it once recovery proves both. Maintenance then waits or gives up
+ * busy; it is never granted over a dirty charger bit. */
 
 #include <stdbool.h>
 #include <stdint.h>

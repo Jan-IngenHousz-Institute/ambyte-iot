@@ -70,6 +70,10 @@ static int mutex_held, locked, sessions, writes, bus_ops;
 static bool dpdm_keep;
 static unsigned conversions;
 static int takes, take_fail_at = -1;  /* HAR-310: the Nth read-mutex take times out (one-shot) */
+/* PR #112 review: REG0B writes allowed before the bus starts failing them
+ * (-1 = never fail), and BG_EN clears the chip ignores while > 0. */
+static int ok_0b_writes = -1, bg_stuck;
+static int bg_writes_busy, dpdm_writes_busy;  /* REG09/REG0B written while maintenance runs */
 
 esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 void h_critical_enter(portMUX_TYPE *m) { assert(!m->held); m->held = 1; }
@@ -117,7 +121,17 @@ esp_err_t i2c_master_write_to_device(int port, unsigned addr, const uint8_t *w, 
         regs[3] = v & 0x7F;
         if (v & 0x80) { conversions++; regs[0x11] = (uint8_t)(124 + conversions % 2); regs[0x0F] = (uint8_t)(175 + conversions % 2); }
         return ESP_OK;
-    case 0x0B: regs[0x0B] = dpdm_keep ? v : (uint8_t)(v & ~0x20); return ESP_OK;
+    case 0x0B:
+        if (g.busy) dpdm_writes_busy++;
+        if (ok_0b_writes == 0) return ESP_FAIL;
+        if (ok_0b_writes > 0) ok_0b_writes--;
+        regs[0x0B] = dpdm_keep ? v : (uint8_t)(v & ~0x20);
+        return ESP_OK;
+    case 0x09:
+        if (g.busy) bg_writes_busy++;
+        if ((regs[9] & 0x08) && !(v & 0x08) && bg_stuck > 0) { bg_stuck--; return ESP_OK; }
+        regs[9] = v;
+        return ESP_OK;
     default: regs[w[0]] = v; return ESP_OK;
     }
 }
@@ -213,6 +227,94 @@ int main(int argc, char **argv)
         maint_gate_mutation_end(&t);
         CHECK(t.mutations == 0, "end never underflows");
         CHECK(maint_gate_poll(&t) == MAINT_GATE_BUSY, "poll without a request");
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "quarantine_dpdm") || !strcmp(c, "quarantine_dpdm_pending")) {
+        /* PR #112 review P1: a DP/DM restore that fails must not let
+         * maintenance be granted with REG0B bit 5 set, and its recovery must
+         * drain a PENDING request, never write under a GRANTED one. */
+        const bool pending = !strcmp(c, "quarantine_dpdm_pending");
+        fresh();
+        ok_0b_writes = 1;                       /* the force lands, the restore fails */
+        if (pending) inject_at = 1;             /* maintenance requested mid-command */
+        const esp_err_t r = m_dpdm();
+        CHECK(r != ESP_OK && !rep.cleared && (regs[0x0B] & 0x20), "restore failed (%d)", r);
+        if (!pending) {
+            CHECK(maint_gate_request(&g) == MAINT_GATE_WAIT,
+                  "maintenance granted with REG0B bit 5 asserted (0x%02X)", regs[0x0B]);
+        }
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_WAIT && !g.busy,
+              "maintenance granted with REG0B bit 5 asserted (0x%02X)", regs[0x0B]);
+        CHECK(g.mutations == 1, "the failed cleanup must hold the gate (mutations %u)", g.mutations);
+        /* Bus still failing: reads keep retrying, maintenance keeps waiting,
+         * then gives up after its bound; the quarantine stays. */
+        reads_for(20 * S);
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_WAIT && (regs[0x0B] & 0x20), "still not proven");
+        maint_gate_abandon(&g);
+        CHECK(g.mutations == 1 && maint_gate_request(&g) == MAINT_GATE_WAIT, "a new request waits too");
+        /* Bus back: the next read restores while maintenance is pending. */
+        ok_0b_writes = -1;
+        reads_for(5 * S);
+        CHECK(!(regs[0x0B] & 0x20) && g.mutations == 0, "recovery drained (0x%02X, %u)", regs[0x0B], g.mutations);
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_GRANTED, "granted only after verified recovery");
+        reads_for(60 * S);
+        CHECK(dpdm_writes_busy == 0 && bg_writes_busy == 0, "no REG09/REG0B write under granted maintenance");
+        maint_gate_end(&g);
+        CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "quarantine_bg_en") || !strcmp(c, "quarantine_bg_en_auto")) {
+        /* The same for BG_EN, manual and automatic: its recovery is a 1->0
+         * edge (the re-detect edge itself) and must never meet GRANTED
+         * maintenance. Pulse: 1 + 3 clears ignored, then one more by the
+         * first recovery read. */
+        const bool automatic = !strcmp(c, "quarantine_bg_en_auto");
+        fresh();
+        bg_stuck = 1 + (int)MP2731_BG_EN_CLEAR_RETRIES + 1;
+        if (automatic) {
+            CHECK(m_redetect_auto() == ESP_OK && (regs[9] & 0x08), "auto pulse left BG_EN set");
+        } else {
+            CHECK(m_bg_en() == ESP_ERR_INVALID_STATE && (regs[9] & 0x08), "manual pulse left BG_EN set");
+        }
+        CHECK(maint_gate_request(&g) == MAINT_GATE_WAIT, "maintenance granted over a dirty BG_EN");
+        CHECK(g.mutations == 1, "dirty BG_EN must hold the gate (mutations %u)", g.mutations);
+        reads_for(5 * S);                       /* the chip ignores this clear too */
+        CHECK((regs[9] & 0x08) && maint_gate_poll(&g) == MAINT_GATE_WAIT, "still dirty, still waiting");
+        reads_for(5 * S);                       /* pending: recovery runs and is proven */
+        CHECK(!(regs[9] & 0x08) && g.mutations == 0 && bg_writes_busy == 0, "recovered while pending");
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_GRANTED, "then granted");
+        reads_for(60 * S);
+        CHECK(bg_writes_busy == 0 && dpdm_writes_busy == 0, "no BG_EN edge under granted maintenance");
+        maint_gate_end(&g);
+        CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "no_edge_under_maintenance")) {
+        /* Whatever maintenance is told after a failed cleanup, no read path
+         * may write REG09/REG0B while it RUNS. The request is not checked
+         * here: reads continue as on the device (on v2.23.0+#112 maintenance
+         * was granted at once and the next read wrote the 1->0 edge). */
+        for (int bit = 0; bit < 2; bit++) {
+            fresh();
+            bg_writes_busy = dpdm_writes_busy = 0;
+            if (bit == 0) { bg_stuck = 1 + (int)MP2731_BG_EN_CLEAR_RETRIES; (void)m_bg_en(); }
+            else { ok_0b_writes = 1; (void)m_dpdm(); ok_0b_writes = -1; }
+            maint_gate_result_t r = maint_gate_request(&g);
+            for (int i = 0; i < 6; i++) {
+                reads_for(5 * S);
+                if (r == MAINT_GATE_WAIT) r = maint_gate_poll(&g);
+            }
+            CHECK(bg_writes_busy == 0 && dpdm_writes_busy == 0,
+                  "%s: REG09/REG0B written under granted maintenance (%d, %d)",
+                  bit ? "dpdm" : "bg_en", bg_writes_busy, dpdm_writes_busy);
+            CHECK(r == MAINT_GATE_GRANTED && !(regs[9] & 0x08) && !(regs[0x0B] & 0x20),
+                  "%s: granted only once recovered", bit ? "dpdm" : "bg_en");
+            maint_gate_end(&g);
+            CHECK(g.mutations == 0 && in_mutation == 0, "clean");
+        }
         puts("OK");
         return 0;
     }

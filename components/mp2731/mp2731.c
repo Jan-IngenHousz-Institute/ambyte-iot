@@ -96,6 +96,50 @@ static void mutation_end(void)
     if (s_gate_begin != NULL && s_gate_end != NULL) s_gate_end();
 }
 
+/* ── Quarantine of a dirty charger bit (HAR-310, Codex review of PR #112) ──
+ * A BG_EN or USB_DET_EN not proven back at 0 is not only a pulse hazard: its
+ * RECOVERY is one too. Clearing BG_EN is a 1->0 edge, which by the datasheet
+ * (Rev 1.2 p.34) "resets the input plug-in detection and safety timer" - the
+ * very re-detect edge, and on the bench it restarted a charge cycle on a full
+ * battery. Clearing USB_DET_EN ends a forced DP/DM detection. Neither may
+ * happen while an OTA or AMBIT flash runs on the external input.
+ *
+ * So, while either bit is dirty, this driver HOLDS one maintenance-gate
+ * admission (s_quarantine). The gate counts it like an in-flight mutation:
+ * a maintenance request becomes pending and waits (APP_CHARGER_DRAIN_MS) or
+ * gives up busy; it is never granted over a dirty bit. The admission is the
+ * one the failing pulse already held, handed over before it would have been
+ * released (quarantine_take_over), so there is no instant with mutations = 0
+ * and the bit dirty. Recovery (pulse_clear_if_dirty, on every power read)
+ * needs no new admission - mutation_begin would refuse it while maintenance
+ * is pending and strand the bit - and it can never meet GRANTED maintenance,
+ * because maintenance cannot be granted while the quarantine is held. Once
+ * both bits read back 0 the admission is released and a pending maintenance
+ * request is granted on its next poll. */
+static bool s_quarantine;   /* under s_read_mtx */
+
+/* Under s_read_mtx, at the end of a pulse that holds an admission. True =
+ * the caller must NOT release it: it now belongs to the quarantine. */
+static bool quarantine_take_over(void)
+{
+    if (!charger_dirty() || s_quarantine) return false;
+    s_quarantine = true;
+    ESP_LOGW(TAG, "charger re-detect: %s%s%s not proven back at 0; charger quarantined, "
+                  "maintenance waits until it is",
+             s_bg_en_dirty ? "BG_EN" : "", s_bg_en_dirty && s_dpdm_dirty ? " and " : "",
+             s_dpdm_dirty ? "USB_DET_EN" : "");
+    return true;
+}
+
+/* Under s_read_mtx: release the quarantine once both bits are proven 0. */
+static void quarantine_release_if_clean(void)
+{
+    if (!s_quarantine || charger_dirty()) return;
+    s_quarantine = false;
+    mutation_end();
+    ESP_LOGW(TAG, "charger re-detect: quarantine released, maintenance admitted again");
+}
+
 /* Reset guard. A pulse that crashed the unit (an unknown silicon reaction to
  * the bandgap toggle collapsing VSYS, a hung bus tripping a watchdog) must
  * not be repeated after every boot: the marker is open from the pulse until
@@ -329,14 +373,25 @@ static int64_t uptime_ms(void)
 /* Under s_read_mtx. A BG_EN or USB_DET_EN that might still be 1 is cleared
  * before anything else happens on the charger.
  *
- * Both recoveries are EXEMPT from the maintenance admission (mutation_begin),
- * and must stay so: each only writes its bit back to its POR value 0 (bandgap
- * enabled / "Not in DP/DM detection"), which can stop charger activity but
- * never start a detection, a charge cycle or a limit change. Refusing it
- * during an OTA or AMBIT flash would leave the hazardous state in place for
- * exactly the operation that relies on a stable input. */
+ * NOT harmless: a BG_EN 1->0 is the re-detect edge itself (input detection
+ * and safety timer reset, a charge cycle can restart), and clearing
+ * USB_DET_EN ends a forced detection. It is exempt from mutation_begin only
+ * in one sense: it runs under the quarantine admission the failing pulse
+ * handed over, so it may run while maintenance is PENDING (and must, or the
+ * bit would stay dirty behind the waiting request), and it can never run
+ * while maintenance is GRANTED (the held admission prevents the grant). */
 static void pulse_clear_if_dirty(void)
 {
+    if (!charger_dirty()) return;
+    if (!s_quarantine) {
+        /* Only while a manual bg_en that dirtied BG_EN is still in its settle
+         * reads: its own admission is held (maintenance cannot be granted),
+         * but it is not the quarantine yet. Take a second admission for the
+         * recovery, or write nothing: a refusal means maintenance is pending,
+         * and the manual command hands its admission over when it ends. */
+        if (!mutation_begin()) return;
+        s_quarantine = true;
+    }
     mp2731_pulse_t p;
     if (s_bg_en_dirty && pulse_locked(PULSE_BG_EN_CLEAR, &p) == ESP_OK && p.cleared) {
         s_bg_en_dirty = false;
@@ -347,6 +402,7 @@ static void pulse_clear_if_dirty(void)
         ESP_LOGW(TAG, "charger re-detect: USB_DET_EN restored to 0 (REG0B 0x%02X)", p.after);
     }
     dirty_sync();
+    quarantine_release_if_clean();
 }
 
 /* Under s_read_mtx: the dwell is met. Precheck, pulse, record, log once. */
@@ -383,7 +439,6 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
     mp2731_pulse_t p = {0};
     s_redetect_marker = REDETECT_MARKER_OPEN;   /* before the write, see marker_sync */
     const esp_err_t err = pulse_locked(PULSE_BG_EN, &p);
-    mutation_end();
     crd_pulse_t result = CRD_PULSE_OK;
     if (err == ESP_ERR_INVALID_RESPONSE) {
         result = CRD_PULSE_NOT_LATCHED;
@@ -396,6 +451,9 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
         if (p.set_attempted && !p.cleared) s_bg_en_dirty = true;
     }
     dirty_sync();
+    /* A dirty BG_EN keeps this pulse's admission as the quarantine: released
+     * only after the dirty flag is visible, never before. */
+    if (!quarantine_take_over()) mutation_end();
     const int64_t dwell_s = (now - s_crd.dwell_start_ms) / 1000;
     (void)dwell_s;   /* log-only */
     crd_note_attempt(&s_crd, now, result, o->status, o->vin_mv, o->vsys_mv);
@@ -894,7 +952,8 @@ void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void))
     s_gate_end = end;
 }
 
-static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out);
+static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out,
+                                           bool *keep_admission);
 
 esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out)
 {
@@ -909,13 +968,16 @@ esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect
      * cannot begin in between (it waits for this to end). */
     if (s_redetect_veto != NULL && s_redetect_veto()) return ESP_ERR_NOT_ALLOWED;
     if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
-    const esp_err_t err = charger_redetect_admitted(method, out);
-    mutation_end();
+    bool keep = false;   /* handed over to the quarantine: see quarantine_take_over */
+    const esp_err_t err = charger_redetect_admitted(method, out, &keep);
+    if (!keep) mutation_end();
     return err;
 }
 
-static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out)
+static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out,
+                                           bool *keep_admission)
 {
+    *keep_admission = false;
     memset(out, 0, sizeof *out);
     out->method = method;
     out->reg = method == POWER_REDETECT_BG_EN ? MP2731_REG_BANDGAP : MP2731_REG_USB_DET;
@@ -1002,12 +1064,17 @@ static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power
             }
             dirty_sync();
         }
+        /* Either bit dirty (BG_EN from the pulse above, USB_DET_EN from this
+         * restore): the command's admission becomes the quarantine, decided
+         * under the same mutex that made the flag visible. */
+        *keep_admission = quarantine_take_over();
         s_manual_active = false;
         marker_sync();
         xSemaphoreGive(s_read_mtx);
     } else {
         /* Unreachable with portMAX_DELAY on FreeRTOS; fail closed anyway. */
         if (restore) s_dpdm_dirty = true;
+        *keep_admission = quarantine_take_over();
         s_manual_active = false;
         if (result == ESP_OK) result = ESP_ERR_TIMEOUT;
         out->cleared = out->cleared && !restore;
