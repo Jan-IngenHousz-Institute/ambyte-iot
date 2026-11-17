@@ -111,14 +111,30 @@ does not recover the charger.** The registers are the source of truth:
   held at once. It also holds one charger admission from just after NVS until
   the charger has been reconciled, because several maintenance paths (OTA,
   AMBIT OTA, script update, command router) are configured before the I²C bus
-  comes up. A request in that window waits, as for any in-flight mutation;
+  comes up. A request in that window waits, as for any in-flight mutation. The
+  reconciled quarantine is *adopted* (`maint_gate_mutation_adopt`): that is
+  refused only while maintenance runs, not while a request is pending, so a
+  request made during the boot hold still waits for the quarantine after the
+  hold ends instead of being granted over the bit;
 - both bits are 0 at power-on and only a re-detect pulse sets them, so a healthy
   charger is never quarantined at boot.
 
-The guarantee covers charger states this firmware can read. A charger that
-fails its boot probe (or a boot that never reaches the I²C init, e.g. Wi-Fi
-startup failure) is not driven at all: no reads, no writes, nothing
-reconciled, and maintenance is not held for it.
+The guarantee covers charger states this firmware can read. **A
+charger-equipped unit whose MP2731 fails its boot probe is unprotected for that
+boot.** The driver is disabled (no reads, no writes), nothing is reconciled, and
+maintenance (OTA, AMBIT flash) is admitted even if a BG_EN or USB_DET_EN is still
+physically set. The same holds for a boot that never reaches the I²C init (e.g.
+a Wi-Fi startup failure). This is deliberate for now: firmware cannot tell a
+failed probe from a board with no charger, and failing closed would block every
+OTA on charger-less dev boards. A provisioned "has charger" capability is a
+separate follow-up.
+
+The AMBIT **boot-sync auto-flash** also takes the maintenance admission (PR #112
+round 3), like every other flash. While a quarantine is held it waits up to 20 s
+for recovery; if the quarantine does not drain, it declines: nothing is flashed or
+counted, and the channels stay pending. While the flash runs, charger pulses are
+vetoed, and no charger bit recovery can run, because the quarantine could not
+have been held when maintenance was granted.
 
 A settle snapshot whose mutex take times out is simply missing from the report
 (`snapshots` < 4); it never skips the cleanup.
@@ -257,6 +273,10 @@ flowchart TD
     BOOT[ESP-only reboot: RAM flags and gate empty,<br/>charger registers retained] --> RI{Init reads REG09 and REG0B:<br/>a bit set, or unreadable?}
     RI -- Yes --> QH
     RI -- No --> CLEAN[Healthy: no quarantine,<br/>boot hold released, maintenance admitted]
+    PF[Charger probe fails at boot] --> UNP[Unprotected this boot:<br/>no reads, nothing reconciled,<br/>maintenance admitted]
+    BF[AMBIT boot-sync flash] --> BA{Maintenance admission?}
+    BA -- Quarantine held, not drained in 20 s --> BD[Declined: nothing flashed or counted,<br/>channels stay pending]
+    BA -- Granted --> BFL[Flash: pulses vetoed,<br/>no recovery can run, ends on every exit]
     OK --> W{Unit resets before the outcome?}
     W -- Brownout, watchdog, panic, USB --> X[Boot finds RTC marker open:<br/>auto off this boot, reason reset_during_attempt]
     W -- No --> V{Valid read at or before +60 s?}
@@ -361,6 +381,16 @@ pio run -e esp32-s3-devkitm-1
   - with maintenance already pending at the failure, recovery drains it and
     then grants;
   - no read path writes REG09 or REG0B under granted maintenance;
+  - the AMBIT boot-sync flash (production `ambit_flash_admitted`, `app_maintenance_begin`
+    modelled as in `app_main`): declined while a quarantine is held; waits and
+    then flashes when the quarantine drains during the wait; admitted on a clean
+    charger with a manual pulse refused mid-flash; no REG09/REG0B write during any
+    flash; maintenance ends on every exit; an unwired gate never flashes;
+    `ambit_flash_boot_sync` reaches the flash loop only through the admission
+    (source contract);
+  - a maintenance request pending during the boot hold is not granted over a
+    retained USB_DET_EN when the hold ends: the reconciled quarantine is
+    adopted, recovery drains it, then the request is granted;
   - after a simulated ESP-only reboot (RAM and gate reset, charger registers
     kept), in both wiring orders: a retained USB_DET_EN or BG_EN, or an
     unreadable REG09, holds maintenance until recovery proves both bits 0; a

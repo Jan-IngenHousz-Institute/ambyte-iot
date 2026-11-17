@@ -112,7 +112,9 @@ holds bench boards.
   a BG_EN 1->0 detection edge) never runs under granted maintenance. An ESP reboot
   does NOT reset the charger: mp2731_init rebuilds the quarantine from REG09/REG0B
   (unreadable = set), app_main wires the gate before it and holds a boot admission
-  from NVS until that reconciliation. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
+  from NVS until that reconciliation. The AMBIT boot-sync flash takes the maintenance
+  admission like every flash (ambit_flash_admitted). A charger that fails its boot
+  probe is UNPROTECTED for that boot (documented limit). RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
   boot that reset during an open attempt.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an
