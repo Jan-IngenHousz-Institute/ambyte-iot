@@ -15,6 +15,7 @@
 #include <string.h>
 
 static uint8_t reg01 = 6;
+static int booting;   /* inside mp2731_init (boot reconciliation reads allowed) */
 static int locked, locks, unlocks, writes, reads, submits, calls;
 static int port_error, lock_error, write_error, read_error, mismatch, probe_error, reject_submit;
 static char last[1024];
@@ -65,8 +66,9 @@ esp_err_t i2c_master_write_read_device(i2c_port_t port, uint8_t addr,
     const uint8_t *reg, size_t reg_size, uint8_t *out, size_t size, TickType_t timeout)
 {
     assert(locked && port == 0 && addr == 0x4b && reg_size == 1 && size == 1 && timeout > 0);
-    /* Boot reconciliation (HAR-310) reads REG09/REG0B once at init: POR 0. */
-    if (*reg == 0x09 || *reg == 0x0B) { *out = 0; return ESP_OK; }
+    /* Boot reconciliation (HAR-310) reads REG09/REG0B once, inside
+     * mp2731_init only (POR 0); anywhere else they are unexpected reads. */
+    if (booting && (*reg == 0x09 || *reg == 0x0B)) { *out = 0; return ESP_OK; }
     assert(*reg == 1); reads++;
     if (read_error) return read_error;
     *out = reg01 + mismatch; return ESP_OK;
@@ -122,6 +124,13 @@ static void expect_error(const char *detail)
 }
 static int cli(int argc, char **argv) { return cli_cmd_vin_limit(argc, argv); }
 
+static esp_err_t boot_init(void)
+{
+    const esp_err_t err = mp2731_init();
+    booting = 0;
+    return err;
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -131,13 +140,13 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "invalid")) {
         assert(mp2731_get_vin_limit(&limit) == ESP_ERR_INVALID_STATE);
         assert(mp2731_set_vin_limit(4000, &limit) == ESP_ERR_INVALID_STATE);
-        probe_error = ESP_FAIL; assert(mp2731_init() == ESP_FAIL && !mp2731_is_ready());
+        probe_error = ESP_FAIL; booting = 1; assert(boot_init() == ESP_FAIL && !mp2731_is_ready());
         assert(mp2731_get_vin_limit(&limit) == ESP_ERR_INVALID_STATE);
         assert(mp2731_set_vin_limit(4000, &limit) == ESP_ERR_INVALID_STATE);
         assert(!locks && !reads && !writes);
         probe_error = 0;
     }
-    assert(mp2731_init() == ESP_OK && mp2731_is_ready());
+    booting = 1; assert(boot_init() == ESP_OK && mp2731_is_ready());
     assert(!writes); /* initialization never changes the charger's default */
     locks = unlocks = 0; /* boot reconciliation reads are not VIN-limit traffic */
     vin_limit_command_config_t config = {.reply = reply, .submit = submit};

@@ -380,6 +380,16 @@ static void app_charger_mutation_end(void)
     taskEXIT_CRITICAL(&s_maint_mux);
 }
 
+/* Adopting a charger quarantine found at boot (mp2731_set_quarantine_adopt):
+ * refused only while maintenance RUNS, never because a request is pending. */
+static bool app_charger_quarantine_adopt(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    const bool ok = maint_gate_mutation_adopt(&s_maint_gate);
+    taskEXIT_CRITICAL(&s_maint_mux);
+    return ok;
+}
+
 /* Boot hold (HAR-310, Codex re-review of PR #112). Until the MP2731 has been
  * reconciled from its registers (mp2731_init reads REG09/REG0B and rebuilds a
  * quarantine for a BG_EN / USB_DET_EN left set across an ESP-only reboot),
@@ -695,6 +705,7 @@ static esp_err_t app_init_i2c_and_sensors(void)
      * the quarantine rebuilt from REG09/REG0B at init (a BG_EN or USB_DET_EN
      * left set across an ESP-only reboot) is a held gate admission at once. */
     mp2731_redetect_set_veto(app_maintenance_active);
+    mp2731_set_quarantine_adopt(app_charger_quarantine_adopt);
     mp2731_set_mutation_gate(app_charger_mutation_begin, app_charger_mutation_end);
 
     /* MP2731 charger — provides battery/input power telemetry. Absent on dev
@@ -1801,6 +1812,12 @@ void app_main(void)
      * revived via the ROM bootloader; flashing is power-gated like MQTT
      * publishing. Detect-only `ambit_check` remains available from the CLI. */
     if (sd_available && uart_available) {
+        /* The boot flash holds the maintenance admission like every other
+         * AMBIT flash (PR #112 round 3): refused while a charger quarantine
+         * is held, and it vetoes charger pulses while it runs. The charger
+         * boot hold was released after app_init_i2c_and_sensors, long before
+         * this, so the flash never waits on our own hold. */
+        ambit_flash_set_maintenance(app_maintenance_begin, app_maintenance_end);
         (void)ambit_flash_boot_sync();
         HIL_TRACE("ambit_boot_sync");
     }

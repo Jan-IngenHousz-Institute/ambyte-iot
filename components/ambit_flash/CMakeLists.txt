@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "ambit_flash.c" "ambit_flash_preflight.c" "ambit_fw_manifest.c" "loader_port_ambyte.c"
+    SRCS "ambit_flash.c" "ambit_flash_admit.c" "ambit_flash_preflight.c" "ambit_fw_manifest.c" "loader_port_ambyte.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
     REQUIRES uart_sensors

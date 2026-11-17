@@ -65,6 +65,23 @@ static inline bool maint_gate_mutation_begin(maint_gate_t *g)
     return true;
 }
 
+/* Quarantine adoption (PR #112 round 3): like mutation_begin, but refused
+ * only while maintenance RUNS, not while it is pending. For a hazard that
+ * already exists - a charger bit found set at boot - not for new work: a
+ * pending request must wait for it exactly as for a mutation that began
+ * before the request (it drains by recovery, or the requester gives up after
+ * its own bound). Without this, a request made during the boot hold would
+ * refuse the adoption and be granted over the dirty bit once the hold ends. */
+static inline bool maint_gate_mutation_adopt(maint_gate_t *g)
+{
+    if (g->busy) {
+        g->refused++;
+        return false;
+    }
+    g->mutations++;
+    return true;
+}
+
 static inline void maint_gate_mutation_end(maint_gate_t *g)
 {
     if (g->mutations > 0u) g->mutations--;

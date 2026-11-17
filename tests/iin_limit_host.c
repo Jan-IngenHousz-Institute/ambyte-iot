@@ -17,6 +17,7 @@
 #include <string.h>
 
 static uint8_t reg00 = 0x48;   /* every field unit: EN_ILIM=1, 500 mA */
+static int booting;   /* inside mp2731_init (boot reconciliation reads allowed) */
 static int locked, locks, unlocks, writes, reads, submits, calls;
 static int port_error, lock_error, write_error, read_error, mismatch, probe_error, reject_submit;
 static int read_error_at;      /* fail the Nth read (1-based) of a set, 0 = never */
@@ -72,8 +73,9 @@ esp_err_t i2c_master_write_read_device(i2c_port_t port, uint8_t addr,
     const uint8_t *reg, size_t reg_size, uint8_t *out, size_t size, TickType_t timeout)
 {
     assert(locked && port == 0 && addr == 0x4b && reg_size == 1 && size == 1 && timeout > 0);
-    /* Boot reconciliation (HAR-310) reads REG09/REG0B once at init: POR 0. */
-    if (*reg == 0x09 || *reg == 0x0B) { *out = 0; return ESP_OK; }
+    /* Boot reconciliation (HAR-310) reads REG09/REG0B once, inside
+     * mp2731_init only (POR 0); anywhere else they are unexpected reads. */
+    if (booting && (*reg == 0x09 || *reg == 0x0B)) { *out = 0; return ESP_OK; }
     assert(*reg == 0); reads++; set_reads++;
     if (read_error) return read_error;
     if (read_error_at && set_reads == read_error_at) return ESP_ERR_TIMEOUT;
@@ -145,6 +147,13 @@ static bool flag(cJSON *root, const char *key)
 }
 static int cli(int argc, char **argv) { return cli_cmd_iin_limit(argc, argv); }
 
+static esp_err_t boot_init(void)
+{
+    const esp_err_t err = mp2731_init();
+    booting = 0;
+    return err;
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -154,13 +163,13 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "invalid")) {
         assert(mp2731_get_iin_limit(&limit) == ESP_ERR_INVALID_STATE);
         assert(mp2731_set_iin_limit(1000, &limit) == ESP_ERR_INVALID_STATE);
-        probe_error = ESP_FAIL; assert(mp2731_init() == ESP_FAIL && !mp2731_is_ready());
+        probe_error = ESP_FAIL; booting = 1; assert(boot_init() == ESP_FAIL && !mp2731_is_ready());
         assert(mp2731_get_iin_limit(&limit) == ESP_ERR_INVALID_STATE);
         assert(mp2731_set_iin_limit(1000, &limit) == ESP_ERR_INVALID_STATE);
         assert(!locks && !reads && !writes);
         probe_error = 0;
     }
-    assert(mp2731_init() == ESP_OK && mp2731_is_ready());
+    booting = 1; assert(boot_init() == ESP_OK && mp2731_is_ready());
     assert(!writes); /* initialization never changes the charger's default */
     locks = unlocks = 0; /* boot reconciliation reads are not IIN-limit traffic */
     iin_limit_command_config_t config = {.reply = reply, .submit = submit};

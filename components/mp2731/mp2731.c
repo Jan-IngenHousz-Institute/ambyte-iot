@@ -85,6 +85,7 @@ static aico_t  s_aico;
  * composition root before any read; NULL = always admitted. */
 static bool  (*s_gate_begin)(void);
 static void  (*s_gate_end)(void);
+static bool  (*s_gate_adopt)(void);   /* mp2731_set_quarantine_adopt */
 
 static bool mutation_begin(void)
 {
@@ -141,7 +142,10 @@ static bool quarantine_take_over(void)
 static void quarantine_adopt(void)
 {
     if (!charger_dirty() || s_quarantine || s_gate_begin == NULL) return;
-    if (mutation_begin()) {
+    /* Adopt, not begin: a maintenance request already PENDING (made during
+     * the boot hold) must not refuse it, or it would be granted over the
+     * dirty bit as soon as the hold ends. Only RUNNING maintenance refuses. */
+    if (s_gate_adopt != NULL ? s_gate_adopt() : mutation_begin()) {
         s_quarantine = true;
     } else {
         ESP_LOGW(TAG, "charger re-detect: dirty charger bit but maintenance already active; "
@@ -993,6 +997,11 @@ void mp2731_ack_diagnostics(uint64_t window_id)
 void mp2731_redetect_set_veto(bool (*veto)(void))
 {
     s_redetect_veto = veto;
+}
+
+void mp2731_set_quarantine_adopt(bool (*adopt)(void))
+{
+    s_gate_adopt = adopt;
 }
 
 void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void))

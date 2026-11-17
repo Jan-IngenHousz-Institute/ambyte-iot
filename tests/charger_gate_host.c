@@ -16,6 +16,7 @@
  * maintenance is granted, and none outside an admitted mutation.
  * usage: charger_gate_host <case> (exit 0 = pass) */
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,18 @@
 
 #include "../components/mp2731/mp2731.c"
 #include "maint_gate.h"
+#if __has_include("ambit_flash_admit.h")
+#include "ambit_flash_admit.h"
+#else
+/* f7f9ada (proof of failure only): ambit_flash_boot_sync flashed with no
+ * maintenance admission at all - model exactly that. */
+typedef struct { bool (*begin)(void); void (*end)(void); } ambit_flash_maint_t;
+#define AMBIT_FLASH_ADMIT_DECLINED (-2)
+static int ambit_flash_admitted(const ambit_flash_maint_t *m, int (*flash)(void *), void *ctx)
+{
+    (void)m; return flash(ctx);
+}
+#endif
 
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr, "FAIL %s:%d: %s - ", __FILE__, __LINE__, #cond); \
@@ -43,6 +56,14 @@ static bool gate_begin(void)
     return ok;
 }
 static void gate_end(void) { maint_gate_mutation_end(&g); in_mutation--; assert(in_mutation >= 0); }
+#ifdef MP2731_HAS_QUARANTINE_ADOPT
+static bool gate_adopt(void)
+{
+    const bool ok = maint_gate_mutation_adopt(&g);
+    if (ok) in_mutation++;
+    return ok;
+}
+#endif
 static bool veto(void)
 {
     const bool active = maint_gate_active(&g);
@@ -75,6 +96,8 @@ static int takes, take_fail_at = -1;  /* HAR-310: the Nth read-mutex take times 
 static int ok_0b_writes = -1, bg_stuck;
 static int bg_writes_busy, dpdm_writes_busy;  /* REG09/REG0B written while maintenance runs */
 static int fail_reads_09;                     /* PR #112 re-review: REG09 reads that fail */
+static int bg_writes_total, dpdm_writes_total;
+static int bg_set_or_clear_writes(void) { return bg_writes_total; }
 
 esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 void h_critical_enter(portMUX_TYPE *m) { assert(!m->held); m->held = 1; }
@@ -124,12 +147,14 @@ esp_err_t i2c_master_write_to_device(int port, unsigned addr, const uint8_t *w, 
         if (v & 0x80) { conversions++; regs[0x11] = (uint8_t)(124 + conversions % 2); regs[0x0F] = (uint8_t)(175 + conversions % 2); }
         return ESP_OK;
     case 0x0B:
+        dpdm_writes_total++;
         if (g.busy) dpdm_writes_busy++;
         if (ok_0b_writes == 0) return ESP_FAIL;
         if (ok_0b_writes > 0) ok_0b_writes--;
         regs[0x0B] = dpdm_keep ? v : (uint8_t)(v & ~0x20);
         return ESP_OK;
     case 0x09:
+        bg_writes_total++;
         if (g.busy) bg_writes_busy++;
         if ((regs[9] & 0x08) && !(v & 0x08) && bg_stuck > 0) { bg_stuck--; return ESP_OK; }
         regs[9] = v;
@@ -206,6 +231,41 @@ static const mutation_t M[] = {
     {"redetect_bg_en", m_bg_en, false, true},  {"redetect_dpdm", m_dpdm, false, true},
     {"redetect_auto", m_redetect_auto, true, true},
 };
+
+/* ── Boot-sync flash model (PR #112 round 3) ──────────────────────────── */
+static int boot_flash_ran, boot_flash_writes, boot_flash_bus_heals, drain_after_reads;
+static int boot_flash_unadmitted, boot_flash_pulse_admitted;
+
+/* app_maintenance_begin as in main/app_main.c: request; while it waits the
+ * other tasks keep reading the charger (5 s reads; the quarantine can drain
+ * here); abandon after APP_CHARGER_DRAIN_MS (20 s = 4 reads). */
+static bool app_begin_model(void)
+{
+    maint_gate_result_t r = maint_gate_request(&g);
+    for (int i = 0; r == MAINT_GATE_WAIT && i < 4; i++) {
+        if (drain_after_reads > 0 && --drain_after_reads == 0) ok_0b_writes = -1;
+        reads_for(5 * S);
+        r = maint_gate_poll(&g);
+    }
+    if (r == MAINT_GATE_WAIT) maint_gate_abandon(&g);
+    return r == MAINT_GATE_GRANTED;
+}
+static void app_end_model(void) { maint_gate_end(&g); }
+
+/* The flash: ~30 s per channel while the readers keep running. Any charger
+ * bit write in here is the bug: recovery or a pulse during the flash. */
+static int boot_flash(void *ctx)
+{
+    boot_flash_ran = 1;
+    const int w09 = bg_set_or_clear_writes(), w0b = dpdm_writes_total;
+    if (boot_flash_bus_heals) ok_0b_writes = -1;
+    if (!maint_gate_active(&g)) boot_flash_unadmitted++;
+    reads_for(30 * S);
+    /* A manual pulse during the flash must be refused. */
+    if (mp2731_charger_redetect(POWER_REDETECT_BG_EN, &rep) != ESP_ERR_NOT_ALLOWED) boot_flash_pulse_admitted++;
+    boot_flash_writes += (bg_set_or_clear_writes() - w09) + (dpdm_writes_total - w0b);
+    return (int)(intptr_t)ctx;
+}
 
 int main(int argc, char **argv)
 {
@@ -350,6 +410,96 @@ int main(int argc, char **argv)
             maint_gate_end(&g);
             CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
         }
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "boot_pending")) {
+        /* PR #112 round 3 (reviewer's boot_pending_model): a maintenance
+         * request made DURING the boot hold is pending when mp2731_init
+         * reconciles a retained USB_DET_EN. The quarantine must still be
+         * adopted, or the request is granted over the dirty bit the moment
+         * the boot hold ends. Wiring as in app_main: adopt + gate, then init. */
+        fresh();
+        memset(&g, 0, sizeof g); in_mutation = 0;
+        s_quarantine = false; s_bg_en_dirty = false; s_dpdm_dirty = false;
+        s_marker_checked = false; s_gate_begin = NULL; s_gate_end = NULL;
+        regs[0x0B] |= 0x20;                       /* retained across the ESP reboot */
+        CHECK(gate_begin(), "boot hold");         /* app_charger_boot_hold_begin */
+        CHECK(maint_gate_request(&g) == MAINT_GATE_WAIT, "a request during the boot hold waits");
+#ifdef MP2731_HAS_QUARANTINE_ADOPT
+        mp2731_set_quarantine_adopt(gate_adopt);
+#endif
+        mp2731_set_mutation_gate(gate_begin, gate_end);
+        assert(mp2731_init() == ESP_OK);
+        mp2731_redetect_set_veto(veto);
+        gate_end();                               /* app_charger_boot_hold_end */
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_WAIT,
+              "pending request granted over a dirty USB_DET_EN when the boot hold ended (REG0B 0x%02X)",
+              regs[0x0B]);
+        CHECK(g.mutations == 1, "the adopted quarantine holds the gate (%u)", g.mutations);
+        reads_for(5 * S);                         /* pending: recovery runs and is proven */
+        CHECK(!(regs[0x0B] & 0x20) && g.mutations == 0 && dpdm_writes_busy == 0, "recovered while pending");
+        CHECK(maint_gate_poll(&g) == MAINT_GATE_GRANTED, "then granted");
+        maint_gate_end(&g);
+#ifdef MP2731_HAS_QUARANTINE_ADOPT
+        /* Adoption is refused only while maintenance RUNS. */
+        maint_gate_t t = {0};
+        CHECK(maint_gate_request(&t) == MAINT_GATE_GRANTED && !maint_gate_mutation_adopt(&t), "busy refuses");
+        maint_gate_end(&t);
+        CHECK(maint_gate_mutation_begin(&t) && maint_gate_request(&t) == MAINT_GATE_WAIT &&
+              !maint_gate_mutation_begin(&t) && maint_gate_mutation_adopt(&t) && t.mutations == 2,
+              "pending refuses begin but not adopt");
+#endif
+        CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
+        puts("OK");
+        return 0;
+    }
+    if (!strncmp(c, "boot_flash_", 11)) {
+        /* PR #112 round 3: the AMBIT boot-sync flash takes the maintenance
+         * admission through ambit_flash_admitted, with app_maintenance_begin
+         * modelled as in app_main (request, then poll while the other tasks
+         * keep reading the charger, abandon after APP_CHARGER_DRAIN_MS). */
+        fresh();
+        boot_flash_ran = 0;
+        const ambit_flash_maint_t m = {.begin = app_begin_model, .end = app_end_model};
+        if (!strcmp(c, "boot_flash_quarantine") || !strcmp(c, "boot_flash_drains")) {
+            ok_0b_writes = 1;                          /* a DP/DM restore failed */
+            CHECK(m_dpdm() != ESP_OK && (regs[0x0B] & 0x20) && g.mutations == 1, "quarantined");
+            ok_0b_writes = 0;                          /* bus still bad */
+            if (!strcmp(c, "boot_flash_drains")) drain_after_reads = 2;
+            boot_flash_bus_heals = 1;                  /* the bus comes back inside the flash */
+            const int r = ambit_flash_admitted(&m, boot_flash, (void *)(intptr_t)1);
+            if (!strcmp(c, "boot_flash_quarantine")) {
+                CHECK(!boot_flash_ran, "boot flash ran while the charger quarantine was held");
+                CHECK(r == AMBIT_FLASH_ADMIT_DECLINED && !g.busy && !g.pending && g.mutations == 1,
+                      "declined, nothing held but the quarantine (%d)", r);
+                ok_0b_writes = -1;
+                reads_for(5 * S);
+                CHECK(!(regs[0x0B] & 0x20) && g.mutations == 0, "recovered later, outside any flash");
+            } else {
+                CHECK(boot_flash_ran && r == 1 && !(regs[0x0B] & 0x20), "drained in the wait, then flashed");
+            }
+        } else if (!strcmp(c, "boot_flash_clean")) {
+            const int r = ambit_flash_admitted(&m, boot_flash, (void *)(intptr_t)3);
+            CHECK(boot_flash_ran && r == 3, "a clean charger is admitted and flashes");
+        } else {
+            CHECK(!strcmp(c, "boot_flash_exits"), "unknown case");
+            const intptr_t results[] = {-1, 0, 2};
+            for (unsigned i = 0; i < 3; i++) {
+                const int r = ambit_flash_admitted(&m, boot_flash, (void *)results[i]);
+                CHECK(r == (int)results[i] && !g.busy && g.mutations == 0, "exit %d ends maintenance", r);
+                CHECK(m_vin() == ESP_OK, "mutations admitted again after exit %d", r);
+            }
+            const ambit_flash_maint_t unwired = {0};
+            boot_flash_ran = 0;
+            CHECK(ambit_flash_admitted(&unwired, boot_flash, NULL) == AMBIT_FLASH_ADMIT_DECLINED &&
+                  !boot_flash_ran, "an unwired gate never flashes");
+        }
+        CHECK(boot_flash_writes == 0, "charger REG09/REG0B written during the boot flash (%d): "
+              "recovery or a pulse mid-flash", boot_flash_writes);
+        CHECK(boot_flash_pulse_admitted == 0, "manual charger pulse admitted during the boot flash");
+        CHECK(boot_flash_unadmitted == 0, "boot flash ran outside the maintenance admission");
+        CHECK(!g.busy && !g.pending && !locked && !mutex_held, "maintenance ended on every exit");
         puts("OK");
         return 0;
     }

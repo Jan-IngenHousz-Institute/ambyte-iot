@@ -102,6 +102,11 @@ void mp2731_redetect_set_veto(bool (*veto)(void));
  * not a new one. Wiring the gate adopts a dirty state found before it.
  * NULL = always admitted. */
 void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void));
+/* Admission used to ADOPT a dirty state found at boot (maint_gate_mutation_
+ * adopt: refused only while maintenance runs, not while it is pending). Wire
+ * it with the gate, before mp2731_init. NULL = adopt with the gate's begin. */
+#define MP2731_HAS_QUARANTINE_ADOPT 1
+void mp2731_set_quarantine_adopt(bool (*adopt)(void));
 
 /* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).
  * get: REG02/00/14/15 under one bus hold plus the reset counters.
