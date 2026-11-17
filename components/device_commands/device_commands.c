@@ -1032,6 +1032,13 @@ cmd_result_t cmd_charger_redetect(power_redetect_method_t method, power_redetect
         return make_result(err, "maintenance_active: re-detect %s refused (OTA/AMBIT flash in progress)", name);
     case ESP_ERR_TIMEOUT:
         return make_result(err, "re-detect %s busy: another re-detect or charger read holds the charger", name);
+    case ESP_ERR_NOT_FINISHED:
+        if (out->snapshots == 0) {
+            return make_result(err, "re-detect %s refused: a previous pulse left REG09 BG_EN or REG0B "
+                                    "USB_DET_EN not proven back at 0; the driver retries the restore "
+                                    "on every charger read", name);
+        }
+        return make_result(err, "re-detect %s failed: %s", name, esp_err_to_name(err));
     case ESP_ERR_INVALID_RESPONSE:
         return make_result(err, "re-detect bg_en FAILED: BG_EN=1 never latched (REG09 0x%02X->0x%02X), "
                                 "so no 1->0 edge happened", out->reg_before, out->reg_set);
@@ -1054,7 +1061,8 @@ cmd_result_t cmd_charger_redetect_auto(int set, power_redetect_auto_t *out)
     }
     const esp_err_t err = s_cfg.charger_redetect_auto(set, out);
     if (err == ESP_ERR_INVALID_STATE) {
-        return make_result(err, "auto re-detect stays off: BG_EN not yet proven cleared");
+        return make_result(err, "auto re-detect stays off: a pulsed bit (REG09 BG_EN or REG0B "
+                                "USB_DET_EN) is not yet proven back at 0");
     }
     if (err != ESP_OK) {
         return make_result(err, "auto re-detect failed: %s", esp_err_to_name(err));

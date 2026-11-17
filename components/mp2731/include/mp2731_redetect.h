@@ -90,8 +90,17 @@ extern "C" {
 #define CRD_VSYS_FULL_MV        4100u
 
 /* After a pulse: how long to look for the outcome. Detection settles in
- * ~1 s; 60 s leaves room for the buck to start and CHG_STAT to report. */
+ * ~1 s; 60 s leaves room for the buck to start and CHG_STAT to report.
+ * Only reads taken AT OR BEFORE attempt + window count (HAR-310 #3): a read
+ * that arrives later (readers stalled, a long publish) describes the charger
+ * after the window, possibly after it re-detected on its own or after dawn,
+ * and must not be credited to the pulse. A window with no valid read inside
+ * it closes as "unknown". */
 #define CRD_OUTCOME_WINDOW_MS   60000
+
+/* crd_t.dirty bits (health.power.charger.redetect.dirty). */
+#define CRD_DIRTY_BG_EN 0x01u
+#define CRD_DIRTY_DPDM  0x02u
 
 /* Backoff after an attempt that did not lead to sustained charging. */
 #define CRD_BACKOFF_FIRST_MS    (10 * 60 * 1000)
@@ -122,6 +131,7 @@ typedef enum {
     CRD_OUT_BUS_ERROR,    /* I2C failed before/while pulsing */
     CRD_OUT_NOT_LATCHED,  /* BG_EN=1 never read back: no 1->0 edge happened */
     CRD_OUT_NOT_CLEARED,  /* BG_EN stuck at 1 after retries: auto disabled */
+    CRD_OUT_UNKNOWN,      /* no valid status read INSIDE the window: nothing to judge */
 } crd_outcome_t;
 
 typedef enum {
@@ -185,6 +195,11 @@ typedef struct {
     int64_t  charging_since_ms;
     /* counters (per boot) */
     uint32_t attempts, charging, detected, no_change, failed, blocked, vetoed, manual;
+    uint32_t unknown;          /* windows closed without a valid read inside them */
+    bool     window_obs;       /* a valid status read landed inside the open window */
+    /* Glue-owned (mp2731.c), rendered only: CRD_DIRTY_* bits for a pulsed bit
+     * not yet proven back at 0. The policy never reads it. */
+    uint8_t  dirty;
     crd_outcome_t last_outcome;
     crd_block_t   last_block;
     int64_t  last_attempt_ms;
@@ -224,8 +239,9 @@ const char *crd_state_name(const crd_t *s, int64_t now_ms);
 
 /* JSON object for health.power.charger.redetect. Returns length or -1.
  * CRD_RENDER_CAP bounds the worst case (all counters at UINT32_MAX, int64
- * timestamps): the charger object's 2048 B cap keeps ~700 B of headroom. */
-#define CRD_RENDER_CAP 512u
+ * timestamps). The charger object (2048 B) drops it whole if it does not fit. */
+/* 531 B measured with "unknown" and both "dirty" bits (HAR-310); was 512. */
+#define CRD_RENDER_CAP 576u
 int crd_render(const crd_t *s, int64_t now_ms, char *out, size_t cap);
 
 #ifdef __cplusplus

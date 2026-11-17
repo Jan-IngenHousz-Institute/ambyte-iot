@@ -216,6 +216,7 @@ esp_err_t mp2731_core_dpdm_force(const mp2731_bus_t *bus, mp2731_pulse_t *out)
     if (err != ESP_OK) return err;
     out->before = v;
     const uint8_t w = (uint8_t)((v & (uint8_t)~MP2731_USB_DET_WRITE0) | MP2731_USB_DET_EN_BIT);
+    out->set_attempted = true;   /* from here the write may have landed: restore owed */
     err = bus->write(bus->ctx, MP2731_REG_USB_DET, w);
     if (err == ESP_OK) err = rd(bus, MP2731_REG_USB_DET, &out->set_rb);
     if (err != ESP_OK) return err;

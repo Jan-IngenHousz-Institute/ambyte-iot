@@ -75,7 +75,12 @@ esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
  * Blocks the caller ~5 s (the read mutex is released while waiting). Returns
  * ESP_ERR_NOT_ALLOWED under the maintenance lock, ESP_ERR_TIMEOUT when busy,
  * ESP_ERR_INVALID_RESPONSE when BG_EN=1 never latched (no 1->0 edge),
- * ESP_ERR_INVALID_STATE when BG_EN stayed 1 (cleared again on later reads).
+ * ESP_ERR_INVALID_STATE when BG_EN stayed 1 (cleared again on later reads),
+ * or when the DP/DM restore read bit 5 back as 1. The DP/DM restore runs on
+ * every exit after a USB_DET_EN write may have landed, inside the admission;
+ * a restore that cannot be proven fails the call and marks the bit dirty
+ * (HAR-310). ESP_ERR_NOT_FINISHED: refused because a previous pulse left
+ * BG_EN or USB_DET_EN not proven back at 0 (retried before every read).
  * Writes nothing else; no NVS, no OTP. */
 esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out);
 /* Automatic re-detection switch: set -1 query, 0 off, 1 on. RAM only. */
@@ -90,9 +95,18 @@ void mp2731_redetect_set_veto(bool (*veto)(void));
  * automatic re-detect pulses (BG_EN, DP/DM and its restore). begin never
  * blocks; false = maintenance active or pending: a command returns
  * ESP_ERR_NOT_ALLOWED and writes nothing, an automatic action is held.
- * Exempt: clearing a BG_EN left at 1 (s_bg_en_dirty), which restores the
- * charger and must run even during maintenance. NULL = always admitted. */
+ * While a pulsed bit (BG_EN or USB_DET_EN) is not proven back at 0 the
+ * driver HOLDS one admission (quarantine, also rebuilt from the registers
+ * at init after an ESP-only reboot): maintenance waits or goes busy, never
+ * granted over it. The recovery of that bit runs under the held admission,
+ * not a new one. Wiring the gate adopts a dirty state found before it.
+ * NULL = always admitted. */
 void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void));
+/* Admission used to ADOPT a dirty state found at boot (maint_gate_mutation_
+ * adopt: refused only while maintenance runs, not while it is pending). Wire
+ * it with the gate, before mp2731_init. NULL = adopt with the gate's begin. */
+#define MP2731_HAS_QUARANTINE_ADOPT 1
+void mp2731_set_quarantine_adopt(bool (*adopt)(void));
 
 /* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).
  * get: REG02/00/14/15 under one bus hold plus the reset counters.

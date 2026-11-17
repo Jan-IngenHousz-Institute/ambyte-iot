@@ -278,7 +278,9 @@ static void scenario_outcomes(void)
         now_ms += 5 * S; crd_obs_t o = with_status(0x30); o.status_valid = false;
         a = crd_step(&s, &o, false);
     }
-    CHECK(s.last_outcome == CRD_OUT_NO_CHANGE, "invalid reads prove nothing");
+    /* HAR-310 #3: no valid read inside the window = nothing to judge. */
+    CHECK(!strcmp(crd_outcome_name(s.last_outcome), "unknown") && s.charging == 0 && s.no_change == 0,
+          "invalid reads prove nothing (%s)", crd_outcome_name(s.last_outcome));
 
     /* Pulse failures: counted as attempts, never pending, backoff applies. */
     const crd_pulse_t fails[] = {CRD_PULSE_BUS_ERROR, CRD_PULSE_NOT_LATCHED};
@@ -353,6 +355,64 @@ static void scenario_veto_and_switch(void)
     puts("OK veto");
 }
 
+/* HAR-310 #3: only reads at or before attempt + CRD_OUTCOME_WINDOW_MS are
+ * evidence for the pulse. Written against names, not new enum values, so the
+ * same file proves the failure on the v2.23.0 policy. */
+static int64_t open_window(crd_t *s)
+{
+    reset(s);
+    run_until_check(s, stuck, 30 * MIN, false);
+    crd_note_attempt(s, now_ms, CRD_PULSE_OK, 0x00, 7500, 3500);
+    return now_ms;
+}
+
+static void scenario_late_evidence(void)
+{
+    crd_t s;
+    /* 1. Readers stalled: the first read after the pulse is at +120 s and
+     *    shows CC charging. Not credited; nothing inside the window. */
+    int64_t t0 = open_window(&s);
+    now_ms = t0 + 120 * S;
+    crd_obs_t o = with_status(0x30);
+    CHECK(crd_step(&s, &o, false) == CRD_RESOLVED, "late read closes the window");
+    CHECK(strcmp(crd_outcome_name(s.last_outcome), "charging") != 0 && s.charging == 0,
+          "late CC must not be credited (%s, charging=%u)", crd_outcome_name(s.last_outcome), s.charging);
+    CHECK(!strcmp(crd_outcome_name(s.last_outcome), "unknown"), "no in-window read: %s",
+          crd_outcome_name(s.last_outcome));
+    CHECK(s.last_after == 0x00, "REG0C after stays the in-window value (0x%02X)", s.last_after);
+
+    /* 2. A gap spanning the deadline: idle at +30 s, then CC at +90 s. */
+    t0 = open_window(&s);
+    now_ms = t0 + 30 * S; o = with_status(0x00);
+    CHECK(crd_step(&s, &o, false) == CRD_NONE, "inside the window, still idle");
+    now_ms = t0 + 90 * S; o = with_status(0x30);
+    CHECK(crd_step(&s, &o, false) == CRD_RESOLVED, "closed");
+    CHECK(!strcmp(crd_outcome_name(s.last_outcome), "no_change") && s.charging == 0,
+          "gap across the deadline: %s", crd_outcome_name(s.last_outcome));
+
+    /* 3. Same for detection: VIN_STAT 001 only after the deadline. */
+    t0 = open_window(&s);
+    now_ms = t0 + 10 * S; o = with_status(0x00); crd_step(&s, &o, false);
+    now_ms = t0 + 75 * S; o = with_status(0x20);
+    CHECK(crd_step(&s, &o, false) == CRD_RESOLVED &&
+          !strcmp(crd_outcome_name(s.last_outcome), "no_change") && s.detected == 0,
+          "late detect not credited: %s", crd_outcome_name(s.last_outcome));
+
+    /* 4. Boundary: a read exactly AT the deadline is still evidence. */
+    t0 = open_window(&s);
+    now_ms = t0 + CRD_OUTCOME_WINDOW_MS; o = with_status(0x30);
+    CHECK(crd_step(&s, &o, false) == CRD_RESOLVED && s.charging == 1, "at the deadline counts");
+
+    /* 5. In-window detection, CC only afterwards: detected, not charging. */
+    t0 = open_window(&s);
+    now_ms = t0 + 20 * S; o = with_status(0x20); crd_step(&s, &o, false);
+    now_ms = t0 + 65 * S; o = with_status(0x30);
+    CHECK(crd_step(&s, &o, false) == CRD_RESOLVED &&
+          !strcmp(crd_outcome_name(s.last_outcome), "detected") && s.charging == 0,
+          "detected inside, charging outside: %s", crd_outcome_name(s.last_outcome));
+    puts("OK late_evidence");
+}
+
 static void scenario_render(void)
 {
     crd_t s; reset(&s);
@@ -372,6 +432,9 @@ static void scenario_render(void)
     s.dwelling = true; s.dwell_start_ms = INT64_MIN + 1; s.last_attempt_ms = INT64_MIN;
     s.last_outcome = CRD_OUT_NOT_CLEARED; s.last_block = CRD_BLOCK_CHARGE_DISABLED;
     s.last_vin_mv = s.last_vsys_mv = UINT16_MAX; s.last_before = s.last_after = 0xFF;
+#ifdef CRD_DIRTY_BG_EN   /* HAR-310 fields; absent when proving failure on v2.23.0 */
+    s.unknown = UINT32_MAX; s.dirty = CRD_DIRTY_BG_EN | CRD_DIRTY_DPDM;
+#endif
     const int n = crd_render(&s, 0, json, sizeof json);
     CHECK(n > 0, "worst case fits CRD_RENDER_CAP");
     printf("RENDER_WORST=%s\n", json);
@@ -393,6 +456,7 @@ int main(int argc, char **argv)
     else if (!strcmp(n, "precheck")) scenario_precheck();
     else if (!strcmp(n, "veto")) scenario_veto_and_switch();
     else if (!strcmp(n, "render")) scenario_render();
+    else if (!strcmp(n, "late_evidence")) scenario_late_evidence();
     else return 2;
     return 0;
 }

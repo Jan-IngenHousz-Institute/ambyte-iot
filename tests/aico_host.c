@@ -220,6 +220,7 @@ static void boot(bool field)
 {
     if (field) field_state(); else usb_state();
     assert(mp2731_init() == ESP_OK);
+    sessions = 0;   /* boot reconciliation (REG09/REG0B reads) is not command traffic */
     mp2731_redetect_set_veto(veto);
     aico_command_config_t cfg = {.reply = reply, .submit = submit};
     aico_command_init(&cfg);

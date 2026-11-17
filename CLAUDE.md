@@ -103,8 +103,18 @@ holds bench boards.
   "no input, not charging" beside a live panel (docs/charger-redetect.md). The
   decision is the pure `mp2731_redetect.c`, fed by the existing power reads (no task).
   It never fires on an expired safety timer (the pulse would clear that fault), while
-  charging/done, on a full battery, under the maintenance lock, or over a BG_EN not
-  proven back at 0. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
+  charging/done, on a full battery, under the maintenance lock, or over a BG_EN or
+  USB_DET_EN not proven back at 0 (HAR-310: the manual DP/DM restore is
+  unconditional cleanup inside the admission, never a settle-snapshot side effect;
+  only reads at or before the 60 s deadline judge an outcome). A dirty bit
+  QUARANTINES maintenance: the failing pulse's gate admission is kept until
+  recovery proves both bits 0, so maintenance waits/goes busy and recovery (itself
+  a BG_EN 1->0 detection edge) never runs under granted maintenance. An ESP reboot
+  does NOT reset the charger: mp2731_init rebuilds the quarantine from REG09/REG0B
+  (unreadable = set), app_main wires the gate before it and holds a boot admission
+  from NVS until that reconciliation. The AMBIT boot-sync flash takes the maintenance
+  admission like every flash (ambit_flash_admitted). A charger that fails its boot
+  probe is UNPROTECTED for that boot (documented limit). RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
   boot that reset during an open attempt.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an

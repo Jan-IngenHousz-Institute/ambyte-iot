@@ -93,6 +93,9 @@ class PolicyTest(unittest.TestCase):
     def test_maintenance_veto_operator_switch_and_manual_pulse(self):
         self.run_case("veto")
 
+    def test_outcome_window_ignores_evidence_after_the_deadline(self):
+        self.run_case("late_evidence")
+
     def test_render_is_valid_json_and_worst_case_fits(self):
         out = self.run_case("render")
         records = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
@@ -108,7 +111,11 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(pending["last"]["vin_mv"], 7500)
         worst = json.loads(records["RENDER_WORST"])
         self.assertEqual(worst["disabled_reason"], "reset_during_attempt")
-        self.assertLess(len(records["RENDER_WORST"]), 512)
+        self.assertEqual(worst["unknown"], 4294967295)
+        self.assertEqual(worst["dirty"], ["bg_en", "dpdm"])
+        self.assertEqual(fresh["dirty"], [])
+        self.assertEqual(fresh["unknown"], 0)
+        self.assertLess(len(records["RENDER_WORST"]), 576)
 
 
 class DriverTest(unittest.TestCase):
@@ -156,6 +163,18 @@ class DriverTest(unittest.TestCase):
     def test_dpdm_self_clear_and_restore(self):
         self.run_case("dpdm")
 
+    def test_dpdm_restore_runs_when_the_last_settle_snapshot_times_out(self):
+        self.run_case("dpdm_settle_timeout")
+
+    def test_dpdm_restore_io_failure_fails_closed_until_a_read_restores_it(self):
+        self.run_case("dpdm_restore_io")
+
+    def test_dpdm_restore_readback_mismatch_fails_closed(self):
+        self.run_case("dpdm_restore_mismatch")
+
+    def test_auto_pulse_with_bus_unavailable_writes_nothing_and_marks_nothing_dirty(self):
+        self.run_case("auto_bus_unavailable")
+
     def test_maintenance_lock_refuses_manual_pulses(self):
         self.run_case("veto")
 
@@ -190,6 +209,59 @@ class DriverTest(unittest.TestCase):
 
     def test_mqtt_rejects_bad_input_and_busy(self):
         self.run_case("mqtt_invalid")
+
+
+DRIVER_CASES = ("bg_en", "not_latched", "stuck", "bus", "dpdm", "veto", "auto", "safety_timer",
+                "reset_guard", "cli", "mqtt", "mqtt_invalid", "dpdm_settle_timeout",
+                "dpdm_restore_io", "dpdm_restore_mismatch", "auto_bus_unavailable")
+
+
+class MsanDriverTest(unittest.TestCase):
+    """The same driver harness under MemorySanitizer (clang only; cannot be
+    combined with ASan). HAR-310 #2 was a read of an uninitialised stack
+    struct after a bus-lock failure: ASan/UBSan cannot see it, MSan can
+    (it flagged mp2731.c redetect_fire on v2.23.0)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="redetect-msan-")
+        directory = Path(cls.tmp.name)
+        (directory / "device_commands.h").write_text(DEVICE_COMMANDS_STUB)
+        cls.binary = directory / "driver"
+        cjson = cjson_dir()
+        clang = shutil.which("clang")
+        if clang is None:
+            raise unittest.SkipTest("MemorySanitizer needs clang")
+        build = subprocess.run([clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1",
+                                "-fsanitize=memory", "-fsanitize-memory-track-origins",
+                                "-DESP_ERR_TIMEOUT=0x107",
+                                f"-I{directory}", f"-I{ROOT / 'tests/mp2731_driver_stubs'}",
+                                f"-I{ROOT / 'tests/host_stubs'}", f"-I{cjson}",
+                                *(f"-I{ROOT / 'components' / name / 'include'}" for name in
+                                  ("domain", "mp2731", "CLI", "command_router")),
+                                str(ROOT / "tests/charger_redetect_host.c"),
+                                str(ROOT / "components/mp2731/mp2731_core.c"),
+                                str(ROOT / "components/mp2731/mp2731_diagnostics.c"),
+                                str(ROOT / "components/mp2731/mp2731_redetect.c"),
+                                str(ROOT / "components/mp2731/mp2731_aico.c"),
+                                str(ROOT / "components/CLI/cli_charger_redetect.c"),
+                                str(ROOT / "components/command_router/charger_redetect_command.c"),
+                                str(cjson / "cJSON.c"), "-lm", "-o", str(cls.binary)],
+                               capture_output=True, text=True)
+        if build.returncode != 0 and "memory" in build.stderr and "unsupported" in build.stderr:
+            raise unittest.SkipTest("MemorySanitizer unsupported here")
+        if build.returncode != 0:
+            raise AssertionError(build.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_every_driver_case_reads_only_initialised_memory(self):
+        for case in DRIVER_CASES:
+            with self.subTest(case=case):
+                result = subprocess.run([self.binary, case], capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr[-3000:] + result.stdout)
 
 
 if __name__ == "__main__":

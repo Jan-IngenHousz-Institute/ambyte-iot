@@ -28,7 +28,16 @@
  * campaign. The wait cannot deadlock: maintenance requesters run on worker
  * tasks that hold no charger lock (read mutex, I2C bus) while they wait, a
  * mutation never requests maintenance, and a mutation that finds maintenance
- * active or pending is refused instead of waiting. */
+ * active or pending is refused instead of waiting.
+ *
+ * A mutation's admission may outlive the call that took it: the MP2731
+ * driver keeps a failing re-detect pulse's admission as a QUARANTINE while
+ * BG_EN or USB_DET_EN is not proven back at 0 (mp2731.c, PR #112 review), and
+ * releases it once recovery proves both - rebuilt from the registers at
+ * init after an ESP-only reboot, which does not reset the charger. The
+ * composition root also holds one admission at boot until that
+ * reconciliation. Maintenance then waits or gives up busy; it is not granted
+ * over a charger bit known or suspected to be set. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -49,6 +58,23 @@ typedef enum {
 static inline bool maint_gate_mutation_begin(maint_gate_t *g)
 {
     if (g->busy || g->pending) {
+        g->refused++;
+        return false;
+    }
+    g->mutations++;
+    return true;
+}
+
+/* Quarantine adoption (PR #112 round 3): like mutation_begin, but refused
+ * only while maintenance RUNS, not while it is pending. For a hazard that
+ * already exists - a charger bit found set at boot - not for new work: a
+ * pending request must wait for it exactly as for a mutation that began
+ * before the request (it drains by recovery, or the requester gives up after
+ * its own bound). Without this, a request made during the boot hold would
+ * refuse the adoption and be granted over the dirty bit once the hold ends. */
+static inline bool maint_gate_mutation_adopt(maint_gate_t *g)
+{
+    if (g->busy) {
         g->refused++;
         return false;
     }

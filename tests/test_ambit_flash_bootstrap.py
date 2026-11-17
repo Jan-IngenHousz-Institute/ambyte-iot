@@ -22,9 +22,11 @@ class AmbitFlashBootstrapTest(unittest.TestCase):
         )
         self.assertIn("newer than SD target", boot_sync)
 
-        flash_loop = boot_sync.split(
-            "/* Power gate", 1
-        )[1].split("return flashed;", 1)[0]
+        # The flash loop runs inside the maintenance admission since PR #112
+        # round 3 (boot_flash_channels); it must still never flash CH_NEWER.
+        flash_loop = source.split("static int boot_flash_channels(void *arg)", 1)[1].split(
+            "return flashed;", 1)[0]
+        self.assertIn("state[ch] != CH_STALE && state[ch] != CH_BARE", flash_loop)
         self.assertNotIn("state[ch] == CH_NEWER", flash_loop)
 
     def test_missing_recovery_directories_are_created_before_file_preflight(self):

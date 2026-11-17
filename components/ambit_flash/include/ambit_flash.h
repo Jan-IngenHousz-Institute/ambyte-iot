@@ -105,8 +105,18 @@ int ambit_flash_check(void);
  * MUST run before the schedule runner starts (it takes the shared UART bus
  * without any quiesce dance, and probing hard-resets all four AMBITs via the
  * shared enable line). Returns the number of channels flashed AND verified at
- * the target version, or -1 if no SD target image is present. */
+ * the target version, or -1 if no SD target image is present.
+ *
+ * The flash phase runs only inside the maintenance admission wired with
+ * ambit_flash_set_maintenance (ambit_flash_admit.h): refused (another
+ * maintenance op, or a charger quarantine that did not drain) = nothing is
+ * flashed or counted and 0 is returned; the channels stay pending. Unwired =
+ * refused. The power checks above it remain in addition. */
 int ambit_flash_boot_sync(void);
+
+/* Composition root, before ambit_flash_boot_sync: the maintenance admission
+ * (app_maintenance_begin/end) the boot-sync flash must hold. */
+void ambit_flash_set_maintenance(bool (*begin)(void), void (*end)(void));
 
 /* Attach-time check of one channel (ambit_attach_gate.h): compare the AMBIT's
  * firmware string `fw` (from the identity cache, no UART traffic) with the
