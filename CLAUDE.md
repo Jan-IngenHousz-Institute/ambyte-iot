@@ -109,7 +109,10 @@ holds bench boards.
   only reads at or before the 60 s deadline judge an outcome). A dirty bit
   QUARANTINES maintenance: the failing pulse's gate admission is kept until
   recovery proves both bits 0, so maintenance waits/goes busy and recovery (itself
-  a BG_EN 1->0 detection edge) never runs under granted maintenance. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
+  a BG_EN 1->0 detection edge) never runs under granted maintenance. An ESP reboot
+  does NOT reset the charger: mp2731_init rebuilds the quarantine from REG09/REG0B
+  (unreadable = set), app_main wires the gate before it and holds a boot admission
+  from NVS until that reconciliation. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
   boot that reset during an open attempt.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an

@@ -89,12 +89,36 @@ AMBIT flash runs on the external input. So while either bit is dirty:
   already held. It is handed over before it would have been released, so the
   gate never sees zero mutations while a bit is dirty;
 - a maintenance request becomes pending and waits (up to 20 s), or gives up
-  busy. It is never granted over a dirty bit;
+  busy. It is not granted over a dirty bit this firmware knows about, also
+  after an ESP reboot (see below);
 - recovery runs on every power read under that held admission. It therefore
   also runs while maintenance is *pending*, which drains the quarantine, but it
   can never meet *granted* maintenance;
 - once both bits read back 0, the admission is released and a waiting request
   is granted on its next poll.
+
+**Across an ESP-only reboot** (Codex re-review of PR #112), the quarantine, the
+dirty flags and the maintenance gate are all ESP RAM and start empty. The MP2731
+is powered separately, though. An ESP reset is not a charger power-on reset, and
+its I²C watchdog has long expired, so nothing resets REG09 or REG0B. **A reboot
+does not recover the charger.** The registers are the source of truth:
+
+- at init the driver reads REG09 and REG0B. A set BG_EN or USB_DET_EN, or a
+  register that cannot be read (fail closed), rebuilds the dirty flags, and
+  with them the quarantine admission. Normal recovery then drains it as in the
+  same boot. Recovery writes only a bit it reads as set;
+- `app_main` wires the gate before `mp2731_init`, so the rebuilt quarantine is
+  held at once. It also holds one charger admission from just after NVS until
+  the charger has been reconciled, because several maintenance paths (OTA,
+  AMBIT OTA, script update, command router) are configured before the I²C bus
+  comes up. A request in that window waits, as for any in-flight mutation;
+- both bits are 0 at power-on and only a re-detect pulse sets them, so a healthy
+  charger is never quarantined at boot.
+
+The guarantee covers charger states this firmware can read. A charger that
+fails its boot probe (or a boot that never reaches the I²C init, e.g. Wi-Fi
+startup failure) is not driven at all: no reads, no writes, nothing
+reconciled, and maintenance is not held for it.
 
 A settle snapshot whose mutex take times out is simply missing from the report
 (`snapshots` < 4); it never skips the cleanup.
@@ -225,11 +249,14 @@ flowchart TD
     T --> QH
     QH --> R[Every later power read restores the dirty bit first.<br/>No pulse of any kind, AICO holds,<br/>auto on refused while dirty]
     R --> MQ{Maintenance requested?}
-    MQ -- While dirty --> MW[Pending: waits up to 20 s or gives up busy,<br/>never granted over a dirty bit]
+    MQ -- While dirty --> MW[Pending: waits up to 20 s or gives up busy,<br/>not granted over a known dirty bit]
     MW --> R
     R --> RC{Both bits read back 0?}
     RC -- Yes --> QR[Quarantine released:<br/>a pending request is granted on its next poll]
     RC -- No --> R
+    BOOT[ESP-only reboot: RAM flags and gate empty,<br/>charger registers retained] --> RI{Init reads REG09 and REG0B:<br/>a bit set, or unreadable?}
+    RI -- Yes --> QH
+    RI -- No --> CLEAN[Healthy: no quarantine,<br/>boot hold released, maintenance admitted]
     OK --> W{Unit resets before the outcome?}
     W -- Brownout, watchdog, panic, USB --> X[Boot finds RTC marker open:<br/>auto off this boot, reason reset_during_attempt]
     W -- No --> V{Valid read at or before +60 s?}
@@ -258,7 +285,8 @@ flowchart TD
 | Bus busy or failing | A lock timeout or bus error in the precheck counts as `blocked` (bus_error). If the pulse cannot get the bus at all, nothing is written and nothing is marked dirty: it is a failed attempt (`bus_error`) with backoff, logged as "pulse not started" (HAR-310). If the set may have landed, the clear is retried on every later read. |
 | Readers stall around the outcome window | Only reads at or before +60 s count; a window with none closes as `unknown` (HAR-310). |
 | DP/DM restore cannot be proven | The manual command fails, `dirty` shows `dpdm`, every pulse and AICO re-arm holds, and every power read retries the restore until bit 5 reads back 0. Maintenance waits (or gives up busy) meanwhile; it is never granted with bit 5 set. |
-| BG_EN clear cannot be proven | Same quarantine. Maintenance is never granted while BG_EN may be 1, so the recovery's 1→0 edge (a detection and safety-timer reset) can never happen under a running OTA or AMBIT flash. |
+| BG_EN clear cannot be proven | Same quarantine. Maintenance is not granted while BG_EN is known or suspected to be 1, so the recovery's 1→0 edge (a detection and safety-timer reset) cannot happen under a running OTA or AMBIT flash. |
+| ESP reboots with BG_EN or USB_DET_EN still set | The reboot does not reset the charger. Init reads REG09/REG0B and rebuilds the quarantine (an unreadable register counts as set); maintenance waits until recovery proves both bits 0. A healthy charger (both 0) is not held. |
 | I²C watchdog resets BG_EN | REG09 is "Reset by WTD". The watchdog is already expired on every unit and the firmware never kicks it, so no new expiry happens during the pulse. The bench confirmed that BG_EN latches 1 with REG0D = 0x80. If an expiry did reset the bit between the writes, the 0 readback still passes. Whether a watchdog reset counts as a 1→0 edge is undocumented; the outcome tracking shows it either way. |
 | Silicon reacts badly to the bandgap toggle (VSYS collapse, hang) | The RTC_NOINIT marker is open from the pulse until the outcome is decided. After any reset except power-on, a deliberate `esp_restart` or deep sleep, automatic re-detection stays off for that boot (`reset_during_attempt`). A real power loss garbles RTC memory, which the magic plus the POWERON check reject. |
 | AMBIT measurement running | Not a veto. The pulse fires only while the chip already ignores its input, so the system is already on battery. A successful re-detect is the same input transition the chip makes at every dawn or passing cloud. |
@@ -332,7 +360,13 @@ pio run -e esp32-s3-devkitm-1
     abandoned request;
   - with maintenance already pending at the failure, recovery drains it and
     then grants;
-  - no read path writes REG09 or REG0B under granted maintenance.
+  - no read path writes REG09 or REG0B under granted maintenance;
+  - after a simulated ESP-only reboot (RAM and gate reset, charger registers
+    kept), in both wiring orders: a retained USB_DET_EN or BG_EN, or an
+    unreadable REG09, holds maintenance until recovery proves both bits 0; a
+    clean charger is admitted at once; `app_main` takes the boot hold before
+    any maintenance-capable component and wires the gate before
+    `mp2731_init` (source contract).
 - **Frontends:** CLI parsing, and the MQTT handler (deferred to the worker, no I²C
   on the MQTT task, snapshots in the reply, evidence on failure, invalid
   id/method/enabled, busy, queue refusal).
