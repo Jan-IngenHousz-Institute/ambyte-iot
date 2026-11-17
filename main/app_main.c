@@ -1105,6 +1105,10 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
     }
 }
 
+#if CONFIG_AMBYTE_BLE_DIAG
+static bool s_ble_diag_snapshot_ok;
+#endif
+
 void app_main(void)
 {
 #if CONFIG_AMBYTE_EVQ_HIL
@@ -1167,6 +1171,24 @@ void app_main(void)
                  AMBYTE_PM_MIN_FREQ_MHZ, AMBYTE_PM_MAX_FREQ_MHZ,
                  esp_err_to_name(pmerr));
     }
+
+#if CONFIG_AMBYTE_BLE_DIAG
+    /* Bench-only (env bench-ble). The BT controller's buffers must be internal
+     * RAM and include blocks larger than the post-TLS heap's largest free
+     * block (first bench boot: esp_bt_controller_init Malloc failed with
+     * ~42 KiB internal free, largest 17 KiB). So the controller, host and
+     * GATT table are set up HERE, before Wi-Fi/TLS fragment the heap; the
+     * radio stays silent until ble_diag_start() at boot-complete. */
+    {
+        const esp_err_t ble_err = ble_diag_init();
+        s_ble_diag_snapshot_ok = ble_err == ESP_OK || ble_diag_snapshot_ready();
+        if (ble_err != ESP_OK)
+            ESP_LOGE(APP_TAG, "BLE diagnostics init: %s", esp_err_to_name(ble_err));
+        ESP_LOGI(APP_TAG, "BLE diagnostics init: internal free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+#endif
 
     /* ── Status LED ─────────────────────────────────────────────── */
     err = ambyte_status_init();
@@ -1674,12 +1696,8 @@ void app_main(void)
     };
 #if CONFIG_AMBYTE_BLE_DIAG
     /* Bench-only (env bench-ble): capture each built heartbeat for the BLE
-     * snapshot. Buffers only here; the radio starts after boot completes. */
-    if (ble_diag_init() == ESP_OK) {
-        cmd_cfg.telemetry_built = ble_diag_snapshot_set;
-    } else {
-        ESP_LOGE(APP_TAG, "BLE diagnostics snapshot unavailable");
-    }
+     * snapshot (buffers allocated by the early ble_diag_init above). */
+    if (s_ble_diag_snapshot_ok) cmd_cfg.telemetry_built = ble_diag_snapshot_set;
 #endif
     device_commands_init(&cmd_cfg);
     device_commands_sensors_start(uart_available ? uart_sensors_inspect : NULL,

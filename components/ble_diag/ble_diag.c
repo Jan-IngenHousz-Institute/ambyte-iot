@@ -49,7 +49,7 @@
 #define WINDOW_DEFAULT_MIN 15u
 #define WINDOW_MAX_MIN     1440u
 #define WORKER_PERIOD_MS   1000u
-#define WORKER_STACK       3584u
+#define WORKER_STACK       3072u
 #define WORKER_PRIORITY    1u
 #define PREFERRED_MTU      247u
 /* 100-150 ms: discoverable within a second for a phone, at a modest radio
@@ -109,7 +109,7 @@ static int64_t uptime_ms(void)
 
 /* ── Snapshot (writer side: the task that built the heartbeat) ────────── */
 
-esp_err_t ble_diag_init(void)
+static esp_err_t snapshot_init(void)
 {
     if (s_inited) return ESP_OK;
     s_write_mtx = xSemaphoreCreateMutex();
@@ -129,6 +129,11 @@ esp_err_t ble_diag_init(void)
     s_snap.cap = BLE_DIAG_SNAPSHOT_CAP;
     s_inited = true;
     return ESP_OK;
+}
+
+bool ble_diag_snapshot_ready(void)
+{
+    return s_inited;
 }
 
 void ble_diag_snapshot_set(const char *json, size_t len)
@@ -523,22 +528,27 @@ static const esp_console_cmd_t s_ble_cmd = {
     .func = ble_cmd,
 };
 
-esp_err_t ble_diag_start(void)
+static bool      s_stack_ok;
+static esp_err_t s_stack_err = ESP_ERR_INVALID_STATE;
+
+esp_err_t ble_diag_init(void)
 {
-    if (s_started) return ESP_ERR_INVALID_STATE;
-    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = snapshot_init();
+    if (err != ESP_OK) return err;
+    if (s_stack_ok) return ESP_OK;
 
     uint8_t mac[6] = {0};
-    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    if (err != ESP_OK) return err;
+    err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) return s_stack_err = err;
     ble_diag_format_name(mac, s_name);
     ble_diag_format_mac(mac, s_mac);
     snprintf(s_fw, sizeof s_fw, "%s", esp_app_get_description()->version);
 
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
-        return err;
+        return s_stack_err = err;
     }
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
@@ -550,15 +560,40 @@ esp_err_t ble_diag_start(void)
     if (rc == 0) rc = ble_att_set_preferred_mtu(PREFERRED_MTU);
     if (rc != 0) {
         ESP_LOGE(TAG, "GATT setup rc=%d", rc);
-        return ESP_FAIL;
+        return s_stack_err = ESP_FAIL;
     }
-    set_window_min(WINDOW_DEFAULT_MIN);
-
-    err = esp_console_cmd_register(&s_ble_cmd);
-    if (err != ESP_OK) ESP_LOGW(TAG, "`ble` command: %s", esp_err_to_name(err));
-    if (xTaskCreate(worker_task, "ble_diag", WORKER_STACK, NULL, WORKER_PRIORITY, NULL) != pdPASS)
-        return ESP_ERR_NO_MEM;
+    /* Both tasks are created here, early, too: at boot-complete the TLS
+     * handshake can leave the internal heap at ~2 KiB for a moment (second
+     * bench boot: min free 1,703 B), and IDF's esp_nimble_enable() ignores a
+     * failed xTaskCreate, so a late host task silently never synced. The host
+     * syncs now and stays silent: advertise() needs the window, which only
+     * ble_diag_start() opens. */
+    if (xTaskCreate(worker_task, "ble_diag", WORKER_STACK, NULL, WORKER_PRIORITY, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "worker task: no memory");
+        return s_stack_err = ESP_ERR_NO_MEM;
+    }
     nimble_port_freertos_init(host_task);
+    if (xTaskGetHandle("nimble_host") == NULL) {
+        ESP_LOGE(TAG, "NimBLE host task not created");
+        return s_stack_err = ESP_ERR_NO_MEM;
+    }
+    s_stack_ok = true;
+    s_stack_err = ESP_OK;
+    ESP_LOGI(TAG, "controller + host ready: internal heap %u -> %u B",
+             (unsigned)before, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return ESP_OK;
+}
+
+esp_err_t ble_diag_start(void)
+{
+    if (s_started) return ESP_ERR_INVALID_STATE;
+    if (!s_stack_ok) return s_stack_err;
+
+    const esp_err_t err = esp_console_cmd_register(&s_ble_cmd);
+    if (err != ESP_OK) ESP_LOGW(TAG, "`ble` command: %s", esp_err_to_name(err));
+    /* Opening the window is all it takes: the worker (or on_sync, if the host
+     * syncs later) starts advertising within a second. */
+    set_window_min(WINDOW_DEFAULT_MIN);
     s_started = true;
     ESP_LOGW(TAG, "BENCH BLE diagnostics on: %s, window %u min (not a release feature)",
              s_name, WINDOW_DEFAULT_MIN);

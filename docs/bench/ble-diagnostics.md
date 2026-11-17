@@ -71,6 +71,10 @@ What it deliberately does not touch:
   worker task calls it. Host callbacks take only the `s_mux` spinlock, never
   `event_log`'s mutex, never a FreeRTOS wait.
 - **No NVS.** Security manager off, bond persistence off, window is RAM state.
+- **Early init, late radio.** Controller, host, GATT table and both BLE tasks
+  start right after NVS/PM, before Wi-Fi/TLS fragment the internal heap (see
+  the RAM budget below); nothing is transmitted until boot-complete opens the
+  window.
 - **The event log and its cursor are untouched.** The hook runs before
   delivery on the building task and only copies.
 
@@ -102,6 +106,32 @@ stateDiagram-v2
   Connected --> Idle: ble off (link dropped)
   Idle --> Advertising: ble on [min]
 ```
+
+## Internal RAM budget (why the overlay trims Wi-Fi and the controller)
+
+The BT controller's buffers must be internal RAM, and this firmware runs with
+little of it: with MQTT up, an image without BLE sits at ~20 KiB internal free,
+largest block ~7.6 KiB. Bench boots on 2026-11-17 (unit 28:37:2F:FF:E7:04,
+v2.23.0 base):
+
+| Boot | Overlay / init | Result |
+|---|---|---|
+| 1 | NimBLE + coex only, init at boot-complete | `esp_bt_controller_init` Malloc failed, no BLE; MQTT 20.3 KiB free / 7.7 KiB largest |
+| 2 | + Wi-Fi IRAM fast paths in flash, controller MAX_ACT 2, no scan/DTM/LL security | heap region 163 → 183 KiB; controller still failed (post-TLS heap fragmented) |
+| 3 | + controller/host/GATT init early (before Wi-Fi) | BLE up, costs 31 KiB; schedule runner `ESP_ERR_NO_MEM`, MQTT at 11 KiB free / 2.5 KiB largest |
+| 4 | + controller code in flash (`BT_CTRL_RUN_IN_FLASH_ONLY`), smaller BLE stacks | heap region 196 KiB; runner starts, but the host task (created at boot-complete) silently failed: never synced |
+| 5 | + host and worker tasks created early too | **all up**: advertising, runner, MQTT; 20.4 KiB free / 7.7 KiB largest with MQTT up and advertising, 19.5 KiB while a client pages the snapshot |
+
+So the IRAM moved to flash pays for the controller (about 35 KiB including
+task stacks). Costs of those trims:
+- Wi-Fi RX/TX fast paths in flash: lower peak Wi-Fi throughput, irrelevant at
+  the MQTT rate.
+- Controller in flash: its ISRs cannot run while the cache is off for a flash
+  erase (littlefs writes), so a link may miss connection events there.
+- DMA-capable free drops to ~11 KiB.
+
+These trims, and the cost of keeping BLE beside MQTT, are the main open
+question before any release use.
 
 ## Console
 
