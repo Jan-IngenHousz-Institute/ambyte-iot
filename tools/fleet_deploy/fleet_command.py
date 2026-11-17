@@ -25,6 +25,8 @@ client-id spelling rules: `ambyte_` and `AMBYTE_` are different MQTT routes.
     fleet_command.py vin-limit --vin-action set --mv 4000 --devices ...
     fleet_command.py iin-limit --devices ambyte_28:37:2F:FF:FC:80
     fleet_command.py iin-limit --iin-action set --ma 1000 --devices ...
+    fleet_command.py aico --devices ambyte_28:37:2F:FF:FC:80
+    fleet_command.py aico --aico-action on --devices ...
 
 log-list / log-read (firmware with remote diagnostics) read the SD log
 directory (/sdcard/logs) without changing anything on the device. One
@@ -53,6 +55,13 @@ whose REG00 readback encodes it. The reply's `en_ilim` says whether the
 board's ILIM-pin resistor also limits: then the lower of the two applies, so
 the register value is a ceiling, not the input current. 1 A doubles the
 charger's input power over the 500 mA default: mind the board's heat.
+
+aico (firmware >= 2.23.0, docs/charger-aico.md) reads (`get`) or switches
+(`on` / `off`) the MP2731 Automatic Input Current Optimizer (REG02 bit 0).
+on/off are MUTATING and need an explicit --devices list. While on, the
+firmware re-arms AICO hourly. Live register only: a full charger power loss
+turns it off again. A switch is confirmed only by a reply whose `enabled` is
+the requested state and whose REG02 readback encodes it.
 
 Replies are written to --results-json (per device) and summarised on stdout.
 Exit status: 0 when every targeted device replied (and, for ping with
@@ -107,6 +116,9 @@ IIN_LIMIT_MIN_MA = 100
 IIN_LIMIT_MAX_MA = 3250
 IIN_LIMIT_STEP_MA = 50
 IIN_LIMIT_REPLY = {"get": "iin_limit_result", "set": "set_iin_limit_result"}
+# aico: REG02 bit 0 (components/command_router/aico_command.c).
+AICO_ACTIONS = ("get", "on", "off")
+AICO_REPLY = {"get": "aico_result", "on": "set_aico_result", "off": "set_aico_result"}
 
 
 def valid_vin_limit_mv(mv):
@@ -127,6 +139,8 @@ def expected_reply_type(args):
         return VIN_LIMIT_REPLY[getattr(args, "vin_action", "get")]
     if args.cmd == "iin-limit":
         return IIN_LIMIT_REPLY[getattr(args, "iin_action", "get")]
+    if args.cmd == "aico":
+        return AICO_REPLY[getattr(args, "aico_action", "get")]
     return REPLY_TYPES.get(args.cmd)
 
 
@@ -160,6 +174,22 @@ def iin_limit_problem(args, reply):
         return f"reg00={reg00:#04x} does not encode {ma} mA"
     if action == "set" and ma != args.ma:
         return f"reads {ma} mA, asked {args.ma} mA"
+    return None
+
+
+def aico_problem(args, reply):
+    """Why an AICO reply does not show the requested outcome, or None. Pure."""
+    action = getattr(args, "aico_action", "get")
+    if reply.get("type") != AICO_REPLY[action] or reply.get("ok") is not True:
+        return f"refused: {reply.get('detail')}"
+    enabled, reg02 = reply.get("enabled"), reply.get("reg02")
+    if (not isinstance(enabled, bool) or not isinstance(reg02, int) or isinstance(reg02, bool)
+            or not 0 <= reg02 <= 0xFF):
+        return f"reply without a confirmed readback: enabled={enabled!r} reg02={reg02!r}"
+    if bool(reg02 & 0x01) != enabled:
+        return f"reg02={reg02:#04x} does not encode enabled={enabled}"
+    if action != "get" and enabled != (action == "on"):
+        return f"reads enabled={enabled}, asked {action}"
     return None
 
 
@@ -434,6 +464,13 @@ def build_message(args, req_id):
             raise SystemExit(f"iin-limit set needs --ma: whole milliamps {IIN_LIMIT_MIN_MA}..{IIN_LIMIT_MAX_MA} "
                              f"in {IIN_LIMIT_STEP_MA} mA steps (e.g. 1000)")
         return {"type": "set_iin_limit", "id": req_id, "ma": ma}
+    if args.cmd == "aico":
+        action = getattr(args, "aico_action", "get")
+        if action not in AICO_ACTIONS:
+            raise SystemExit("aico --aico-action must be get, on or off")
+        if action == "get":
+            return {"type": "get_aico", "id": req_id}
+        return {"type": "set_aico", "id": req_id, "enabled": action == "on"}
     if args.cmd == "ambit-versions":
         return {"type": "ambit_versions", "id": req_id}
     if args.cmd == "ambit-flash":
@@ -507,6 +544,13 @@ def summarise(dev, reply):
         return (f"{t} ok={reply.get('ok')} register_ma={reply.get('ma')} "
                 f"reg00={f'{reg00:#04x}' if isinstance(reg00, int) else reg00} "
                 f"en_ilim={reply.get('en_ilim')} hiz={reply.get('hiz')} detail={reply.get('detail')}")
+    if t in ("aico_result", "set_aico_result"):
+        reg02 = reply.get("reg02")
+        return (f"{t} ok={reply.get('ok')} enabled={reply.get('enabled')} "
+                f"reg02={f'{reg02:#04x}' if isinstance(reg02, int) else reg02} "
+                f"iin_limit_ma={reply.get('iin_limit_ma')} iin_dpm_ma={reply.get('iin_dpm_ma')} "
+                f"aico_stat={reply.get('aico_stat')} resets={reply.get('resets')} "
+                f"failed={reply.get('failed')} detail={reply.get('detail')}")
     if t == "ambit_flash_status":
         return (f"ambit_flash ch={reply.get('channel')} state={reply.get('state')}"
                 + (f" detail={reply.get('detail')}" if reply.get("detail") else ""))
@@ -521,12 +565,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ping", "inventory", "replay", "ota", "ambit-versions", "ambit-flash",
                                     "get-timezone", "set-timezone", "log-list", "log-read", "power-protect",
-                                    "vin-limit", "iin-limit"])
+                                    "vin-limit", "iin-limit", "aico"])
     ap.add_argument("--vin-action", dest="vin_action", default="get", choices=VIN_LIMIT_ACTIONS,
                     help="vin-limit: get (read-only) or set (MUTATING)")
     ap.add_argument("--mv", type=int, default=None,
                     help=f"vin-limit --vin-action set: millivolts, {VIN_LIMIT_MIN_MV}..{VIN_LIMIT_MAX_MV} "
                          f"in {VIN_LIMIT_STEP_MV} mV steps")
+    ap.add_argument("--aico-action", dest="aico_action", default="get", choices=AICO_ACTIONS,
+                    help="aico: get (read-only), on or off (MUTATING)")
     ap.add_argument("--iin-action", dest="iin_action", default="get", choices=IIN_LIMIT_ACTIONS,
                     help="iin-limit: get (read-only) or set (MUTATING)")
     ap.add_argument("--ma", type=int, default=None,
@@ -595,6 +641,9 @@ def main(argv=None):
             ap.error(str(exc))
         if args.iin_action == "set" and (not args.devices.strip() or not parse_devices(args.devices)):
             ap.error("iin-limit set requires an explicit --devices list; fleet-wide discovery is refused")
+    if args.cmd == "aico" and args.aico_action != "get" and (
+            not args.devices.strip() or not parse_devices(args.devices)):
+        ap.error(f"aico {args.aico_action} requires an explicit --devices list; fleet-wide discovery is refused")
     if args.cmd == "log-read":
         # Validate before any AWS access: a bad name or window must cost nothing.
         try:
@@ -667,7 +716,8 @@ def main(argv=None):
                 or args.cmd in ("ambit-flash", "set-timezone")
                 or (args.cmd == "power-protect" and args.action != "status")
                 or (args.cmd == "vin-limit" and args.vin_action == "set")
-                or (args.cmd == "iin-limit" and args.iin_action == "set"))
+                or (args.cmd == "iin-limit" and args.iin_action == "set")
+                or (args.cmd == "aico" and args.aico_action != "get"))
     reply_type = expected_reply_type(args)
 
     print(f"{args.cmd}{' ' + args.mode if args.cmd == 'replay' else ''}: {len(devices)} device(s), "
@@ -785,6 +835,10 @@ def main(argv=None):
                   if args.cmd == "iin-limit" and iin_limit_problem(args, r)}
     if iin_failed:
         print(f"iin-limit not confirmed on: {json.dumps(iin_failed)}")
+    aico_failed = {d: aico_problem(args, r) for d, r in replies.items()
+                   if args.cmd == "aico" and aico_problem(args, r)}
+    if aico_failed:
+        print(f"aico not confirmed on: {json.dumps(aico_failed)}")
     flash_failed = [d for d, r in replies.items()
                     if r.get("type") == "ambit_flash_status" and r.get("state") != "success"]
     if flash_failed:
@@ -817,10 +871,11 @@ def main(argv=None):
                        "firmware": fw_hist, "replay_states": states, "progress": progress,
                        "timezone_failures": timezone_failed, "log_failures": log_failed,
                        "power_protect_failures": pp_failed, "vin_limit_failures": vin_failed,
-                       "iin_limit_failures": iin_failed},
+                       "iin_limit_failures": iin_failed,
+                       "aico_failures": aico_failed},
                       fh, indent=1, sort_keys=True)
     return 1 if (missing or bad_fw or flash_failed or timezone_failed or log_failed or pp_failed
-                 or vin_failed or iin_failed) else 0
+                 or vin_failed or iin_failed or aico_failed) else 0
 
 
 def stitch_log(args, session, dev, req_id):

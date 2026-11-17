@@ -977,3 +977,119 @@ class IinLimit(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("--iin-action", argv)
         self.assertNotIn("--ma", argv)
+
+
+class Aico(unittest.TestCase):
+    """aico: get is read-only; on/off are explicit and verified by the REG02 readback."""
+    CLIENT = "ambyte_28:37:2F:FF:FC:80"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+    _run = VinLimit._run
+
+    def setUp(self):
+        self.fc = _load()
+
+    @staticmethod
+    def reply(type_, enabled, reg02, **kw):
+        return dict(type=type_, ok=True, enabled=enabled, reg02=reg02, iin_limit_ma=1000, iin_dpm_ma=800,
+                    aico_stat=enabled, resets=2, failed=0, last_reset_ms=3601000, next_check_in_s=120,
+                    detail="AICO", **kw)
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="aico", aico_action="get"), "r"), {"type": "get_aico", "id": "r"})
+        self.assertEqual(b(_args(cmd="aico", aico_action="on"), "r"),
+                         {"type": "set_aico", "id": "r", "enabled": True})
+        self.assertEqual(b(_args(cmd="aico", aico_action="off"), "r"),
+                         {"type": "set_aico", "id": "r", "enabled": False})
+        with self.assertRaises(SystemExit):
+            b(_args(cmd="aico", aico_action="reset"), "r")
+
+    def test_switch_refuses_discovery_before_aws(self):
+        from unittest.mock import patch
+        for argv in (["aico", "--aico-action", "on"], ["aico", "--aico-action", "off", "--devices", " "],
+                     ["aico", "--aico-action", "reset", "--devices", self.CLIENT]):
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_get_is_read_only_and_switch_is_mutating_and_verified(self):
+        rc, sent, text = self._run(["aico"], lambda req: [self.reply("aico_result", False, 0xDC)])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "get_aico", "id": sent[0]["id"]})
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("enabled=False reg02=0xdc iin_limit_ma=1000 iin_dpm_ma=800", text)
+        busy = dict(type="set_aico_result", ok=False, detail="busy")
+        rc, sent, text = self._run(["aico", "--aico-action", "on"],
+                                   lambda req: [busy, self.reply("set_aico_result", True, 0xDD)])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "set_aico", "id": sent[0]["id"], "enabled": True})
+        self.assertIn("(MUTATING)", text)
+        rc, sent, text = self._run(["aico", "--aico-action", "off"],
+                                   lambda req: [self.reply("set_aico_result", False, 0xDC)])
+        self.assertEqual(rc, 0, text)
+        self.assertIs(sent[0]["enabled"], False)
+
+    def test_refusal_wrong_state_or_readback_fails_the_run(self):
+        on = ["aico", "--aico-action", "on"]
+        refused = dict(type="set_aico_result", ok=False, detail="AICO set/readback failed")
+        rc, _, text = self._run(on, lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("aico not confirmed", text)
+        for bad in (self.reply("set_aico_result", False, 0xDC),     # still off
+                    self.reply("set_aico_result", True, 0xDC),      # bit 0 does not say on
+                    self.reply("set_aico_result", True, 0x1DD),     # not a byte
+                    self.reply("set_aico_result", 1, 0xDD),         # not a bool
+                    dict(type="set_aico_result", ok=True, detail="x")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._run(on, lambda req: [bad])[0], 1)
+        # A get reply never answers a switch: the run times out.
+        rc, _, text = self._run(on, lambda req: [self.reply("aico_result", True, 0xDD)])
+        self.assertEqual(rc, 1)
+        self.assertIn("replies 0/1", text)
+
+    def test_workflow_offers_aico_with_one_input_at_the_limit(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("aico", inputs["command"]["options"])
+        self.assertEqual(inputs["aico_action"]["options"], ["get", "on", "off"])   # strings, not YAML booleans
+        self.assertEqual(inputs["aico_action"]["default"], "get")
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        self.assertEqual(step["env"]["AICO_ACTION"], "${{ inputs.aico_action }}")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, devices, command="aico"):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND=command, DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION="status", PP_STATE="no_flash",
+                           VIN_ACTION="get", VIN_MV="", IIN_ACTION="get", IIN_MA="", AICO_ACTION=action)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("on", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "aico")
+        self.assertEqual(argv[argv.index("--aico-action") + 1], "on")
+        rc, argv = argv_for("get", "")
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[argv.index("--aico-action") + 1], "get")
+        self.assertEqual(argv_for("off", " ")[0], 2)          # mutating without explicit devices
+        self.assertEqual(argv_for("on", "")[0], 2)
+        rc, argv = argv_for("on", self.CLIENT, command="iin-limit")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--aico-action", argv)              # never leaks into another command

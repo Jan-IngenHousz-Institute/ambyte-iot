@@ -13,7 +13,9 @@ name: Fleet command (ping / inventory / replay)
 # changes (set, MUTATING, explicit devices only) the charger's input voltage
 # limit on firmware >= 2.21.0 (docs/charger-vin-limit.md). `iin-limit` does the
 # same for the charger's input current limit register on firmware >= 2.23.0
-# (docs/charger-iin-limit.md).
+# (docs/charger-iin-limit.md). `aico` reads (get) or switches (on / off,
+# MUTATING, explicit devices only) the charger's AICO on firmware >= 2.23.0
+# (docs/charger-aico.md).
 
 on:
   workflow_dispatch:
@@ -26,7 +28,7 @@ on:
       command:
         description: "Command to send"
         type: choice
-        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read, power-protect, vin-limit, iin-limit]
+        options: [ping, inventory, replay, get-timezone, set-timezone, log-list, log-read, power-protect, vin-limit, iin-limit, aico]
         default: ping
       timezone:
         description: "set-timezone only: IANA timezone (e.g. Australia/Darwin); requires firmware with remote timezone support"
@@ -72,6 +74,11 @@ on:
         description: "iin-limit set only: charger input current limit register in mA, 100-3250 in 50 mA steps (e.g. 1000; default 500)"
         type: string
         default: ""
+      aico_action:
+        description: "aico only: get (read-only), on or off (MUTATING; needs an explicit device list; firmware >= 2.23.0)"
+        type: choice
+        options: [get, "on", "off"]
+        default: get
       devices:
         description: "Exact client ids (ambyte_<MAC> or AMBYTE_<MAC>, case matters) or MACs, comma/space separated; empty = discover active devices"
         type: string
@@ -187,6 +194,7 @@ jobs:
           VIN_MV: ${{ inputs.vin_limit_mv }}
           IIN_ACTION: ${{ inputs.iin_limit_action }}
           IIN_MA: ${{ inputs.iin_limit_ma }}
+          AICO_ACTION: ${{ inputs.aico_action }}
         run: |
           set -uo pipefail
           for v in WINDOW FROM_ID TO_ID FROM_MS TO_MS CHUNK WAIT LOG_TAIL; do
@@ -220,6 +228,10 @@ jobs:
               exit 2
             fi
           fi
+          if [[ "${COMMAND}" == "aico" && "${AICO_ACTION:-get}" != "get" && -z "${DEVICES//[[:space:]]/}" ]]; then
+            echo "::error::aico ${AICO_ACTION} requires an explicit device list; discovery is refused"
+            exit 2
+          fi
           if [[ -n "${EXPECT_OFFSET}" && ! "${EXPECT_OFFSET}" =~ ^-?[0-9]+$ ]]; then
             echo "::error::expect_offset must be integer seconds"
             exit 2
@@ -244,6 +256,7 @@ jobs:
             ARGS+=(--iin-action "${IIN_ACTION:-get}")
             [[ "${IIN_ACTION:-get}" == "set" ]] && ARGS+=(--ma "${IIN_MA}")
           fi
+          [[ "${COMMAND}" == "aico" ]] && ARGS+=(--aico-action "${AICO_ACTION:-get}")
           if [[ "${COMMAND}" == "log-read" ]]; then
             # fleet_command validates the name and refuses anything but one explicit device.
             ARGS+=(--name "${LOG_NAME}" --out device-log.txt)
