@@ -95,8 +95,12 @@ void mp2731_redetect_set_veto(bool (*veto)(void));
  * automatic re-detect pulses (BG_EN, DP/DM and its restore). begin never
  * blocks; false = maintenance active or pending: a command returns
  * ESP_ERR_NOT_ALLOWED and writes nothing, an automatic action is held.
- * Exempt: clearing a BG_EN left at 1 (s_bg_en_dirty), which restores the
- * charger and must run even during maintenance. NULL = always admitted. */
+ * While a pulsed bit (BG_EN or USB_DET_EN) is not proven back at 0 the
+ * driver HOLDS one admission (quarantine, also rebuilt from the registers
+ * at init after an ESP-only reboot): maintenance waits or goes busy, never
+ * granted over it. The recovery of that bit runs under the held admission,
+ * not a new one. Wiring the gate adopts a dirty state found before it.
+ * NULL = always admitted. */
 void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void));
 
 /* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).

@@ -107,10 +107,11 @@ static void mutation_end(void)
  * So, while either bit is dirty, this driver HOLDS one maintenance-gate
  * admission (s_quarantine). The gate counts it like an in-flight mutation:
  * a maintenance request becomes pending and waits (APP_CHARGER_DRAIN_MS) or
- * gives up busy; it is never granted over a dirty bit. The admission is the
- * one the failing pulse already held, handed over before it would have been
- * released (quarantine_take_over), so there is no instant with mutations = 0
- * and the bit dirty. Recovery (pulse_clear_if_dirty, on every power read)
+ * gives up busy; it is not granted over a dirty bit (rebuilt from the
+ * registers at init after an ESP-only reboot: charger_reconcile). The
+ * admission is the one the failing pulse already held, handed over before it
+ * would have been released (quarantine_take_over), so there is no instant
+ * with mutations = 0 and the bit dirty. Recovery (pulse_clear_if_dirty, on every power read)
  * needs no new admission - mutation_begin would refuse it while maintenance
  * is pending and strand the bit - and it can never meet GRANTED maintenance,
  * because maintenance cannot be granted while the quarantine is held. Once
@@ -122,13 +123,30 @@ static bool s_quarantine;   /* under s_read_mtx */
  * the caller must NOT release it: it now belongs to the quarantine. */
 static bool quarantine_take_over(void)
 {
-    if (!charger_dirty() || s_quarantine) return false;
+    /* Without a gate there is nothing to hold (mutation_end is a no-op);
+     * mp2731_set_mutation_gate adopts the dirty state when one is wired. */
+    if (!charger_dirty() || s_quarantine || s_gate_begin == NULL) return false;
     s_quarantine = true;
     ESP_LOGW(TAG, "charger re-detect: %s%s%s not proven back at 0; charger quarantined, "
                   "maintenance waits until it is",
              s_bg_en_dirty ? "BG_EN" : "", s_bg_en_dirty && s_dpdm_dirty ? " and " : "",
              s_dpdm_dirty ? "USB_DET_EN" : "");
     return true;
+}
+
+/* Under s_read_mtx (or single-threaded boot): take a NEW admission for a
+ * dirty state that has none - found at boot, or the gate wired after it.
+ * Refused (maintenance active) = nothing held; recovery then writes nothing
+ * until it can take one (pulse_clear_if_dirty). */
+static void quarantine_adopt(void)
+{
+    if (!charger_dirty() || s_quarantine || s_gate_begin == NULL) return;
+    if (mutation_begin()) {
+        s_quarantine = true;
+    } else {
+        ESP_LOGW(TAG, "charger re-detect: dirty charger bit but maintenance already active; "
+                      "recovery held until it ends");
+    }
 }
 
 /* Under s_read_mtx: release the quarantine once both bits are proven 0. */
@@ -223,6 +241,36 @@ static esp_err_t mp2731_write_reg(uint8_t reg, uint8_t val)
     return err;
 }
 
+/* ── Boot reconciliation (HAR-310, Codex re-review of PR #112) ───────────
+ * The quarantine, the dirty flags and the maintenance gate all live in ESP
+ * RAM; the MP2731 is powered separately and an ESP reset is not a charger
+ * POR (its I2C watchdog has long expired, so nothing resets REG09/REG0B
+ * either). After any ESP-only reboot the chip can still hold BG_EN = 1 or
+ * USB_DET_EN = 1 from a pulse whose cleanup was never proven. The REGISTERS
+ * are therefore the source of truth: read both at init and rebuild the dirty
+ * flags (and with them the quarantine). A register that cannot be read is
+ * treated as set - fail closed; recovery reads it again on every power read
+ * and writes only a bit it sees set. POR is 0 for both bits and nothing but
+ * a re-detect pulse sets them, so a healthy unit is never quarantined.
+ * Not covered: a charger that fails its boot probe is not driven at all this
+ * boot (no reads, no writes), and nothing can be reconciled. */
+static void charger_reconcile(void)
+{
+    uint8_t r09 = 0, r0b = 0;
+    const esp_err_t e09 = mp2731_read_reg(MP2731_REG_BANDGAP, &r09);
+    const esp_err_t e0b = mp2731_read_reg(MP2731_REG_USB_DET, &r0b);
+    if (e09 != ESP_OK || (r09 & MP2731_BG_EN_BIT) != 0u) s_bg_en_dirty = true;
+    if (e0b != ESP_OK || (r0b & MP2731_USB_DET_EN_BIT) != 0u) s_dpdm_dirty = true;
+    dirty_sync();
+    if (!charger_dirty()) return;
+    ESP_LOGW(TAG, "charger re-detect at boot: REG09 %s0x%02X, REG0B %s0x%02X - %s%s%s not proven 0; "
+                  "charger quarantined, maintenance waits until recovery proves it",
+             e09 != ESP_OK ? "unreadable " : "", r09, e0b != ESP_OK ? "unreadable " : "", r0b,
+             s_bg_en_dirty ? "BG_EN" : "", s_bg_en_dirty && s_dpdm_dirty ? " and " : "",
+             s_dpdm_dirty ? "USB_DET_EN" : "");
+    quarantine_adopt();
+}
+
 esp_err_t mp2731_init(void)
 {
     i2c_port_t port = I2C_NUM_MAX;
@@ -257,6 +305,7 @@ esp_err_t mp2731_init(void)
     s_ready = (err == ESP_OK);
     if (s_ready) {
         ESP_LOGI(TAG, "MP2731 charger detected @ 0x%02X", MP2731_I2C_ADDR);
+        charger_reconcile();
     } else {
         ESP_LOGW(TAG, "MP2731 not found @ 0x%02X: %s", MP2731_I2C_ADDR,
                  esp_err_to_name(err));
@@ -383,7 +432,7 @@ static int64_t uptime_ms(void)
 static void pulse_clear_if_dirty(void)
 {
     if (!charger_dirty()) return;
-    if (!s_quarantine) {
+    if (!s_quarantine && s_gate_begin != NULL) {
         /* Only while a manual bg_en that dirtied BG_EN is still in its settle
          * reads: its own admission is held (maintenance cannot be granted),
          * but it is not the quarantine yet. Take a second admission for the
@@ -950,6 +999,12 @@ void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void))
 {
     s_gate_begin = begin;
     s_gate_end = end;
+    /* A dirty state reconciled at init before the gate was wired becomes a
+     * held admission now, so it is visible before any maintenance runs. */
+    if (s_read_mtx != NULL && xSemaphoreTake(s_read_mtx, portMAX_DELAY) == pdTRUE) {
+        quarantine_adopt();
+        xSemaphoreGive(s_read_mtx);
+    }
 }
 
 static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out,

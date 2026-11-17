@@ -73,6 +73,39 @@ class GateTest(unittest.TestCase):
     def test_no_bg_en_or_usb_det_en_write_from_any_read_path_under_granted_maintenance(self):
         self.run_case("no_edge_under_maintenance")
 
+    def test_esp_reboot_with_usb_det_en_still_set_rebuilds_the_quarantine(self):
+        self.run_case("reboot_dpdm")
+
+    def test_esp_reboot_with_bg_en_still_set_rebuilds_the_quarantine(self):
+        self.run_case("reboot_bg_en")
+
+    def test_unreadable_register_at_boot_fails_closed_then_recovers(self):
+        self.run_case("boot_read_failure")
+
+    def test_clean_charger_at_boot_is_never_quarantined(self):
+        self.run_case("boot_clean")
+
+    def test_app_main_holds_maintenance_until_the_charger_is_reconciled(self):
+        """Source contract (app_main is not host-built): the charger boot hold
+        is taken before any maintenance-capable component is configured and
+        released only after mp2731_init reconciled REG09/REG0B; the gate is
+        wired before mp2731_init so the rebuilt quarantine is held at once."""
+        src = (ROOT / "main/app_main.c").read_text()
+        main = src[src.index("void app_main(void)"):]
+        hold = main.index("app_charger_boot_hold_begin();")
+        for user in ("command_router_init(", "ota_update_init(", "ambit_ota_init(",
+                     "script_update_init("):
+            if user in main:
+                self.assertLess(hold, main.index(user), user)
+        i2c = main.index("app_init_i2c_and_sensors();")
+        end = main.index("app_charger_boot_hold_end();", i2c)
+        # Released right after the reconciliation, before anything else runs.
+        self.assertNotIn(";", main[i2c + len("app_init_i2c_and_sensors();"):end].replace(" */", "").split("/*")[0])
+        self.assertLess(main.index("app_init_nvs();"), hold)
+        init = src[src.index("static esp_err_t app_init_i2c_and_sensors(void)"):]
+        init = init[:init.index("\n}\n")]
+        self.assertLess(init.index("mp2731_set_mutation_gate("), init.index("mp2731_init()"))
+
     def test_pure_gate_semantics(self):
         self.run_case("gate")
 

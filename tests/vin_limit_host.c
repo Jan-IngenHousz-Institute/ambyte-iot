@@ -65,6 +65,8 @@ esp_err_t i2c_master_write_read_device(i2c_port_t port, uint8_t addr,
     const uint8_t *reg, size_t reg_size, uint8_t *out, size_t size, TickType_t timeout)
 {
     assert(locked && port == 0 && addr == 0x4b && reg_size == 1 && size == 1 && timeout > 0);
+    /* Boot reconciliation (HAR-310) reads REG09/REG0B once at init: POR 0. */
+    if (*reg == 0x09 || *reg == 0x0B) { *out = 0; return ESP_OK; }
     assert(*reg == 1); reads++;
     if (read_error) return read_error;
     *out = reg01 + mismatch; return ESP_OK;
@@ -137,6 +139,7 @@ int main(int argc, char **argv)
     }
     assert(mp2731_init() == ESP_OK && mp2731_is_ready());
     assert(!writes); /* initialization never changes the charger's default */
+    locks = unlocks = 0; /* boot reconciliation reads are not VIN-limit traffic */
     vin_limit_command_config_t config = {.reply = reply, .submit = submit};
     vin_limit_command_init(&config);
 

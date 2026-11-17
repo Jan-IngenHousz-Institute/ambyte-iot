@@ -380,6 +380,30 @@ static void app_charger_mutation_end(void)
     taskEXIT_CRITICAL(&s_maint_mux);
 }
 
+/* Boot hold (HAR-310, Codex re-review of PR #112). Until the MP2731 has been
+ * reconciled from its registers (mp2731_init reads REG09/REG0B and rebuilds a
+ * quarantine for a BG_EN / USB_DET_EN left set across an ESP-only reboot),
+ * the charger state is UNKNOWN, and maintenance must not be granted over it.
+ * Several maintenance paths are configured before the I2C bus comes up (OTA,
+ * AMBIT OTA, script update, command router), so rather than rely on none of
+ * them running early, one charger admission is held from just after NVS
+ * until the reconciliation is done: a request meanwhile waits (bounded by
+ * APP_CHARGER_DRAIN_MS) like any in-flight charger mutation. Released on
+ * every path past that point (idempotent). */
+static bool s_charger_boot_hold;
+
+static void app_charger_boot_hold_begin(void)
+{
+    s_charger_boot_hold = app_charger_mutation_begin();
+}
+
+static void app_charger_boot_hold_end(void)
+{
+    if (!s_charger_boot_hold) return;
+    s_charger_boot_hold = false;
+    app_charger_mutation_end();
+}
+
 /* Refcounted MQTT suspend/resume for the maintenance workers (belt-and-suspenders
  * to the maintenance lock above). Raw mqtt_client_stop/start are idempotent but
  * NOT refcounted — this wrapper restarts MQTT only when the LAST holder resumes,
@@ -666,15 +690,18 @@ static esp_err_t app_init_i2c_and_sensors(void)
         ESP_LOGI(APP_TAG, "BME280 initialized");
     }
 
+    /* Charger re-detection never pulses under the maintenance lock (OTA /
+     * AMBIT flash): docs/charger-redetect.md. Wired BEFORE mp2731_init, so
+     * the quarantine rebuilt from REG09/REG0B at init (a BG_EN or USB_DET_EN
+     * left set across an ESP-only reboot) is a held gate admission at once. */
+    mp2731_redetect_set_veto(app_maintenance_active);
+    mp2731_set_mutation_gate(app_charger_mutation_begin, app_charger_mutation_end);
+
     /* MP2731 charger — provides battery/input power telemetry. Absent on dev
      * boards without the charger; the read path degrades gracefully. */
     if (mp2731_init() == ESP_OK) {
         ESP_LOGI(APP_TAG, "MP2731 charger initialized");
     }
-    /* Charger re-detection never pulses under the maintenance lock (OTA /
-     * AMBIT flash): docs/charger-redetect.md. Set before any power read. */
-    mp2731_redetect_set_veto(app_maintenance_active);
-    mp2731_set_mutation_gate(app_charger_mutation_begin, app_charger_mutation_end);
 
     return ESP_OK;
 }
@@ -1140,6 +1167,7 @@ void app_main(void)
         return;
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
+    app_charger_boot_hold_begin();   /* released once the charger is reconciled */
     sd_diag_boot_nvs();
     /* Boot counter + reset reason + coredump summary, read ONCE here in task
      * context and cached for every heartbeat / pong (diag.h). Read-only on the
@@ -1440,6 +1468,7 @@ void app_main(void)
     err = app_start_wifi();
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Wi-Fi startup failed: %s", esp_err_to_name(err));
+        app_charger_boot_hold_end();
         return;
     }
     ESP_LOGI(APP_TAG, "Free heap after WiFi: %lu", (unsigned long)esp_get_free_heap_size());
@@ -1481,6 +1510,9 @@ void app_main(void)
 
     /* ── I2C + Sensors ────────────────────────────────────────────── */
     err = app_init_i2c_and_sensors();
+    /* The MP2731 is reconciled (or absent / the bus failed: nothing to
+     * reconcile): a quarantine, if any, now holds its own admission. */
+    app_charger_boot_hold_end();
     /* ── Brownout protection (power_protect.h) ──────────────────────────
      * Here, on BOTH sides of the I2C check: NVS and diag are up, the RTC and
      * clock_trust have just decided how far the clock can be trusted (the

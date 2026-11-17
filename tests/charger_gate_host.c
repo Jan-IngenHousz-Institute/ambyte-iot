@@ -74,6 +74,7 @@ static int takes, take_fail_at = -1;  /* HAR-310: the Nth read-mutex take times 
  * (-1 = never fail), and BG_EN clears the chip ignores while > 0. */
 static int ok_0b_writes = -1, bg_stuck;
 static int bg_writes_busy, dpdm_writes_busy;  /* REG09/REG0B written while maintenance runs */
+static int fail_reads_09;                     /* PR #112 re-review: REG09 reads that fail */
 
 esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 void h_critical_enter(portMUX_TYPE *m) { assert(!m->held); m->held = 1; }
@@ -100,6 +101,7 @@ esp_err_t i2c_master_write_read_device(int port, unsigned addr, const uint8_t *w
     (void)port; (void)timeout;
     assert(locked && addr == 0x4B && wn == 1 && rn == 1 && *w < 24);
     io_step(); bus_ops++;
+    if (*w == 0x09 && fail_reads_09 > 0) { fail_reads_09--; return ESP_FAIL; }
     *r = regs[*w];
     return ESP_OK;
 }
@@ -289,6 +291,65 @@ int main(int argc, char **argv)
         CHECK(bg_writes_busy == 0 && dpdm_writes_busy == 0, "no BG_EN edge under granted maintenance");
         maint_gate_end(&g);
         CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
+        puts("OK");
+        return 0;
+    }
+    if (!strcmp(c, "reboot_dpdm") || !strcmp(c, "reboot_bg_en") ||
+        !strcmp(c, "boot_read_failure") || !strcmp(c, "boot_clean")) {
+        /* PR #112 re-review P1: an ESP-only reboot clears every RAM flag and
+         * the gate, but the separately powered MP2731 keeps REG09/REG0B. The
+         * driver must rebuild the quarantine from the registers at init, in
+         * either wiring order, before maintenance can be granted. */
+        for (int gate_first = 0; gate_first < 2; gate_first++) {
+            fresh();
+            bg_writes_busy = dpdm_writes_busy = 0;
+            if (!strcmp(c, "reboot_dpdm")) {
+                ok_0b_writes = 1;                 /* force lands, restore fails */
+                CHECK(m_dpdm() != ESP_OK && (regs[0x0B] & 0x20), "dpdm left set");
+                ok_0b_writes = 0;                 /* and the bus stays bad across the reboot */
+            } else if (!strcmp(c, "reboot_bg_en")) {
+                bg_stuck = 1 + (int)MP2731_BG_EN_CLEAR_RETRIES + 1;
+                CHECK(m_bg_en() != ESP_OK && (regs[9] & 0x08), "bg_en left set");
+            } else if (!strcmp(c, "boot_read_failure")) {
+                fail_reads_09 = 2;                /* the boot read (and nothing else) fails */
+            }
+            /* ── ESP reboot: RAM (BSS) gone, charger registers retained ── */
+            memset(&g, 0, sizeof g); in_mutation = 0;
+            s_quarantine = false; s_bg_en_dirty = false; s_dpdm_dirty = false;
+            s_manual_active = false; s_marker_checked = false; s_prev_adc_valid = false;
+            s_gate_begin = NULL; s_gate_end = NULL; s_redetect_veto = NULL;
+            if (!strcmp(c, "boot_read_failure")) fail_reads_09 = 1;
+            const int boot_writes = writes;
+            if (gate_first) mp2731_set_mutation_gate(gate_begin, gate_end);
+            assert(mp2731_init() == ESP_OK);
+            mp2731_redetect_set_veto(veto);
+            if (!gate_first) mp2731_set_mutation_gate(gate_begin, gate_end);
+            CHECK(writes == boot_writes, "boot writes nothing to the charger");
+            const maint_gate_result_t r = maint_gate_request(&g);
+            if (!strcmp(c, "boot_clean")) {
+                CHECK(r == MAINT_GATE_GRANTED && g.mutations == 0,
+                      "healthy charger: maintenance granted at once (gate_first %d)", gate_first);
+                maint_gate_end(&g);
+                continue;
+            }
+            CHECK(r == MAINT_GATE_WAIT, "%s: maintenance granted after the reboot with REG09 0x%02X "
+                  "REG0B 0x%02X (gate_first %d)", c, regs[9], regs[0x0B], gate_first);
+            CHECK(g.mutations == 1, "the rebuilt quarantine holds the gate (%u)", g.mutations);
+            if (!strcmp(c, "reboot_dpdm")) {
+                reads_for(20 * S);
+                CHECK(maint_gate_poll(&g) == MAINT_GATE_WAIT && (regs[0x0B] & 0x20), "still unproven");
+                ok_0b_writes = -1;
+            }
+            for (int i = 0; i < 4 && g.mutations != 0; i++) reads_for(5 * S);
+            CHECK(!(regs[9] & 0x08) && !(regs[0x0B] & 0x20) && g.mutations == 0,
+                  "%s: recovery proved both bits 0 (REG09 0x%02X REG0B 0x%02X, %u)", c, regs[9],
+                  regs[0x0B], g.mutations);
+            CHECK(maint_gate_poll(&g) == MAINT_GATE_GRANTED, "%s: granted after recovery", c);
+            reads_for(30 * S);
+            CHECK(bg_writes_busy == 0 && dpdm_writes_busy == 0, "%s: no REG09/REG0B write under maintenance", c);
+            maint_gate_end(&g);
+            CHECK(!locked && !mutex_held && in_mutation == 0 && g.mutations == 0, "clean exit");
+        }
         puts("OK");
         return 0;
     }
