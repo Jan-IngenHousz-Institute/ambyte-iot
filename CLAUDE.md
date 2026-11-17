@@ -106,7 +106,10 @@ holds bench boards.
   charging/done, on a full battery, under the maintenance lock, or over a BG_EN or
   USB_DET_EN not proven back at 0 (HAR-310: the manual DP/DM restore is
   unconditional cleanup inside the admission, never a settle-snapshot side effect;
-  only reads at or before the 60 s deadline judge an outcome). RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
+  only reads at or before the 60 s deadline judge an outcome). A dirty bit
+  QUARANTINES maintenance: the failing pulse's gate admission is kept until
+  recovery proves both bits 0, so maintenance waits/goes busy and recovery (itself
+  a BG_EN 1->0 detection edge) never runs under granted maintenance. RAM only (no NVS/OTP); an RTC_NOINIT marker turns auto off for a
   boot that reset during an open attempt.
 - **Self-reboot paths** (nightly maintenance, conn-health, memory, no-PUBACK watchdogs) each
   have their own NVS anti-loop latch + uptime gate; maintenance lock (OTA/AMBIT flash) is an

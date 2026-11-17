@@ -76,12 +76,28 @@ While a BG_EN or USB_DET_EN is dirty (not proven back at 0), every power
 read first retries its restore. Every pulse is refused meanwhile: manual commands
 reply `ESP_ERR_NOT_FINISHED`, automatic re-detection and AICO re-arms hold, and
 `charger_redetect auto on` is refused. Telemetry shows the state in
-`redetect.dirty`. These restores are exempt from the maintenance admission:
-each one only writes a bit back to its POR value, which can stop charger activity but
-never starts a detection, a charge cycle or a limit change. Refusing it during
-an OTA would keep the hazard in place for exactly the operation that relies on
-a stable input. A settle snapshot whose mutex take times out is simply missing
-from the report (`snapshots` < 4); it never skips the cleanup.
+`redetect.dirty`.
+
+**A dirty bit quarantines maintenance** (PR #112 review). The recovery is not
+harmless. Clearing BG_EN is a 1→0 edge, which is the re-detect edge itself:
+datasheet Rev 1.2 p.34 says it "resets the input plug-in detection and safety
+timer", and on the bench it restarted a charge cycle on a full battery.
+Clearing USB_DET_EN ends a forced detection. Neither may happen while an OTA or
+AMBIT flash runs on the external input. So while either bit is dirty:
+
+- the driver keeps one maintenance-gate admission, the one the failing pulse
+  already held. It is handed over before it would have been released, so the
+  gate never sees zero mutations while a bit is dirty;
+- a maintenance request becomes pending and waits (up to 20 s), or gives up
+  busy. It is never granted over a dirty bit;
+- recovery runs on every power read under that held admission. It therefore
+  also runs while maintenance is *pending*, which drains the quarantine, but it
+  can never meet *granted* maintenance;
+- once both bits read back 0, the admission is released and a waiting request
+  is granted on its next poll.
+
+A settle snapshot whose mutex take times out is simply missing from the report
+(`snapshots` < 4); it never skips the cleanup.
 
 The command is refused under the maintenance lock (OTA, AMBIT flash), with
 `maintenance_active`. It holds the
@@ -205,8 +221,15 @@ flowchart TD
     D -- Yes --> OK[Outcome window opens]
     D -- No, readback 1 --> S[not_cleared: auto disabled,<br/>ESP_LOGE, BG_EN dirty]
     D -- No, bus error --> T[bus_error, BG_EN dirty]
-    S --> R[Every later power read restores the dirty bit first.<br/>No pulse of any kind, AICO holds,<br/>auto on refused while dirty]
-    T --> R
+    S --> QH[Quarantine: the pulse's gate admission is kept,<br/>handed over before release]
+    T --> QH
+    QH --> R[Every later power read restores the dirty bit first.<br/>No pulse of any kind, AICO holds,<br/>auto on refused while dirty]
+    R --> MQ{Maintenance requested?}
+    MQ -- While dirty --> MW[Pending: waits up to 20 s or gives up busy,<br/>never granted over a dirty bit]
+    MW --> R
+    R --> RC{Both bits read back 0?}
+    RC -- Yes --> QR[Quarantine released:<br/>a pending request is granted on its next poll]
+    RC -- No --> R
     OK --> W{Unit resets before the outcome?}
     W -- Brownout, watchdog, panic, USB --> X[Boot finds RTC marker open:<br/>auto off this boot, reason reset_during_attempt]
     W -- No --> V{Valid read at or before +60 s?}
@@ -221,7 +244,7 @@ flowchart TD
     RS --> RV{Bit 5 reads back 0?}
     RV -- Yes --> MOK[Admission released, maintenance may begin]
     RV -- No, or bus error --> MD[Command fails, USB_DET_EN dirty]
-    MD --> R
+    MD --> QH
 ```
 
 ### Failure modes
@@ -234,7 +257,8 @@ flowchart TD
 | Battery actually full | Excluded by VSYS ≥ 4.1 V and by CHG_STAT 11. The bench showed why this matters: a pulse on a full battery restarts a charge cycle. |
 | Bus busy or failing | A lock timeout or bus error in the precheck counts as `blocked` (bus_error). If the pulse cannot get the bus at all, nothing is written and nothing is marked dirty: it is a failed attempt (`bus_error`) with backoff, logged as "pulse not started" (HAR-310). If the set may have landed, the clear is retried on every later read. |
 | Readers stall around the outcome window | Only reads at or before +60 s count; a window with none closes as `unknown` (HAR-310). |
-| DP/DM restore cannot be proven | The manual command fails, `dirty` shows `dpdm`, every pulse and AICO re-arm holds, and every power read retries the restore until bit 5 reads back 0. |
+| DP/DM restore cannot be proven | The manual command fails, `dirty` shows `dpdm`, every pulse and AICO re-arm holds, and every power read retries the restore until bit 5 reads back 0. Maintenance waits (or gives up busy) meanwhile; it is never granted with bit 5 set. |
+| BG_EN clear cannot be proven | Same quarantine. Maintenance is never granted while BG_EN may be 1, so the recovery's 1→0 edge (a detection and safety-timer reset) can never happen under a running OTA or AMBIT flash. |
 | I²C watchdog resets BG_EN | REG09 is "Reset by WTD". The watchdog is already expired on every unit and the firmware never kicks it, so no new expiry happens during the pulse. The bench confirmed that BG_EN latches 1 with REG0D = 0x80. If an expiry did reset the bit between the writes, the 0 readback still passes. Whether a watchdog reset counts as a 1→0 edge is undocumented; the outcome tracking shows it either way. |
 | Silicon reacts badly to the bandgap toggle (VSYS collapse, hang) | The RTC_NOINIT marker is open from the pulse until the outcome is decided. After any reset except power-on, a deliberate `esp_restart` or deep sleep, automatic re-detection stays off for that boot (`reset_during_attempt`). A real power loss garbles RTC memory, which the magic plus the POWERON check reject. |
 | AMBIT measurement running | Not a veto. The pulse fires only while the chip already ignores its input, so the system is already on battery. A successful re-detect is the same input transition the chip makes at every dawn or passing cloud. |
@@ -302,6 +326,13 @@ pio run -e esp32-s3-devkitm-1
   read exactly at the deadline is. The driver harness also runs under
   MemorySanitizer (`MsanDriverTest`), which is what catches the uninitialised
   pulse result on v2.23.0. ASan/UBSan cannot see it.
+- **Quarantine regressions (PR #112 review), both bits** (`test_charger_gate.py`):
+  - a failed DP/DM restore or a stuck BG_EN (manual and automatic) keeps
+    maintenance waiting until recovery is verified, including after an
+    abandoned request;
+  - with maintenance already pending at the failure, recovery drains it and
+    then grants;
+  - no read path writes REG09 or REG0B under granted maintenance.
 - **Frontends:** CLI parsing, and the MQTT handler (deferred to the worker, no I²C
   on the MQTT task, snapshots in the reply, evidence on failure, invalid
   id/method/enabled, busy, queue refusal).

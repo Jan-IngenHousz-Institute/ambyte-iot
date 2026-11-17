@@ -216,7 +216,8 @@ first bus access and released after the last, on every exit path.
 | Maintenance requested while mutations are in flight | Becomes pending and **waits** (polling every 10 ms) until they end, at most 20 s; new mutations are refused from that moment, so it cannot be starved |
 | Mutation still running after 20 s (a sick bus) | The maintenance op gives up and reports busy, exactly as for a concurrent maintenance op; mutations are admitted again |
 | Maintenance begins just after a veto probe said "free" | The admission is refused: nothing is written (the race found in review) |
-| Clearing a BG_EN left at 1, restoring a USB_DET_EN left at 1 (HAR-310) | Exempt: each only writes its bit back to its POR value 0, which can stop charger activity but never start it, and must run even during maintenance |
+| A pulse leaves BG_EN or USB_DET_EN not proven back at 0 | **Quarantine**: the pulse's admission is kept (handed over before release) until both bits read back 0. Maintenance requested meanwhile waits up to 20 s or gives up busy, and is never granted over a dirty bit |
+| Recovering that bit (every power read) | Runs under the quarantine admission, so without a new `mutation_begin` and also while maintenance is pending, which drains the quarantine. It can never run under granted maintenance. It is not harmless: a BG_EN 1→0 is the re-detect edge (input detection and safety timer reset, a charge cycle can restart) |
 | The DP/DM restore of a manual `charger_redetect dpdm` | Inside the command's admission, unconditionally, before it is released (HAR-310): maintenance is never granted with bit 5 still forcing detection |
 
 Maintenance waits instead of being refused because charger mutations are
