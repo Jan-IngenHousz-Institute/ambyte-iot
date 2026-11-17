@@ -618,6 +618,11 @@ CONFIG_AMBYTE_WIFI_PASSWORD="__UNPROVISIONED__"
 # end of Ambyte bench diagnostics
 
 #
+# Ambyte bench BLE diagnostics
+#
+# end of Ambyte bench BLE diagnostics
+
+#
 # Ambyte SD overflow on-device verification
 #
 # CONFIG_AMBYTE_EVQ_HIL is not set

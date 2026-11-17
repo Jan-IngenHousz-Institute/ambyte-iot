@@ -134,6 +134,15 @@ typedef struct {
      * sched_runner call, because sched_runner already depends on this
      * component — the composition root (app_main) wires the two. */
     schedule_provenance_fn              schedule_provenance;
+
+    /* Bench-only observer (env bench-ble, components/ble_diag): receives each
+     * ambyte.telemetry/1 sample object the moment emit_status_event has built
+     * it (stored or direct heartbeat; never a CLI preview), BEFORE delivery,
+     * so a local reader sees the exact JSON the unit sends without triggering
+     * a second status read (charger reads have side effects). Runs on the
+     * building task; it must copy and return, and must not call back into
+     * device_commands or event_log. NULL in every release build. */
+    void                              (*telemetry_built)(const char *json, size_t len);
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);

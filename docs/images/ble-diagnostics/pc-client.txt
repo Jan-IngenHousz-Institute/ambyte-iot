@@ -1,0 +1,27 @@
+Bench BLE diagnostics: contract v0 flow from a PC - real BlueZ/bleak client output
+Unit 28:37:2F:FF:E7:04 - 2026-11-17 09:44 local (UTC+1) - client: Linux BlueZ, bleak 0.22.3
+Firmware: v2.23.0-2-g1da5eb4-dirty = commit 8c88316 (env bench-ble)
+Client: scan by service UUID, read meta, page the snapshot (write page_offset, read page,
+check seq), read live, subscribe meta+live for 25 s, then a deliberately wrong 3-byte write.
+
+09:44:20 scanning for 6a4d0001-3b2c-4f8e-9a51-0c7e2b4d9a10
+09:44:21 found Ambyte-E704 28:37:2F:FF:E7:06
+09:44:23 connected
+09:44:23 meta {'v': 0, 'seq': 3, 'len': 4632, 'age_ms': 4686, 'fw': 'v2.23.0-2-g1da5eb4-dirty', 'mac': '28:37:2F:FF:E7:04'}
+09:44:29 snapshot 4632 B in 20 pages, 5.07 s; schema=ambyte.telemetry/1 keys=['schema', 'measure_id', 'device', 'tag', 'time', 'observations', 'health']
+09:44:29 live {'age_ms': 5709, 'vin_mv': 5160, 'vsys_mv': 4400, 'vbat_mv': 4200, 'iin_ma': 186, 'ichg_ma': 0, 'status': 57, 'fault': 128, 'valid': True, 'reason': 'ok'}
+09:44:30 NOTIFY live {"age_ms":855,"vin_mv":5100,"vsys_mv":4340,"vbat_mv":4200,"iin_ma":199,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:35 NOTIFY live {"age_ms":425,"vin_mv":5100,"vsys_mv":4380,"vbat_mv":4200,"iin_ma":146,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:36 NOTIFY live {"age_ms":714,"vin_mv":5100,"vsys_mv":4360,"vbat_mv":4180,"iin_ma":199,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:42 NOTIFY live {"age_ms":725,"vin_mv":5100,"vsys_mv":4400,"vbat_mv":4200,"iin_ma":212,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:48 NOTIFY live {"age_ms":715,"vin_mv":5160,"vsys_mv":4340,"vbat_mv":4200,"iin_ma":212,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:51 NOTIFY live {"age_ms":705,"vin_mv":5160,"vsys_mv":4360,"vbat_mv":4200,"iin_ma":159,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:54 NOTIFY live {"age_ms":705,"vin_mv":5100,"vsys_mv":4320,"vbat_mv":4200,"iin_ma":146,"ichg_ma":0,"status":57,"fault":128,"valid":true,"reason":"ok"}
+09:44:54 3-byte offset write refused: [org.bluez.Error.InvalidArguments] Invalid Length
+09:44:56 disconnected
+
+Annotations (not client output):
+The device negotiated MTU 247 (console: "ble_diag: mtu 247"); bleak's own mtu_size property
+reported 23 before acquiring it, so it is left out above. status 57 = REG0C 0x39, fault 128 =
+REG0D 0x80. The heartbeat seq stayed 3 for the 25 s (stored heartbeat every 5 min), so no
+meta notify was due; live notifies followed each cached charger read (every 3-6 s).
