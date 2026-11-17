@@ -1,0 +1,19 @@
+Comparison run: official release v2.23.0 on the same unit, MQTT up - real USB console
+Unit 28:37:2F:FF:E7:04 - 2026-11-17 local time (UTC+1) - restored right after the bench-ble run
+Firmware: 2.23.0 (official production-signed release, image sha256 c526e53d...)
+Excerpt; sync_runner 'heap:' lines sampled once a minute. Compare dma largest 10740 here with 6132 under bench-ble.
+
+09:54:48 I app_init: App version:      2.23.0
+09:54:48 I heap_init: At 3FCBB068 len 0002E6A8 (185 KiB): RAM
+09:55:20 I APP_MAIN: schedule runner started
+09:55:22 I mqtt_client: MQTT connected
+09:55:30 I sync_runner: heap: internal free=45143 largest=10740; dma free=37399 largest=10740; window=0/16 slots 0/65536 B
+09:56:00 I sync_runner: heap: internal free=44067 largest=10740; dma free=36323 largest=10740; window=0/16 slots 0/65536 B
+09:57:00 I sync_runner: heap: internal free=43747 largest=10740; dma free=36003 largest=10740; window=0/16 slots 0/65536 B
+09:58:00 I sync_runner: heap: internal free=43703 largest=10740; dma free=35959 largest=10740; window=0/16 slots 0/65536 B
+09:59:00 I sync_runner: heap: internal free=43411 largest=10740; dma free=35667 largest=10740; window=0/16 slots 0/65536 B
+10:00:00 I sync_runner: heap: internal free=43275 largest=10740; dma free=35531 largest=10740; window=0/16 slots 0/65536 B
+10:00:12 I sched_act: MPF ch0: 180 points, -253.4C, stored 253475 (10s after trigger, est 10s)
+10:00:12 W sync_runner: publish deferred (window heap): id=253475 need=11884B int_largest=10740 dma_largest=10740 (attempt 1/30)
+10:01:00 I sync_runner: heap: internal free=43187 largest=10740; dma free=35443 largest=10740; window=0/16 slots 0/65536 B
+10:01:31 W sync_runner: publish deferred (window heap): id=253475 need=11884B int_largest=10740 dma_largest=10740 (attempt 11/30)

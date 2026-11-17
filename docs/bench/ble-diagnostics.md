@@ -107,6 +107,37 @@ stateDiagram-v2
   Idle --> Advertising: ble on [min]
 ```
 
+## Main finding: with BLE on, the gateway's own uplink fails
+
+The publisher's window-heap gate (`device_commands.c`, `heap_need = outstanding
++ envelope cap + 2 KiB`) needs that much as ONE contiguous block in both the
+internal and the DMA-capable pool. Measured on the same unit with MQTT up
+(sync_runner `heap:` lines, 2026-11-17):
+
+| | release v2.23.0 (official, 7 min, 58 samples) | bench-ble (8c88316, 10 min, 80 samples) | delta |
+|---|---|---|---|
+| internal free (median) | 43,363 B | 18,840 B | −24.5 KB |
+| internal largest block | 10,740 B | 7,668 B | −3.1 KB |
+| DMA free (median) | 35,619 B | 11,096 B | −24.5 KB |
+| **DMA largest block** | **10,740 B** | **6,132 B** | **−4.6 KB** |
+
+A normal ~4.3–4.7 KB heartbeat record needs ~6.7 KB. Under bench-ble the
+largest DMA block (6.1 KB) is smaller than that, so every heartbeat was
+deferred, with or without a phone connected (the controller's memory is taken
+at boot), and after 30 attempts quarantined: ids 253080 (09:48:02) and 253081
+(09:52:02) went to `/evstore/events/quarantine.log` and the SD archive. **This
+is a release blocker for BLE in this form**, independent of the bench-only
+label: BLE as built here costs ~24.5 KB of internal/DMA heap that the uplink
+needs.
+
+The same gate also blocks the official image, at a higher threshold: on
+v2.23.0 an MPF trace record (id 253475, 180 points, need 11,884 B) was deferred
+against a 10,740 B largest block, still at attempt 11/30 when the log ended. So
+records whose envelope exceeds ~8.7 KB cannot leave this unit even without
+BLE. To check: with `SPIRAM_MALLOC_ALWAYSINTERNAL=1024` the envelope
+`malloc(cap)` itself prefers PSRAM, so charging the whole envelope against the
+internal/DMA largest block may be stricter than the real allocations.
+
 ## Internal RAM budget (why the overlay trims Wi-Fi and the controller)
 
 The BT controller's buffers must be internal RAM, and this firmware runs with
@@ -120,10 +151,12 @@ v2.23.0 base):
 | 2 | + Wi-Fi IRAM fast paths in flash, controller MAX_ACT 2, no scan/DTM/LL security | heap region 163 → 183 KiB; controller still failed (post-TLS heap fragmented) |
 | 3 | + controller/host/GATT init early (before Wi-Fi) | BLE up, costs 31 KiB; schedule runner `ESP_ERR_NO_MEM`, MQTT at 11 KiB free / 2.5 KiB largest |
 | 4 | + controller code in flash (`BT_CTRL_RUN_IN_FLASH_ONLY`), smaller BLE stacks | heap region 196 KiB; runner starts, but the host task (created at boot-complete) silently failed: never synced |
-| 5 | + host and worker tasks created early too | **all up**: advertising, runner, MQTT; 20.4 KiB free / 7.7 KiB largest with MQTT up and advertising, 19.5 KiB while a client pages the snapshot |
+| 5 | + host and worker tasks created early too | BLE, runner and MQTT all start; 20.4 KiB free / 7.7 KiB largest; but the DMA largest block (6.1 KiB) starves the publisher (finding above) |
 
-So the IRAM moved to flash pays for the controller (about 35 KiB including
-task stacks). Costs of those trims:
+The IRAM moved to flash pays for the controller's code footprint, but not
+for its heap: the controller, host and their tasks take ~35 KiB of heap, and
+against the release image the internal and DMA free pools are ~24.5 KB lower
+(table above). Other costs of those trims:
 - Wi-Fi RX/TX fast paths in flash: lower peak Wi-Fi throughput, irrelevant at
   the MQTT rate.
 - Controller in flash: its ISRs cannot run while the cache is off for a flash
