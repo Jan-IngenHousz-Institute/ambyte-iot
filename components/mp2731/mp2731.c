@@ -15,12 +15,19 @@
 #include "mp2731_core.h"
 #include "mp2731_diagnostics.h"
 #include "mp2731_redetect.h"
+#include "mp2731_aico.h"
 
 #define TAG "mp2731"
 
 /* Register map, datasheet citations and the read algorithm live in
  * mp2731_core.{h,c} (host-testable); this file is only the I2C adapter. */
 #define MP2731_REG_VIN_LIMIT 0x01u
+#define MP2731_REG_IIN_LIMIT 0x00u
+#define MP2731_REG_AICO      0x02u   /* REG02 bit 0 AICO_EN; bits 7:1 NTC/TJ_REG */
+#define MP2731_AICO_EN_BIT   0x01u
+#define MP2731_REG_IIN_DPM   0x14u   /* [5:0] limit AICO applies, 100 mA + 50 mA steps */
+#define MP2731_REG_DPM_MASK  0x15u   /* bit 7 AICO_STAT */
+#define MP2731_AICO_STAT_BIT 0x80u
 
 #define MP2731_I2C_TIMEOUT_TICKS pdMS_TO_TICKS(1000)
 
@@ -51,6 +58,24 @@ static uint8_t s_prev_adc[5];
 static bool    s_bg_en_dirty;
 static bool    s_manual_active;
 static crd_block_t s_logged_block = CRD_BLOCK_NONE;
+
+/* AICO re-arm policy (docs/charger-aico.md), also guarded by s_read_mtx. */
+static aico_t  s_aico;
+
+/* Charger mutation admission (mp2731_set_mutation_gate). Set once by the
+ * composition root before any read; NULL = always admitted. */
+static bool  (*s_gate_begin)(void);
+static void  (*s_gate_end)(void);
+
+static bool mutation_begin(void)
+{
+    return s_gate_begin == NULL || s_gate_begin();
+}
+
+static void mutation_end(void)
+{
+    if (s_gate_begin != NULL && s_gate_end != NULL) s_gate_end();
+}
 
 /* Reset guard. A pulse that crashed the unit (an unknown silicon reaction to
  * the bandgap toggle collapsing VSYS, a hung bus tripping a watchdog) must
@@ -154,6 +179,7 @@ esp_err_t mp2731_init(void)
     if (!s_marker_checked) {
         s_marker_checked = true;
         crd_init(&s_crd);
+        aico_init(&s_aico);
         const esp_reset_reason_t why = esp_reset_reason();
         if (s_redetect_marker == REDETECT_MARKER_OPEN && why != ESP_RST_POWERON &&
             why != ESP_RST_SW && why != ESP_RST_DEEPSLEEP) {
@@ -312,9 +338,18 @@ static void redetect_fire(int64_t now, const crd_obs_t *o)
     }
     s_logged_block = CRD_BLOCK_NONE;
 
+    /* The veto probe in crd_step is a snapshot: maintenance may have begun
+     * since. The admission is the exclusion; refused = held like a veto (the
+     * next read sees maintenance active and holds through crd_step). */
+    if (!mutation_begin()) {
+        if (!s_crd.veto_counted) s_crd.vetoed++;
+        s_crd.veto_counted = true;
+        return;
+    }
     mp2731_pulse_t p;
     s_redetect_marker = REDETECT_MARKER_OPEN;   /* before the write, see marker_sync */
     const esp_err_t err = pulse_locked(PULSE_BG_EN, &p);
+    mutation_end();
     crd_pulse_t result = CRD_PULSE_OK;
     if (err == ESP_ERR_INVALID_RESPONSE) {
         result = CRD_PULSE_NOT_LATCHED;
@@ -369,6 +404,166 @@ static void redetect_after_read(esp_err_t err, const power_reading_t *p, const m
     }
 }
 
+/* ── AICO: register access ──────────────────────────────────────────────
+ * Every AICO access is ONE bus hold, like the re-detect pulse: no other bus
+ * user can interleave a REG00/REG02 change between the read and the write,
+ * and the reset can never land inside a BG_EN pulse (which holds the bus for
+ * its whole set/verify/clear/verify sequence). */
+typedef enum {
+    AICO_OP_READ,           /* REG02, REG00, REG14, REG15 */
+    AICO_OP_RESET_IF_ON,    /* automatic: rewrite REG00 only while AICO_EN reads 1 */
+    AICO_OP_RESET,          /* manual: rewrite REG00 now */
+    AICO_OP_SET_ON,
+    AICO_OP_SET_OFF,
+} aico_op_t;
+
+typedef struct {
+    uint8_t   r02, r00, r14_before, r14, r15;
+    bool      wrote;        /* the mutation's write was issued */
+    bool      skipped_off;  /* RESET_IF_ON read AICO_EN = 0: nothing else read or written */
+    bool      status_ok;    /* every read AFTER the verified mutation succeeded */
+    esp_err_t status_err;
+} aico_io_t;
+
+/* Returns the outcome of the decisive part only: for READ every read; for a
+ * mutation the reads it depends on, the write and its readback (ESP_OK =
+ * written and verified). Reads AFTER a verified mutation are observation:
+ * their failure is reported in status_ok and never turns a verified mutation
+ * into a failed one, which the caller would otherwise retry and replay
+ * (Codex review of PR #109: three verified rewrites in 11 min, resets=0). */
+static esp_err_t aico_io(aico_op_t op, aico_io_t *io)
+{
+    memset(io, 0, sizeof *io);
+    io->status_ok = true;
+    const bool set = op == AICO_OP_SET_ON || op == AICO_OP_SET_OFF;
+    const bool reset = op == AICO_OP_RESET || op == AICO_OP_RESET_IF_ON;
+    i2c_port_t port = I2C_NUM_MAX;
+    esp_err_t err = i2c_bus_get_port(&port);
+    if (err != ESP_OK) return err;
+    err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
+    if (err != ESP_OK) return err;
+    err = locked_read(&port, MP2731_REG_AICO, &io->r02);
+    if (err == ESP_OK && op == AICO_OP_RESET_IF_ON && (io->r02 & MP2731_AICO_EN_BIT) == 0u) {
+        io->skipped_off = true;          /* the off-state look is this one read */
+        (void)i2c_bus_unlock();
+        return ESP_OK;
+    }
+    if (err == ESP_OK && set) {
+        /* Only bit 0. Bits 7:1 (shipping delay, NTC type/enables, TJ_REG,
+         * NTC option) are copied from the read: unlike AICO_EN they ARE reset
+         * by the expired watchdog, so a stale cached value must never be
+         * written over them. */
+        const uint8_t want = (uint8_t)((io->r02 & (uint8_t)~MP2731_AICO_EN_BIT) |
+                                       (op == AICO_OP_SET_ON ? MP2731_AICO_EN_BIT : 0u));
+        io->wrote = true;
+        err = locked_write(&port, MP2731_REG_AICO, want);
+        if (err == ESP_OK) err = locked_read(&port, MP2731_REG_AICO, &io->r02);
+        if (err == ESP_OK && io->r02 != want) err = ESP_ERR_INVALID_RESPONSE;
+    } else if (err == ESP_OK && reset) {
+        /* "Any write to IIN_LIM can reset IIN_DPM to the same IIN_LIM value
+         * when the AICO function is enabled" (Rev 1.2 p.21). The byte goes
+         * back exactly as read: HIZ and EN_ILIM (bits 7:6) and the register
+         * limit are unchanged; only AICO's learned limit is released. */
+        err = locked_read(&port, MP2731_REG_IIN_LIMIT, &io->r00);
+        if (err == ESP_OK) err = locked_read(&port, MP2731_REG_IIN_DPM, &io->r14_before);
+        if (err == ESP_OK) {
+            uint8_t rb = 0;
+            io->wrote = true;
+            err = locked_write(&port, MP2731_REG_IIN_LIMIT, io->r00);
+            if (err == ESP_OK) err = locked_read(&port, MP2731_REG_IIN_LIMIT, &rb);
+            if (err == ESP_OK && rb != io->r00) err = ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (err == ESP_OK) {          /* AICO_OP_READ */
+        err = locked_read(&port, MP2731_REG_IIN_LIMIT, &io->r00);
+        if (err == ESP_OK) err = locked_read(&port, MP2731_REG_IIN_DPM, &io->r14_before);
+        if (err == ESP_OK) err = locked_read(&port, MP2731_REG_DPM_MASK, &io->r15);
+        io->r14 = io->r14_before;
+    }
+    if (err == ESP_OK && (set || reset)) {
+        esp_err_t s = ESP_OK;
+        if (set) s = locked_read(&port, MP2731_REG_IIN_LIMIT, &io->r00);
+        if (s == ESP_OK) s = locked_read(&port, MP2731_REG_IIN_DPM, &io->r14);
+        if (set) io->r14_before = io->r14;
+        if (s == ESP_OK) s = locked_read(&port, MP2731_REG_DPM_MASK, &io->r15);
+        io->status_ok = s == ESP_OK;
+        io->status_err = s;
+    }
+    (void)i2c_bus_unlock();
+    return err;
+}
+
+/* Under s_read_mtx: anything that must not see a REG00 rewrite right now.
+ * The maintenance lock (OTA / AMBIT flash run on external power: no input
+ * disturbance), a manual re-detect in progress (its settle snapshots must see
+ * only the pulse), an automatic re-detect whose outcome is being judged, and
+ * a BG_EN not yet proven back at 0. This is the policy's HOLD; the exclusion
+ * against maintenance itself is the admission taken around the I/O. */
+static bool aico_vetoed(void)
+{
+    return s_manual_active || s_crd.pending || s_bg_en_dirty ||
+           (s_redetect_veto != NULL && s_redetect_veto());
+}
+
+static uint16_t iin_limit_ma(uint8_t reg00);
+
+static uint16_t iin_dpm_ma(uint8_t reg14)
+{
+    return (uint16_t)(POWER_IIN_LIMIT_MIN_MA + (reg14 & POWER_IIN_LIMIT_REG_MASK) * POWER_IIN_LIMIT_STEP_MA);
+}
+
+/* Under s_read_mtx, after every power read, after the re-detect step (so a
+ * pulse fired by this very read already shows as pending and vetoes). */
+static void aico_after_read(void)
+{
+    const int64_t now = uptime_ms();
+    if (aico_step(&s_aico, now, aico_vetoed()) != AICO_CHECK) return;
+    /* Admission for the whole bus sequence: maintenance cannot begin between
+     * the REG02 decision and the REG00 write. Refused = held like a veto. */
+    if (!mutation_begin()) {
+        aico_note_refused(&s_aico);
+        return;
+    }
+    aico_io_t io;
+    const esp_err_t err = aico_io(AICO_OP_RESET_IF_ON, &io);
+    mutation_end();
+    if (err != ESP_OK) {
+        aico_note_result(&s_aico, now, AICO_RESULT_FAILED);
+        ESP_LOGW(TAG, "AICO re-arm failed (%s%s); retry in %us", esp_err_to_name(err),
+                 io.wrote ? ", REG00 write issued but not verified" : ", nothing written",
+                 (unsigned)(AICO_RETRY_MS / 1000));
+        return;
+    }
+    if (io.skipped_off) {
+        aico_note_result(&s_aico, now, AICO_RESULT_OFF);
+        return;
+    }
+    aico_note_result(&s_aico, now, AICO_RESULT_RESET);
+    if (io.status_ok) {
+        ESP_LOGI(TAG, "AICO re-armed #%u: REG00 0x%02X rewritten, IIN_DPM %u -> %u mA (REG15 0x%02X)",
+                 (unsigned)s_aico.resets, io.r00, iin_dpm_ma(io.r14_before), iin_dpm_ma(io.r14), io.r15);
+    } else {
+        ESP_LOGW(TAG, "AICO re-armed #%u: REG00 0x%02X rewritten and verified; status read after it "
+                      "failed (%s), not retried", (unsigned)s_aico.resets, io.r00,
+                 esp_err_to_name(io.status_err));
+    }
+}
+
+/* Under s_read_mtx. Registers that were not read (a status read after a
+ * verified mutation failed) are reported as such, never as zero. */
+static void aico_fill(power_aico_t *out, const aico_io_t *io, int64_t now)
+{
+    *out = (power_aico_t){
+        .enabled = (io->r02 & MP2731_AICO_EN_BIT) != 0u,
+        .status_valid = io->status_ok,
+        .aico_stat = io->status_ok && (io->r15 & MP2731_AICO_STAT_BIT) != 0u,
+        .reg02 = io->r02, .reg00 = io->r00, .reg14 = io->r14, .reg15 = io->r15,
+        .iin_limit_ma = iin_limit_ma(io->r00), .iin_dpm_ma = iin_dpm_ma(io->r14),
+        .resets = s_aico.resets, .failed = s_aico.failed,
+        .has_reset = s_aico.has_reset, .last_reset_ms = s_aico.last_reset_ms,
+        .next_check_in_s = aico_next_in_s(&s_aico, now),
+    };
+}
+
 esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out)
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
@@ -391,12 +586,16 @@ esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    /* Held across read/write/readback: maintenance cannot begin mid-set. */
+    if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
 
     i2c_port_t port = I2C_NUM_MAX;
     esp_err_t err = i2c_bus_get_port(&port);
-    if (err != ESP_OK) return err;
-    err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
-    if (err != ESP_OK) return err;
+    if (err == ESP_OK) err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
+    if (err != ESP_OK) {
+        mutation_end();
+        return err;
+    }
 
     /* REG01[6:0] = (VIN_MIN - 3.7 V) / 100 mV. Bit 7 is REGISTER RESET:
      * deliberately write it as zero, rather than copying a transient reset
@@ -415,6 +614,77 @@ esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
     }
     (void)i2c_bus_unlock();
     if (err == ESP_OK) *out = (power_vin_limit_t){.mv = mv, .reg01 = readback};
+    mutation_end();
+    return err;
+}
+
+static uint16_t iin_limit_ma(uint8_t reg00)
+{
+    return (uint16_t)(POWER_IIN_LIMIT_MIN_MA + (reg00 & POWER_IIN_LIMIT_REG_MASK) * POWER_IIN_LIMIT_STEP_MA);
+}
+
+esp_err_t mp2731_get_iin_limit(power_iin_limit_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
+    uint8_t reg = 0;
+    esp_err_t err = mp2731_read_reg(MP2731_REG_IIN_LIMIT, &reg);
+    if (err != ESP_OK) return err;
+    /* All 64 codes decode inside 100..3250 mA, and bits 7:6 (HIZ, EN_ILIM)
+     * are legitimate state rather than a corrupt value: report, never refuse. */
+    *out = (power_iin_limit_t){.ma = iin_limit_ma(reg), .reg00 = reg};
+    return ESP_OK;
+}
+
+esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out)
+{
+    if (out == NULL || !power_iin_limit_valid_ma(ma)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    /* Held across read/write/readback: maintenance cannot begin mid-set. */
+    if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
+
+    i2c_port_t port = I2C_NUM_MAX;
+    esp_err_t err = i2c_bus_get_port(&port);
+    if (err == ESP_OK) err = i2c_bus_lock(MP2731_I2C_TIMEOUT_TICKS);
+    if (err != ESP_OK) {
+        mutation_end();
+        return err;
+    }
+
+    /* REG00 = EN_HIZ(7) | EN_ILIM(6) | IIN_LIM[5:0], IIN_LIM = 100 mA + 50 mA
+     * steps (MP2731 Rev 1.2 p.30). Unlike REG01 there is no reset bit to keep
+     * clear: bits 7:6 are live controls this command must never change, so the
+     * write is a read-modify-write that copies them from the read. HIZ=1 would
+     * switch the converter off; clearing EN_ILIM would drop the ILIM-pin cap,
+     * the board's hardware safety limit. One bus hold spans read, write and
+     * readback so no other bus user can interleave a REG00 change, and a CLI
+     * and an MQTT set cannot acknowledge each other's values. A readback that
+     * differs in ANY bit (a watchdog reset of 7:6 in the window included) is
+     * reported as a failure, never as success. */
+    const uint8_t reg = MP2731_REG_IIN_LIMIT;
+    uint8_t before = 0;
+    uint8_t value = 0;
+    uint8_t readback = 0;
+    err = i2c_master_write_read_device(port, MP2731_I2C_ADDR, &reg, 1, &before, 1,
+                                       MP2731_I2C_TIMEOUT_TICKS);
+    if (err == ESP_OK) {
+        value = (uint8_t)((before & (uint8_t)~POWER_IIN_LIMIT_REG_MASK) |
+                          ((ma - POWER_IIN_LIMIT_MIN_MA) / POWER_IIN_LIMIT_STEP_MA));
+        const uint8_t buf[2] = {MP2731_REG_IIN_LIMIT, value};
+        err = i2c_master_write_to_device(port, MP2731_I2C_ADDR, buf, sizeof(buf),
+                                         MP2731_I2C_TIMEOUT_TICKS);
+    }
+    if (err == ESP_OK) {
+        err = i2c_master_write_read_device(port, MP2731_I2C_ADDR, &reg, 1, &readback, 1,
+                                           MP2731_I2C_TIMEOUT_TICKS);
+        if (err == ESP_OK && readback != value) err = ESP_ERR_INVALID_RESPONSE;
+    }
+    (void)i2c_bus_unlock();
+    if (err == ESP_OK) *out = (power_iin_limit_t){.ma = ma, .reg00 = readback};
+    mutation_end();
     return err;
 }
 
@@ -439,6 +709,9 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     /* Re-detection rides on the reads that already happen (5-15 s): no task,
      * no polling of its own. The read's verdict and caller see nothing of it. */
     redetect_after_read(err, out, &f);
+    /* AICO re-arm rides on the same reads: at most one REG02 read per
+     * interval, plus a REG00 rewrite while AICO is on (mp2731_aico.h). */
+    aico_after_read();
     xSemaphoreGive(s_read_mtx);
     return err;
 }
@@ -507,6 +780,22 @@ power_read_fn mp2731_get_power_read_fn(void)
     return mp2731_read_power;
 }
 
+/* Insert `key` + frag before the closing brace of the object in out[0..n).
+ * Returns the new length, or n unchanged when it does not fit. */
+static int append_member(char *out, size_t cap, int n, const char *key, const char *frag, int m)
+{
+    const size_t k = strlen(key);
+    if (n <= 0 || m <= 0 || out[n - 1] != '}' || (size_t)n - 1u + k + (size_t)m + 1u >= cap) return n;
+    n--;
+    memcpy(out + n, key, k);
+    n += (int)k;
+    memcpy(out + n, frag, (size_t)m);
+    n += m;
+    out[n++] = '}';
+    out[n] = '\0';
+    return n;
+}
+
 /* Slow register scans belong to telemetry, never the 5 s power-control path.
  * Keep the same read mutex as ADC conversions so scans cannot interleave with
  * a conversion sequence. A partial scan is still useful evidence. */
@@ -525,23 +814,18 @@ int mp2731_render_diagnostics(char *out, size_t cap, uint64_t *window_id, bool s
     d.scan_end_ms = esp_timer_get_time() / 1000;
     *window_id = d.window_id;
     const crd_t crd = s_crd;
+    const aico_t aico = s_aico;
     xSemaphoreGive(s_read_mtx);
     int n = mp2731_diagnostics_render(&d, out, cap);
-    /* Append "redetect" inside the charger object. Optional: when it does not
-     * fit, the object is reported without it rather than not at all. */
+    /* Append "redetect", then "aico", inside the charger object. Optional:
+     * one that does not fit is dropped whole (never truncated), and the
+     * charger evidence is reported without it rather than not at all. */
     char frag[CRD_RENDER_CAP];
-    const int m = crd_render(&crd, now, frag, sizeof frag);
-    static const char key[] = ",\"redetect\":";
-    if (n > 0 && m > 0 && out[n - 1] == '}' &&
-        (size_t)n - 1u + (sizeof key - 1u) + (size_t)m + 1u < cap) {
-        n--;
-        memcpy(out + n, key, sizeof key - 1u);
-        n += (int)(sizeof key - 1u);
-        memcpy(out + n, frag, (size_t)m);
-        n += m;
-        out[n++] = '}';
-        out[n] = '\0';
-    }
+    int m = crd_render(&crd, now, frag, sizeof frag);
+    n = append_member(out, cap, n, ",\"redetect\":", frag, m);
+    char aico_frag[AICO_RENDER_CAP];
+    m = aico_render(&aico, d.registers, d.read_mask, aico_frag, sizeof aico_frag);
+    n = append_member(out, cap, n, ",\"aico\":", aico_frag, m);
     return n;
 }
 
@@ -560,6 +844,14 @@ void mp2731_redetect_set_veto(bool (*veto)(void))
     s_redetect_veto = veto;
 }
 
+void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void))
+{
+    s_gate_begin = begin;
+    s_gate_end = end;
+}
+
+static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out);
+
 esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect_report_t *out)
 {
     if (out == NULL || (method != POWER_REDETECT_BG_EN && method != POWER_REDETECT_DPDM)) {
@@ -568,8 +860,18 @@ esp_err_t mp2731_charger_redetect(power_redetect_method_t method, power_redetect
     if (!s_ready || s_read_mtx == NULL) return ESP_ERR_INVALID_STATE;
     /* OTA / AMBIT flash: a flash runs only on external power, and a pulse on
      * a charger that IS using its input drops the system to battery for the
-     * re-detection. Never under the maintenance lock. */
+     * re-detection. Never under the maintenance lock: the admission is held
+     * from before the first write to after the DP/DM restore, so maintenance
+     * cannot begin in between (it waits for this to end). */
     if (s_redetect_veto != NULL && s_redetect_veto()) return ESP_ERR_NOT_ALLOWED;
+    if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
+    const esp_err_t err = charger_redetect_admitted(method, out);
+    mutation_end();
+    return err;
+}
+
+static esp_err_t charger_redetect_admitted(power_redetect_method_t method, power_redetect_report_t *out)
+{
     memset(out, 0, sizeof *out);
     out->method = method;
     out->reg = method == POWER_REDETECT_BG_EN ? MP2731_REG_BANDGAP : MP2731_REG_USB_DET;
@@ -669,6 +971,79 @@ esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out)
         .next_in_s = s_crd.has_next && s_crd.next_allowed_ms > now
                          ? (uint32_t)((s_crd.next_allowed_ms - now + 999) / 1000) : 0u,
     };
+    xSemaphoreGive(s_read_mtx);
+    return err;
+}
+
+esp_err_t mp2731_get_aico(power_aico_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready || s_read_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) return ESP_ERR_TIMEOUT;
+    aico_io_t io;
+    const esp_err_t err = aico_io(AICO_OP_READ, &io);
+    if (err == ESP_OK) aico_fill(out, &io, uptime_ms());
+    xSemaphoreGive(s_read_mtx);
+    return err;
+}
+
+esp_err_t mp2731_set_aico(bool enabled, power_aico_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready || s_read_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) {
+        mutation_end();
+        return ESP_ERR_TIMEOUT;
+    }
+    aico_io_t io;
+    const esp_err_t err = aico_io(enabled ? AICO_OP_SET_ON : AICO_OP_SET_OFF, &io);
+    mutation_end();
+    const int64_t now = uptime_ms();
+    if (err == ESP_OK) {
+        /* REG02 is written and verified: record it even if a status read
+         * after it failed, or the next power read would re-arm at once. */
+        aico_note_enabled(&s_aico, now, enabled);
+        aico_fill(out, &io, now);
+        ESP_LOGW(TAG, "AICO %s by operator: REG02 0x%02X (RAM-only charger register; "
+                      "re-armed every %u min while on)", enabled ? "ON" : "OFF", io.r02,
+                 (unsigned)(AICO_RESET_INTERVAL_MS / 60000));
+    }
+    xSemaphoreGive(s_read_mtx);
+    return err;
+}
+
+esp_err_t mp2731_reset_aico(power_aico_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_ready || s_read_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_redetect_veto != NULL && s_redetect_veto()) return ESP_ERR_NOT_ALLOWED;
+    if (!mutation_begin()) return ESP_ERR_NOT_ALLOWED;
+    if (xSemaphoreTake(s_read_mtx, MP2731_I2C_TIMEOUT_TICKS) != pdTRUE) {
+        mutation_end();
+        return ESP_ERR_TIMEOUT;
+    }
+    if (aico_vetoed()) {     /* a re-detect is in progress or being judged */
+        xSemaphoreGive(s_read_mtx);
+        mutation_end();
+        return ESP_ERR_TIMEOUT;
+    }
+    aico_io_t io;
+    const esp_err_t err = aico_io(AICO_OP_RESET, &io);
+    mutation_end();
+    const int64_t now = uptime_ms();
+    /* ESP_OK = REG00 written and verified, whatever the status reads after. */
+    aico_note_result(&s_aico, now, err == ESP_OK ? AICO_RESULT_RESET : AICO_RESULT_FAILED);
+    if (err == ESP_OK) {
+        aico_fill(out, &io, now);
+        if (io.status_ok) {
+            ESP_LOGW(TAG, "AICO manual re-arm: REG00 0x%02X rewritten (verified), IIN_DPM %u -> %u mA",
+                     io.r00, iin_dpm_ma(io.r14_before), iin_dpm_ma(io.r14));
+        } else {
+            ESP_LOGW(TAG, "AICO manual re-arm: REG00 0x%02X rewritten (verified); status read after it failed",
+                     io.r00);
+        }
+    }
     xSemaphoreGive(s_read_mtx);
     return err;
 }

@@ -15,6 +15,8 @@
 #include "cli_identity.h"
 #include "cli_sensors.h"
 #include "cli_vin_limit.h"
+#include "cli_iin_limit.h"
+#include "cli_aico.h"
 #include "cli_charger_redetect.h"
 #include "driver/i2c.h"
 #include "esp_app_desc.h"
@@ -2364,6 +2366,16 @@ static esp_err_t cli_register_commands(void)
         .help = "vin_limit | vin_limit set <mV>  read/set charger input voltage limit (3700..15200, step 100)",
         .func = cli_cmd_vin_limit,
     };
+    static const esp_console_cmd_t iin_limit_cmd = {
+        .command = "iin_limit",
+        .help = "iin_limit | iin_limit set <mA>  read/set charger input current limit REGISTER (100..3250, step 50; ILIM pin may cap lower)",
+        .func = cli_cmd_iin_limit,
+    };
+    static const esp_console_cmd_t aico_cmd = {
+        .command = "aico",
+        .help = "aico | aico on | aico off | aico reset  charger AICO (REG02 bit 0, RAM only); reset = rewrite REG00 now so AICO re-learns",
+        .func = cli_cmd_aico,
+    };
     static const esp_console_cmd_t charger_redetect_cmd = {
         .command = "charger_redetect",
         .help = "charger_redetect [bg_en|dpdm] | charger_redetect auto [on|off]  re-run charger input detection (REG09 BG_EN pulse / REG0B DP/DM) with before/after registers; auto = RAM-only automatic re-detect switch",
@@ -2564,6 +2576,14 @@ static esp_err_t cli_register_commands(void)
         return err;
     }
     err = esp_console_cmd_register(&vin_limit_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_console_cmd_register(&iin_limit_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_console_cmd_register(&aico_cmd);
     if (err != ESP_OK) {
         return err;
     }

@@ -66,7 +66,11 @@ Replies arrive on the existing status topic. Successful examples:
 `reg01` is a JSON integer, not a hex string. Errors carry `ok:false` and a
 `detail` message; they omit `mv` and `reg01` because there is no confirmed
 readback. Malformed ids are reported with an empty `id`. Invalid values are
-rejected before dispatch. `busy` means a VIN request is already pending;
+rejected before dispatch. `maintenance_active` (since the AICO change) means
+an OTA, AMBIT flash or other maintenance op is running or about to: the set
+is refused before any bus access, see
+[maintenance admission](charger-aico.md#maintenance-admission).
+`busy` means a VIN request is already pending;
 `queue_unavailable` means the shared worker queue refused submission. Neither
 refusal touches the charger. Retry with backoff after the pending work completes.
 

@@ -1,0 +1,177 @@
+{
+  "source_commit": "843aa1072cfdfac2e5fee9923c0e7cbe15f00690",
+  "firmware_sources_equal_to": "9615fab (components/ and main/ unchanged through 843aa10)",
+  "version_string_note": "app_version v2.21.0-2-g674161f-dirty is a cached CMake describe from the first build, configured before the firmware commit; local clone lacked the v2.22.0 tag",
+  "firmware": "v2.21.0-2-g674161f-dirty",
+  "bench_signed": true,
+  "signed_image_sha256": "dcfcfe00ceabd2f9c24a5ed463492890cd1b7ba65e213e2a526bd07353fdbd2b",
+  "test_utc_date": "2026-11-16",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "power_source": "laptop USB port, battery charge done",
+  "sample_source": "MP2731 ADC via USB status, then a separate raw REG00..REG17 dump; no independent meter",
+  "baseline_firmware": "2.21.0",
+  "reg00_before": 72,
+  "reg00_test": 82,
+  "reg00_restored": 72,
+  "reg0d_watchdog_fault": "80",
+  "phases": {
+    "A": {
+      "n": 6,
+      "register_ma": 500,
+      "reg00": [
+        "48"
+      ],
+      "reg14": [
+        "08"
+      ],
+      "reg0c": [
+        "39"
+      ],
+      "iinppm_any": false,
+      "vinppm_any": false,
+      "charge_states": [
+        "charged"
+      ],
+      "iin_dpm_ma": [
+        500
+      ],
+      "vin_v": {
+        "min": 5.1,
+        "max": 5.16,
+        "median": 5.13
+      },
+      "battery_v": {
+        "min": 4.18,
+        "max": 4.2,
+        "median": 4.18
+      },
+      "vsys_v": {
+        "min": 4.34,
+        "max": 4.4,
+        "median": 4.38
+      },
+      "iin_ma": {
+        "min": 106,
+        "max": 199,
+        "median": 146.0
+      },
+      "icharge_ma": {
+        "min": 0,
+        "max": 0,
+        "median": 0.0
+      },
+      "span_s": 42.0
+    },
+    "B": {
+      "n": 15,
+      "register_ma": 1000,
+      "reg00": [
+        "52"
+      ],
+      "reg14": [
+        "12"
+      ],
+      "reg0c": [
+        "39"
+      ],
+      "iinppm_any": false,
+      "vinppm_any": false,
+      "charge_states": [
+        "charged"
+      ],
+      "iin_dpm_ma": [
+        1000
+      ],
+      "vin_v": {
+        "min": 5.1,
+        "max": 5.16,
+        "median": 5.16
+      },
+      "battery_v": {
+        "min": 4.18,
+        "max": 4.2,
+        "median": 4.18
+      },
+      "vsys_v": {
+        "min": 4.26,
+        "max": 4.4,
+        "median": 4.3
+      },
+      "iin_ma": {
+        "min": 106,
+        "max": 239,
+        "median": 119
+      },
+      "icharge_ma": {
+        "min": 0,
+        "max": 0,
+        "median": 0
+      },
+      "span_s": 117.9
+    },
+    "C": {
+      "n": 3,
+      "register_ma": 500,
+      "reg00": [
+        "48"
+      ],
+      "reg14": [
+        "08"
+      ],
+      "reg0c": [
+        "39"
+      ],
+      "iinppm_any": false,
+      "vinppm_any": false,
+      "charge_states": [
+        "charged"
+      ],
+      "iin_dpm_ma": [
+        500
+      ],
+      "vin_v": {
+        "min": 5.1,
+        "max": 5.16,
+        "median": 5.16
+      },
+      "battery_v": {
+        "min": 4.18,
+        "max": 4.2,
+        "median": 4.18
+      },
+      "vsys_v": {
+        "min": 4.38,
+        "max": 4.4,
+        "median": 4.38
+      },
+      "iin_ma": {
+        "min": 119,
+        "max": 172,
+        "median": 133
+      },
+      "icharge_ma": {
+        "min": 0,
+        "max": 0,
+        "median": 0
+      },
+      "span_s": 10.8
+    }
+  },
+  "nvs_erased": false,
+  "cloud_commands_sent": false,
+  "input_power_cycle_qualified": false,
+  "capture_source": "physical USB console; ANSI, prompts, trailing whitespace and asynchronous log lines removed",
+  "restoration": {
+    "firmware": "2.22.0",
+    "release_tag": "v2.22.0",
+    "signed": true,
+    "signed_image_sha256": "470033c3b99ebeb44c55f4b18a1cc84631fa85e5bf8e5a79a01b3cdeb41afaa4",
+    "reg00_final": 72,
+    "reg01_final": 6,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_sha256_unchanged": true,
+    "nvs_erased": false,
+    "cloud_commands_sent": false
+  }
+}

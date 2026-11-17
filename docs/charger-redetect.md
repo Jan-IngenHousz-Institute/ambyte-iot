@@ -72,7 +72,11 @@ The read mutex is released during the waits, so power reads continue as normal.
 An MQTT reply with four snapshots is about 1.1 KB. Registers are sent as one
 48-character hex string; `--` marks a register that was not read.
 
-The command is refused under the maintenance lock (OTA, AMBIT flash). It writes no NVS,
+The command is refused under the maintenance lock (OTA, AMBIT flash), with
+`maintenance_active`. It holds the
+[maintenance admission](charger-aico.md#maintenance-admission) from before the
+pulse to after the DP/DM restore, so maintenance cannot begin mid-pulse: it
+waits for the pulse to end. It writes no NVS,
 no OTP and no other register. **A manual `bg_en` restarts the charge cycle and the
 safety timer.** On a full battery on USB the chip went from "done" to
 constant-current charging. During detection the input is not used
@@ -211,7 +215,7 @@ flowchart TD
 | Silicon reacts badly to the bandgap toggle (VSYS collapse, hang) | The RTC_NOINIT marker is open from the pulse until the outcome is decided. After any reset except power-on, a deliberate `esp_restart` or deep sleep, automatic re-detection stays off for that boot (`reset_during_attempt`). A real power loss garbles RTC memory, which the magic plus the POWERON check reject. |
 | AMBIT measurement running | Not a veto. The pulse fires only while the chip already ignores its input, so the system is already on battery. A successful re-detect is the same input transition the chip makes at every dawn or passing cloud. |
 | Brownout protection active | Not a veto, on purpose. A unit shedding load because its battery browned out is the one that most needs charging. |
-| Maintenance lock (OTA, AMBIT flash) | Vetoed. The attempt waits and fires when the lock is released. |
+| Maintenance lock (OTA, AMBIT flash) | Vetoed. The attempt waits and fires when the lock is released. The veto probe is only a hold: the pulse itself takes the [maintenance admission](charger-aico.md#maintenance-admission), so maintenance that begins right after the probe still blocks the write (counted in `vetoed`), and maintenance requested during the pulse waits for it to end. |
 | Manual and automatic pulses together | A manual pulse restarts the dwell, so the two cannot overlap. Only one manual pulse runs at a time (CLI and MQTT share a single-flight flag). |
 
 ## Telemetry

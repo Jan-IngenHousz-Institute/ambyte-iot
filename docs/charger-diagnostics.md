@@ -43,10 +43,11 @@ sequenceDiagram
 | `read_mask` | Bit N set only if register N was read successfully. Full mask = 16777215 (`0xFFFFFF`). |
 | `read_error` | ESP error code, zero for a complete scan. On first failure, stop the scan to bound latency on a failing bus. |
 | `registers` | Object keyed by uppercase two-digit hexadecimal addresses `00` through `17`, values integer 0–255. Missing reads are omitted, never zero-filled. Includes control, charge profile, watchdog/timer configuration, status/fault, ADC, limiting and JEITA registers. |
-| `iin_limit_ma` | REG00[5:0] × 50 + 100 mA. Register ceiling only; an enabled hardware ILIM may be lower. |
+| `iin_limit_ma` | REG00[5:0] × 50 + 100 mA. Register ceiling only; an enabled hardware ILIM may be lower. Settable with `iin_limit` / `set_iin_limit` ([charger-iin-limit.md](charger-iin-limit.md)). |
 | `external_ilim_enabled`, `high_impedance` | REG00 bits 6 and 7. |
 | `vin_min_mv` | REG01[6:0] × 100 + 3700 mV. Actual readback, not a claimed default. |
 | `charge_ntc_enabled`, `aico_enabled` | REG02 bits 4 and 0. |
+| `aico` | Object after `redetect`: `enabled`, `iin_dpm_ma`, `aico_stat` from this scan (REG02/14/15, omitted when unread) and the hourly re-arm counters `resets`, `failed`, `last_reset_ms` (uptime). Dropped whole when it does not fit. See [charger-aico.md](charger-aico.md). |
 | `charge_config` | REG04[5:4]: 0 disabled, 1 enabled, 2 reserved, 3 OTG. Does not measure the physical CE pin. |
 | `safety_timer_enabled` | REG08 bit 0. |
 | `ntc_pct` | REG10 × 0.392 **percent of the NTC reference**, not battery temperature or absolute millivolts. Thermistor network and NTC configuration are needed to interpret temperature. |

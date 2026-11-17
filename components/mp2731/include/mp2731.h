@@ -59,6 +59,14 @@ esp_err_t mp2731_probe_conversion(uint8_t *first_ctrl, uint32_t *done_us);
  * OTP default; an ESP reboot alone need not reset the charger. */
 esp_err_t mp2731_get_vin_limit(power_vin_limit_t *out);
 esp_err_t mp2731_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
+/* Read/set REG00 IIN_LIM (input current limit REGISTER): 100..3250 mA in
+ * 50 mA steps. out is required. Set is one read-modify-write-readback under a
+ * single I2C bus hold that keeps EN_HIZ (bit 7) and EN_ILIM (bit 6) exactly as
+ * read; it succeeds only when the full byte reads back as written. With
+ * EN_ILIM set the ILIM-pin resistor may cap the input below the register.
+ * Live register only, like the VIN limit (docs/charger-iin-limit.md). */
+esp_err_t mp2731_get_iin_limit(power_iin_limit_t *out);
+esp_err_t mp2731_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
 
 /* Charger input re-detection (docs/charger-redetect.md, mp2731_redetect.h).
  * Manual: one BG_EN pulse (REG09 bit 3, 1 then 0, both verified) or one forced
@@ -75,6 +83,29 @@ esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out);
 /* Maintenance-lock probe (OTA / AMBIT flash): vetoes automatic and manual
  * pulses. Set once by the composition root; NULL = never vetoed. */
 void mp2731_redetect_set_veto(bool (*veto)(void));
+
+/* Charger mutation admission (maint_gate.h, held by the composition root).
+ * EVERY charger register mutation holds it for its whole sequence: VIN and
+ * IIN limit sets, AICO switch / manual reset / hourly re-arm, and manual and
+ * automatic re-detect pulses (BG_EN, DP/DM and its restore). begin never
+ * blocks; false = maintenance active or pending: a command returns
+ * ESP_ERR_NOT_ALLOWED and writes nothing, an automatic action is held.
+ * Exempt: clearing a BG_EN left at 1 (s_bg_en_dirty), which restores the
+ * charger and must run even during maintenance. NULL = always admitted. */
+void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void));
+
+/* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).
+ * get: REG02/00/14/15 under one bus hold plus the reset counters.
+ * set: read-modify-write of REG02 changing ONLY bit 0 (bits 7:1 copied from
+ * the read), verified readback; switching on restarts the reset period.
+ * reset: rewrite REG00 with its own value now (bits 7:6 included), verified,
+ * counted as a reset; refused under the maintenance lock (ESP_ERR_NOT_ALLOWED)
+ * and while a manual re-detect is in progress (ESP_ERR_TIMEOUT).
+ * The automatic hourly reset rides on mp2731_read_power and shares its veto.
+ * Live registers only: no NVS, no OTP, no boot override. */
+esp_err_t mp2731_get_aico(power_aico_t *out);
+esp_err_t mp2731_set_aico(bool enabled, power_aico_t *out);
+esp_err_t mp2731_reset_aico(power_aico_t *out);
 
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);

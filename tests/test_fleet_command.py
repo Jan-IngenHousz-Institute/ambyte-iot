@@ -689,3 +689,407 @@ class PowerProtectCommand(unittest.TestCase):
         self.assertNotIn("--state", argv)       # the state input only rides with force
         rc, _ = argv_for("clear", "no_flash", " ")
         self.assertEqual(rc, 2)                 # mutating without explicit devices
+
+
+class VinLimit(unittest.TestCase):
+    """vin-limit: get is read-only; set is explicit, validated and verified by readback."""
+    CLIENT = "ambyte_28:37:2F:FF:FC:80"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+
+    def setUp(self):
+        self.fc = _load()
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="vin-limit", vin_action="get", mv=None), "r"),
+                         {"type": "get_vin_limit", "id": "r"})
+        for mv in (3700, 4000, 4300, 5000, 15200):
+            self.assertEqual(b(_args(cmd="vin-limit", vin_action="set", mv=mv), "r"),
+                             {"type": "set_vin_limit", "id": "r", "mv": mv})
+
+    def test_bad_input_refused(self):
+        for kw in (dict(vin_action="set", mv=None), dict(vin_action="set", mv=4050),
+                   dict(vin_action="set", mv=3600), dict(vin_action="set", mv=15300),
+                   dict(vin_action="set", mv=True), dict(vin_action="set", mv="4000"),
+                   dict(vin_action="set", mv=4000.0), dict(vin_action="get", mv=4000),
+                   dict(vin_action="reset", mv=None)):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="vin-limit", **kw), "r")
+
+    def test_set_refuses_discovery_and_bad_input_before_aws(self):
+        from unittest.mock import patch
+        cases = (["vin-limit", "--vin-action", "set", "--mv", "4000"],
+                 ["vin-limit", "--vin-action", "set", "--devices", self.CLIENT],
+                 ["vin-limit", "--vin-action", "set", "--mv", "4050", "--devices", self.CLIENT],
+                 ["vin-limit", "--mv", "4000", "--devices", self.CLIENT])
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    def _run(self, argv, reply_for):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        future = SimpleNamespace(result=lambda **kw: None)
+        sent = []
+
+        def connection(session, subscription, receive, **kwargs):
+            def publish(*, topic, payload, qos):
+                request = json.loads(payload)
+                sent.append(request)
+                for reply in reply_for(request):
+                    receive(self.STATUS, json.dumps(dict(reply, id=request["id"])).encode())
+                return future, 1
+            return SimpleNamespace(publish=publish, disconnect=lambda: future)
+        aws = SimpleNamespace(mqtt=SimpleNamespace(QoS=SimpleNamespace(AT_LEAST_ONCE=1)))
+        out = io.StringIO()
+        with patch.dict(sys.modules, awscrt=aws), \
+             patch.object(self.fc.fleet_deploy, "boto_session", return_value=object()), \
+             patch.object(self.fc.fleet_deploy, "mqtt_connection", connection), \
+             patch.object(self.fc.time, "sleep", lambda _: None), redirect_stdout(out):
+            rc = self.fc.main([*argv, "--devices", self.CLIENT, "--wait", "1"])
+        return rc, sent, out.getvalue()
+
+    def test_get_is_read_only_and_set_is_mutating_and_verified(self):
+        got = dict(type="vin_limit_result", ok=True, mv=4300, reg01=6, detail="VIN limit=4300 mV REG01=0x06")
+        rc, sent, text = self._run(["vin-limit"], lambda req: [got])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "get_vin_limit", "id": sent[0]["id"]})
+        self.assertLessEqual(len(sent[0]["id"].encode()), 64)     # firmware id limit
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("mv=4300 reg01=0x06", text)
+
+        done = dict(type="set_vin_limit_result", ok=True, mv=4000, reg01=3,
+                    detail="VIN limit=4000 mV REG01=0x03 (verified)")
+        busy = dict(type="set_vin_limit_result", ok=False, detail="busy")
+        rc, sent, text = self._run(["vin-limit", "--vin-action", "set", "--mv", "4000"],
+                                   lambda req: [busy, done])      # a QoS1 duplicate first
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "set_vin_limit", "id": sent[0]["id"], "mv": 4000})
+        self.assertIn("(MUTATING)", text)
+
+    def test_refusal_wrong_readback_or_wrong_reply_type_fails_the_run(self):
+        set_argv = ["vin-limit", "--vin-action", "set", "--mv", "4000"]
+        refused = dict(type="set_vin_limit_result", ok=False, detail="ESP_ERR_INVALID_RESPONSE")
+        rc, _, text = self._run(set_argv, lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("not confirmed", text)
+        other = dict(type="set_vin_limit_result", ok=True, mv=4300, reg01=6, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [other])[0], 1)          # reads another value
+        mismatch = dict(type="set_vin_limit_result", ok=True, mv=4000, reg01=6, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [mismatch])[0], 1)       # reg01 != mv
+        reset_bit = dict(type="set_vin_limit_result", ok=True, mv=4000, reg01=0x83, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [reset_bit])[0], 1)      # REGISTER RESET set
+        no_readback = dict(type="set_vin_limit_result", ok=True, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [no_readback])[0], 1)
+        # A get reply never answers a set (and the other way round): the run times out.
+        wrong_type = dict(type="vin_limit_result", ok=True, mv=4000, reg01=3, detail="x")
+        rc, _, text = self._run(set_argv, lambda req: [wrong_type])
+        self.assertEqual(rc, 1)
+        self.assertIn("replies 0/1", text)
+
+    def test_workflow_offers_vin_limit_and_passes_action_and_mv(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("vin-limit", inputs["command"]["options"])
+        self.assertEqual(inputs["vin_limit_action"]["options"], ["get", "set"])
+        self.assertEqual(inputs["vin_limit_action"]["default"], "get")
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        self.assertEqual(step["env"]["VIN_ACTION"], "${{ inputs.vin_limit_action }}")
+        self.assertEqual(step["env"]["VIN_MV"], "${{ inputs.vin_limit_mv }}")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, mv, devices):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND="vin-limit", DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION="status", PP_STATE="no_flash",
+                           VIN_ACTION=action, VIN_MV=mv)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("set", "4000", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "vin-limit")
+        self.assertEqual(argv[argv.index("--vin-action") + 1], "set")
+        self.assertEqual(argv[argv.index("--mv") + 1], "4000")
+        rc, argv = argv_for("get", "4000", "")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--mv", argv)          # the value only rides with set
+        self.assertEqual(argv_for("set", "4000", " ")[0], 2)      # mutating without explicit devices
+        self.assertEqual(argv_for("set", "", self.CLIENT)[0], 2)  # set without a value
+        self.assertEqual(argv_for("set", "4.0", self.CLIENT)[0], 2)
+
+
+
+class IinLimit(unittest.TestCase):
+    """iin-limit: get is read-only; set is explicit, validated and verified by REG00 readback."""
+    CLIENT = "ambyte_28:37:2F:FF:FC:80"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+
+    def setUp(self):
+        self.fc = _load()
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="iin-limit", iin_action="get", ma=None), "r"),
+                         {"type": "get_iin_limit", "id": "r"})
+        for ma in (100, 150, 500, 1000, 1500, 3250):
+            self.assertEqual(b(_args(cmd="iin-limit", iin_action="set", ma=ma), "r"),
+                             {"type": "set_iin_limit", "id": "r", "ma": ma})
+
+    def test_bad_input_refused(self):
+        for kw in (dict(iin_action="set", ma=None), dict(iin_action="set", ma=1025),
+                   dict(iin_action="set", ma=50), dict(iin_action="set", ma=3300),
+                   dict(iin_action="set", ma=0), dict(iin_action="set", ma=-1000),
+                   dict(iin_action="set", ma=True), dict(iin_action="set", ma="1000"),
+                   dict(iin_action="set", ma=1000.0), dict(iin_action="get", ma=1000),
+                   dict(iin_action="reset", ma=None)):
+            with self.subTest(**kw), self.assertRaises(SystemExit):
+                self.fc.build_message(_args(cmd="iin-limit", **kw), "r")
+
+    def test_set_refuses_discovery_and_bad_input_before_aws(self):
+        from unittest.mock import patch
+        cases = (["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                 ["iin-limit", "--iin-action", "set", "--devices", self.CLIENT],
+                 ["iin-limit", "--iin-action", "set", "--ma", "1025", "--devices", self.CLIENT],
+                 ["iin-limit", "--iin-action", "set", "--ma", "1000", "--devices", " "],
+                 ["iin-limit", "--ma", "1000", "--devices", self.CLIENT])
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    _run = VinLimit._run
+
+    def test_get_is_read_only_and_set_is_mutating_and_verified(self):
+        got = dict(type="iin_limit_result", ok=True, ma=500, reg00=0x48, en_ilim=True, hiz=False,
+                   detail="IIN register limit=500 mA REG00=0x48 EN_ILIM=1 HIZ=0")
+        rc, sent, text = self._run(["iin-limit"], lambda req: [got])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "get_iin_limit", "id": sent[0]["id"]})
+        self.assertLessEqual(len(sent[0]["id"].encode()), 64)     # firmware id limit
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("register_ma=500 reg00=0x48 en_ilim=True hiz=False", text)
+
+        done = dict(type="set_iin_limit_result", ok=True, ma=1000, reg00=0x52, en_ilim=True, hiz=False,
+                    detail="IIN register limit=1000 mA REG00=0x52 (verified)")
+        busy = dict(type="set_iin_limit_result", ok=False, detail="busy")
+        rc, sent, text = self._run(["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                                   lambda req: [busy, done])      # a QoS1 duplicate first
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "set_iin_limit", "id": sent[0]["id"], "ma": 1000})
+        self.assertIn("(MUTATING)", text)
+        # HIZ/EN_ILIM are reported state, not part of the limit: still confirmed.
+        hiz = dict(done, reg00=0x92, en_ilim=False, hiz=True)
+        self.assertEqual(self._run(["iin-limit", "--iin-action", "set", "--ma", "1000"],
+                                   lambda req: [hiz])[0], 0)
+
+    def test_refusal_wrong_readback_or_wrong_reply_type_fails_the_run(self):
+        set_argv = ["iin-limit", "--iin-action", "set", "--ma", "1000"]
+        refused = dict(type="set_iin_limit_result", ok=False, detail="ESP_ERR_INVALID_RESPONSE")
+        rc, _, text = self._run(set_argv, lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("iin-limit not confirmed", text)
+        other = dict(type="set_iin_limit_result", ok=True, ma=500, reg00=0x48, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [other])[0], 1)          # reads another value
+        mismatch = dict(type="set_iin_limit_result", ok=True, ma=1000, reg00=0x48, detail="x")
+        self.assertEqual(self._run(set_argv, lambda req: [mismatch])[0], 1)       # reg00 != ma
+        for bad in (dict(ma=1000, reg00=0x152), dict(ma=1000, reg00=True), dict(ma=1000, reg00="0x52"),
+                    dict(ma=1000.5, reg00=0x52), dict()):
+            reply = dict(type="set_iin_limit_result", ok=True, detail="x", **bad)
+            with self.subTest(**bad):
+                self.assertEqual(self._run(set_argv, lambda req: [reply])[0], 1)
+        # A VIN reply or a get reply never answers an IIN set: the run times out.
+        for wrong in (dict(type="iin_limit_result", ok=True, ma=1000, reg00=0x52, detail="x"),
+                      dict(type="set_vin_limit_result", ok=True, mv=4000, reg01=3, detail="x")):
+            rc, _, text = self._run(set_argv, lambda req: [wrong])
+            self.assertEqual(rc, 1)
+            self.assertIn("replies 0/1", text)
+
+    def test_workflow_offers_iin_limit_and_passes_action_and_ma(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("iin-limit", inputs["command"]["options"])
+        self.assertEqual(inputs["iin_limit_action"]["options"], ["get", "set"])
+        self.assertEqual(inputs["iin_limit_action"]["default"], "get")
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        self.assertEqual(step["env"]["IIN_ACTION"], "${{ inputs.iin_limit_action }}")
+        self.assertEqual(step["env"]["IIN_MA"], "${{ inputs.iin_limit_ma }}")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, ma, devices, command="iin-limit"):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND=command, DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION="status", PP_STATE="no_flash",
+                           VIN_ACTION="get", VIN_MV="", IIN_ACTION=action, IIN_MA=ma)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("set", "1000", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "iin-limit")
+        self.assertEqual(argv[argv.index("--iin-action") + 1], "set")
+        self.assertEqual(argv[argv.index("--ma") + 1], "1000")
+        self.assertNotIn("--mv", argv)
+        rc, argv = argv_for("get", "1000", "")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--ma", argv)          # the value only rides with set
+        self.assertEqual(argv_for("set", "1000", " ")[0], 2)      # mutating without explicit devices
+        self.assertEqual(argv_for("set", "", self.CLIENT)[0], 2)  # set without a value
+        self.assertEqual(argv_for("set", "1.0", self.CLIENT)[0], 2)
+        # The IIN inputs never leak into another command's arguments.
+        rc, argv = argv_for("set", "1000", self.CLIENT, command="vin-limit")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--iin-action", argv)
+        self.assertNotIn("--ma", argv)
+
+
+class Aico(unittest.TestCase):
+    """aico: get is read-only; on/off are explicit and verified by the REG02 readback."""
+    CLIENT = "ambyte_28:37:2F:FF:FC:80"
+    STATUS = f"experiment/data_ingest/v1/experiment/ambyte/v1.0/{CLIENT}/status"
+    _run = VinLimit._run
+
+    def setUp(self):
+        self.fc = _load()
+
+    @staticmethod
+    def reply(type_, enabled, reg02, **kw):
+        return dict(type=type_, ok=True, enabled=enabled, reg02=reg02, iin_limit_ma=1000, iin_dpm_ma=800,
+                    aico_stat=enabled, resets=2, failed=0, last_reset_ms=3601000, next_check_in_s=120,
+                    detail="AICO", **kw)
+
+    def test_payloads(self):
+        b = self.fc.build_message
+        self.assertEqual(b(_args(cmd="aico", aico_action="get"), "r"), {"type": "get_aico", "id": "r"})
+        self.assertEqual(b(_args(cmd="aico", aico_action="on"), "r"),
+                         {"type": "set_aico", "id": "r", "enabled": True})
+        self.assertEqual(b(_args(cmd="aico", aico_action="off"), "r"),
+                         {"type": "set_aico", "id": "r", "enabled": False})
+        with self.assertRaises(SystemExit):
+            b(_args(cmd="aico", aico_action="reset"), "r")
+
+    def test_switch_refuses_discovery_before_aws(self):
+        from unittest.mock import patch
+        for argv in (["aico", "--aico-action", "on"], ["aico", "--aico-action", "off", "--devices", " "],
+                     ["aico", "--aico-action", "reset", "--devices", self.CLIENT]):
+            with self.subTest(argv=argv), \
+                 patch.object(self.fc.fleet_deploy, "boto_session", side_effect=AssertionError("must not touch AWS")), \
+                 self.assertRaises(SystemExit) as error:
+                self.fc.main(argv)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_get_is_read_only_and_switch_is_mutating_and_verified(self):
+        rc, sent, text = self._run(["aico"], lambda req: [self.reply("aico_result", False, 0xDC)])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "get_aico", "id": sent[0]["id"]})
+        self.assertNotIn("MUTATING", text)
+        self.assertIn("enabled=False reg02=0xdc iin_limit_ma=1000 iin_dpm_ma=800", text)
+        busy = dict(type="set_aico_result", ok=False, detail="busy")
+        rc, sent, text = self._run(["aico", "--aico-action", "on"],
+                                   lambda req: [busy, self.reply("set_aico_result", True, 0xDD)])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(sent[0], {"type": "set_aico", "id": sent[0]["id"], "enabled": True})
+        self.assertIn("(MUTATING)", text)
+        rc, sent, text = self._run(["aico", "--aico-action", "off"],
+                                   lambda req: [self.reply("set_aico_result", False, 0xDC)])
+        self.assertEqual(rc, 0, text)
+        self.assertIs(sent[0]["enabled"], False)
+
+    def test_refusal_wrong_state_or_readback_fails_the_run(self):
+        on = ["aico", "--aico-action", "on"]
+        refused = dict(type="set_aico_result", ok=False, detail="AICO set/readback failed")
+        rc, _, text = self._run(on, lambda req: [refused])
+        self.assertEqual(rc, 1)
+        self.assertIn("aico not confirmed", text)
+        for bad in (self.reply("set_aico_result", False, 0xDC),     # still off
+                    self.reply("set_aico_result", True, 0xDC),      # bit 0 does not say on
+                    self.reply("set_aico_result", True, 0x1DD),     # not a byte
+                    self.reply("set_aico_result", 1, 0xDD),         # not a bool
+                    dict(type="set_aico_result", ok=True, detail="x")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._run(on, lambda req: [bad])[0], 1)
+        # A get reply never answers a switch: the run times out.
+        rc, _, text = self._run(on, lambda req: [self.reply("aico_result", True, 0xDD)])
+        self.assertEqual(rc, 1)
+        self.assertIn("replies 0/1", text)
+
+    def test_workflow_offers_aico_with_one_input_at_the_limit(self):
+        import os
+        import pathlib
+        import subprocess
+        import tempfile
+        import yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        wf = yaml.safe_load((root / ".github/workflows/fleet-command.yml").read_text())
+        inputs = wf[True]["workflow_dispatch"]["inputs"]
+        self.assertIn("aico", inputs["command"]["options"])
+        self.assertEqual(inputs["aico_action"]["options"], ["get", "on", "off"])   # strings, not YAML booleans
+        self.assertEqual(inputs["aico_action"]["default"], "get")
+        self.assertLessEqual(len(inputs), 25)    # GitHub's workflow_dispatch input limit
+        step = next(s for s in wf["jobs"]["command"]["steps"] if s.get("id") == "run")
+        self.assertEqual(step["env"]["AICO_ACTION"], "${{ inputs.aico_action }}")
+        script = step["run"].replace("${{ inputs.environment }}", "dev")
+
+        def argv_for(action, devices, command="aico"):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = pathlib.Path(tmp) / "python"
+                fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+                fake.chmod(0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", ARGV_OUT=f"{tmp}/argv",
+                           GITHUB_STEP_SUMMARY=f"{tmp}/summary", COMMAND=command, DEVICES=devices,
+                           TIMEZONE="", EXPECT_OFFSET="", WINDOW="1440", EXPECT_FW="", MODE="status", TOKEN="",
+                           FROM_ID="0", TO_ID="0", FROM_MS="0", TO_MS="0", CHUNK="64", WAIT="90",
+                           DRY_RUN="false", LOG_NAME="", LOG_TAIL="65536", PP_ACTION="status", PP_STATE="no_flash",
+                           VIN_ACTION="get", VIN_MV="", IIN_ACTION="get", IIN_MA="", AICO_ACTION=action)
+                r = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+                argv = pathlib.Path(f"{tmp}/argv").read_text().splitlines() if r.returncode == 0 else None
+                return r.returncode, argv
+
+        rc, argv = argv_for("on", self.CLIENT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[1], "aico")
+        self.assertEqual(argv[argv.index("--aico-action") + 1], "on")
+        rc, argv = argv_for("get", "")
+        self.assertEqual(rc, 0)
+        self.assertEqual(argv[argv.index("--aico-action") + 1], "get")
+        self.assertEqual(argv_for("off", " ")[0], 2)          # mutating without explicit devices
+        self.assertEqual(argv_for("on", "")[0], 2)
+        rc, argv = argv_for("on", self.CLIENT, command="iin-limit")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--aico-action", argv)              # never leaks into another command

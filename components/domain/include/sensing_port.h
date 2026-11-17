@@ -116,6 +116,33 @@ typedef struct {
 typedef esp_err_t (*power_get_vin_limit_fn)(power_vin_limit_t *out);
 typedef esp_err_t (*power_set_vin_limit_fn)(uint16_t mv, power_vin_limit_t *out);
 
+/* Charger input current limit REGISTER (REG00[5:0] IIN_LIM), not the input
+ * current itself and not the battery charge current. With EN_ILIM (REG00 bit 6,
+ * set on every field unit: REG00=0x48) the chip uses the LOWER of this register
+ * and the hardware ILIM-pin resistor, so the effective ceiling can sit below
+ * the register value. HIZ (bit 7) turns the converter off entirely. Both bits
+ * are reported, and a set preserves them exactly as read. */
+#define POWER_IIN_LIMIT_MIN_MA   100U
+#define POWER_IIN_LIMIT_MAX_MA  3250U
+#define POWER_IIN_LIMIT_STEP_MA   50U
+#define POWER_IIN_LIMIT_REG_MASK 0x3FU   /* REG00[5:0] */
+#define POWER_IIN_EN_ILIM_BIT    0x40U   /* REG00 bit 6: ILIM pin limit enabled */
+#define POWER_IIN_HIZ_BIT        0x80U   /* REG00 bit 7: EN_HIZ */
+
+static inline bool power_iin_limit_valid_ma(uint32_t ma)
+{
+    return ma >= POWER_IIN_LIMIT_MIN_MA && ma <= POWER_IIN_LIMIT_MAX_MA &&
+           (ma - POWER_IIN_LIMIT_MIN_MA) % POWER_IIN_LIMIT_STEP_MA == 0;
+}
+
+typedef struct {
+    uint16_t ma;       /* register limit decoded from reg00[5:0] */
+    uint8_t reg00;     /* full raw readback, bits 7:6 included */
+} power_iin_limit_t;
+
+typedef esp_err_t (*power_get_iin_limit_fn)(power_iin_limit_t *out);
+typedef esp_err_t (*power_set_iin_limit_fn)(uint16_t ma, power_iin_limit_t *out);
+
 /* Charger input re-detection (docs/charger-redetect.md). A manual pulse
  * reports the full REG00..REG17 file before, immediately after, and twice
  * after the write (detection settles), so the operator sees what the chip
@@ -169,6 +196,29 @@ typedef struct {
 
 /* set: -1 query, 0 disable, 1 enable. */
 typedef esp_err_t (*power_redetect_auto_fn)(int set, power_redetect_auto_t *out);
+
+/* Automatic Input Current Optimizer (docs/charger-aico.md). REG02 bit 0
+ * AICO_EN is a live charger register (no NVS); the firmware re-arms it by
+ * rewriting REG00 at most hourly (mp2731_aico.h). iin_limit_ma is the REG00
+ * register limit, iin_dpm_ma the limit AICO currently applies (REG14[5:0]). */
+typedef struct {
+    bool     enabled;           /* REG02 bit 0 */
+    /* false: a verified switch/reset succeeded but a status read after it
+     * failed; iin_limit_ma / iin_dpm_ma / aico_stat are then unknown. */
+    bool     status_valid;
+    bool     aico_stat;         /* REG15 bit 7: AICO action */
+    uint8_t  reg02, reg00, reg14, reg15;
+    uint16_t iin_limit_ma, iin_dpm_ma;
+    uint32_t resets, failed;    /* per boot, automatic + manual */
+    bool     has_reset;
+    int64_t  last_reset_ms;     /* uptime of the last verified reset */
+    uint32_t next_check_in_s;
+} power_aico_t;
+
+typedef esp_err_t (*power_get_aico_fn)(power_aico_t *out);
+typedef esp_err_t (*power_set_aico_fn)(bool enabled, power_aico_t *out);
+/* Rewrite REG00 with its own value now (re-arms AICO); counted as a reset. */
+typedef esp_err_t (*power_reset_aico_fn)(power_aico_t *out);
 
 #ifdef __cplusplus
 }

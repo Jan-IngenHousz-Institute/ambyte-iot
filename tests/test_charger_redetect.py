@@ -54,7 +54,7 @@ class PolicyTest(unittest.TestCase):
                         f"-I{ROOT / 'components/domain/include'}",
                         f"-I{ROOT / 'components/mp2731/include'}",
                         str(ROOT / "tests/charger_redetect_policy_host.c"),
-                        str(ROOT / "components/mp2731/mp2731_redetect.c"),
+                        str(ROOT / "components/mp2731/mp2731_redetect.c"), str(ROOT / "components/mp2731/mp2731_aico.c"),
                         "-o", str(cls.binary)], check=True)
 
     @classmethod
@@ -127,7 +127,7 @@ class DriverTest(unittest.TestCase):
                         str(ROOT / "tests/charger_redetect_host.c"),
                         str(ROOT / "components/mp2731/mp2731_core.c"),
                         str(ROOT / "components/mp2731/mp2731_diagnostics.c"),
-                        str(ROOT / "components/mp2731/mp2731_redetect.c"),
+                        str(ROOT / "components/mp2731/mp2731_redetect.c"), str(ROOT / "components/mp2731/mp2731_aico.c"),
                         str(ROOT / "components/CLI/cli_charger_redetect.c"),
                         str(ROOT / "components/command_router/charger_redetect_command.c"),
                         str(cjson / "cJSON.c"), "-lm", "-o", str(cls.binary)], check=True)
