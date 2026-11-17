@@ -84,6 +84,11 @@ aico_action_t aico_step(aico_t *s, int64_t now_ms, bool veto);
  * restarting the period, so resets stay at most one per interval). */
 void aico_note_result(aico_t *s, int64_t now_ms, aico_result_t r);
 
+/* AICO_CHECK was returned but the charger-mutation admission was refused
+ * (maintenance began after the veto probe): nothing was read or written; held
+ * like a veto (counted once per wait) until a later read is admitted. */
+void aico_note_refused(aico_t *s);
+
 /* The operator switched AICO on or off. On: a full interval before the first
  * reset, so AICO learns the panel before it is reset. */
 void aico_note_enabled(aico_t *s, int64_t now_ms, bool enabled);

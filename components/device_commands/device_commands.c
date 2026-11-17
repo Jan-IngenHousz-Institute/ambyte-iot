@@ -895,6 +895,9 @@ cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out)
     }
     esp_err_t err = s_cfg.set_vin_limit(mv, out);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_NOT_ALLOWED) {
+            return make_result(err, "maintenance_active: VIN limit not changed (OTA/AMBIT flash in progress)");
+        }
         return make_result(err, "VIN limit set/readback failed: %s; query before retrying",
                            esp_err_to_name(err));
     }
@@ -935,6 +938,9 @@ cmd_result_t cmd_set_iin_limit(uint16_t ma, power_iin_limit_t *out)
     }
     esp_err_t err = s_cfg.set_iin_limit(ma, out);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_NOT_ALLOWED) {
+            return make_result(err, "maintenance_active: IIN limit not changed (OTA/AMBIT flash in progress)");
+        }
         return make_result(err, "IIN limit set/readback failed: %s; query before retrying",
                            esp_err_to_name(err));
     }
@@ -947,6 +953,13 @@ static cmd_result_t aico_result(const power_aico_t *a, const char *what)
 {
     char last[32] = "none";
     if (a->has_reset) snprintf(last, sizeof last, "uptime %llds", (long long)(a->last_reset_ms / 1000));
+    if (!a->status_valid) {
+        /* The switch/reset itself is verified; only the reads after it failed. */
+        return make_result(ESP_OK, "AICO %s%s REG02=0x%02X; status read after it failed (query aico again) "
+                           "resets=%u failed=%u last_reset=%s next_check_in=%us",
+                           a->enabled ? "on" : "off", what, a->reg02, (unsigned)a->resets,
+                           (unsigned)a->failed, last, (unsigned)a->next_check_in_s);
+    }
     return make_result(ESP_OK, "AICO %s%s REG02=0x%02X IIN register=%u mA IIN_DPM=%u mA AICO_STAT=%d "
                        "resets=%u failed=%u last_reset=%s next_check_in=%us",
                        a->enabled ? "on" : "off", what, a->reg02, a->iin_limit_ma, a->iin_dpm_ma,
@@ -973,6 +986,9 @@ cmd_result_t cmd_set_aico(bool enabled, power_aico_t *out)
     }
     esp_err_t err = s_cfg.set_aico(enabled, out);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_NOT_ALLOWED) {
+            return make_result(err, "maintenance_active: AICO not changed (OTA/AMBIT flash in progress)");
+        }
         return make_result(err, "AICO set/readback failed: %s; query before retrying",
                            esp_err_to_name(err));
     }
@@ -986,7 +1002,7 @@ cmd_result_t cmd_reset_aico(power_aico_t *out)
         return make_result(ESP_ERR_NOT_SUPPORTED, "charger AICO not available");
     }
     esp_err_t err = s_cfg.reset_aico(out);
-    if (err == ESP_ERR_NOT_ALLOWED) return make_result(err, "AICO reset refused: maintenance in progress");
+    if (err == ESP_ERR_NOT_ALLOWED) return make_result(err, "maintenance_active: AICO reset refused (OTA/AMBIT flash in progress)");
     if (err == ESP_ERR_TIMEOUT) return make_result(err, "AICO reset refused: charger busy (re-detect); retry later");
     if (err != ESP_OK) return make_result(err, "AICO reset failed: %s", esp_err_to_name(err));
     return aico_result(out, ", REG00 rewritten (verified)");
@@ -1013,7 +1029,7 @@ cmd_result_t cmd_charger_redetect(power_redetect_method_t method, power_redetect
                            out->latched ? "latched" : "read back 0: self-cleared or ignored",
                            out->restored ? ", restored to 0" : "");
     case ESP_ERR_NOT_ALLOWED:
-        return make_result(err, "re-detect %s refused: maintenance (OTA/AMBIT flash) in progress", name);
+        return make_result(err, "maintenance_active: re-detect %s refused (OTA/AMBIT flash in progress)", name);
     case ESP_ERR_TIMEOUT:
         return make_result(err, "re-detect %s busy: another re-detect or charger read holds the charger", name);
     case ESP_ERR_INVALID_RESPONSE:

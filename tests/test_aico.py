@@ -156,13 +156,16 @@ class DriverTest(unittest.TestCase):
     def test_manual_reset_counts_restarts_the_hour_and_keeps_hiz_en_ilim(self):
         self.run_case("manual")
 
+    def test_verified_mutation_with_failed_status_read_is_recorded_not_replayed(self):
+        self.run_case("status_fail")
+
     def test_cli_parses_get_on_off_reset(self):
         self.run_case("cli")
 
     def test_mqtt_defers_to_worker_and_reports_registers_and_counters(self):
         out = self.run_case("mqtt")
         reply = json.loads(records(out)["REPLY"])
-        self.assertEqual(set(reply), {"type", "id", "ok", "enabled", "reg02", "iin_limit_ma", "iin_dpm_ma",
+        self.assertEqual(set(reply), {"type", "id", "ok", "enabled", "reg02", "status_valid", "iin_limit_ma", "iin_dpm_ma",
                                       "aico_stat", "resets", "failed", "last_reset_ms", "next_check_in_s",
                                       "detail"})
 

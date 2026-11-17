@@ -28,6 +28,7 @@ class SensorWorkerTest(unittest.TestCase):
             build = subprocess.run([os.environ.get("CC", "clang"), "-std=c11", "-Wall", "-Wextra",
                 "-Werror", "-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                 f"-I{tmp}", f"-I{ROOT / 'components/sensor_inventory/include'}",
+                f"-I{ROOT / 'components/domain/include'}",
                 str(ROOT / "components/sensor_inventory/sensor_inventory.c"),
                 str(ROOT / "tests/sensors_host/worker_driver.c"), "-o", str(binary)],
                 capture_output=True, text=True)

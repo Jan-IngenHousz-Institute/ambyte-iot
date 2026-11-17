@@ -203,6 +203,9 @@ typedef esp_err_t (*power_redetect_auto_fn)(int set, power_redetect_auto_t *out)
  * register limit, iin_dpm_ma the limit AICO currently applies (REG14[5:0]). */
 typedef struct {
     bool     enabled;           /* REG02 bit 0 */
+    /* false: a verified switch/reset succeeded but a status read after it
+     * failed; iin_limit_ma / iin_dpm_ma / aico_stat are then unknown. */
+    bool     status_valid;
     bool     aico_stat;         /* REG15 bit 7: AICO action */
     uint8_t  reg02, reg00, reg14, reg15;
     uint16_t iin_limit_ma, iin_dpm_ma;

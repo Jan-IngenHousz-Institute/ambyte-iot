@@ -32,6 +32,10 @@ static int read_session[24];          /* bus session of the last read of each re
 static int bg_session = -1, last_reg00_write_session = -1;
 static int fail_write_reg = -1, fail_write_n, fail_read_reg = -1, fail_read_n;
 static uint8_t corrupt_reg = 0xFF;    /* this register reads back XOR 0x01 after a write */
+static int reads_of[24];
+/* Fail reads of this register that happen AFTER a verified REG00/REG02
+ * write in the same bus hold (the status reads that follow a mutation). */
+static int fail_after_write_reg = -1, fail_after_write_n, last_write_session = -1;
 static esp_err_t lock_error;
 static bool veto_on, vary, model_detect;
 static unsigned conversions;
@@ -64,6 +68,12 @@ esp_err_t i2c_master_write_read_device(int port, unsigned addr, const uint8_t *w
     (void)port; (void)timeout;
     assert(locked && addr == 0x4B && wn == 1 && rn == 1 && *w < 24);
     if (*w == fail_read_reg && fail_read_n > 0) { fail_read_n--; return ESP_FAIL; }
+    if (*w == fail_after_write_reg && fail_after_write_n > 0 && last_write_session == sessions) {
+        /* a read after the write in the same hold; tests target only the
+         * status registers, never the register whose readback verifies it */
+        fail_after_write_n--; return ESP_FAIL;
+    }
+    reads_of[*w]++;
     if (*w == 0x02) reg02_reads++;
     read_session[*w] = sessions;
     *r = regs[*w];
@@ -80,14 +90,14 @@ esp_err_t i2c_master_write_to_device(int port, unsigned addr, const uint8_t *w, 
         CHECK(v == regs[0], "REG00 rewritten unchanged (0x%02X over 0x%02X)", v, regs[0]);
         CHECK(read_session[0] == sessions, "REG00 read and written under ONE bus hold");
         CHECK(sessions != bg_session, "never inside a BG_EN pulse");
-        reg00_writes++; last_reg00_write_session = sessions;
+        reg00_writes++; last_reg00_write_session = sessions; last_write_session = sessions;
         regs[0] = w[0] == corrupt_reg ? (uint8_t)(v ^ 0x01) : v;
         if (regs[2] & 0x01) regs[0x14] = (uint8_t)((regs[0x14] & 0xC0) | (v & 0x3F));
         return ESP_OK;
     case 0x02:   /* AICO_EN: only bit 0 may change, from a read in this hold */
         CHECK((v & 0xFE) == (regs[2] & 0xFE), "REG02 bits 7:1 preserved (0x%02X over 0x%02X)", v, regs[2]);
         CHECK(read_session[2] == sessions, "REG02 read and written under ONE bus hold");
-        reg02_writes++;
+        reg02_writes++; last_write_session = sessions;
         regs[2] = w[0] == corrupt_reg ? (uint8_t)(v ^ 0x01) : v;
         return ESP_OK;
     case 0x03:   /* ADC control: a START converts instantly */
@@ -294,6 +304,9 @@ int main(int argc, char **argv)
         CHECK(reg00_writes == 0 && reg02_writes == 0, "nothing written");
         CHECK(reg02_reads - r02 == 5 && s_aico.checks == 5 && s_aico.resets == 0, "hourly look (%d)",
               reg02_reads - r02);
+        CHECK(reads_of[0x00] == 0 && reads_of[0x14] == 0 && reads_of[0x15] == 0,
+              "the off-state look is one REG02 read (REG00 %d, REG14 %d, REG15 %d)",
+              reads_of[0x00], reads_of[0x14], reads_of[0x15]);
     } else if (!strcmp(c, "veto")) {
         CHECK(mp2731_set_aico(true, &a) == ESP_OK, "on");
         veto_on = true;                           /* OTA / AMBIT flash */
@@ -348,6 +361,53 @@ int main(int argc, char **argv)
         CHECK(reg00_writes == 3, "automatic one an hour later");
         regs[0] = 0xD2;                           /* HIZ set: the byte goes back as read */
         CHECK(mp2731_reset_aico(&a) == ESP_OK && regs[0] == 0xD2, "HIZ/EN_ILIM untouched");
+    } else if (!strcmp(c, "status_fail")) {
+        /* A verified mutation followed by a failed status read is recorded as
+         * done and never replayed (Codex P2). Automatic re-arm first. */
+        CHECK(mp2731_set_aico(true, &a) == ESP_OK, "on");
+        regs[0x14] = 0x04;
+        reads_for(60 * MIN - 5 * S);
+        fail_after_write_reg = 0x14; fail_after_write_n = 1;
+        reads_for(10 * S);
+        CHECK(reg00_writes == 1 && s_aico.resets == 1 && s_aico.failed == 0 && s_aico.has_reset,
+              "verified re-arm counted despite the REG14 read failing (resets %u failed %u)",
+              s_aico.resets, s_aico.failed);
+        reads_for(60 * MIN - 10 * S);
+        CHECK(reg00_writes == 1, "not replayed within the hour (%d writes)", reg00_writes);
+        reads_for(10 * S);
+        CHECK(reg00_writes == 2 && s_aico.resets == 2, "next one on schedule");
+        fail_after_write_reg = 0x15; fail_after_write_n = 1;
+        reads_for(60 * MIN);
+        CHECK(reg00_writes == 3 && s_aico.resets == 3 && s_aico.failed == 0, "same for REG15");
+        /* Manual reset: success with status_valid=false. */
+        fail_after_write_reg = 0x14; fail_after_write_n = 1;
+        CHECK(mp2731_reset_aico(&a) == ESP_OK && !a.status_valid && a.resets == 4 && reg00_writes == 4,
+              "manual reset verified, status unread");
+        /* Switch: a verified enable followed by a failed REG15 read still
+         * starts the learning hour; the next read must not re-arm at once. */
+        CHECK(mp2731_set_aico(false, &a) == ESP_OK, "off");
+        fail_after_write_reg = 0x15; fail_after_write_n = 1;
+        CHECK(mp2731_set_aico(true, &a) == ESP_OK && a.enabled && !a.status_valid && regs[2] == 0xDD,
+              "enable verified, status unread");
+        CHECK(a.next_check_in_s == 3600, "learning hour started (%u)", a.next_check_in_s);
+        const int w = reg00_writes;
+        reads_for(60 * MIN - 5 * S);
+        CHECK(reg00_writes == w, "no immediate re-arm after the enable");
+        /* MQTT shows the unread status as null, never zero. */
+        fail_after_write_reg = 0x00; fail_after_write_n = 1;
+        request("{\"type\":\"set_aico\",\"id\":\"s\",\"enabled\":true}"); execute();
+        cJSON *root = response(true);
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "status_valid")) &&
+              cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(root, "iin_dpm_ma")) &&
+              cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(root, "iin_limit_ma")) &&
+              cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "enabled")), "%s", last_reply);
+        cJSON_Delete(root);
+        /* A failure BEFORE the write is still a failure, with nothing written. */
+        const int before = reg00_writes;
+        s_aico.next_ms = uptime_ms();
+        fail_read_reg = 0x00; fail_read_n = 1;
+        reads_for(5 * S);
+        CHECK(s_aico.failed == 1 && reg00_writes == before, "pre-write read failure: failed, nothing written");
     } else if (!strcmp(c, "cli")) {
         char *g[] = {"aico"};
         CHECK(cli_cmd_aico(1, g) == 0 && reg02_writes == 0, "get");

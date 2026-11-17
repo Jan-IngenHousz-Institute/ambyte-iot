@@ -28,10 +28,19 @@ static void report(const request_t *request, bool ok, const power_aico_t *a, con
     if (a != NULL) {
         cJSON_AddBoolToObject(reply, "enabled", a->enabled);
         cJSON_AddNumberToObject(reply, "reg02", a->reg02);
-        /* REG00 register limit vs the limit AICO applies now (REG14). */
-        cJSON_AddNumberToObject(reply, "iin_limit_ma", a->iin_limit_ma);
-        cJSON_AddNumberToObject(reply, "iin_dpm_ma", a->iin_dpm_ma);
-        cJSON_AddBoolToObject(reply, "aico_stat", a->aico_stat);
+        /* status_valid=false: the switch is verified but the reads after it
+         * failed; the status fields are null, never stale or zero. */
+        cJSON_AddBoolToObject(reply, "status_valid", a->status_valid);
+        if (a->status_valid) {
+            /* REG00 register limit vs the limit AICO applies now (REG14). */
+            cJSON_AddNumberToObject(reply, "iin_limit_ma", a->iin_limit_ma);
+            cJSON_AddNumberToObject(reply, "iin_dpm_ma", a->iin_dpm_ma);
+            cJSON_AddBoolToObject(reply, "aico_stat", a->aico_stat);
+        } else {
+            cJSON_AddNullToObject(reply, "iin_limit_ma");
+            cJSON_AddNullToObject(reply, "iin_dpm_ma");
+            cJSON_AddNullToObject(reply, "aico_stat");
+        }
         cJSON_AddNumberToObject(reply, "resets", a->resets);
         cJSON_AddNumberToObject(reply, "failed", a->failed);
         if (a->has_reset) cJSON_AddNumberToObject(reply, "last_reset_ms", (double)a->last_reset_ms);

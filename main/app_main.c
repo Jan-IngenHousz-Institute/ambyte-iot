@@ -47,6 +47,7 @@
 #include "i2c_bus.h"
 #include "sched_runner.h"
 #include "mp2731.h"
+#include "maint_gate.h"
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
@@ -298,17 +299,47 @@ static void app_workload_resume(void)
  * A single flag, taken at each worker's op entry and released on completion, makes
  * the three mutually exclusive; a second concurrent op of any type is rejected as
  * "busy"/"dropped". */
-static portMUX_TYPE s_maint_mux  = portMUX_INITIALIZER_UNLOCKED;
-static bool         s_maint_busy = false;
+static portMUX_TYPE  s_maint_mux  = portMUX_INITIALIZER_UNLOCKED;
+/* The same lock now also admits charger register mutations (maint_gate.h):
+ * maintenance and a charger write (VIN/IIN limit, AICO, re-detect pulse) are
+ * mutually exclusive for the WHOLE mutation, not just at a snapshot check. */
+static maint_gate_t s_maint_gate;
+
+/* How long a maintenance op waits for in-flight charger mutations. The longest
+ * is a manual re-detect (one pulse, then register scans at +1.5 s and +5 s);
+ * everything else is a few I2C transactions. 20 s covers that with a slow bus;
+ * a charger still busy after it means a sick bus, where an OTA should not
+ * start anyway: the op reports busy, exactly like a concurrent maintenance op. */
+#define APP_CHARGER_DRAIN_MS 20000
 
 static bool app_maintenance_begin(void)
 {
     sensor_inventory_veto_begin();
-    bool acquired;
     taskENTER_CRITICAL(&s_maint_mux);
-    acquired = !s_maint_busy;
-    if (acquired) s_maint_busy = true;
+    maint_gate_result_t r = maint_gate_request(&s_maint_gate);
     taskEXIT_CRITICAL(&s_maint_mux);
+    /* Only maintenance workers call this (never the esp-mqtt task), and they
+     * hold no charger lock: waiting here cannot block a mutation's release. */
+    const int64_t deadline = esp_timer_get_time() + (int64_t)APP_CHARGER_DRAIN_MS * 1000;
+    while (r == MAINT_GATE_WAIT) {
+        if (esp_timer_get_time() >= deadline) {
+            taskENTER_CRITICAL(&s_maint_mux);
+            r = maint_gate_poll(&s_maint_gate);   /* last look before giving up */
+            if (r != MAINT_GATE_GRANTED) maint_gate_abandon(&s_maint_gate);
+            taskEXIT_CRITICAL(&s_maint_mux);
+            if (r != MAINT_GATE_GRANTED) {
+                ESP_LOGW(APP_TAG, "maintenance refused: a charger mutation is still running after %d ms",
+                         APP_CHARGER_DRAIN_MS);
+                r = MAINT_GATE_BUSY;
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        taskENTER_CRITICAL(&s_maint_mux);
+        r = maint_gate_poll(&s_maint_gate);
+        taskEXIT_CRITICAL(&s_maint_mux);
+    }
+    const bool acquired = r == MAINT_GATE_GRANTED;
     if (!acquired) sensor_inventory_veto_end();
     return acquired;
 }
@@ -316,20 +347,37 @@ static bool app_maintenance_begin(void)
 static void app_maintenance_end(void)
 {
     taskENTER_CRITICAL(&s_maint_mux);
-    s_maint_busy = false;
+    maint_gate_end(&s_maint_gate);
     taskEXIT_CRITICAL(&s_maint_mux);
     sensor_inventory_veto_end();
 }
 
 /* Registered with sync_runner as the all-reboot maintenance veto. This is the
  * same interlock used by OTA, script exec/update, and AMBIT flash: the narrower
- * OTA admission flag cannot protect sensor-board firmware writes. */
+ * OTA admission flag cannot protect sensor-board firmware writes. A pending
+ * request counts as active, so automatic charger actions hold for it too. */
 static bool app_maintenance_active(void)
 {
     taskENTER_CRITICAL(&s_maint_mux);
-    bool active = s_maint_busy;
+    bool active = maint_gate_active(&s_maint_gate);
     taskEXIT_CRITICAL(&s_maint_mux);
     return active;
+}
+
+/* Charger mutation admission (mp2731_set_mutation_gate): never blocks. */
+static bool app_charger_mutation_begin(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    const bool ok = maint_gate_mutation_begin(&s_maint_gate);
+    taskEXIT_CRITICAL(&s_maint_mux);
+    return ok;
+}
+
+static void app_charger_mutation_end(void)
+{
+    taskENTER_CRITICAL(&s_maint_mux);
+    maint_gate_mutation_end(&s_maint_gate);
+    taskEXIT_CRITICAL(&s_maint_mux);
 }
 
 /* Refcounted MQTT suspend/resume for the maintenance workers (belt-and-suspenders
@@ -626,6 +674,7 @@ static esp_err_t app_init_i2c_and_sensors(void)
     /* Charger re-detection never pulses under the maintenance lock (OTA /
      * AMBIT flash): docs/charger-redetect.md. Set before any power read. */
     mp2731_redetect_set_veto(app_maintenance_active);
+    mp2731_set_mutation_gate(app_charger_mutation_begin, app_charger_mutation_end);
 
     return ESP_OK;
 }

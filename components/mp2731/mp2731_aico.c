@@ -56,6 +56,14 @@ void aico_note_result(aico_t *s, int64_t now_ms, aico_result_t r)
     }
 }
 
+void aico_note_refused(aico_t *s)
+{
+    if (!s->waiting_veto) {
+        s->waiting_veto = true;
+        s->vetoed++;
+    }
+}
+
 void aico_note_enabled(aico_t *s, int64_t now_ms, bool enabled)
 {
     s->enabled_seen = enabled ? 1 : 0;

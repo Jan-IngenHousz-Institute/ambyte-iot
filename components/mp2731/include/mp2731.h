@@ -84,6 +84,16 @@ esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out);
  * pulses. Set once by the composition root; NULL = never vetoed. */
 void mp2731_redetect_set_veto(bool (*veto)(void));
 
+/* Charger mutation admission (maint_gate.h, held by the composition root).
+ * EVERY charger register mutation holds it for its whole sequence: VIN and
+ * IIN limit sets, AICO switch / manual reset / hourly re-arm, and manual and
+ * automatic re-detect pulses (BG_EN, DP/DM and its restore). begin never
+ * blocks; false = maintenance active or pending: a command returns
+ * ESP_ERR_NOT_ALLOWED and writes nothing, an automatic action is held.
+ * Exempt: clearing a BG_EN left at 1 (s_bg_en_dirty), which restores the
+ * charger and must run even during maintenance. NULL = always admitted. */
+void mp2731_set_mutation_gate(bool (*begin)(void), void (*end)(void));
+
 /* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).
  * get: REG02/00/14/15 under one bus hold plus the reset counters.
  * set: read-modify-write of REG02 changing ONLY bit 0 (bits 7:1 copied from

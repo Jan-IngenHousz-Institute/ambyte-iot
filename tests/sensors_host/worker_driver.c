@@ -1,5 +1,6 @@
 /* Hardware-free execution of the exact resident-worker and AMBIT op functions. */
 #include "sensor_inventory.h"
+#include "maint_gate.h"
 #include <assert.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -18,8 +19,12 @@ typedef void *QueueHandle_t;
 #define taskEXIT_CRITICAL(m) ((void)(m))
 #define ESP_LOGW(...) ((void)0)
 #define TAG "worker_host"
+#define APP_TAG TAG
+/* app_main.c's maintenance state since the charger admission (maint_gate.h);
+ * no charger mutation runs here, so a request is granted at once. */
+#define APP_CHARGER_DRAIN_MS 20000
 static portMUX_TYPE s_maint_mux;
-static bool s_maint_busy;
+static maint_gate_t s_maint_gate;
 static QueueHandle_t s_maint_q=(void *)1;
 typedef void *TaskHandle_t;
 static TaskHandle_t s_maint_task;
@@ -33,6 +38,7 @@ static int target_type, target_op, jobs_run, reads, reads_at_queue;
 static int64_t queued_at;
 static jmp_buf done;
 static int64_t esp_timer_get_time(void) { return clock_us; }
+static void vTaskDelay(TickType_t ticks) { clock_us += (int64_t)ticks * 1000; }
 static bool app_service_boot_ready(void) { return boot_ready; }
 static void ota_update_run_boot_confirm(void) {}
 static BaseType_t xQueueSend(QueueHandle_t,const void *,TickType_t);
@@ -96,7 +102,7 @@ static void no_lock(void) {}
 static void yield_ms(uint32_t ms) { clock_us+=(int64_t)ms*1000; }
 static void guarded_op(void)
 {
-    assert(s_maint_busy && sensor_inventory_wait_ms()==UINT32_MAX);
+    assert(s_maint_gate.busy && sensor_inventory_wait_ms()==UINT32_MAX);
     int before=reads; sensor_inventory_refresh();assert(before==reads);
     ++jobs_run;
 }
