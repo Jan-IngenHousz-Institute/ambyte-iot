@@ -39,6 +39,9 @@ typedef struct {
     power_set_vin_limit_fn      set_vin_limit;
     power_get_iin_limit_fn      get_iin_limit;
     power_set_iin_limit_fn      set_iin_limit;
+    power_get_aico_fn           get_aico;       /* NULL = no charger */
+    power_set_aico_fn           set_aico;
+    power_reset_aico_fn         reset_aico;
     power_redetect_fn           charger_redetect;      /* NULL = no charger */
     power_redetect_auto_fn      charger_redetect_auto; /* NULL = no charger */
 
@@ -216,6 +219,13 @@ cmd_result_t cmd_set_vin_limit(uint16_t mv, power_vin_limit_t *out);
  * EN_ILIM) and returns the verified hardware readback. out is required. */
 cmd_result_t cmd_get_iin_limit(power_iin_limit_t *out);
 cmd_result_t cmd_set_iin_limit(uint16_t ma, power_iin_limit_t *out);
+
+/* Charger AICO (docs/charger-aico.md): live REG02 bit 0, no NVS. get reads
+ * REG02/00/14/15 + reset counters; set changes only REG02 bit 0 (verified);
+ * reset rewrites REG00 with its own value now (re-arms AICO). out is required. */
+cmd_result_t cmd_get_aico(power_aico_t *out);
+cmd_result_t cmd_set_aico(bool enabled, power_aico_t *out);
+cmd_result_t cmd_reset_aico(power_aico_t *out);
 
 /* Charger input re-detection (docs/charger-redetect.md): one manual BG_EN or
  * DP/DM pulse with before/after register snapshots in *out (blocks ~5 s), and

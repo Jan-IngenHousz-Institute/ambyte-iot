@@ -7,6 +7,7 @@
 #include "timezone_command.h"
 #include "vin_limit_command.h"
 #include "iin_limit_command.h"
+#include "aico_command.h"
 #include "charger_redetect_command.h"
 
 #include <math.h>
@@ -493,6 +494,8 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
         /* Only validation and a bounded enqueue run on the MQTT task. */
     } else if (iin_limit_command_handle(root)) {
         /* Same split as VIN: validation + enqueue here, I2C on the worker. */
+    } else if (aico_command_handle(root)) {
+        /* Same split: validation + enqueue here, I2C on the worker. */
     } else if (charger_redetect_command_handle(root)) {
         /* Same: validation + enqueue only; the ~5 s pulse runs on the worker. */
     } else if (timezone_command_handle(root)) {
@@ -617,6 +620,8 @@ esp_err_t command_router_init(const command_router_config_t *cfg)
     vin_limit_command_init(&vin_config);
     iin_limit_command_config_t iin_config = {.reply = publish_reply, .submit = cfg->submit};
     iin_limit_command_init(&iin_config);
+    aico_command_config_t aico_config = {.reply = publish_reply, .submit = cfg->submit};
+    aico_command_init(&aico_config);
     charger_redetect_command_config_t redetect_config = {.reply = publish_reply, .submit = cfg->submit};
     charger_redetect_command_init(&redetect_config);
     ESP_LOGI(TAG, "command router ready (status_topic=%s)",

@@ -84,6 +84,19 @@ esp_err_t mp2731_redetect_auto(int set, power_redetect_auto_t *out);
  * pulses. Set once by the composition root; NULL = never vetoed. */
 void mp2731_redetect_set_veto(bool (*veto)(void));
 
+/* Automatic Input Current Optimizer (docs/charger-aico.md, mp2731_aico.h).
+ * get: REG02/00/14/15 under one bus hold plus the reset counters.
+ * set: read-modify-write of REG02 changing ONLY bit 0 (bits 7:1 copied from
+ * the read), verified readback; switching on restarts the reset period.
+ * reset: rewrite REG00 with its own value now (bits 7:6 included), verified,
+ * counted as a reset; refused under the maintenance lock (ESP_ERR_NOT_ALLOWED)
+ * and while a manual re-detect is in progress (ESP_ERR_TIMEOUT).
+ * The automatic hourly reset rides on mp2731_read_power and shares its veto.
+ * Live registers only: no NVS, no OTP, no boot override. */
+esp_err_t mp2731_get_aico(power_aico_t *out);
+esp_err_t mp2731_set_aico(bool enabled, power_aico_t *out);
+esp_err_t mp2731_reset_aico(power_aico_t *out);
+
 /* Port adapter for the device_commands composition root. */
 power_read_fn mp2731_get_power_read_fn(void);
 

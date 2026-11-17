@@ -197,6 +197,26 @@ typedef struct {
 /* set: -1 query, 0 disable, 1 enable. */
 typedef esp_err_t (*power_redetect_auto_fn)(int set, power_redetect_auto_t *out);
 
+/* Automatic Input Current Optimizer (docs/charger-aico.md). REG02 bit 0
+ * AICO_EN is a live charger register (no NVS); the firmware re-arms it by
+ * rewriting REG00 at most hourly (mp2731_aico.h). iin_limit_ma is the REG00
+ * register limit, iin_dpm_ma the limit AICO currently applies (REG14[5:0]). */
+typedef struct {
+    bool     enabled;           /* REG02 bit 0 */
+    bool     aico_stat;         /* REG15 bit 7: AICO action */
+    uint8_t  reg02, reg00, reg14, reg15;
+    uint16_t iin_limit_ma, iin_dpm_ma;
+    uint32_t resets, failed;    /* per boot, automatic + manual */
+    bool     has_reset;
+    int64_t  last_reset_ms;     /* uptime of the last verified reset */
+    uint32_t next_check_in_s;
+} power_aico_t;
+
+typedef esp_err_t (*power_get_aico_fn)(power_aico_t *out);
+typedef esp_err_t (*power_set_aico_fn)(bool enabled, power_aico_t *out);
+/* Rewrite REG00 with its own value now (re-arms AICO); counted as a reset. */
+typedef esp_err_t (*power_reset_aico_fn)(power_aico_t *out);
+
 #ifdef __cplusplus
 }
 #endif

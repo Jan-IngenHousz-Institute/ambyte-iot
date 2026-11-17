@@ -32,6 +32,9 @@ extern "C" {
  * input current limit REGISTER (REG00[5:0]); the set preserves REG00 bits 7:6
  * (HIZ, EN_ILIM) and replies carry verified REG00 plus `en_ilim`/`hiz`. Same
  * id rules and single-flight `busy` as VIN-limit, and independent of it.
+ * `get_aico` / `set_aico` (boolean `enabled`) read/switch the charger's AICO
+ * (REG02 bit 0 only, verified); replies carry REG02, the REG00 register
+ * limit, REG14 IIN_DPM, REG15 AICO_STAT and the hourly re-arm counters.
  * `charger_redetect` (`method` bg_en|dpdm, default bg_en) pulses the charger's
  * input detection on the worker and replies with before/after register scans;
  * `charger_redetect_auto` (`enabled` bool, omitted = query) flips the RAM-only

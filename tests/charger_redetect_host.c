@@ -324,11 +324,21 @@ int main(int argc, char **argv)
         const int n = mp2731_render_diagnostics(json, sizeof json, &window, false);
         CHECK(n > 0 && (size_t)n == strlen(json), "render");
         printf("CHARGER=%s\n", json);
-        /* A tight buffer drops the optional object, never the charger evidence. */
+        /* A tight buffer drops the optional objects whole (the last appended,
+         * "aico", first), never the charger evidence. */
         const int tight = n - 30;
         char *buf = malloc((size_t)tight);
         CHECK(buf && mp2731_render_diagnostics(buf, (size_t)tight, &window, false) > 0 &&
-              strstr(buf, "\"redetect\"") == NULL, "fallback without redetect");
+              strstr(buf, "\"aico\"") == NULL && strstr(buf, "\"redetect\"") != NULL &&
+              buf[strlen(buf) - 1] == '}', "fallback without aico");
+        free(buf);
+        const char *at = strstr(json, ",\"redetect\":");
+        CHECK(at != NULL, "redetect present");
+        const size_t tighter = (size_t)(at - json) + 20u;
+        buf = malloc(tighter);
+        CHECK(buf && mp2731_render_diagnostics(buf, tighter, &window, false) > 0 &&
+              strstr(buf, "\"redetect\"") == NULL && strstr(buf, "\"aico\"") == NULL &&
+              strstr(buf, "\"read_mask\"") != NULL, "fallback without redetect");
         free(buf);
     } else if (!strcmp(c, "safety_timer")) {
         vary = true; regs[0x17] = 0x80;

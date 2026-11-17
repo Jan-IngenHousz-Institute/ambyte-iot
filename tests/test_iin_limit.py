@@ -98,7 +98,7 @@ class IinLimitTest(unittest.TestCase):
             str(ROOT / "components/mp2731/mp2731.c"),
             str(ROOT / "components/mp2731/mp2731_core.c"),
             str(ROOT / "components/mp2731/mp2731_diagnostics.c"),
-            str(ROOT / "components/mp2731/mp2731_redetect.c"),
+            str(ROOT / "components/mp2731/mp2731_redetect.c"), str(ROOT / "components/mp2731/mp2731_aico.c"),
             str(ROOT / "components/CLI/cli_iin_limit.c"),
             str(ROOT / "components/command_router/iin_limit_command.c"),
             str(cjson / "cJSON.c"), "-lm", "-o", str(cls.binary),
