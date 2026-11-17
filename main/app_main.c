@@ -17,6 +17,7 @@
 #include "timezone.h"
 #include "bme280.h"
 #include "bench_diag.h"
+#include "ble_diag.h"
 #include "command_router.h"
 #include "clock_trust.h"
 #include "ota_update.h"
@@ -1671,6 +1672,15 @@ void app_main(void)
          * the envelope omits workbook provenance for them. */
         .provenance_suppressed  = evlog_replay_covers,
     };
+#if CONFIG_AMBYTE_BLE_DIAG
+    /* Bench-only (env bench-ble): capture each built heartbeat for the BLE
+     * snapshot. Buffers only here; the radio starts after boot completes. */
+    if (ble_diag_init() == ESP_OK) {
+        cmd_cfg.telemetry_built = ble_diag_snapshot_set;
+    } else {
+        ESP_LOGE(APP_TAG, "BLE diagnostics snapshot unavailable");
+    }
+#endif
     device_commands_init(&cmd_cfg);
     device_commands_sensors_start(uart_available ? uart_sensors_inspect : NULL,
         uart_available ? uart_sensors_recover : NULL, app_sensors_wake);
@@ -1787,6 +1797,13 @@ void app_main(void)
     if (bench_diag_err != ESP_OK) {
         ESP_LOGE(APP_TAG, "bench diagnostics unavailable: %s",
                  esp_err_to_name(bench_diag_err));
+    }
+#endif
+
+#if CONFIG_AMBYTE_BLE_DIAG
+    const esp_err_t ble_diag_err = ble_diag_start();
+    if (ble_diag_err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "BLE diagnostics unavailable: %s", esp_err_to_name(ble_diag_err));
     }
 #endif
 

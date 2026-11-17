@@ -1,0 +1,28 @@
+# Bench-only BLE diagnostics prototype (env bench-ble, docs/bench/ble-diagnostics.md).
+# The release sdkconfig.defaults keeps Bluetooth out of the build entirely; this
+# overlay is the ONLY place it is switched on. Not qualified for release: no
+# pairing/authentication, and the radio's power and Wi-Fi coexistence cost is
+# what this env exists to measure.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+# One phone at a time, peripheral only.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# Read-only, unauthenticated by design for the bench: no security manager and,
+# above all, no bonding keys persisted to NVS.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# 244-byte page reads (4 seq + 240 data) in one ATT response.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+# Host buffers in PSRAM: the internal heap carries Wi-Fi, TLS and the publisher.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=5120
+# Wi-Fi STA (MIN_MODEM power save) + BLE share one radio.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_AMBYTE_BLE_DIAG=y
