@@ -60,7 +60,7 @@ worker refused it. Neither refusal touches the charger.
 | Method | Writes | Verification |
 | --- | --- | --- |
 | `bg_en` | REG09 := REG09 \| 0x08, then REG09 & ~0x08. The reserved bits keep whatever the chip read back (read-modify-write). | The 1 must read back, otherwise no 1→0 edge happened and the result is a **failure** (`ESP_ERR_INVALID_RESPONSE`, nothing is cleared because nothing is set). The 0 must read back; the clear is retried 3 more times. A BG_EN that is still 1 is a failure (`ESP_ERR_INVALID_STATE`), and the driver retries the clear before every later power read. Set, verify, clear and verify run under one hold of the shared I²C bus, so the bandgap is never left "Disabled" while another bus user runs. |
-| `dpdm` | REG0B bit 5 USB_DET_EN := 1. Bits 7:6 and 2:1 are preserved. DM, DP and FAST_CHG_RESET (bits 4/3/0) are always written 0, because writing 1 to them drives the pins. | Readback is reported. The datasheet gives no self-clear for bit 5. After the +5 s scan, a bit 5 that is still set is written back to 0, its POR value (`restored`). |
+| `dpdm` | REG0B bit 5 USB_DET_EN := 1. Bits 7:6 and 2:1 are preserved. DM, DP and FAST_CHG_RESET (bits 4/3/0) are always written 0, because writing 1 to them drives the pins. | Readback is reported. The datasheet gives no self-clear for bit 5. After the settle points, bit 5 is restored to 0 (its POR value; `restored` when a write was needed) and **must read back 0**. This cleanup is unconditional (HAR-310): it runs whenever the set write may have landed, even if a settle snapshot was skipped or the set failed after issuing the write, and it stays inside the maintenance admission. If it cannot be proven (bus error, or bit 5 still reads 1) the command fails (`cleared:false`), and the bit is marked dirty, like a stuck BG_EN. |
 
 The command reports the full REG00–REG17 file four times: before the write,
 immediately after it, at +1.5 s and at +5 s. Each scan includes the decoded
@@ -71,6 +71,17 @@ soft-start to CHG_STAT, so +5 s (ten DCD timeouts) shows whether charging began.
 The read mutex is released during the waits, so power reads continue as normal.
 An MQTT reply with four snapshots is about 1.1 KB. Registers are sent as one
 48-character hex string; `--` marks a register that was not read.
+
+While a BG_EN or USB_DET_EN is dirty (not proven back at 0), every power
+read first retries its restore. Every pulse is refused meanwhile: manual commands
+reply `ESP_ERR_NOT_FINISHED`, automatic re-detection and AICO re-arms hold, and
+`charger_redetect auto on` is refused. Telemetry shows the state in
+`redetect.dirty`. These restores are exempt from the maintenance admission:
+each one only writes a bit back to its POR value, which can stop charger activity but
+never starts a detection, a charge cycle or a limit change. Refusing it during
+an OTA would keep the hazard in place for exactly the operation that relies on
+a stable input. A settle snapshot whose mutex take times out is simply missing
+from the report (`snapshots` < 4); it never skips the cleanup.
 
 The command is refused under the maintenance lock (OTA, AMBIT flash), with
 `maintenance_active`. It holds the
@@ -122,7 +133,7 @@ It also holds under the maintenance lock (OTA, AMBIT flash), counted once per wa
 | Dwell | 3 min | The chip's own transitions finish in seconds, and the 17 Nov dawn bursts restarted on their own within tens of seconds. The stuck state lasted hours. |
 | Backoff | not before 10, 20, 40, 60, 60 … min after the previous attempt, plus a fresh full dwell | A panel that keeps collapsing costs at most one pulse an hour. |
 | Backoff reset | 10 min of continuous charging | A charging burst of a few seconds that collapses again (17 Nov 06:56–07:21) must not re-arm a 3-minute loop. A bus failure or a gap of more than 45 s breaks the run. |
-| Outcome window | 60 s | `charging` if CHG_STAT reaches 01/10, `detected` if VIN_STAT left 000 but no charging was seen, `no_change` otherwise. |
+| Outcome window | 60 s | Only reads taken at or before attempt + 60 s are evidence (HAR-310). `charging` if CHG_STAT reaches 01/10 inside the window, `detected` if VIN_STAT left 000 but no charging was seen, `no_change` if there were valid reads but neither, `unknown` if no valid read landed inside the window. A late read (stalled readers) can close the window but is never credited: by then the chip may have re-detected on its own or it may be dawn. |
 | Per-boot cap | 24 attempts | Units reboot nightly at 01:20 UTC (mid-day at Uluru); 24 attempts at the 60 min cap is a full day of daylight. |
 
 Each attempt is logged once with `ESP_LOGW` (VIN, VSYS, REG0C/0D, how long the
@@ -143,7 +154,7 @@ stateDiagram-v2
     Precheck --> Idle: not latched or bus error<br/>(failed attempt, backoff doubled)
     Precheck --> Disabled: BG_EN stuck at 1<br/>(clear retried on every read)
     Pending --> Idle: CHG_STAT 01/10 seen (charging)
-    Pending --> Idle: 60 s window closed<br/>(detected or no_change)
+    Pending --> Idle: 60 s window closed, judged on in-window reads only<br/>(detected, no_change, or unknown if none)
     Idle --> Capped: 24 attempts this boot
     Idle --> Disabled: operator off, or reset during an open attempt
     Disabled --> Idle: operator on (refused while BG_EN not proven 0)
@@ -176,7 +187,7 @@ sequenceDiagram
         R->>D: mp2731_read_power()
         D->>P: crd_step(...)
     end
-    P-->>D: RESOLVED charging / detected / no_change
+    P-->>D: RESOLVED charging / detected / no_change / unknown (in-window reads only)
     D->>D: RTC marker closed, LOGI outcome
 ```
 
@@ -184,22 +195,33 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A[BG_EN pulse] --> B{1 read back?}
+    A[BG_EN pulse] --> L{I2C port and bus lock?}
+    L -- Unavailable --> N[Nothing written, nothing dirty:<br/>failed attempt bus_error, backoff grows,<br/>not logged as a pulse]
+    L -- Held --> B{1 read back?}
     B -- No --> F1[not_latched: no edge happened.<br/>Failed attempt, backoff grows]
     B -- Bus error --> C[Clear anyway: the set may have landed]
     B -- Yes --> C
     C --> D{0 read back within 4 writes?}
     D -- Yes --> OK[Outcome window opens]
-    D -- No, readback 1 --> S[not_cleared: auto disabled,<br/>ESP_LOGE, dirty flag]
-    D -- No, bus error --> T[bus_error, dirty flag]
-    S --> R[Every later power read clears BG_EN first.<br/>No new pulse while dirty.<br/>auto on refused while dirty]
+    D -- No, readback 1 --> S[not_cleared: auto disabled,<br/>ESP_LOGE, BG_EN dirty]
+    D -- No, bus error --> T[bus_error, BG_EN dirty]
+    S --> R[Every later power read restores the dirty bit first.<br/>No pulse of any kind, AICO holds,<br/>auto on refused while dirty]
     T --> R
     OK --> W{Unit resets before the outcome?}
     W -- Brownout, watchdog, panic, USB --> X[Boot finds RTC marker open:<br/>auto off this boot, reason reset_during_attempt]
-    W -- No --> Y[charging / detected / no_change]
+    W -- No --> V{Valid read at or before +60 s?}
+    V -- Yes --> Y[charging / detected / no_change<br/>from in-window reads only]
+    V -- No --> U[unknown: a late read is never credited]
     Y --> Z{Charging for 10 min?}
+    U --> Z
     Z -- Yes --> Q[Backoff reset]
     Z -- No --> BO[Next attempt after 10, 20, 40, 60 min]
+    M[Manual dpdm: USB_DET_EN set] --> SN[Settle snapshots, optional:<br/>a mutex timeout only drops one]
+    SN --> RS[Restore bit 5 to 0, unconditional,<br/>inside the maintenance admission]
+    RS --> RV{Bit 5 reads back 0?}
+    RV -- Yes --> MOK[Admission released, maintenance may begin]
+    RV -- No, or bus error --> MD[Command fails, USB_DET_EN dirty]
+    MD --> R
 ```
 
 ### Failure modes
@@ -210,7 +232,9 @@ flowchart TD
 | Unit on a 5 V USB source | Never triggers: VIN < 5.5 V, and such a unit charges anyway (CHG_STAT ≠ 00). |
 | Night or twilight | A dark panel gives VIN ≈ 0. At dusk an unloaded panel can stay above 5.5 V with almost no current, so an attempt can happen. It ends `detected` or `no_change` (or a short `charging` burst) and the backoff grows. The cost is one I²C pulse per backoff step. |
 | Battery actually full | Excluded by VSYS ≥ 4.1 V and by CHG_STAT 11. The bench showed why this matters: a pulse on a full battery restarts a charge cycle. |
-| Bus busy or failing | A lock timeout or bus error in the precheck counts as `blocked` (bus_error). During the pulse it is a failed attempt with backoff. If the set may have landed, the clear is retried on every later read. |
+| Bus busy or failing | A lock timeout or bus error in the precheck counts as `blocked` (bus_error). If the pulse cannot get the bus at all, nothing is written and nothing is marked dirty: it is a failed attempt (`bus_error`) with backoff, logged as "pulse not started" (HAR-310). If the set may have landed, the clear is retried on every later read. |
+| Readers stall around the outcome window | Only reads at or before +60 s count; a window with none closes as `unknown` (HAR-310). |
+| DP/DM restore cannot be proven | The manual command fails, `dirty` shows `dpdm`, every pulse and AICO re-arm holds, and every power read retries the restore until bit 5 reads back 0. |
 | I²C watchdog resets BG_EN | REG09 is "Reset by WTD". The watchdog is already expired on every unit and the firmware never kicks it, so no new expiry happens during the pulse. The bench confirmed that BG_EN latches 1 with REG0D = 0x80. If an expiry did reset the bit between the writes, the 0 readback still passes. Whether a watchdog reset counts as a 1→0 edge is undocumented; the outcome tracking shows it either way. |
 | Silicon reacts badly to the bandgap toggle (VSYS collapse, hang) | The RTC_NOINIT marker is open from the pulse until the outcome is decided. After any reset except power-on, a deliberate `esp_restart` or deep sleep, automatic re-detection stays off for that boot (`reset_during_attempt`). A real power loss garbles RTC memory, which the magic plus the POWERON check reject. |
 | AMBIT measurement running | Not a veto. The pulse fires only while the chip already ignores its input, so the system is already on battery. A successful re-detect is the same input transition the chip makes at every dawn or passing cloud. |
@@ -221,7 +245,7 @@ flowchart TD
 ## Telemetry
 
 `health.power.charger.redetect` is added inside the charger object (about
-280 bytes; the worst case is under 512 B, inside the object's 2048 B cap). If it
+300 bytes; the worst case is 531 B, rendered into a 576 B buffer). If it
 does not fit, the charger object is sent without it. The bench charger object
 with `redetect` was 1232 B.
 
@@ -231,12 +255,13 @@ with `redetect` was 1232 B.
 | `state` | `idle`, `dwell`, `backoff`, `pending`, `capped`, `disabled` |
 | `disabled_reason` | `null`, `operator`, `reset_during_attempt`, `bg_en_stuck` |
 | `attempts` | Automatic pulses this boot (including failed ones). |
-| `charging`, `detected`, `no_change`, `failed` | Outcomes of those attempts. |
+| `charging`, `detected`, `no_change`, `unknown`, `failed` | Outcomes of those attempts. `unknown` (since HAR-310): the outcome window closed without a valid status read inside it. |
 | `blocked`, `last_block` | Prechecks that held: `hiz`, `charge_disabled`, `safety_timer`, `vin_limit`, `bus_error`. `last_block` is cleared by the next attempt. |
 | `vetoed` | Maintenance-lock waits. |
 | `manual` | Manual pulses this boot (CLI/MQTT); not counted in `attempts`. |
+| `dirty` | Array, normally `[]`. `"bg_en"` and/or `"dpdm"` for a pulsed bit (REG09 BG_EN, REG0B USB_DET_EN) not yet proven back at 0. While non-empty, no pulse of any kind runs and every power read retries the restore (since HAR-310). |
 | `dwell_s`, `backoff_s`, `next_in_s` | Current dwell length, the last applied backoff, and time until a retry is allowed. |
-| `last` | `null`, or `{uptime_ms, outcome, reg0c_before, reg0c_after, vin_mv, vsys_mv}` for the latest attempt. `outcome` is `pending` until the window closes, and can also be `bus_error`, `not_latched` or `not_cleared`. `reg0c_after` is the last REG0C seen in the window. |
+| `last` | `null`, or `{uptime_ms, outcome, reg0c_before, reg0c_after, vin_mv, vsys_mv}` for the latest attempt. `outcome` is `pending` until the window closes, and can also be `unknown`, `bus_error`, `not_latched` or `not_cleared`. `reg0c_after` is the last REG0C seen in the window. |
 
 All counters are RAM-only and per boot, like the rest of `charger.history`.
 
@@ -268,6 +293,15 @@ pio run -e esp32-s3-devkitm-1
   heartbeat JSON with `redetect` and the fallback without it), the safety timer
   hold, and the reset guard (brownout disables, power-on and deliberate restart do
   not, operator re-enable).
+- **HAR-310 regressions:** a timed-out +5 s snapshot still restores DP/DM, here
+  and with maintenance requested mid-command (`test_charger_gate.py`: when
+  maintenance is granted, bit 5 is already 0); a failed restore write and a
+  readback of 1 both fail closed until a read restores the bit; a bus lock lost
+  after a passed precheck writes nothing and marks nothing dirty; late evidence
+  (+120 s CC, a gap across the deadline, late detection) is never credited, and a
+  read exactly at the deadline is. The driver harness also runs under
+  MemorySanitizer (`MsanDriverTest`), which is what catches the uninitialised
+  pulse result on v2.23.0. ASan/UBSan cannot see it.
 - **Frontends:** CLI parsing, and the MQTT handler (deferred to the worker, no I²C
   on the MQTT task, snapshots in the reply, evidence on failure, invalid
   id/method/enabled, busy, queue refusal).

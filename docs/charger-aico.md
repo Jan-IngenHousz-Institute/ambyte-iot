@@ -137,8 +137,8 @@ read mutex:
 - a due re-arm is **held** (counted once per wait in the policy's `vetoed`)
   while the maintenance lock is held (OTA / AMBIT flash), while a manual
   charger re-detect runs (its settle snapshots must see only the pulse), while
-  an automatic re-detect's outcome window is open, and while a BG_EN is not
-  proven back at 0. The rewrite and the BG_EN pulse each hold the I2C bus for
+  an automatic re-detect's outcome window is open, and while a BG_EN or a
+  DP/DM USB_DET_EN is not proven back at 0. The rewrite and the BG_EN pulse each hold the I2C bus for
   their whole sequence, so they can never interleave. The hold is a policy
   decision taken from a snapshot; the exclusion against maintenance is the
   admission below, held around the bus sequence.
@@ -190,7 +190,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A[Re-arm due] --> B{Maintenance lock, re-detect running or judged, BG_EN dirty?}
+    A[Re-arm due] --> B{Maintenance lock, re-detect running or judged, BG_EN or DP/DM dirty?}
     B -- Yes --> H[Hold, count the wait once] --> A
     B -- No --> C[Bus hold, read REG02]
     C -- Read fails --> F[failed++, retry in 5 min, nothing written]
@@ -216,7 +216,8 @@ first bus access and released after the last, on every exit path.
 | Maintenance requested while mutations are in flight | Becomes pending and **waits** (polling every 10 ms) until they end, at most 20 s; new mutations are refused from that moment, so it cannot be starved |
 | Mutation still running after 20 s (a sick bus) | The maintenance op gives up and reports busy, exactly as for a concurrent maintenance op; mutations are admitted again |
 | Maintenance begins just after a veto probe said "free" | The admission is refused: nothing is written (the race found in review) |
-| Clearing a BG_EN left at 1 | Exempt: it restores the charger and must run even during maintenance |
+| Clearing a BG_EN left at 1, restoring a USB_DET_EN left at 1 (HAR-310) | Exempt: each only writes its bit back to its POR value 0, which can stop charger activity but never start it, and must run even during maintenance |
+| The DP/DM restore of a manual `charger_redetect dpdm` | Inside the command's admission, unconditionally, before it is released (HAR-310): maintenance is never granted with bit 5 still forcing detection |
 
 Maintenance waits instead of being refused because charger mutations are
 short (a few I2C transactions; the longest, a manual re-detect, ~5 s) and a
