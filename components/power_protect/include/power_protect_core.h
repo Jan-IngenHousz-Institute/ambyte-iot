@@ -339,6 +339,20 @@ static inline int pp_protection_rank(const pp_persist_t *p)
     return (int)p->state * 2 + (p->forced ? 1 : 0);
 }
 
+/* Fold record b into a, keeping the MOST PROTECTIVE value of every fact
+ * (review of PR #113, round 6). For records whose order cannot be known (an
+ * unverified NVS epoch: another lifetime may have written either), so none
+ * may be dropped for being "older":
+ *   state/reason/forced/since : of the higher pp_protection_rank (a on a tie);
+ *   probe_fails               : the maximum (the longest backoff);
+ *   probation                 : kept only if both agree (and it still fits);
+ *   has_low / low_utc         : OR; the NEWEST dated low, or undated if
+ *                               either is undated (the quiet period from boot);
+ *   history                   : the union (more history links more brownouts);
+ *   gen                       : the maximum.
+ * The result is never less protective than either input. */
+void pp_merge_protective(pp_persist_t *a, const pp_persist_t *b);
+
 /* Blob codec. encode always writes v2 (PP_BLOB_LEN). decode reads v2 and the
  * v1 blob of the first brownout-protection release (PP_BLOB_V1_LEN, no probe
  * fields: none on probation, no failures), so an upgrade never turns a stored

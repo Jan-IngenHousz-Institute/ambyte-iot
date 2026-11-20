@@ -37,6 +37,47 @@ void pp_load_missing(pp_core_t *c, pp_clock_t clk)
     c->p.reason = PP_REASON_STATE_MISSING;
 }
 
+void pp_merge_protective(pp_persist_t *a, const pp_persist_t *b)
+{
+    pp_persist_t r = *a;
+    if (pp_protection_rank(b) > pp_protection_rank(a)) {
+        r.state = b->state;
+        r.reason = b->reason;
+        r.forced = b->forced;
+        r.since_utc = b->since_utc;
+    }
+    if (b->probe_fails > r.probe_fails) r.probe_fails = b->probe_fails;
+    /* A probation only where every candidate agrees, and only in the state
+     * its step entered (pp_decode's own rule). */
+    if (a->probation != b->probation || a->state != b->state) r.probation = PP_PROBATION_NONE;
+    if (r.probation != PP_PROBATION_NONE &&
+        (r.forced || r.state != (r.probation == PP_PROBATION_NO_FLASH ? PP_STATE_NO_FLASH : PP_STATE_NORMAL))) {
+        r.probation = PP_PROBATION_NONE;
+    }
+    if (a->has_low || b->has_low) {
+        const bool undated = (a->has_low && a->low_utc == 0) || (b->has_low && b->low_utc == 0);
+        int64_t newest = 0;
+        if (a->has_low && a->low_utc > newest) newest = a->low_utc;
+        if (b->has_low && b->low_utc > newest) newest = b->low_utc;
+        r.has_low = true;
+        r.low_utc = undated ? 0 : newest;
+    }
+    for (unsigned i = 0; i < b->hist_n && i < PP_HIST_MAX; i++) {
+        bool seen = false;
+        for (unsigned k = 0; k < r.hist_n; k++) {
+            if (r.hist[k].utc == b->hist[i].utc && r.hist[k].boot == b->hist[i].boot) seen = true;
+        }
+        if (seen) continue;
+        if (r.hist_n == PP_HIST_MAX) {   /* keep the newest PP_HIST_MAX: drop the oldest */
+            memmove(&r.hist[0], &r.hist[1], (PP_HIST_MAX - 1) * sizeof r.hist[0]);
+            r.hist_n--;
+        }
+        r.hist[r.hist_n++] = b->hist[i];
+    }
+    if (b->gen > r.gen) r.gen = b->gen;
+    *a = r;
+}
+
 /* ── names ─────────────────────────────────────────────────────────────── */
 
 const char *pp_state_name(pp_state_t s)

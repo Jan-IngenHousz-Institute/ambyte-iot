@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 62)
+        self.assertGreaterEqual(len(self.scenarios), 66)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -117,7 +117,10 @@ class PowerProtectHostTest(unittest.TestCase):
                      "relaxation_reread_inconclusive", "epoch_missing_first_boot", "no_epoch_no_relaxation",
                      "fence_unconfirmed", "cmd_persist_unconfirmed",
                      # review round 5 (each fails on db64678)
-                     "missing_record_fails_closed", "unverified_epoch_never_relaxes"):
+                     "missing_record_fails_closed", "unverified_epoch_never_relaxes",
+                     # review round 6 (same_epoch_low_veto passes on db64678, fails on 6c998a4)
+                     "same_epoch_low_veto", "slot_shadow", "merge_keeps_every_fact",
+                     "verify_reconciles_before_relaxing"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):

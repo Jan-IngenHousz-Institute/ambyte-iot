@@ -469,22 +469,44 @@ The model is now one record, ordered by generation:
   - A deliberate NVS rewrite or wipe (flash_gui provisioning, `clean_nvs`)
     creates a new epoch. That rewrite ends in a USB or watchdog reset, which
     keeps RTC memory, but an RTC record from before it is never adopted.
-  - **An epoch that exists but cannot be *read* is UNVERIFIED** (round 5).
-    The newest valid RTC record's own epoch is borrowed so the record can be
-    considered at all. But that record may belong to another NVS lifetime:
-    round 5 showed a foreign *cleared* record overwriting a current forced
-    hold. So while unverified:
-    - generations are **never compared** across the two;
-    - an RTC record wins **only if strictly more protective** than what NVS
-      gives (protection order `hold` > `no_flash` > `normal`, forced above
-      automatic). With the NVS record unreadable too, it is measured against
-      the fail-closed `no_flash`;
-    - nothing less protective is ever written to NVS from it;
-    - **no automatic relaxation** runs until the epoch reads back, which is
-      retried after every write and before every relaxation.
+  - **An epoch that exists but cannot be *read* is UNVERIFIED** (rounds 5-6).
+    The RTC records may belong to another NVS lifetime (round 5: a foreign
+    *cleared* record overwrote a current forced hold), or to this one (round
+    6: a same-lifetime low veto was dropped on a rank tie, and a foreign
+    gen-17 record in one slot shadowed an intact hold in the other). Nothing
+    can be ordered, so **nothing is selected**:
+    - **Merge.** The NVS record (or the fail-closed `no_flash`) and **every**
+      decodable RTC slot, of any epoch, are merged into the most protective
+      composite (`pp_merge_protective`):
+      - state, reason and forced from the highest protection rank (`hold` >
+        `no_flash` > `normal`, forced above automatic);
+      - the largest backoff level;
+      - the low veto (OR; the newest dated time, or undated if any is);
+      - the union of the brownout histories;
+      - a probation only if every candidate agrees.
+    - The composite is written to NVS only if it adds protection, under a
+      generation above every candidate's.
+    - **No automatic relaxation** runs while the epoch is unverified.
+    - RTC writes made while unverified are **tagged** and are never ordered
+      by generation against anything.
+    - **On verification** (the epoch reads back: retried after every write
+      and before every relaxation, so always BEFORE a relaxation), the state
+      is reconciled first:
+      - it already holds the composite, and any tagged slot written since is
+        folded in;
+      - the result goes to NVS under a newer generation, and only then are
+        the tagged slots retired.
+    - A **verified boot** orders only untagged records of its own lifetime
+      by generation, and folds the facts of any tagged slot that NVS does not
+      hold yet.
 
-    A foreign record can therefore only ever raise protection. A retained
-    failure of the same lifetime still wins, because it is more protective.
+    A record of another lifetime can therefore only ever **raise**
+    protection, and a same-lifetime fact (a retained failure, a low veto) is
+    never lost to an unreadable epoch. **Stated caveat:** a more protective
+    foreign state merged in under this ambiguity stays. A foreign **forced
+    hold**, for example, is still forced after the epoch reads again, and
+    only an operator `clear` ends it. Not every state taken in while
+    unverified heals by itself.
   - **With no epoch at all** (absent and not creatable), RTC records are
     neither written nor adopted, and **no automatic relaxation happens**. A
     failure after such a relaxation that NVS refused could not survive a
@@ -530,9 +552,13 @@ The 113-byte version-1 blob of the first release is still read, with no
 probation and level 0, so an upgrade keeps every stored state. The next
 persisting event writes version 2. A **rollback** to firmware before this
 change reads a version-2 blob as unreadable and starts in `no_flash`
-(`state_unreadable`). That is the safe side; `clear` repairs it. Units that
-never had a transition under the new firmware still carry version 1 and are
-unaffected.
+(`state_unreadable`). That is the safe side; `clear` repairs it. Only units
+that already carried a version-1 record and had no persisting event under the
+new firmware keep version 1 and are unaffected. Units that had **no record
+at all** before (never protected: most of the fleet) get a version-2 `normal`
+record on their first boot of this release (the first install writes it),
+so a rollback starts them in `no_flash` / `state_unreadable` too: fail-closed,
+until `clear` or the accumulated exit.
 
 At boot the blob is either:
 
@@ -817,6 +843,13 @@ run fails unless every reply confirms the requested state. In Actions →
       relaxation runs), a more protective foreign record may win, a foreign
       `normal` never beats the fail-closed `no_flash`, and a retained failure
       of the same lifetime still survives;
+    - (round 6) the same-lifetime low veto kept in RTC survives an
+      unverified boot (passes on db64678, failed on 6c998a4); a foreign
+      gen-17 record never shadows an intact hold written while unverified,
+      which reaches NVS at verification and survives a power loss; the merge
+      keeps every protective fact of NVS and both slots; verification
+      reconciles and writes the merged facts BEFORE the probe step, and a
+      merged veto still blocks the probe after verification;
     - (round 5, native) every pair of two transient raw-write faults across
       a `clear` and its fence writes (a ≤ 16, b ≤ 24), then a direct power
       loss: `persist_failed` always means a forced hold on NVS (the reviewer's
