@@ -31,6 +31,13 @@
 #else
 #define HAVE_RECOVERY 0
 #endif
+/* Likewise the durability round (commit-first, RTC copy, durable low), so
+ * its regressions also build against the round-0 head b4103f5. */
+#ifdef PP_RELAX_RETRY_MS
+#define HAVE_DURABILITY 1
+#else
+#define HAVE_DURABILITY 0
+#endif
 
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr, "FAIL %s:%d: %s - ", __FILE__, __LINE__, #cond); \
@@ -116,6 +123,13 @@ static void reboot(esp_reset_reason_t rr, uint32_t boot, bool clock_valid)
 {
     s_mtx = NULL;
     memset(&s_core, 0, sizeof s_core);
+#if HAVE_DURABILITY
+    /* RTC_NOINIT memory survives resets without power loss; after a power
+     * loss it holds garbage. */
+    if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT || rr == ESP_RST_PWR_GLITCH) {
+        memset(&s_unwritten, 0xA5, sizeof s_unwritten);
+    }
+#endif
     s_state_pub = PP_STATE_NORMAL;
     memset(&s_skips, 0, sizeof s_skips);
     power_gate_init(&g_gate);
@@ -759,7 +773,7 @@ static void blob_v1_upgrade(void)
     p.state = PP_STATE_HOLD; p.reason = PP_REASON_REPEAT_BROWNOUT; p.since_utc = (int64_t)g_utc;
     p.hist_n = 2; p.hist[0] = (pp_brownout_t){(int64_t)g_utc - 600, 2}; p.hist[1] = (pp_brownout_t){(int64_t)g_utc, 3};
     uint8_t v2[PP_BLOB_LEN];
-    CHECK(pp_encode(&p, v2, sizeof v2) == PP_BLOB_LEN && PP_BLOB_LEN == 115 && PP_BLOB_V1_LEN == 113, "lens");
+    CHECK(pp_encode(&p, v2, sizeof v2) == PP_BLOB_LEN && PP_BLOB_LEN == 124 && PP_BLOB_V1_LEN == 113, "lens");
     /* v1 = v2 without the two probe bytes, version 1, its own CRC. */
     memcpy(g_blob, v2, PP_BLOB_V1_LEN - 4);
     g_blob[0] = 1;
@@ -785,6 +799,17 @@ static void blob_v1_upgrade(void)
     bad = p; bad.probe_fails = PP_PROBE_FAILS_MAX + 1;
     pp_encode(&bad, v2, sizeof v2);
     CHECK(!pp_decode(&q, v2, sizeof v2), "fails");
+#if HAVE_DURABILITY
+    bad = p; bad.has_low = true; bad.low_utc = 1763152200;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(pp_decode(&q, v2, sizeof v2) && q.has_low && q.low_utc == 1763152200, "durable low round trip");
+    v2[PP_BLOB_LEN - 4 - 9] = 0;      /* has_low 0 with a low_utc: refused (CRC fixed below) */
+    {
+        const uint32_t crc = crc32_v1(v2, PP_BLOB_LEN - 4);
+        for (int i = 0; i < 4; i++) v2[PP_BLOB_LEN - 4 + i] = (uint8_t)(crc >> (8 * i));
+    }
+    CHECK(!pp_decode(&q, v2, sizeof v2), "low_utc without has_low");
+#endif
     bad = p; bad.state = PP_STATE_NORMAL; bad.probation = PP_PROBATION_NORMAL; bad.probe_fails = 3;
     pp_encode(&bad, v2, sizeof v2);
     CHECK(pp_decode(&q, v2, sizeof v2) && q.probation == PP_PROBATION_NORMAL && q.probe_fails == 3, "valid probation");
@@ -797,6 +822,176 @@ static void blob_v1_upgrade(void)
     reboot(ESP_RST_SW, 5, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == PP_PROBE_LEVEL_CAP && s_core.persist_fault, "unreadable");
 #endif
+}
+
+/* ── scenarios: durability of the probe (review of PR #113, round 1) ───── */
+
+#if HAVE_RECOVERY
+/* [P1] The probe step's commit fails: nothing relaxes, before or after a
+ * brownout or a software reset; the next try waits an hour. */
+static void probe_step_commit_fault(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    const int w = g_writes;
+    g_fail_writes = true;
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE && s_core.persist_fault,
+          "an uncommitted probe step never takes effect (state %d)", st());
+    CHECK(g_elines == 1, "no transition line for an uncommitted step (%d)", g_elines);
+    CHECK(rec().probe == PP_PROBE_WAITING && rec().next_probe_s > 55 * 60 && rec().next_probe_s <= 60 * 60,
+          "retry in an hour: %lld", (long long)rec().next_probe_s);
+    quiet_reads(POWER_READ_NO_INPUT, 50 * 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "no retry inside the hour");
+    /* Brownouts with NVS still refusing: never relaxed, so never a cycle. */
+    for (uint32_t i = 0; i < 8; i++) {
+        reboot(ESP_RST_BROWNOUT, 3 + i, true);
+        quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE, "cycle %u: stays no_flash", i);
+    }
+    CHECK(g_writes == w, "every write refused");
+    /* A software reset: still protected; with NVS back the probe commits. */
+    reboot(ESP_RST_SW, 20, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "a software reset relaxes nothing");
+    g_fail_writes = false;
+    quiet_reads(POWER_READ_NO_INPUT, 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL && !s_core.persist_fault &&
+          g_writes == w + 1, "committed probe (w %d)", g_writes - w);
+    reboot(ESP_RST_SW, 21, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "on record");
+    /* Within one boot: NVS comes back during the hold, the retry commits. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 30, true);
+    g_fail_writes = true;
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "refused");
+    g_fail_writes = false;
+    quiet_reads(POWER_READ_NO_INPUT, 30 * 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "the hold runs its hour");
+    quiet_reads(POWER_READ_NO_INPUT, 31 * 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "retried and committed");
+}
+
+/* [P1] The probe FAILURE's write fails. The protective state holds in RAM;
+ * a software reset brings it back from the RTC copy; a power loss counts the
+ * stored probation as failed. Never full load from the stored probation. */
+static void failure_commit_fault(void)
+{
+    static const esp_reset_reason_t after[] = { ESP_RST_SW, ESP_RST_TASK_WDT, ESP_RST_BROWNOUT, ESP_RST_POWERON,
+                                                ESP_RST_PWR_GLITCH };
+    for (unsigned k = 0; k < sizeof after / sizeof after[0]; k++) {
+        g_blob_len = 0;
+        g_fail_writes = false;
+        reboot(ESP_RST_BROWNOUT, 2, true);
+        quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+        CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "k=%u probation on record", k);
+        g_fail_writes = true;
+        advance_s(H);
+        reboot(ESP_RST_BROWNOUT, 3, true);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1 && s_core.persist_fault, "k=%u failure in RAM", k);
+        advance_s(2 * H);
+        reboot(after[k], 4, true);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails >= 1 && s_core.p.probation == PP_PROBATION_NONE,
+              "k=%u: reset %d brought back state %d fails %u", k, after[k], st(), (unsigned)s_core.p.probe_fails);
+        /* NVS back: the next write puts it on record. */
+        g_fail_writes = false;
+        CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && !s_core.persist_fault, "k=%u repaired", k);
+        reboot(ESP_RST_SW, 5, true);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails >= 1, "k=%u on record", k);
+    }
+    /* No unwritten state: a reset without power loss keeps the probation
+     * (the nightly reboot must not fail it); a power-on fails it. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 10, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    reboot(ESP_RST_INT_WDT, 11, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "a watchdog keeps the probation");
+    reboot(ESP_RST_POWERON, 12, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probe_fails == 1 &&
+          s_core.p.hist_n == 1, "power-on on probation: failed (no brownout recorded)");
+    CHECK(strcmp(g_last_e, "power_protect: normal -> hold reason=probe_failed") == 0, "%s", g_last_e);
+    /* Garbage in RTC memory after a power-on never decodes. */
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 20, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "garbage is not a state");
+}
+
+/* [P1] The accumulated exit and the probation pass commit first too. */
+static void relaxation_commit_fault(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    g_fail_writes = true;
+    good_reads(READS_30MIN + 2, 4100, 3900);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.persist_fault, "uncommitted exit: still protected");
+    good_reads(10, 4100, 3900);
+    g_fail_writes = false;
+    good_reads(300, 4100, 3900);                   /* 25 min more, inside the hour */
+    CHECK(st() == PP_STATE_NO_FLASH, "no retry inside the hour");
+    good_reads(450, 4100, 3900);                   /* past the hour */
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED && !s_core.persist_fault,
+          "exit committed after the hold");
+    /* The probation pass. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
+    g_fail_writes = true;
+    quiet_reads(POWER_READ_NO_INPUT, 24 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL && s_core.persist_fault, "an unrecorded pass is not a pass");
+    g_fail_writes = false;
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NONE && !s_core.persist_fault, "passed once on record");
+}
+#endif
+
+/* [P2] A fresh low read vetoes the probe for a full quiet period, and a
+ * reboot does not erase that: low read -> software reset -> input lost, for
+ * no_flash and hold, with and without a valid clock. */
+static void low_veto_survives_reboot(void)
+{
+    for (int k = 0; k < 4; k++) {
+        const bool hold = k & 1, clock = k < 2;
+        g_blob_len = 0;
+        reboot(ESP_RST_BROWNOUT, 2, clock);
+        if (hold) {
+            advance_s(600);
+            reboot(ESP_RST_BROWNOUT, 3, clock);
+        }
+        const pp_state_t from = hold ? PP_STATE_HOLD : PP_STATE_NO_FLASH;
+        CHECK(st() == from, "k=%d setup", k);
+        quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
+        good_reads(3, 4100, 3350);                 /* fresh, input, battery 3.35 V */
+        quiet_reads(POWER_READ_NO_INPUT, 90);
+        CHECK(st() == from, "k=%d: the low read holds the probe", k);
+        reboot(ESP_RST_SW, 10, clock);             /* the nightly / no-PUBACK reboot */
+        quiet_reads(POWER_READ_NO_INPUT, 6 * H - 120);
+        CHECK(st() == from, "k=%d: 6 h after the low read, across the reboot: still %d (state %d)", k, from, st());
+        if (clock) {
+            /* The stored low counts an hour later (it may be that stale). */
+            quiet_reads(POWER_READ_NO_INPUT, H);
+            CHECK(st() == from, "k=%d: the refresh margin", k);
+        }
+        quiet_reads(POWER_READ_NO_INPUT, 300);
+        CHECK(st() != from, "k=%d: then the probe (state %d)", k, st());
+    }
+}
+
+/* The durable low costs at most one write per hour of low reads. */
+static void low_writes_bounded(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    const int w = g_writes;
+    for (int i = 0; i < 10 * 720; i++) read5(POWER_READ_OK, 4100, 3500, true, true);   /* 10 h, every 5 s */
+    CHECK(st() == PP_STATE_NO_FLASH, "low all along");
+    CHECK(g_writes - w >= 10 && g_writes - w <= 11, "one write an hour: %d", g_writes - w);
+    /* Without a valid clock: one write (undated), then none until it can be dated. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, false);
+    const int w2 = g_writes;
+    for (int i = 0; i < 2 * 720; i++) read5(POWER_READ_OK, 4100, 3500, true, true);
+    CHECK(g_writes == w2 + 1, "undated: one write (%d)", g_writes - w2);
+    g_src = "rtc";
+    read5(POWER_READ_OK, 4100, 3500, true, true);
+    CHECK(g_writes == w2 + 2, "dated once the clock is valid (%d)", g_writes - w2);
 }
 
 static void low_voltage_trigger(void)
@@ -932,7 +1127,7 @@ static void persistence_roundtrip(void)
     p.hist[0] = (pp_brownout_t){1763152200, 2};
     p.hist[1] = (pp_brownout_t){0, UINT32_MAX};
     uint8_t b[PP_BLOB_LEN], b2[PP_BLOB_LEN];
-    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 115, "len");
+    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 124, "len");
     CHECK(pp_encode(&p, b, PP_BLOB_LEN - 1) == 0, "short buffer refused");
     pp_persist_t q;
     CHECK(pp_decode(&q, b, sizeof b), "decode");
@@ -1323,6 +1518,13 @@ static const scenario_t k_scenarios[] = {
     {"probe_uptime_without_clock", probe_uptime_without_clock},
     {"evidence_blocks_probe", evidence_blocks_probe},
     {"blob_v1_upgrade", blob_v1_upgrade},
+#if HAVE_RECOVERY
+    {"probe_step_commit_fault", probe_step_commit_fault},
+    {"failure_commit_fault", failure_commit_fault},
+    {"relaxation_commit_fault", relaxation_commit_fault},
+#endif
+    {"low_veto_survives_reboot", low_veto_survives_reboot},
+    {"low_writes_bounded", low_writes_bounded},
     {"low_voltage_trigger", low_voltage_trigger},
     {"hold_never_exits_on_battery", hold_never_exits_on_battery},
     {"forced_never_exits", forced_never_exits},

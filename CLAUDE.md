@@ -95,8 +95,11 @@ holds bench boards.
 - **Brownout protection (2026-11)**: `components/power_protect` sheds whole schedule jobs and
   refuses updates (docs/power-protect.md). A shed run is NOT a failure (no fail streak) and
   never touches the event log or its cursor; its NVS blob is written only on transitions
-  (probe steps and their pass/failure included), brownout records, force and clear — never
-  per read or heartbeat. Only fresh (changing), valid, input-present charger frames count as
+  (probe steps and their pass/failure included), brownout records, a protected unit's fresh
+  low read (first, then at most hourly), force and clear — never per read or heartbeat. A
+  relaxation (probe step, probation pass, accumulated exit) is written BEFORE it takes effect;
+  a refused write keeps the unit protected (retry after 1 h). An unwritten protective state
+  survives non-power resets in RTC_NOINIT; a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
   evidence (accumulated, 30 min within 12 h; on exit `battery_v` 0 = judge the rail as the battery,
   entry unchanged: a 0 never triggers);
   battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on

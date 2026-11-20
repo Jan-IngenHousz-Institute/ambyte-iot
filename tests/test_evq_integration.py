@@ -80,7 +80,9 @@ PRODUCTION_SOURCES = [
 ]
 HARNESS_SOURCES = ["tests/evq_integ/harness.c"]
 IMPL_SOURCES = ["tests/evq_integ/rtos_shim.c", "tests/evq_integ/esp_stubs.c", "tests/evq_host/sha256.c",
-                "components/sd_card/sd_diag_core.c"]
+                "components/sd_card/sd_diag_core.c",
+                # the production health.power_protect renderer (worst case in esp_stubs.c)
+                "components/power_protect/power_protect_core.c"]
 INCLUDES = [
     "tests/evq_integ/stubs", "tests/evq_integ",
     "components/event_log/include", "components/event_log",
@@ -527,6 +529,12 @@ class EvqIntegration(unittest.TestCase):
         for w in worst_tel:
             with self.subTest(worst=w["variant"]):
                 self.assertEqual(w["cap"], 8192)
+                if w["variant"] == "max_width":
+                    # Every field the firmware can render at its widest still fits.
+                    self.assertTrue(w["fits"], w["worst_len"])
+                    pp = w["payload"]["health"]["power_protect"]
+                    self.assertTrue({"qualifying_s", "probe", "next_probe_s", "backoff_level"} <= set(pp), pp)
+                    self.assertEqual(pp["reason"], "brownout_unordered")
                 if w["fits"]:
                     self.assertLess(w["worst_len"], w["cap"])
                     self.assertEqual(w["payload"]["schema"], "ambyte.telemetry/1")

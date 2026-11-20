@@ -88,6 +88,23 @@
  *      monitor (no reads, or the charger never answering) there is no probe:
  *      fail-closed, as before. While qualifying evidence sits inside the
  *      horizon the accumulation decides and the probe waits.
+ *   Durability (review of PR #113, round 1):
+ *    - A RELAXATION (the probe step, a passed probation, the accumulated
+ *      exit) is committed to NVS BEFORE it takes effect (pp_event_t.relaxes;
+ *      the glue persists first and rolls the core back if the write fails).
+ *      After a failed commit the unit stays protected and no relaxation is
+ *      tried for PP_RELAX_RETRY_MS: a probe that is not on record could
+ *      otherwise be repeated after every brownout without its failure ever
+ *      counting (the 6-failure cap bypassed).
+ *    - A probation found at boot after a POWER loss (power-on, power glitch,
+ *      brownout) is a failed probe: the run on probation ended with the power
+ *      gone. After any other reset (the nightly reboot, a watchdog) it goes
+ *      on; a protective state that could not be written survives such a
+ *      reset in an RTC_NOINIT copy (glue).
+ *    - The newest fresh low read is part of the persisted state (has_low,
+ *      low_utc), refreshed at most once per PP_LOW_REFRESH_S, so a reboot
+ *      cannot erase the probe's low-read veto. After a reboot the stored
+ *      time counts PP_LOW_REFRESH_S later than written (it may be that stale).
  * Operator: force(no_flash|hold) sets a forced state that never auto-exits
  *   (a linked brownout still escalates forced no_flash to hold); clear returns
  *   to normal and wipes the brownout history, the forced flag, the probation
@@ -156,6 +173,15 @@ extern "C" {
 #define PP_PROBE_LEVEL_CAP     2u      /* 6 h << 2 = 24 h */
 #define PP_PROBE_FAILS_MAX     6u
 #define PP_PROBATION_S         (24LL * 60 * 60)
+/* A relaxation whose NVS commit failed is not retried for an hour: at most
+ * one write attempt per hour while the NVS refuses, and the unit stays
+ * protected in between. */
+#define PP_RELAX_RETRY_MS      (60LL * 60 * 1000)
+/* The durable low-read time is refreshed at most hourly while fresh low reads
+ * continue (≤ 24 writes a day, and only on days a protected unit sees its
+ * panel with a low battery; never per read). The cost is that after a reboot
+ * the veto counts from up to an hour later than the real last low read. */
+#define PP_LOW_REFRESH_S       (60LL * 60)
 
 typedef enum {
     PP_STATE_NORMAL = 0,
@@ -215,6 +241,10 @@ typedef struct {
      * the last qualifying exit or clear (the backoff level). */
     uint8_t  probation;
     uint8_t  probe_fails;
+    /* The newest fresh low read of this state (cleared by every transition):
+     * has_low with low_utc 0 = seen while the clock was not valid. */
+    bool     has_low;
+    int64_t  low_utc;
 } pp_persist_t;
 
 typedef struct {
@@ -231,6 +261,7 @@ typedef struct {
     int64_t  last_low_ms;
     bool     monitor_live;     /* the last read came from a charger that answered */
     int64_t  since_mono_ms;    /* monotonic time of this boot's last read-driven transition; 0 = boot */
+    int64_t  relax_hold_until_ms; /* no relaxation before this (a failed commit); glue-owned */
     /* The NVS copy is not trustworthy: unreadable at boot, or the last write
      * failed. Cleared by the next successful write (the glue owns it). */
     bool     persist_fault;
@@ -250,6 +281,7 @@ typedef struct {
     pp_state_t  from, to;
     pp_reason_t reason;
     bool        probe_passed;   /* probation ended well (one E line, state unchanged) */
+    bool        relaxes;        /* less protection: commit to NVS BEFORE it takes effect */
 } pp_event_t;
 
 /* Skipped-work counters (RAM, per boot: counting into NVS would write per run). */
@@ -273,13 +305,18 @@ void pp_load_unreadable(pp_core_t *c, pp_clock_t clk);
  * unreadable (no_flash, state_unreadable): the safe side. */
 #define PP_BLOB_VERSION 2u
 #define PP_BLOB_V1_LEN  (1u + 3u + 8u + 1u + PP_HIST_MAX * 12u + 4u)
-#define PP_BLOB_LEN     (PP_BLOB_V1_LEN + 2u)
+#define PP_BLOB_LEN     (PP_BLOB_V1_LEN + 2u + 1u + 8u)
 size_t pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap);
 bool   pp_decode(pp_persist_t *out, const uint8_t *buf, size_t len);
 
 /* Once per boot, after the persisted state is loaded and before anything that
  * sheds runs. Idempotent per boot number. */
 pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock_t clk);
+
+/* This boot followed a power loss other than a brownout (power-on, power
+ * glitch). A probation in flight failed (-> hold, probe_failed); otherwise
+ * nothing. Call before pp_on_boot. */
+pp_event_t pp_on_power_loss(pp_core_t *c, pp_clock_t clk);
 
 /* One charger read: the driver verdict, the reading (only when OK), and
  * power_policy's fresh-external-power evidence (power_gate_flash_ok after this

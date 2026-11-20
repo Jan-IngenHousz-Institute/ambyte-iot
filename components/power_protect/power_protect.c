@@ -2,14 +2,32 @@
  * power_protect.c — target glue for the brownout protection state machine
  * (contract: include/power_protect.h; decisions: power_protect_core.c).
  *
- * NVS namespace "pwr_protect", key "state": the pp_encode blob (115 B, v2; the
+ * NVS namespace "pwr_protect", key "state": the pp_encode blob (124 B, v2; the
  * 113-B v1 blob of the first release is still read). Written ONLY when the
  * core says persist — a state transition (the probe step and a failed probe
  * included), a passed probation, a recorded brownout (at most one per boot),
- * force, clear. Never per read, never per heartbeat:
+ * a protected unit's fresh low read (first, then at most hourly), force,
+ * clear. Never per read, never per heartbeat:
  * a flash write per 5 s charger read would wear the NVS sector for nothing.
  * RTC_NOINIT is not enough on its own: a brownout is a power-on-class reset,
  * exactly the reset this module exists for, and it clears RTC memory.
+ *
+ * Commit order (review of PR #113, round 1):
+ *  - A RELAXATION (ev.relaxes: the probe step, a passed probation, the
+ *    accumulated exit) is written FIRST and only then published. If the write
+ *    fails the core is rolled back to its state before the read, the unit
+ *    stays protected and no relaxation is tried for PP_RELAX_RETRY_MS. A probe
+ *    that is not on record would come back after a brownout as an ordinary
+ *    episode: its failure would never count and the 6-failure cap and the
+ *    backoff could be bypassed for ever.
+ *  - Everything else (more protection) is published FIRST, then written: the
+ *    unit is protected at once even when the write fails. Such an unwritten
+ *    state is also kept in an RTC_NOINIT copy (s_unwritten), which a reset
+ *    WITHOUT power loss (the nightly reboot, a watchdog, a panic) adopts at
+ *    boot, so a failure on probation that NVS refused cannot be undone by a
+ *    software reset bringing back the stored probation. After a power loss
+ *    the copy is gone, and a stored probation counts as failed instead
+ *    (pp_on_power_loss / pp_on_boot).
  */
 #include "power_protect.h"
 
@@ -18,6 +36,7 @@
 
 #include "clock_trust.h"
 #include "diag.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -32,11 +51,44 @@
 static SemaphoreHandle_t s_mtx;
 static StaticSemaphore_t s_mtx_storage;
 static pp_core_t s_core;                 /* under s_mtx */
+static pp_core_t s_before;               /* under s_mtx: rollback copy for a relaxation (~0.5 KiB, off the stack) */
 /* Published copy of s_core.p.state for lock-free readers (sched_runner,
  * ota_update, the pong on the esp-mqtt task). A byte store is atomic here. */
 static volatile uint8_t s_state_pub = PP_STATE_NORMAL;
 static portMUX_TYPE s_skip_mux = portMUX_INITIALIZER_UNLOCKED;
 static pp_skips_t s_skips;               /* under s_skip_mux */
+
+/* The newest state NVS refused (see the header comment). Survives resets
+ * without power loss; validated by a magic word and the blob's own CRC, so
+ * the garbage RTC memory holds after a power-on never decodes. */
+#define PP_UNWRITTEN_MAGIC 0x50505257u   /* "PPRW" */
+typedef struct {
+    uint32_t magic;
+    uint8_t  blob[PP_BLOB_LEN];
+} pp_unwritten_t;
+static RTC_NOINIT_ATTR pp_unwritten_t s_unwritten;
+
+static void unwritten_keep(const pp_persist_t *p)
+{
+    if (pp_encode(p, s_unwritten.blob, sizeof s_unwritten.blob) == PP_BLOB_LEN) {
+        s_unwritten.magic = PP_UNWRITTEN_MAGIC;
+    } else {
+        s_unwritten.magic = 0;
+    }
+}
+
+static void unwritten_drop(void)
+{
+    s_unwritten.magic = 0;
+}
+
+static bool unwritten_take(pp_persist_t *out)
+{
+    const bool ok = s_unwritten.magic == PP_UNWRITTEN_MAGIC &&
+                    pp_decode(out, s_unwritten.blob, sizeof s_unwritten.blob);
+    unwritten_drop();
+    return ok;
+}
 
 /* Valid = a UTC the brownout history may compare across boots. SNTP outranks
  * everything. An RTC-sourced clock counts only when nothing made it suspect
@@ -90,16 +142,50 @@ static esp_err_t apply(const pp_event_t *ev)
     if (!ev->persist) return ESP_OK;
     const esp_err_t err = persist(&s_core.p);
     if (err != ESP_OK) {
-        /* RAM keeps the new state for this boot; only the next boot would
-         * miss it. Warn (not error): the transition line already went out.
-         * health.power_protect.persist_fault says so until a write succeeds. */
+        /* RAM keeps the new state for this boot, and the RTC copy keeps it
+         * across a reset without power loss. Warn (not error): the
+         * transition line already went out. health.power_protect.persist_fault
+         * says so until a write succeeds. */
         ESP_LOGW(TAG, "state not persisted: %s", esp_err_to_name(err));
         s_core.persist_fault = true;
-    } else if (s_core.persist_fault) {
+        unwritten_keep(&s_core.p);
+    } else {
+        unwritten_drop();
+        s_core.relax_hold_until_ms = 0;
+        if (s_core.persist_fault) {
+            ESP_LOGW(TAG, "persisted state repaired");
+            s_core.persist_fault = false;
+        }
+    }
+    return err;
+}
+
+/* Under s_mtx. A relaxation: written first, published only once it is on
+ * record. On a failed write the core goes back to `before` (this read never
+ * happened), the unit stays protected, and relaxations wait. */
+static void commit_relaxation(const pp_event_t *ev, const pp_core_t *before, int64_t now_ms)
+{
+    const esp_err_t err = persist(&s_core.p);
+    if (err != ESP_OK) {
+        s_core = *before;
+        s_core.persist_fault = true;
+        s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
+        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s, next try in %lld min",
+                 pp_state_name(ev->from), pp_state_name(ev->to), ev->probe_passed ? "probe_passed"
+                 : pp_reason_name(ev->reason), esp_err_to_name(err), pp_state_name(ev->from),
+                 (long long)(PP_RELAX_RETRY_MS / 60000));
+        s_state_pub = s_core.p.state;
+        return;
+    }
+    unwritten_drop();
+    s_core.relax_hold_until_ms = 0;
+    if (s_core.persist_fault) {
         ESP_LOGW(TAG, "persisted state repaired");
         s_core.persist_fault = false;
     }
-    return err;
+    pp_event_t published = *ev;
+    published.persist = false;   /* already written */
+    (void)apply(&published);
 }
 
 static bool lock(void)
@@ -145,8 +231,27 @@ void power_protect_boot(void)
         pp_load_unreadable(&s_core, clk);
     }
 
-    const bool brownout = esp_reset_reason() == ESP_RST_BROWNOUT;
+    const esp_reset_reason_t rr = esp_reset_reason();
+    const bool brownout = rr == ESP_RST_BROWNOUT;
+    const bool power_lost = brownout || rr == ESP_RST_POWERON || rr == ESP_RST_PWR_GLITCH;
+    /* A state NVS refused, kept in RTC memory: newer than the blob. Only a
+     * reset without power loss keeps it; otherwise it is dropped unread. */
+    pp_persist_t unwritten;
+    if (!power_lost && unwritten_take(&unwritten)) {
+        ESP_LOGW(TAG, "adopting the unwritten state %s (reason %s) from before the reset",
+                 pp_state_name((pp_state_t)unwritten.state), pp_reason_name((pp_reason_t)unwritten.reason));
+        s_core.p = unwritten;
+        s_core.persist_fault = true;   /* not on record until the next write */
+    } else {
+        unwritten_drop();
+    }
     lock();
+    if (power_lost && !brownout) {
+        /* Power-on / power glitch: a probation in flight failed. (A brownout
+         * is decided by pp_on_boot, with its history entry.) */
+        const pp_event_t lost = pp_on_power_loss(&s_core, clk);
+        (void)apply(&lost);
+    }
     const pp_event_t ev = pp_on_boot(&s_core, brownout, diag_boot_count(), clk);
     (void)apply(&ev);
     const uint32_t recent = pp_brownouts_6h(&s_core, clk, diag_boot_count());
@@ -163,8 +268,14 @@ void power_protect_on_power_read(power_read_reason_t reason, const power_reading
                                  bool fresh_present)
 {
     if (!lock()) return;   /* before boot: nothing to protect yet */
-    const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, mono_ms(), clock_now());
-    (void)apply(&ev);
+    const int64_t now = mono_ms();
+    s_before = s_core;
+    const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, now, clock_now());
+    if (ev.relaxes) {
+        commit_relaxation(&ev, &s_before, now);
+    } else {
+        (void)apply(&ev);
+    }
     unlock();
 }
 

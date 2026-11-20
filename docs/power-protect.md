@@ -61,8 +61,8 @@ stateDiagram-v2
     hold --> normal: 30 min of qualifying evidence within 12 h (power_recovered)
     hold --> no_flash: probe, after a quiet period on battery (probation)
     no_flash --> normal: probe, after a quiet period on battery (probation)
-    normal --> hold: brownout on probation (probe_failed)
-    no_flash --> hold: brownout or fresh low read on the hold to no_flash probation (probe_failed)
+    normal --> hold: brownout or power loss on probation (probe_failed)
+    no_flash --> hold: brownout, power loss or fresh low read on the hold to no_flash probation (probe_failed)
     normal --> no_flash: fresh low read on probation (probe_failed)
     normal --> no_flash: force no_flash
     normal --> hold: force hold
@@ -199,8 +199,9 @@ no fresh low read and no collected evidence:
   (or the probe step) and the newest recorded brownout, across reboots.
   Without one it counts uptime since boot or since this boot's last
   transition, so any reboot restarts it (conservative). A fresh low read
-  restarts it; evidence inside the 12-h horizon holds it off, because the
-  accumulation decides then.
+  restarts it, durably: the newest low read of the state is stored (below),
+  so a reboot cannot erase the veto. Evidence inside the 12-h horizon holds
+  the probe off, because the accumulation decides then.
 - **Probation:** 24 h, measured the same way (from the probe step).
   - A **brownout** during it fails the probe. It belongs to the episode the
     probe stepped out of, so it escalates like a linked brownout: → `hold`,
@@ -221,6 +222,15 @@ no fresh low read and no collected evidence:
 - The probe step, a failed probe and a passed probation each write the blob
   once (they are transitions). The backoff level and the probation survive
   reboots.
+- **On record first.** A relaxation (the probe step, a passed probation, the
+  accumulated exit) takes effect only once NVS has accepted it; if the write
+  fails the unit stays protected and the next relaxation waits an hour (§
+  "Commit order").
+- **A power loss on probation is a failed probe.** A probation found at boot
+  after a power-on or power-glitch reset counts as failed exactly like a
+  brownout (→ `hold`, level +1; no brownout entry is recorded). The nightly
+  reboot and watchdog resets keep the probation: the nightly reboot runs
+  every day, so failing on it would make the 24-h probation impossible.
 
 Why these numbers:
 
@@ -246,14 +256,15 @@ stateDiagram-v2
     state "on probation (one level down)" as P
     state "exhausted (6 failures)" as X
     [*] --> W: brownout / low_voltage / state_unreadable (level from NVS)
-    W --> P: quiet 6h·2^min(L,2), live monitor, no evidence (probe)
-    P --> W: brownout → hold, or fresh read below entry → back (probe_failed, L+1)
-    P --> [*]: 24 h without either (probe_passed)
+    W --> P: quiet 6h·2^min(L,2), live monitor, no evidence, step on record (probe)
+    W --> W: probe step not written - stay, retry in 1 h
+    P --> W: brownout or power-on → hold, or fresh read below entry → back (probe_failed, L+1)
+    P --> [*]: 24 h without either, pass on record (probe_passed)
     W --> X: L reaches 6
     W --> [*]: 30 min evidence in 12 h (power_recovered, L := 0)
     X --> [*]: 30 min evidence in 12 h, or clear (L := 0)
     note right of W
-        L survives reboots (NVS blob v2)
+        L, the probation and the newest low read survive reboots (NVS blob v2)
         forced: never waits, never probes
         no charger monitor: never probes
     end note
@@ -326,17 +337,64 @@ at all counts (conservative) until `clear` wipes the history.
 
 ### Persistence
 
-NVS namespace `pwr_protect`, key `state`: one 115-byte blob, version 2. It
+NVS namespace `pwr_protect`, key `state`: one 124-byte blob, version 2. It
 holds the version, state, reason, forced flag, `since_utc`, the history, the
-probation step and the backoff level, then a CRC32. The bytes are explicit
-little-endian, not a struct dump. It is written **only** on:
+probation step, the backoff level and the newest fresh low read of the state
+(`has_low`, `low_utc`), then a CRC32. The bytes are explicit little-endian,
+not a struct dump. It is written **only** on:
 
 - a state transition (the probe step and a failed probe included);
 - a passed probation;
 - a recorded brownout (at most once per boot);
+- a fresh low read while protected: the first of the state, the first one
+  the clock can date, then **at most once an hour** while low reads go on
+  (≤ 24 writes a day, and only on days a protected unit sees its panel with
+  a low battery);
 - `force` and `clear`.
 
-Never per charger read, never per heartbeat.
+Never per charger read, never per heartbeat. The stored low read keeps the
+probe's veto across a reboot (the nightly reboot, a no-PUBACK reboot). After a
+reboot it counts an hour later than written, since it may be that stale, so
+the veto is never shorter than it was before the reboot. Every transition
+clears it (the new `since_utc` is later anyway).
+
+#### Commit order
+
+Review of PR #113: a probe step that NVS refused still took effect, and the
+next brownout reloaded the old blob as an ordinary episode, so the failure
+never counted and the 6-failure cap could be bypassed for ever. A failure
+that NVS refused could likewise be undone by a software reset bringing the
+stored probation back.
+
+- **Relaxations are written first.** The probe step, a passed probation and
+  the accumulated exit are written to NVS and only then published. If the
+  write fails, the core is rolled back to its state before the read, the unit
+  stays protected (`persist_fault: true`), and no relaxation is tried for an
+  hour: at most one write attempt an hour while NVS refuses.
+- **Protection is published first.** Every other change (entry, escalation,
+  a failed probe, `force`) takes effect at once and is then written. If NVS
+  refuses, the state holds in RAM and in an **RTC_NOINIT copy** (magic word
+  + the blob's own CRC). A reset **without** power loss (the nightly reboot,
+  a watchdog, a panic) adopts that copy at boot, ahead of the blob, with
+  `persist_fault` set until a write succeeds. After a power loss the copy is
+  gone (and garbage never decodes).
+- **Boot policy for a stored probation:** after a brownout, power-on or
+  power-glitch reset it is a failed probe. After any other reset it goes on.
+
+```mermaid
+flowchart TD
+    E["event from a read"] --> R{"relaxes?<br/>(probe step, probation pass,<br/>accumulated exit)"}
+    R -->|yes| W1["write NVS first"]
+    W1 -->|ok| P1["publish, one E line"]
+    W1 -->|refused| B["roll back to before the read<br/>stay protected, persist_fault<br/>no relaxation for 1 h"]
+    R -->|"no (more protection)"| P2["publish at once, E line"]
+    P2 --> W2["write NVS"]
+    W2 -->|ok| D["drop the RTC copy"]
+    W2 -->|refused| K["keep the state in the RTC_NOINIT copy<br/>persist_fault"]
+    K --> RS{"next reset"}
+    RS -->|"software, watchdog, panic"| A["adopt the RTC copy at boot"]
+    RS -->|"brownout, power-on, glitch"| L["copy gone: a stored probation<br/>counts as failed → hold"]
+```
 
 The 113-byte version-1 blob of the first release is still read, with no
 probation and level 0, so an upgrade keeps every stored state. The next
@@ -360,9 +418,9 @@ At boot the blob is either:
   written at boot; the next persisting event (a transition, a brownout record,
   `force`, `clear`) rewrites the blob and clears `persist_fault`.
 
-`persist_fault` is also raised when a write fails at run time (the new state
-holds in RAM but would not survive a reboot) and cleared by the next
-successful write. RTC_NOINIT alone was
+`persist_fault` is also raised when a write fails at run time (a protective
+state holds in RAM and the RTC copy; a relaxation does not happen) and
+cleared by the next successful write. RTC_NOINIT alone was
 not an option: a brownout is a power-on-class reset, exactly the reset this
 state has to survive.
 
@@ -566,11 +624,23 @@ run fails unless every reply confirms the requested state. In Actions →
     then 0);
   - the blob round trip, corruption and the v1 → v2 upgrade; unreadable state
     after non-brownout reboots and after open/read failures;
+  - durability (review round 1): a probe step whose write fails never takes
+    effect, before or after 8 brownouts or a software reset, and is retried
+    after an hour; a probe failure whose write fails comes back after a
+    software or watchdog reset (RTC copy) and is counted after a brownout,
+    power-on or power glitch; the accumulated exit and the probation pass
+    commit first; the low-read veto survives a software reset in `no_flash`
+    and `hold`, with and without a valid clock; low reads cost at most one
+    write an hour;
   - NVS writes only on transitions; the command codec and its allocation
     failures.
 
   The 13 recovery scenarios also build against the previous core (origin/main
-  a13fbfd), where 12 of them fail. `blob_v1_upgrade` is new-API only.
+  a13fbfd), where 12 of them fail. `blob_v1_upgrade` is new-API only. The 5
+  durability regressions build against the round-0 head b4103f5, where all 5
+  fail. `tests/test_evq_integration.py` I5 renders the widest
+  `health.power_protect` through the production `pp_render_json`: the
+  max-width heartbeat is 6637 of 8192 bytes.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.
