@@ -90,8 +90,8 @@
  *      horizon the accumulation decides and the probe waits.
  *   Durability (review of PR #113, rounds 1-2): ONE generation-ordered record.
  *    - Every persisted record carries a generation number (gen) that is never
- *      reused. The glue keeps two copies: NVS, and an RTC_NOINIT mirror that
- *      survives resets without power loss. At boot the NEWEST valid copy by
+ *      reused. The glue keeps two copies: NVS, and an RTC_NOINIT mirror (two
+ *      slots, bound to the NVS epoch) that survives resets without power loss. At boot the NEWEST valid copy by
  *      generation wins (the RTC copy only after a reset without power loss);
  *      neither copy is consumed by being read.
  *    - A protective update (entry, escalation, a failed probe, a brownout or

@@ -59,7 +59,7 @@ def build(out: Path) -> Path:
            str(ROOT / "components/device_commands/power_policy.c"),
            str(ROOT / "components/command_router/power_protect_command.c"),
            str(cjson / "cJSON.c"),
-           "-Wl,--wrap=time", "-lm", "-o", str(binary)]
+           "-Wl,--wrap=time", "-Wl,--wrap=pp_encode", "-lm", "-o", str(binary)]
     if "clang" in Path(cc).name:
         cmd[1:1] = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 52)
+        self.assertGreaterEqual(len(self.scenarios), 55)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -110,7 +110,9 @@ class PowerProtectHostTest(unittest.TestCase):
                      "low_veto_survives_reboot", "low_writes_bounded",
                      # review round 2 (each fails on 92f1698)
                      "rtc_repeated_resets", "reset_at_commit_boundary", "rejected_relaxation_keeps_low",
-                     "low_clock_trust_change", "operator_relaxation_needs_record"):
+                     "low_clock_trust_change", "operator_relaxation_needs_record",
+                     # review round 3 (each fails on 85205f0)
+                     "rtc_store_interrupted", "relaxation_write_then_error", "rtc_bound_to_nvs_epoch"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):

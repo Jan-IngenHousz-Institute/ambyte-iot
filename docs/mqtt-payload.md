@@ -1176,7 +1176,7 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
   `queue_unavailable`, `maintenance_active` (`clear`/`force` while another
   maintenance op holds the lock), `persist_failed` (the NVS write failed: a
   `clear` or force down was NOT applied, the reply carries the unchanged
-  state; a force up applied in RAM and RTC memory, survives resets without
+  state; a write NVS reported as failed but which re-reads as landed is `ok`; a force up applied in RAM and RTC memory, survives resets without
   power loss but not a power loss), `no_mem`. Refusals carry
   `state` too.
 

@@ -350,7 +350,9 @@ explicit little-endian, not a struct dump. It is written **only** on:
   the clock can date; the switch to undated when a low read arrives while the
   clock is not trusted; then **at most once an hour** while low reads go on;
 - `force` and `clear`;
-- once at boot, to put a newer record from RTC memory on record (below).
+- once at boot, to put a newer record from RTC memory on record (below);
+- a fence after a relaxation whose write outcome cannot be read back (below);
+- the NVS epoch, once per NVS lifetime (below).
 
 Never per charger read, never per heartbeat. **The real bound for the low
 record:** per protected state, 1 (the first low read) + at most 1 an hour of
@@ -368,23 +370,31 @@ clears it (the new `since_utc` is later anyway).
 
 #### One generation-ordered record
 
-Two review rounds of PR #113 found reset windows in patching NVS and an RTC
-copy separately:
+Three review rounds of PR #113 found reset windows in patching NVS and an
+RTC copy separately:
 
 - a probe step that NVS refused still took effect, so its failure never
   counted;
 - an RTC copy consumed at its first adoption protected for one reset only;
 - an older RTC copy could override a newer durable record;
-- a rejected relaxation rolled back the low read that came with it.
+- a rejected relaxation rolled back the low read that came with it;
+- rewriting the single RTC slot in place left no valid copy for a moment;
+- an NVS write that reported an error could still have landed.
 
 The model is now one record, ordered by generation:
 
 - **Every record written carries a generation number**, one more than the
   last, never reused. A refused relaxation consumes its number too, because
   it may have landed.
-- **Two copies:** NVS, and a mirror of the newest record in RTC_NOINIT memory
-  (magic word + the blob's own CRC, so garbage never decodes). The mirror
-  survives resets without power loss and is **never consumed** by being read.
+- **Two copies:** NVS, and a mirror of the newest record in RTC_NOINIT memory.
+  The mirror survives resets without power loss and is **never consumed** by
+  being read.
+  - It has **two slots**, each checked by a magic word, the blob's own CRC (so
+    garbage never decodes) and the NVS epoch (below).
+  - A rewrite goes to the slot that does *not* hold the newest record. It is
+    invalidated, filled, and only then armed. A reset anywhere inside it
+    leaves the previous slot valid.
+  - Writing a record the newest slot already holds is skipped.
 - **Protective updates go RTC first, then NVS.** Entry, escalation, a failed
   probe, a brownout or low-read record and a force up take effect at once.
   If NVS refuses, the RTC copy is the newest record.
@@ -399,11 +409,35 @@ The model is now one record, ordered by generation:
     for an hour: at most one write attempt an hour while NVS refuses.
   - An operator relaxation that NVS refuses is **not applied**. The reply is
     `persist_failed` with the unchanged state.
+  - **An NVS error is not proof that nothing was written.** The pinned
+    ESP-IDF's `Storage::writeItem` writes the new blob first and can fail
+    after it: `ESP_ERR_NVS_REMOVE_FAILED` erasing the old copy, or any error
+    from `eraseMultiPageBlob`. So after any error the record is **re-read**,
+    and what NVS returns now is what the next boot reads.
+    - If the new record is there, the relaxation stands: state, log line and
+      reply say so (`ok`, with a warning in the log).
+    - If it is not there, the relaxation is refused as above.
+    - If the re-read fails, the outcome is unknown, so the relaxation is
+      **fenced**: a newer protective record (the unchanged state, generation
+      + 1 again) goes to RTC and NVS, so a relaxation that did land can never
+      win at a later boot. The reply is `persist_failed`.
 - **At boot the newer record by generation wins.** RTC is only considered
-  after a reset without power loss; it then wins over NVS when its generation
-  is higher, or when NVS is absent or unreadable. An adopted RTC record is
-  written to NVS once at boot, and the mirror stays armed until NVS holds a
-  newer record.
+  after a reset without power loss, and only for the current NVS epoch. It
+  then wins over NVS when its generation is higher, or when NVS is absent or
+  unreadable. An adopted RTC record is written to NVS once at boot, and the
+  mirror stays armed until NVS holds a newer record.
+- **The NVS epoch** binds RTC records to one NVS lifetime. It is a random
+  non-zero number in NVS (`pwr_protect/epoch`), created once when absent:
+  one NVS write per NVS lifetime.
+  - A deliberate NVS rewrite or wipe (flash_gui provisioning, `clean_nvs`)
+    creates a new epoch. That rewrite ends in a USB or watchdog reset, which
+    keeps RTC memory, but an RTC record from before it is never adopted.
+  - An epoch that exists but cannot be *read* proves no rewrite. The newest
+    valid RTC record's own epoch is used, so an NVS read fault does not cost
+    the retained protection.
+  - With no epoch at all (absent and not creatable), RTC records are neither
+    written nor adopted. NVS is then refusing every write anyway, so
+    protection holds in RAM only.
 - **A stored probation after a power loss is a failed probe.** That covers a
   brownout, power-on or power-glitch reset, where the RTC copy is gone.
   After any other reset it goes on: failing it on the nightly reboot would
@@ -430,8 +464,10 @@ flowchart TD
     C -->|ok| A["adopt the copy, mirror to RTC,<br/>publish, one E line"]
     C -->|refused| H["keep the state (with this read's facts),<br/>consume the gen, persist_fault,<br/>no relaxation for 1 h"]
     B["boot"] --> PL{"power lost?<br/>(brownout, power-on, glitch)"}
-    PL -->|no| CMP{"RTC valid and newer than NVS<br/>(or NVS absent / unreadable)?"}
+    PL -->|no| CMP{"RTC valid for this NVS epoch,<br/>newer than NVS (or NVS absent / unreadable)?"}
     CMP -->|yes| AD["adopt RTC, write it to NVS once,<br/>the mirror stays armed"]
+    C -->|"error, re-read shows it landed"| A
+    C -->|"error, re-read impossible"| FE["fence: newer protective record<br/>to RTC and NVS, refuse"]
     CMP -->|no| NV["NVS record"]
     PL -->|yes| NV2["NVS record (RTC gone):<br/>a stored probation fails → hold"]
 ```
@@ -627,7 +663,9 @@ sequenceDiagram
 - `clear` and a force **down** (`hold` → `no_flash`) lower protection, so like
   every relaxation they take effect only once NVS has them: if the write
   fails nothing changes and the reply is `persist_failed` with the unchanged
-  state. A force **up** applies at once; if NVS refuses it the reply is
+  state. If NVS reports an error but the re-read shows the record landed, it
+  stands and the reply is `ok` (the state is what the next boot reads); if
+  the re-read is impossible, it is fenced and refused. A force **up** applies at once; if NVS refuses it the reply is
   `persist_failed`, the forced state holds in RAM and the RTC mirror
   (surviving resets without power loss), and a power loss loses it.
 - Runs on the resident maintenance worker, the same pattern as
@@ -691,6 +729,13 @@ run fails unless every reply confirms the requested state. In Actions →
     - low reads cost at most one write an hour;
     - a `clear` or force down that NVS refuses changes nothing, and a force
       up survives a reset but not a power loss;
+    - (round 3) a reset at the boot's mirror rewrite and at each point inside
+      the RTC write (before invalidating, between invalidating and filling,
+      before arming) never loses the retained failed probe; a write that
+      lands and then reports `ESP_ERR_NVS_REMOVE_FAILED` (operator `clear`,
+      force down, the automatic probe step) stands and is reported as such;
+      with the re-read failing it is fenced across a reset and a power loss;
+      a rewritten NVS (new epoch) never adopts the old RTC record;
   - NVS writes only on transitions; the command codec and its allocation
     failures.
 
@@ -700,7 +745,8 @@ run fails unless every reply confirms the requested state. In Actions →
   fail. `tests/test_evq_integration.py` I5 renders the widest
   `health.power_protect` through the production `pp_render_json`: the
   max-width heartbeat is 6637 of 8192 bytes. The 5 round-2 regressions
-  build against round-1 head 92f1698, where all 5 fail.
+  build against round-1 head 92f1698, where all 5 fail; the 3 round-3
+  regressions build against round-2 head 85205f0, where all 3 fail.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.

@@ -88,7 +88,9 @@ int power_protect_render_json(char *buf, size_t cap);
 
 /* Operator actions; the return value is the NVS persist result (ESP_OK also
  * when nothing needed writing). clear and a force DOWN (hold -> no_flash) are
- * relaxations: written first, and NOT applied when the write fails. A force
+ * relaxations: written first, and NOT applied when the write fails (an error
+ * after which the record re-reads as landed counts as success: the state is
+ * what the next boot reads; an unreadable outcome is fenced). A force
  * UP applies at once; if NVS refuses it, it holds in RAM and the RTC mirror
  * (resets without power loss), not across a power loss. */
 esp_err_t power_protect_force(pp_state_t state);

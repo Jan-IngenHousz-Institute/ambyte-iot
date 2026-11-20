@@ -101,8 +101,11 @@ holds bench boards.
   (never reused); protective updates go RTC_NOINIT mirror then NVS; relaxations (probe step,
   probation pass, accumulated exit, clear, force down) go NVS FIRST and are adopted only on
   success (refused: stay protected, keep the read's low veto, retry after 1 h; operator: not
-  applied). Boot adopts the newer valid record by gen (RTC only after a non-power reset, never
-  consumed); a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
+  applied; an NVS error is re-read — landed = it stands, unreadable = fenced by a newer
+  protective record). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
+  to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never
+  adopts an old record. Boot adopts the newer valid record by gen (RTC only after a non-power
+  reset, never consumed); a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
   evidence (accumulated, 30 min within 12 h; on exit `battery_v` 0 = judge the rail as the battery,
   entry unchanged: a 0 never triggers);
   battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on

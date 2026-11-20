@@ -7,9 +7,10 @@
  * ONLY when the core says persist (a state transition, the probe step and a
  * failed probe included; a passed probation; a recorded brownout, at most one
  * per boot; a protected unit's fresh low read, first / dating / at most
- * hourly), on force and clear, and once at boot to put an adopted RTC record
- * on record. Never per read, never per heartbeat: a flash write per 5 s
- * charger read would wear the NVS sector for nothing. RTC_NOINIT is not
+ * hourly), on force and clear, once at boot to put an adopted RTC record on
+ * record, as a fence after an unreadable relaxation outcome, and (key "epoch")
+ * once per NVS lifetime. Never per read, never per heartbeat: a flash write
+ * per 5 s charger read would wear the NVS sector for nothing. RTC_NOINIT is not
  * enough on its own: a brownout is a power-on-class reset, exactly the reset
  * this module exists for, and it clears RTC memory.
  *
@@ -18,13 +19,17 @@
  * after a refused NVS write) each left a reset window, so the model is now:
  *  - every record written carries pp_persist_t.gen = the previous number + 1,
  *    never reused (a refused relaxation consumes its number too);
- *  - s_rtc mirrors the newest record in RTC_NOINIT memory; it survives resets
- *    WITHOUT power loss and is never cleared by being read;
+ *  - s_rtc mirrors the newest record in RTC_NOINIT memory, in two slots (a
+ *    rewrite never touches the newest one) bound to the NVS epoch; it
+ *    survives resets WITHOUT power loss and is never cleared by being read;
  *  - a PROTECTIVE update is applied, written to s_rtc, then to NVS;
  *  - a RELAXATION (pp_relax, an operator clear / force down) is computed on a
  *    copy (s_cand), written to NVS FIRST, and only then adopted and mirrored
  *    to s_rtc. A refused write leaves the state as it was after the read's
- *    protective facts, and automatic relaxations wait PP_RELAX_RETRY_MS;
+ *    protective facts, and automatic relaxations wait PP_RELAX_RETRY_MS. An
+ *    NVS error is re-read (round 3): the pinned IDF can report one after the
+ *    new blob was written; landed = it stands, unreadable = fenced by a newer
+ *    protective record;
  *  - at boot the newer valid record by generation wins: s_rtc (only after a
  *    reset without power loss) over NVS when its generation is higher. The
  *    adopted record is written to NVS once (sync), and s_rtc stays armed.
@@ -42,6 +47,7 @@
 #include "diag.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -51,6 +57,11 @@
 #define TAG "power_protect"
 #define PP_NVS_NS  "pwr_protect"
 #define PP_NVS_KEY "state"
+#define PP_NVS_EPOCH "epoch"
+/* Host tests inject resets inside the RTC write (tests/power_protect_host). */
+#ifndef PP_TEST_POINT
+#define PP_TEST_POINT(n) ((void)0)
+#endif
 
 static SemaphoreHandle_t s_mtx;
 static StaticSemaphore_t s_mtx_storage;
@@ -62,25 +73,73 @@ static volatile uint8_t s_state_pub = PP_STATE_NORMAL;
 static portMUX_TYPE s_skip_mux = portMUX_INITIALIZER_UNLOCKED;
 static pp_skips_t s_skips;               /* under s_skip_mux */
 
-/* The RTC_NOINIT mirror of the newest record (see the header comment).
- * Validated by a magic word and the blob's own CRC, so the garbage RTC memory
- * holds after a power-on never decodes. */
+/* The RTC_NOINIT mirror of the newest record (see the header comment), in
+ * TWO slots (review of PR #113, round 3): a rewrite goes to the slot that does
+ * NOT hold the newest record, which stays valid until the new one is armed, so
+ * a reset inside the write never leaves no valid copy. Each slot is validated
+ * by a magic word, the blob's own CRC and the NVS epoch (below); garbage after
+ * a power-on never decodes.
+ *
+ * The NVS epoch binds RTC records to one NVS lifetime: a random non-zero u32
+ * kept in NVS ("epoch"), created once when absent. A deliberate NVS rewrite or
+ * wipe (flash_gui provisioning, clean_nvs) creates a new one, so a record left
+ * in RTC memory from before it is never adopted. If the key exists but cannot
+ * be READ, nothing proves a rewrite: the epoch of the newest valid RTC record
+ * is taken (an NVS read fault must not cost the retained protection). 0 = no
+ * epoch at all (absent and not creatable, or unreadable with no RTC record):
+ * RTC records are then neither written nor adopted. */
 #define PP_RTC_MAGIC 0x50505247u   /* "PPRG" */
 typedef struct {
-    uint32_t magic;
+    volatile uint32_t magic;
+    uint32_t epoch;
     uint8_t  blob[PP_BLOB_LEN];
-} pp_rtc_t;
-static RTC_NOINIT_ATTR pp_rtc_t s_rtc;
+} pp_rtc_slot_t;
+static RTC_NOINIT_ATTR pp_rtc_slot_t s_rtc[2];
+static uint32_t s_epoch;
 
-static void rtc_store(const pp_persist_t *p)
+static bool rtc_slot(int i, pp_persist_t *out)
 {
-    s_rtc.magic = 0;
-    if (pp_encode(p, s_rtc.blob, sizeof s_rtc.blob) == PP_BLOB_LEN) s_rtc.magic = PP_RTC_MAGIC;
+    return s_epoch != 0 && s_rtc[i].magic == PP_RTC_MAGIC && s_rtc[i].epoch == s_epoch &&
+           pp_decode(out, s_rtc[i].blob, sizeof s_rtc[i].blob);
+}
+
+/* The valid slot with the higher generation; -1 when none. */
+static int rtc_newest(pp_persist_t *out)
+{
+    int best = -1;
+    pp_persist_t p;
+    for (int i = 0; i < 2; i++) {
+        if (rtc_slot(i, &p) && (best < 0 || p.gen > out->gen)) {
+            *out = p;
+            best = i;
+        }
+    }
+    return best;
 }
 
 static bool rtc_load(pp_persist_t *out)
 {
-    return s_rtc.magic == PP_RTC_MAGIC && pp_decode(out, s_rtc.blob, sizeof s_rtc.blob);
+    return rtc_newest(out) >= 0;
+}
+
+static void rtc_store(const pp_persist_t *p)
+{
+    if (s_epoch == 0) return;
+    uint8_t enc[PP_BLOB_LEN];
+    if (pp_encode(p, enc, sizeof enc) != PP_BLOB_LEN) return;
+    pp_persist_t cur;
+    const int n = rtc_newest(&cur);
+    if (n >= 0 && memcmp(s_rtc[n].blob, enc, sizeof enc) == 0) return;   /* already the newest */
+    const int t = n < 0 ? 0 : 1 - n;   /* never the slot holding the newest record */
+    PP_TEST_POINT(1);
+    s_rtc[t].magic = 0;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* invalidate before rewriting */
+    PP_TEST_POINT(2);
+    s_rtc[t].epoch = s_epoch;
+    memcpy(s_rtc[t].blob, enc, sizeof enc);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* arm only after the record is complete */
+    PP_TEST_POINT(3);
+    s_rtc[t].magic = PP_RTC_MAGIC;
 }
 
 /* Valid = a UTC the brownout history may compare across boots. SNTP outranks
@@ -115,6 +174,74 @@ static esp_err_t persist(const pp_persist_t *p)
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
+}
+
+typedef enum { REC_OK, REC_ABSENT, REC_UNREADABLE } rec_status_t;
+
+/* The record NVS holds now. *why names an unreadable one. */
+static rec_status_t nvs_record(pp_persist_t *out, const char **why)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return REC_ABSENT;
+    if (err != ESP_OK) {
+        *why = esp_err_to_name(err);
+        return REC_UNREADABLE;
+    }
+    uint8_t blob[PP_BLOB_LEN];
+    size_t len = sizeof blob;
+    err = nvs_get_blob(h, PP_NVS_KEY, blob, &len);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return REC_ABSENT;
+    if (err != ESP_OK) {
+        *why = esp_err_to_name(err);
+        return REC_UNREADABLE;
+    }
+    if (!pp_decode(out, blob, len)) {
+        *why = "corrupt";
+        return REC_UNREADABLE;
+    }
+    return REC_OK;
+}
+
+/* The epoch of the newest valid RTC record, whatever epoch it carries. */
+static uint32_t rtc_any_epoch(void)
+{
+    uint32_t e = 0, gen = 0;
+    pp_persist_t p;
+    for (int i = 0; i < 2; i++) {
+        if (s_rtc[i].magic == PP_RTC_MAGIC && s_rtc[i].epoch != 0 &&
+            pp_decode(&p, s_rtc[i].blob, sizeof s_rtc[i].blob) && (e == 0 || p.gen > gen)) {
+            e = s_rtc[i].epoch;
+            gen = p.gen;
+        }
+    }
+    return e;
+}
+
+/* The NVS epoch (see s_rtc): read, or created once when absent. */
+static uint32_t epoch_load(bool power_lost)
+{
+    nvs_handle_t h;
+    uint32_t e = 0;
+    esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        err = nvs_get_u32(h, PP_NVS_EPOCH, &e);
+        nvs_close(h);
+        if (err == ESP_OK && e != 0) return e;
+    }
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        /* Present but unreadable: not a rewrite. Keep the RTC record's own. */
+        return power_lost ? 0 : rtc_any_epoch();
+    }
+    /* Absent (a new NVS, or one rewritten / wiped since): a new epoch. One
+     * write per NVS lifetime. */
+    do { e = esp_random(); } while (e == 0);
+    if (nvs_open(PP_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return 0;
+    err = nvs_set_u32(h, PP_NVS_EPOCH, e);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err == ESP_OK ? e : 0;
 }
 
 /* Under s_mtx. One ESP_LOGE per state transition: v2.18.0's diag hook turns
@@ -171,14 +298,47 @@ static esp_err_t apply(const pp_event_t *ev)
 static esp_err_t commit_relaxation(const pp_event_t *ev, int64_t now_ms, bool automatic)
 {
     s_cand.p.gen = s_core.p.gen + 1;
-    const esp_err_t err = persist(&s_cand.p);
-    if (err != ESP_OK) {
+    esp_err_t err = persist(&s_cand.p);
+    bool landed = err == ESP_OK;
+    bool unknown = false;
+    if (!landed) {
+        /* An NVS error does not mean nothing was written: the pinned IDF's
+         * Storage::writeItem writes the new blob first and can fail after it
+         * (ESP_ERR_NVS_REMOVE_FAILED erasing the old copy, or any error from
+         * eraseMultiPageBlob; review of PR #113, round 3). Re-read: what NVS
+         * returns now is what the next boot reads. */
+        pp_persist_t durable;
+        const char *why = NULL;
+        const rec_status_t rs = nvs_record(&durable, &why);
+        if (rs == REC_OK) {
+            uint8_t a[PP_BLOB_LEN], b[PP_BLOB_LEN];
+            landed = pp_encode(&durable, a, sizeof a) == PP_BLOB_LEN &&
+                     pp_encode(&s_cand.p, b, sizeof b) == PP_BLOB_LEN && memcmp(a, b, sizeof a) == 0;
+        } else {
+            unknown = rs == REC_UNREADABLE;
+        }
+        if (landed) {
+            ESP_LOGW(TAG, "NVS reported %s, but the record is on NVS: %s -> %s stands", esp_err_to_name(err),
+                     pp_state_name(ev->from), pp_state_name(ev->to));
+            err = ESP_OK;   /* the durable truth: it happened */
+        }
+    }
+    if (!landed) {
         s_core.p.gen = s_cand.p.gen;   /* never reuse a number that may have landed */
+        if (unknown) {
+            /* Cannot tell whether it landed: FENCE it. A newer protective
+             * record (the unchanged state) to RTC and NVS, so a relaxation
+             * that did land can never win at the next boot. */
+            s_core.p.gen++;
+            rtc_store(&s_core.p);
+            (void)persist(&s_core.p);
+        }
         s_core.persist_fault = true;
         if (automatic) s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
-        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s%s", pp_state_name(ev->from),
+        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s%s%s", pp_state_name(ev->from),
                  pp_state_name(ev->to), ev->probe_passed ? "probe_passed" : pp_reason_name(ev->reason),
-                 esp_err_to_name(err), pp_state_name(ev->from), automatic ? ", next try in 60 min" : "");
+                 esp_err_to_name(err), pp_state_name(ev->from), unknown ? " (fenced)" : "",
+                 automatic ? ", next try in 60 min" : "");
         s_state_pub = s_core.p.state;
         return err;
     }
@@ -210,47 +370,32 @@ void power_protect_boot(void)
      * failed open or read, or a blob failing version/length/CRC/range checks)
      * = no_flash + persist_fault (pp_load_unreadable): defaulting to normal let
      * a corrupted forced hold resume full load on a watchdog reboot (review of
-     * PR #103). Nothing is written here; the next persisting event repairs it. */
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
+     * PR #103). */
     const char *unreadable = NULL;
-    bool nvs_absent = err == ESP_ERR_NVS_NOT_FOUND;
-    if (err == ESP_OK) {
-        uint8_t blob[PP_BLOB_LEN];
-        size_t len = sizeof blob;
-        err = nvs_get_blob(h, PP_NVS_KEY, blob, &len);
-        nvs_close(h);
-        if (err == ESP_OK && !pp_decode(&s_core.p, blob, len)) {
-            unreadable = "corrupt";
-        } else if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-            unreadable = esp_err_to_name(err);
-        }
-        nvs_absent = err == ESP_ERR_NVS_NOT_FOUND;
-    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
-        unreadable = esp_err_to_name(err);
-    }
+    const rec_status_t rs = nvs_record(&s_core.p, &unreadable);
+    if (rs != REC_OK) pp_core_init(&s_core);
     const pp_clock_t clk = clock_now();
 
     const esp_reset_reason_t rr = esp_reset_reason();
     const bool brownout = rr == ESP_RST_BROWNOUT;
     const bool power_lost = brownout || rr == ESP_RST_POWERON || rr == ESP_RST_PWR_GLITCH;
+    s_epoch = epoch_load(power_lost);
     /* The newer record by generation wins. The RTC mirror only counts after
-     * a reset without power loss (after one it is gone or garbage), and only
-     * when NVS holds no record as new: it is then ahead by protective
-     * updates NVS refused. It is not consumed: until NVS takes a newer
-     * record, every such reset adopts it again. */
+     * a reset without power loss (after one it is gone or garbage), only for
+     * this NVS epoch, and only when NVS holds no record as new: it is then
+     * ahead by protective updates NVS refused. It is not consumed: until NVS
+     * takes a newer record, every such reset adopts it again. */
     pp_persist_t rtc;
     bool adopted = false;
-    if (!power_lost && rtc_load(&rtc) &&
-        (unreadable != NULL || nvs_absent || rtc.gen > s_core.p.gen)) {
+    if (!power_lost && rtc_load(&rtc) && (rs != REC_OK || rtc.gen > s_core.p.gen)) {
         ESP_LOGW(TAG, "adopting the newer record from RTC memory: %s (reason %s, gen %lu over %lu)",
                  pp_state_name((pp_state_t)rtc.state), pp_reason_name((pp_reason_t)rtc.reason),
-                 (unsigned long)rtc.gen, (unsigned long)(unreadable != NULL || nvs_absent ? 0 : s_core.p.gen));
+                 (unsigned long)rtc.gen, (unsigned long)(rs != REC_OK ? 0 : s_core.p.gen));
         pp_core_init(&s_core);
         s_core.p = rtc;
         s_core.persist_fault = true;   /* not on record until NVS takes it */
         adopted = true;
-    } else if (unreadable != NULL) {
+    } else if (rs == REC_UNREADABLE) {
         ESP_LOGW(TAG, "persisted state unreadable (%s) - starting at no_flash", unreadable);
         pp_load_unreadable(&s_core, clk);
     }
@@ -260,7 +405,7 @@ void power_protect_boot(void)
          * boot; on failure the mirror stays armed. */
         if (persist(&s_core.p) == ESP_OK) write_ok();
     }
-    rtc_store(&s_core.p);   /* the mirror always holds the current record */
+    rtc_store(&s_core.p);   /* the mirror holds the current record (a no-op when it already does) */
     if (power_lost && !brownout) {
         /* Power-on / power glitch: a probation in flight failed. (A brownout
          * is decided by pp_on_boot, with its history entry.) */

@@ -19,6 +19,17 @@
 #include <string.h>
 #include <time.h>
 
+/* Reset injection (declared before the glue: its PP_TEST_POINT uses it).
+ * g_reset_at: at the NVS boundary, 1 = the unit resets as nvs_set_blob starts
+ * (nothing stored), 2 = right after nvs_commit (stored, but the glue never
+ * updates RAM / the RTC mirror). g_rtc_reset_at: inside rtc_store, 1 = before
+ * the target slot is invalidated, 2 = between invalidating and rewriting it,
+ * 3 = after rewriting, before arming it. The test longjmps out of the glue
+ * and calls reboot(), which resets every static the glue owns. */
+static jmp_buf g_reset_jump;
+static int     g_reset_at;
+static int     g_rtc_reset_at;
+#define PP_TEST_POINT(n) do { if (g_rtc_reset_at == (n)) { g_rtc_reset_at = 0; longjmp(g_reset_jump, 1); } } while (0)
 #include "../../components/power_protect/power_protect.c"
 #include "power_policy.h"
 #include "power_protect_command.h"
@@ -90,17 +101,46 @@ static size_t  g_blob_len;       /* 0 = not found */
 static int     g_writes;
 static bool    g_fail_writes;
 static esp_err_t g_open_err = ESP_OK, g_get_err = ESP_OK;   /* injected read-side failures */
-/* Reset injection at the NVS boundary: 1 = the unit resets as nvs_set_blob
- * starts (nothing stored), 2 = right after nvs_commit (stored, but the glue
- * never gets to update RAM / the RTC mirror). The test longjmps out of the
- * glue and calls reboot(), which resets every static the glue owns. */
-static jmp_buf g_reset_jump;
-static int     g_reset_at;
+/* NVS writes that store the blob and THEN report an error, as the pinned
+ * IDF's Storage::writeItem can (ESP_ERR_NVS_REMOVE_FAILED erasing the old
+ * copy). Counts down: each such write decrements it. */
+static int     g_write_then_fail;
+/* The epoch key (u32). 0 = absent. */
+static uint32_t g_epoch;
+static int      g_epoch_writes;
+/* Every pp_encode from the glue passes through here (-Wl,--wrap=pp_encode):
+ * g_encode_reset_n > 0 resets the unit AT the n-th call from now. */
+static int g_encode_reset_n;
+size_t __real_pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap);
+size_t __wrap_pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap)
+{
+    if (g_encode_reset_n > 0 && --g_encode_reset_n == 0) longjmp(g_reset_jump, 1);
+    return __real_pp_encode(p, buf, cap);
+}
+uint32_t esp_random(void) { static uint32_t x = 0x2545F491u; x = x * 1664525u + 1013904223u; return x; }
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
 {
     CHECK(strcmp(ns, "pwr_protect") == 0, "namespace %s", ns);
     if (mode == NVS_READONLY && g_open_err != ESP_OK) return g_open_err;
     *out = 7;
+    return ESP_OK;
+}
+esp_err_t nvs_get_u32(nvs_handle_t h, const char *key, uint32_t *out)
+{
+    (void)h;
+    CHECK(strcmp(key, "epoch") == 0, "key %s", key);
+    if (g_get_err != ESP_OK) return g_get_err;
+    if (g_epoch == 0) return ESP_ERR_NVS_NOT_FOUND;
+    *out = g_epoch;
+    return ESP_OK;
+}
+esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t value)
+{
+    (void)h;
+    CHECK(strcmp(key, "epoch") == 0, "key %s", key);
+    if (g_fail_writes) return ESP_FAIL;
+    g_epoch = value;
+    g_epoch_writes++;
     return ESP_OK;
 }
 esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out, size_t *len)
@@ -123,6 +163,10 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_
     memcpy(g_blob, value, len);
     g_blob_len = len;
     g_writes++;
+    if (g_write_then_fail > 0) {
+        g_write_then_fail--;
+        return 0x1108;   /* ESP_ERR_NVS_REMOVE_FAILED: written, old copy not erased */
+    }
     return ESP_OK;
 }
 esp_err_t nvs_commit(nvs_handle_t h)
@@ -1182,6 +1226,128 @@ static void operator_relaxation_needs_record(void)
 }
 #endif
 
+/* ── scenarios: round 3 (RTC rewrite, indeterminate NVS writes, NVS epoch) ─ */
+
+#if HAVE_RECOVERY
+/* A failed probe kept in RTC only (NVS refusing); the next reset adopts it
+ * and its NVS sync fails too. */
+static void rtc_only_failure(uint32_t boot)
+{
+    g_blob_len = 0;
+    g_fail_writes = false;
+    reboot(ESP_RST_BROWNOUT, boot, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "probation on record");
+    g_fail_writes = true;
+    good_reads(3, 3250, 3900);                           /* the probation fails: RTC only */
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1 && s_core.persist_fault, "failure in RTC only");
+}
+
+/* [P2] A reset INSIDE the RTC rewrite never loses the retained record. */
+static void rtc_store_interrupted(void)
+{
+    /* The reviewer's case: the reset hits the boot's mirror rewrite after the
+     * adopted record's NVS sync failed (the 2nd pp_encode of that boot). */
+    rtc_only_failure(2);
+    g_encode_reset_n = 2;
+    if (setjmp(g_reset_jump) == 0) reboot(ESP_RST_SW, 3, true);
+    g_encode_reset_n = 0;
+    g_fail_writes = false;
+    reboot(ESP_RST_TASK_WDT, 4, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1,
+          "a reset in the boot rewrite must not restore the failed probation (state %d fails %u)", st(),
+          (unsigned)s_core.p.probe_fails);
+#if HAVE_GEN
+    /* Every point inside rtc_store, on a run-time protective update (a force
+     * up NVS refuses) on top of the RTC-only failure: the older slot carries
+     * the failed probe through; the interrupted one is never armed. */
+    for (int point = 1; point <= 3; point++) {
+        rtc_only_failure(10);
+        reboot(ESP_RST_SW, 11, true);                    /* adopted, sync refused */
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.persist_fault, "point %d: adopted", point);
+        g_rtc_reset_at = point;
+        if (setjmp(g_reset_jump) == 0) (void)power_protect_force(PP_STATE_HOLD);   /* -> rtc_store */
+        CHECK(g_rtc_reset_at == 0, "point %d: injected", point);
+        reboot(ESP_RST_INT_WDT, 12, true);
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1 && !s_core.p.forced,
+              "point %d: still the failed probe (state %d fails %u)", point, st(), (unsigned)s_core.p.probe_fails);
+        reboot(ESP_RST_PANIC, 13, true);
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "point %d: and after another reset", point);
+    }
+    /* And a rewrite that completes: the newer slot wins. */
+    rtc_only_failure(20);
+    reboot(ESP_RST_SW, 21, true);
+    (void)power_protect_force(PP_STATE_HOLD);
+    reboot(ESP_RST_INT_WDT, 22, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced && s_core.p.probe_fails == 1, "the completed rewrite wins");
+#endif
+    g_fail_writes = false;
+}
+
+/* [P2] An NVS write that stores the record and THEN reports an error
+ * (ESP_ERR_NVS_REMOVE_FAILED): the re-read decides, and state and reply match
+ * what NVS holds; when the re-read itself fails the relaxation is fenced. */
+static void relaxation_write_then_error(void)
+{
+    /* operator clear */
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
+    g_write_then_fail = 1;
+    CHECK(power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL && !s_core.p.forced,
+          "a clear that landed is reported as applied (state %d)", st());
+    reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.p.forced, "and is what the next boot reads");
+    /* operator force down */
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "hold again");
+    g_write_then_fail = 1;
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == ESP_OK && st() == PP_STATE_NO_FLASH, "a force down that landed");
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.forced, "on record");
+    /* automatic: the probe step */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 4, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
+    g_write_then_fail = 1;
+    quiet_reads(POWER_READ_NO_INPUT, 120);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL && !s_core.persist_fault,
+          "a probe step that landed stands (state %d)", st());
+    CHECK(strcmp(g_last_e, "power_protect: no_flash -> normal reason=probe") == 0, "%s", g_last_e);
+    reboot(ESP_RST_SW, 5, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "and is on record");
+    /* The re-read fails: cannot tell, so fence. The clear is refused and can
+     * never win at a later boot, after a reset or a power loss. */
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 6, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
+    g_write_then_fail = 1;
+    g_get_err = ESP_FAIL;
+    CHECK(power_protect_clear() != ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced, "unknown outcome: refused");
+    g_get_err = ESP_OK;
+    reboot(ESP_RST_SW, 7, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "fenced across a reset (state %d)", st());
+    reboot(ESP_RST_POWERON, 8, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "and across a power loss");
+}
+
+/* The RTC record belongs to one NVS lifetime: a wiped or rewritten NVS (new
+ * epoch) never adopts it; an unreadable epoch does not count as a rewrite. */
+static void rtc_bound_to_nvs_epoch(void)
+{
+    rtc_only_failure(2);
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "control: same NVS, adopted");
+    /* flash_gui / clean_nvs rewrites NVS, then a USB / watchdog reset */
+    g_fail_writes = false;
+    g_blob_len = 0;
+    g_epoch = 0;
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.hist_n == 0 && g_epoch != 0,
+          "a rewritten NVS never brings the old record back (state %d)", st());
+    reboot(ESP_RST_SW, 5, true);
+    CHECK(st() == PP_STATE_NORMAL, "and stays so");
+}
+#endif
+
 static void low_voltage_trigger(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
@@ -1732,6 +1898,9 @@ static const scenario_t k_scenarios[] = {
     {"rejected_relaxation_keeps_low", rejected_relaxation_keeps_low},
     {"low_clock_trust_change", low_clock_trust_change},
     {"operator_relaxation_needs_record", operator_relaxation_needs_record},
+    {"rtc_store_interrupted", rtc_store_interrupted},
+    {"relaxation_write_then_error", relaxation_write_then_error},
+    {"rtc_bound_to_nvs_epoch", rtc_bound_to_nvs_epoch},
 #endif
     {"low_writes_bounded", low_writes_bounded},
     {"low_voltage_trigger", low_voltage_trigger},
