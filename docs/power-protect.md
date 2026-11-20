@@ -505,10 +505,20 @@ The model is now one record, ordered by generation:
           - the brownout recorded during U1. It is appended to the history
             newest-last, dropping the oldest at the cap, so it still links
             with the next one and counts in `brownouts_6h`. Round 8 found it
-            dropped: two brownouts 30 min apart stayed `no_flash`.
+            dropped: two brownouts 30 min apart stayed `no_flash`. It is
+            de-duplicated only by a known identity. An entry with no UTC and
+            boot count 0 (an invalid clock, and `diag`'s counter unavailable
+            after a counter read or write failure) means "unknown", not one
+            particular earlier event, so it is always carried (round 9).
       - The result is persisted through the normal verified path (RTC first,
         then NVS). Any relaxation that was due is re-evaluated by the next
         read, never decided on the pre-verification state.
+    - **Verification latches per boot.** Once the epoch has been read, the
+      boot never returns to U1, even if a later epoch read fails. This
+      assumes NVS is not rewritten under a running power-protection
+      instance. A live reprovision or reflash that changes NVS while the
+      firmware keeps running is outside that assumption; such tools end in a
+      reset, and startup reinitialises everything.
     - **Stated limits** (they replace the earlier foreign-forced caveat):
       - Protective facts of an unverified period live only in RAM until
         verification. A reset during it loses them. The unit is fail-closed
@@ -875,6 +885,10 @@ run fails unless every reply confirms the requested state. In Actions →
       never auto-exits; U1 → U2 → U1 → U2 across boots carries each
       brownout, and a verified boot never returns to U1; a full history
       drops its oldest entry for the U1 brownout (all 5 fail on 8ac9d8c);
+    - (round 9) a U1 brownout with an unknown identity (no clock, boot
+      counter 0) is carried even beside an older unknown entry, and the next
+      brownout escalates (fails on 5d68839; the same flow without U1 passes
+      on both);
     - (round 5, native) every pair of two transient raw-write faults across
       a `clear` and its fence writes (a ≤ 16, b ≤ 24), then a direct power
       loss: `persist_failed` always means a forced hold on NVS (the reviewer's

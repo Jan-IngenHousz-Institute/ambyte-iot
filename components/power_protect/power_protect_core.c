@@ -642,8 +642,14 @@ pp_event_t pp_on_verified(pp_core_t *c, const pp_persist_t *selected, int64_t mo
     if (c->p.forced) c->p.probation = PP_PROBATION_NONE;
     if (ram.probe_fails > c->p.probe_fails) c->p.probe_fails = ram.probe_fails;
     if (c->u1_has_brownout) {
+        /* De-duplicated only by a KNOWN identity: an entry with no UTC and no
+         * boot count (an invalid clock and diag's counter unavailable) is
+         * "unknown", not one particular earlier event, so it is always this
+         * boot's own and always carried (round 9: an older unknown entry
+         * swallowed it and the next brownout did not escalate). */
+        const bool known = c->u1_brownout.utc != 0 || c->u1_brownout.boot != 0;
         bool seen = false;
-        for (unsigned i = 0; i < c->p.hist_n; i++) {
+        for (unsigned i = 0; known && i < c->p.hist_n; i++) {
             if (c->p.hist[i].utc == c->u1_brownout.utc && c->p.hist[i].boot == c->u1_brownout.boot) seen = true;
         }
         if (!seen) {

@@ -2201,6 +2201,32 @@ static void r8_u1_brownout_history_cap(void)
     CHECK(s_core.p.hist_n == PP_HIST_MAX && s_core.p.hist[PP_HIST_MAX - 1].boot == 50 &&
           s_core.p.hist[0].boot == oldest_next, "newest last, the oldest dropped");
 }
+/* Round 9: an UNKNOWN-identity brownout (no clock, boot counter 0) recorded
+ * during U1 is carried, never de-duplicated against an older unknown entry;
+ * the next brownout then escalates. Plus the same flow without U1 (control). */
+static void r9_unknown_brownout_flow(bool u1)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    reboot(ESP_RST_BROWNOUT, 0, false);                  /* undated, boot counter unavailable */
+    advance_s(7 * H);
+    reboot(ESP_RST_BROWNOUT, 2, true);                   /* a later, dated entry */
+    CHECK(s_core.p.hist_n == 2, "two recorded brownouts");
+    good_reads(READS_30MIN + 4, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL, "healthy evidence recovers");
+    advance_s(7 * H);
+    if (u1) g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_BROWNOUT, 0, false);                  /* a NEW unknown-identity brownout */
+    CHECK(s_core.p.hist_n == 3, "recorded (%u)", (unsigned)s_core.p.hist_n);
+    g_epoch_get_err = ESP_OK;
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == ESP_OK, "verify (U2) and force down");
+    CHECK(s_core.p.hist_n == 3 && s_core.p.hist[2].utc == 0 && s_core.p.hist[2].boot == 0,
+          "the new unknown entry is carried, newest last (hist %u)", (unsigned)s_core.p.hist_n);
+    advance_s(60);
+    reboot(ESP_RST_BROWNOUT, 4, true);
+    CHECK(st() == PP_STATE_HOLD, "the next brownout escalates (state %d)", st());
+}
+static void r9_u1_unknown_brownout_dedup(void) { r9_unknown_brownout_flow(true); }
+static void r9_unknown_brownout_no_u1_control(void) { r9_unknown_brownout_flow(false); }
 #endif
 
 static void low_voltage_trigger(void)
@@ -2782,6 +2808,8 @@ static const scenario_t k_scenarios[] = {
     {"r8_u1_force_survives_verification", r8_u1_force_survives_verification},
     {"r8_u1_u2_cycles", r8_u1_u2_cycles},
     {"r8_u1_brownout_history_cap", r8_u1_brownout_history_cap},
+    {"r9_u1_unknown_brownout_dedup", r9_u1_unknown_brownout_dedup},
+    {"r9_unknown_brownout_no_u1_control", r9_unknown_brownout_no_u1_control},
     {"cmd_persist_unconfirmed", cmd_persist_unconfirmed},
 #endif
 #ifdef PP_NATIVE_NVS
