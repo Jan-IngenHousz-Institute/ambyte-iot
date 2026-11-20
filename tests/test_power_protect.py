@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 66)
+        self.assertGreaterEqual(len(self.scenarios), 77)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -117,10 +117,13 @@ class PowerProtectHostTest(unittest.TestCase):
                      "relaxation_reread_inconclusive", "epoch_missing_first_boot", "no_epoch_no_relaxation",
                      "fence_unconfirmed", "cmd_persist_unconfirmed",
                      # review round 5 (each fails on db64678)
-                     "missing_record_fails_closed", "unverified_epoch_never_relaxes",
-                     # review round 6 (same_epoch_low_veto passes on db64678, fails on 6c998a4)
-                     "same_epoch_low_veto", "slot_shadow", "merge_keeps_every_fact",
-                     "verify_reconciles_before_relaxing"):
+                     "missing_record_fails_closed",
+                     # review rounds 6-7: the unverified-epoch rule U1/U2 and the reviewer's repros
+                     "same_epoch_low_veto", "slot_shadow", "u1_unverified_is_passive",
+                     "u2_verification_reconciles", "r7_probation_merge", "r7_history_merge",
+                     "r7_clear_reverify", "r7_verify_rtc_interrupt", "r7_probation_natural",
+                     "r7_history_natural", "r7_clear_unreadable", "r7_verify_rtc_interrupt_hold",
+                     "r7_clear_reply", "r7_merge_gen", "r7_since_merge", "r7_merge_gen_natural"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):
@@ -135,7 +138,7 @@ class PowerProtectHostTest(unittest.TestCase):
                          (0, "no_monitor", None, 0))
         worst = re.search(r"^WORST (\d+) (.*)$", out, re.M)
         self.assertLess(int(worst.group(1)), 384)                                       # PP_JSON_CAP
-        self.assertEqual(json.loads(worst.group(2))["reason"], "brownout_unordered")   # the longest name
+        self.assertEqual(json.loads(worst.group(2))["reason"], "identity_unverified")   # the longest name
         probation = json.loads(re.search(r"^JSON_PROBATION (.*)$", out, re.M).group(1))
         self.assertEqual(set(probation), keys)
         self.assertEqual((probation["state"], probation["reason"], probation["probe"], probation["next_probe_s"]),

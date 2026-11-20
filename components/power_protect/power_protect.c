@@ -88,52 +88,36 @@ static pp_skips_t s_skips;               /* under s_skip_mux */
  * The NVS epoch binds RTC records to one NVS lifetime: a random non-zero u32
  * kept in NVS ("epoch"), created once when absent. A deliberate NVS rewrite or
  * wipe (flash_gui provisioning, clean_nvs) creates a new one, so a record left
- * in RTC memory from before it is never adopted. If the key exists but cannot
- * be READ, nothing proves a rewrite: the epoch of the newest valid RTC record
- * is taken (an NVS read fault must not cost the retained protection). 0 = no
- * epoch at all (absent and not creatable, or unreadable with no RTC record):
- * RTC records are then neither written nor adopted. */
+ * in RTC memory from before it is never adopted. 0 = no epoch (absent and not
+ * creatable): RTC records are neither written nor adopted.
+ *
+ * An epoch that exists but cannot be READ is the UNVERIFIED identity (U1,
+ * review of PR #113 round 7): nothing proves which RTC record belongs to this
+ * lifetime, so the unit fails closed (>= no_flash) and stays passive: RTC is
+ * neither read nor written, NVS is not written, no relaxation runs, and
+ * operator relaxations are refused (POWER_PROTECT_ERR_UNVERIFIED). When the
+ * epoch reads again (U2, epoch_ensure) the verified selection runs and the
+ * result is reconciled conservatively (pp_on_verified). Rounds 5-6 tried to
+ * order or merge records across lifetimes; each version left a window. */
 #define PP_RTC_MAGIC 0x50505247u   /* "PPRG" */
 typedef struct {
     volatile uint32_t magic;
     uint32_t epoch;
-    /* Written while the epoch was UNVERIFIED (round 6): its generation belongs
-     * to no known sequence, so it is never ORDERED against anything; its
-     * protective facts are FOLDED in (pp_merge_protective) until NVS holds
-     * them, then the slot is retired. */
-    uint32_t unverified;
     uint8_t  blob[PP_BLOB_LEN];
 } pp_rtc_slot_t;
 static RTC_NOINIT_ATTR pp_rtc_slot_t s_rtc[2];
-#define PP_RTC_TAGGED 1   /* (host tests: this build tags unverified RTC writes) */
 static uint32_t s_epoch;
-/* s_epoch was READ from NVS (or created and read back) this boot. False when
- * it was borrowed from an RTC record because the key was unreadable: then RTC
- * generations cannot be compared with NVS ones (another lifetime may have
- * written either), records are merged instead of selected, and no automatic
- * relaxation runs (rounds 5-6). */
-static bool     s_epoch_verified;
+static bool     s_epoch_verified;   /* s_epoch was read (or created and read back) */
+static bool     s_unverified;       /* U1: the epoch exists but cannot be read */
+static bool     s_boot_power_lost;  /* RTC memory is not this boot's to trust */
 
-/* Any slot that decodes, whatever its epoch or tag. */
-static bool rtc_decode(int i, pp_persist_t *out)
-{
-    return s_rtc[i].magic == PP_RTC_MAGIC && pp_decode(out, s_rtc[i].blob, sizeof s_rtc[i].blob);
-}
-
-/* A slot of the VERIFIED lifetime, written while verified: orderable by gen. */
 static bool rtc_slot(int i, pp_persist_t *out)
 {
-    return s_epoch_verified && s_epoch != 0 && s_rtc[i].epoch == s_epoch && s_rtc[i].unverified == 0 &&
-           rtc_decode(i, out);
+    return s_epoch_verified && s_epoch != 0 && s_rtc[i].magic == PP_RTC_MAGIC && s_rtc[i].epoch == s_epoch &&
+           pp_decode(out, s_rtc[i].blob, sizeof s_rtc[i].blob);
 }
 
-/* A tagged (unverified) slot, any epoch: its facts are folded, never ordered. */
-static bool rtc_tagged(int i, pp_persist_t *out)
-{
-    return s_rtc[i].unverified != 0 && rtc_decode(i, out);
-}
-
-/* The newest orderable slot; -1 when none. */
+/* The valid slot with the higher generation; -1 when none. */
 static int rtc_newest(pp_persist_t *out)
 {
     int best = -1;
@@ -152,66 +136,24 @@ static bool rtc_load(pp_persist_t *out)
     return rtc_newest(out) >= 0;
 }
 
-/* The slot a rewrite must NOT touch: verified, the newest orderable one;
- * unverified, the decodable one with the higher generation (both were merged
- * into the state at boot, so either may go, but never both at once). */
-static int rtc_anchor(void)
-{
-    pp_persist_t p, best_p;
-    int best = -1;
-    for (int i = 0; i < 2; i++) {
-        const bool ok = s_epoch_verified ? rtc_slot(i, &p) : rtc_decode(i, &p);
-        if (ok && (best < 0 || p.gen > best_p.gen)) {
-            best_p = p;
-            best = i;
-        }
-    }
-    return best;
-}
-
 static void rtc_store(const pp_persist_t *p)
 {
-    if (s_epoch_verified ? s_epoch == 0 : false) return;
+    if (!s_epoch_verified || s_epoch == 0) return;   /* (U1 never writes RTC) */
     uint8_t enc[PP_BLOB_LEN];
     if (pp_encode(p, enc, sizeof enc) != PP_BLOB_LEN) return;
-    const uint32_t tag = s_epoch_verified ? 0 : 1;
-    const int n = rtc_anchor();
-    if (n >= 0 && s_rtc[n].unverified == tag && s_rtc[n].epoch == s_epoch &&
-        memcmp(s_rtc[n].blob, enc, sizeof enc) == 0) {
-        return;   /* already the newest */
-    }
+    pp_persist_t cur;
+    const int n = rtc_newest(&cur);
+    if (n >= 0 && memcmp(s_rtc[n].blob, enc, sizeof enc) == 0) return;   /* already the newest */
     const int t = n < 0 ? 0 : 1 - n;   /* never the slot holding the newest record */
     PP_TEST_POINT(1);
     s_rtc[t].magic = 0;
     __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* invalidate before rewriting */
     PP_TEST_POINT(2);
     s_rtc[t].epoch = s_epoch;
-    s_rtc[t].unverified = tag;
     memcpy(s_rtc[t].blob, enc, sizeof enc);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* arm only after the record is complete */
     PP_TEST_POINT(3);
     s_rtc[t].magic = PP_RTC_MAGIC;
-}
-
-/* NVS now holds a record that includes every tagged slot's facts (or one an
- * operator wrote over them): retire the tagged slots, so they are not folded
- * in again at the next boot. Verified only. */
-static void rtc_retire_tagged(void)
-{
-    if (!s_epoch_verified) return;
-    for (int i = 0; i < 2; i++) {
-        if (s_rtc[i].unverified != 0) s_rtc[i].magic = 0;
-    }
-}
-
-/* Records equal in every protective fact (generation ignored)? */
-static bool same_facts(const pp_persist_t *a, const pp_persist_t *b)
-{
-    pp_persist_t x = *a, y = *b;
-    x.gen = y.gen = 0;
-    uint8_t ea[PP_BLOB_LEN], eb[PP_BLOB_LEN];
-    return pp_encode(&x, ea, sizeof ea) == PP_BLOB_LEN && pp_encode(&y, eb, sizeof eb) == PP_BLOB_LEN &&
-           memcmp(ea, eb, sizeof ea) == 0;
 }
 
 /* Valid = a UTC the brownout history may compare across boots. SNTP outranks
@@ -276,21 +218,6 @@ static rec_status_t nvs_record(pp_persist_t *out, const char **why)
     return REC_OK;
 }
 
-/* The epoch of the newest valid RTC record, whatever epoch it carries. */
-static uint32_t rtc_any_epoch(void)
-{
-    uint32_t e = 0, gen = 0;
-    pp_persist_t p;
-    for (int i = 0; i < 2; i++) {
-        if (s_rtc[i].magic == PP_RTC_MAGIC && s_rtc[i].epoch != 0 &&
-            pp_decode(&p, s_rtc[i].blob, sizeof s_rtc[i].blob) && (e == 0 || p.gen > gen)) {
-            e = s_rtc[i].epoch;
-            gen = p.gen;
-        }
-    }
-    return e;
-}
-
 /* The epoch key: 1 = read (*out), 0 = absent, -1 = present but unreadable. */
 static int epoch_read(uint32_t *out)
 {
@@ -320,49 +247,43 @@ static uint32_t epoch_create(void)
     return epoch_read(&back) == 1 ? back : 0;
 }
 
-static void rtc_store(const pp_persist_t *p);
+static esp_err_t apply(const pp_event_t *ev);
+static void select_verified(pp_persist_t *out, pp_clock_t clk);
 
-/* Under s_mtx. A missing or unverified epoch leaves the RTC mirror without a
- * reset-safe identity: a failure NVS refused could not be told apart from a
- * foreign record at the next boot (rounds 4-5: a first boot that could not
- * create the epoch, then a probe that NVS took and a failure it refused, came
- * back at full load after a software reset). So: read it again whenever NVS
- * has just taken a write and before every automatic relaxation; create it
- * when absent (a record exists by then); once verified, re-arm the mirror
- * under it. True = verified. */
+/* Under s_mtx. Called after every write NVS takes, before every automatic
+ * relaxation and before every operator command. True = verified.
+ *  - No epoch (absent and not creatable so far): create it now (a record
+ *    exists by then); the RTC mirror is armed under it. Rounds 4-5: without a
+ *    reset-safe identity a failure NVS refused could not survive a reset, so
+ *    no automatic relaxation runs until it exists.
+ *  - UNVERIFIED (U1): once it reads, U2: the verified selection, reconciled
+ *    by pp_on_verified (a probation counts as failed, the quiet period
+ *    restarts, never below the U1 state) and persisted RTC-first like every
+ *    protective update. The caller re-evaluates any relaxation afterwards. */
 static bool epoch_ensure(void)
 {
     if (s_epoch_verified) return true;
     uint32_t e = 0;
     const int r = epoch_read(&e);
+    if (s_unverified) {
+        if (r != 1) return false;   /* still unreadable (or gone): stay passive */
+        s_epoch = e;
+        s_epoch_verified = true;
+        s_unverified = false;
+        pp_persist_t sel;
+        const pp_clock_t clk = clock_now();
+        select_verified(&sel, clk);
+        const pp_event_t ev = pp_on_verified(&s_core, &sel, esp_timer_get_time() / 1000, clk);
+        ESP_LOGW(TAG, "NVS epoch verified: state reconciled (%s, quiet period restarted)",
+                 pp_state_name((pp_state_t)s_core.p.state));
+        (void)apply(&ev);
+        return true;
+    }
     if (r == 0) e = epoch_create();
     if ((r == 1 || r == 0) && e != 0) {
         s_epoch = e;
         s_epoch_verified = true;
-        /* Reconcile BEFORE any relaxation (round 6): the state already holds
-         * the composite of every candidate merged at boot; fold any tagged
-         * slot written since, put the result on NVS (a newer generation than
-         * anything there) and only then retire the tagged slots. */
-        pp_persist_t t;
-        for (int i = 0; i < 2; i++) {
-            if (rtc_tagged(i, &t)) pp_merge_protective(&s_core.p, &t);
-        }
-        pp_persist_t durable;
-        const char *why = NULL;
-        const bool readable = nvs_record(&durable, &why) == REC_OK;
-        if (!readable || !same_facts(&durable, &s_core.p)) {
-            if (readable && durable.gen > s_core.p.gen) s_core.p.gen = durable.gen;
-            s_core.p.gen++;
-            if (persist(&s_core.p) == ESP_OK) {
-                s_core.persist_fault = false;
-                rtc_retire_tagged();
-            } else {
-                s_core.persist_fault = true;
-            }
-        } else {
-            rtc_retire_tagged();
-        }
-        ESP_LOGW(TAG, "NVS epoch verified: state reconciled, RTC mirror armed");
+        ESP_LOGW(TAG, "NVS epoch established: RTC mirror armed");
         rtc_store(&s_core.p);
     }
     return s_epoch_verified;
@@ -393,7 +314,6 @@ static void write_ok(void)
         s_core.persist_fault = false;
     }
     (void)epoch_ensure();   /* NVS takes writes again: a missing epoch now */
-    rtc_retire_tagged();    /* NVS holds the current record (verified only) */
 }
 
 /* Under s_mtx. A PROTECTIVE (or neutral) event already applied to s_core:
@@ -402,6 +322,12 @@ static esp_err_t apply(const pp_event_t *ev)
 {
     publish(ev);
     if (!ev->persist) return ESP_OK;
+    if (s_unverified) {
+        /* U1: protective facts live in RAM only until the epoch reads again;
+         * nothing is written anywhere (the unit is >= no_flash meanwhile). */
+        s_core.persist_fault = true;
+        return POWER_PROTECT_ERR_UNVERIFIED;
+    }
     s_core.p.gen++;
     rtc_store(&s_core.p);
     const esp_err_t err = persist(&s_core.p);
@@ -532,15 +458,12 @@ void power_protect_boot(void)
     const esp_reset_reason_t rr = esp_reset_reason();
     const bool brownout = rr == ESP_RST_BROWNOUT;
     const bool power_lost = brownout || rr == ESP_RST_POWERON || rr == ESP_RST_PWR_GLITCH;
+    s_boot_power_lost = power_lost;
     uint32_t e = 0;
     const int er = epoch_read(&e);
     s_epoch = er == 1 ? e : 0;
     s_epoch_verified = er == 1;
-    if (er < 0 && !power_lost) {
-        /* Present but unreadable: no proof of a rewrite, so the RTC record's
-         * own epoch is borrowed, UNVERIFIED (see the adoption rule below). */
-        s_epoch = rtc_any_epoch();
-    }
+    s_unverified = er < 0;
 
     /* The NVS record. ABSENT with no epoch = a first install (or a wiped NVS):
      * normal, and that record is written before the epoch, so an epoch always
@@ -557,58 +480,32 @@ void power_protect_boot(void)
         pp_load_missing(&s_core, clk);
     }
 
-    /* The RTC mirror only counts after a reset without power loss (after one
-     * it is gone or garbage). It is not consumed: until NVS takes a newer
-     * record, every such reset adopts it again.
-     *  - VERIFIED epoch (same NVS lifetime): the newer orderable record by
-     *    generation wins (NVS absent or unreadable loses to it); then the
-     *    protective facts of every TAGGED slot (written while unverified) are
-     *    folded in.
-     *  - UNVERIFIED (borrowed) epoch: nothing can be ordered (round 6: a
-     *    same-lifetime low veto was dropped on a rank tie; a foreign gen 17
-     *    shadowed an intact hold in the other slot). So NOTHING is selected:
-     *    the NVS record (or the fail-closed no_flash) and EVERY decodable slot
-     *    are MERGED into the most protective composite (pp_merge_protective),
-     *    and it is written to NVS only if it adds protection. */
     bool adopted = false;
-    /* An ABSENT epoch (a first install, or an NVS wiped / rewritten since)
-     * means no RTC record belongs here at all: none is considered. */
-    if (!power_lost && er != 0) {
-        pp_persist_t source = s_core.p;   /* NVS, or the fail-closed baseline */
+    if (s_unverified) {
+        /* U1: fail closed, stay passive (no RTC, no NVS, no relaxation). */
+        ESP_LOGW(TAG, "NVS epoch unreadable - identity unverified: no_flash at least, nothing written");
+        pp_unverified_floor(&s_core, clk);
+    } else if (!power_lost && s_epoch_verified) {
+        /* VERIFIED: the newer record of this lifetime by generation. The RTC
+         * mirror only counts after a reset without power loss (after one it
+         * is gone or garbage); it is never consumed: until NVS takes a newer
+         * record, every such reset adopts it again. */
         pp_persist_t cand;
-        if (s_epoch_verified && rtc_load(&cand) && (rs != REC_OK || cand.gen > s_core.p.gen)) {
-            source = cand;                 /* the newer record of this lifetime */
-            adopted = true;
-        }
-        pp_persist_t merged = source;
-        uint32_t top = source.gen > s_core.p.gen ? source.gen : s_core.p.gen;
-        for (int i = 0; i < 2; i++) {
-            const bool fold = s_epoch_verified ? rtc_tagged(i, &cand) : rtc_decode(i, &cand);
-            if (!fold) continue;
-            if (cand.gen > top) top = cand.gen;
-            pp_merge_protective(&merged, &cand);
-        }
-        if (!same_facts(&merged, &source)) {
-            merged.gen = top + 1;          /* a new record, newer than every candidate */
-            adopted = true;
-        }
-        if (adopted) {
-            ESP_LOGW(TAG, "boot record from RTC memory: %s (reason %s, gen %lu; epoch %s)",
-                     pp_state_name((pp_state_t)merged.state), pp_reason_name((pp_reason_t)merged.reason),
-                     (unsigned long)merged.gen, s_epoch_verified ? "verified" : "unverified, merged");
+        if (rtc_load(&cand) && (rs != REC_OK || cand.gen > s_core.p.gen)) {
+            ESP_LOGW(TAG, "adopting the newer record from RTC memory: %s (reason %s, gen %lu over %lu)",
+                     pp_state_name((pp_state_t)cand.state), pp_reason_name((pp_reason_t)cand.reason),
+                     (unsigned long)cand.gen, (unsigned long)(rs != REC_OK ? 0 : s_core.p.gen));
             pp_core_init(&s_core);
-            s_core.p = merged;
+            s_core.p = cand;
             s_core.persist_fault = true;   /* not on record until NVS takes it */
+            adopted = true;
         }
     }
     lock();
     if (adopted) {
-        /* Put it on record: a record of THIS lifetime, or a composite that is
-         * only ever MORE protective than NVS. Once per boot; on failure the
-         * mirror stays armed (and tagged slots stay until NVS has them). */
+        /* Put it on record (same generation: it is the same record). Once per
+         * boot; on failure the mirror stays armed. */
         if (persist(&s_core.p) == ESP_OK) write_ok();
-    } else if (s_epoch_verified && rs == REC_OK) {
-        rtc_retire_tagged();   /* nothing in them that NVS lacks */
     }
     if (first_install) {
         /* The first record, then the epoch (each read back). A failed record
@@ -624,7 +521,7 @@ void power_protect_boot(void)
         s_epoch = epoch_create();
         s_epoch_verified = s_epoch != 0;
     }
-    rtc_store(&s_core.p);   /* the mirror holds the current record (a no-op when it already does) */
+    rtc_store(&s_core.p);   /* the mirror holds the current record (a no-op when it already does; U1: none) */
     if (power_lost && !brownout) {
         /* Power-on / power glitch: a probation in flight failed. (A brownout
          * is decided by pp_on_boot, with its history entry.) */
@@ -643,6 +540,21 @@ void power_protect_boot(void)
              clk.valid ? "valid" : "not valid");
 }
 
+/* Under s_mtx. The VERIFIED selection, as at boot: the NVS record (or the
+ * fail-closed baseline when it is unreadable or missing beside the epoch)
+ * against the same-lifetime RTC slots, by generation. */
+static void select_verified(pp_persist_t *out, pp_clock_t clk)
+{
+    const char *why = NULL;
+    pp_core_init(&s_cand);
+    const rec_status_t rs = nvs_record(&s_cand.p, &why);
+    if (rs == REC_UNREADABLE) pp_load_unreadable(&s_cand, clk);
+    else if (rs == REC_ABSENT) pp_load_missing(&s_cand, clk);
+    *out = s_cand.p;
+    pp_persist_t cand;
+    if (!s_boot_power_lost && rtc_load(&cand) && (rs != REC_OK || cand.gen > out->gen)) *out = cand;
+}
+
 void power_protect_on_power_read(power_read_reason_t reason, const power_reading_t *p,
                                  bool fresh_present)
 {
@@ -653,11 +565,14 @@ void power_protect_on_power_read(power_read_reason_t reason, const power_reading
      * and written first, whatever happens to a relaxation it makes due. */
     const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, now, clk);
     (void)apply(&ev);
+    const bool was_unverified = s_unverified;
     if (ev.relax_due != PP_RELAX_NONE && !epoch_ensure()) {
-        /* No reset-safe identity for the RTC mirror: a failure after this
-         * relaxation that NVS refused could not survive a reset. Hold it. */
+        /* No reset-safe identity (none yet, or U1): hold it. */
         s_core.relax_hold_until_ms = now + PP_RELAX_RETRY_MS;
-        ESP_LOGW(TAG, "relaxation held: no NVS epoch (RTC mirror off), next try in 60 min");
+        ESP_LOGW(TAG, "relaxation held: NVS epoch %s, next try in 60 min", s_unverified ? "unverified" : "missing");
+    } else if (ev.relax_due != PP_RELAX_NONE && was_unverified) {
+        /* Just verified (U2): the reconciled state is re-evaluated by the
+         * next read; no relaxation on the pre-verification decision. */
     } else if (ev.relax_due != PP_RELAX_NONE) {
         s_cand = s_core;
         const pp_event_t rel = pp_relax(&s_cand, (pp_relax_t)ev.relax_due, now, clk);
@@ -745,6 +660,7 @@ esp_err_t power_protect_force(pp_state_t state)
 {
     if (state != PP_STATE_NO_FLASH && state != PP_STATE_HOLD) return ESP_ERR_INVALID_ARG;
     if (!lock()) return ESP_ERR_INVALID_STATE;
+    (void)epoch_ensure();   /* an operator command verifies first if it can (U2) */
     /* Run on a copy: forcing a LOWER state (hold -> no_flash) is a relaxation
      * and takes effect only once on record; a refused write leaves the unit
      * where it was (the reply says persist_failed, with that state). Forcing
@@ -756,7 +672,9 @@ esp_err_t power_protect_force(pp_state_t state)
         ESP_LOGW(TAG, "power_protect: %s now forced", pp_state_name(state));
     }
     esp_err_t err;
-    if (ev.relaxes) {
+    if (ev.relaxes && s_unverified) {
+        err = POWER_PROTECT_ERR_UNVERIFIED;   /* U1: a force down is refused, state unchanged */
+    } else if (ev.relaxes) {
         err = commit_relaxation(&ev, mono_ms(), false);
     } else {
         s_cand.persist_fault = s_core.persist_fault;
@@ -770,6 +688,11 @@ esp_err_t power_protect_force(pp_state_t state)
 esp_err_t power_protect_clear(void)
 {
     if (!lock()) return ESP_ERR_INVALID_STATE;
+    (void)epoch_ensure();   /* verify first if it can (U2) */
+    if (s_unverified) {
+        unlock();
+        return POWER_PROTECT_ERR_UNVERIFIED;   /* U1: a clear needs a readable epoch */
+    }
     /* clear lowers protection: on record first (see power_protect_force). */
     s_cand = s_core;
     const pp_event_t ev = pp_clear(&s_cand, clock_now());

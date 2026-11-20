@@ -469,44 +469,46 @@ The model is now one record, ordered by generation:
   - A deliberate NVS rewrite or wipe (flash_gui provisioning, `clean_nvs`)
     creates a new epoch. That rewrite ends in a USB or watchdog reset, which
     keeps RTC memory, but an RTC record from before it is never adopted.
-  - **An epoch that exists but cannot be *read* is UNVERIFIED** (rounds 5-6).
-    The RTC records may belong to another NVS lifetime (round 5: a foreign
-    *cleared* record overwrote a current forced hold), or to this one (round
-    6: a same-lifetime low veto was dropped on a rank tie, and a foreign
-    gen-17 record in one slot shadowed an intact hold in the other). Nothing
-    can be ordered, so **nothing is selected**:
-    - **Merge.** The NVS record (or the fail-closed `no_flash`) and **every**
-      decodable RTC slot, of any epoch, are merged into the most protective
-      composite (`pp_merge_protective`):
-      - state, reason and forced from the highest protection rank (`hold` >
-        `no_flash` > `normal`, forced above automatic);
-      - the largest backoff level;
-      - the low veto (OR; the newest dated time, or undated if any is);
-      - the union of the brownout histories;
-      - a probation only if every candidate agrees.
-    - The composite is written to NVS only if it adds protection, under a
-      generation above every candidate's.
-    - **No automatic relaxation** runs while the epoch is unverified.
-    - RTC writes made while unverified are **tagged** and are never ordered
-      by generation against anything.
-    - **On verification** (the epoch reads back: retried after every write
-      and before every relaxation, so always BEFORE a relaxation), the state
-      is reconciled first:
-      - it already holds the composite, and any tagged slot written since is
-        folded in;
-      - the result goes to NVS under a newer generation, and only then are
-        the tagged slots retired.
-    - A **verified boot** orders only untagged records of its own lifetime
-      by generation, and folds the facts of any tagged slot that NVS does not
-      hold yet.
-
-    A record of another lifetime can therefore only ever **raise**
-    protection, and a same-lifetime fact (a retained failure, a low veto) is
-    never lost to an unreadable epoch. **Stated caveat:** a more protective
-    foreign state merged in under this ambiguity stays. A foreign **forced
-    hold**, for example, is still forced after the epoch reads again, and
-    only an operator `clear` ends it. Not every state taken in while
-    unverified heals by itself.
+  - **An epoch that exists but cannot be *read* is UNVERIFIED** (round 7:
+    rule U1/U2). Rounds 5 and 6 tried to select, then to merge, RTC records
+    across NVS lifetimes; each version left a window (a dropped low veto, a
+    shadowed hold, a lost probation, a cleared hold folded back). The rule is
+    now deliberately simple.
+    - **U1, while unverified: fail closed and stay passive.**
+      - The state is the more protective of `no_flash` and the readable NVS
+        record (a forced NVS state is kept). If NVS is unreadable too, it is
+        `no_flash`. Reason `identity_unverified` when raised.
+      - RTC slots are **never read, adopted or written**. They are left
+        untouched for later.
+      - NVS is **never written**.
+      - **No relaxation of any kind.** Automatic ones are held. An operator
+        `clear` or force down is refused with the state unchanged (reply
+        `identity_unverified`). A force up applies in RAM.
+      - Protective updates (a brownout, a low read, a failure, an
+        escalation) apply in RAM only.
+    - **U2, when the epoch first reads again** (`epoch_ensure`, which runs
+      before every relaxation and every operator command):
+      - The **verified selection** runs exactly as at boot: NVS against the
+        same-lifetime RTC slots, by generation. Nothing is merged; no foreign
+        record counts.
+      - Then, conservatively:
+        - (a) a probation in the selected record counts as a **failed probe**
+          (`hold`, backoff + 1), because the unverified period hid what
+          happened;
+        - (b) the **quiet period restarts** at the verification time (a dated
+          low veto, which every transition clears);
+        - (c) the state is raised to at least the RAM state of the unverified
+          period (state rank and forced only).
+      - The result is persisted through the normal verified path (RTC first,
+        then NVS). Any relaxation that was due is re-evaluated by the next
+        read, never decided on the pre-verification state.
+    - **Stated limits** (they replace the earlier foreign-forced caveat):
+      - Protective facts of an unverified period live only in RAM until
+        verification. A reset during it loses them. The unit is fail-closed
+        (≥ `no_flash`) the whole time, and verification restarts the quiet
+        period.
+      - An unverified period during a probation costs one backoff level.
+      - An operator `clear` needs a readable epoch. Retry once storage reads.
   - **With no epoch at all** (absent and not creatable), RTC records are
     neither written nor adopted, and **no automatic relaxation happens**. A
     failure after such a relaxation that NVS refused could not survive a
@@ -753,7 +755,10 @@ sequenceDiagram
   state. If NVS reports an error but a positive read shows the new record, it
   stands and the reply is `ok`. Anything else is fenced and refused:
   `persist_failed` when the fence is confirmed on NVS (it cannot win later),
-  `persist_unconfirmed` when it is not. In that case it is protected now and
+  `persist_unconfirmed` when it is not. While the NVS epoch cannot be read,
+  `clear` and a force down are refused with `identity_unverified` (state
+  unchanged) and a force up applies in RAM only (rule U1 below).
+  In the `persist_unconfirmed` case it is protected now and
   across resets, but **a power loss before the next reset may let the
   relaxation win** (stated limit: total NVS failure cannot be made durable).
   A force **up** applies at once; if NVS refuses it the reply is
@@ -843,13 +848,17 @@ run fails unless every reply confirms the requested state. In Actions →
       relaxation runs), a more protective foreign record may win, a foreign
       `normal` never beats the fail-closed `no_flash`, and a retained failure
       of the same lifetime still survives;
-    - (round 6) the same-lifetime low veto kept in RTC survives an
-      unverified boot (passes on db64678, failed on 6c998a4); a foreign
-      gen-17 record never shadows an intact hold written while unverified,
-      which reaches NVS at verification and survives a power loss; the merge
-      keeps every protective fact of NVS and both slots; verification
-      reconciles and writes the merged facts BEFORE the probe step, and a
-      merged veto still blocks the probe after verification;
+    - (rounds 6-7, U1/U2) an unreadable epoch keeps NVS's forced hold or
+      raises to `no_flash`, never touches RTC, never writes NVS, refuses a
+      `clear` / force down (`identity_unverified`), applies a force up in
+      RAM, and holds every automatic relaxation; verification counts a
+      hidden probation as failed, restarts the quiet period, keeps the U1
+      state, and persists; the same-lifetime low veto and the foreign gen-17
+      record of round 6 are safe; and each of the reviewer's round-7 repros
+      (probation, history, clear-then-verify, interrupted verification,
+      cleared-while-unverified, clear reply, generation and since ties, the
+      old fence against a later clear) is a scenario that must hold (12 of
+      the 16 fail on 3ce665b);
     - (round 5, native) every pair of two transient raw-write faults across
       a `clear` and its fence writes (a ≤ 16, b ≤ 24), then a direct power
       loss: `persist_failed` always means a forced hold on NVS (the reviewer's

@@ -142,7 +142,8 @@ static void execute(void *arg)
              * whose protective fence is not confirmed on NVS either (it may
              * still win after a power loss; power_protect.h). */
             detail = ok ? (r->action == ACT_FORCE ? "applied" : "cleared")
-                        : err == POWER_PROTECT_ERR_UNCONFIRMED ? "persist_unconfirmed" : "persist_failed";
+                        : err == POWER_PROTECT_ERR_UNCONFIRMED ? "persist_unconfirmed"
+                        : err == POWER_PROTECT_ERR_UNVERIFIED ? "identity_unverified" : "persist_failed";
         }
     }
     if (refusal != NULL) {

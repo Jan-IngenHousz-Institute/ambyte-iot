@@ -91,7 +91,9 @@
  *   Durability (review of PR #113, rounds 1-2): ONE generation-ordered record.
  *    - Every persisted record carries a generation number (gen) that is never
  *      reused. The glue keeps two copies: NVS, and an RTC_NOINIT mirror (two
- *      slots, bound to the NVS epoch) that survives resets without power loss. At boot the NEWEST valid copy by
+ *      slots, bound to the NVS epoch) that survives resets without power loss.
+ *      With the epoch unreadable the glue is passive (U1, pp_unverified_floor)
+ *      until it reads (U2, pp_on_verified). At boot the NEWEST valid copy by
  *      generation wins (the RTC copy only after a reset without power loss);
  *      neither copy is consumed by being read.
  *    - A protective update (entry, escalation, a failed probe, a brownout or
@@ -218,6 +220,7 @@ typedef enum {
     PP_REASON_PROBE,            /* "probe": battery-only probe, one level down on probation */
     PP_REASON_PROBE_FAILED,     /* "probe_failed": a brownout (or fresh low read) on probation */
     PP_REASON_STATE_MISSING,    /* "state_missing": NVS has an epoch but no record: the state was lost */
+    PP_REASON_IDENTITY_UNVERIFIED, /* "identity_unverified": the NVS epoch is unreadable: failed closed (U1) */
     PP_REASON_COUNT
 } pp_reason_t;
 /* "probe_passed" is a log reason only (the probation ended without a failure;
@@ -339,19 +342,22 @@ static inline int pp_protection_rank(const pp_persist_t *p)
     return (int)p->state * 2 + (p->forced ? 1 : 0);
 }
 
-/* Fold record b into a, keeping the MOST PROTECTIVE value of every fact
- * (review of PR #113, round 6). For records whose order cannot be known (an
- * unverified NVS epoch: another lifetime may have written either), so none
- * may be dropped for being "older":
- *   state/reason/forced/since : of the higher pp_protection_rank (a on a tie);
- *   probe_fails               : the maximum (the longest backoff);
- *   probation                 : kept only if both agree (and it still fits);
- *   has_low / low_utc         : OR; the NEWEST dated low, or undated if
- *                               either is undated (the quiet period from boot);
- *   history                   : the union (more history links more brownouts);
- *   gen                       : the maximum.
- * The result is never less protective than either input. */
-void pp_merge_protective(pp_persist_t *a, const pp_persist_t *b);
+/* U1 (review of PR #113, round 7): the NVS epoch exists but cannot be read,
+ * so nothing proves which RTC record, if any, belongs to this NVS lifetime.
+ * The unit fails closed and stays passive: the state is at least no_flash
+ * (reason identity_unverified when raised; a forced NVS state is kept), RTC is
+ * neither read nor written, NVS is not written, and no relaxation runs. RAM
+ * only. */
+void pp_unverified_floor(pp_core_t *c, pp_clock_t clk);
+
+/* U2: the epoch has just been read, after a U1 period. `selected` is the
+ * VERIFIED selection (NVS against same-lifetime RTC slots, by generation).
+ * The result, conservatively: (a) a probation in it counts as a FAILED probe
+ * (hold, backoff +1: the unverified period hid what happened); (b) the quiet
+ * period restarts now (a dated low veto at the verification time); (c) the
+ * state is raised to at least the RAM state of the U1 period (state rank and
+ * forced only). Returns a persisting event (the caller writes it RTC-first). */
+pp_event_t pp_on_verified(pp_core_t *c, const pp_persist_t *selected, int64_t mono_ms, pp_clock_t clk);
 
 /* Blob codec. encode always writes v2 (PP_BLOB_LEN). decode reads v2 and the
  * v1 blob of the first brownout-protection release (PP_BLOB_V1_LEN, no probe

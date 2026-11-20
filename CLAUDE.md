@@ -105,11 +105,11 @@ holds bench boards.
   (absent/old/unreadable: the pinned IDF can report NOT_FOUND or the OLD value after a landed
   write) = fenced by protective records until TWO CLEAN writes follow the last failure (≤4
   writes); otherwise persist_unconfirmed. First install writes the record THEN the epoch, so
-  epoch + no record = state lost → no_flash/state_missing. An unreadable epoch is UNVERIFIED: NVS
-  (or fail-closed no_flash) and EVERY RTC slot are MERGED into the most protective composite
-  (pp_merge_protective, nothing ordered across lifetimes), RTC writes are tagged, no auto
-  relaxation; on verification reconcile (fold tags, write NVS) before any relaxation, then
-  retire tagged slots. A merged foreign forced hold stays until clear (documented). No automatic relaxation without an NVS epoch; epoch creation is re-read
+  epoch + no record = state lost → no_flash/state_missing. An unreadable epoch is UNVERIFIED (U1):
+  fail closed (>= no_flash, NVS forced kept), never read/write RTC, never write NVS, no
+  relaxation (operator clear/force-down -> identity_unverified), protective updates RAM only.
+  U2 on first read: the verified selection, then a hidden probation = failed probe, the quiet
+  period restarts, never below the U1 state; persisted RTC-first. No cross-lifetime merging. No automatic relaxation without an NVS epoch; epoch creation is re-read
   and retried after every successful write. Evidence: NativeNvsRelaxationTest runs the glue on
   the pinned IDF NVS with fault injection). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
   to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never

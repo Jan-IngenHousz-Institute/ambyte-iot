@@ -37,47 +37,6 @@ void pp_load_missing(pp_core_t *c, pp_clock_t clk)
     c->p.reason = PP_REASON_STATE_MISSING;
 }
 
-void pp_merge_protective(pp_persist_t *a, const pp_persist_t *b)
-{
-    pp_persist_t r = *a;
-    if (pp_protection_rank(b) > pp_protection_rank(a)) {
-        r.state = b->state;
-        r.reason = b->reason;
-        r.forced = b->forced;
-        r.since_utc = b->since_utc;
-    }
-    if (b->probe_fails > r.probe_fails) r.probe_fails = b->probe_fails;
-    /* A probation only where every candidate agrees, and only in the state
-     * its step entered (pp_decode's own rule). */
-    if (a->probation != b->probation || a->state != b->state) r.probation = PP_PROBATION_NONE;
-    if (r.probation != PP_PROBATION_NONE &&
-        (r.forced || r.state != (r.probation == PP_PROBATION_NO_FLASH ? PP_STATE_NO_FLASH : PP_STATE_NORMAL))) {
-        r.probation = PP_PROBATION_NONE;
-    }
-    if (a->has_low || b->has_low) {
-        const bool undated = (a->has_low && a->low_utc == 0) || (b->has_low && b->low_utc == 0);
-        int64_t newest = 0;
-        if (a->has_low && a->low_utc > newest) newest = a->low_utc;
-        if (b->has_low && b->low_utc > newest) newest = b->low_utc;
-        r.has_low = true;
-        r.low_utc = undated ? 0 : newest;
-    }
-    for (unsigned i = 0; i < b->hist_n && i < PP_HIST_MAX; i++) {
-        bool seen = false;
-        for (unsigned k = 0; k < r.hist_n; k++) {
-            if (r.hist[k].utc == b->hist[i].utc && r.hist[k].boot == b->hist[i].boot) seen = true;
-        }
-        if (seen) continue;
-        if (r.hist_n == PP_HIST_MAX) {   /* keep the newest PP_HIST_MAX: drop the oldest */
-            memmove(&r.hist[0], &r.hist[1], (PP_HIST_MAX - 1) * sizeof r.hist[0]);
-            r.hist_n--;
-        }
-        r.hist[r.hist_n++] = b->hist[i];
-    }
-    if (b->gen > r.gen) r.gen = b->gen;
-    *a = r;
-}
-
 /* ── names ─────────────────────────────────────────────────────────────── */
 
 const char *pp_state_name(pp_state_t s)
@@ -105,6 +64,7 @@ const char *pp_reason_name(pp_reason_t r)
     case PP_REASON_PROBE:           return "probe";
     case PP_REASON_PROBE_FAILED:    return "probe_failed";
     case PP_REASON_STATE_MISSING:   return "state_missing";
+    case PP_REASON_IDENTITY_UNVERIFIED: return "identity_unverified";
     case PP_REASON_COUNT:           break;
     }
     return "none";
@@ -636,6 +596,53 @@ pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_read
     const pp_event_t ev = on_read(c, reason, p, fresh_present, mono_ms, clk);
     /* The uptime fallbacks (quiet period, probation) count from here. */
     if (ev.changed) c->since_mono_ms = mono_ms;
+    return ev;
+}
+
+void pp_unverified_floor(pp_core_t *c, pp_clock_t clk)
+{
+    c->persist_fault = true;   /* nothing of this period is on record */
+    if ((pp_state_t)c->p.state != PP_STATE_NORMAL) return;   /* already protective (forced kept) */
+    c->p.state = PP_STATE_NO_FLASH;
+    c->p.reason = PP_REASON_IDENTITY_UNVERIFIED;
+    c->p.since_utc = clk.valid ? clk.utc : 0;
+    c->p.probation = PP_PROBATION_NONE;   /* a normal probation does not fit no_flash */
+}
+
+pp_event_t pp_on_verified(pp_core_t *c, const pp_persist_t *selected, int64_t mono_ms, pp_clock_t clk)
+{
+    const pp_persist_t ram = c->p;
+    c->p = *selected;
+    const int64_t now = clk.valid ? clk.utc : 0;
+    /* (a) the unverified period hid whatever happened on probation */
+    if (c->p.probation != PP_PROBATION_NONE) {
+        c->p.probation = PP_PROBATION_NONE;
+        c->p.state = PP_STATE_HOLD;
+        c->p.reason = PP_REASON_PROBE_FAILED;
+        c->p.since_utc = now;
+        if (c->p.probe_fails < PP_PROBE_FAILS_MAX) c->p.probe_fails++;
+    }
+    /* (c) never below what the unit ran at while unverified (rank only) */
+    if (pp_protection_rank(&ram) > pp_protection_rank(&c->p)) {
+        c->p.state = ram.state;
+        c->p.forced = ram.forced;
+        c->p.reason = ram.reason;
+        c->p.since_utc = ram.since_utc;
+    }
+    /* (b) the quiet period restarts now: the low veto mechanism is the
+     * durable anchor the probe already honours (6 h, + the refresh margin
+     * after a reboot), and every transition clears it */
+    c->p.has_low = true;
+    c->p.low_utc = now;
+    c->have_low = true;
+    c->last_low_ms = mono_ms;
+    if (ram.gen > c->p.gen) c->p.gen = ram.gen;
+    acc_reset(c);
+    c->since_mono_ms = mono_ms;
+    pp_event_t ev = no_event(c);
+    ev.from = (pp_state_t)ram.state;
+    ev.changed = ev.from != ev.to;
+    ev.persist = true;
     return ev;
 }
 

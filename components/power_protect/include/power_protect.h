@@ -92,6 +92,12 @@ int power_protect_render_json(char *buf, size_t cap);
  * relaxation may still win. (Command reply detail "persist_unconfirmed".) */
 #define POWER_PROTECT_ERR_UNCONFIRMED ESP_ERR_NOT_FINISHED
 
+/* The NVS epoch exists but cannot be read (U1, round 7): a clear or a force
+ * down is refused with the state unchanged; a force up applies in RAM only;
+ * nothing is written until the epoch reads again. (Reply detail
+ * "identity_unverified".) */
+#define POWER_PROTECT_ERR_UNVERIFIED ESP_ERR_NOT_ALLOWED
+
 /* Operator actions; the return value is the NVS persist result (ESP_OK also
  * when nothing needed writing). clear and a force DOWN (hold -> no_flash) are
  * relaxations: written first, and NOT applied when the write fails. After a

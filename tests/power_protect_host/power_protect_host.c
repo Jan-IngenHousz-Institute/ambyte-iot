@@ -61,11 +61,6 @@ static int     g_rtc_reset_at;
 #else
 #define HAVE_R5 0
 #endif
-#ifdef PP_RTC_TAGGED
-#define HAVE_R6 1
-#else
-#define HAVE_R6 0
-#endif
 /* And the generation-ordered record of review round 2 (s_rtc mirror). */
 #ifdef PP_RTC_MAGIC
 #define HAVE_GEN 1
@@ -1792,110 +1787,89 @@ static void nvs_put(const pp_persist_t *p)
     g_blob_len = PP_BLOB_LEN;
 }
 
-/* [P2] With the epoch unreadable, an RTC record of ANOTHER NVS lifetime never
- * lowers or wipes the protection NVS holds; it wins only if strictly more
- * protective, and with NVS unreadable too, against a fail-closed no_flash. */
-static void unverified_epoch_never_relaxes(void)
+/* U1 (round 7): an unreadable epoch fails closed and stays passive. */
+static void u1_unverified_is_passive(void)
 {
-    for (int kind = 0; kind < 4; kind++) {
-        /* the old lifetime leaves a record in RTC memory */
-        fresh_nvs();
-        reboot(ESP_RST_POWERON, 1, true);
-        switch (kind) {
-        case 0:                                          /* cleared */
-            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && power_protect_clear() == ESP_OK, "cleared");
-            break;
-        case 1:                                          /* normal on probation */
-            reboot(ESP_RST_BROWNOUT, 2, true);
-            quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
-            CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probation");
-            break;
-        case 2:                                          /* automatic no_flash */
-            reboot(ESP_RST_BROWNOUT, 2, true);
-            break;
-        case 3:                                          /* forced hold: MORE protective */
-            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "forced hold");
-            break;
-        }
-        const pp_state_t old_state = st();
-        /* flash_gui rewrites NVS: a new lifetime with a protective record
-         * (kinds 0-2: forced hold; kind 3: a plain normal) */
-        pp_persist_t cur;
-        memset(&cur, 0, sizeof cur);
-        cur.gen = 1;
-        if (kind < 3) { cur.state = PP_STATE_HOLD; cur.reason = PP_REASON_FORCED; cur.forced = true; }
-        nvs_put(&cur);
-        g_epoch = 0x5EED0001u;
-        g_epoch_get_err = ESP_FAIL;                      /* only the epoch read fails */
-        const int w = g_writes;
-        reboot(ESP_RST_SW, 3, true);
-        if (kind < 3) {
-            CHECK(st() == PP_STATE_HOLD && s_core.p.forced,
-                  "kind %d: a foreign %s record never lowers NVS's forced hold (state %d)", kind,
-                  pp_state_name(old_state), st());
-            pp_persist_t back;
-            /* (a foreign record's brownout history is a protective fact and
-             * may be merged in and written; its state never is) */
-            CHECK(pp_decode(&back, g_blob, g_blob_len) && back.state == PP_STATE_HOLD && back.forced,
-                  "kind %d: NVS still holds the forced hold (writes %d)", kind, g_writes - w);
-            /* no automatic relaxation while the epoch is unverified */
-            quiet_reads(POWER_READ_NO_INPUT, 12 * H);
-            CHECK(st() == PP_STATE_HOLD, "kind %d: still hold", kind);
-        } else {
-            CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "a MORE protective foreign record may win (state %d)", st());
-        }
-        g_epoch_get_err = ESP_OK;
-    }
-    /* NVS unreadable as well: a foreign normal falls back to no_flash, a
-     * foreign hold wins. */
-    for (int hold = 0; hold < 3; hold++) {
-        fresh_nvs();
-        memset(&s_rtc, 0, sizeof s_rtc);                 /* an RTC holding only this lifetime */
-        reboot(ESP_RST_POWERON, 1, true);
-        if (hold == 1) {
-            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "forced hold");
-        } else if (hold == 2) {
-            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && power_protect_clear() == ESP_OK, "cleared");
-        }
-        g_blob[9] ^= 0x55;                               /* the record unreadable */
-        g_epoch = 0x5EED0002u;
-        g_epoch_get_err = ESP_FAIL;
-        reboot(ESP_RST_SW, 2, true);
-        g_epoch_get_err = ESP_OK;
-        if (hold == 1) {
-            CHECK(st() == PP_STATE_HOLD, "a foreign hold beats the fail-closed no_flash");
-        } else if (hold == 0) {
-            CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE,
-                  "a foreign normal never beats the fail-closed no_flash (state %d)", st());
-        } else {
-            /* The stated caveat: the cleared record cannot be ordered against
-             * the forced hold still in the other slot, so the merge keeps the
-             * hold, forced, until an operator clear. */
-            CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "ambiguity keeps the more protective forced hold");
-        }
-    }
-    /* the SAME lifetime with an unreadable epoch still keeps a retained
-     * failure (more protective than NVS's probation) across a reset */
+    /* a durable forced hold, RTC slots of this lifetime */
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "forced hold");
+    pp_rtc_slot_t rtc_before[2];
+    memcpy(rtc_before, s_rtc, sizeof rtc_before);
+    const int w = g_writes;
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced && s_core.persist_fault, "NVS forced hold kept");
+    quiet_reads(POWER_READ_NO_INPUT, 30 * H);
+    CHECK(st() == PP_STATE_HOLD, "no relaxation of any kind");
+#ifdef POWER_PROTECT_ERR_UNVERIFIED
+    CHECK(power_protect_clear() == POWER_PROTECT_ERR_UNVERIFIED && st() == PP_STATE_HOLD, "clear refused");
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == POWER_PROTECT_ERR_UNVERIFIED && st() == PP_STATE_HOLD,
+          "force down refused");
+#endif
+    reboot(ESP_RST_SW, 4, true);                         /* (a reset keeps RTC memory) */
+    CHECK(memcmp(rtc_before, s_rtc, sizeof rtc_before) == 0, "RTC slots never touched");
+    reboot(ESP_RST_BROWNOUT, 3, true);                   /* a brownout while unverified: RAM only */
+    CHECK(st() == PP_STATE_HOLD, "still hold");
+    CHECK(g_writes == w, "nothing written to NVS (%d)", g_writes - w);
+    /* NVS normal -> no_flash, identity_unverified; force up applies in RAM */
+    g_epoch_get_err = ESP_OK;
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 5, true);
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_SW, 6, true);
+#ifdef POWER_PROTECT_ERR_UNVERIFIED
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_IDENTITY_UNVERIFIED, "floor: no_flash");
+#else
+    CHECK(st() == PP_STATE_NO_FLASH, "floor: no_flash (state %d)", st());
+#endif
+#ifdef POWER_PROTECT_ERR_UNVERIFIED
+    CHECK(power_protect_force(PP_STATE_HOLD) == POWER_PROTECT_ERR_UNVERIFIED && st() == PP_STATE_HOLD &&
+          s_core.p.forced, "force up applies in RAM");
+#endif
+    /* NVS unreadable too: no_flash, state_unreadable, whatever RTC holds */
+    g_blob[9] ^= 0x55;
+    reboot(ESP_RST_SW, 7, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE, "unreadable: no_flash");
+    g_epoch_get_err = ESP_OK;
+}
+
+/* U2: verification reconciles (a) a probation as failed, (b) restarts the
+ * quiet period, (c) never goes below the U1 state; then it is persisted. */
+static void u2_verification_reconciles(void)
+{
+    /* (a) + (b) */
     fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 1, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
-    g_fail_writes = true;
-    good_reads(3, 3250, 3900);                           /* the probation fails, NVS refuses */
-    g_fail_writes = false;
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probation on record");
     g_epoch_get_err = ESP_FAIL;
     reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "U1 floor");
     g_epoch_get_err = ESP_OK;
-    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "retained failure kept (state %d)", st());
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);         /* due: epoch_ensure verifies (U2) */
+    CHECK(s_epoch_verified && st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_PROBE_FAILED &&
+          s_core.p.probe_fails == 1 && s_core.p.has_low, "(a) a hidden probation counts as failed (state %d)", st());
+    pp_persist_t q;
+    CHECK(pp_decode(&q, g_blob, g_blob_len) && q.state == PP_STATE_HOLD && q.probe_fails == 1 && q.has_low,
+          "persisted");
+    quiet_reads(POWER_READ_NO_INPUT, 11 * H);
+    CHECK(st() == PP_STATE_HOLD, "(b) the quiet period restarted at verification (level 1: 12 h)");
+    quiet_reads(POWER_READ_NO_INPUT, H + 120);
+    CHECK(st() == PP_STATE_NO_FLASH, "then the probe (state %d)", st());
+    /* (c) */
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 10, true);
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_SW, 11, true);
+    (void)power_protect_force(PP_STATE_HOLD);           /* RAM only */
+    g_epoch_get_err = ESP_OK;
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced,
+          "(c) verified: the U1 forced hold is kept and written");
+    CHECK(pp_decode(&q, g_blob, g_blob_len) && q.state == PP_STATE_HOLD && q.forced, "on record");
 }
-#endif
 
-/* ── scenarios: round 6 (unverified epoch: merge, never order) ─────────── */
-
-#if HAVE_RECOVERY
-/* [P2-1] Same lifetime, only the epoch read fails at one boot: the low veto
- * kept in RTC (its NVS write refused) must survive (passes on db64678,
- * failed on 6c998a4: the rank tie dropped it and the probe ran ~2 min after
- * the low read). */
+/* Round 6 cases, now under U1/U2. */
 static void same_epoch_low_veto(void)
 {
     fresh_nvs();
@@ -1909,26 +1883,23 @@ static void same_epoch_low_veto(void)
     g_epoch_get_err = ESP_OK;
     quiet_reads(POWER_READ_NO_INPUT, 120);
     CHECK(st() == PP_STATE_NO_FLASH, "the low veto survives an unverified boot (state %d)", st());
-    quiet_reads(POWER_READ_NO_INPUT, 6 * H);
-    CHECK(st() == PP_STATE_NO_FLASH, "still within the veto (+ the refresh margin)");
-    quiet_reads(POWER_READ_NO_INPUT, 2 * H);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 300);
+    CHECK(st() == PP_STATE_NO_FLASH, "the quiet period restarted at verification");
+    quiet_reads(POWER_READ_NO_INPUT, 600);
     CHECK(st() == PP_STATE_NORMAL, "then the probe (state %d)", st());
 }
 
-/* An RTC slot as another lifetime left it (untagged, its own epoch). */
+/* An RTC slot as another lifetime left it (its own epoch). */
 static void rtc_put(int slot, const pp_persist_t *p, uint32_t epoch)
 {
     s_rtc[slot].magic = 0;
     CHECK(pp_encode(p, s_rtc[slot].blob, sizeof s_rtc[slot].blob) == PP_BLOB_LEN, "encode");
     s_rtc[slot].epoch = epoch;
-#if HAVE_R6
-    s_rtc[slot].unverified = 0;
-#endif
     s_rtc[slot].magic = PP_RTC_MAGIC;
 }
 
-/* [P2-2] A foreign high-generation record in one slot must not shadow an
- * intact protective record written (unverified) in the other. */
+/* A foreign gen-17 record never decides anything; while unverified the unit
+ * is >= no_flash, after verification the current lifetime's NVS decides. */
 static void slot_shadow(void)
 {
     fresh_nvs();
@@ -1936,118 +1907,190 @@ static void slot_shadow(void)
     pp_persist_t old;
     memset(&old, 0, sizeof old);
     old.state = PP_STATE_NORMAL; old.reason = PP_REASON_CLEARED; old.gen = 17;
-    rtc_put(0, &old, 0x01D0001u);                        /* old lifetime: cleared, gen 17 */
+    rtc_put(0, &old, 0x01D0001u);
     pp_persist_t cur;
     memset(&cur, 0, sizeof cur);
-    cur.gen = 1;
-    nvs_put(&cur);                                       /* rewritten NVS: normal gen 1 */
+    cur.gen = 1; cur.state = PP_STATE_HOLD; cur.forced = true; cur.reason = PP_REASON_FORCED;
+    nvs_put(&cur);
     g_epoch = 0x0E70002u;
     g_epoch_get_err = ESP_FAIL;
     reboot(ESP_RST_SW, 2, true);
-    CHECK(st() == PP_STATE_NORMAL, "normal + foreign normal = normal");
-    g_fail_writes = true;
-    CHECK(power_protect_force(PP_STATE_HOLD) != ESP_OK && st() == PP_STATE_HOLD, "forced hold, refused");
-    g_fail_writes = false;
-    reboot(ESP_RST_SW, 3, true);                         /* epoch still unreadable */
-    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "the intact hold is not shadowed by gen 17 (state %d)", st());
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "unverified: NVS's forced hold, the foreign record ignored");
     g_epoch_get_err = ESP_OK;
-    reboot(ESP_RST_SW, 4, true);                         /* the epoch reads: verified */
-    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "and survives verification (state %d)", st());
-    pp_persist_t back;
-    CHECK(pp_decode(&back, g_blob, g_blob_len) && back.state == PP_STATE_HOLD && back.forced, "now on NVS");
-    reboot(ESP_RST_POWERON, 5, true);
-    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "and across a power loss");
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "verified: the foreign gen 17 never shadows it (state %d)", st());
 }
 
-#if HAVE_R6
-/* The merge keeps every protective fact of every candidate. */
-static void merge_keeps_every_fact(void)
+/* ── the reviewer's round-7 repros, now required to be safe ────────────── */
+
+static void r7_probation_merge(void)
 {
-    pp_persist_t a, b;
-    memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
-    a.state = PP_STATE_NO_FLASH; a.reason = PP_REASON_BROWNOUT; a.probe_fails = 1; a.gen = 5;
-    a.has_low = true; a.low_utc = 1000; a.hist_n = 1; a.hist[0] = (pp_brownout_t){ 900, 2 };
-    b.state = PP_STATE_NORMAL; b.reason = PP_REASON_PROBE; b.probation = PP_PROBATION_NORMAL; b.probe_fails = 3;
-    b.gen = 40; b.has_low = true; b.low_utc = 2000; b.hist_n = 1; b.hist[0] = (pp_brownout_t){ 1500, 9 };
-    pp_merge_protective(&a, &b);
-    CHECK(a.state == PP_STATE_NO_FLASH && a.reason == PP_REASON_BROWNOUT && a.probe_fails == 3 && a.gen == 40 &&
-          a.probation == PP_PROBATION_NONE && a.has_low && a.low_utc == 2000 && a.hist_n == 2, "merge 1");
-    pp_persist_t c;
-    memset(&c, 0, sizeof c);
-    c.state = PP_STATE_NO_FLASH; c.forced = true; c.reason = PP_REASON_FORCED; c.has_low = true; c.low_utc = 0;
-    pp_merge_protective(&a, &c);
-    CHECK(a.forced && a.reason == PP_REASON_FORCED && a.has_low && a.low_utc == 0, "forced wins, undated low wins");
-    uint8_t buf[PP_BLOB_LEN];
-    pp_persist_t q;
-    CHECK(pp_encode(&a, buf, sizeof buf) == PP_BLOB_LEN && pp_decode(&q, buf, sizeof buf), "a valid record");
-    /* Through the glue: NVS + two RTC slots, each with a different fact. */
-    fresh_nvs();
-    memset(&s_rtc, 0, sizeof s_rtc);
-    pp_persist_t n;
-    memset(&n, 0, sizeof n);
-    n.state = PP_STATE_NO_FLASH; n.reason = PP_REASON_BROWNOUT; n.gen = 3; n.probe_fails = 1;
-    nvs_put(&n);
-    g_epoch = 0xAB0001u;
-    pp_persist_t r1 = n, r2 = n;
-    r1.gen = 9; r1.has_low = true; r1.low_utc = (int64_t)g_utc - 600;
-    r2.gen = 2; r2.probe_fails = 4; r2.hist_n = 1; r2.hist[0] = (pp_brownout_t){ (int64_t)g_utc - 3600, 7 };
-    rtc_put(0, &r1, 0xAB0001u);
-    rtc_put(1, &r2, 0x0FF0002u);
-    g_epoch_get_err = ESP_FAIL;
-    reboot(ESP_RST_SW, 8, true);
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    pp_persist_t current; memset(&current, 0, sizeof current);
+    current.state = PP_STATE_NORMAL; current.reason = PP_REASON_PROBE;
+    current.probation = PP_PROBATION_NORMAL; current.since_utc = (int64_t)g_utc - 60; current.gen = 20;
+    nvs_put(&current);
+    pp_persist_t stale; memset(&stale, 0, sizeof stale);
+    stale.state = PP_STATE_NORMAL; stale.reason = PP_REASON_CLEARED; stale.gen = 1;
+    memset(&s_rtc, 0, sizeof s_rtc); rtc_put(0, &stale, g_epoch);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "U1 floor");
     g_epoch_get_err = ESP_OK;
-    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.has_low && s_core.p.probe_fails == 4 && s_core.p.hist_n == 1,
-          "composite: low %d fails %u hist %u", s_core.p.has_low, (unsigned)s_core.p.probe_fails,
-          (unsigned)s_core.p.hist_n);
-    CHECK(pp_decode(&q, g_blob, g_blob_len) && q.has_low && q.probe_fails == 4 && q.gen > 9, "written: gen %u",
-          (unsigned)q.gen);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "a brownout on probation fails the probe");
 }
 
-/* Verification during the boot reconciles BEFORE any relaxation: the facts
- * merged while unverified reach NVS, the tagged slots are retired, and the
- * probe still honours the low veto. */
-static void verify_reconciles_before_relaxing(void)
+static void r7_history_merge(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    pp_persist_t current; memset(&current, 0, sizeof current);
+    current.gen = 20; current.state = PP_STATE_NO_FLASH; current.reason = PP_REASON_BROWNOUT;
+    current.since_utc = (int64_t)g_utc - 24 * H; current.hist_n = 1;
+    current.hist[0] = (pp_brownout_t){ (int64_t)g_utc - 60, 10 };
+    nvs_put(&current);
+    pp_persist_t stale = current; stale.gen = 1; stale.hist[0] = (pp_brownout_t){ (int64_t)g_utc - 24 * H, 1 };
+    memset(&s_rtc, 0, sizeof s_rtc); rtc_put(0, &stale, g_epoch ^ 0x1111);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 11, true);
+    g_epoch_get_err = ESP_OK;
+    quiet_reads(POWER_READ_NO_INPUT, 2 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "a recent brownout vetoes the probe for 6 h");
+}
+
+static void r7_clear_reverify(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    CHECK(!s_epoch_verified && st() == PP_STATE_HOLD, "unverified");
+    g_epoch_get_err = ESP_OK;
+    const esp_err_t err = power_protect_clear();
+    pp_persist_t durable; CHECK(pp_decode(&durable, g_blob, g_blob_len), "decode");
+    CHECK(err == ESP_OK && st() == PP_STATE_NORMAL && s_core.p.state == PP_STATE_NORMAL &&
+          durable.state == PP_STATE_NORMAL, "a clear once the epoch reads stands (err %#x)", (unsigned)err);
+}
+
+static void r7_verify_rtc_interrupt(void)
+{
+    fresh_nvs(); reboot(ESP_RST_BROWNOUT, 1, true);
+    quiet_reads(POWER_READ_NO_INPUT, 3 * H);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_fail_writes = true;
+    good_reads(3, 4100, 3500);                           /* RAM only while unverified */
+    g_epoch_get_err = ESP_OK;
+    g_rtc_reset_at = 2;
+    if (setjmp(g_reset_jump) == 0) (void)epoch_ensure();
+    g_rtc_reset_at = 0;
+    g_fail_writes = false;
+    reboot(ESP_RST_SW, 3, true);
+    /* stated limit: U1 facts are RAM-only until verification is on record;
+     * the unit stays protective */
+    CHECK(st() >= PP_STATE_NO_FLASH, "fail-closed after a reset inside verification (state %d)", st());
+}
+
+static void r7_probation_natural(void)
+{
+    fresh_nvs(); reboot(ESP_RST_BROWNOUT, 1, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "probe setup");
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "U1 floor");
+    g_epoch_get_err = ESP_OK; reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "a brownout during the probation fails the probe");
+}
+
+static void r7_history_natural(void)
 {
     fresh_nvs();
-    reboot(ESP_RST_BROWNOUT, 2, true);
-    quiet_reads(POWER_READ_NO_INPUT, 3 * H);
-    g_fail_writes = true;
-    good_reads(3, 4100, 3500);                           /* low kept in RTC only */
-    g_epoch_get_err = ESP_FAIL;
-    reboot(ESP_RST_SW, 3, true);                         /* unverified; NVS still refusing */
-    g_fail_writes = false;
-    CHECK(s_core.p.has_low && !s_epoch_verified, "merged, unverified");
-    quiet_reads(POWER_READ_NO_INPUT, 10 * H);
-    CHECK(st() == PP_STATE_NO_FLASH, "no relaxation while unverified");
-    g_epoch_get_err = ESP_OK;
-    const int n0 = g_wlog_n;
-    quiet_reads(POWER_READ_NO_INPUT, 60);   /* the probe is due: epoch_ensure verifies, reconciles, then it runs */
-    CHECK(s_epoch_verified && st() == PP_STATE_NORMAL && g_wlog_n == n0 + 2, "verified, then probed (%d writes)",
-          g_wlog_n - n0);
-    pp_persist_t rec, step;
-    CHECK(pp_decode(&rec, g_wlog[WRITE_LOG - 2], PP_BLOB_LEN) && rec.state == PP_STATE_NO_FLASH && rec.has_low,
-          "first the reconciled record, with the low veto merged while unverified");
-    CHECK(pp_decode(&step, g_wlog[WRITE_LOG - 1], PP_BLOB_LEN) && step.state == PP_STATE_NORMAL &&
-          step.probation == PP_PROBATION_NORMAL && step.gen > rec.gen, "then the probe step");
-    for (int i = 0; i < 2; i++) CHECK(!(s_rtc[i].magic == PP_RTC_MAGIC && s_rtc[i].unverified), "tagged retired");
-    /* And a veto still inside its window blocks the probe after verification. */
-    fresh_nvs();
-    reboot(ESP_RST_BROWNOUT, 5, true);
-    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
-    g_fail_writes = true;
-    good_reads(3, 4100, 3500);
-    g_epoch_get_err = ESP_FAIL;
-    reboot(ESP_RST_SW, 6, true);
-    g_fail_writes = false;
-    g_epoch_get_err = ESP_OK;
-    quiet_reads(POWER_READ_NO_INPUT, H + 60);
-    CHECK(!s_epoch_verified && st() == PP_STATE_NO_FLASH, "nothing written yet: still unverified");
-    good_reads(3, 4100, 3500);                           /* the hourly low refresh: a write, then verify */
-    CHECK(s_epoch_verified, "verified");
-    quiet_reads(POWER_READ_NO_INPUT, 3 * H);
-    CHECK(st() == PP_STATE_NO_FLASH, "the merged veto holds after verification (state %d)", st());
+    for (unsigned boot = 1; boot <= 9; boot++) {
+        reboot(ESP_RST_BROWNOUT, boot, true);
+        if (boot < 9) advance_s(24 * H);
+    }
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 10, true);
+    g_epoch_get_err = ESP_OK; quiet_reads(POWER_READ_NO_INPUT, 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "a brownout a minute ago vetoes the probe");
 }
+
+static void r7_clear_unreadable(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+#ifdef POWER_PROTECT_ERR_UNVERIFIED
+    CHECK(power_protect_clear() == POWER_PROTECT_ERR_UNVERIFIED && st() == PP_STATE_HOLD,
+          "a clear needs a readable epoch");
 #endif
+    g_epoch_get_err = ESP_OK; reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "still the forced hold");
+    CHECK(power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL, "then the clear applies");
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.p.forced, "and stands");
+}
+
+static void r7_verify_rtc_interrupt_hold(void)
+{
+    fresh_nvs(); reboot(ESP_RST_BROWNOUT, 1, true);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_fail_writes = true; good_reads(3, 4100, 3500);
+    (void)power_protect_force(PP_STATE_HOLD);            /* RAM only */
+    CHECK(st() == PP_STATE_HOLD, "forced hold in RAM");
+    g_epoch_get_err = ESP_OK; g_rtc_reset_at = 2;
+    if (setjmp(g_reset_jump) == 0) reboot(ESP_RST_SW, 3, true);
+    g_rtc_reset_at = 0;
+    g_fail_writes = false; reboot(ESP_RST_SW, 4, true);
+    /* stated limit: the RAM-only forced hold of the U1 period is lost by a
+     * reset; the unit is still protective */
+    CHECK(st() >= PP_STATE_NO_FLASH, "fail-closed (state %d)", st());
+}
+
+static void r7_clear_reply(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_epoch_get_err = ESP_OK; cmd_init();
+    cmd("{\"type\":\"power_protect\",\"id\":\"review\",\"action\":\"clear\"}", true);
+    CHECK(st() == PP_STATE_NORMAL, "the reply corresponds to the cleared state");
+}
+
+static void r7_merge_gen(void)
+{
+    fresh_nvs(); reboot(ESP_RST_BROWNOUT, 1, true);
+    pp_persist_t newer = s_core.p; newer.gen = 17;
+    memset(&s_rtc, 0, sizeof s_rtc); rtc_put(0, &newer, g_epoch);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_epoch_get_err = ESP_OK; quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "verification restarted the quiet period");
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H);
+    CHECK(st() == PP_STATE_NORMAL, "probe");
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_NORMAL, "a verified relaxation is never shadowed by an older record");
+}
+
+static void r7_since_merge(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    pp_persist_t a; memset(&a, 0, sizeof a);
+    a.state = PP_STATE_NO_FLASH; a.reason = PP_REASON_LOW_VOLTAGE; a.since_utc = (int64_t)g_utc - 24 * H; a.gen = 1;
+    nvs_put(&a);
+    pp_persist_t b = a; b.since_utc = (int64_t)g_utc - 60; b.gen = 17;
+    memset(&s_rtc, 0, sizeof s_rtc); rtc_put(0, &b, g_epoch ^ 0x1111);
+    g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_epoch_get_err = ESP_OK; quiet_reads(POWER_READ_NO_INPUT, 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "no probe a minute after an unverified period");
+}
+
+static void r7_merge_gen_natural(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "hold setup");
+    g_fail_writes = true;
+    CHECK(power_protect_clear() == POWER_PROTECT_ERR_UNCONFIRMED, "clear and fences refused");
+    g_fail_writes = false; g_epoch_get_err = ESP_FAIL; reboot(ESP_RST_SW, 2, true);
+    g_epoch_get_err = ESP_OK;
+    CHECK(power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL, "clear accepted once the epoch reads");
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_NORMAL, "the old fence never outranks a later accepted clear");
+}
 #endif
 
 static void low_voltage_trigger(void)
@@ -2285,7 +2328,7 @@ static void read_failures_are_protected(void)
     g_get_err = ESP_FAIL;
 #if HAVE_GEN
     reboot(ESP_RST_SW, 4, true);
-    CHECK(st() == PP_STATE_HOLD, "a reset without power loss keeps hold from the RTC mirror");
+    CHECK(st() == PP_STATE_NO_FLASH, "state and epoch unreadable: U1, fail-closed no_flash (state %d)", st());
 #endif
     reboot(ESP_RST_POWERON, 4, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE && s_core.persist_fault,
@@ -2608,13 +2651,22 @@ static const scenario_t k_scenarios[] = {
     {"no_epoch_no_relaxation", no_epoch_no_relaxation},
     {"fence_unconfirmed", fence_unconfirmed},
     {"missing_record_fails_closed", missing_record_fails_closed},
-    {"unverified_epoch_never_relaxes", unverified_epoch_never_relaxes},
+    {"u1_unverified_is_passive", u1_unverified_is_passive},
+    {"u2_verification_reconciles", u2_verification_reconciles},
     {"same_epoch_low_veto", same_epoch_low_veto},
     {"slot_shadow", slot_shadow},
-#if HAVE_R6
-    {"merge_keeps_every_fact", merge_keeps_every_fact},
-    {"verify_reconciles_before_relaxing", verify_reconciles_before_relaxing},
-#endif
+    {"r7_probation_merge", r7_probation_merge},
+    {"r7_history_merge", r7_history_merge},
+    {"r7_clear_reverify", r7_clear_reverify},
+    {"r7_verify_rtc_interrupt", r7_verify_rtc_interrupt},
+    {"r7_probation_natural", r7_probation_natural},
+    {"r7_history_natural", r7_history_natural},
+    {"r7_clear_unreadable", r7_clear_unreadable},
+    {"r7_verify_rtc_interrupt_hold", r7_verify_rtc_interrupt_hold},
+    {"r7_clear_reply", r7_clear_reply},
+    {"r7_merge_gen", r7_merge_gen},
+    {"r7_since_merge", r7_since_merge},
+    {"r7_merge_gen_natural", r7_merge_gen_natural},
     {"cmd_persist_unconfirmed", cmd_persist_unconfirmed},
 #endif
 #ifdef PP_NATIVE_NVS

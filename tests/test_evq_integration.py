@@ -534,7 +534,7 @@ class EvqIntegration(unittest.TestCase):
                     self.assertTrue(w["fits"], w["worst_len"])
                     pp = w["payload"]["health"]["power_protect"]
                     self.assertTrue({"qualifying_s", "probe", "next_probe_s", "backoff_level"} <= set(pp), pp)
-                    self.assertEqual(pp["reason"], "brownout_unordered")
+                    self.assertEqual(pp["reason"], "identity_unverified")
                 if w["fits"]:
                     self.assertLess(w["worst_len"], w["cap"])
                     self.assertEqual(w["payload"]["schema"], "ambyte.telemetry/1")
