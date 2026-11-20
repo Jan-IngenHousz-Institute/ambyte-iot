@@ -103,8 +103,10 @@ holds bench boards.
   success (refused: stay protected, keep the read's low veto, retry after 1 h; operator: not
   applied; after an NVS error only a positive read of the new record = landed, anything else
   (absent/old/unreadable: the pinned IDF can report NOT_FOUND or the OLD value after a landed
-  write) = fenced by a newer protective record written TWICE; an unconfirmed fence replies
-  persist_unconfirmed. No automatic relaxation without an NVS epoch; epoch creation is re-read
+  write) = fenced by protective records until TWO CLEAN writes follow the last failure (≤4
+  writes); otherwise persist_unconfirmed. First install writes the record THEN the epoch, so
+  epoch + no record = state lost → no_flash/state_missing. An unreadable epoch is UNVERIFIED: an
+  RTC record then wins only if strictly more protective, never relaxes NVS, no auto relaxation. No automatic relaxation without an NVS epoch; epoch creation is re-read
   and retried after every successful write. Evidence: NativeNvsRelaxationTest runs the glue on
   the pinned IDF NVS with fault injection). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
   to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never

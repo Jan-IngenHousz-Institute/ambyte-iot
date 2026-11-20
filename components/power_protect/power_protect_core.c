@@ -31,6 +31,12 @@ void pp_load_unreadable(pp_core_t *c, pp_clock_t clk)
     c->persist_fault = true;
 }
 
+void pp_load_missing(pp_core_t *c, pp_clock_t clk)
+{
+    pp_load_unreadable(c, clk);
+    c->p.reason = PP_REASON_STATE_MISSING;
+}
+
 /* ── names ─────────────────────────────────────────────────────────────── */
 
 const char *pp_state_name(pp_state_t s)
@@ -57,6 +63,7 @@ const char *pp_reason_name(pp_reason_t r)
     case PP_REASON_BROWNOUT_UNORDERED: return "brownout_unordered";
     case PP_REASON_PROBE:           return "probe";
     case PP_REASON_PROBE_FAILED:    return "probe_failed";
+    case PP_REASON_STATE_MISSING:   return "state_missing";
     case PP_REASON_COUNT:           break;
     }
     return "none";

@@ -50,7 +50,8 @@ register file.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> normal: no persisted state (first install)
+    [*] --> normal: no record AND no epoch (first install: record then epoch written)
+    [*] --> no_flash: epoch but no record (state_missing)
     [*] --> no_flash: persisted state unreadable (state_unreadable, persist_fault)
     normal --> no_flash: brownout boot (first of an episode)
     normal --> no_flash: fresh read with input, system_v below 3.30 V or battery_v in (0, 3.40 V)
@@ -352,7 +353,8 @@ explicit little-endian, not a struct dump. It is written **only** on:
 - `force` and `clear`;
 - once at boot, to put a newer record from RTC memory on record (below);
 - a fence after a relaxation whose write outcome cannot be read back (below);
-- the NVS epoch, once per NVS lifetime (below).
+- the NVS epoch, once per NVS lifetime, and on a first install the first
+  record just before it (below).
 
 Never per charger read, never per heartbeat. **The real bound for the low
 record:** per protected state, 1 (the first low read) + at most 1 an hour of
@@ -426,16 +428,26 @@ The model is now one record, ordered by generation:
     say so (`ok`, with a warning in the log). Anything else (absent, the old
     record, unreadable) is **unknown** and is **fenced**:
     - A newer protective record (the unchanged state; the relaxation's
-      generation is consumed) goes to RTC and NVS, **twice**. A write that
-      failed part-way can leave a stray chunk under the next blob version
-      while this boot's `Storage` still holds the old index. The first fence
-      then lands under that same version, reports `ESP_OK`, and after a
-      re-init the stray relaxed record is what NVS returns (found by the
-      native matrix). The second write toggles the version, and its erase of
-      the previous version removes the strays.
-    - If the second fence write is confirmed (clean, or a positive read), the
-      reply is `persist_failed`: the relaxation **cannot win at any later
-      boot**, after a reset or a power loss.
+      generation is consumed) goes to RTC and NVS until **two clean writes in
+      a row follow the last failure**, at most **4** fence writes.
+      - A write that failed part-way can leave a stray chunk under the next
+        blob version while this boot's `Storage` still holds the old index.
+        The next clean write then lands under that same version, reports
+        `ESP_OK`, and after a re-init the stray record is what NVS returns
+        (round 4, native matrix).
+      - A second clean write toggles the version, and its erase of the
+        previous version removes the strays.
+      - A failed *fence* write is such a part-way write too, so one clean
+        write after it does not cancel it. Round 5's native two-fault repro:
+        the candidate fails at raw write #2, the first fence at #4, one
+        clean fence "confirmed" it, and after a re-init NVS held no record
+        at all.
+      - Only clean writes count here. A positive read says nothing about
+        strays.
+    - If such a run is reached, the reply is `persist_failed`: the relaxation
+      **cannot win at any later boot**, after a reset or a power loss. The
+      native scan of every pair of two transient write faults (a ≤ 16,
+      b ≤ 24, 248 pairs) checks exactly this.
     - If it is not confirmed, the reply is **`persist_unconfirmed`**. The
       fence is then only in RTC: the unit is protected now and after any
       reset without power loss, and that reset's boot puts the fence on NVS.
@@ -457,13 +469,22 @@ The model is now one record, ordered by generation:
   - A deliberate NVS rewrite or wipe (flash_gui provisioning, `clean_nvs`)
     creates a new epoch. That rewrite ends in a USB or watchdog reset, which
     keeps RTC memory, but an RTC record from before it is never adopted.
-  - **The one exception (chosen policy: continuity).** An epoch that exists
-    but cannot be *read* proves no rewrite, so the newest valid RTC record's
-    own epoch is used. An NVS read fault then does not cost the retained
-    protection. The flip side: a rewritten NVS whose new epoch key is
-    unreadable at that boot would adopt a foreign RTC record. That needs a
-    rewrite *and* an unreadable epoch at the same boot, and what it brings
-    back is a protective record.
+  - **An epoch that exists but cannot be *read* is UNVERIFIED** (round 5).
+    The newest valid RTC record's own epoch is borrowed so the record can be
+    considered at all. But that record may belong to another NVS lifetime:
+    round 5 showed a foreign *cleared* record overwriting a current forced
+    hold. So while unverified:
+    - generations are **never compared** across the two;
+    - an RTC record wins **only if strictly more protective** than what NVS
+      gives (protection order `hold` > `no_flash` > `normal`, forced above
+      automatic). With the NVS record unreadable too, it is measured against
+      the fail-closed `no_flash`;
+    - nothing less protective is ever written to NVS from it;
+    - **no automatic relaxation** runs until the epoch reads back, which is
+      retried after every write and before every relaxation.
+
+    A foreign record can therefore only ever raise protection. A retained
+    failure of the same lifetime still wins, because it is more protective.
   - **With no epoch at all** (absent and not creatable), RTC records are
     neither written nor adopted, and **no automatic relaxation happens**. A
     failure after such a relaxation that NVS refused could not survive a
@@ -515,8 +536,15 @@ unaffected.
 
 At boot the blob is either:
 
-- **absent** (`ESP_ERR_NVS_NOT_FOUND` for the namespace or the key: first
-  install, never protected) → `normal`;
+- **absent with no epoch** (`ESP_ERR_NVS_NOT_FOUND`, and no `epoch` key: a
+  first install, or an NVS wiped since) → `normal`. That boot writes the
+  record (generation 1) and *then* the epoch, so from then on **an epoch
+  always means a record was written**. If the record write fails, no epoch
+  is created, and the next boot is a first install again.
+- **absent beside an epoch** (or beside an unreadable one) → the state was
+  **lost**: `no_flash`, reason `state_missing`, `persist_fault: true`
+  (round 5: the root cause behind an interrupted fence booting at full load,
+  closed for any storage path). It exits like an unreadable state;
 - **unreadable** (`nvs_open` or `nvs_get_blob` failed otherwise, or the blob
   fails its version, length, CRC or range checks) → `no_flash`, reason
   `state_unreadable`, not forced, `persist_fault: true`, logged. A corrupted
@@ -524,8 +552,8 @@ At boot the blob is either:
   reset without power loss now restores the real record from the RTC mirror
   instead; this path is the power-loss case). It exits like any automatic state: accumulated evidence, the probe (assuming
   backoff level 2, the longest wait, since the stored level is lost) or
-  `clear`. Nothing is
-  written at boot; the next persisting event (a transition, a brownout record,
+  `clear`. Apart from a first install's record and epoch, nothing is written
+  at boot; the next persisting event (a transition, a brownout record,
   `force`, `clear`) rewrites the blob and clears `persist_fault`.
 
 `persist_fault` is also raised when a write fails at run time (a protective
@@ -781,6 +809,18 @@ run fails unless every reply confirms the requested state. In Actions →
       automatic relaxation happens; a refused fence is reported as
       `persist_unconfirmed`, and its stated limit (a direct power loss) is
       asserted;
+    - (round 5) a missing record beside an epoch (or an unreadable epoch)
+      boots `no_flash` / `state_missing`, no epoch and no record is a first
+      install that writes its record before the epoch; with the epoch
+      unreadable, foreign cleared / probation / `no_flash` RTC records never
+      lower a forced hold in NVS (and nothing is written over it, and no
+      relaxation runs), a more protective foreign record may win, a foreign
+      `normal` never beats the fail-closed `no_flash`, and a retained failure
+      of the same lifetime still survives;
+    - (round 5, native) every pair of two transient raw-write faults across
+      a `clear` and its fence writes (a ≤ 16, b ≤ 24), then a direct power
+      loss: `persist_failed` always means a forced hold on NVS (the reviewer's
+      #2/#4 case included);
     - (round 4, `NativeNvsRelaxationTest`) the production glue on the PINNED
       ESP-IDF NVS on an in-memory partition: an operator `clear` and the
       probe step with a fault at each of the first 16 raw writes and 16 reads.
@@ -801,7 +841,11 @@ run fails unless every reply confirms the requested state. In Actions →
   round-4 regressions build against round-3 head e0d4e2e, where 4 fail, the
   codec reply reads `persist_failed` instead of `persist_unconfirmed`, and
   the native matrix fails at the reviewer's point (write fault 4:
-  REMOVE_FAILED, refused, NORMAL after the next reset).
+  REMOVE_FAILED, refused, NORMAL after the next reset). The round-5
+  regressions build against round-4 head db64678: the native two-fault scan
+  fails at the reviewer's #2/#4 case (persist_failed, then normal with no
+  record after a power loss), `missing_record_fails_closed` and
+  `unverified_epoch_never_relaxes` fail.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.

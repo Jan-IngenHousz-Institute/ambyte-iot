@@ -125,7 +125,9 @@
  * Persistence: the pp_persist_t below, as a versioned, CRC-checked blob. The
  * caller writes it ONLY when an event says persist (state transitions, a
  * recorded brownout — at most one per boot — a probe step, its pass or
- * failure, force and clear); reads and heartbeats never write. An ABSENT blob (first install) starts at normal; an
+ * failure, force and clear); reads and heartbeats never write. An ABSENT blob
+ * with no NVS epoch (first install) starts at normal; absent beside an epoch
+ * the state was lost (pp_load_missing: no_flash, state_missing); an
  * UNREADABLE one (corrupt, or the read itself failed) starts at no_flash,
  * reason state_unreadable, with persist_fault set (pp_load_unreadable): a
  * corrupted forced hold must not come back at full load. The next persisting
@@ -215,6 +217,7 @@ typedef enum {
     PP_REASON_BROWNOUT_UNORDERED, /* "brownout_unordered": a further brownout, order unknown */
     PP_REASON_PROBE,            /* "probe": battery-only probe, one level down on probation */
     PP_REASON_PROBE_FAILED,     /* "probe_failed": a brownout (or fresh low read) on probation */
+    PP_REASON_STATE_MISSING,    /* "state_missing": NVS has an epoch but no record: the state was lost */
     PP_REASON_COUNT
 } pp_reason_t;
 /* "probe_passed" is a log reason only (the probation ended without a failure;
@@ -321,6 +324,20 @@ void pp_core_init(pp_core_t *c);
 /* The persisted state exists but could not be read: no_flash, reason
  * state_unreadable, not forced, empty history, persist_fault set. RAM only. */
 void pp_load_unreadable(pp_core_t *c, pp_clock_t clk);
+
+/* NVS has an epoch (so this module wrote a record into it) but no record:
+ * the protection state was lost (review of PR #113, round 5). Like
+ * unreadable, but reason state_missing. Only no epoch AND no record is a
+ * first install (normal). */
+void pp_load_missing(pp_core_t *c, pp_clock_t clk);
+
+/* Protection order of a record: hold > no_flash > normal, a forced state above
+ * the automatic one of the same level. For comparing records whose
+ * generations cannot be compared (another NVS lifetime). */
+static inline int pp_protection_rank(const pp_persist_t *p)
+{
+    return (int)p->state * 2 + (p->forced ? 1 : 0);
+}
 
 /* Blob codec. encode always writes v2 (PP_BLOB_LEN). decode reads v2 and the
  * v1 blob of the first brownout-protection release (PP_BLOB_V1_LEN, no probe

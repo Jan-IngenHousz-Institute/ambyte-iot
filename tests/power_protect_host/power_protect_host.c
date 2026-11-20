@@ -56,6 +56,11 @@ static int     g_rtc_reset_at;
 #else
 #define HAVE_EPOCH_R4 0
 #endif
+#ifdef PP_FENCE_RUN
+#define HAVE_R5 1
+#else
+#define HAVE_R5 0
+#endif
 /* And the generation-ordered record of review round 2 (s_rtc mirror). */
 #ifdef PP_RTC_MAGIC
 #define HAVE_GEN 1
@@ -107,6 +112,7 @@ void host_log(char level, const char *tag, const char *fmt, ...)
 void native_format(void);
 void native_reinit(void);
 void native_fault(int write_at, int read_at);
+void native_fault2(int write_a, int write_b);
 int  native_open(int readwrite);
 int  native_get_blob(void *out, size_t *len);
 int  native_set_blob(const void *src, size_t len);
@@ -144,6 +150,7 @@ static uint32_t g_epoch;
 static int      g_epoch_writes;
 static bool     g_fail_epoch_writes;   /* epoch writes refused, state writes not */
 static bool     g_epoch_lands_error;   /* the epoch write lands, then reports an error */
+static esp_err_t g_epoch_get_err = ESP_OK;   /* only the epoch read fails */
 /* Every pp_encode from the glue passes through here (-Wl,--wrap=pp_encode):
  * g_encode_reset_n > 0 resets the unit AT the n-th call from now. */
 static int g_encode_reset_n;
@@ -169,6 +176,7 @@ esp_err_t nvs_get_u32(nvs_handle_t h, const char *key, uint32_t *out)
     CHECK(strcmp(key, "epoch") == 0, "key %s", key);
     NATIVE(native_get_u32(out));
     if (g_get_err != ESP_OK) return g_get_err;
+    if (g_epoch_get_err != ESP_OK) return g_epoch_get_err;
     if (g_epoch == 0) return ESP_ERR_NVS_NOT_FOUND;
     *out = g_epoch;
     return ESP_OK;
@@ -236,6 +244,13 @@ void nvs_close(nvs_handle_t h) { (void)h; }
 /* ── helpers ───────────────────────────────────────────────────────────── */
 
 static power_gate_t g_gate;
+
+/* A new (or wiped) device: no record, no epoch. */
+static void fresh_nvs(void)
+{
+    g_blob_len = 0;
+    g_epoch = 0;
+}
 
 /* A boot: RAM (statics) gone, NVS kept. valid=false models clock.source hwm. */
 static void reboot(esp_reset_reason_t rr, uint32_t boot, bool clock_valid)
@@ -326,15 +341,22 @@ static pp_state_t st(void) { return power_protect_state(); }
 static void fresh_boot_no_writes(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0 && g_elines == 0, "w=%d e=%d", g_writes, g_elines);
+    /* A first install writes its record (gen 1) and then the epoch, once:
+     * from then on an epoch without a record means the state was lost. */
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1 && g_epoch_writes == 1 && g_elines == 0, "w=%d e=%d",
+          g_writes, g_elines);
     CHECK(!power_protect_blocks_flash() && !power_protect_blocks_ambit(), "probes");
+    reboot(ESP_RST_SW, 2, true);
+    reboot(ESP_RST_POWERON, 3, true);
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1 && g_epoch_writes == 1, "nothing more at later boots (w=%d)",
+          g_writes);
 }
 
 static void brownout_enters_no_flash(void)
 {
     reboot(ESP_RST_BROWNOUT, 2, true);
     CHECK(st() == PP_STATE_NO_FLASH, "state %d", st());
-    CHECK(g_writes == 1 && g_elines == 1, "w=%d e=%d", g_writes, g_elines);
+    CHECK(g_writes == 2 && g_elines == 1, "w=%d e=%d (first record + brownout)", g_writes, g_elines);
     CHECK(strcmp(g_last_e, "power_protect: normal -> no_flash reason=brownout") == 0, "%s", g_last_e);
     CHECK(power_protect_blocks_flash() && !power_protect_blocks_ambit(), "probes");
     power_protect_status_t s;
@@ -355,7 +377,8 @@ static void uluru_valid_clock(void)
     advance_s(5 * 60);
     reboot(ESP_RST_BROWNOUT, 4, true);
     CHECK(st() == PP_STATE_HOLD, "boot 4 stays");
-    CHECK(g_writes == 3 && g_elines == 2, "w=%d e=%d (history write on boot 4, no transition)", g_writes, g_elines);
+    CHECK(g_writes == 4 && g_elines == 2, "w=%d e=%d (first record; history write on boot 4, no transition)",
+          g_writes, g_elines);
     power_protect_status_t s;
     power_protect_get_status(&s);
     CHECK(s.brownouts_6h == 3, "brownouts_6h %u", (unsigned)s.brownouts_6h);
@@ -380,7 +403,7 @@ static void invalid_clock_not_consecutive(void)
     reboot(ESP_RST_SW, 3, false);
     reboot(ESP_RST_BROWNOUT, 4, false);
     CHECK(st() == PP_STATE_NO_FLASH, "a boot between: no link without a clock");
-    CHECK(g_elines == 1 && g_writes == 2, "e=%d w=%d", g_elines, g_writes);
+    CHECK(g_elines == 1 && g_writes == 3, "e=%d w=%d (first record + 2 brownouts)", g_elines, g_writes);
     power_protect_status_t s;
     power_protect_get_status(&s);
     CHECK(s.brownouts_6h == 1, "only boot 4 is in this boot's chain: %u", (unsigned)s.brownouts_6h);
@@ -445,7 +468,7 @@ static void window_restarts(void)
 {
     for (int k = 0; k < 8; k++) {
         g_writes = 0;
-        g_blob_len = 0;
+        fresh_nvs();
         reboot(ESP_RST_BROWNOUT, 2, true);
         good_reads(READS_30MIN - 10, 4100, 3900);           /* 29:05 collected */
         bool resets = false;
@@ -475,7 +498,7 @@ static void window_restarts(void)
     }
     /* A frozen frame: identical ADC values stop being fresh after the
      * power_policy freshness window. Stale is not evidence: it pauses. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 2, true);
     good_reads(200, 4100, 3900);
     for (int i = 0; i < 20; i++) read5(POWER_READ_OK, 4100, 3900, true, false);
@@ -488,8 +511,8 @@ static void battery_zero_with_input(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
     good_reads(50, 4100, 0);
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "battery_v 0 with a healthy rail never triggers");
-    g_blob_len = 0;
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1, "battery_v 0 with a healthy rail never triggers");
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 2, true);
     good_reads(READS_30MIN + 2, 4100, 0);
     CHECK(st() == PP_STATE_NORMAL, "battery 0 with a rail above the battery threshold qualifies the exit");
@@ -508,7 +531,7 @@ static void idle_battery_zero(void)
     CHECK(st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED, "3.75 V does");
     /* And it is a reset, not a pause: 25 min at 3.75 V, one idle 3.65 V read,
      * 25 min more is not enough. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, true);
     good_reads(300, 3750, 0);
     good_reads(1, 3650, 0);
@@ -523,13 +546,13 @@ static void idle_rail_entry_unchanged(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
     good_reads(60, 3350, 0);
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "a 3.35 V idle rail with battery_v 0 must not enter");
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1, "a 3.35 V idle rail with battery_v 0 must not enter");
     good_reads(3, 3250, 0);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_LOW_VOLTAGE, "a rail below 3.30 V enters");
 #if HAVE_RECOVERY
     /* The normal probation is failed by the same entry rule: a 3.35 V idle
      * rail does not fail it. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 2, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
@@ -559,7 +582,7 @@ static void intermittent_solar_recovers(void)
     CHECK(strcmp(g_last_e, "power_protect: no_flash -> normal reason=power_recovered") == 0, "%s", g_last_e);
 
     /* Start-stop charging: 80-s spells, 60 s collapsed between them. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, true);
     for (int spell = 0; spell < 30; spell++) {
         if (spell == 20) CHECK(st() == PP_STATE_NO_FLASH, "20 spells (< 25 min) are not enough");
@@ -605,7 +628,7 @@ static void old_evidence_expires(void)
     good_reads(125, 4100, 3900);                           /* +10 min, 10.5 h later */
     CHECK(st() == PP_STATE_NORMAL, "control: evidence 10.5 h apart adds up");
 
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, true);
 #if HAVE_RECOVERY
     /* Once the old evidence has expired, the first read from a live charger
@@ -752,7 +775,7 @@ static void hold_steps_down_first(void)
 #if HAVE_RECOVERY
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL && s_core.p.reason == PP_REASON_PROBE, "normal on probation");
     /* The no_flash probation can fail on a fresh low read: back to hold. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 10, true);
     reboot(ESP_RST_BROWNOUT, 11, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
@@ -763,7 +786,7 @@ static void hold_steps_down_first(void)
     CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probe_fails == 1,
           "a low read fails the no_flash probation");
     /* And the normal probation: back to no_flash. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 20, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
@@ -849,7 +872,7 @@ static void probe_uptime_without_clock(void)
     CHECK(s_core.p.probation == PP_PROBATION_NONE, "24 h of uptime: passed");
     /* A probation that fails on a low read: the next quiet period counts from
      * the failure, not from boot. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 10, false);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
@@ -987,7 +1010,7 @@ static void probe_step_commit_fault(void)
     reboot(ESP_RST_SW, 21, true);
     CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "on record");
     /* Within one boot: NVS comes back during the hold, the retry commits. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 30, true);
     g_fail_writes = true;
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
@@ -1007,7 +1030,7 @@ static void failure_commit_fault(void)
     static const esp_reset_reason_t after[] = { ESP_RST_SW, ESP_RST_TASK_WDT, ESP_RST_BROWNOUT, ESP_RST_POWERON,
                                                 ESP_RST_PWR_GLITCH };
     for (unsigned k = 0; k < sizeof after / sizeof after[0]; k++) {
-        g_blob_len = 0;
+        fresh_nvs();
         g_fail_writes = false;
         reboot(ESP_RST_BROWNOUT, 2, true);
         quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
@@ -1028,7 +1051,7 @@ static void failure_commit_fault(void)
     }
     /* No unwritten state: a reset without power loss keeps the probation
      * (the nightly reboot must not fail it); a power-on fails it. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 10, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     reboot(ESP_RST_INT_WDT, 11, true);
@@ -1038,7 +1061,7 @@ static void failure_commit_fault(void)
           s_core.p.hist_n == 1, "power-on on probation: failed (no brownout recorded)");
     CHECK(strcmp(g_last_e, "power_protect: normal -> hold reason=probe_failed") == 0, "%s", g_last_e);
     /* Garbage in RTC memory after a power-on never decodes. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_POWERON, 20, true);
     CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "garbage is not a state");
 }
@@ -1058,7 +1081,7 @@ static void relaxation_commit_fault(void)
     CHECK(st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED && !s_core.persist_fault,
           "exit committed after the hold");
     /* The probation pass. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
@@ -1078,7 +1101,7 @@ static void low_veto_survives_reboot(void)
 {
     for (int k = 0; k < 4; k++) {
         const bool hold = k & 1, clock = k < 2;
-        g_blob_len = 0;
+        fresh_nvs();
         reboot(ESP_RST_BROWNOUT, 2, clock);
         if (hold) {
             advance_s(600);
@@ -1112,7 +1135,7 @@ static void low_writes_bounded(void)
     CHECK(st() == PP_STATE_NO_FLASH, "low all along");
     CHECK(g_writes - w >= 10 && g_writes - w <= 11, "one write an hour: %d", g_writes - w);
     /* Without a valid clock: one write (undated), then none until it can be dated. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, false);
     const int w2 = g_writes;
     for (int i = 0; i < 2 * 720; i++) read5(POWER_READ_OK, 4100, 3500, true, true);
@@ -1135,7 +1158,7 @@ static void rtc_repeated_resets(void)
     for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
         for (int clk = 0; clk < 2; clk++) {
             for (int counter = 0; counter < 2; counter++) {
-                g_blob_len = 0;
+                fresh_nvs();
                 g_fail_writes = false;
                 reboot(ESP_RST_BROWNOUT, counter ? 2 : 0, clk);
                 quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
@@ -1185,7 +1208,7 @@ static void reset_at_commit_boundary(void)
     CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "and keeps winning");
 
     /* Protective update, reset BEFORE NVS stores it: the RTC copy is newer. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 10, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "normal probation");
@@ -1196,7 +1219,7 @@ static void reset_at_commit_boundary(void)
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "RTC copy ahead of NVS wins (state %d)", st());
 
     /* Relaxation, reset BEFORE NVS stores it: never happened. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 20, true);
     g_reset_at = 1;
     if (setjmp(g_reset_jump) == 0) quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);   /* the probe step */
@@ -1248,7 +1271,7 @@ static void low_clock_trust_change(void)
     quiet_reads(POWER_READ_NO_INPUT, 240);
     CHECK(st() == PP_STATE_NORMAL, "then the probe");
     /* The suspect-RTC path is the same: a low read while suspect undates it. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 10, true);
     good_reads(3, 4100, 3500);
     g_suspect = true;
@@ -1274,8 +1297,10 @@ static void operator_relaxation_needs_record(void)
     reboot(ESP_RST_SW, 4, true);
     CHECK(st() == PP_STATE_HOLD, "and nothing comes back after a reset");
     /* force up with NVS refusing: applied, survives a reset, not a power loss */
-    g_blob_len = 0;
-    reboot(ESP_RST_POWERON, 5, true);
+    g_fail_writes = false;
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 5, true);              /* a first install: record + epoch */
+    g_fail_writes = true;
     CHECK(power_protect_force(PP_STATE_HOLD) != ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced, "forced up");
     reboot(ESP_RST_SW, 6, true);
     CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "kept across a reset");
@@ -1294,7 +1319,7 @@ static void operator_relaxation_needs_record(void)
  * and its NVS sync fails too. */
 static void rtc_only_failure(uint32_t boot)
 {
-    g_blob_len = 0;
+    fresh_nvs();
     g_fail_writes = false;
     reboot(ESP_RST_BROWNOUT, boot, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
@@ -1365,7 +1390,7 @@ static void relaxation_write_then_error(void)
     reboot(ESP_RST_SW, 3, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.forced, "on record");
     /* automatic: the probe step */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 4, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
     g_write_then_fail = 1;
@@ -1377,7 +1402,7 @@ static void relaxation_write_then_error(void)
     CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "and is on record");
     /* The re-read fails: cannot tell, so fence. The clear is refused and can
      * never win at a later boot, after a reset or a power loss. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_POWERON, 6, true);
     CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
     g_write_then_fail = 1;
@@ -1399,7 +1424,7 @@ static void rtc_bound_to_nvs_epoch(void)
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "control: same NVS, adopted");
     /* flash_gui / clean_nvs rewrites NVS, then a USB / watchdog reset */
     g_fail_writes = false;
-    g_blob_len = 0;
+    fresh_nvs();
     g_epoch = 0;
     reboot(ESP_RST_SW, 4, true);
     CHECK(st() == PP_STATE_NORMAL && s_core.p.hist_n == 0 && g_epoch != 0,
@@ -1420,7 +1445,7 @@ static void rtc_bound_to_nvs_epoch(void)
 static void relaxation_reread_inconclusive(void)
 {
     for (int mode = 1; mode <= 2; mode++) {
-        g_blob_len = 0;
+        fresh_nvs();
         reboot(ESP_RST_POWERON, 1, true);
         CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "mode %d: durable forced hold", mode);
         g_write_then_fail = 1;
@@ -1433,7 +1458,7 @@ static void relaxation_reread_inconclusive(void)
         reboot(ESP_RST_POWERON, 3, true);
         CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "mode %d: and across a power loss (state %d)", mode, st());
         /* the automatic probe step */
-        g_blob_len = 0;
+        fresh_nvs();
         reboot(ESP_RST_BROWNOUT, 4, true);
         quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
         g_write_then_fail = 1;
@@ -1473,7 +1498,7 @@ static void epoch_missing_first_boot(void)
           "the failure survives a software reset (state %d fails %u)", st(), (unsigned)s_core.p.probe_fails);
     g_fail_writes = false;
     /* An epoch write that lands but reports an error is read back. */
-    g_blob_len = 0;
+    fresh_nvs();
     g_epoch = 0;
     g_epoch_lands_error = true;
     reboot(ESP_RST_BROWNOUT, 10, true);
@@ -1504,7 +1529,7 @@ static void no_epoch_no_relaxation(void)
     CHECK(g_epoch != 0 && st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED,
           "once the epoch exists, the exit commits (state %d)", st());
     /* and the probe likewise */
-    g_blob_len = 0;
+    fresh_nvs();
     g_epoch = 0;
     g_fail_epoch_writes = true;
     reboot(ESP_RST_BROWNOUT, 3, true);
@@ -1633,7 +1658,7 @@ static void fence_unconfirmed(void)
     g_refuse_after_landed = false;
     /* Once NVS takes writes again, a reset in between puts the fence on NVS
      * (the boot sync of the adopted RTC record) and the limit is closed. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_POWERON, 4, true);
     CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
     g_write_then_fail = 1;
@@ -1664,6 +1689,186 @@ static void cmd_persist_unconfirmed(void)
 }
 #endif
 
+#ifdef PP_NATIVE_NVS
+/* Round 5: TWO transient raw-write faults across the relaxation and its fence
+ * writes (the reviewer's #2/#4 case: candidate fails, first fence fails,
+ * second fence clean -> was "confirmed", and after a re-init NVS held NO
+ * record -> normal). Every pair a in 1..16, b in a+1..24, then a direct power
+ * loss: a clear reported refused must never come back at full load, and
+ * persist_failed must mean the forced hold is what NVS holds. */
+static void native_two_fault_scan(void)
+{
+    int n_ok = 0, n_failed = 0, n_unconfirmed = 0, n_full_load = 0;
+    for (int a = 1; a <= 16; a++) {
+        for (int b = a + 1; b <= 24; b++) {
+            native_format();
+            reboot(ESP_RST_POWERON, 1, true);
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+            native_fault2(a, b);
+            const esp_err_t err = power_protect_clear();
+            native_fault(0, 0);
+            reboot(ESP_RST_POWERON, 2, true);
+            const pp_state_t after = st();
+            const bool forced = s_core.p.forced;
+            if (a == 2 && b == 4) {
+                printf("NATIVE2 reviewer_case a=2 b=4 result=%#x after_power_loss=%s forced=%d reason=%s\n",
+                       (unsigned)err, pp_state_name(after), forced, pp_reason_name((pp_reason_t)s_core.p.reason));
+            }
+            if (err == ESP_OK) {
+                n_ok++;
+                CHECK(after == PP_STATE_NORMAL, "a=%d b=%d: an applied clear stands", a, b);
+            } else if (err == POWER_PROTECT_ERR_UNCONFIRMED) {
+                n_unconfirmed++;
+                if (after == PP_STATE_NORMAL) n_full_load++;   /* the documented limit */
+            } else {
+                n_failed++;
+                CHECK(after == PP_STATE_HOLD && forced,
+                      "a=%d b=%d: persist_failed must mean the fence is on NVS (after %d forced %d reason %d)", a, b,
+                      after, forced, s_core.p.reason);
+            }
+        }
+    }
+    printf("NATIVE2_SUMMARY pairs=%d ok=%d failed=%d unconfirmed=%d unconfirmed_full_load=%d\n",
+           n_ok + n_failed + n_unconfirmed, n_ok, n_failed, n_unconfirmed, n_full_load);
+}
+#endif
+
+/* ── scenarios: round 5 (missing record, unverified epoch) ──────────────── */
+
+#if HAVE_RECOVERY
+/* [P1b] An epoch says this module wrote a record into this NVS: a missing
+ * record then means the state was LOST, never "first install". */
+static void missing_record_fails_closed(void)
+{
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(st() == PP_STATE_NORMAL && g_epoch != 0 && g_blob_len == PP_BLOB_LEN, "first install: record + epoch");
+    g_blob_len = 0;                                      /* the record is gone, the epoch is not */
+    reboot(ESP_RST_POWERON, 2, true);
+#if HAVE_R5
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_MISSING && s_core.persist_fault,
+          "epoch + no record: no_flash, state_missing (state %d)", st());
+#else
+    CHECK(st() == PP_STATE_NO_FLASH, "epoch + no record: no_flash (state %d)", st());
+#endif
+    /* an unreadable epoch beside a missing record: also not a first install */
+    g_blob_len = 0;
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_POWERON, 3, true);
+    g_epoch_get_err = ESP_OK;
+    CHECK(st() == PP_STATE_NO_FLASH, "unreadable epoch + no record: no_flash (state %d)", st());
+    /* no epoch and no record: a first install (or a wiped NVS), normal */
+    fresh_nvs();
+    reboot(ESP_RST_POWERON, 4, true);
+    CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "no epoch + no record: normal");
+    /* a first install whose record write fails creates no epoch: next boot is
+     * a first install again, not a lost state */
+    fresh_nvs();
+    g_fail_writes = true;
+    reboot(ESP_RST_POWERON, 5, true);
+    CHECK(g_epoch == 0, "no epoch without a record");
+    g_fail_writes = false;
+    reboot(ESP_RST_POWERON, 6, true);
+    CHECK(st() == PP_STATE_NORMAL && g_epoch != 0, "then a clean first install");
+    /* an upgrade from the first release: a v1 record, no epoch: epoch created */
+}
+
+/* Put a record into NVS as another lifetime wrote it. */
+static void nvs_put(const pp_persist_t *p)
+{
+    CHECK(pp_encode(p, g_blob, sizeof g_blob) == PP_BLOB_LEN, "encode");
+    g_blob_len = PP_BLOB_LEN;
+}
+
+/* [P2] With the epoch unreadable, an RTC record of ANOTHER NVS lifetime never
+ * lowers or wipes the protection NVS holds; it wins only if strictly more
+ * protective, and with NVS unreadable too, against a fail-closed no_flash. */
+static void unverified_epoch_never_relaxes(void)
+{
+    for (int kind = 0; kind < 4; kind++) {
+        /* the old lifetime leaves a record in RTC memory */
+        fresh_nvs();
+        reboot(ESP_RST_POWERON, 1, true);
+        switch (kind) {
+        case 0:                                          /* cleared */
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && power_protect_clear() == ESP_OK, "cleared");
+            break;
+        case 1:                                          /* normal on probation */
+            reboot(ESP_RST_BROWNOUT, 2, true);
+            quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+            CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probation");
+            break;
+        case 2:                                          /* automatic no_flash */
+            reboot(ESP_RST_BROWNOUT, 2, true);
+            break;
+        case 3:                                          /* forced hold: MORE protective */
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "forced hold");
+            break;
+        }
+        const pp_state_t old_state = st();
+        /* flash_gui rewrites NVS: a new lifetime with a protective record
+         * (kinds 0-2: forced hold; kind 3: a plain normal) */
+        pp_persist_t cur;
+        memset(&cur, 0, sizeof cur);
+        cur.gen = 1;
+        if (kind < 3) { cur.state = PP_STATE_HOLD; cur.reason = PP_REASON_FORCED; cur.forced = true; }
+        nvs_put(&cur);
+        g_epoch = 0x5EED0001u;
+        g_epoch_get_err = ESP_FAIL;                      /* only the epoch read fails */
+        const int w = g_writes;
+        reboot(ESP_RST_SW, 3, true);
+        if (kind < 3) {
+            CHECK(st() == PP_STATE_HOLD && s_core.p.forced,
+                  "kind %d: a foreign %s record never lowers NVS's forced hold (state %d)", kind,
+                  pp_state_name(old_state), st());
+            pp_persist_t back;
+            CHECK(pp_decode(&back, g_blob, g_blob_len) && back.state == PP_STATE_HOLD && back.forced && g_writes == w,
+                  "kind %d: and nothing is written over it", kind);
+            /* no automatic relaxation while the epoch is unverified */
+            quiet_reads(POWER_READ_NO_INPUT, 12 * H);
+            CHECK(st() == PP_STATE_HOLD, "kind %d: still hold", kind);
+        } else {
+            CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "a MORE protective foreign record may win (state %d)", st());
+        }
+        g_epoch_get_err = ESP_OK;
+    }
+    /* NVS unreadable as well: a foreign normal falls back to no_flash, a
+     * foreign hold wins. */
+    for (int hold = 0; hold < 2; hold++) {
+        fresh_nvs();
+        reboot(ESP_RST_POWERON, 1, true);
+        if (hold) {
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "forced hold");
+        } else {
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && power_protect_clear() == ESP_OK, "cleared");
+        }
+        g_blob[9] ^= 0x55;                               /* the record unreadable */
+        g_epoch = 0x5EED0002u;
+        g_epoch_get_err = ESP_FAIL;
+        reboot(ESP_RST_SW, 2, true);
+        g_epoch_get_err = ESP_OK;
+        if (hold) {
+            CHECK(st() == PP_STATE_HOLD, "a foreign hold beats the fail-closed no_flash");
+        } else {
+            CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE,
+                  "a foreign normal never beats the fail-closed no_flash (state %d)", st());
+        }
+    }
+    /* the SAME lifetime with an unreadable epoch still keeps a retained
+     * failure (more protective than NVS's probation) across a reset */
+    fresh_nvs();
+    reboot(ESP_RST_BROWNOUT, 1, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    g_fail_writes = true;
+    good_reads(3, 3250, 3900);                           /* the probation fails, NVS refuses */
+    g_fail_writes = false;
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_SW, 2, true);
+    g_epoch_get_err = ESP_OK;
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "retained failure kept (state %d)", st());
+}
+#endif
+
 static void low_voltage_trigger(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
@@ -1673,20 +1878,20 @@ static void low_voltage_trigger(void)
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_LOW_VOLTAGE, "rail < 3.30 V");
     CHECK(strcmp(g_last_e, "power_protect: normal -> no_flash reason=low_voltage") == 0, "%s", g_last_e);
 
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_POWERON, 5, true);
     good_reads(3, 4100, 3350);
     CHECK(st() == PP_STATE_NO_FLASH, "0 < battery < 3.40 V");
 
     /* Never on stale, invalid, no_input or input-absent reads. */
-    g_blob_len = 0;
+    fresh_nvs();
     g_writes = 0;
     reboot(ESP_RST_POWERON, 6, true);
     for (int i = 0; i < 30; i++) read5(POWER_READ_OK, 3000, 3000, true, false);   /* frozen */
     read5(POWER_READ_NO_INPUT, 0, 0, false, true);
     read5(POWER_READ_IMPLAUSIBLE, 0, 0, false, true);
     for (int i = 0; i < 5; i++) read5(POWER_READ_OK, 3000, 3000, false, true);    /* on battery */
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "no trigger without fresh present evidence");
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1, "no trigger without fresh present evidence (first record only)");
 }
 
 static void hold_never_exits_on_battery(void)
@@ -1824,7 +2029,7 @@ static void persistence_roundtrip(void)
     CHECK(!pp_decode(&q, b2, sizeof b2), "version");
 
     /* Through the glue: what a brownout boot wrote is what the next boot reads. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 2, true);
     reboot(ESP_RST_BROWNOUT, 3, true);
     const pp_persist_t before = s_core.p;
@@ -1913,7 +2118,7 @@ static void read_failures_are_protected(void)
     reboot(ESP_RST_POWERON, 6, true);
     CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "absent namespace");
     g_open_err = ESP_OK;
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_POWERON, 7, true);
     CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "absent key");
     /* A failed write raises the flag; the next good one clears it. */
@@ -1937,7 +2142,7 @@ static void unknown_boot_counter(void)
     CHECK(s.brownouts_6h == 2, "unknown-age entries count: %u", (unsigned)s.brownouts_6h);
     /* Counter recovered (0 then nonzero), and lost (nonzero then 0). */
     for (int k = 0; k < 2; k++) {
-        g_blob_len = 0;
+        fresh_nvs();
         reboot(ESP_RST_BROWNOUT, k == 0 ? 0 : 7, false);
         CHECK(st() == PP_STATE_NO_FLASH, "k=%d first", k);
         reboot(ESP_RST_BROWNOUT, k == 0 ? 5 : 0, false);
@@ -1946,7 +2151,7 @@ static void unknown_boot_counter(void)
         CHECK(s.brownouts_6h == 2, "k=%d count %u", k, (unsigned)s.brownouts_6h);
     }
     /* A valid clock still orders brownouts with a counter of 0: UTC decides. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 0, true);
     advance_s(7 * 3600);
     reboot(ESP_RST_BROWNOUT, 0, true);
@@ -2025,12 +2230,12 @@ static void render_json(void)
     printf("WORST %d %s\n", n, json);
     CHECK(pp_render_json(json, 40, &p, false, 0, NULL, NULL) == -1 && json[0] == '\0', "no partial object");
     /* A unit on probation, through the glue. */
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 3, true);
     quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
     CHECK(power_protect_render_json(json, sizeof json) > 0, "render");
     printf("JSON_PROBATION %s\n", json);
-    g_blob_len = 0;
+    fresh_nvs();
     reboot(ESP_RST_BROWNOUT, 4, true);
     good_reads(61, 4100, 3900);
     quiet_reads(POWER_READ_NO_INPUT, H);
@@ -2119,7 +2324,7 @@ static void cmd_refusals(void)
         cmd(bad[i], false);
         CHECK(g_job == NULL, "case %zu must not queue", i);
     }
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "nothing changed");
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 1, "nothing changed (first record only)");
     /* busy: one op at a time; queue_unavailable: the worker refused it. */
     cmd("{\"type\":\"power_protect\",\"id\":\"b1\",\"action\":\"status\"}", false);
     cmd("{\"type\":\"power_protect\",\"id\":\"b2\",\"action\":\"status\"}", false);
@@ -2221,10 +2426,13 @@ static const scenario_t k_scenarios[] = {
     {"epoch_missing_first_boot", epoch_missing_first_boot},
     {"no_epoch_no_relaxation", no_epoch_no_relaxation},
     {"fence_unconfirmed", fence_unconfirmed},
+    {"missing_record_fails_closed", missing_record_fails_closed},
+    {"unverified_epoch_never_relaxes", unverified_epoch_never_relaxes},
     {"cmd_persist_unconfirmed", cmd_persist_unconfirmed},
 #endif
 #ifdef PP_NATIVE_NVS
     {"native_relaxation_matrix", native_relaxation_matrix},
+    {"native_two_fault_scan", native_two_fault_scan},
 #endif
     {"low_writes_bounded", low_writes_bounded},
     {"low_voltage_trigger", low_voltage_trigger},

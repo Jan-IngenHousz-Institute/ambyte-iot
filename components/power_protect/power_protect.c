@@ -8,8 +8,9 @@
  * failed probe included; a passed probation; a recorded brownout, at most one
  * per boot; a protected unit's fresh low read, first / dating / at most
  * hourly), on force and clear, once at boot to put an adopted RTC record on
- * record, as a fence after an unreadable relaxation outcome, and (key "epoch")
- * once per NVS lifetime. Never per read, never per heartbeat: a flash write
+ * record, as a fence after an unproven relaxation outcome (until two clean
+ * writes follow the last failure, at most four), and on a first install the
+ * first record and then (key "epoch") the epoch, once per NVS lifetime. Never per read, never per heartbeat: a flash write
  * per 5 s charger read would wear the NVS sector for nothing. RTC_NOINIT is not
  * enough on its own: a brownout is a power-on-class reset, exactly the reset
  * this module exists for, and it clears RTC memory.
@@ -59,6 +60,10 @@
 #define PP_NVS_KEY "state"
 #define PP_NVS_EPOCH "epoch"
 /* Host tests inject resets inside the RTC write (tests/power_protect_host). */
+/* The fence (commit_relaxation): PP_FENCE_RUN clean writes after the last
+ * failure, at most PP_FENCE_WRITES writes in all. */
+#define PP_FENCE_RUN    2
+#define PP_FENCE_WRITES 4
 #ifndef PP_TEST_POINT
 #define PP_TEST_POINT(n) ((void)0)
 #endif
@@ -96,6 +101,11 @@ typedef struct {
 } pp_rtc_slot_t;
 static RTC_NOINIT_ATTR pp_rtc_slot_t s_rtc[2];
 static uint32_t s_epoch;
+/* s_epoch was READ from NVS (or created and read back) this boot. False when
+ * it was borrowed from an RTC record because the key was unreadable: then RTC
+ * generations cannot be compared with NVS ones (another lifetime may have
+ * written either), and no automatic relaxation runs (round 5). */
+static bool     s_epoch_verified;
 
 static bool rtc_slot(int i, pp_persist_t *out)
 {
@@ -248,36 +258,29 @@ static uint32_t epoch_create(void)
     return epoch_read(&back) == 1 ? back : 0;
 }
 
-/* The NVS epoch at boot (see s_rtc). */
-static uint32_t epoch_load(bool power_lost)
-{
-    uint32_t e = 0;
-    const int r = epoch_read(&e);
-    if (r == 1) return e;
-    /* Present but unreadable: not a rewrite. Keep the RTC record's own. */
-    if (r < 0) return power_lost ? 0 : rtc_any_epoch();
-    return epoch_create();   /* absent: a new NVS, or one rewritten / wiped since */
-}
-
 static void rtc_store(const pp_persist_t *p);
 
-/* Under s_mtx. Without an epoch the RTC mirror is off, so nothing survives a
- * reset that NVS refused (round 4: a first boot that could not create the
- * epoch, then a probe that NVS took and a failure it refused, came back at
- * full load after a software reset). So: try again whenever NVS has just
- * taken a write and before every automatic relaxation; once it exists, arm
- * the mirror with the current record. */
+/* Under s_mtx. A missing or unverified epoch leaves the RTC mirror without a
+ * reset-safe identity: a failure NVS refused could not be told apart from a
+ * foreign record at the next boot (rounds 4-5: a first boot that could not
+ * create the epoch, then a probe that NVS took and a failure it refused, came
+ * back at full load after a software reset). So: read it again whenever NVS
+ * has just taken a write and before every automatic relaxation; create it
+ * when absent (a record exists by then); once verified, re-arm the mirror
+ * under it. True = verified. */
 static bool epoch_ensure(void)
 {
-    if (s_epoch != 0) return true;
+    if (s_epoch_verified) return true;
     uint32_t e = 0;
     const int r = epoch_read(&e);
-    s_epoch = r == 1 ? e : r == 0 ? epoch_create() : 0;
-    if (s_epoch != 0) {
-        ESP_LOGW(TAG, "NVS epoch established: RTC mirror armed");
+    if (r == 0) e = epoch_create();
+    if ((r == 1 || r == 0) && e != 0) {
+        s_epoch = e;
+        s_epoch_verified = true;
+        ESP_LOGW(TAG, "NVS epoch verified: RTC mirror armed");
         rtc_store(&s_core.p);
     }
-    return s_epoch != 0;
+    return s_epoch_verified;
 }
 
 /* Under s_mtx. One ESP_LOGE per state transition: v2.18.0's diag hook turns
@@ -384,21 +387,25 @@ static esp_err_t commit_relaxation(const pp_event_t *ev, int64_t now_ms, bool au
      * have landed at EVERY later boot; a fence only in RTC covers resets
      * without power loss, and after a power loss the landed relaxation can
      * win (POWER_PROTECT_ERR_UNCONFIRMED; documented limit). */
-    s_core.p.gen = s_cand.p.gen + 1;
-    rtc_store(&s_core.p);
-    esp_err_t fence_err;
-    bool fenced = persist_confirmed(&s_core.p, &fence_err);
-    /* ...twice. The native IDF matrix (tests/power_protect_host/nvs_native)
-     * found a write that failed part-way leaving a stray chunk under the NEXT
-     * blob version, while this boot's Storage still holds the old index: the
-     * first fence is then written under that same version, reports ESP_OK,
-     * and after a re-init the stray RELAXED record is what NVS returns. A
-     * second write toggles the version, and its eraseMultiPageBlob of the
-     * previous version removes the stray chunks with the first fence. Only
-     * the second write's outcome confirms anything. */
-    s_core.p.gen++;
-    rtc_store(&s_core.p);
-    fenced = persist_confirmed(&s_core.p, &fence_err);
+    /* Written until a RUN of PP_FENCE_RUN clean writes follows the LAST
+     * failure, at most PP_FENCE_WRITES writes. The native IDF matrix found a
+     * write that failed part-way leaving a stray chunk under the next blob
+     * version while this boot's Storage still holds the old index: the next
+     * clean write lands under that same version and after a re-init the stray
+     * RELAXED record is what NVS returns (round 4). A second clean write
+     * toggles the version and its eraseMultiPageBlob of the previous version
+     * removes the strays. And a failed fence write is just such a part-way
+     * write again: a clean write after a failed FENCE does not cancel it
+     * (round 5, native two-fault repro: faults on raw writes #2 and #4 ->
+     * "confirmed" after one clean fence, NO record after a re-init). Only a
+     * clean write counts: a positive read proves nothing about strays. */
+    int run = 0;
+    for (int n = 0; n < PP_FENCE_WRITES && run < PP_FENCE_RUN; n++) {
+        s_core.p.gen = (n == 0 ? s_cand.p.gen : s_core.p.gen) + 1;
+        rtc_store(&s_core.p);
+        run = persist(&s_core.p) == ESP_OK ? run + 1 : 0;
+    }
+    const bool fenced = run >= PP_FENCE_RUN;
     s_core.persist_fault = !fenced;
     if (automatic) s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
     ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s, %s%s", pp_state_name(ev->from),
@@ -439,31 +446,76 @@ void power_protect_boot(void)
     const esp_reset_reason_t rr = esp_reset_reason();
     const bool brownout = rr == ESP_RST_BROWNOUT;
     const bool power_lost = brownout || rr == ESP_RST_POWERON || rr == ESP_RST_PWR_GLITCH;
-    s_epoch = epoch_load(power_lost);
-    /* The newer record by generation wins. The RTC mirror only counts after
-     * a reset without power loss (after one it is gone or garbage), only for
-     * this NVS epoch, and only when NVS holds no record as new: it is then
-     * ahead by protective updates NVS refused. It is not consumed: until NVS
-     * takes a newer record, every such reset adopts it again. */
-    pp_persist_t rtc;
-    bool adopted = false;
-    if (!power_lost && rtc_load(&rtc) && (rs != REC_OK || rtc.gen > s_core.p.gen)) {
-        ESP_LOGW(TAG, "adopting the newer record from RTC memory: %s (reason %s, gen %lu over %lu)",
-                 pp_state_name((pp_state_t)rtc.state), pp_reason_name((pp_reason_t)rtc.reason),
-                 (unsigned long)rtc.gen, (unsigned long)(rs != REC_OK ? 0 : s_core.p.gen));
-        pp_core_init(&s_core);
-        s_core.p = rtc;
-        s_core.persist_fault = true;   /* not on record until NVS takes it */
-        adopted = true;
-    } else if (rs == REC_UNREADABLE) {
+    uint32_t e = 0;
+    const int er = epoch_read(&e);
+    s_epoch = er == 1 ? e : 0;
+    s_epoch_verified = er == 1;
+    if (er < 0 && !power_lost) {
+        /* Present but unreadable: no proof of a rewrite, so the RTC record's
+         * own epoch is borrowed, UNVERIFIED (see the adoption rule below). */
+        s_epoch = rtc_any_epoch();
+    }
+
+    /* The NVS record. ABSENT with no epoch = a first install (or a wiped NVS):
+     * normal, and that record is written before the epoch, so an epoch always
+     * implies a record was written. ABSENT with an epoch (or an unreadable
+     * one) = the state was LOST (round 5: an interrupted fence sequence left
+     * no record and the unit booted at full load): no_flash, state_missing.
+     * UNREADABLE = no_flash, state_unreadable (review of PR #103). */
+    const bool first_install = rs == REC_ABSENT && er == 0;
+    if (rs == REC_UNREADABLE) {
         ESP_LOGW(TAG, "persisted state unreadable (%s) - starting at no_flash", unreadable);
         pp_load_unreadable(&s_core, clk);
+    } else if (rs == REC_ABSENT && !first_install) {
+        ESP_LOGW(TAG, "persisted state missing beside an NVS epoch - starting at no_flash");
+        pp_load_missing(&s_core, clk);
+    }
+
+    /* The RTC mirror only counts after a reset without power loss (after one
+     * it is gone or garbage). It is not consumed: until NVS takes a newer
+     * record, every such reset adopts it again.
+     *  - VERIFIED epoch (same NVS lifetime): the newer record by generation
+     *    wins; NVS absent or unreadable loses to it.
+     *  - UNVERIFIED (borrowed) epoch: generations of two lifetimes cannot be
+     *    compared, so an RTC record wins only if it is STRICTLY MORE
+     *    PROTECTIVE than what NVS gives (round 5: a foreign cleared record
+     *    overwrote a current forced hold). With NVS unreadable too, that is
+     *    measured against the fail-closed no_flash. */
+    pp_persist_t rtc;
+    bool adopted = false;
+    if (!power_lost && rtc_load(&rtc)) {
+        const bool newer = s_epoch_verified ? (rs != REC_OK || rtc.gen > s_core.p.gen)
+                                            : pp_protection_rank(&rtc) > pp_protection_rank(&s_core.p);
+        if (newer) {
+            ESP_LOGW(TAG, "adopting the RTC record: %s (reason %s, gen %lu; epoch %s)",
+                     pp_state_name((pp_state_t)rtc.state), pp_reason_name((pp_reason_t)rtc.reason),
+                     (unsigned long)rtc.gen, s_epoch_verified ? "verified" : "unverified, more protective");
+            pp_core_init(&s_core);
+            s_core.p = rtc;
+            s_core.persist_fault = true;   /* not on record until NVS takes it */
+            adopted = true;
+        }
     }
     lock();
     if (adopted) {
         /* Put it on record (same generation: it is the same record). Once per
-         * boot; on failure the mirror stays armed. */
+         * boot; on failure the mirror stays armed. Only ever a record of THIS
+         * lifetime or a more protective one (the rule above). */
         if (persist(&s_core.p) == ESP_OK) write_ok();
+    }
+    if (first_install) {
+        /* The first record, then the epoch (each read back). A failed record
+         * write leaves both absent: the next boot is a first install again. */
+        s_core.p.gen = 1;
+        if (persist(&s_core.p) == ESP_OK || nvs_holds(&s_core.p)) {
+            s_epoch = epoch_create();
+            s_epoch_verified = s_epoch != 0;
+        }
+    } else if (er == 0) {
+        /* A record (or an unreadable one) but no epoch yet: an upgrade from
+         * the first release, or a first install whose epoch write failed. */
+        s_epoch = epoch_create();
+        s_epoch_verified = s_epoch != 0;
     }
     rtc_store(&s_core.p);   /* the mirror holds the current record (a no-op when it already does) */
     if (power_lost && !brownout) {

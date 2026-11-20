@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 60)
+        self.assertGreaterEqual(len(self.scenarios), 62)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -115,7 +115,9 @@ class PowerProtectHostTest(unittest.TestCase):
                      "rtc_store_interrupted", "relaxation_write_then_error", "rtc_bound_to_nvs_epoch",
                      # review round 4 (each fails on e0d4e2e)
                      "relaxation_reread_inconclusive", "epoch_missing_first_boot", "no_epoch_no_relaxation",
-                     "fence_unconfirmed", "cmd_persist_unconfirmed"):
+                     "fence_unconfirmed", "cmd_persist_unconfirmed",
+                     # review round 5 (each fails on db64678)
+                     "missing_record_fails_closed", "unverified_epoch_never_relaxes"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):
@@ -289,6 +291,19 @@ class NativeNvsRelaxationTest(unittest.TestCase):
                 self.assertEqual((fields["now"], fields["reset"], fields["power_loss"], fields["direct_loss"]),
                                  ("hold",) * 4, l)
         print("\n".join(l for l in r.stdout.splitlines() if l.startswith("NATIVE")))
+
+    def test_two_faults_never_falsely_confirm(self):
+        # Review round 5: a failed candidate AND a failed fence write (#2/#4)
+        # was reported persist_failed ("fenced") while NVS ended with no record.
+        r = subprocess.run([str(self.bin), "native_two_fault_scan"], capture_output=True, text=True, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stdout[-4000:] + r.stderr[-4000:])
+        self.assertIn("PASS native_two_fault_scan", r.stdout)
+        case = next(l for l in r.stdout.splitlines() if l.startswith("NATIVE2 reviewer_case"))
+        self.assertNotIn("after_power_loss=normal", case)
+        summary = dict(f.split("=") for f in next(l for l in r.stdout.splitlines()
+                                                    if l.startswith("NATIVE2_SUMMARY")).split()[1:])
+        self.assertEqual(int(summary["pairs"]), sum(24 - a for a in range(1, 17)))
+        print(case, "\n", " ".join(f"{k}={v}" for k, v in summary.items()))
 
 
 class DestructivePrimitivesTest(unittest.TestCase):

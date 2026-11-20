@@ -24,7 +24,7 @@ namespace {
 class MemPartition : public nvs::Partition {
 public:
     std::vector<uint8_t> bytes = std::vector<uint8_t>(4 * 4096, 0xff);
-    int raw_writes = 0, fail_write_at = 0, reads = 0, fail_read_at = 0;
+    int raw_writes = 0, fail_write_at = 0, fail_write_at2 = 0, reads = 0, fail_read_at = 0;
     const char *get_partition_name() override { return "nvs"; }
     esp_err_t read_raw(size_t off, void *dst, size_t n) override
     {
@@ -41,7 +41,9 @@ public:
     esp_err_t write_raw(size_t off, const void *src, size_t n) override
     {
         raw_writes++;
-        if (fail_write_at && raw_writes == fail_write_at) return ESP_ERR_FLASH_OP_FAIL;
+        if ((fail_write_at && raw_writes == fail_write_at) || (fail_write_at2 && raw_writes == fail_write_at2)) {
+            return ESP_ERR_FLASH_OP_FAIL;
+        }
         return write(off, src, n);
     }
     esp_err_t write(size_t off, const void *src, size_t n) override
@@ -94,7 +96,16 @@ void native_fault(int write_at, int read_at)
     g_part->raw_writes = 0;
     g_part->reads = 0;
     g_part->fail_write_at = write_at;
+    g_part->fail_write_at2 = 0;
     g_part->fail_read_at = read_at;
+}
+
+/* Two transient raw-write faults (round 5: the relaxation AND a fence write
+ * failing, e.g. #2 and #4). */
+void native_fault2(int write_a, int write_b)
+{
+    native_fault(write_a, 0);
+    g_part->fail_write_at2 = write_b;
 }
 
 int native_open(int readwrite)
