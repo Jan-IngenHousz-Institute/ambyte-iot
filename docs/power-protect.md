@@ -53,7 +53,7 @@ stateDiagram-v2
     [*] --> normal: no persisted state (first install)
     [*] --> no_flash: persisted state unreadable (state_unreadable, persist_fault)
     normal --> no_flash: brownout boot (first of an episode)
-    normal --> no_flash: fresh read with input, system_v below 3.30 V or battery below 3.40 V
+    normal --> no_flash: fresh read with input, system_v below 3.30 V or battery_v in (0, 3.40 V)
     normal --> hold: brownout boot linked to the previous one (recovered within the episode)
     no_flash --> hold: brownout boot linked to the previous one
     no_flash --> hold: brownout boot whose order is unknown (brownout_unordered)
@@ -76,15 +76,15 @@ stateDiagram-v2
 **Entry.**
 
 - `normal → no_flash` when this boot's reset reason is `brownout`, or a
-  **fresh** valid read with input present shows `system_v < 3.30 V` or a
-  battery below 3.40 V. Fresh = power_policy's AMBIT-flash evidence
+  **fresh** valid read with input present shows `system_v < 3.30 V` or
+  `0 < battery_v < 3.40 V`. Fresh = power_policy's AMBIT-flash evidence
   (`power_gate_flash_ok`): the latest read valid with input present and the
   ADC frame changing.
-  - `battery_v == 0` with input present is the idle charger: the panel is
-    there (VIN 7–8 V) but the chip is not charging, and the unit runs on the
-    battery through the BATFET, so `system_v` **is** the battery voltage.
-    The battery threshold then applies to `system_v` (see "battery_v 0"
-    below).
+  - `battery_v == 0` with input present (the idle charger, see "battery_v 0"
+    below) never triggers on its own, as in the first release. Uluru units
+    idle on 3.3–3.6 V rails all day; entering `no_flash` there would cut
+    their Fv/Fm data mid-deployment. Only the **exit** reads the rail as the
+    battery.
   - Invalid, stale (frozen frame), `no_input` and input-absent reads never
     trigger.
 - `→ hold` on a brownout **linked** to the previous recorded brownout (below):
@@ -174,10 +174,15 @@ day.
 
 The board **cannot tell** an absent battery from an idle charger. The
 MP2731 reports no battery-present bit, and both read `battery_v` 0. The safe
-reading is chosen: whenever `battery_v` is 0, `system_v` must meet the
-**battery** thresholds (exit 3.70 V, entry 3.40 V). A battery-less unit on
+reading is chosen **for the exit**: whenever `battery_v` is 0, `system_v`
+must meet the **battery** exit threshold (3.70 V). A battery-less unit on
 external power still recovers when its regulated rail sits at 3.70 V or above.
 If its rail is lower, it stays protected until `clear`.
+
+**Entry is unchanged**: a `battery_v` of 0 never triggers on its own (only
+`system_v < 3.30 V` does). Many Uluru units idle on 3.3–3.6 V rails, and
+entering `no_flash` on a 3.35 V idle rail would cut a lot of Fv/Fm data. A
+probation is failed by the same entry rule.
 
 #### Battery-only probe
 
@@ -548,7 +553,7 @@ run fails unless every reply confirms the requested state. In Actions →
   - intermittent solar: 3 × 12-min bursts with collapses and 20-min `no_input`
     gaps, and 80-s start-stop spells;
   - the idle `battery_v` 0 rail: 3.65 V never qualifies, 3.75 V does, and an
-    idle 3.35 V rail enters;
+    idle 3.35 V rail does **not** enter (unchanged entry);
   - the battery-only probe: the quiet period, the probation across the nightly
     reboot and its pass; a brownout on probation → `hold` with backoff
     6 → 12 → 24 → 24 h that survives reboots and exhausts after 6; `hold`

@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 41)
+        self.assertGreaterEqual(len(self.scenarios), 42)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -104,7 +104,7 @@ class PowerProtectHostTest(unittest.TestCase):
                      "battery_probe_recovers", "probation_brownout_backoff", "hold_steps_down_first",
                      "forced_never_probes", "idle_battery_zero", "no_monitor_no_probe",
                      "probe_waits_after_low_read", "probe_uptime_without_clock", "evidence_blocks_probe",
-                     "blob_v1_upgrade"):
+                     "blob_v1_upgrade", "idle_rail_entry_unchanged"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):

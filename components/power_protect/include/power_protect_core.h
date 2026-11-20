@@ -31,8 +31,12 @@
  * Entry:
  *   normal   -> no_flash : this boot's reset reason is brownout, or a FRESH
  *                          valid read with input present shows system < 3.30 V
- *                          or battery < 3.40 V (battery 0 with input: the
- *                          rail is the battery, C below).
+ *                          or 0 < battery < 3.40 V. battery 0 with input
+ *                          (the idle charger, C below) never triggers on
+ *                          its own: Uluru units idle on 3.3-3.6 V rails all
+ *                          day, and entering there would cut their Fv/Fm
+ *                          data mid-deployment. Only the EXIT reads 0 as
+ *                          "the rail is the battery".
  *   *        -> hold     : a brownout LINKED to the previous one (below).
  * Linking two brownouts (brownout history, persisted):
  *   - both carry a valid UTC (the clock was valid at both boots) and the new
@@ -65,8 +69,9 @@
  *      battery through the BATFET, so system_v IS the battery voltage
  *      (10:BD:A3:63:FD:20 left protection on a 3.68 V rail and browned out the
  *      same day). The board cannot tell an absent battery from an idle charger,
- *      so a 0 always means "judge the rail as the battery": the battery
- *      thresholds (exit 3.70 V, entry 3.40 V) apply to system_v.
+ *      so on the EXIT a 0 always means "judge the rail as the battery": the
+ *      battery exit threshold (3.70 V) applies to system_v. Entry is
+ *      unchanged (a 0 never triggers; see Entry above).
  *   B. Battery-only PROBE. On battery the ADC is dead and nothing qualifies, so
  *      a protected, automatic (not forced) unit with a live charger monitor
  *      that has seen no brownout and no fresh low read for a quiet period

@@ -372,11 +372,28 @@ static void idle_battery_zero(void)
     good_reads(1, 3650, 0);
     good_reads(300, 3750, 0);
     CHECK(st() == PP_STATE_NO_FLASH, "an idle low rail resets the evidence");
-    /* Entry uses the same reading: an idle 3.35 V rail is a 3.35 V battery. */
+}
+
+/* Entry is unchanged from the first release: battery_v 0 never triggers on
+ * its own. Many Uluru units idle on 3.3-3.6 V rails; entering no_flash on a
+ * 3.35 V idle rail would cut their Fv/Fm data. Only system_v < 3.30 V does. */
+static void idle_rail_entry_unchanged(void)
+{
+    reboot(ESP_RST_POWERON, 1, true);
+    good_reads(60, 3350, 0);
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "a 3.35 V idle rail with battery_v 0 must not enter");
+    good_reads(3, 3250, 0);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_LOW_VOLTAGE, "a rail below 3.30 V enters");
+#if HAVE_RECOVERY
+    /* The normal probation is failed by the same entry rule: a 3.35 V idle
+     * rail does not fail it. */
     g_blob_len = 0;
-    reboot(ESP_RST_POWERON, 4, true);
-    good_reads(3, 3350, 0);
-    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_LOW_VOLTAGE, "idle rail below 3.40 V enters");
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
+    good_reads(30, 3350, 0);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "3.35 V idle rail: probation goes on");
+#endif
 }
 
 /* ── scenarios: recovery on solar and on battery (Uluru 17-20 Nov) ─────── */
@@ -1293,6 +1310,7 @@ static const scenario_t k_scenarios[] = {
     {"window_restarts", window_restarts},
     {"battery_zero_with_input", battery_zero_with_input},
     {"idle_battery_zero", idle_battery_zero},
+    {"idle_rail_entry_unchanged", idle_rail_entry_unchanged},
     {"intermittent_solar_recovers", intermittent_solar_recovers},
     {"low_read_resets_accumulation", low_read_resets_accumulation},
     {"old_evidence_expires", old_evidence_expires},

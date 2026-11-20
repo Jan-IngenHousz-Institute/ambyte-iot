@@ -97,7 +97,8 @@ holds bench boards.
   never touches the event log or its cursor; its NVS blob is written only on transitions
   (probe steps and their pass/failure included), brownout records, force and clear — never
   per read or heartbeat. Only fresh (changing), valid, input-present charger frames count as
-  evidence (accumulated, 30 min within 12 h; `battery_v` 0 = judge the rail as the battery);
+  evidence (accumulated, 30 min within 12 h; on exit `battery_v` 0 = judge the rail as the battery,
+  entry unchanged: a 0 never triggers);
   battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on
   24-h probation after 6/12/24 h without a brownout, never forced, never without a charger
   monitor, 6 failures max).

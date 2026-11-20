@@ -423,12 +423,17 @@ static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_
 
     /* battery_v == 0 with input: the charger idles and the unit runs on the
      * battery through the BATFET, so the rail IS the battery (C in the
-     * header). Judge it with the battery thresholds. */
+     * header). The EXIT judges it with the battery threshold. The entry
+     * trigger (also the probation-failure test) keeps the first release's
+     * rule: a 0 never triggers on its own. Uluru units idle on 3.3-3.6 V
+     * rails, and entering there would cut Fv/Fm data mid-deployment. */
     const uint32_t sys = fresh ? p->system_mv : 0;
-    const uint32_t bat = fresh ? (p->battery_mv != 0 ? p->battery_mv : p->system_mv) : 0;
-    const bool qualifies = fresh && sys >= PP_SYS_EXIT_MV && bat >= PP_BAT_EXIT_MV;
+    const uint32_t bat_raw = fresh ? p->battery_mv : 0;
+    const uint32_t bat_exit = bat_raw != 0 ? bat_raw : sys;
+    const bool qualifies = fresh && sys >= PP_SYS_EXIT_MV && bat_exit >= PP_BAT_EXIT_MV;
     const bool low = fresh && !qualifies;
-    const bool trigger = fresh && (sys < PP_SYS_TRIGGER_MV || bat < PP_BAT_TRIGGER_MV);
+    const bool trigger = fresh && (sys < PP_SYS_TRIGGER_MV ||
+                                   (bat_raw > 0 && bat_raw < PP_BAT_TRIGGER_MV));
 
     const pp_state_t s = (pp_state_t)c->p.state;
     if (s == PP_STATE_NORMAL) {
