@@ -83,11 +83,12 @@ bool pp_force_state_parse(const char *s, pp_state_t *out)
 }
 
 /* ── blob codec ────────────────────────────────────────────────────────────
- * Layout v2 (little endian, PP_BLOB_LEN = 124 B):
+ * Layout v2 (little endian):
  *   u8 version | u8 state | u8 reason | u8 forced | i64 since_utc |
  *   u8 hist_n  | PP_HIST_MAX × { i64 utc | u32 boot } |
- *   u8 probation | u8 probe_fails | u8 has_low | i64 low_utc | u32 crc32(all above)
- * v1 (113 B, the first release) is the same without the 11 recovery bytes. It
+ *   u8 probation | u8 probe_fails | u8 has_low | i64 low_utc | u32 gen | u32 crc32(all above)
+ * PP_BLOB_LEN = 128 B. v1 (113 B, the first release) is the same without the
+ * 15 recovery bytes; it reads as generation 0. It
  * is still read, so an upgrade keeps every stored state.
  * Explicit bytes, not a struct dump: padding and field order can never make a
  * blob written by one build unreadable by the next, and a torn or foreign
@@ -150,6 +151,7 @@ size_t pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap)
     buf[o++] = p->probe_fails;
     buf[o++] = p->has_low ? 1 : 0;
     put_i64(buf + o, p->has_low ? p->low_utc : 0); o += 8;
+    put_u32(buf + o, p->gen); o += 4;
     put_u32(buf + o, crc32_ieee(buf, o)); o += 4;
     return o;
 }
@@ -189,6 +191,7 @@ bool pp_decode(pp_persist_t *out, const uint8_t *buf, size_t len)
         if (p.probation > PP_PROBATION_NORMAL || p.probe_fails > PP_PROBE_FAILS_MAX || has_low > 1) return false;
         if (!has_low && p.low_utc != 0) return false;
         p.has_low = has_low != 0;
+        p.gen = get_u32(buf + o); o += 4;
         /* A probation is always automatic and in the state its step entered. */
         if (p.probation != PP_PROBATION_NONE &&
             (p.forced || p.state != (p.probation == PP_PROBATION_NO_FLASH ? PP_STATE_NO_FLASH
@@ -361,7 +364,13 @@ static bool record_low(pp_core_t *c, pp_clock_t clk)
         write = true;
     } else if (c->p.low_utc == 0) {
         write = now != 0;                              /* now it can be dated */
-    } else if (now != 0) {
+    } else if (now == 0) {
+        /* A dated low, and now a low the clock cannot date (hwm, a suspect
+         * RTC): the dated record is older than the newest low by an unknown
+         * amount. Switch to undated, so a reboot counts the quiet period from
+         * boot rather than from the old date (review of PR #113, round 2). */
+        write = true;
+    } else {
         write = now < c->p.low_utc || now - c->p.low_utc >= PP_LOW_REFRESH_S;
     }
     if (write) {
@@ -486,8 +495,9 @@ static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_
         acc_reset(c);
         if (c->p.probation == PP_PROBATION_NORMAL) {
             if (trigger) return probe_fail(c, PP_STATE_NO_FLASH, clk);
-            if (may_relax && probation_s(c, mono_ms, clk) >= PP_PROBATION_S) return probe_pass(c);
-            return no_event(c);
+            pp_event_t ev = no_event(c);
+            if (may_relax && probation_s(c, mono_ms, clk) >= PP_PROBATION_S) ev.relax_due = PP_RELAX_PASS;
+            return ev;
         }
         if (trigger) return transition(c, PP_STATE_NO_FLASH, PP_REASON_LOW_VOLTAGE, clk);
         return no_event(c);
@@ -502,9 +512,8 @@ static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_
         if (c->prev_qual && in_seq) acc_credit(c, mono_ms, interval);
         c->prev_qual = true;
         if (may_relax && acc_sum(c, mono_ms) >= PP_EXIT_TARGET_MS) {
-            pp_event_t ev = transition(c, PP_STATE_NORMAL, PP_REASON_POWER_RECOVERED, clk);
-            c->p.probe_fails = 0;   /* proven good power: the backoff starts over */
-            ev.relaxes = true;
+            pp_event_t ev = no_event(c);
+            ev.relax_due = PP_RELAX_EXIT;
             return ev;
         }
     }
@@ -525,10 +534,9 @@ static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_
 
     if (c->p.probation == PP_PROBATION_NO_FLASH) {
         if (trigger) return probe_fail(c, PP_STATE_HOLD, clk);
-        if (may_relax && probation_s(c, mono_ms, clk) >= PP_PROBATION_S) {
-            /* (the low record, if any, rides along in the same commit) */
-            return probe_pass(c);
-        }
+        /* The pass is only reported due: the read's low record (quiet.persist)
+         * stands on its own, whether or not the pass is then committed. */
+        if (may_relax && probation_s(c, mono_ms, clk) >= PP_PROBATION_S) quiet.relax_due = PP_RELAX_PASS;
         return quiet;
     }
     /* The probe is for the unit WITHOUT evidence. While qualifying evidence
@@ -537,15 +545,41 @@ static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_
     if (qualifies || acc_sum(c, mono_ms) > 0) return quiet;
     if (may_relax && c->monitor_live && c->p.probe_fails < PP_PROBE_FAILS_MAX &&
         quiet_s(c, mono_ms, clk) >= probe_wait_s(c->p.probe_fails)) {
+        quiet.relax_due = PP_RELAX_PROBE;
+    }
+    return quiet;
+}
+
+pp_event_t pp_relax(pp_core_t *c, pp_relax_t what, int64_t mono_ms, pp_clock_t clk)
+{
+    const pp_state_t s = (pp_state_t)c->p.state;
+    pp_event_t ev = no_event(c);
+    switch (what) {
+    case PP_RELAX_EXIT:
+        if (s == PP_STATE_NORMAL || c->p.forced) return ev;
+        ev = transition(c, PP_STATE_NORMAL, PP_REASON_POWER_RECOVERED, clk);
+        c->p.probe_fails = 0;   /* proven good power: the backoff starts over */
+        break;
+    case PP_RELAX_PROBE: {
+        if (s == PP_STATE_NORMAL || c->p.forced || c->p.probation != PP_PROBATION_NONE) return ev;
         /* One level down, on probation: steady-state work comes back before
          * the saturating flashes do. */
         const pp_state_t to = s == PP_STATE_HOLD ? PP_STATE_NO_FLASH : PP_STATE_NORMAL;
-        pp_event_t ev = transition(c, to, PP_REASON_PROBE, clk);
+        ev = transition(c, to, PP_REASON_PROBE, clk);
         c->p.probation = to == PP_STATE_NO_FLASH ? PP_PROBATION_NO_FLASH : PP_PROBATION_NORMAL;
-        ev.relaxes = true;
+        break;
+    }
+    case PP_RELAX_PASS:
+        if (c->p.probation == PP_PROBATION_NONE) return ev;
+        ev = probe_pass(c);
+        break;
+    case PP_RELAX_NONE:
+    default:
         return ev;
     }
-    return quiet;
+    if (ev.changed) c->since_mono_ms = mono_ms;
+    ev.relaxes = true;
+    return ev;
 }
 
 pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_reading_t *p,
@@ -561,8 +595,13 @@ pp_event_t pp_force(pp_core_t *c, pp_state_t state, pp_clock_t clk)
 {
     if (state != PP_STATE_NO_FLASH && state != PP_STATE_HOLD) return no_event(c);
     if ((pp_state_t)c->p.state == state && c->p.forced) return no_event(c);
+    /* Forcing a LOWER state (hold -> no_flash) lowers protection: like every
+     * relaxation it must be on record before it takes effect. */
+    const bool lower = state < (pp_state_t)c->p.state;
     c->p.forced = true;
-    return transition(c, state, PP_REASON_FORCED, clk);
+    pp_event_t ev = transition(c, state, PP_REASON_FORCED, clk);
+    ev.relaxes = lower;
+    return ev;
 }
 
 pp_event_t pp_clear(pp_core_t *c, pp_clock_t clk)
@@ -575,7 +614,9 @@ pp_event_t pp_clear(pp_core_t *c, pp_clock_t clk)
     c->p.hist_n = 0;
     memset(c->p.hist, 0, sizeof c->p.hist);
     c->p.probe_fails = 0;
-    return transition(c, PP_STATE_NORMAL, PP_REASON_CLEARED, clk);
+    pp_event_t ev = transition(c, PP_STATE_NORMAL, PP_REASON_CLEARED, clk);
+    ev.relaxes = true;   /* everything it wipes is protection */
+    return ev;
 }
 
 /* ── reporting ─────────────────────────────────────────────────────────── */

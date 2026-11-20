@@ -88,23 +88,35 @@
  *      monitor (no reads, or the charger never answering) there is no probe:
  *      fail-closed, as before. While qualifying evidence sits inside the
  *      horizon the accumulation decides and the probe waits.
- *   Durability (review of PR #113, round 1):
+ *   Durability (review of PR #113, rounds 1-2): ONE generation-ordered record.
+ *    - Every persisted record carries a generation number (gen) that is never
+ *      reused. The glue keeps two copies: NVS, and an RTC_NOINIT mirror that
+ *      survives resets without power loss. At boot the NEWEST valid copy by
+ *      generation wins (the RTC copy only after a reset without power loss);
+ *      neither copy is consumed by being read.
+ *    - A protective update (entry, escalation, a failed probe, a brownout or
+ *      low-read record, a force up) is applied at once, written to the RTC
+ *      mirror, then to NVS. If NVS refuses, the RTC copy is the newest record
+ *      and every later reset without power loss adopts it until NVS takes a
+ *      newer one.
  *    - A RELAXATION (the probe step, a passed probation, the accumulated
- *      exit) is committed to NVS BEFORE it takes effect (pp_event_t.relaxes;
- *      the glue persists first and rolls the core back if the write fails).
- *      After a failed commit the unit stays protected and no relaxation is
- *      tried for PP_RELAX_RETRY_MS: a probe that is not on record could
- *      otherwise be repeated after every brownout without its failure ever
- *      counting (the 6-failure cap bypassed).
+ *      exit; and an operator clear or force down) is computed on a copy and
+ *      written to NVS FIRST; only then does it replace the state and the RTC
+ *      mirror. pp_on_read never applies an automatic relaxation itself: it
+ *      applies the read's protective facts (low veto, evidence, failures) and
+ *      reports the relaxation as due (relax_due); the glue applies it with
+ *      pp_relax on the copy. A refused write leaves the state with every
+ *      protective fact of the read, and no relaxation is tried for
+ *      PP_RELAX_RETRY_MS. The refused generation number is consumed.
  *    - A probation found at boot after a POWER loss (power-on, power glitch,
  *      brownout) is a failed probe: the run on probation ended with the power
- *      gone. After any other reset (the nightly reboot, a watchdog) it goes
- *      on; a protective state that could not be written survives such a
- *      reset in an RTC_NOINIT copy (glue).
- *    - The newest fresh low read is part of the persisted state (has_low,
- *      low_utc), refreshed at most once per PP_LOW_REFRESH_S, so a reboot
- *      cannot erase the probe's low-read veto. After a reboot the stored
- *      time counts PP_LOW_REFRESH_S later than written (it may be that stale).
+ *      gone. After any other reset (the nightly reboot, a watchdog) it goes on.
+ *    - The newest fresh low read is part of the record (has_low, low_utc):
+ *      the first of a state, the first one the clock can date (or, with the
+ *      clock no longer trusted, the switch to undated), then at most once per
+ *      PP_LOW_REFRESH_S. After a reboot a dated one counts PP_LOW_REFRESH_S
+ *      later than written (it may be that stale); an undated one makes the
+ *      quiet period count from boot.
  * Operator: force(no_flash|hold) sets a forced state that never auto-exits
  *   (a linked brownout still escalates forced no_flash to hold); clear returns
  *   to normal and wipes the brownout history, the forced flag, the probation
@@ -178,9 +190,10 @@ extern "C" {
  * protected in between. */
 #define PP_RELAX_RETRY_MS      (60LL * 60 * 1000)
 /* The durable low-read time is refreshed at most hourly while fresh low reads
- * continue (≤ 24 writes a day, and only on days a protected unit sees its
- * panel with a low battery; never per read). The cost is that after a reboot
- * the veto counts from up to an hour later than the real last low read. */
+ * continue; never per read. Real bound per protected state: 1 (the first low)
+ * + ≤ 1 an hour (≤ 24 a day) + ≤ 2 per change of clock trust (undate,
+ * re-date). The cost is that after a reboot a dated veto counts from up to an
+ * hour later than the real last low read. */
 #define PP_LOW_REFRESH_S       (60LL * 60)
 
 typedef enum {
@@ -245,6 +258,9 @@ typedef struct {
      * has_low with low_utc 0 = seen while the clock was not valid. */
     bool     has_low;
     int64_t  low_utc;
+    /* Generation of this record: the glue numbers every write, never reusing
+     * a number; at boot the newer of the NVS and RTC copies wins. */
+    uint32_t gen;
 } pp_persist_t;
 
 typedef struct {
@@ -281,8 +297,17 @@ typedef struct {
     pp_state_t  from, to;
     pp_reason_t reason;
     bool        probe_passed;   /* probation ended well (one E line, state unchanged) */
-    bool        relaxes;        /* less protection: commit to NVS BEFORE it takes effect */
+    bool        relaxes;        /* this (already applied) event lowers protection: the caller ran it on a
+                                 * copy and must commit it to NVS BEFORE adopting it */
+    uint8_t     relax_due;      /* pp_relax_t: an automatic relaxation is due (NOT applied) */
 } pp_event_t;
+
+typedef enum {
+    PP_RELAX_NONE = 0,
+    PP_RELAX_EXIT,    /* accumulated evidence: -> normal (power_recovered) */
+    PP_RELAX_PROBE,   /* one level down on probation (probe) */
+    PP_RELAX_PASS,    /* probation passed (probe_passed) */
+} pp_relax_t;
 
 /* Skipped-work counters (RAM, per boot: counting into NVS would write per run). */
 typedef struct {
@@ -305,7 +330,7 @@ void pp_load_unreadable(pp_core_t *c, pp_clock_t clk);
  * unreadable (no_flash, state_unreadable): the safe side. */
 #define PP_BLOB_VERSION 2u
 #define PP_BLOB_V1_LEN  (1u + 3u + 8u + 1u + PP_HIST_MAX * 12u + 4u)
-#define PP_BLOB_LEN     (PP_BLOB_V1_LEN + 2u + 1u + 8u)
+#define PP_BLOB_LEN     (PP_BLOB_V1_LEN + 2u + 1u + 8u + 4u)
 size_t pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap);
 bool   pp_decode(pp_persist_t *out, const uint8_t *buf, size_t len);
 
@@ -326,6 +351,13 @@ pp_event_t pp_on_power_loss(pp_core_t *c, pp_clock_t clk);
 pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_reading_t *p,
                       bool fresh_present, int64_t mono_ms, pp_clock_t clk);
 
+/* Apply a relaxation pp_on_read reported as due. Call it on a COPY of the
+ * core, commit the copy's record to NVS, and adopt the copy only once that
+ * write succeeded. The event has relaxes set. */
+pp_event_t pp_relax(pp_core_t *c, pp_relax_t what, int64_t mono_ms, pp_clock_t clk);
+
+/* Operator commands. An event with relaxes set (clear; force to a lower
+ * state) must be run on a copy and committed to NVS first, like pp_relax. */
 pp_event_t pp_force(pp_core_t *c, pp_state_t state, pp_clock_t clk);
 pp_event_t pp_clear(pp_core_t *c, pp_clock_t clk);
 

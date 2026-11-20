@@ -2,32 +2,36 @@
  * power_protect.c — target glue for the brownout protection state machine
  * (contract: include/power_protect.h; decisions: power_protect_core.c).
  *
- * NVS namespace "pwr_protect", key "state": the pp_encode blob (124 B, v2; the
- * 113-B v1 blob of the first release is still read). Written ONLY when the
- * core says persist — a state transition (the probe step and a failed probe
- * included), a passed probation, a recorded brownout (at most one per boot),
- * a protected unit's fresh low read (first, then at most hourly), force,
- * clear. Never per read, never per heartbeat:
- * a flash write per 5 s charger read would wear the NVS sector for nothing.
- * RTC_NOINIT is not enough on its own: a brownout is a power-on-class reset,
- * exactly the reset this module exists for, and it clears RTC memory.
+ * NVS namespace "pwr_protect", key "state": the pp_encode blob (128 B, v2; the
+ * 113-B v1 blob of the first release is still read, as generation 0). Written
+ * ONLY when the core says persist (a state transition, the probe step and a
+ * failed probe included; a passed probation; a recorded brownout, at most one
+ * per boot; a protected unit's fresh low read, first / dating / at most
+ * hourly), on force and clear, and once at boot to put an adopted RTC record
+ * on record. Never per read, never per heartbeat: a flash write per 5 s
+ * charger read would wear the NVS sector for nothing. RTC_NOINIT is not
+ * enough on its own: a brownout is a power-on-class reset, exactly the reset
+ * this module exists for, and it clears RTC memory.
  *
- * Commit order (review of PR #113, round 1):
- *  - A RELAXATION (ev.relaxes: the probe step, a passed probation, the
- *    accumulated exit) is written FIRST and only then published. If the write
- *    fails the core is rolled back to its state before the read, the unit
- *    stays protected and no relaxation is tried for PP_RELAX_RETRY_MS. A probe
- *    that is not on record would come back after a brownout as an ordinary
- *    episode: its failure would never count and the 6-failure cap and the
- *    backoff could be bypassed for ever.
- *  - Everything else (more protection) is published FIRST, then written: the
- *    unit is protected at once even when the write fails. Such an unwritten
- *    state is also kept in an RTC_NOINIT copy (s_unwritten), which a reset
- *    WITHOUT power loss (the nightly reboot, a watchdog, a panic) adopts at
- *    boot, so a failure on probation that NVS refused cannot be undone by a
- *    software reset bringing back the stored probation. After a power loss
- *    the copy is gone, and a stored probation counts as failed instead
- *    (pp_on_power_loss / pp_on_boot).
+ * ONE generation-ordered record (review of PR #113, rounds 1-2). Two earlier
+ * fixes in a row (an RTC copy consumed at its first adoption; one written only
+ * after a refused NVS write) each left a reset window, so the model is now:
+ *  - every record written carries pp_persist_t.gen = the previous number + 1,
+ *    never reused (a refused relaxation consumes its number too);
+ *  - s_rtc mirrors the newest record in RTC_NOINIT memory; it survives resets
+ *    WITHOUT power loss and is never cleared by being read;
+ *  - a PROTECTIVE update is applied, written to s_rtc, then to NVS;
+ *  - a RELAXATION (pp_relax, an operator clear / force down) is computed on a
+ *    copy (s_cand), written to NVS FIRST, and only then adopted and mirrored
+ *    to s_rtc. A refused write leaves the state as it was after the read's
+ *    protective facts, and automatic relaxations wait PP_RELAX_RETRY_MS;
+ *  - at boot the newer valid record by generation wins: s_rtc (only after a
+ *    reset without power loss) over NVS when its generation is higher. The
+ *    adopted record is written to NVS once (sync), and s_rtc stays armed.
+ * Why that closes the windows: s_rtc is only ever AHEAD of NVS by protective
+ * updates (relaxations reach NVS first), and a reset between the two writes
+ * of either kind leaves the newer record winning: protective -> s_rtc is
+ * newer; relaxation -> NVS is newer.
  */
 #include "power_protect.h"
 
@@ -51,43 +55,32 @@
 static SemaphoreHandle_t s_mtx;
 static StaticSemaphore_t s_mtx_storage;
 static pp_core_t s_core;                 /* under s_mtx */
-static pp_core_t s_before;               /* under s_mtx: rollback copy for a relaxation (~0.5 KiB, off the stack) */
+static pp_core_t s_cand;                 /* under s_mtx: a relaxation's candidate (~0.5 KiB, off the stack) */
 /* Published copy of s_core.p.state for lock-free readers (sched_runner,
  * ota_update, the pong on the esp-mqtt task). A byte store is atomic here. */
 static volatile uint8_t s_state_pub = PP_STATE_NORMAL;
 static portMUX_TYPE s_skip_mux = portMUX_INITIALIZER_UNLOCKED;
 static pp_skips_t s_skips;               /* under s_skip_mux */
 
-/* The newest state NVS refused (see the header comment). Survives resets
- * without power loss; validated by a magic word and the blob's own CRC, so
- * the garbage RTC memory holds after a power-on never decodes. */
-#define PP_UNWRITTEN_MAGIC 0x50505257u   /* "PPRW" */
+/* The RTC_NOINIT mirror of the newest record (see the header comment).
+ * Validated by a magic word and the blob's own CRC, so the garbage RTC memory
+ * holds after a power-on never decodes. */
+#define PP_RTC_MAGIC 0x50505247u   /* "PPRG" */
 typedef struct {
     uint32_t magic;
     uint8_t  blob[PP_BLOB_LEN];
-} pp_unwritten_t;
-static RTC_NOINIT_ATTR pp_unwritten_t s_unwritten;
+} pp_rtc_t;
+static RTC_NOINIT_ATTR pp_rtc_t s_rtc;
 
-static void unwritten_keep(const pp_persist_t *p)
+static void rtc_store(const pp_persist_t *p)
 {
-    if (pp_encode(p, s_unwritten.blob, sizeof s_unwritten.blob) == PP_BLOB_LEN) {
-        s_unwritten.magic = PP_UNWRITTEN_MAGIC;
-    } else {
-        s_unwritten.magic = 0;
-    }
+    s_rtc.magic = 0;
+    if (pp_encode(p, s_rtc.blob, sizeof s_rtc.blob) == PP_BLOB_LEN) s_rtc.magic = PP_RTC_MAGIC;
 }
 
-static void unwritten_drop(void)
+static bool rtc_load(pp_persist_t *out)
 {
-    s_unwritten.magic = 0;
-}
-
-static bool unwritten_take(pp_persist_t *out)
-{
-    const bool ok = s_unwritten.magic == PP_UNWRITTEN_MAGIC &&
-                    pp_decode(out, s_unwritten.blob, sizeof s_unwritten.blob);
-    unwritten_drop();
-    return ok;
+    return s_rtc.magic == PP_RTC_MAGIC && pp_decode(out, s_rtc.blob, sizeof s_rtc.blob);
 }
 
 /* Valid = a UTC the brownout history may compare across boots. SNTP outranks
@@ -127,7 +120,7 @@ static esp_err_t persist(const pp_persist_t *p)
 /* Under s_mtx. One ESP_LOGE per state transition: v2.18.0's diag hook turns
  * it into an ambyte.log/1 record, so the cloud sees every change with its
  * reason even when no heartbeat lands in between. */
-static esp_err_t apply(const pp_event_t *ev)
+static void publish(const pp_event_t *ev)
 {
     s_state_pub = s_core.p.state;
     if (ev->changed) {
@@ -139,53 +132,62 @@ static esp_err_t apply(const pp_event_t *ev)
         ESP_LOGE(TAG, "power_protect: %s probation passed reason=probe_passed backoff_level=%u",
                  pp_state_name(ev->to), (unsigned)s_core.p.probe_fails);
     }
-    if (!ev->persist) return ESP_OK;
-    const esp_err_t err = persist(&s_core.p);
-    if (err != ESP_OK) {
-        /* RAM keeps the new state for this boot, and the RTC copy keeps it
-         * across a reset without power loss. Warn (not error): the
-         * transition line already went out. health.power_protect.persist_fault
-         * says so until a write succeeds. */
-        ESP_LOGW(TAG, "state not persisted: %s", esp_err_to_name(err));
-        s_core.persist_fault = true;
-        unwritten_keep(&s_core.p);
-    } else {
-        unwritten_drop();
-        s_core.relax_hold_until_ms = 0;
-        if (s_core.persist_fault) {
-            ESP_LOGW(TAG, "persisted state repaired");
-            s_core.persist_fault = false;
-        }
-    }
-    return err;
 }
 
-/* Under s_mtx. A relaxation: written first, published only once it is on
- * record. On a failed write the core goes back to `before` (this read never
- * happened), the unit stays protected, and relaxations wait. */
-static void commit_relaxation(const pp_event_t *ev, const pp_core_t *before, int64_t now_ms)
+static void write_ok(void)
 {
-    const esp_err_t err = persist(&s_core.p);
-    if (err != ESP_OK) {
-        s_core = *before;
-        s_core.persist_fault = true;
-        s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
-        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s, next try in %lld min",
-                 pp_state_name(ev->from), pp_state_name(ev->to), ev->probe_passed ? "probe_passed"
-                 : pp_reason_name(ev->reason), esp_err_to_name(err), pp_state_name(ev->from),
-                 (long long)(PP_RELAX_RETRY_MS / 60000));
-        s_state_pub = s_core.p.state;
-        return;
-    }
-    unwritten_drop();
     s_core.relax_hold_until_ms = 0;
     if (s_core.persist_fault) {
         ESP_LOGW(TAG, "persisted state repaired");
         s_core.persist_fault = false;
     }
-    pp_event_t published = *ev;
-    published.persist = false;   /* already written */
-    (void)apply(&published);
+}
+
+/* Under s_mtx. A PROTECTIVE (or neutral) event already applied to s_core:
+ * publish at once, then the next generation to the RTC mirror, then NVS. */
+static esp_err_t apply(const pp_event_t *ev)
+{
+    publish(ev);
+    if (!ev->persist) return ESP_OK;
+    s_core.p.gen++;
+    rtc_store(&s_core.p);
+    const esp_err_t err = persist(&s_core.p);
+    if (err != ESP_OK) {
+        /* RAM and the RTC mirror hold the new record; every reset without
+         * power loss adopts it until NVS takes a newer one. Warn (not error):
+         * the transition line already went out. */
+        ESP_LOGW(TAG, "state not persisted: %s (kept in RTC memory)", esp_err_to_name(err));
+        s_core.persist_fault = true;
+    } else {
+        write_ok();
+    }
+    return err;
+}
+
+/* Under s_mtx. A RELAXATION computed on s_cand: NVS first, adopted only once
+ * on record. A refused write consumes the generation number and leaves s_core
+ * (with every protective fact of the read) as it is; an automatic relaxation
+ * then waits PP_RELAX_RETRY_MS. */
+static esp_err_t commit_relaxation(const pp_event_t *ev, int64_t now_ms, bool automatic)
+{
+    s_cand.p.gen = s_core.p.gen + 1;
+    const esp_err_t err = persist(&s_cand.p);
+    if (err != ESP_OK) {
+        s_core.p.gen = s_cand.p.gen;   /* never reuse a number that may have landed */
+        s_core.persist_fault = true;
+        if (automatic) s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
+        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s%s", pp_state_name(ev->from),
+                 pp_state_name(ev->to), ev->probe_passed ? "probe_passed" : pp_reason_name(ev->reason),
+                 esp_err_to_name(err), pp_state_name(ev->from), automatic ? ", next try in 60 min" : "");
+        s_state_pub = s_core.p.state;
+        return err;
+    }
+    s_cand.persist_fault = s_core.persist_fault;
+    s_core = s_cand;
+    rtc_store(&s_core.p);
+    write_ok();
+    publish(ev);
+    return ESP_OK;
 }
 
 static bool lock(void)
@@ -212,6 +214,7 @@ void power_protect_boot(void)
     nvs_handle_t h;
     esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
     const char *unreadable = NULL;
+    bool nvs_absent = err == ESP_ERR_NVS_NOT_FOUND;
     if (err == ESP_OK) {
         uint8_t blob[PP_BLOB_LEN];
         size_t len = sizeof blob;
@@ -222,30 +225,42 @@ void power_protect_boot(void)
         } else if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
             unreadable = esp_err_to_name(err);
         }
+        nvs_absent = err == ESP_ERR_NVS_NOT_FOUND;
     } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         unreadable = esp_err_to_name(err);
     }
     const pp_clock_t clk = clock_now();
-    if (unreadable != NULL) {
-        ESP_LOGW(TAG, "persisted state unreadable (%s) - starting at no_flash", unreadable);
-        pp_load_unreadable(&s_core, clk);
-    }
 
     const esp_reset_reason_t rr = esp_reset_reason();
     const bool brownout = rr == ESP_RST_BROWNOUT;
     const bool power_lost = brownout || rr == ESP_RST_POWERON || rr == ESP_RST_PWR_GLITCH;
-    /* A state NVS refused, kept in RTC memory: newer than the blob. Only a
-     * reset without power loss keeps it; otherwise it is dropped unread. */
-    pp_persist_t unwritten;
-    if (!power_lost && unwritten_take(&unwritten)) {
-        ESP_LOGW(TAG, "adopting the unwritten state %s (reason %s) from before the reset",
-                 pp_state_name((pp_state_t)unwritten.state), pp_reason_name((pp_reason_t)unwritten.reason));
-        s_core.p = unwritten;
-        s_core.persist_fault = true;   /* not on record until the next write */
-    } else {
-        unwritten_drop();
+    /* The newer record by generation wins. The RTC mirror only counts after
+     * a reset without power loss (after one it is gone or garbage), and only
+     * when NVS holds no record as new: it is then ahead by protective
+     * updates NVS refused. It is not consumed: until NVS takes a newer
+     * record, every such reset adopts it again. */
+    pp_persist_t rtc;
+    bool adopted = false;
+    if (!power_lost && rtc_load(&rtc) &&
+        (unreadable != NULL || nvs_absent || rtc.gen > s_core.p.gen)) {
+        ESP_LOGW(TAG, "adopting the newer record from RTC memory: %s (reason %s, gen %lu over %lu)",
+                 pp_state_name((pp_state_t)rtc.state), pp_reason_name((pp_reason_t)rtc.reason),
+                 (unsigned long)rtc.gen, (unsigned long)(unreadable != NULL || nvs_absent ? 0 : s_core.p.gen));
+        pp_core_init(&s_core);
+        s_core.p = rtc;
+        s_core.persist_fault = true;   /* not on record until NVS takes it */
+        adopted = true;
+    } else if (unreadable != NULL) {
+        ESP_LOGW(TAG, "persisted state unreadable (%s) - starting at no_flash", unreadable);
+        pp_load_unreadable(&s_core, clk);
     }
     lock();
+    if (adopted) {
+        /* Put it on record (same generation: it is the same record). Once per
+         * boot; on failure the mirror stays armed. */
+        if (persist(&s_core.p) == ESP_OK) write_ok();
+    }
+    rtc_store(&s_core.p);   /* the mirror always holds the current record */
     if (power_lost && !brownout) {
         /* Power-on / power glitch: a probation in flight failed. (A brownout
          * is decided by pp_on_boot, with its history entry.) */
@@ -269,12 +284,15 @@ void power_protect_on_power_read(power_read_reason_t reason, const power_reading
 {
     if (!lock()) return;   /* before boot: nothing to protect yet */
     const int64_t now = mono_ms();
-    s_before = s_core;
-    const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, now, clock_now());
-    if (ev.relaxes) {
-        commit_relaxation(&ev, &s_before, now);
-    } else {
-        (void)apply(&ev);
+    const pp_clock_t clk = clock_now();
+    /* The read's protective facts (low veto, evidence, failures) are applied
+     * and written first, whatever happens to a relaxation it makes due. */
+    const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, now, clk);
+    (void)apply(&ev);
+    if (ev.relax_due != PP_RELAX_NONE) {
+        s_cand = s_core;
+        const pp_event_t rel = pp_relax(&s_cand, (pp_relax_t)ev.relax_due, now, clk);
+        if (rel.relaxes) (void)commit_relaxation(&rel, now, true);
     }
     unlock();
 }
@@ -358,12 +376,24 @@ esp_err_t power_protect_force(pp_state_t state)
 {
     if (state != PP_STATE_NO_FLASH && state != PP_STATE_HOLD) return ESP_ERR_INVALID_ARG;
     if (!lock()) return ESP_ERR_INVALID_STATE;
-    const pp_event_t ev = pp_force(&s_core, state, clock_now());
+    /* Run on a copy: forcing a LOWER state (hold -> no_flash) is a relaxation
+     * and takes effect only once on record; a refused write leaves the unit
+     * where it was (the reply says persist_failed, with that state). Forcing
+     * up applies at once, like every protective update. */
+    s_cand = s_core;
+    const pp_event_t ev = pp_force(&s_cand, state, clock_now());
     if (!ev.changed && ev.persist) {
         /* Same state, now forced: not a transition, but worth a line. */
         ESP_LOGW(TAG, "power_protect: %s now forced", pp_state_name(state));
     }
-    const esp_err_t err = apply(&ev);
+    esp_err_t err;
+    if (ev.relaxes) {
+        err = commit_relaxation(&ev, mono_ms(), false);
+    } else {
+        s_cand.persist_fault = s_core.persist_fault;
+        s_core = s_cand;
+        err = apply(&ev);
+    }
     unlock();
     return err;
 }
@@ -371,11 +401,15 @@ esp_err_t power_protect_force(pp_state_t state)
 esp_err_t power_protect_clear(void)
 {
     if (!lock()) return ESP_ERR_INVALID_STATE;
-    const pp_event_t ev = pp_clear(&s_core, clock_now());
-    if (!ev.changed && ev.persist) {
-        ESP_LOGW(TAG, "power_protect: brownout history cleared");
+    /* clear lowers protection: on record first (see power_protect_force). */
+    s_cand = s_core;
+    const pp_event_t ev = pp_clear(&s_cand, clock_now());
+    if (!ev.persist) {
+        unlock();
+        return ESP_OK;   /* nothing to clear */
     }
-    const esp_err_t err = apply(&ev);
+    if (!ev.changed) ESP_LOGW(TAG, "power_protect: brownout history cleared");
+    const esp_err_t err = commit_relaxation(&ev, mono_ms(), false);
     unlock();
     return err;
 }

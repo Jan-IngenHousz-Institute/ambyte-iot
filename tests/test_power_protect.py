@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 47)
+        self.assertGreaterEqual(len(self.scenarios), 52)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -107,7 +107,10 @@ class PowerProtectHostTest(unittest.TestCase):
                      "blob_v1_upgrade", "idle_rail_entry_unchanged",
                      # review round 1 (each fails on b4103f5)
                      "probe_step_commit_fault", "failure_commit_fault", "relaxation_commit_fault",
-                     "low_veto_survives_reboot", "low_writes_bounded"):
+                     "low_veto_survives_reboot", "low_writes_bounded",
+                     # review round 2 (each fails on 92f1698)
+                     "rtc_repeated_resets", "reset_at_commit_boundary", "rejected_relaxation_keeps_low",
+                     "low_clock_trust_change", "operator_relaxation_needs_record"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):

@@ -96,10 +96,13 @@ holds bench boards.
   refuses updates (docs/power-protect.md). A shed run is NOT a failure (no fail streak) and
   never touches the event log or its cursor; its NVS blob is written only on transitions
   (probe steps and their pass/failure included), brownout records, a protected unit's fresh
-  low read (first, then at most hourly), force and clear — never per read or heartbeat. A
-  relaxation (probe step, probation pass, accumulated exit) is written BEFORE it takes effect;
-  a refused write keeps the unit protected (retry after 1 h). An unwritten protective state
-  survives non-power resets in RTC_NOINIT; a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
+  low read (first, dating/undating on clock-trust change, then at most hourly), force and
+  clear — never per read or heartbeat. ONE generation-ordered record: every write is gen+1
+  (never reused); protective updates go RTC_NOINIT mirror then NVS; relaxations (probe step,
+  probation pass, accumulated exit, clear, force down) go NVS FIRST and are adopted only on
+  success (refused: stay protected, keep the read's low veto, retry after 1 h; operator: not
+  applied). Boot adopts the newer valid record by gen (RTC only after a non-power reset, never
+  consumed); a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
   evidence (accumulated, 30 min within 12 h; on exit `battery_v` 0 = judge the rail as the battery,
   entry unchanged: a 0 never triggers);
   battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on

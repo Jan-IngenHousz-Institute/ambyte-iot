@@ -778,7 +778,7 @@ from RAM on every heartbeat (never an NVS access).
 | `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or `battery_v` in (0, 3.40 V); `battery_v` 0 alone never triggers), `forced`, `power_recovered` (30 min of qualifying external power accumulated within 12 h; with `battery_v` 0 the rail must meet the 3.70 V battery threshold), `cleared`, `state_unreadable` (the persisted state existed but could not be read: started protected), `brownout_unordered` (a further brownout that neither a valid clock nor the boot counter could order: escalated to `hold`), `probe` (battery-only probe: one level down on probation, `hold` → `no_flash` or `no_flash` → `normal`), `probe_failed` (a brownout, power-on or power glitch on probation, → `hold`; or a fresh read below the entry thresholds, back to the level the probe left). Unknown future values are preserved. |
 | `since_utc` | integer or null | UTC seconds when `state` was entered; `null` when the clock was not valid then (`clock.source` `hwm`, or a suspect RTC). |
 | `forced` | boolean | An operator `force`; never auto-exits, only `clear` ends it. |
-| `persist_fault` | boolean | The stored copy is not trustworthy: it was unreadable at boot (then `reason: state_unreadable`), the last write failed (a relaxation then did not happen; a protective state holds in RAM and an RTC copy), or the state came from that RTC copy after a reset. Cleared by the next successful write. |
+| `persist_fault` | boolean | The stored copy is not trustworthy: it was unreadable at boot (then `reason: state_unreadable`), the last write failed (a relaxation then did not happen; a protective record holds in RAM and the RTC mirror), or the record came from that mirror after a reset and is not yet on NVS. Cleared by the next successful write. |
 | `brownouts_6h` | integer | Recorded brownouts in the last 6 h: by UTC when both clocks are valid; else, with boot counts known, the run of consecutive brownout boots ending at this boot; an entry neither can date counts (conservative) until `clear`. |
 | `qualifying_s` | integer | Qualifying external-power evidence collected inside the 12-h horizon (RAM, restarts at boot); 30 min (1800) exits. 0 in `normal` and in a forced state. |
 | `probe` | string enum | Battery-only probe: `off` (`normal` not on probation, or a forced state), `waiting` (counting the quiet period), `probation` (a probe step is on its 24-h probation), `exhausted` (6 failed probes: only a qualifying exit or `clear` ends it), `no_monitor` (no charger read answered this boot: no probe, fail-closed). Unknown future values are preserved. |
@@ -1174,8 +1174,10 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
   or not `no_flash`/`hold` with `force`; present with `status`/`clear`),
   `busy` (another power_protect op in flight, or a QoS 1 duplicate),
   `queue_unavailable`, `maintenance_active` (`clear`/`force` while another
-  maintenance op holds the lock), `persist_failed` (the state applied in RAM,
-  the NVS write failed: it will not survive a reboot), `no_mem`. Refusals carry
+  maintenance op holds the lock), `persist_failed` (the NVS write failed: a
+  `clear` or force down was NOT applied, the reply carries the unchanged
+  state; a force up applied in RAM and RTC memory, survives resets without
+  power loss but not a power loss), `no_mem`. Refusals carry
   `state` too.
 
 ### Updates refused by brownout protection

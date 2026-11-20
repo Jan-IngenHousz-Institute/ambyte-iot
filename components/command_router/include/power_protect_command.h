@@ -23,7 +23,9 @@
  *   invalid_state (missing/unknown with force, present with status/clear).
  *   Runtime refusals: busy, queue_unavailable, maintenance_active, no_mem.
  *   A force/clear whose NVS write failed answers ok:false "persist_failed"
- *   with the (already applied in RAM) state.
+ *   with the state after it: unchanged for clear / a force down (relaxations
+ *   apply only once on record), the forced state for a force up (applied in
+ *   RAM and RTC memory).
  *
  * Execution: the esp-mqtt task only parses, validates and copies a bounded
  * request; the power_protect API (mutex, NVS) runs on the maintenance worker.

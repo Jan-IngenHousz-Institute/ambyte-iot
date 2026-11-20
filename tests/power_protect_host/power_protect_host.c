@@ -12,6 +12,7 @@
  *
  * usage: power_protect_host <scenario> | --list   (exit 0 = PASS)
  * Command scenarios also print "REPLY <json>" lines for test_power_protect.py. */
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,12 @@
 #define HAVE_DURABILITY 1
 #else
 #define HAVE_DURABILITY 0
+#endif
+/* And the generation-ordered record of review round 2 (s_rtc mirror). */
+#ifdef PP_RTC_MAGIC
+#define HAVE_GEN 1
+#else
+#define HAVE_GEN 0
 #endif
 
 #define CHECK(cond, ...) do { if (!(cond)) { \
@@ -83,6 +90,12 @@ static size_t  g_blob_len;       /* 0 = not found */
 static int     g_writes;
 static bool    g_fail_writes;
 static esp_err_t g_open_err = ESP_OK, g_get_err = ESP_OK;   /* injected read-side failures */
+/* Reset injection at the NVS boundary: 1 = the unit resets as nvs_set_blob
+ * starts (nothing stored), 2 = right after nvs_commit (stored, but the glue
+ * never gets to update RAM / the RTC mirror). The test longjmps out of the
+ * glue and calls reboot(), which resets every static the glue owns. */
+static jmp_buf g_reset_jump;
+static int     g_reset_at;
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
 {
     CHECK(strcmp(ns, "pwr_protect") == 0, "namespace %s", ns);
@@ -105,13 +118,19 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_
 {
     (void)h;
     CHECK(strcmp(key, "state") == 0 && len <= sizeof g_blob, "key %s len %zu", key, len);
+    if (g_reset_at == 1) { g_reset_at = 0; longjmp(g_reset_jump, 1); }
     if (g_fail_writes) return ESP_FAIL;
     memcpy(g_blob, value, len);
     g_blob_len = len;
     g_writes++;
     return ESP_OK;
 }
-esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+esp_err_t nvs_commit(nvs_handle_t h)
+{
+    (void)h;
+    if (g_reset_at == 2) { g_reset_at = 0; longjmp(g_reset_jump, 1); }
+    return ESP_OK;
+}
 void nvs_close(nvs_handle_t h) { (void)h; }
 
 /* ── helpers ───────────────────────────────────────────────────────────── */
@@ -123,9 +142,13 @@ static void reboot(esp_reset_reason_t rr, uint32_t boot, bool clock_valid)
 {
     s_mtx = NULL;
     memset(&s_core, 0, sizeof s_core);
-#if HAVE_DURABILITY
+#if HAVE_GEN
     /* RTC_NOINIT memory survives resets without power loss; after a power
      * loss it holds garbage. */
+    if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT || rr == ESP_RST_PWR_GLITCH) {
+        memset(&s_rtc, 0xA5, sizeof s_rtc);
+    }
+#elif HAVE_DURABILITY
     if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT || rr == ESP_RST_PWR_GLITCH) {
         memset(&s_unwritten, 0xA5, sizeof s_unwritten);
     }
@@ -773,7 +796,7 @@ static void blob_v1_upgrade(void)
     p.state = PP_STATE_HOLD; p.reason = PP_REASON_REPEAT_BROWNOUT; p.since_utc = (int64_t)g_utc;
     p.hist_n = 2; p.hist[0] = (pp_brownout_t){(int64_t)g_utc - 600, 2}; p.hist[1] = (pp_brownout_t){(int64_t)g_utc, 3};
     uint8_t v2[PP_BLOB_LEN];
-    CHECK(pp_encode(&p, v2, sizeof v2) == PP_BLOB_LEN && PP_BLOB_LEN == 124 && PP_BLOB_V1_LEN == 113, "lens");
+    CHECK(pp_encode(&p, v2, sizeof v2) == PP_BLOB_LEN && PP_BLOB_LEN == 128 && PP_BLOB_V1_LEN == 113, "lens");
     /* v1 = v2 without the two probe bytes, version 1, its own CRC. */
     memcpy(g_blob, v2, PP_BLOB_V1_LEN - 4);
     g_blob[0] = 1;
@@ -803,7 +826,7 @@ static void blob_v1_upgrade(void)
     bad = p; bad.has_low = true; bad.low_utc = 1763152200;
     pp_encode(&bad, v2, sizeof v2);
     CHECK(pp_decode(&q, v2, sizeof v2) && q.has_low && q.low_utc == 1763152200, "durable low round trip");
-    v2[PP_BLOB_LEN - 4 - 9] = 0;      /* has_low 0 with a low_utc: refused (CRC fixed below) */
+    v2[PP_BLOB_LEN - 4 - 4 - 9] = 0;  /* has_low 0 with a low_utc: refused (CRC fixed below) */
     {
         const uint32_t crc = crc32_v1(v2, PP_BLOB_LEN - 4);
         for (int i = 0; i < 4; i++) v2[PP_BLOB_LEN - 4 + i] = (uint8_t)(crc >> (8 * i));
@@ -819,7 +842,7 @@ static void blob_v1_upgrade(void)
     CHECK(!pp_decode(&q, v2, sizeof v2), "v1 byte, v2 length");
     /* An unreadable blob assumes the longest backoff wait (level cap). */
     g_blob[7] ^= 1;
-    reboot(ESP_RST_SW, 5, true);
+    reboot(ESP_RST_POWERON, 5, true);   /* (after a power loss: no RTC mirror) */
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == PP_PROBE_LEVEL_CAP && s_core.persist_fault, "unreadable");
 #endif
 }
@@ -994,6 +1017,171 @@ static void low_writes_bounded(void)
     CHECK(g_writes == w2 + 2, "dated once the clock is valid (%d)", g_writes - w2);
 }
 
+/* ── scenarios: one generation-ordered record (review of PR #113, round 2) ─ */
+
+#if HAVE_RECOVERY
+/* [P1] A failed probe that NVS refused stays protected through ANY number of
+ * resets without power loss, for every such reset kind, with and without a
+ * valid clock and a boot counter; and is put on record once NVS works. */
+static void rtc_repeated_resets(void)
+{
+    static const esp_reset_reason_t kinds[] = { ESP_RST_SW, ESP_RST_TASK_WDT, ESP_RST_INT_WDT, ESP_RST_PANIC,
+                                                ESP_RST_WDT };
+    for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        for (int clk = 0; clk < 2; clk++) {
+            for (int counter = 0; counter < 2; counter++) {
+                g_blob_len = 0;
+                g_fail_writes = false;
+                reboot(ESP_RST_BROWNOUT, counter ? 2 : 0, clk);
+                quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+                CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "setup");
+                g_fail_writes = true;
+                reboot(ESP_RST_BROWNOUT, counter ? 3 : 0, clk);
+                CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "failure in RAM");
+                for (uint32_t r = 0; r < 3; r++) {
+                    reboot(kinds[i], counter ? 4 + r : 0, clk);
+                    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1 && s_core.persist_fault,
+                          "kind %d clk %d counter %d reset %u: state %d fails %u", kinds[i], clk, counter, r, st(),
+                          (unsigned)s_core.p.probe_fails);
+                }
+                /* NVS back: the next reset puts the record on NVS by itself. */
+                g_fail_writes = false;
+                reboot(kinds[i], counter ? 9 : 0, clk);
+                CHECK(st() == PP_STATE_HOLD && !s_core.persist_fault, "synced at boot");
+                reboot(ESP_RST_POWERON, counter ? 10 : 0, clk);
+                CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "and on record after a power loss");
+            }
+        }
+    }
+}
+
+/* [P2] A reset at either NVS boundary, for a protective update and for a
+ * relaxation: the newer record wins, an older RTC copy never overrides a
+ * newer durable one, and a relaxation only exists if it reached NVS. */
+static void reset_at_commit_boundary(void)
+{
+    /* The reviewer's case: an unwritten low record leaves the RTC copy ahead
+     * (no_flash probation); NVS recovers; a probation failure (-> hold) is
+     * committed and the unit resets before RAM/RTC are updated. */
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NO_FLASH, "no_flash probation");
+    g_fail_writes = true;
+    good_reads(3, 4100, 3500);                          /* a low record NVS refuses */
+    g_fail_writes = false;
+    g_reset_at = 2;
+    if (setjmp(g_reset_jump) == 0) read5(POWER_READ_OK, 3200, 3350, true, true);   /* probation fails */
+    CHECK(g_reset_at == 0, "the reset was injected");
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1 && s_core.p.reason == PP_REASON_PROBE_FAILED,
+          "the durable hold wins over the older RTC copy (state %d fails %u)", st(), (unsigned)s_core.p.probe_fails);
+    reboot(ESP_RST_TASK_WDT, 5, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "and keeps winning");
+
+    /* Protective update, reset BEFORE NVS stores it: the RTC copy is newer. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 10, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "normal probation");
+    g_reset_at = 1;
+    if (setjmp(g_reset_jump) == 0) good_reads(3, 3250, 3900);   /* fails the probation -> no_flash */
+    CHECK(g_reset_at == 0, "the reset was injected");
+    reboot(ESP_RST_SW, 11, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "RTC copy ahead of NVS wins (state %d)", st());
+
+    /* Relaxation, reset BEFORE NVS stores it: never happened. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 20, true);
+    g_reset_at = 1;
+    if (setjmp(g_reset_jump) == 0) quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);   /* the probe step */
+    CHECK(g_reset_at == 0, "the reset was injected");
+    reboot(ESP_RST_SW, 21, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE, "an unwritten probe never happened");
+    /* Relaxation, reset AFTER NVS committed it: it is on record, so it holds. */
+    g_reset_at = 2;
+    if (setjmp(g_reset_jump) == 0) quiet_reads(POWER_READ_NO_INPUT, 60);
+    CHECK(g_reset_at == 0, "the reset was injected");
+    reboot(ESP_RST_SW, 22, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "a committed probe holds");
+}
+
+/* [P2] A rejected relaxation keeps the protective facts of its read. */
+static void rejected_relaxation_keeps_low(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NO_FLASH, "no_flash probation");
+    advance_s(PP_PROBATION_S - (g_utc - s_core.p.since_utc) - 15);
+    good_reads(2, 4100, 3900);
+    advance_s(5);
+    g_fail_writes = true;
+    read5(POWER_READ_OK, 4100, 3500, true, true);   /* a low read AND the pass due; NVS refuses */
+    CHECK(s_core.have_low && s_core.p.probation == PP_PROBATION_NO_FLASH, "pass refused, low kept");
+    g_fail_writes = false;
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NONE && st() == PP_STATE_NO_FLASH, "passed after the hold");
+    quiet_reads(POWER_READ_NO_INPUT, 4 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "no probe within 6 h of the low read");
+    quiet_reads(POWER_READ_NO_INPUT, H + 120);
+    CHECK(st() == PP_STATE_NORMAL, "6 h after the low read: probe");
+}
+
+/* [P2] trusted -> untrusted low -> trusted reboot: the newest low still vetoes. */
+static void low_clock_trust_change(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    good_reads(3, 4100, 3500);                      /* dated low */
+    CHECK(s_core.p.has_low && s_core.p.low_utc != 0, "dated");
+    reboot(ESP_RST_SW, 3, false);                   /* clock not trusted (hwm) */
+    for (int i = 0; i < 8 * 720; i++) read5(POWER_READ_OK, 4100, 3500, true, true);   /* 8 h of lows */
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.has_low && s_core.p.low_utc == 0, "switched to undated");
+    reboot(ESP_RST_SW, 4, true);                    /* trust back */
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 120);
+    CHECK(st() == PP_STATE_NO_FLASH, "undated low: the quiet period counts from boot");
+    quiet_reads(POWER_READ_NO_INPUT, 240);
+    CHECK(st() == PP_STATE_NORMAL, "then the probe");
+    /* The suspect-RTC path is the same: a low read while suspect undates it. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 10, true);
+    good_reads(3, 4100, 3500);
+    g_suspect = true;
+    good_reads(3, 4100, 3500);
+    CHECK(s_core.p.has_low && s_core.p.low_utc == 0, "suspect RTC undates it");
+    g_suspect = false;
+    good_reads(3, 4100, 3500);
+    CHECK(s_core.p.low_utc != 0, "and trust dates it again");
+}
+
+/* clear and a force DOWN are relaxations: on record first, or not at all.
+ * A force UP applies at once and is kept in the RTC mirror. */
+static void operator_relaxation_needs_record(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD, "hold");
+    g_fail_writes = true;
+    CHECK(power_protect_clear() != ESP_OK && st() == PP_STATE_HOLD && s_core.p.hist_n == 2,
+          "a refused clear changes nothing (state %d)", st());
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) != ESP_OK && st() == PP_STATE_HOLD,
+          "a refused force down changes nothing");
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_HOLD, "and nothing comes back after a reset");
+    /* force up with NVS refusing: applied, survives a reset, not a power loss */
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 5, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) != ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced, "forced up");
+    reboot(ESP_RST_SW, 6, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "kept across a reset");
+    reboot(ESP_RST_POWERON, 7, true);
+    CHECK(st() == PP_STATE_NORMAL, "but not a power loss (never on record)");
+    g_fail_writes = false;
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && power_protect_force(PP_STATE_NO_FLASH) == ESP_OK &&
+          st() == PP_STATE_NO_FLASH && power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL, "with NVS: all apply");
+}
+#endif
+
 static void low_voltage_trigger(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
@@ -1127,7 +1315,7 @@ static void persistence_roundtrip(void)
     p.hist[0] = (pp_brownout_t){1763152200, 2};
     p.hist[1] = (pp_brownout_t){0, UINT32_MAX};
     uint8_t b[PP_BLOB_LEN], b2[PP_BLOB_LEN];
-    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 124, "len");
+    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 128, "len");
     CHECK(pp_encode(&p, b, PP_BLOB_LEN - 1) == 0, "short buffer refused");
     pp_persist_t q;
     CHECK(pp_decode(&q, b, sizeof b), "decode");
@@ -1175,12 +1363,22 @@ static void persistence_roundtrip(void)
  * resume full load on a NON-brownout reboot. */
 static void unreadable_state_is_protected(void)
 {
-    /* forced hold, one stored byte flipped, a watchdog (sw) reboot */
+    /* forced hold, one stored byte flipped. A reset WITHOUT power loss finds
+     * the record in the RTC mirror (newer than an unreadable NVS) and puts it
+     * back on record at once. */
     reboot(ESP_RST_POWERON, 1, true);
     CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "force");
     g_blob[20] ^= 0x10;
-    const int w = g_writes;
+#if HAVE_GEN
+    const int w0 = g_writes;
     reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced && !s_core.persist_fault && g_writes == w0 + 1,
+          "RTC mirror restores and repairs the forced hold (state %d)", st());
+    g_blob[20] ^= 0x10;
+#endif
+    /* After a power loss the mirror is gone: unreadable = no_flash. */
+    const int w = g_writes;
+    reboot(ESP_RST_POWERON, 2, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE && !s_core.p.forced,
           "state %d reason %d", st(), s_core.p.reason);
     CHECK(s_core.persist_fault && g_writes == w, "flagged, nothing written at boot");
@@ -1191,22 +1389,22 @@ static void unreadable_state_is_protected(void)
     power_protect_status_t s;
     power_protect_get_status(&s);
     CHECK(s.persist_fault && s.state == PP_STATE_NO_FLASH, "status");
-    /* Still unreadable on the next boot (not repaired yet): still protected. */
-    reboot(ESP_RST_INT_WDT, 3, true);
+    /* Still unreadable on the next power-on (not repaired yet): still protected. */
+    reboot(ESP_RST_POWERON, 3, true);
     CHECK(st() == PP_STATE_NO_FLASH && g_writes == w, "no write until a transition");
-    /* Exits through the normal 30-min window; that transition repairs NVS. */
+    /* Exits through accumulated evidence; that transition repairs NVS. */
     good_reads(READS_30MIN + 2, 4100, 3900);
     CHECK(st() == PP_STATE_NORMAL && g_writes == w + 1 && !s_core.persist_fault, "recovered + repaired");
     reboot(ESP_RST_SW, 4, true);
     CHECK(st() == PP_STATE_NORMAL && !s_core.persist_fault, "repaired blob reads back");
     /* ... or through clear. */
     g_blob[30] ^= 1;
-    reboot(ESP_RST_SW, 5, true);
+    reboot(ESP_RST_POWERON, 5, true);
     CHECK(st() == PP_STATE_NO_FLASH && power_protect_clear() == ESP_OK && st() == PP_STATE_NORMAL &&
           !s_core.persist_fault, "clear repairs");
     /* A stored blob of the wrong size is unreadable too. */
     g_blob_len = PP_BLOB_LEN - 1;
-    reboot(ESP_RST_SW, 6, true);
+    reboot(ESP_RST_POWERON, 6, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.persist_fault, "short blob");
 }
 
@@ -1217,7 +1415,11 @@ static void read_failures_are_protected(void)
     reboot(ESP_RST_BROWNOUT, 3, true);
     CHECK(st() == PP_STATE_HOLD, "hold stored");
     g_get_err = ESP_FAIL;
+#if HAVE_GEN
     reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_HOLD, "a reset without power loss keeps hold from the RTC mirror");
+#endif
+    reboot(ESP_RST_POWERON, 4, true);
     CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_STATE_UNREADABLE && s_core.persist_fault,
           "get_blob failure");
     g_get_err = ESP_OK;
@@ -1524,6 +1726,13 @@ static const scenario_t k_scenarios[] = {
     {"relaxation_commit_fault", relaxation_commit_fault},
 #endif
     {"low_veto_survives_reboot", low_veto_survives_reboot},
+#if HAVE_RECOVERY
+    {"rtc_repeated_resets", rtc_repeated_resets},
+    {"reset_at_commit_boundary", reset_at_commit_boundary},
+    {"rejected_relaxation_keeps_low", rejected_relaxation_keeps_low},
+    {"low_clock_trust_change", low_clock_trust_change},
+    {"operator_relaxation_needs_record", operator_relaxation_needs_record},
+#endif
     {"low_writes_bounded", low_writes_bounded},
     {"low_voltage_trigger", low_voltage_trigger},
     {"hold_never_exits_on_battery", hold_never_exits_on_battery},
