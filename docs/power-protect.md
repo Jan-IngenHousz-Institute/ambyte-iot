@@ -409,18 +409,40 @@ The model is now one record, ordered by generation:
     for an hour: at most one write attempt an hour while NVS refuses.
   - An operator relaxation that NVS refuses is **not applied**. The reply is
     `persist_failed` with the unchanged state.
-  - **An NVS error is not proof that nothing was written.** The pinned
-    ESP-IDF's `Storage::writeItem` writes the new blob first and can fail
-    after it: `ESP_ERR_NVS_REMOVE_FAILED` erasing the old copy, or any error
-    from `eraseMultiPageBlob`. So after any error the record is **re-read**,
-    and what NVS returns now is what the next boot reads.
-    - If the new record is there, the relaxation stands: state, log line and
-      reply say so (`ok`, with a warning in the log).
-    - If it is not there, the relaxation is refused as above.
-    - If the re-read fails, the outcome is unknown, so the relaxation is
-      **fenced**: a newer protective record (the unchanged state, generation
-      + 1 again) goes to RTC and NVS, so a relaxation that did land can never
-      win at a later boot. The reply is `persist_failed`.
+  - **An NVS error is not proof that nothing was written, and an immediate
+    re-read is not proof of anything except a positive read of the new
+    record.** This is shown on the pinned ESP-IDF itself: its `Storage`,
+    `Page` and `PageManager` run on an in-memory partition with fault
+    injection (`tests/power_protect_host/nvs_native`).
+    - `Storage::writeItem` writes the new blob first and can fail after it:
+      `ESP_ERR_NVS_REMOVE_FAILED` erasing the old copy, or any error from
+      `eraseMultiPageBlob`.
+    - An immediate read then returns NOT_FOUND (`Page::alterEntryState`
+      invalidated the page for this boot; reopening a handle does not reset
+      that) or even the OLD record. After a re-init (the next boot) it
+      returns the NEW one.
+  - So after any error, **only a positive read of exactly the new record
+    counts as landed**: the relaxation stands, and state, log line and reply
+    say so (`ok`, with a warning in the log). Anything else (absent, the old
+    record, unreadable) is **unknown** and is **fenced**:
+    - A newer protective record (the unchanged state; the relaxation's
+      generation is consumed) goes to RTC and NVS, **twice**. A write that
+      failed part-way can leave a stray chunk under the next blob version
+      while this boot's `Storage` still holds the old index. The first fence
+      then lands under that same version, reports `ESP_OK`, and after a
+      re-init the stray relaxed record is what NVS returns (found by the
+      native matrix). The second write toggles the version, and its erase of
+      the previous version removes the strays.
+    - If the second fence write is confirmed (clean, or a positive read), the
+      reply is `persist_failed`: the relaxation **cannot win at any later
+      boot**, after a reset or a power loss.
+    - If it is not confirmed, the reply is **`persist_unconfirmed`**. The
+      fence is then only in RTC: the unit is protected now and after any
+      reset without power loss, and that reset's boot puts the fence on NVS.
+      **Stated limit:** a power loss before such a reset reads NVS, and a
+      relaxation that did land there wins. On the real IDF this happens when
+      a flash fault leaves its `Storage` refusing writes for the rest of the
+      boot. Total NVS failure cannot be made durable.
 - **At boot the newer record by generation wins.** RTC is only considered
   after a reset without power loss, and only for the current NVS epoch. It
   then wins over NVS when its generation is higher, or when NVS is absent or
@@ -428,16 +450,27 @@ The model is now one record, ordered by generation:
   mirror stays armed until NVS holds a newer record.
 - **The NVS epoch** binds RTC records to one NVS lifetime. It is a random
   non-zero number in NVS (`pwr_protect/epoch`), created once when absent:
-  one NVS write per NVS lifetime.
+  one NVS write per NVS lifetime. Its creation is a write like any other, so
+  the epoch is whatever **reads back** afterwards, whatever the write
+  reported. If there is no epoch yet, creation is retried after every write
+  NVS takes and before every automatic relaxation.
   - A deliberate NVS rewrite or wipe (flash_gui provisioning, `clean_nvs`)
     creates a new epoch. That rewrite ends in a USB or watchdog reset, which
     keeps RTC memory, but an RTC record from before it is never adopted.
-  - An epoch that exists but cannot be *read* proves no rewrite. The newest
-    valid RTC record's own epoch is used, so an NVS read fault does not cost
-    the retained protection.
-  - With no epoch at all (absent and not creatable), RTC records are neither
-    written nor adopted. NVS is then refusing every write anyway, so
-    protection holds in RAM only.
+  - **The one exception (chosen policy: continuity).** An epoch that exists
+    but cannot be *read* proves no rewrite, so the newest valid RTC record's
+    own epoch is used. An NVS read fault then does not cost the retained
+    protection. The flip side: a rewritten NVS whose new epoch key is
+    unreadable at that boot would adopt a foreign RTC record. That needs a
+    rewrite *and* an unreadable epoch at the same boot, and what it brings
+    back is a protective record.
+  - **With no epoch at all** (absent and not creatable), RTC records are
+    neither written nor adopted, and **no automatic relaxation happens**. A
+    failure after such a relaxation that NVS refused could not survive a
+    reset. Review round 4 found exactly that: a first upgrade boot with a
+    transient NVS fault, then a probe, then a refused failure, came back at
+    full load after a software reset. The relaxation waits an hour and
+    retries; operator relaxations still apply.
 - **A stored probation after a power loss is a failed probe.** That covers a
   brownout, power-on or power-glitch reset, where the RTC copy is gone.
   After any other reset it goes on: failing it on the nightly reboot would
@@ -466,8 +499,8 @@ flowchart TD
     B["boot"] --> PL{"power lost?<br/>(brownout, power-on, glitch)"}
     PL -->|no| CMP{"RTC valid for this NVS epoch,<br/>newer than NVS (or NVS absent / unreadable)?"}
     CMP -->|yes| AD["adopt RTC, write it to NVS once,<br/>the mirror stays armed"]
-    C -->|"error, re-read shows it landed"| A
-    C -->|"error, re-read impossible"| FE["fence: newer protective record<br/>to RTC and NVS, refuse"]
+    C -->|"error, positive read of the new record"| A
+    C -->|"error, anything but a positive read of the new record"| FE["fence twice: newer protective record<br/>to RTC and NVS, refuse<br/>(not confirmed: persist_unconfirmed)"]
     CMP -->|no| NV["NVS record"]
     PL -->|yes| NV2["NVS record (RTC gone):<br/>a stored probation fails → hold"]
 ```
@@ -663,9 +696,13 @@ sequenceDiagram
 - `clear` and a force **down** (`hold` → `no_flash`) lower protection, so like
   every relaxation they take effect only once NVS has them: if the write
   fails nothing changes and the reply is `persist_failed` with the unchanged
-  state. If NVS reports an error but the re-read shows the record landed, it
-  stands and the reply is `ok` (the state is what the next boot reads); if
-  the re-read is impossible, it is fenced and refused. A force **up** applies at once; if NVS refuses it the reply is
+  state. If NVS reports an error but a positive read shows the new record, it
+  stands and the reply is `ok`. Anything else is fenced and refused:
+  `persist_failed` when the fence is confirmed on NVS (it cannot win later),
+  `persist_unconfirmed` when it is not. In that case it is protected now and
+  across resets, but **a power loss before the next reset may let the
+  relaxation win** (stated limit: total NVS failure cannot be made durable).
+  A force **up** applies at once; if NVS refuses it the reply is
   `persist_failed`, the forced state holds in RAM and the RTC mirror
   (surviving resets without power loss), and a power loss loses it.
 - Runs on the resident maintenance worker, the same pattern as
@@ -736,6 +773,20 @@ run fails unless every reply confirms the requested state. In Actions →
       force down, the automatic probe step) stands and is reported as such;
       with the re-read failing it is fenced across a reset and a power loss;
       a rewritten NVS (new epoch) never adopts the old RTC record;
+    - (round 4) a write that lands and errors and then re-reads as NOT_FOUND
+      or as the OLD record is fenced, for the operator `clear` and the probe
+      step, across a reset and a power loss; a first boot that cannot create
+      the epoch keeps a later refused failure across a software reset, and an
+      epoch write that lands with an error is read back; without an epoch no
+      automatic relaxation happens; a refused fence is reported as
+      `persist_unconfirmed`, and its stated limit (a direct power loss) is
+      asserted;
+    - (round 4, `NativeNvsRelaxationTest`) the production glue on the PINNED
+      ESP-IDF NVS on an in-memory partition: an operator `clear` and the
+      probe step with a fault at each of the first 16 raw writes and 16 reads.
+      An applied relaxation stands everywhere; a `persist_failed` one never
+      wins after a reset or a direct power loss; a `persist_unconfirmed` one
+      never wins after a reset;
   - NVS writes only on transitions; the command codec and its allocation
     failures.
 
@@ -746,7 +797,11 @@ run fails unless every reply confirms the requested state. In Actions →
   `health.power_protect` through the production `pp_render_json`: the
   max-width heartbeat is 6637 of 8192 bytes. The 5 round-2 regressions
   build against round-1 head 92f1698, where all 5 fail; the 3 round-3
-  regressions build against round-2 head 85205f0, where all 3 fail.
+  regressions build against round-2 head 85205f0, where all 3 fail; the
+  round-4 regressions build against round-3 head e0d4e2e, where 4 fail, the
+  codec reply reads `persist_failed` instead of `persist_unconfirmed`, and
+  the native matrix fails at the reviewer's point (write fault 4:
+  REMOVE_FAILED, refused, NORMAL after the next reset).
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.

@@ -50,6 +50,12 @@ static int     g_rtc_reset_at;
 #else
 #define HAVE_DURABILITY 0
 #endif
+/* Round 4: POWER_PROTECT_ERR_UNCONFIRMED (fence confirmation). */
+#ifdef POWER_PROTECT_ERR_UNCONFIRMED
+#define HAVE_EPOCH_R4 1
+#else
+#define HAVE_EPOCH_R4 0
+#endif
 /* And the generation-ordered record of review round 2 (s_rtc mirror). */
 #ifdef PP_RTC_MAGIC
 #define HAVE_GEN 1
@@ -95,6 +101,22 @@ void host_log(char level, const char *tag, const char *fmt, ...)
     (void)tag;
 }
 
+#ifdef PP_NATIVE_NVS
+/* -DPP_NATIVE_NVS: the NVS calls below go to the PINNED ESP-IDF NVS on an
+ * in-memory partition (nvs_native/nvs_native.cpp), not to the fake. */
+void native_format(void);
+void native_reinit(void);
+void native_fault(int write_at, int read_at);
+int  native_open(int readwrite);
+int  native_get_blob(void *out, size_t *len);
+int  native_set_blob(const void *src, size_t len);
+int  native_get_u32(uint32_t *out);
+int  native_set_u32(uint32_t value);
+#define NATIVE(call) return (call)
+#else
+#define NATIVE(call) ((void)0)
+#endif
+
 /* One-slot NVS for namespace "pwr_protect", key "state". */
 static uint8_t g_blob[256];
 static size_t  g_blob_len;       /* 0 = not found */
@@ -105,9 +127,23 @@ static esp_err_t g_open_err = ESP_OK, g_get_err = ESP_OK;   /* injected read-sid
  * IDF's Storage::writeItem can (ESP_ERR_NVS_REMOVE_FAILED erasing the old
  * copy). Counts down: each such write decrements it. */
 static int     g_write_then_fail;
+/* What the pinned IDF does right after such a write (native repro of PR #113
+ * round 4): 1 = reads return NOT_FOUND (Page::alterEntryState invalidated the
+ * page for this boot), 2 = reads return the OLD record; either way the NEW
+ * one is read after a re-init (reboot() clears it). */
+static int     g_hide_after_write;
+/* After such a landed-then-error write, NVS refuses every further write
+ * (the fence too) until reboot. */
+static bool    g_refuse_after_landed;
+static bool    g_landed_then_failed;
+static int     g_hidden;
+static uint8_t g_old_blob[256];
+static size_t  g_old_len;
 /* The epoch key (u32). 0 = absent. */
 static uint32_t g_epoch;
 static int      g_epoch_writes;
+static bool     g_fail_epoch_writes;   /* epoch writes refused, state writes not */
+static bool     g_epoch_lands_error;   /* the epoch write lands, then reports an error */
 /* Every pp_encode from the glue passes through here (-Wl,--wrap=pp_encode):
  * g_encode_reset_n > 0 resets the unit AT the n-th call from now. */
 static int g_encode_reset_n;
@@ -121,6 +157,8 @@ uint32_t esp_random(void) { static uint32_t x = 0x2545F491u; x = x * 1664525u + 
 esp_err_t nvs_open(const char *ns, nvs_open_mode_t mode, nvs_handle_t *out)
 {
     CHECK(strcmp(ns, "pwr_protect") == 0, "namespace %s", ns);
+    *out = 7;
+    NATIVE(native_open(mode == NVS_READWRITE));
     if (mode == NVS_READONLY && g_open_err != ESP_OK) return g_open_err;
     *out = 7;
     return ESP_OK;
@@ -129,6 +167,7 @@ esp_err_t nvs_get_u32(nvs_handle_t h, const char *key, uint32_t *out)
 {
     (void)h;
     CHECK(strcmp(key, "epoch") == 0, "key %s", key);
+    NATIVE(native_get_u32(out));
     if (g_get_err != ESP_OK) return g_get_err;
     if (g_epoch == 0) return ESP_ERR_NVS_NOT_FOUND;
     *out = g_epoch;
@@ -138,16 +177,26 @@ esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t value)
 {
     (void)h;
     CHECK(strcmp(key, "epoch") == 0, "key %s", key);
-    if (g_fail_writes) return ESP_FAIL;
+    NATIVE(native_set_u32(value));
+    if (g_fail_writes || g_fail_epoch_writes) return ESP_FAIL;
     g_epoch = value;
     g_epoch_writes++;
-    return ESP_OK;
+    return g_epoch_lands_error ? 0x1108 : ESP_OK;
 }
 esp_err_t nvs_get_blob(nvs_handle_t h, const char *key, void *out, size_t *len)
 {
     (void)h;
     CHECK(strcmp(key, "state") == 0, "key %s", key);
+    NATIVE(native_get_blob(out, len));
     if (g_get_err != ESP_OK) return g_get_err;
+    if (g_hidden == 1) return ESP_ERR_NVS_NOT_FOUND;
+    if (g_hidden == 2) {
+        if (g_old_len == 0) return ESP_ERR_NVS_NOT_FOUND;
+        if (*len < g_old_len) return ESP_ERR_INVALID_SIZE;
+        memcpy(out, g_old_blob, g_old_len);
+        *len = g_old_len;
+        return ESP_OK;
+    }
     if (g_blob_len == 0) return ESP_ERR_NVS_NOT_FOUND;
     if (*len < g_blob_len) return ESP_ERR_INVALID_SIZE;
     memcpy(out, g_blob, g_blob_len);
@@ -158,13 +207,20 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *value, size_
 {
     (void)h;
     CHECK(strcmp(key, "state") == 0 && len <= sizeof g_blob, "key %s len %zu", key, len);
+    NATIVE(native_set_blob(value, len));
     if (g_reset_at == 1) { g_reset_at = 0; longjmp(g_reset_jump, 1); }
-    if (g_fail_writes) return ESP_FAIL;
+    if (g_fail_writes || (g_refuse_after_landed && g_landed_then_failed)) return ESP_FAIL;
+    if (g_hide_after_write && g_write_then_fail > 0) {
+        memcpy(g_old_blob, g_blob, g_blob_len);
+        g_old_len = g_blob_len;
+        g_hidden = g_hide_after_write;
+    }
     memcpy(g_blob, value, len);
     g_blob_len = len;
     g_writes++;
     if (g_write_then_fail > 0) {
         g_write_then_fail--;
+        g_landed_then_failed = true;
         return 0x1108;   /* ESP_ERR_NVS_REMOVE_FAILED: written, old copy not erased */
     }
     return ESP_OK;
@@ -186,6 +242,11 @@ static void reboot(esp_reset_reason_t rr, uint32_t boot, bool clock_valid)
 {
     s_mtx = NULL;
     memset(&s_core, 0, sizeof s_core);
+    g_hidden = 0;   /* a re-init reads what NVS really holds */
+    g_landed_then_failed = false;
+#ifdef PP_NATIVE_NVS
+    native_reinit();
+#endif
 #if HAVE_GEN
     /* RTC_NOINIT memory survives resets without power loss; after a power
      * loss it holds garbage. */
@@ -1348,6 +1409,261 @@ static void rtc_bound_to_nvs_epoch(void)
 }
 #endif
 
+/* ── scenarios: round 4 (only a read of the NEW record proves it landed;
+ *    no relaxation without a reset-safe RTC identity) ───────────────────── */
+
+#if HAVE_RECOVERY
+/* [P2] REMOVE_FAILED, then the immediate re-read shows NOTHING (mode 1) or
+ * the OLD record (mode 2) while the new one is what the next boot reads:
+ * neither proves "not landed", both are fenced. Operator clear and the
+ * automatic probe step; after a reset and after a power loss. */
+static void relaxation_reread_inconclusive(void)
+{
+    for (int mode = 1; mode <= 2; mode++) {
+        g_blob_len = 0;
+        reboot(ESP_RST_POWERON, 1, true);
+        CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "mode %d: durable forced hold", mode);
+        g_write_then_fail = 1;
+        g_hide_after_write = mode;
+        CHECK(power_protect_clear() != ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced,
+              "mode %d: an unproven clear is refused (state %d)", mode, st());
+        g_hide_after_write = 0;
+        reboot(ESP_RST_SW, 2, true);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "mode %d: fenced across a reset (state %d)", mode, st());
+        reboot(ESP_RST_POWERON, 3, true);
+        CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "mode %d: and across a power loss (state %d)", mode, st());
+        /* the automatic probe step */
+        g_blob_len = 0;
+        reboot(ESP_RST_BROWNOUT, 4, true);
+        quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
+        g_write_then_fail = 1;
+        g_hide_after_write = mode;
+        quiet_reads(POWER_READ_NO_INPUT, 120);
+        g_hide_after_write = 0;
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE,
+              "mode %d: an unproven probe step never takes effect (state %d)", mode, st());
+        CHECK(!s_core.persist_fault, "mode %d: the fence is on NVS: the durable record is the state", mode);
+        reboot(ESP_RST_SW, 5, true);
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE, "mode %d: fenced (reset)", mode);
+        reboot(ESP_RST_POWERON, 6, true);
+        CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE, "mode %d: fenced (power loss)",
+              mode);
+    }
+}
+
+/* [P2] The first upgrade boot cannot create the epoch (transient NVS fault):
+ * NVS recovers, a probe is taken, NVS refuses again and the probe fails. The
+ * failure must survive a software reset. */
+static void epoch_missing_first_boot(void)
+{
+    g_epoch = 0;
+    g_fail_writes = true;
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    CHECK(st() == PP_STATE_NO_FLASH, "protected on a brownout");
+    g_fail_writes = false;
+    good_reads(3, 3500, 3500);                         /* a low record: NVS takes it */
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "probation on record");
+    CHECK(g_epoch != 0, "the epoch was created once NVS took writes again");
+    g_fail_writes = true;
+    good_reads(3, 3250, 3900);                         /* the probation fails; NVS refuses */
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "failure in RAM");
+    reboot(ESP_RST_SW, 3, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1,
+          "the failure survives a software reset (state %d fails %u)", st(), (unsigned)s_core.p.probe_fails);
+    g_fail_writes = false;
+    /* An epoch write that lands but reports an error is read back. */
+    g_blob_len = 0;
+    g_epoch = 0;
+    g_epoch_lands_error = true;
+    reboot(ESP_RST_BROWNOUT, 10, true);
+    g_epoch_lands_error = false;
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL, "probation on record");
+    g_fail_writes = true;
+    good_reads(3, 3250, 3900);
+    reboot(ESP_RST_SW, 11, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "landed-with-error epoch is used");
+    g_fail_writes = false;
+}
+
+/* No epoch at all (its write keeps failing while state writes work): no
+ * automatic relaxation, until it can be created. */
+static void no_epoch_no_relaxation(void)
+{
+    g_epoch = 0;
+    g_fail_epoch_writes = true;
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    quiet_reads(POWER_READ_NO_INPUT, 12 * H);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NONE,
+          "no probe without a reset-safe identity (state %d)", st());
+    good_reads(READS_30MIN + 30, 4100, 3900);
+    CHECK(st() == PP_STATE_NO_FLASH, "no accumulated exit either");
+    g_fail_epoch_writes = false;
+    good_reads(800, 4100, 3900);                   /* past the 1-h hold, still qualifying */
+    CHECK(g_epoch != 0 && st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED,
+          "once the epoch exists, the exit commits (state %d)", st());
+    /* and the probe likewise */
+    g_blob_len = 0;
+    g_epoch = 0;
+    g_fail_epoch_writes = true;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    quiet_reads(POWER_READ_NO_INPUT, 7 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "held");
+    g_fail_epoch_writes = false;
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(g_epoch != 0 && st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NORMAL,
+          "then the probe (state %d)", st());
+}
+#endif
+
+#ifdef PP_NATIVE_NVS
+#ifndef POWER_PROTECT_ERR_UNCONFIRMED   /* (so the matrix also runs against e0d4e2e) */
+#define POWER_PROTECT_ERR_UNCONFIRMED ESP_ERR_NOT_FINISHED
+#endif
+/* A relaxation (operator clear of a forced hold; the automatic probe step)
+ * against the REAL IDF NVS, with a fault at every raw entry-table write and
+ * every read of the attempt in turn. Whatever the IDF reports, the outcome
+ * must be one of: it stands (ok, and every later boot reads it), or it is
+ * refused and fenced on NVS (persist_failed, and every later boot, after a
+ * reset AND after a power loss, is still protected), or the fence is not
+ * confirmed (persist_unconfirmed: protected now and after a reset). Prints
+ * one NATIVE line per fault point for test_power_protect.py. */
+static void native_relaxation_matrix(void)
+{
+    int n_ok = 0, n_refused = 0, n_unconfirmed = 0;
+    for (int kind = 0; kind < 2; kind++) {
+        for (int at = 1; at <= 16; at++) {
+            /* operator clear */
+            native_format();
+            reboot(ESP_RST_POWERON, 1, true);
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+            native_fault(kind == 0 ? at : 0, kind == 1 ? at : 0);
+            const esp_err_t err = power_protect_clear();
+            native_fault(0, 0);
+            const pp_state_t now = st();
+            reboot(ESP_RST_SW, 2, true);
+            const pp_state_t after_reset = st();
+            const bool forced_reset = s_core.p.forced;
+            reboot(ESP_RST_POWERON, 3, true);
+            const pp_state_t after_loss = st();
+            /* the same fault, then a power loss straight away (no reset in
+             * between to sync the RTC fence to NVS) */
+            native_format();
+            reboot(ESP_RST_POWERON, 4, true);
+            CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "setup");
+            native_fault(kind == 0 ? at : 0, kind == 1 ? at : 0);
+            const esp_err_t err2 = power_protect_clear();
+            native_fault(0, 0);
+            reboot(ESP_RST_POWERON, 5, true);
+            const pp_state_t direct_loss = st();
+            CHECK(err2 == err, "deterministic");
+            printf("NATIVE clear %s_fault=%d result=%#x now=%s reset=%s power_loss=%s direct_loss=%s\n",
+                   kind ? "read" : "write", at, (unsigned)err, pp_state_name(now), pp_state_name(after_reset),
+                   pp_state_name(after_loss), pp_state_name(direct_loss));
+            if (err == ESP_OK) {
+                n_ok++;
+                CHECK(now == PP_STATE_NORMAL && after_reset == PP_STATE_NORMAL && after_loss == PP_STATE_NORMAL &&
+                      direct_loss == PP_STATE_NORMAL,
+                      "%s %d: an applied clear stands", kind ? "read" : "write", at);
+            } else if (err == POWER_PROTECT_ERR_UNCONFIRMED) {
+                n_unconfirmed++;
+                CHECK(now == PP_STATE_HOLD && after_reset == PP_STATE_HOLD && forced_reset,
+                      "%s %d: unconfirmed, still protected now and after a reset", kind ? "read" : "write", at);
+            } else {
+                n_refused++;
+                CHECK(now == PP_STATE_HOLD && after_reset == PP_STATE_HOLD && forced_reset &&
+                      after_loss == PP_STATE_HOLD && direct_loss == PP_STATE_HOLD,
+                      "%s %d: a refused clear never wins (now %d reset %d loss %d)", kind ? "read" : "write", at, now,
+                      after_reset, after_loss);
+            }
+            /* the automatic probe step */
+            native_format();
+            reboot(ESP_RST_BROWNOUT, 10, true);
+            quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
+            native_fault(kind == 0 ? at : 0, kind == 1 ? at : 0);
+            quiet_reads(POWER_READ_NO_INPUT, 120);
+            native_fault(0, 0);
+            const bool probed = st() == PP_STATE_NORMAL;
+            reboot(ESP_RST_SW, 11, true);
+            const pp_state_t p_reset = st();
+            reboot(ESP_RST_POWERON, 12, true);
+            const pp_state_t p_loss = st();
+            printf("NATIVE probe %s_fault=%d probed=%d reset=%s power_loss=%s\n", kind ? "read" : "write", at,
+                   probed, pp_state_name(p_reset), pp_state_name(p_loss));
+            if (probed) {
+                CHECK(p_reset == PP_STATE_NORMAL, "%s %d: a taken probe is on record", kind ? "read" : "write", at);
+            } else if (!s_core.persist_fault) {
+                CHECK(p_reset == PP_STATE_NO_FLASH, "%s %d: an untaken probe never appears (reset)",
+                      kind ? "read" : "write", at);
+            }
+        }
+    }
+    printf("NATIVE_SUMMARY ok=%d refused=%d unconfirmed=%d\n", n_ok, n_refused, n_unconfirmed);
+    CHECK(n_refused > 0, "the matrix must hit the REMOVE_FAILED path");
+}
+#endif
+
+#if HAVE_RECOVERY
+/* The fence itself is refused (documented limit, round 4): the reply says the
+ * outcome is UNCONFIRMED; the unit is protected now and after a reset (RTC
+ * fence), and after a POWER LOSS the clear that did land wins: total NVS
+ * failure cannot be made durable. */
+static void fence_unconfirmed(void)
+{
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
+    g_write_then_fail = 1;
+    g_hide_after_write = 1;
+    g_refuse_after_landed = true;
+    const esp_err_t err = power_protect_clear();
+#if HAVE_EPOCH_R4
+    CHECK(err == POWER_PROTECT_ERR_UNCONFIRMED, "the reply says unconfirmed (%#x)", (unsigned)err);
+#endif
+    CHECK(err != ESP_OK && st() == PP_STATE_HOLD && s_core.p.forced && s_core.persist_fault, "still protected");
+    g_hide_after_write = 0;
+    /* NVS still refusing: a reset keeps the RTC fence... */
+    g_fail_writes = true;
+    reboot(ESP_RST_SW, 2, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "after a reset: the RTC fence holds (state %d)", st());
+    /* ...but a power loss before NVS takes any write reads the landed clear. */
+    reboot(ESP_RST_POWERON, 3, true);
+    CHECK(st() == PP_STATE_NORMAL, "after a power loss the landed clear wins: the documented limit");
+    g_fail_writes = false;
+    g_refuse_after_landed = false;
+    /* Once NVS takes writes again, a reset in between puts the fence on NVS
+     * (the boot sync of the adopted RTC record) and the limit is closed. */
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 4, true);
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
+    g_write_then_fail = 1;
+    g_hide_after_write = 1;
+    g_refuse_after_landed = true;
+    CHECK(power_protect_clear() != ESP_OK, "unconfirmed");
+    g_hide_after_write = 0;
+    g_refuse_after_landed = false;
+    reboot(ESP_RST_SW, 5, true);
+    reboot(ESP_RST_POWERON, 6, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "synced fence survives a later power loss (state %d)", st());
+}
+
+static void cmd_init(void);
+static void cmd(const char *json, bool run);
+static void cmd_persist_unconfirmed(void)
+{
+    reboot(ESP_RST_POWERON, 1, true);
+    cmd_init();
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "durable forced hold");
+    g_write_then_fail = 1;
+    g_hide_after_write = 1;
+    g_refuse_after_landed = true;
+    cmd("{\"type\":\"power_protect\",\"id\":\"u1\",\"action\":\"clear\"}", true);
+    g_hide_after_write = 0;
+    g_refuse_after_landed = false;
+    CHECK(st() == PP_STATE_HOLD, "still protected");
+}
+#endif
+
 static void low_voltage_trigger(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
@@ -1901,6 +2217,14 @@ static const scenario_t k_scenarios[] = {
     {"rtc_store_interrupted", rtc_store_interrupted},
     {"relaxation_write_then_error", relaxation_write_then_error},
     {"rtc_bound_to_nvs_epoch", rtc_bound_to_nvs_epoch},
+    {"relaxation_reread_inconclusive", relaxation_reread_inconclusive},
+    {"epoch_missing_first_boot", epoch_missing_first_boot},
+    {"no_epoch_no_relaxation", no_epoch_no_relaxation},
+    {"fence_unconfirmed", fence_unconfirmed},
+    {"cmd_persist_unconfirmed", cmd_persist_unconfirmed},
+#endif
+#ifdef PP_NATIVE_NVS
+    {"native_relaxation_matrix", native_relaxation_matrix},
 #endif
     {"low_writes_bounded", low_writes_bounded},
     {"low_voltage_trigger", low_voltage_trigger},

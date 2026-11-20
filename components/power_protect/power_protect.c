@@ -219,29 +219,65 @@ static uint32_t rtc_any_epoch(void)
     return e;
 }
 
-/* The NVS epoch (see s_rtc): read, or created once when absent. */
-static uint32_t epoch_load(bool power_lost)
+/* The epoch key: 1 = read (*out), 0 = absent, -1 = present but unreadable. */
+static int epoch_read(uint32_t *out)
 {
     nvs_handle_t h;
-    uint32_t e = 0;
     esp_err_t err = nvs_open(PP_NVS_NS, NVS_READONLY, &h);
     if (err == ESP_OK) {
-        err = nvs_get_u32(h, PP_NVS_EPOCH, &e);
+        err = nvs_get_u32(h, PP_NVS_EPOCH, out);
         nvs_close(h);
-        if (err == ESP_OK && e != 0) return e;
+        if (err == ESP_OK && *out != 0) return 1;
     }
-    if (err != ESP_ERR_NVS_NOT_FOUND) {
-        /* Present but unreadable: not a rewrite. Keep the RTC record's own. */
-        return power_lost ? 0 : rtc_any_epoch();
-    }
-    /* Absent (a new NVS, or one rewritten / wiped since): a new epoch. One
-     * write per NVS lifetime. */
+    return err == ESP_ERR_NVS_NOT_FOUND ? 0 : -1;
+}
+
+/* A new epoch, one write per NVS lifetime. Like every write here, a reported
+ * error is not proof that nothing landed (round 4 of the PR #113 review):
+ * whatever the write says, the epoch is what reads back. 0 = none. */
+static uint32_t epoch_create(void)
+{
+    uint32_t e;
     do { e = esp_random(); } while (e == 0);
-    if (nvs_open(PP_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return 0;
-    err = nvs_set_u32(h, PP_NVS_EPOCH, e);
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    return err == ESP_OK ? e : 0;
+    nvs_handle_t h;
+    if (nvs_open(PP_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_u32(h, PP_NVS_EPOCH, e) == ESP_OK) (void)nvs_commit(h);
+        nvs_close(h);
+    }
+    uint32_t back = 0;
+    return epoch_read(&back) == 1 ? back : 0;
+}
+
+/* The NVS epoch at boot (see s_rtc). */
+static uint32_t epoch_load(bool power_lost)
+{
+    uint32_t e = 0;
+    const int r = epoch_read(&e);
+    if (r == 1) return e;
+    /* Present but unreadable: not a rewrite. Keep the RTC record's own. */
+    if (r < 0) return power_lost ? 0 : rtc_any_epoch();
+    return epoch_create();   /* absent: a new NVS, or one rewritten / wiped since */
+}
+
+static void rtc_store(const pp_persist_t *p);
+
+/* Under s_mtx. Without an epoch the RTC mirror is off, so nothing survives a
+ * reset that NVS refused (round 4: a first boot that could not create the
+ * epoch, then a probe that NVS took and a failure it refused, came back at
+ * full load after a software reset). So: try again whenever NVS has just
+ * taken a write and before every automatic relaxation; once it exists, arm
+ * the mirror with the current record. */
+static bool epoch_ensure(void)
+{
+    if (s_epoch != 0) return true;
+    uint32_t e = 0;
+    const int r = epoch_read(&e);
+    s_epoch = r == 1 ? e : r == 0 ? epoch_create() : 0;
+    if (s_epoch != 0) {
+        ESP_LOGW(TAG, "NVS epoch established: RTC mirror armed");
+        rtc_store(&s_core.p);
+    }
+    return s_epoch != 0;
 }
 
 /* Under s_mtx. One ESP_LOGE per state transition: v2.18.0's diag hook turns
@@ -268,6 +304,7 @@ static void write_ok(void)
         ESP_LOGW(TAG, "persisted state repaired");
         s_core.persist_fault = false;
     }
+    (void)epoch_ensure();   /* NVS takes writes again: a missing epoch now */
 }
 
 /* Under s_mtx. A PROTECTIVE (or neutral) event already applied to s_core:
@@ -295,59 +332,82 @@ static esp_err_t apply(const pp_event_t *ev)
  * on record. A refused write consumes the generation number and leaves s_core
  * (with every protective fact of the read) as it is; an automatic relaxation
  * then waits PP_RELAX_RETRY_MS. */
+/* Does NVS, read back now, hold exactly this record? */
+static bool nvs_holds(const pp_persist_t *p)
+{
+    pp_persist_t durable;
+    const char *why = NULL;
+    if (nvs_record(&durable, &why) != REC_OK) return false;
+    uint8_t a[PP_BLOB_LEN], b[PP_BLOB_LEN];
+    return pp_encode(&durable, a, sizeof a) == PP_BLOB_LEN && pp_encode(p, b, sizeof b) == PP_BLOB_LEN &&
+           memcmp(a, b, sizeof a) == 0;
+}
+
+/* Write a record and learn whether it is on NVS: true only on a clean write
+ * or a POSITIVE read of exactly this record afterwards. */
+static bool persist_confirmed(const pp_persist_t *p, esp_err_t *err_out)
+{
+    const esp_err_t err = persist(p);
+    *err_out = err;
+    return err == ESP_OK || nvs_holds(p);
+}
+
 static esp_err_t commit_relaxation(const pp_event_t *ev, int64_t now_ms, bool automatic)
 {
     s_cand.p.gen = s_core.p.gen + 1;
-    esp_err_t err = persist(&s_cand.p);
-    bool landed = err == ESP_OK;
-    bool unknown = false;
-    if (!landed) {
-        /* An NVS error does not mean nothing was written: the pinned IDF's
-         * Storage::writeItem writes the new blob first and can fail after it
-         * (ESP_ERR_NVS_REMOVE_FAILED erasing the old copy, or any error from
-         * eraseMultiPageBlob; review of PR #113, round 3). Re-read: what NVS
-         * returns now is what the next boot reads. */
-        pp_persist_t durable;
-        const char *why = NULL;
-        const rec_status_t rs = nvs_record(&durable, &why);
-        if (rs == REC_OK) {
-            uint8_t a[PP_BLOB_LEN], b[PP_BLOB_LEN];
-            landed = pp_encode(&durable, a, sizeof a) == PP_BLOB_LEN &&
-                     pp_encode(&s_cand.p, b, sizeof b) == PP_BLOB_LEN && memcmp(a, b, sizeof a) == 0;
-        } else {
-            unknown = rs == REC_UNREADABLE;
-        }
-        if (landed) {
-            ESP_LOGW(TAG, "NVS reported %s, but the record is on NVS: %s -> %s stands", esp_err_to_name(err),
+    /* An NVS error does not mean nothing was written: the pinned IDF's
+     * Storage::writeItem writes the new blob first and can fail after it
+     * (ESP_ERR_NVS_REMOVE_FAILED erasing the old copy, or any error from
+     * eraseMultiPageBlob; round 3). Nor does what an immediate re-read
+     * returns decide it: after REMOVE_FAILED the native IDF reads NOT_FOUND
+     * (Page::alterEntryState invalidated the page for this boot; reopening a
+     * handle does not reset that) or even the OLD record, and the NEW one is
+     * read after a re-init (round 4, native repro on the real Storage). So
+     * only a POSITIVE read of the new record counts as landed; anything else
+     * (absent, old, unreadable) is unknown, and fenced. */
+    esp_err_t err;
+    if (persist_confirmed(&s_cand.p, &err)) {
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "NVS reported %s, but the record reads back: %s -> %s stands", esp_err_to_name(err),
                      pp_state_name(ev->from), pp_state_name(ev->to));
-            err = ESP_OK;   /* the durable truth: it happened */
         }
+        s_cand.persist_fault = s_core.persist_fault;
+        s_core = s_cand;
+        rtc_store(&s_core.p);
+        write_ok();
+        publish(ev);
+        return ESP_OK;
     }
-    if (!landed) {
-        s_core.p.gen = s_cand.p.gen;   /* never reuse a number that may have landed */
-        if (unknown) {
-            /* Cannot tell whether it landed: FENCE it. A newer protective
-             * record (the unchanged state) to RTC and NVS, so a relaxation
-             * that did land can never win at the next boot. */
-            s_core.p.gen++;
-            rtc_store(&s_core.p);
-            (void)persist(&s_core.p);
-        }
-        s_core.persist_fault = true;
-        if (automatic) s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
-        ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s%s%s", pp_state_name(ev->from),
-                 pp_state_name(ev->to), ev->probe_passed ? "probe_passed" : pp_reason_name(ev->reason),
-                 esp_err_to_name(err), pp_state_name(ev->from), unknown ? " (fenced)" : "",
-                 automatic ? ", next try in 60 min" : "");
-        s_state_pub = s_core.p.state;
-        return err;
-    }
-    s_cand.persist_fault = s_core.persist_fault;
-    s_core = s_cand;
+    /* Unknown: FENCE it. A newer protective record (the unchanged state; the
+     * relaxation's number is consumed, never reused) to RTC and NVS. Only a
+     * fence that is itself confirmed on NVS outranks a relaxation that may
+     * have landed at EVERY later boot; a fence only in RTC covers resets
+     * without power loss, and after a power loss the landed relaxation can
+     * win (POWER_PROTECT_ERR_UNCONFIRMED; documented limit). */
+    s_core.p.gen = s_cand.p.gen + 1;
     rtc_store(&s_core.p);
-    write_ok();
-    publish(ev);
-    return ESP_OK;
+    esp_err_t fence_err;
+    bool fenced = persist_confirmed(&s_core.p, &fence_err);
+    /* ...twice. The native IDF matrix (tests/power_protect_host/nvs_native)
+     * found a write that failed part-way leaving a stray chunk under the NEXT
+     * blob version, while this boot's Storage still holds the old index: the
+     * first fence is then written under that same version, reports ESP_OK,
+     * and after a re-init the stray RELAXED record is what NVS returns. A
+     * second write toggles the version, and its eraseMultiPageBlob of the
+     * previous version removes the stray chunks with the first fence. Only
+     * the second write's outcome confirms anything. */
+    s_core.p.gen++;
+    rtc_store(&s_core.p);
+    fenced = persist_confirmed(&s_core.p, &fence_err);
+    s_core.persist_fault = !fenced;
+    if (automatic) s_core.relax_hold_until_ms = now_ms + PP_RELAX_RETRY_MS;
+    ESP_LOGW(TAG, "%s -> %s (%s) not committed: %s - staying %s, %s%s", pp_state_name(ev->from),
+             pp_state_name(ev->to), ev->probe_passed ? "probe_passed" : pp_reason_name(ev->reason),
+             esp_err_to_name(err), pp_state_name(ev->from),
+             fenced ? "fenced on NVS" : "fence NOT confirmed on NVS (RTC only: a power loss may let it win)",
+             automatic ? ", next try in 60 min" : "");
+    s_state_pub = s_core.p.state;
+    return fenced ? err : POWER_PROTECT_ERR_UNCONFIRMED;
 }
 
 static bool lock(void)
@@ -434,7 +494,12 @@ void power_protect_on_power_read(power_read_reason_t reason, const power_reading
      * and written first, whatever happens to a relaxation it makes due. */
     const pp_event_t ev = pp_on_read(&s_core, reason, p, fresh_present, now, clk);
     (void)apply(&ev);
-    if (ev.relax_due != PP_RELAX_NONE) {
+    if (ev.relax_due != PP_RELAX_NONE && !epoch_ensure()) {
+        /* No reset-safe identity for the RTC mirror: a failure after this
+         * relaxation that NVS refused could not survive a reset. Hold it. */
+        s_core.relax_hold_until_ms = now + PP_RELAX_RETRY_MS;
+        ESP_LOGW(TAG, "relaxation held: no NVS epoch (RTC mirror off), next try in 60 min");
+    } else if (ev.relax_due != PP_RELAX_NONE) {
         s_cand = s_core;
         const pp_event_t rel = pp_relax(&s_cand, (pp_relax_t)ev.relax_due, now, clk);
         if (rel.relaxes) (void)commit_relaxation(&rel, now, true);

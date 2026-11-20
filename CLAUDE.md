@@ -101,8 +101,12 @@ holds bench boards.
   (never reused); protective updates go RTC_NOINIT mirror then NVS; relaxations (probe step,
   probation pass, accumulated exit, clear, force down) go NVS FIRST and are adopted only on
   success (refused: stay protected, keep the read's low veto, retry after 1 h; operator: not
-  applied; an NVS error is re-read — landed = it stands, unreadable = fenced by a newer
-  protective record). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
+  applied; after an NVS error only a positive read of the new record = landed, anything else
+  (absent/old/unreadable: the pinned IDF can report NOT_FOUND or the OLD value after a landed
+  write) = fenced by a newer protective record written TWICE; an unconfirmed fence replies
+  persist_unconfirmed. No automatic relaxation without an NVS epoch; epoch creation is re-read
+  and retried after every successful write. Evidence: NativeNvsRelaxationTest runs the glue on
+  the pinned IDF NVS with fault injection). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
   to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never
   adopts an old record. Boot adopts the newer valid record by gen (RTC only after a non-power
   reset, never consumed); a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as

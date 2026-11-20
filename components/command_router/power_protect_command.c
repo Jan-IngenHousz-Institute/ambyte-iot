@@ -138,7 +138,11 @@ static void execute(void *arg)
                 : (s_config.clear ? s_config.clear() : ESP_ERR_NOT_SUPPORTED);
             s_config.maintenance_end();
             ok = err == ESP_OK;
-            detail = ok ? (r->action == ACT_FORCE ? "applied" : "cleared") : "persist_failed";
+            /* persist_unconfirmed: a relaxation whose outcome is unknown and
+             * whose protective fence is not confirmed on NVS either (it may
+             * still win after a power loss; power_protect.h). */
+            detail = ok ? (r->action == ACT_FORCE ? "applied" : "cleared")
+                        : err == POWER_PROTECT_ERR_UNCONFIRMED ? "persist_unconfirmed" : "persist_failed";
         }
     }
     if (refusal != NULL) {

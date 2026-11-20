@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 55)
+        self.assertGreaterEqual(len(self.scenarios), 60)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -112,7 +112,10 @@ class PowerProtectHostTest(unittest.TestCase):
                      "rtc_repeated_resets", "reset_at_commit_boundary", "rejected_relaxation_keeps_low",
                      "low_clock_trust_change", "operator_relaxation_needs_record",
                      # review round 3 (each fails on 85205f0)
-                     "rtc_store_interrupted", "relaxation_write_then_error", "rtc_bound_to_nvs_epoch"):
+                     "rtc_store_interrupted", "relaxation_write_then_error", "rtc_bound_to_nvs_epoch",
+                     # review round 4 (each fails on e0d4e2e)
+                     "relaxation_reread_inconclusive", "epoch_missing_first_boot", "no_epoch_no_relaxation",
+                     "fence_unconfirmed", "cmd_persist_unconfirmed"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):
@@ -181,6 +184,13 @@ class PowerProtectHostTest(unittest.TestCase):
         self.assertEqual((r["ok"], r["detail"], r["state"], r["forced"], r["persist_fault"]),
                          (False, "persist_failed", "no_flash", True, True))
 
+    def test_unconfirmed_fence_is_reported(self):
+        # Round 4: a clear whose outcome is unknown and whose fence NVS also
+        # refused must not read as a plain refusal.
+        (r,) = self.replies("cmd_persist_unconfirmed")
+        self.assertEqual((r["ok"], r["detail"], r["state"], r["forced"], r["persist_fault"]),
+                         (False, "persist_unconfirmed", "hold", True, True))
+
     def test_allocation_failures_never_report_partial_success(self):
         replies = self.replies("cmd_no_mem")
         self.assertEqual(len(replies), 61)
@@ -196,6 +206,89 @@ class PowerProtectHostTest(unittest.TestCase):
                 self.assertIn("persist_fault", r)
                 for key in ("qualifying_s", "probe", "next_probe_s", "backoff_level"):
                     self.assertIn(key, r)
+
+
+class NativeNvsRelaxationTest(unittest.TestCase):
+    """Review of PR #113, round 4: the production glue against the PINNED
+    ESP-IDF NVS (nvs_storage / nvs_page / nvs_pagemanager / nvs_types /
+    nvs_item_hash_list from framework-espidf@3.50500.0, compiled verbatim) on
+    an in-memory partition, with a fault at every raw entry-table write and
+    every read of a relaxation in turn (tests/power_protect_host/nvs_native).
+    On this IDF a write can report ESP_ERR_NVS_REMOVE_FAILED after the new
+    blob landed, and an immediate read then returns NOT_FOUND or the OLD
+    value while the next boot reads the NEW one: the glue must still never
+    let a refused relaxation win at a later boot."""
+
+    @classmethod
+    def setUpClass(cls):
+        from pinned_idf import pinned_idf
+        idf = pinned_idf()
+        cls.tmp = tempfile.TemporaryDirectory(prefix="pp-native-nvs-")
+        out = Path(cls.tmp.name)
+        cc = os.environ.get("CC") or shutil.which("clang") or "cc"
+        cxx = shutil.which("clang++") if "clang" in Path(cc).name else (shutil.which("c++") or "c++")
+        san = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"] if "clang" in Path(cc).name else []
+        cjson = idf / "components/json/cJSON"
+        cflags = [*san, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                  "-DPP_NATIVE_NVS", f"-I{HOST / 'include'}", f"-I{ROOT / 'tests/diag_host/include'}",
+                  f"-I{ROOT / 'components/power_protect/include'}", f"-I{ROOT / 'components/domain/include'}",
+                  f"-I{ROOT / 'components/device_commands/include'}",
+                  f"-I{ROOT / 'components/command_router/include'}",
+                  f"-I{ROOT / 'components/clock_trust/include'}", f"-I{ROOT / 'components/diag/include'}",
+                  f"-I{cjson}"]
+        nvs = idf / "components/nvs_flash"
+        cxxflags = [*san, "-std=c++17", "-O1", "-g", "-DNO_DEBUG_STORAGE",
+                    "-include", str(HOST / "nvs_native/include/compat.h"), f"-I{HOST / 'nvs_native/include'}",
+                    f"-I{idf / 'components/esp_common/include'}", f"-I{nvs / 'include'}",
+                    f"-I{nvs / 'private_include'}", f"-I{nvs / 'src'}"]
+        objects = []
+        for src in (HOST / "power_protect_host.c", ROOT / "components/power_protect/power_protect_core.c",
+                    ROOT / "components/device_commands/power_policy.c",
+                    ROOT / "components/command_router/power_protect_command.c", cjson / "cJSON.c"):
+            obj = out / (src.name + ".o")
+            r = subprocess.run([cc, *cflags, "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+            if r.returncode:
+                raise AssertionError(r.stderr)
+            objects.append(str(obj))
+        for src in (HOST / "nvs_native/nvs_native.cpp", *(nvs / "src" / n for n in (
+                "nvs_storage.cpp", "nvs_page.cpp", "nvs_types.cpp", "nvs_pagemanager.cpp",
+                "nvs_item_hash_list.cpp"))):
+            obj = out / (src.name + ".o")
+            r = subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], capture_output=True, text=True)
+            if r.returncode:
+                raise AssertionError(r.stderr)
+            objects.append(str(obj))
+        cls.bin = out / "native"
+        r = subprocess.run([cxx, *san, *objects, "-Wl,--wrap=time", "-Wl,--wrap=pp_encode", "-lm", "-o",
+                            str(cls.bin)], capture_output=True, text=True)
+        if r.returncode:
+            raise AssertionError(r.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_no_refused_relaxation_ever_wins(self):
+        r = subprocess.run([str(self.bin), "native_relaxation_matrix"], capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout[-4000:] + r.stderr[-4000:])
+        self.assertIn("PASS native_relaxation_matrix", r.stdout)
+        clear = [l.split() for l in r.stdout.splitlines() if l.startswith("NATIVE clear ")]
+        self.assertEqual(len(clear), 32)
+        # The matrix reaches the path the review found: REMOVE_FAILED after
+        # the blob landed, refused and fenced, never winning afterwards.
+        self.assertTrue(any("result=0x1108" in " ".join(l) for l in clear), clear)
+        for l in clear:
+            fields = dict(f.split("=", 1) for f in l[2:])
+            result = int(fields["result"], 16)
+            if result == 0:                             # applied: it stands everywhere
+                self.assertEqual((fields["now"], fields["reset"], fields["power_loss"], fields["direct_loss"]),
+                                 ("normal",) * 4, l)
+            elif result == 0x10C:                       # persist_unconfirmed: protected now and after a reset
+                self.assertEqual((fields["now"], fields["reset"], fields["power_loss"]), ("hold",) * 3, l)
+            else:                                       # persist_failed (fence on NVS): never wins anywhere
+                self.assertEqual((fields["now"], fields["reset"], fields["power_loss"], fields["direct_loss"]),
+                                 ("hold",) * 4, l)
+        print("\n".join(l for l in r.stdout.splitlines() if l.startswith("NATIVE")))
 
 
 class DestructivePrimitivesTest(unittest.TestCase):

@@ -1176,9 +1176,14 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
   `queue_unavailable`, `maintenance_active` (`clear`/`force` while another
   maintenance op holds the lock), `persist_failed` (the NVS write failed: a
   `clear` or force down was NOT applied, the reply carries the unchanged
-  state; a write NVS reported as failed but which re-reads as landed is `ok`; a force up applied in RAM and RTC memory, survives resets without
-  power loss but not a power loss), `no_mem`. Refusals carry
-  `state` too.
+  state, and a protective fence on NVS keeps it from winning later; a write
+  NVS reported as failed but which reads back positively is `ok`; a force up
+  applied in RAM and RTC memory, survives resets without power loss but not
+  a power loss), `persist_unconfirmed` (a `clear` or force down whose outcome
+  NVS could not confirm and whose fence NVS could not confirm either: NOT
+  applied, protected now and after resets without power loss, but a power
+  loss before the next reset may let it win; total NVS failure cannot be made
+  durable), `no_mem`. Refusals carry `state` too.
 
 ### Updates refused by brownout protection
 

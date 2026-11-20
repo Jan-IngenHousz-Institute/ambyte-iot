@@ -86,11 +86,19 @@ void power_protect_get_status(power_protect_status_t *out);
 /* health.power_protect. Returns the length, -1 when it does not fit. */
 int power_protect_render_json(char *buf, size_t cap);
 
+/* A relaxation could not be shown to have landed, and the protective fence
+ * written over it could not be confirmed on NVS either: the unit is protected
+ * now and across resets without power loss, but after a power loss the
+ * relaxation may still win. (Command reply detail "persist_unconfirmed".) */
+#define POWER_PROTECT_ERR_UNCONFIRMED ESP_ERR_NOT_FINISHED
+
 /* Operator actions; the return value is the NVS persist result (ESP_OK also
  * when nothing needed writing). clear and a force DOWN (hold -> no_flash) are
- * relaxations: written first, and NOT applied when the write fails (an error
- * after which the record re-reads as landed counts as success: the state is
- * what the next boot reads; an unreadable outcome is fenced). A force
+ * relaxations: written first, and NOT applied when the write fails. After a
+ * write error only a positive read of the new record counts as success;
+ * anything else is fenced by a newer protective record and the result is an
+ * error (POWER_PROTECT_ERR_UNCONFIRMED when the fence is not confirmed on NVS
+ * either). A force
  * UP applies at once; if NVS refuses it, it holds in RAM and the RTC mirror
  * (resets without power loss), not across a power loss. */
 esp_err_t power_protect_force(pp_state_t state);
