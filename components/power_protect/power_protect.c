@@ -2,9 +2,11 @@
  * power_protect.c — target glue for the brownout protection state machine
  * (contract: include/power_protect.h; decisions: power_protect_core.c).
  *
- * NVS namespace "pwr_protect", key "state": the pp_encode blob (113 B). Written
- * ONLY when the core says persist — a state transition, a recorded brownout
- * (at most one per boot), force, clear. Never per read, never per heartbeat:
+ * NVS namespace "pwr_protect", key "state": the pp_encode blob (115 B, v2; the
+ * 113-B v1 blob of the first release is still read). Written ONLY when the
+ * core says persist — a state transition (the probe step and a failed probe
+ * included), a passed probation, a recorded brownout (at most one per boot),
+ * force, clear. Never per read, never per heartbeat:
  * a flash write per 5 s charger read would wear the NVS sector for nothing.
  * RTC_NOINIT is not enough on its own: a brownout is a power-on-class reset,
  * exactly the reset this module exists for, and it clears RTC memory.
@@ -79,6 +81,11 @@ static esp_err_t apply(const pp_event_t *ev)
     if (ev->changed) {
         ESP_LOGE(TAG, "power_protect: %s -> %s reason=%s", pp_state_name(ev->from),
                  pp_state_name(ev->to), pp_reason_name(ev->reason));
+    } else if (ev->probe_passed) {
+        /* Not a state change, but the end of a probe: one line, as distinct
+         * as the transitions (the cloud sees every probe step and outcome). */
+        ESP_LOGE(TAG, "power_protect: %s probation passed reason=probe_passed backoff_level=%u",
+                 pp_state_name(ev->to), (unsigned)s_core.p.probe_fails);
     }
     if (!ev->persist) return ESP_OK;
     const esp_err_t err = persist(&s_core.p);
@@ -144,9 +151,11 @@ void power_protect_boot(void)
     (void)apply(&ev);
     const uint32_t recent = pp_brownouts_6h(&s_core, clk, diag_boot_count());
     unlock();
-    ESP_LOGW(TAG, "boot: state=%s reason=%s forced=%d brownouts_6h=%lu (reset %s, clock %s)",
+    ESP_LOGW(TAG, "boot: state=%s reason=%s forced=%d brownouts_6h=%lu probation=%u backoff_level=%u "
+                  "(reset %s, clock %s)",
              pp_state_name((pp_state_t)s_core.p.state), pp_reason_name((pp_reason_t)s_core.p.reason),
-             s_core.p.forced ? 1 : 0, (unsigned long)recent, brownout ? "brownout" : "other",
+             s_core.p.forced ? 1 : 0, (unsigned long)recent, (unsigned)s_core.p.probation,
+             (unsigned)s_core.p.probe_fails, brownout ? "brownout" : "other",
              clk.valid ? "valid" : "not valid");
 }
 
@@ -196,6 +205,7 @@ void power_protect_get_status(power_protect_status_t *out)
 {
     memset(out, 0, sizeof *out);
     out->exit_in_s = -1;
+    out->recovery.next_probe_s = -1;
     out->skipped = skips_snapshot();
     if (!lock()) {
         out->state = PP_STATE_NORMAL;
@@ -207,9 +217,12 @@ void power_protect_get_status(power_protect_status_t *out)
     out->forced = s_core.p.forced;
     out->since_utc = s_core.p.since_utc;
     out->persist_fault = s_core.persist_fault;
-    out->brownouts_6h = pp_brownouts_6h(&s_core, clock_now(), diag_boot_count());
-    const int64_t left = pp_window_remaining_ms(&s_core, mono_ms());
-    out->exit_in_s = left < 0 ? -1 : left / 1000;
+    const pp_clock_t clk = clock_now();
+    const int64_t now = mono_ms();
+    out->brownouts_6h = pp_brownouts_6h(&s_core, clk, diag_boot_count());
+    const int64_t left = pp_exit_remaining_ms(&s_core, now);
+    out->exit_in_s = left < 0 ? -1 : (left + 999) / 1000;
+    out->recovery = pp_recovery(&s_core, now, clk);
     unlock();
 }
 
@@ -219,13 +232,15 @@ int power_protect_render_json(char *buf, size_t cap)
     if (!lock()) {
         pp_persist_t normal;
         memset(&normal, 0, sizeof normal);
-        return pp_render_json(buf, cap, &normal, false, 0, &skips);
+        return pp_render_json(buf, cap, &normal, false, 0, &skips, NULL);
     }
+    const pp_clock_t clk = clock_now();
     const pp_persist_t p = s_core.p;
     const bool fault = s_core.persist_fault;
-    const uint32_t recent = pp_brownouts_6h(&s_core, clock_now(), diag_boot_count());
+    const uint32_t recent = pp_brownouts_6h(&s_core, clk, diag_boot_count());
+    const pp_recovery_t rec = pp_recovery(&s_core, mono_ms(), clk);
     unlock();
-    return pp_render_json(buf, cap, &p, fault, recent, &skips);
+    return pp_render_json(buf, cap, &p, fault, recent, &skips, &rec);
 }
 
 esp_err_t power_protect_force(pp_state_t state)

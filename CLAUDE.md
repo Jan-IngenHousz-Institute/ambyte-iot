@@ -94,10 +94,13 @@ holds bench boards.
   Host evidence: tests/sdlog_host, tests/ambit_host, tests/evq_host X group.
 - **Brownout protection (2026-11)**: `components/power_protect` sheds whole schedule jobs and
   refuses updates (docs/power-protect.md). A shed run is NOT a failure (no fail streak) and
-  never touches the event log or its cursor; its NVS blob is written only on transitions,
-  brownout records, force and clear — never per read or heartbeat. Only fresh (changing),
-  valid, input-present charger frames may move it; battery-only units can only react to
-  `ESP_RST_BROWNOUT`.
+  never touches the event log or its cursor; its NVS blob is written only on transitions
+  (probe steps and their pass/failure included), brownout records, force and clear — never
+  per read or heartbeat. Only fresh (changing), valid, input-present charger frames count as
+  evidence (accumulated, 30 min within 12 h; `battery_v` 0 = judge the rail as the battery);
+  battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on
+  24-h probation after 6/12/24 h without a brownout, never forced, never without a charger
+  monitor, 6 failures max).
 - **Charger re-detection (2026-11)**: the MP2731 driver pulses REG09 BG_EN (1 then 0,
   both read back, under ONE I2C bus hold, reserved bits preserved) when the chip says
   "no input, not charging" beside a live panel (docs/charger-redetect.md). The

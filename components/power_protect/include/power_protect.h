@@ -57,17 +57,20 @@ typedef struct {
     bool        persist_fault;  /* NVS copy unreadable at boot or last write failed */
     uint32_t    brownouts_6h;
     pp_skips_t  skipped;
-    int64_t     exit_in_s;      /* seconds left in a running exit window; -1 = none */
+    int64_t     exit_in_s;      /* qualifying seconds still needed to exit; -1 = none collected */
+    pp_recovery_t recovery;     /* accumulated evidence, probe, backoff level */
 } power_protect_status_t;
 
 /* Once per boot, after nvs_flash_init + diag_boot_init and after the RTC /
  * clock_trust bootstrap, BEFORE AMBIT boot sync and the schedule runner start
  * (so the first action after a brownout is already shed). Never fails boot:
- * an unreadable blob starts at normal (logged). */
+ * an unreadable blob starts at no_flash, state_unreadable (logged). */
 void power_protect_boot(void);
 
 /* Feed one charger read (device_commands' power-state refresh, after
- * power_gate_step). `fresh_present` = power_gate_flash_ok(). */
+ * power_gate_step). `fresh_present` = power_gate_flash_ok(). This is also
+ * where the accumulated exit, the battery-only probe and the probation are
+ * decided: without charger reads nothing of that runs (fail-closed). */
 void power_protect_on_power_read(power_read_reason_t reason, const power_reading_t *p,
                                  bool fresh_present);
 

@@ -13,6 +13,18 @@ Nothing in the firmware reacted. The rule this feature implements: **detect
 it, stop the risky work, report it, and hold the actions until the power status
 changes.**
 
+The first release left protection only after 30 minutes of *continuous*
+charger-confirmed good power. On the solar units at Uluru (17–20 Nov) that was
+too strict. `14:63:93:37:A0:C4` browned out once at 11:11 ACST, its panel
+delivered nothing (charger `no_input` on 186 of 187 heartbeats), and it stayed
+in `no_flash` all day without a single saturating-pulse measurement. Weak
+panels charge in 80-s bursts and collapse to the 4.3 V floor between them, so
+their batteries recover over hours without ever giving 30 continuous minutes.
+And `10:BD:A3:63:FD:20` left protection on a 3.68 V rail with `battery_v` 0
+(the idle charger's reading, when the rail *is* the battery) and went back to
+`hold` the same day. Recovery now works on accumulated evidence, with a
+battery-only probe, and `battery_v` 0 is judged on the rail (§A, "Exit").
+
 | Part | What the device does | Where it shows up |
 |---|---|---|
 | A. State machine | A persistent `normal` / `no_flash` / `hold` state with the entry and exit rules below | `components/power_protect` (pure core + glue) |
@@ -41,30 +53,38 @@ stateDiagram-v2
     [*] --> normal: no persisted state (first install)
     [*] --> no_flash: persisted state unreadable (state_unreadable, persist_fault)
     normal --> no_flash: brownout boot (first of an episode)
-    normal --> no_flash: fresh read with input, system_v below 3.30 V or battery_v in (0, 3.40 V)
+    normal --> no_flash: fresh read with input, system_v below 3.30 V or battery below 3.40 V
     normal --> hold: brownout boot linked to the previous one (recovered within the episode)
     no_flash --> hold: brownout boot linked to the previous one
     no_flash --> hold: brownout boot whose order is unknown (brownout_unordered)
-    no_flash --> normal: 30 min continuous qualifying external power (not forced)
-    hold --> normal: 30 min continuous qualifying external power (not forced)
+    no_flash --> normal: 30 min of qualifying evidence within 12 h (power_recovered)
+    hold --> normal: 30 min of qualifying evidence within 12 h (power_recovered)
+    hold --> no_flash: probe, after a quiet period on battery (probation)
+    no_flash --> normal: probe, after a quiet period on battery (probation)
+    normal --> hold: brownout on probation (probe_failed)
+    no_flash --> hold: brownout or fresh low read on the hold to no_flash probation (probe_failed)
+    normal --> no_flash: fresh low read on probation (probe_failed)
     normal --> no_flash: force no_flash
     normal --> hold: force hold
     no_flash --> hold: force hold
     hold --> no_flash: force no_flash
     no_flash --> normal: clear
     hold --> normal: clear
-    note right of hold: forced states never auto-exit, a linked brownout still escalates forced no_flash to hold
+    note right of hold: forced states never auto-exit and never probe, a linked brownout still escalates forced no_flash to hold
 ```
 
 **Entry.**
 
 - `normal → no_flash` when this boot's reset reason is `brownout`, or a
-  **fresh** valid read with input present shows `system_v < 3.30 V` or
-  `0 < battery_v < 3.40 V`. Fresh = power_policy's AMBIT-flash evidence
+  **fresh** valid read with input present shows `system_v < 3.30 V` or a
+  battery below 3.40 V. Fresh = power_policy's AMBIT-flash evidence
   (`power_gate_flash_ok`): the latest read valid with input present and the
   ADC frame changing.
-  - `battery_v == 0` with input present means no battery or an idle charger
-    ([power-telemetry.md](power-telemetry.md)). On its own it never triggers.
+  - `battery_v == 0` with input present is the idle charger: the panel is
+    there (VIN 7–8 V) but the chip is not charging, and the unit runs on the
+    battery through the BATFET, so `system_v` **is** the battery voltage.
+    The battery threshold then applies to `system_v` (see "battery_v 0"
+    below).
   - Invalid, stale (frozen frame), `no_input` and input-absent reads never
     trigger.
 - `→ hold` on a brownout **linked** to the previous recorded brownout (below):
@@ -80,22 +100,182 @@ stateDiagram-v2
 - A brownout that is not linked leaves an already protected state as it is
   (the history entry is still recorded).
 
-**Exit.** Either protected state returns to `normal` after **30 minutes of
-continuous qualifying reads**. A read qualifies when it is valid, input is
-present, the frame is fresh, `system_v ≥ 3.60 V`, and `battery_v ≥ 3.70 V` or
-`battery_v == 0` (no battery: the rail alone carries the unit). The thresholds
-sit above the entry ones so a rail at the edge cannot flap.
+**Exit.** A protected, automatic (not forced) state leaves in one of two
+ways: **accumulated evidence** with external power, or a **battery-only probe**
+when there is no evidence at all. A forced state does neither; only `clear`
+ends it.
 
-- Any read that does not qualify restarts the window: invalid, stale,
-  `no_input`, input absent, or a value below the exit thresholds.
-- So does a gap of more than 60 s between reads: nobody looking is not
-  evidence. `device_commands` reads the charger at most every 5 s on demand,
-  and the power-guard task asks every 15 s (`device_commands_power_tick`), so
-  a gap only happens when something is wrong.
-- `hold` therefore never exits on battery.
-- The window lives in RAM. A reboot restarts it.
-- Without a charger monitor there are no reads, so a protected state stays
-  until `clear` (fail-closed, like AMBIT flashing).
+#### Accumulated evidence (power_recovered)
+
+A read **qualifies** when it is valid, input is present, the frame is fresh,
+`system_v ≥ 3.60 V`, and the battery is ≥ 3.70 V (with `battery_v` 0: the rail,
+below). The thresholds sit above the entry ones so a rail at the edge cannot
+flap.
+
+- Each interval between two **consecutive qualifying reads**, at most 60 s
+  apart, adds to the evidence. **30 minutes** of it within the last **12 hours**
+  returns the unit to `normal` (`power_recovered`) and resets the probe
+  backoff.
+- Reads that carry **no evidence** **pause** the accumulation: invalid,
+  stale, `no_input`, input absent, and a gap of more than 60 s between reads.
+  The interval around them earns nothing, but what was collected stays.
+  Clouds and start-stop charging therefore recover a healthy unit.
+- A **fresh read with input that is low** (below either exit threshold)
+  **resets** it to zero. A sagging battery never recovers, and the probe
+  waits a full quiet period from that read.
+- Evidence older than the horizon drops out, in 30-minute buckets (evidence
+  11.5–12 h old may already be gone).
+- The accumulation lives in RAM. A reboot starts it again: the power_protect
+  blob is never written per read.
+
+Why these numbers:
+
+- **30 minutes** is unchanged. It is the amount of charger-confirmed healthy
+  power the first release asked for; only the "in one piece" requirement
+  went.
+- **12 hours** is one daylight period. Yesterday afternoon's evidence is
+  separated from this morning by a night on battery that the ADC cannot see,
+  so it must not count. Where some does carry across the night, the first
+  fresh read in the morning resets it if the battery sagged. A battery still
+  ≥ 3.70 V after the night is a healthy one.
+- **No rising-trend rule.** While charging, `battery_v` sits above the
+  resting voltage by the charge current times the cell's internal
+  resistance. A rising reading across bursts is as much "more current" as
+  "more charge", and the idle reads between bursts (the rail, below) already
+  tell a resting battery's voltage. The accumulation alone recovers the
+  burst case (tests below).
+
+```mermaid
+flowchart TD
+    R["charger read (5–15 s)"] --> F{"valid, input present,<br/>frame fresh?"}
+    F -->|no: invalid, stale,<br/>no_input, input absent| P["PAUSE<br/>keep the evidence,<br/>this interval earns nothing"]
+    F -->|yes| B{"battery_v == 0?"}
+    B -->|yes: idle charger,<br/>the rail is the battery| RB["battery := system_v"]
+    B -->|no| Q
+    RB --> Q{"system_v ≥ 3.60 V and<br/>battery ≥ 3.70 V?"}
+    Q -->|no| Z["RESET<br/>evidence := 0<br/>probe quiet period restarts"]
+    Q -->|yes| C{"previous read qualified<br/>and ≤ 60 s ago?"}
+    C -->|no| A0["arm: next interval counts"]
+    C -->|yes| A["add the interval to<br/>this 30-min bucket"]
+    A --> S{"sum of the last 12 h<br/>≥ 30 min?"}
+    S -->|yes| N["→ normal (power_recovered)<br/>backoff level := 0"]
+    S -->|no| W["stay protected"]
+```
+
+#### battery_v 0: the rail is the battery
+
+`battery_v == 0` with input present was read as "no battery: the rail alone
+carries the unit", so the exit qualified on the rail at 3.60 V. In the field it
+is the MP2731 idling beside a live panel (VIN_STAT 000, not charging, VIN
+7–8 V, [power-telemetry.md](power-telemetry.md)). The unit runs on the battery
+through the BATFET, so the rail is the battery minus a small drop.
+`10:BD:A3:63:FD:20` recovered on a 3.68 V rail and was back in `hold` the same
+day.
+
+The board **cannot tell** an absent battery from an idle charger. The
+MP2731 reports no battery-present bit, and both read `battery_v` 0. The safe
+reading is chosen: whenever `battery_v` is 0, `system_v` must meet the
+**battery** thresholds (exit 3.70 V, entry 3.40 V). A battery-less unit on
+external power still recovers when its regulated rail sits at 3.70 V or above.
+If its rail is lower, it stays protected until `clear`.
+
+#### Battery-only probe
+
+On battery the ADC is dead (§"What the firmware can and cannot see"), so
+nothing ever qualifies. The only evidence is the absence of the brownout reset.
+A protected, automatic state with a **live charger monitor** steps **one level
+down on probation** after a **quiet period** in which there was no brownout,
+no fresh low read and no collected evidence:
+
+- `hold → no_flash` first, so steady-state work comes back before the
+  saturating flashes do; `no_flash → normal` on the next probe.
+- **Quiet period:** 6 h, then 12 h, then 24 h (capped) after each failed
+  probe. With a valid clock it is measured from the later of the state entry
+  (or the probe step) and the newest recorded brownout, across reboots.
+  Without one it counts uptime since boot or since this boot's last
+  transition, so any reboot restarts it (conservative). A fresh low read
+  restarts it; evidence inside the 12-h horizon holds it off, because the
+  accumulation decides then.
+- **Probation:** 24 h, measured the same way (from the probe step).
+  - A **brownout** during it fails the probe. It belongs to the episode the
+    probe stepped out of, so it escalates like a linked brownout: → `hold`,
+    reason `probe_failed`, backoff level +1.
+  - So does a fresh read below the **entry** thresholds. That read goes back
+    to the level the probe left: `normal → no_flash`, or the `hold → no_flash`
+    step back to `hold`.
+  - 24 h without either: the probation passes (`probe_passed`). The state
+    keeps reason `probe`. The backoff level stays: only a qualifying exit or
+    `clear` proves the power good again.
+- **Bounded:** after **6 failed probes** in a row (6+12+24+24+24+24 h ≈ 5
+  days of trying) the probe is `exhausted` until a qualifying exit or
+  `clear`.
+- **Never** for a forced state, and **never without a charger monitor**: no
+  reads at all, `unavailable` (no charger fitted) or `i2c_error` (the charger
+  does not answer). A live `no_input` answer is a monitor; it is the
+  battery-only unit itself. Without one, the unit fails closed as before.
+- The probe step, a failed probe and a passed probation each write the blob
+  once (they are transitions). The backoff level and the probation survive
+  reboots.
+
+Why these numbers:
+
+- **6 h base.** Past the 6-h brownout link window: by the linking rule's own
+  measure, the episode that put the unit here is over.
+- **Doubling to 24 h.** A failed probe costs one brownout, a power-on-class
+  reset of a depleted battery on a card without a journal. Doubling and the
+  cap keep that at most one every 6/12/24 h, so never more than one a day
+  once the level is 2.
+- **24 h probation.** It covers one full day and night, including the
+  pre-dawn battery minimum when the MPF slots hit the weakest battery. A
+  shorter probation would "pass" in the evening and fail at dawn as a fresh,
+  unlinked episode: one silent brownout a day, forever. That is the loop the
+  design must not cause.
+- **6 attempts.** This bounds the cost of a unit whose battery is simply
+  dying (a dead panel). An operator sees `probe: exhausted` in the heartbeat
+  and decides.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "protected, waiting (level L)" as W
+    state "on probation (one level down)" as P
+    state "exhausted (6 failures)" as X
+    [*] --> W: brownout / low_voltage / state_unreadable (level from NVS)
+    W --> P: quiet 6h·2^min(L,2), live monitor, no evidence (probe)
+    P --> W: brownout → hold, or fresh read below entry → back (probe_failed, L+1)
+    P --> [*]: 24 h without either (probe_passed)
+    W --> X: L reaches 6
+    W --> [*]: 30 min evidence in 12 h (power_recovered, L := 0)
+    X --> [*]: 30 min evidence in 12 h, or clear (L := 0)
+    note right of W
+        L survives reboots (NVS blob v2)
+        forced: never waits, never probes
+        no charger monitor: never probes
+    end note
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Unit on battery (dead panel)
+    participant PP as power_protect
+    participant NVS
+    U->>PP: brownout boot 11:11 → no_flash (L 0)
+    PP->>NVS: write (transition)
+    loop every 15 s: no_input reads (live monitor, no evidence)
+        U->>PP: no_input
+    end
+    PP->>PP: 17:11, quiet 6 h → no_flash → normal (probe)
+    PP->>NVS: write (probation, L 0)
+    alt dawn MPF slot browns the unit out
+        U->>PP: brownout boot 05:40 → hold (probe_failed, L 1)
+        PP->>NVS: write
+        PP->>PP: 17:40, quiet 12 h → hold → no_flash (probe)
+        Note over PP: then 24 h of no_flash probation before normal is tried
+    else 24 h without a brownout
+        PP->>PP: probe_passed (stays normal, L kept)
+        PP->>NVS: write
+    end
+```
 
 ### Brownout history and the clock
 
@@ -141,11 +321,25 @@ at all counts (conservative) until `clear` wipes the history.
 
 ### Persistence
 
-NVS namespace `pwr_protect`, key `state`: one 113-byte blob (version, state,
-reason, forced flag, `since_utc`, the history, CRC32), explicit
-little-endian bytes rather than a struct dump. It is written **only** on a
-state transition, a recorded brownout (at most once per boot), `force` and
-`clear`. Never per charger read, never per heartbeat.
+NVS namespace `pwr_protect`, key `state`: one 115-byte blob, version 2. It
+holds the version, state, reason, forced flag, `since_utc`, the history, the
+probation step and the backoff level, then a CRC32. The bytes are explicit
+little-endian, not a struct dump. It is written **only** on:
+
+- a state transition (the probe step and a failed probe included);
+- a passed probation;
+- a recorded brownout (at most once per boot);
+- `force` and `clear`.
+
+Never per charger read, never per heartbeat.
+
+The 113-byte version-1 blob of the first release is still read, with no
+probation and level 0, so an upgrade keeps every stored state. The next
+persisting event writes version 2. A **rollback** to firmware before this
+change reads a version-2 blob as unreadable and starts in `no_flash`
+(`state_unreadable`). That is the safe side; `clear` repairs it. Units that
+never had a transition under the new firmware still carry version 1 and are
+unaffected.
 
 At boot the blob is either:
 
@@ -155,7 +349,9 @@ At boot the blob is either:
   fails its version, length, CRC or range checks) → `no_flash`, reason
   `state_unreadable`, not forced, `persist_fault: true`, logged. A corrupted
   forced `hold` must not come back at full load after a watchdog reboot. It
-  exits like any automatic state: the 30-min window or `clear`. Nothing is
+  exits like any automatic state: accumulated evidence, the probe (assuming
+  backoff level 2, the longest wait, since the stored level is lost) or
+  `clear`. Nothing is
   written at boot; the next persisting event (a transition, a brownout record,
   `force`, `clear`) rewrites the blob and clears `persist_fault`.
 
@@ -264,14 +460,24 @@ behaviour. With the two primitive gates removed those 5 scenarios fail.
 ## C. Reporting
 
 - **Heartbeat:** `health.power_protect = {state, reason, since_utc|null,
-  forced, persist_fault, brownouts_6h, skipped: {flash_runs, ambit_runs, ota}}` in every
+  forced, persist_fault, brownouts_6h, qualifying_s, probe, next_probe_s|null,
+  backoff_level, skipped: {flash_runs, ambit_runs, ota}}` in every
   `ambyte.telemetry/1`, rendered from RAM (no NVS access). `skipped` counts
-  since this boot.
-- **pong:** `power_protect: normal | no_flash | hold`.
+  since this boot. The object stays bounded: at most ~330 bytes, rendered
+  into a 384-byte slice and omitted (never truncated) if it does not fit.
+  - `qualifying_s`: the evidence collected inside the 12-h horizon.
+  - `probe`: `off`, `waiting`, `probation`, `exhausted` or `no_monitor`.
+  - `next_probe_s`: seconds to the probe while `waiting`.
+  - `backoff_level`: failed probes since the last qualifying exit or `clear`.
+- **pong:** `power_protect: normal | no_flash | hold`, unchanged. The
+  recovery detail is in the heartbeat and the `status` reply.
 - **Transitions:** exactly one `ESP_LOGE("power_protect: <from> -> <to>
   reason=<reason>")` per transition, which v2.18.0's diag capture delivers as
-  an `ambyte.log/1` record. A same-state force or a history-only clear logs a
-  warning instead (not a transition).
+  an `ambyte.log/1` record. Reasons: `power_recovered` (evidence), `probe`
+  (the step), `probe_failed`. A passed probation is not a state change but
+  gets its own line: `power_protect: <state> probation passed
+  reason=probe_passed backoff_level=<L>`. A same-state force or a
+  history-only clear logs a warning instead (not a transition).
 
 ```mermaid
 sequenceDiagram
@@ -290,9 +496,9 @@ sequenceDiagram
     M-->>M: heartbeat health.power_protect, pong power_protect
     loop every read
         C->>PP: verdict + reading + fresh evidence
-        PP->>PP: qualifying? keep the window, else restart it
+        PP->>PP: qualifying? add the interval. No evidence? pause. Fresh and low? reset
     end
-    PP->>PP: 30 min continuous qualifying external power
+    PP->>PP: 30 min of qualifying evidence within 12 h
     PP-->>M: ESP_LOGE "power_protect: no_flash -> normal reason=power_recovered"
     R->>PP: state? → MPF runs again ("running again after N power-protect skips")
 ```
@@ -304,13 +510,15 @@ sequenceDiagram
 {"type":"power_protect","id":"r2","action":"force","state":"hold"}
 {"type":"power_protect","id":"r3","action":"clear"}
 // → {"type":"power_protect_result","id","ok","action","detail","state","reason",
-//    "forced","persist_fault","since_utc","brownouts_6h","exit_in_s","skipped":{…}}
+//    "forced","persist_fault","since_utc","brownouts_6h","exit_in_s","qualifying_s",
+//    "probe","next_probe_s","backoff_level","skipped":{…}}
 ```
 
 - `status` is read-only. `clear` returns to `normal` and wipes the brownout
-  history and the forced flag. `force` sets a **forced** state that never
-  auto-exits; only `clear` ends it (a linked brownout can still escalate a
-  forced `no_flash` to `hold`).
+  history, the forced flag, any probation and the backoff level. `force` sets
+  a **forced** state that never auto-exits or probes, and ends a probation;
+  only `clear` ends it (a linked brownout can still escalate a forced
+  `no_flash` to `hold`).
 - Runs on the resident maintenance worker, the same pattern as
   `set_timezone` / `log_read`: the esp-mqtt task only parses and copies;
   `clear` / `force` take the maintenance lock.
@@ -332,14 +540,32 @@ run fails unless every reply confirms the requested state. In Actions →
 
 - `tests/test_power_protect.py` drives the production core and glue (fake NVS
   that counts every write, the real power_policy gate for freshness) and the
-  command codec: every transition and exit timer, window restarts on invalid,
-  stale, `no_input`, input-absent, out-of-threshold reads and read gaps,
-  `battery_v == 0`, forced states, `clear`, escalation with a valid and an
-  invalid clock (the Uluru 2-3-4 replay), an unknown boot counter (0 twice,
-  0 then known, known then 0), the blob round trip and corruption, unreadable
-  state after non-brownout reboots and after open/read failures,
-  NVS writes only on transitions, the command codec and its allocation
-  failures.
+  command codec. It covers:
+  - every transition;
+  - the accumulated exit: pauses on invalid, stale, `no_input`, input-absent
+    and `i2c_error` reads and on read gaps; resets on fresh low reads; the
+    12-h horizon;
+  - intermittent solar: 3 × 12-min bursts with collapses and 20-min `no_input`
+    gaps, and 80-s start-stop spells;
+  - the idle `battery_v` 0 rail: 3.65 V never qualifies, 3.75 V does, and an
+    idle 3.35 V rail enters;
+  - the battery-only probe: the quiet period, the probation across the nightly
+    reboot and its pass; a brownout on probation → `hold` with backoff
+    6 → 12 → 24 → 24 h that survives reboots and exhausts after 6; `hold`
+    stepping down to `no_flash` first; low reads failing either probation;
+    forced states and no charger monitor never probing; a low read restarting
+    the quiet period; uptime counting without a valid clock; evidence holding
+    the probe off;
+  - forced states, `clear`, escalation with a valid and an invalid clock (the
+    Uluru 2-3-4 replay), an unknown boot counter (0 twice, 0 then known, known
+    then 0);
+  - the blob round trip, corruption and the v1 → v2 upgrade; unreadable state
+    after non-brownout reboots and after open/read failures;
+  - NVS writes only on transitions; the command codec and its allocation
+    failures.
+
+  The 13 recovery scenarios also build against the previous core (origin/main
+  a13fbfd), where 12 of them fail. `blob_v1_upgrade` is new-API only.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.
@@ -360,5 +586,7 @@ run fails unless every reply confirms the requested state. In Actions →
   removed the 9 round-2 in-step scenarios fail, and on the round-2 head the 3
   open/seek scenarios fail). The Ambyte worker also covers protection during
   the suspend and the second flush.
-- **Real brownout behaviour is covered by host tests only.** A bench cannot
-  brown out on demand; the bench run exercises `force` and `clear`.
+- **Real brownout and solar behaviour is covered by host tests only.** A
+  bench cannot brown out on demand and has no solar rig. The bench run
+  exercises `force` and `clear`. For the solar-recovery change the bench box
+  was not reachable, so no capture was made (see its PR).

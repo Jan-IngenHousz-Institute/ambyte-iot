@@ -565,7 +565,8 @@ that reading, and BME280 values MUST NOT be copied into any channel-specific
     "crash": { "present": false },
     "power_protect": {
       "state": "normal", "reason": "none", "since_utc": null, "forced": false,
-      "persist_fault": false, "brownouts_6h": 0, "skipped": { "flash_runs": 0, "ambit_runs": 0, "ota": 0 }
+      "persist_fault": false, "brownouts_6h": 0, "qualifying_s": 0, "probe": "off",
+      "next_probe_s": null, "backoff_level": 0, "skipped": { "flash_runs": 0, "ambit_runs": 0, "ota": 0 }
     },
     "clock": { "source": "rtc", "suspect": false },
     "software": {
@@ -766,25 +767,33 @@ from RAM on every heartbeat (never an NVS access).
 ```jsonc
 "power_protect": {
   "state": "no_flash", "reason": "brownout", "since_utc": 1763152200, "forced": false,
-  "persist_fault": false, "brownouts_6h": 1, "skipped": { "flash_runs": 3, "ambit_runs": 0, "ota": 1 }
+  "persist_fault": false, "brownouts_6h": 1, "qualifying_s": 840, "probe": "waiting",
+  "next_probe_s": 12960, "backoff_level": 0, "skipped": { "flash_runs": 3, "ambit_runs": 0, "ota": 1 }
 }
 ```
 
 | leaf | type | meaning |
 |---|---|---|
 | `state` | string enum | `normal`, `no_flash` (actinic-bearing AMBIT work, AMBIT flashing and every OTA shed), `hold` (every `ambit/` action shed as well). |
-| `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or `battery_v` in (0, 3.40 V)), `forced`, `power_recovered` (30 min of qualifying external power), `cleared`, `state_unreadable` (the persisted state existed but could not be read: started protected), `brownout_unordered` (a further brownout that neither a valid clock nor the boot counter could order: escalated to `hold`). Unknown future values are preserved. |
+| `reason` | string enum | Why the current state was entered: `none` (never protected, or the persisted state was unreadable), `brownout`, `repeat_brownout` (a second brownout linked to the previous one), `low_voltage` (fresh read with input: `system_v` below 3.30 V or the battery below 3.40 V; with `battery_v` 0 the rail is the battery), `forced`, `power_recovered` (30 min of qualifying external power accumulated within 12 h), `cleared`, `state_unreadable` (the persisted state existed but could not be read: started protected), `brownout_unordered` (a further brownout that neither a valid clock nor the boot counter could order: escalated to `hold`), `probe` (battery-only probe: one level down on probation, `hold` → `no_flash` or `no_flash` → `normal`), `probe_failed` (a brownout on probation, → `hold`; or a fresh read below the entry thresholds, back to the level the probe left). Unknown future values are preserved. |
 | `since_utc` | integer or null | UTC seconds when `state` was entered; `null` when the clock was not valid then (`clock.source` `hwm`, or a suspect RTC). |
 | `forced` | boolean | An operator `force`; never auto-exits, only `clear` ends it. |
 | `persist_fault` | boolean | The stored copy is not trustworthy: it was unreadable at boot (then `reason: state_unreadable`), or the last write failed. Cleared by the next successful write. |
 | `brownouts_6h` | integer | Recorded brownouts in the last 6 h: by UTC when both clocks are valid; else, with boot counts known, the run of consecutive brownout boots ending at this boot; an entry neither can date counts (conservative) until `clear`. |
+| `qualifying_s` | integer | Qualifying external-power evidence collected inside the 12-h horizon (RAM, restarts at boot); 30 min (1800) exits. 0 in `normal` and in a forced state. |
+| `probe` | string enum | Battery-only probe: `off` (`normal` not on probation, or a forced state), `waiting` (counting the quiet period), `probation` (a probe step is on its 24-h probation), `exhausted` (6 failed probes: only a qualifying exit or `clear` ends it), `no_monitor` (no charger read answered this boot: no probe, fail-closed). Unknown future values are preserved. |
+| `next_probe_s` | integer or null | While `waiting`: seconds until the probe (the quiet period 6/12/24 h by backoff level, a fresh low read restarting it, collected evidence holding it off until it expires). `null` otherwise. |
+| `backoff_level` | integer 0–6 | Failed probes since the last qualifying exit or `clear`; the quiet period is 6 h · 2^min(level, 2). Persisted. |
 | `skipped.flash_runs` | integer | Schedule runs skipped since this boot because they carried actinic/flash work. |
 | `skipped.ambit_runs` | integer | Schedule runs skipped since this boot by `hold` only (no actinic content). |
 | `skipped.ota` | integer | Refused Ambyte OTA, AMBIT OTA, `ambit_flash` and AMBIT boot-sync flashing since this boot. |
 
-The counters are per boot (RAM). The state, reason, `since_utc`, `forced` and
-the brownout history persist in NVS and survive reboots. A transition is also
-reported as one `ambyte.log/1` line: `power_protect: <from> -> <to> reason=<reason>`.
+The counters and `qualifying_s` are per boot (RAM). The state, reason,
+`since_utc`, `forced`, the brownout history, the probation and
+`backoff_level` persist in NVS and survive reboots. A transition is also
+reported as one `ambyte.log/1` line: `power_protect: <from> -> <to> reason=<reason>`;
+a passed probation as `power_protect: <state> probation passed reason=probe_passed backoff_level=<n>`.
+The four recovery leaves are additive since the solar-recovery release.
 
 ## 10. Attached AMBIT device object (normative, Ambyte only)
 
@@ -1035,6 +1044,7 @@ unstorable. `protocol.cmd` (≤ ~522 B) stays in the record's command column.
 | 2026-08-10 | New firmware's lossless v2 trace fallback and the existing `ambit.spec`, `ambit.temp`, and `db.store_event` v2 families are permanent; platform dual-read support has no retirement date. |
 | 2026-08-12 | Transport gzip of the v3 `sample` (`_sample_encoding: "gzip+base64"`, §14a) ships behind the NVS flag `publish_gzip`, default OFF, fail-open to plain JSON; the compressed text is byte-identical to the plain `sample` array so Silver's existing decoder needs no change. Chosen over SenML JSON/CBOR after exact same-trace benchmarks (920 B vs 1,740/1,900 B gzipped). |
 | 2026-08-12 | Measurements publish on the lean 7-segment topic (`topic_root` verbatim, §13), complying with openJII `e38cdd45b`; the hardcoded `/1234` legacy protocolId suffix is removed. Attribution is payload-only (`protocol.id`). |
+| 2026-11-20 | Brownout protection recovers on solar and on battery: `health.power_protect` and the `power_protect_result` reply add `qualifying_s`, `probe`, `next_probe_s`, `backoff_level`; reasons add `probe` and `probe_failed`; `exit_in_s` now means qualifying seconds still needed (accumulated within 12 h, no longer one continuous window). The pong is unchanged. |
 | 2026-11-15 | Brownout protection: `health.power_protect` (§9.6) and `pong.power_protect` are additive; the operator command is `power_protect` (§19). A protected unit refuses an Ambyte OTA as `ota_status` `dropped` / `power_protect` (a retry candidate, the Jobs execution stays QUEUED) and AMBIT OTA / `ambit_flash` as `failed` / `power_protect`. Skip counters are per boot so a heartbeat never writes NVS. |
 | 2026-11-14 | Remote diagnostics: `health.runtime.reset_reason` + `boot_count` and `health.crash` are additive telemetry fields; captured `ESP_LOGE` lines become a separate persisted family `ambyte.log/1` (tag `LOG`) on the normal QoS1 path rather than a field of the heartbeat, so a log burst never grows or delays the health row. `log_read` data is base64 (bounded 4/3 growth) rather than escaped text (up to 6×). |
 
@@ -1147,15 +1157,17 @@ topic, QoS 1, **not retained** (a retained `force` would come back after every
 // reply
 {"type":"power_protect_result","id":"r2","ok":true,"action":"force","detail":"applied",
  "state":"hold","reason":"forced","forced":true,"persist_fault":false,"since_utc":1763152200,"brownouts_6h":0,
- "exit_in_s":null,"skipped":{"flash_runs":0,"ambit_runs":0,"ota":0}}
+ "exit_in_s":null,"qualifying_s":0,"probe":"off","next_probe_s":null,"backoff_level":0,
+ "skipped":{"flash_runs":0,"ambit_runs":0,"ota":0}}
 ```
 
 - `status` is read-only (`detail` `ok`). `clear` (`cleared`) returns to
-  `normal` and wipes the brownout history and the forced flag. `force`
-  (`applied`) sets a forced `no_flash` or `hold` that never auto-exits.
+  `normal` and wipes the brownout history, the forced flag, any probation and
+  the backoff level. `force` (`applied`) sets a forced `no_flash` or `hold`
+  that never auto-exits or probes (and ends a probation).
 - Every reply carries the state after the action: the §9.6 leaves plus
-  `exit_in_s`, the seconds left in a running 30-min exit window (`null` when
-  none runs).
+  `exit_in_s`, the qualifying seconds still needed to exit (`null` when none
+  has been collected).
 - An `ok:true` reply is always complete; an allocation failure turns it into
   `no_mem`.
 - `ok:false` details: `invalid_id`, `invalid_action`, `invalid_state` (missing

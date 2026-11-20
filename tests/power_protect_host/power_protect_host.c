@@ -22,6 +22,16 @@
 #include "power_policy.h"
 #include "power_protect_command.h"
 
+/* The recovery scenarios (accumulated exit, battery-only probe, idle battery
+ * 0) also compile against the PREVIOUS core (origin/main a13fbfd) to prove
+ * they fail there: only the state machine's observable behaviour is checked
+ * when the recovery API is absent. */
+#ifdef PP_PROBE_FAILS_MAX
+#define HAVE_RECOVERY 1
+#else
+#define HAVE_RECOVERY 0
+#endif
+
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr, "FAIL %s:%d: %s - ", __FILE__, __LINE__, #cond); \
     fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); exit(1); } } while (0)
@@ -144,6 +154,28 @@ static void good_reads(int n, uint16_t sys, uint16_t bat)
 }
 
 #define READS_30MIN 360   /* 5-s reads */
+#define H (3600)
+
+/* Reads carrying no evidence at the power guard's 15-s cadence: NO_INPUT is
+ * the battery-only unit (live status: no input), I2C_ERROR / UNAVAILABLE a
+ * charger that does not answer / is not fitted. */
+static void quiet_reads(power_read_reason_t r, int64_t seconds)
+{
+    for (int64_t t = 0; t < seconds; t += 15) {
+        power_gate_step(&g_gate, r, NULL);
+        power_protect_on_power_read(r, NULL, power_gate_flash_ok(&g_gate));
+        advance_s(15);
+    }
+}
+
+#if HAVE_RECOVERY
+static pp_recovery_t rec(void)
+{
+    power_protect_status_t s;
+    power_protect_get_status(&s);
+    return s.recovery;
+}
+#endif
 
 static pp_state_t st(void) { return power_protect_state(); }
 
@@ -265,49 +297,489 @@ static void exit_after_30min(void)
     CHECK(strcmp(g_last_e, "power_protect: no_flash -> normal reason=power_recovered") == 0, "%s", g_last_e);
 }
 
-/* Every class of bad read restarts the 30-min window. */
+/* Reads that carry no evidence PAUSE the accumulation (it keeps what it had);
+ * a fresh read with input below the exit thresholds RESETS it. */
 static void window_restarts(void)
 {
-    for (int k = 0; k < 7; k++) {
+    for (int k = 0; k < 8; k++) {
         g_writes = 0;
         g_blob_len = 0;
         reboot(ESP_RST_BROWNOUT, 2, true);
-        good_reads(READS_30MIN - 10, 4100, 3900);           /* 29:10 */
+        good_reads(READS_30MIN - 10, 4100, 3900);           /* 29:05 collected */
+        bool resets = false;
         switch (k) {
         case 0: read5(POWER_READ_NO_INPUT, 0, 0, false, true); break;
         case 1: read5(POWER_READ_IMPLAUSIBLE, 0, 0, false, true); break;
         case 2: read5(POWER_READ_ADC_TIMEOUT, 0, 0, false, true); break;
-        case 3: read5(POWER_READ_OK, 3500, 3900, true, true); break;   /* rail below 3.60 V */
-        case 4: read5(POWER_READ_OK, 4100, 3650, true, true); break;   /* battery below 3.70 V */
+        case 3: read5(POWER_READ_OK, 3500, 3900, true, true); resets = true; break;   /* rail below 3.60 V */
+        case 4: read5(POWER_READ_OK, 4100, 3650, true, true); resets = true; break;   /* battery below 3.70 V */
         case 5: read5(POWER_READ_OK, 4100, 3900, false, true); break;  /* valid, input absent */
         case 6: advance_s(90); break;                                   /* nobody read for 90 s */
+        case 7: read5(POWER_READ_I2C_ERROR, 0, 0, false, true); break;
+        }
+        if (!resets) {
+            /* The interval around the pause earns nothing, nor do the reads
+             * before power_policy calls the frames fresh again. */
+            good_reads(4, 4100, 3900);
+            CHECK(st() == PP_STATE_NO_FLASH, "case %d: under 30 min", k);
+            good_reads(12, 4100, 3900);                  /* well under a minute more */
+            CHECK(st() == PP_STATE_NORMAL, "case %d: a pause keeps what was collected", k);
+            continue;
         }
         good_reads(READS_30MIN - 10, 4100, 3900);
-        CHECK(st() == PP_STATE_NO_FLASH, "case %d: window must have restarted", k);
+        CHECK(st() == PP_STATE_NO_FLASH, "case %d: a low read must have reset the evidence", k);
         good_reads(20, 4100, 3900);
-        CHECK(st() == PP_STATE_NORMAL, "case %d: a full window after the restart exits", k);
+        CHECK(st() == PP_STATE_NORMAL, "case %d: a full 30 min after the reset exits", k);
     }
     /* A frozen frame: identical ADC values stop being fresh after the
-     * power_policy freshness window, and that restarts the exit window. */
+     * power_policy freshness window. Stale is not evidence: it pauses. */
     g_blob_len = 0;
     reboot(ESP_RST_BROWNOUT, 2, true);
     good_reads(200, 4100, 3900);
     for (int i = 0; i < 20; i++) read5(POWER_READ_OK, 4100, 3900, true, false);
-    good_reads(READS_30MIN - 10, 4100, 3900);
-    CHECK(st() == PP_STATE_NO_FLASH, "stale frames restart the window");
-    good_reads(20, 4100, 3900);
-    CHECK(st() == PP_STATE_NORMAL, "then exits");
+    CHECK(st() == PP_STATE_NO_FLASH, "stale frames are not evidence");
+    good_reads(READS_30MIN - 150, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL, "then the rest of the 30 min exits");
 }
 
 static void battery_zero_with_input(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
     good_reads(50, 4100, 0);
-    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "battery_v 0 with input never triggers");
+    CHECK(st() == PP_STATE_NORMAL && g_writes == 0, "battery_v 0 with a healthy rail never triggers");
     g_blob_len = 0;
     reboot(ESP_RST_BROWNOUT, 2, true);
     good_reads(READS_30MIN + 2, 4100, 0);
-    CHECK(st() == PP_STATE_NORMAL, "battery 0 (no battery, rail carries it) qualifies the exit");
+    CHECK(st() == PP_STATE_NORMAL, "battery 0 with a rail above the battery threshold qualifies the exit");
+}
+
+/* Uluru 18 Nov, 10:BD:A3:63:FD:20: the charger idles beside a live panel
+ * (VIN 7-8 V, not charging), battery_v reads 0 and system_v IS the battery
+ * through the BATFET. It left protection on a 3.68 V rail and browned out the
+ * same day. The rail must meet the BATTERY threshold (3.70 V). */
+static void idle_battery_zero(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    good_reads(2 * READS_30MIN, 3650, 0);               /* an hour at 3.65 V */
+    CHECK(st() == PP_STATE_NO_FLASH, "3.65 V rail with battery_v 0 must not qualify");
+    good_reads(READS_30MIN + 2, 3750, 0);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED, "3.75 V does");
+    /* And it is a reset, not a pause: 25 min at 3.75 V, one idle 3.65 V read,
+     * 25 min more is not enough. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    good_reads(300, 3750, 0);
+    good_reads(1, 3650, 0);
+    good_reads(300, 3750, 0);
+    CHECK(st() == PP_STATE_NO_FLASH, "an idle low rail resets the evidence");
+    /* Entry uses the same reading: an idle 3.35 V rail is a 3.35 V battery. */
+    g_blob_len = 0;
+    reboot(ESP_RST_POWERON, 4, true);
+    good_reads(3, 3350, 0);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_LOW_VOLTAGE, "idle rail below 3.40 V enters");
+}
+
+/* ── scenarios: recovery on solar and on battery (Uluru 17-20 Nov) ─────── */
+
+/* A weak panel: 12-min charging bursts, a collapse to the 4.3 V floor (input
+ * absent) and 20 min of cloud (no_input) between them. The continuous rule
+ * never exited; accumulated evidence does on the third burst. */
+static void intermittent_solar_recovers(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    const int e0 = g_elines, w0 = g_writes;
+    for (int burst = 0; burst < 3; burst++) {
+        good_reads(144, 4000, 3850);                       /* 12 min: 11:55 of evidence */
+        if (burst == 2) break;
+        CHECK(st() == PP_STATE_NO_FLASH, "burst %d: not 30 min yet", burst);
+        for (int i = 0; i < 12; i++) read5(POWER_READ_OK, 3900, 3850, false, true);   /* collapsed */
+        quiet_reads(POWER_READ_NO_INPUT, 20 * 60);                                     /* cloud */
+    }
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.reason == PP_REASON_POWER_RECOVERED, "3 x 12 min recovers: %d", st());
+    CHECK(g_elines == e0 + 1 && g_writes == w0 + 1, "one line, one write (e=%d w=%d)", g_elines - e0, g_writes - w0);
+    CHECK(strcmp(g_last_e, "power_protect: no_flash -> normal reason=power_recovered") == 0, "%s", g_last_e);
+
+    /* Start-stop charging: 80-s spells, 60 s collapsed between them. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    for (int spell = 0; spell < 30; spell++) {
+        if (spell == 20) CHECK(st() == PP_STATE_NO_FLASH, "20 spells (< 25 min) are not enough");
+        good_reads(16, 4000, 3850);
+        for (int i = 0; i < 12; i++) read5(POWER_READ_OK, 3900, 3850, false, true);
+    }
+    CHECK(st() == PP_STATE_NORMAL, "30 x 80-s spells recover");
+}
+
+/* A fresh read with input below the exit thresholds throws everything away. */
+static void low_read_resets_accumulation(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    good_reads(121, 4100, 3900);                           /* 10 min */
+    quiet_reads(POWER_READ_NO_INPUT, 600);
+    good_reads(121, 4100, 3900);                           /* 20 min collected */
+#if HAVE_RECOVERY
+    const uint32_t got = rec().qualifying_s;   /* 1200 s less the reads power_policy needs to call it fresh */
+    CHECK(got >= 1180 && got <= 1200, "collected %u", (unsigned)got);
+    power_protect_status_t s;
+    power_protect_get_status(&s);
+    CHECK(s.exit_in_s == (int64_t)(1800 - got), "exit_in_s %lld", (long long)s.exit_in_s);
+#endif
+    read5(POWER_READ_OK, 4100, 3600, true, true);          /* battery 3.60 V: low */
+#if HAVE_RECOVERY
+    CHECK(rec().qualifying_s == 0, "reset to %u", (unsigned)rec().qualifying_s);
+#endif
+    good_reads(181, 4100, 3900);                           /* 15 min */
+    quiet_reads(POWER_READ_NO_INPUT, 600);
+    good_reads(169, 4100, 3900);                           /* 29 min since the reset */
+    CHECK(st() == PP_STATE_NO_FLASH, "the 20 min before the low read must not count");
+    good_reads(13, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL, "30 min after the reset exits");
+}
+
+/* Evidence counts inside a 12-h horizon only. While the charger does not
+ * answer (I2C errors) there is no probe, so only the accumulation decides. */
+static void old_evidence_expires(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    good_reads(241, 4100, 3900);                           /* 20 min */
+    quiet_reads(POWER_READ_I2C_ERROR, 10 * H);
+    good_reads(125, 4100, 3900);                           /* +10 min, 10.5 h later */
+    CHECK(st() == PP_STATE_NORMAL, "control: evidence 10.5 h apart adds up");
+
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+#if HAVE_RECOVERY
+    /* Once the old evidence has expired, the first read from a live charger
+     * (not yet fresh) would probe: take the probe out to isolate the horizon. */
+    s_core.p.probe_fails = PP_PROBE_FAILS_MAX;
+#endif
+    good_reads(241, 4100, 3900);
+    quiet_reads(POWER_READ_I2C_ERROR, 12 * H + 30 * 60);
+    good_reads(125, 4100, 3900);
+    CHECK(st() == PP_STATE_NO_FLASH, "20 min from 12.5 h ago expired");
+    good_reads(240, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL, "fresh 30 min exits");
+}
+
+/* 14:63:93:37:A0:C4, 18 Nov: browned out at 11:11, panel delivering nothing
+ * (no_input on 186 of 187 heartbeats), no_flash all day. Probe after 6 h quiet,
+ * probation 24 h across the nightly reboot, then passed. */
+static void battery_probe_recovers(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "5:59 quiet: no probe yet");
+#if HAVE_RECOVERY
+    pp_recovery_t r = rec();
+    CHECK(r.probe == PP_PROBE_WAITING && r.next_probe_s > 0 && r.next_probe_s <= 60 && r.backoff_level == 0,
+          "waiting %d next %lld", r.probe, (long long)r.next_probe_s);
+#endif
+    const int w0 = g_writes;
+    (void)w0;
+    quiet_reads(POWER_READ_NO_INPUT, 120);
+    CHECK(st() == PP_STATE_NORMAL, "probe: no_flash -> normal (state %d)", st());
+#if HAVE_RECOVERY
+    CHECK(s_core.p.reason == PP_REASON_PROBE && s_core.p.probation == PP_PROBATION_NORMAL && g_writes == w0 + 1,
+          "reason %d probation %d w %d", s_core.p.reason, s_core.p.probation, g_writes - w0);
+    CHECK(strcmp(g_last_e, "power_protect: no_flash -> normal reason=probe") == 0, "%s", g_last_e);
+    CHECK(rec().probe == PP_PROBE_PROBATION && rec().next_probe_s == -1, "probation");
+#endif
+    CHECK(!power_protect_blocks_flash(), "saturating flashes run again on probation");
+    quiet_reads(POWER_READ_NO_INPUT, 10 * H);
+    reboot(ESP_RST_SW, 3, true);                           /* the nightly maintenance reboot */
+    CHECK(st() == PP_STATE_NORMAL, "probation survives a reboot");
+    quiet_reads(POWER_READ_NO_INPUT, 13 * H);
+#if HAVE_RECOVERY
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "23 h: still on probation");
+    const int e = g_elines, w = g_writes;
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NONE && st() == PP_STATE_NORMAL, "24 h quiet: passed");
+    CHECK(g_elines == e + 1 && g_writes == w + 1, "one line, one write (e=%d w=%d)", g_elines - e, g_writes - w);
+    CHECK(strcmp(g_last_e, "power_protect: normal probation passed reason=probe_passed backoff_level=0") == 0,
+          "%s", g_last_e);
+    CHECK(rec().probe == PP_PROBE_OFF, "off");
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probation == PP_PROBATION_NONE, "passed survives a reboot");
+    /* A later brownout is a new episode (no_flash), not a failed probe. */
+    advance_s(7 * H);
+    reboot(ESP_RST_BROWNOUT, 5, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_BROWNOUT && s_core.p.probe_fails == 0, "new episode");
+#endif
+}
+
+#if HAVE_RECOVERY
+/* Probe from no_flash to normal and fail it with a brownout. */
+static void probe_and_fail(uint32_t *boot, int64_t wait_s, pp_state_t from)
+{
+    CHECK(st() == from, "from %d (state %d)", from, st());
+    quiet_reads(POWER_READ_NO_INPUT, wait_s - 120);
+    CHECK(st() == from, "not before %lld s (state %d)", (long long)wait_s, st());
+    quiet_reads(POWER_READ_NO_INPUT, 240);
+    CHECK(s_core.p.probation != PP_PROBATION_NONE && s_core.p.reason == PP_REASON_PROBE, "probed after %lld s",
+          (long long)wait_s);
+    advance_s(H);
+    reboot(ESP_RST_BROWNOUT, ++*boot, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probation == 0,
+          "failed probe escalates to hold (state %d reason %d)", st(), s_core.p.reason);
+}
+#endif
+
+/* A brownout on probation fails the probe: hold, and the next probe waits
+ * 6 -> 12 -> 24 h (capped), across reboots; 6 failures exhaust it. */
+static void probation_brownout_backoff(void)
+{
+    uint32_t boot = 2;
+    reboot(ESP_RST_BROWNOUT, boot, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL, "probed");
+    advance_s(H);
+    reboot(ESP_RST_BROWNOUT, ++boot, true);
+    CHECK(st() == PP_STATE_HOLD, "a brownout on probation -> hold");
+#if HAVE_RECOVERY
+    CHECK(s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probe_fails == 1, "level 1");
+    CHECK(strcmp(g_last_e, "power_protect: normal -> hold reason=probe_failed") == 0, "%s", g_last_e);
+    reboot(ESP_RST_SW, ++boot, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.probe_fails == 1, "the level survives a reboot");
+    quiet_reads(POWER_READ_NO_INPUT, 15);
+    CHECK(rec().backoff_level == 1 && rec().next_probe_s > 11 * H, "next %lld", (long long)rec().next_probe_s);
+    /* hold steps down to no_flash after 12 h; fail it (level 2), then 24 h. */
+    probe_and_fail(&boot, 12 * H, PP_STATE_HOLD);
+    CHECK(s_core.p.probe_fails == 2, "level 2");
+    reboot(ESP_RST_SW, ++boot, true);
+    probe_and_fail(&boot, 24 * H, PP_STATE_HOLD);
+    CHECK(s_core.p.probe_fails == 3, "level 3, wait capped at 24 h");
+    probe_and_fail(&boot, 24 * H, PP_STATE_HOLD);
+    probe_and_fail(&boot, 24 * H, PP_STATE_HOLD);
+    probe_and_fail(&boot, 24 * H, PP_STATE_HOLD);
+    CHECK(s_core.p.probe_fails == PP_PROBE_FAILS_MAX, "level %u", (unsigned)s_core.p.probe_fails);
+    CHECK(rec().probe == PP_PROBE_EXHAUSTED && rec().next_probe_s == -1, "exhausted");
+    const int w = g_writes;
+    quiet_reads(POWER_READ_NO_INPUT, 72 * H);
+    CHECK(st() == PP_STATE_HOLD && g_writes == w, "no further probe, no writes");
+    reboot(ESP_RST_SW, ++boot, true);
+    CHECK(rec().probe == PP_PROBE_EXHAUSTED, "exhausted survives a reboot");
+    /* A qualifying exit resets the backoff. */
+    good_reads(READS_30MIN + 2, 4100, 3900);
+    CHECK(st() == PP_STATE_NORMAL && s_core.p.probe_fails == 0, "qualifying exit resets the level");
+    /* ... and so does clear. */
+    reboot(ESP_RST_BROWNOUT, ++boot, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    advance_s(H);
+    reboot(ESP_RST_BROWNOUT, ++boot, true);
+    CHECK(s_core.p.probe_fails == 1, "level 1 again");
+    CHECK(power_protect_clear() == ESP_OK && s_core.p.probe_fails == 0 && st() == PP_STATE_NORMAL, "clear resets");
+#endif
+}
+
+/* hold never jumps to normal: no_flash first (steady-state work), then, after
+ * 24 h of no_flash probation without a brownout, normal on probation. */
+static void hold_steps_down_first(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    advance_s(13 * 60);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD, "hold");
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NO_FLASH, "hold -> no_flash first (state %d)", st());
+    CHECK(power_protect_blocks_flash() && !power_protect_blocks_ambit(), "steady-state work only");
+#if HAVE_RECOVERY
+    CHECK(s_core.p.probation == PP_PROBATION_NO_FLASH, "on probation");
+    CHECK(strcmp(g_last_e, "power_protect: hold -> no_flash reason=probe") == 0, "%s", g_last_e);
+#endif
+    quiet_reads(POWER_READ_NO_INPUT, 24 * H - 600);
+    CHECK(st() == PP_STATE_NO_FLASH, "not normal during the no_flash probation");
+    quiet_reads(POWER_READ_NO_INPUT, 900);
+    CHECK(st() == PP_STATE_NORMAL, "then normal (state %d)", st());
+#if HAVE_RECOVERY
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL && s_core.p.reason == PP_REASON_PROBE, "normal on probation");
+    /* The no_flash probation can fail on a fresh low read: back to hold. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 10, true);
+    reboot(ESP_RST_BROWNOUT, 11, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NO_FLASH, "probing");
+    good_reads(3, 4100, 3600);                    /* below exit, above entry: not a failure */
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probation == PP_PROBATION_NO_FLASH, "3.60 V does not fail it");
+    good_reads(3, 4100, 3350);                    /* below the entry threshold */
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probe_fails == 1,
+          "a low read fails the no_flash probation");
+    /* And the normal probation: back to no_flash. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 20, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
+    good_reads(3, 3250, 3900);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.reason == PP_REASON_PROBE_FAILED && s_core.p.probe_fails == 1,
+          "a low read fails the normal probation");
+#endif
+}
+
+static void forced_never_probes(void)
+{
+    reboot(ESP_RST_POWERON, 1, true);
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == ESP_OK, "force");
+    quiet_reads(POWER_READ_NO_INPUT, 72 * H);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.forced, "forced no_flash: 72 h on battery, no probe");
+#if HAVE_RECOVERY
+    CHECK(rec().probe == PP_PROBE_OFF && rec().next_probe_s == -1, "probe off");
+#endif
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK, "force hold");
+    quiet_reads(POWER_READ_NO_INPUT, 72 * H);
+    CHECK(st() == PP_STATE_HOLD, "forced hold: no probe");
+    /* Forcing a unit on probation ends the probation. */
+    CHECK(power_protect_clear() == ESP_OK, "clear");
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(st() == PP_STATE_NORMAL, "probed");
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == ESP_OK && st() == PP_STATE_NO_FLASH, "forced");
+#if HAVE_RECOVERY
+    CHECK(s_core.p.probation == PP_PROBATION_NONE, "force ends the probation");
+#endif
+    quiet_reads(POWER_READ_NO_INPUT, 72 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "no probe while forced");
+}
+
+/* No charger monitor: no probe (fail-closed, as before). */
+static void no_monitor_no_probe(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    advance_s(48 * H);                              /* nothing reads the charger at all */
+#if HAVE_RECOVERY
+    CHECK(rec().probe == PP_PROBE_NO_MONITOR && rec().next_probe_s == -1, "no_monitor");
+#endif
+    quiet_reads(POWER_READ_UNAVAILABLE, 48 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "no charger fitted: no probe");
+    quiet_reads(POWER_READ_I2C_ERROR, 48 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "charger not answering: no probe");
+#if HAVE_RECOVERY
+    CHECK(rec().probe == PP_PROBE_NO_MONITOR, "still no_monitor");
+#endif
+    quiet_reads(POWER_READ_NO_INPUT, 30);           /* a live "no input" answer */
+    CHECK(st() == PP_STATE_NORMAL, "a live monitor saying no input probes");
+}
+
+/* A fresh low read restarts the quiet period; the probe waits 6 h from it. */
+static void probe_waits_after_low_read(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    quiet_reads(POWER_READ_NO_INPUT, 5 * H);
+    good_reads(3, 4100, 3600);                      /* fresh, input, battery 3.60 V */
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H - 120);
+    CHECK(st() == PP_STATE_NO_FLASH, "11 h after entry, under 6 h after the low read");
+    quiet_reads(POWER_READ_NO_INPUT, 240);
+    CHECK(st() == PP_STATE_NORMAL, "6 h after the low read: probe");
+}
+
+/* Without a valid clock the quiet period and the probation count uptime: any
+ * reboot restarts them (conservative). */
+static void probe_uptime_without_clock(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, false);
+    quiet_reads(POWER_READ_NO_INPUT, 5 * H);
+    reboot(ESP_RST_SW, 3, false);
+    quiet_reads(POWER_READ_NO_INPUT, 5 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "10 h, but only 5 h of uptime");
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(st() == PP_STATE_NORMAL, "6 h of uptime: probe");
+#if HAVE_RECOVERY
+    quiet_reads(POWER_READ_NO_INPUT, 20 * H);
+    reboot(ESP_RST_SW, 4, false);
+    quiet_reads(POWER_READ_NO_INPUT, 20 * H);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probation restarted at the reboot");
+    quiet_reads(POWER_READ_NO_INPUT, 4 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NONE, "24 h of uptime: passed");
+    /* A probation that fails on a low read: the next quiet period counts from
+     * the failure, not from boot. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 10, false);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(s_core.p.probation == PP_PROBATION_NORMAL, "probing");
+    quiet_reads(POWER_READ_NO_INPUT, 4 * H);
+    good_reads(3, 3250, 3900);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == 1, "failed on a low read");
+    quiet_reads(POWER_READ_NO_INPUT, 12 * H - 120);
+    CHECK(st() == PP_STATE_NO_FLASH, "12 h from the failure, not from boot");
+    quiet_reads(POWER_READ_NO_INPUT, 240);
+    CHECK(st() == PP_STATE_NORMAL, "then the next probe");
+#endif
+}
+
+/* Qualifying evidence inside the horizon blocks the probe: the accumulation
+ * decides; once it has expired the probe may run. */
+static void evidence_blocks_probe(void)
+{
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    good_reads(121, 4100, 3900);                    /* 10 min of evidence */
+    quiet_reads(POWER_READ_NO_INPUT, 11 * H);
+    CHECK(st() == PP_STATE_NO_FLASH, "evidence 11 h old still blocks the probe");
+#if HAVE_RECOVERY
+    CHECK(rec().probe == PP_PROBE_WAITING && rec().next_probe_s > 0 && rec().next_probe_s <= H,
+          "next %lld", (long long)rec().next_probe_s);
+#endif
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);
+    CHECK(st() == PP_STATE_NORMAL, "expired evidence: the probe runs");
+}
+
+#if HAVE_RECOVERY
+static uint32_t crc32_v1(const uint8_t *b, size_t n)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= b[i];
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+#endif
+
+/* The first release's 113-B v1 blob reads back unchanged (an upgrade never
+ * turns a stored state into "unreadable"); the next write is v2. */
+static void blob_v1_upgrade(void)
+{
+#if HAVE_RECOVERY
+    pp_persist_t p;
+    memset(&p, 0, sizeof p);
+    p.state = PP_STATE_HOLD; p.reason = PP_REASON_REPEAT_BROWNOUT; p.since_utc = (int64_t)g_utc;
+    p.hist_n = 2; p.hist[0] = (pp_brownout_t){(int64_t)g_utc - 600, 2}; p.hist[1] = (pp_brownout_t){(int64_t)g_utc, 3};
+    uint8_t v2[PP_BLOB_LEN];
+    CHECK(pp_encode(&p, v2, sizeof v2) == PP_BLOB_LEN && PP_BLOB_LEN == 115 && PP_BLOB_V1_LEN == 113, "lens");
+    /* v1 = v2 without the two probe bytes, version 1, its own CRC. */
+    memcpy(g_blob, v2, PP_BLOB_V1_LEN - 4);
+    g_blob[0] = 1;
+    const uint32_t crc = crc32_v1(g_blob, PP_BLOB_V1_LEN - 4);
+    for (int i = 0; i < 4; i++) g_blob[PP_BLOB_V1_LEN - 4 + i] = (uint8_t)(crc >> (8 * i));
+    g_blob_len = PP_BLOB_V1_LEN;
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.reason == PP_REASON_REPEAT_BROWNOUT && !s_core.persist_fault &&
+          s_core.p.hist_n == 2 && s_core.p.probation == 0 && s_core.p.probe_fails == 0, "v1 read back");
+    CHECK(g_writes == 0, "nothing rewritten at boot");
+    CHECK(power_protect_force(PP_STATE_HOLD) == ESP_OK && g_blob_len == PP_BLOB_LEN && g_blob[0] == 2, "v2 written");
+    /* v2 range checks: a probation must be automatic and in its step's state. */
+    pp_persist_t q;
+    pp_persist_t bad = p; bad.state = PP_STATE_NORMAL; bad.probation = PP_PROBATION_NO_FLASH;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(!pp_decode(&q, v2, sizeof v2), "no_flash probation in normal");
+    bad = p; bad.state = PP_STATE_NO_FLASH; bad.forced = true; bad.probation = PP_PROBATION_NO_FLASH;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(!pp_decode(&q, v2, sizeof v2), "forced probation");
+    bad = p; bad.probation = 3;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(!pp_decode(&q, v2, sizeof v2), "probation 3");
+    bad = p; bad.probe_fails = PP_PROBE_FAILS_MAX + 1;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(!pp_decode(&q, v2, sizeof v2), "fails");
+    bad = p; bad.state = PP_STATE_NORMAL; bad.probation = PP_PROBATION_NORMAL; bad.probe_fails = 3;
+    pp_encode(&bad, v2, sizeof v2);
+    CHECK(pp_decode(&q, v2, sizeof v2) && q.probation == PP_PROBATION_NORMAL && q.probe_fails == 3, "valid probation");
+    /* A v1 version byte on a v2-length blob (and the reverse) is refused. */
+    pp_encode(&p, v2, sizeof v2);
+    v2[0] = 1;
+    CHECK(!pp_decode(&q, v2, sizeof v2), "v1 byte, v2 length");
+    /* An unreadable blob assumes the longest backoff wait (level cap). */
+    g_blob[7] ^= 1;
+    reboot(ESP_RST_SW, 5, true);
+    CHECK(st() == PP_STATE_NO_FLASH && s_core.p.probe_fails == PP_PROBE_LEVEL_CAP && s_core.persist_fault, "unreadable");
+#endif
 }
 
 static void low_voltage_trigger(void)
@@ -443,7 +915,7 @@ static void persistence_roundtrip(void)
     p.hist[0] = (pp_brownout_t){1763152200, 2};
     p.hist[1] = (pp_brownout_t){0, UINT32_MAX};
     uint8_t b[PP_BLOB_LEN], b2[PP_BLOB_LEN];
-    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 113, "len");
+    CHECK(pp_encode(&p, b, sizeof b) == PP_BLOB_LEN && PP_BLOB_LEN == 115, "len");
     CHECK(pp_encode(&p, b, PP_BLOB_LEN - 1) == 0, "short buffer refused");
     pp_persist_t q;
     CHECK(pp_decode(&q, b, sizeof b), "decode");
@@ -466,7 +938,7 @@ static void persistence_roundtrip(void)
     bad = p; bad.reason = PP_REASON_COUNT;
     pp_encode(&bad, b2, sizeof b2);
     CHECK(!pp_decode(&q, b2, sizeof b2), "reason");
-    b2[0] = 2;
+    b2[0] = 3;
     CHECK(!pp_decode(&q, b2, sizeof b2), "version");
 
     /* Through the glue: what a brownout boot wrote is what the next boot reads. */
@@ -618,6 +1090,7 @@ static void no_writes_on_reads_or_reports(void)
 
 static void render_json(void)
 {
+#if HAVE_RECOVERY   /* the heartbeat object of this core only */
     reboot(ESP_RST_BROWNOUT, 2, true);
     power_protect_note_skip(POWER_PROTECT_SKIP_FLASH_RUN);
     power_protect_note_skip(POWER_PROTECT_SKIP_FLASH_RUN);
@@ -628,6 +1101,7 @@ static void render_json(void)
     char want[PP_JSON_CAP];
     snprintf(want, sizeof want, "{\"state\":\"no_flash\",\"reason\":\"brownout\",\"since_utc\":%lld,"
              "\"forced\":false,\"persist_fault\":false,\"brownouts_6h\":1,"
+             "\"qualifying_s\":0,\"probe\":\"no_monitor\",\"next_probe_s\":null,\"backoff_level\":0,"
              "\"skipped\":{\"flash_runs\":2,\"ambit_runs\":1,\"ota\":1}}",
              (long long)g_utc);
     CHECK(strcmp(json, want) == 0, "%s", json);
@@ -635,7 +1109,8 @@ static void render_json(void)
     /* Unknown since -> null; worst case fits PP_JSON_CAP; too small -> -1, empty. */
     pp_persist_t p;
     memset(&p, 0, sizeof p);
-    CHECK(pp_render_json(json, sizeof json, &p, false, 0, NULL) > 0 && strstr(json, "\"since_utc\":null"), "%s", json);
+    CHECK(pp_render_json(json, sizeof json, &p, false, 0, NULL, NULL) > 0 && strstr(json, "\"since_utc\":null") &&
+          strstr(json, "\"next_probe_s\":null"), "%s", json);
     /* Worst case: the longest state and reason names, every number at its widest. */
     size_t longest = 0;
     pp_reason_t widest = PP_REASON_NONE;
@@ -648,10 +1123,24 @@ static void render_json(void)
     p.state = PP_STATE_NO_FLASH; p.reason = (uint8_t)widest; p.forced = true;
     p.since_utc = INT64_MIN;
     const pp_skips_t max = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
-    const int n = pp_render_json(json, sizeof json, &p, true, UINT32_MAX, &max);
+    const pp_recovery_t wide = { UINT32_MAX, PP_PROBE_NO_MONITOR, INT64_MAX, UINT8_MAX };
+    const int n = pp_render_json(json, sizeof json, &p, true, UINT32_MAX, &max, &wide);
     CHECK(n > 0 && (size_t)n < PP_JSON_CAP, "worst case %d", n);
     printf("WORST %d %s\n", n, json);
-    CHECK(pp_render_json(json, 40, &p, false, 0, NULL) == -1 && json[0] == '\0', "no partial object");
+    CHECK(pp_render_json(json, 40, &p, false, 0, NULL, NULL) == -1 && json[0] == '\0', "no partial object");
+    /* A unit on probation, through the glue. */
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    quiet_reads(POWER_READ_NO_INPUT, 6 * H + 60);
+    CHECK(power_protect_render_json(json, sizeof json) > 0, "render");
+    printf("JSON_PROBATION %s\n", json);
+    g_blob_len = 0;
+    reboot(ESP_RST_BROWNOUT, 4, true);
+    good_reads(61, 4100, 3900);
+    quiet_reads(POWER_READ_NO_INPUT, H);
+    CHECK(power_protect_render_json(json, sizeof json) > 0, "render");
+    printf("JSON_WAITING %s\n", json);
+#endif
 }
 
 /* ── scenarios: the MQTT command codec, wired to the real glue ─────────── */
@@ -781,7 +1270,7 @@ static void cmd_no_mem(void)
     /* Every single allocation failure: the reply is either a complete success
      * or an allocation-free refusal (queue_unavailable / no_mem), never a
      * partial ok:true; the busy flag is always released. */
-    for (int at = 1; at <= 40; at++) {
+    for (int at = 1; at <= 60; at++) {
         cmd_with_alloc_fail("{\"type\":\"power_protect\",\"id\":\"n1\",\"action\":\"status\"}", at);
         CHECK(g_job == NULL, "nothing left queued");
     }
@@ -803,6 +1292,19 @@ static const scenario_t k_scenarios[] = {
     {"exit_after_30min", exit_after_30min},
     {"window_restarts", window_restarts},
     {"battery_zero_with_input", battery_zero_with_input},
+    {"idle_battery_zero", idle_battery_zero},
+    {"intermittent_solar_recovers", intermittent_solar_recovers},
+    {"low_read_resets_accumulation", low_read_resets_accumulation},
+    {"old_evidence_expires", old_evidence_expires},
+    {"battery_probe_recovers", battery_probe_recovers},
+    {"probation_brownout_backoff", probation_brownout_backoff},
+    {"hold_steps_down_first", hold_steps_down_first},
+    {"forced_never_probes", forced_never_probes},
+    {"no_monitor_no_probe", no_monitor_no_probe},
+    {"probe_waits_after_low_read", probe_waits_after_low_read},
+    {"probe_uptime_without_clock", probe_uptime_without_clock},
+    {"evidence_blocks_probe", evidence_blocks_probe},
+    {"blob_v1_upgrade", blob_v1_upgrade},
     {"low_voltage_trigger", low_voltage_trigger},
     {"hold_never_exits_on_battery", hold_never_exits_on_battery},
     {"forced_never_exits", forced_never_exits},

@@ -7,11 +7,15 @@ Compiles the PRODUCTION state machine (components/power_protect/power_protect_co
 its glue (power_protect.c, against a fake NVS that counts every write), the real
 power_policy gate that supplies the fresh-external-power evidence, and the MQTT
 command codec (components/command_router/power_protect_command.c, pinned cJSON)
-into tests/power_protect_host and runs every scenario: every transition and exit
-timer, window restarts on invalid / stale / no_input / out-of-threshold reads and
-read gaps, battery_v == 0 with input, forced states, clear, brownout escalation
-with a valid and an invalid clock (the 15 Nov Uluru boots 2-3-4), the blob
-round-trip and NVS writes only on transitions, and the command codec.
+into tests/power_protect_host and runs every scenario: every transition, the
+accumulated exit (pauses on invalid / stale / no_input / input-absent reads and
+read gaps, resets on fresh low reads, a 12-h horizon), intermittent solar, the
+battery-only probe (quiet period, probation, backoff 6 -> 12 -> 24 h across
+reboots, exhaustion, hold -> no_flash first, never when forced or without a
+charger monitor), battery_v == 0 with input judged on the rail, forced states,
+clear, brownout escalation with a valid and an invalid clock (the 15 Nov Uluru
+boots 2-3-4), the v1 -> v2 blob upgrade and NVS writes only on transitions, and
+the command codec.
 
 Real brownout behaviour is covered here only: a bench cannot brown out on demand,
 so the bench run exercises `force` and `clear`. Source-contract tests pin the
@@ -88,21 +92,43 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 25)
+        self.assertGreaterEqual(len(self.scenarios), 41)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
 
+    def test_recovery_scenarios_are_present(self):
+        # Uluru 17-20 Nov: each of these fails on the continuous-window core
+        # (origin/main a13fbfd), see the PR for the run.
+        for name in ("intermittent_solar_recovers", "low_read_resets_accumulation", "old_evidence_expires",
+                     "battery_probe_recovers", "probation_brownout_backoff", "hold_steps_down_first",
+                     "forced_never_probes", "idle_battery_zero", "no_monitor_no_probe",
+                     "probe_waits_after_low_read", "probe_uptime_without_clock", "evidence_blocks_probe",
+                     "blob_v1_upgrade"):
+            self.assertIn(name, self.scenarios)
+
     def test_heartbeat_object(self):
         out = self.run_case("render_json")
         obj = json.loads(re.search(r"^JSON (.*)$", out, re.M).group(1))
-        self.assertEqual(set(obj), {"state", "reason", "since_utc", "forced", "persist_fault", "brownouts_6h",
-                                    "skipped"})
+        keys = {"state", "reason", "since_utc", "forced", "persist_fault", "brownouts_6h", "qualifying_s",
+                "probe", "next_probe_s", "backoff_level", "skipped"}
+        self.assertEqual(set(obj), keys)
         self.assertIs(obj["persist_fault"], False)
         self.assertEqual(obj["skipped"], {"flash_runs": 2, "ambit_runs": 1, "ota": 1})
+        self.assertEqual((obj["qualifying_s"], obj["probe"], obj["next_probe_s"], obj["backoff_level"]),
+                         (0, "no_monitor", None, 0))
         worst = re.search(r"^WORST (\d+) (.*)$", out, re.M)
-        self.assertLess(int(worst.group(1)), 256)
+        self.assertLess(int(worst.group(1)), 384)                                       # PP_JSON_CAP
         self.assertEqual(json.loads(worst.group(2))["reason"], "brownout_unordered")   # the longest name
+        probation = json.loads(re.search(r"^JSON_PROBATION (.*)$", out, re.M).group(1))
+        self.assertEqual(set(probation), keys)
+        self.assertEqual((probation["state"], probation["reason"], probation["probe"], probation["next_probe_s"]),
+                         ("normal", "probe", "probation", None))
+        waiting = json.loads(re.search(r"^JSON_WAITING (.*)$", out, re.M).group(1))
+        self.assertEqual((waiting["state"], waiting["probe"]), ("no_flash", "waiting"))
+        self.assertGreater(waiting["qualifying_s"], 0)
+        # Collected evidence blocks the probe until it leaves the 12-h horizon.
+        self.assertGreater(waiting["next_probe_s"], 10 * 3600)
         unreadable = json.loads(re.search(r"^JSON_UNREADABLE (.*)$", self.run_case("unreadable_state_is_protected"),
                                           re.M).group(1))
         self.assertEqual((unreadable["state"], unreadable["reason"], unreadable["forced"], unreadable["persist_fault"]),
@@ -117,6 +143,8 @@ class PowerProtectHostTest(unittest.TestCase):
                           status["persist_fault"]), ("no_flash", "brownout", False, 1, False))
         self.assertIsInstance(status["since_utc"], (int, float))
         self.assertIsNone(status["exit_in_s"])
+        self.assertEqual((status["qualifying_s"], status["probe"], status["next_probe_s"], status["backoff_level"]),
+                         (0, "no_monitor", None, 0))
         self.assertEqual(status["skipped"], {"flash_runs": 0, "ambit_runs": 0, "ota": 0})
         self.assertEqual((forced["ok"], forced["detail"], forced["state"], forced["reason"], forced["forced"]),
                          (True, "applied", "hold", "forced", True))
@@ -147,7 +175,7 @@ class PowerProtectHostTest(unittest.TestCase):
 
     def test_allocation_failures_never_report_partial_success(self):
         replies = self.replies("cmd_no_mem")
-        self.assertEqual(len(replies), 41)
+        self.assertEqual(len(replies), 61)
         details = {r["detail"] for r in replies}
         self.assertLessEqual(details, {"queue_unavailable", "no_mem", "ok"})
         self.assertIn("no_mem", details)
@@ -158,6 +186,8 @@ class PowerProtectHostTest(unittest.TestCase):
                 self.assertIn("skipped", r)
                 self.assertEqual(set(r["skipped"]), {"flash_runs", "ambit_runs", "ota"})
                 self.assertIn("persist_fault", r)
+                for key in ("qualifying_s", "probe", "next_probe_s", "backoff_level"):
+                    self.assertIn(key, r)
 
 
 class DestructivePrimitivesTest(unittest.TestCase):

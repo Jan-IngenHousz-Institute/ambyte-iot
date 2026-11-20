@@ -20,11 +20,14 @@ void pp_load_unreadable(pp_core_t *c, pp_clock_t clk)
      * whose blob was corrupted resume full load on its next non-brownout
      * reboot. We cannot know what was stored, so assume the protected side
      * that still lets the unit measure and recover by itself: no_flash, not
-     * forced (the 30-min window or clear ends it). */
+     * forced (accumulated evidence, the probe or clear ends it). */
     pp_core_init(c);
     c->p.state = PP_STATE_NO_FLASH;
     c->p.reason = PP_REASON_STATE_UNREADABLE;
     c->p.since_utc = clk.valid ? clk.utc : 0;
+    /* The failed-probe count is lost with the blob: assume the longest wait
+     * (level cap), not a fresh 6 h, and none on probation. */
+    c->p.probe_fails = PP_PROBE_LEVEL_CAP;
     c->persist_fault = true;
 }
 
@@ -52,9 +55,23 @@ const char *pp_reason_name(pp_reason_t r)
     case PP_REASON_CLEARED:         return "cleared";
     case PP_REASON_STATE_UNREADABLE: return "state_unreadable";
     case PP_REASON_BROWNOUT_UNORDERED: return "brownout_unordered";
+    case PP_REASON_PROBE:           return "probe";
+    case PP_REASON_PROBE_FAILED:    return "probe_failed";
     case PP_REASON_COUNT:           break;
     }
     return "none";
+}
+
+const char *pp_probe_name(pp_probe_t p)
+{
+    switch (p) {
+    case PP_PROBE_OFF:        return "off";
+    case PP_PROBE_WAITING:    return "waiting";
+    case PP_PROBE_PROBATION:  return "probation";
+    case PP_PROBE_EXHAUSTED:  return "exhausted";
+    case PP_PROBE_NO_MONITOR: return "no_monitor";
+    }
+    return "off";
 }
 
 bool pp_force_state_parse(const char *s, pp_state_t *out)
@@ -66,9 +83,12 @@ bool pp_force_state_parse(const char *s, pp_state_t *out)
 }
 
 /* ── blob codec ────────────────────────────────────────────────────────────
- * Layout (little endian, PP_BLOB_LEN = 113 B):
+ * Layout v2 (little endian, PP_BLOB_LEN = 115 B):
  *   u8 version | u8 state | u8 reason | u8 forced | i64 since_utc |
- *   u8 hist_n  | PP_HIST_MAX × { i64 utc | u32 boot } | u32 crc32(all above)
+ *   u8 hist_n  | PP_HIST_MAX × { i64 utc | u32 boot } |
+ *   u8 probation | u8 probe_fails | u32 crc32(all above)
+ * v1 (113 B, the first release) is the same without the two probe bytes. It
+ * is still read, so an upgrade keeps every stored state.
  * Explicit bytes, not a struct dump: padding and field order can never make a
  * blob written by one build unreadable by the next, and a torn or foreign
  * value fails the CRC instead of being trusted. */
@@ -126,15 +146,19 @@ size_t pp_encode(const pp_persist_t *p, uint8_t *buf, size_t cap)
         put_i64(buf + o, e.utc); o += 8;
         put_u32(buf + o, e.boot); o += 4;
     }
+    buf[o++] = p->probation;
+    buf[o++] = p->probe_fails;
     put_u32(buf + o, crc32_ieee(buf, o)); o += 4;
     return o;
 }
 
 bool pp_decode(pp_persist_t *out, const uint8_t *buf, size_t len)
 {
-    if (out == NULL || buf == NULL || len != PP_BLOB_LEN) return false;
-    if (buf[0] != PP_BLOB_VERSION) return false;
-    if (get_u32(buf + PP_BLOB_LEN - 4) != crc32_ieee(buf, PP_BLOB_LEN - 4)) return false;
+    if (out == NULL || buf == NULL) return false;
+    if (!(len == PP_BLOB_LEN && buf[0] == PP_BLOB_VERSION) && !(len == PP_BLOB_V1_LEN && buf[0] == 1u)) {
+        return false;
+    }
+    if (get_u32(buf + len - 4) != crc32_ieee(buf, len - 4)) return false;
     pp_persist_t p;
     memset(&p, 0, sizeof p);
     size_t o = 1;
@@ -155,6 +179,17 @@ bool pp_decode(pp_persist_t *out, const uint8_t *buf, size_t len)
         p.hist[i].boot = get_u32(buf + o); o += 4;
         if (i >= p.hist_n) p.hist[i] = (pp_brownout_t){0, 0};
     }
+    if (len == PP_BLOB_LEN) {
+        p.probation = buf[o++];
+        p.probe_fails = buf[o++];
+        if (p.probation > PP_PROBATION_NORMAL || p.probe_fails > PP_PROBE_FAILS_MAX) return false;
+        /* A probation is always automatic and in the state its step entered. */
+        if (p.probation != PP_PROBATION_NONE &&
+            (p.forced || p.state != (p.probation == PP_PROBATION_NO_FLASH ? PP_STATE_NO_FLASH
+                                                                          : PP_STATE_NORMAL))) {
+            return false;
+        }
+    }
     *out = p;
     return true;
 }
@@ -168,14 +203,59 @@ static pp_event_t no_event(const pp_core_t *c)
                          .reason = (pp_reason_t)c->p.reason };
 }
 
-static void window_reset(pp_core_t *c)
+/* ── accumulated exit evidence (RAM) ─────────────────────────────────────── */
+
+static void acc_reset(pp_core_t *c)
 {
-    c->window_open = false;
-    c->window_start_ms = 0;
+    memset(c->acc_ms, 0, sizeof c->acc_ms);
+    memset(c->acc_bucket, 0, sizeof c->acc_bucket);
+    c->prev_qual = false;
+}
+
+static void acc_credit(pp_core_t *c, int64_t mono_ms, int64_t ms)
+{
+    const int64_t b = mono_ms / PP_EXIT_BUCKET_MS;
+    const unsigned s = (unsigned)(b % PP_EXIT_BUCKETS);
+    if (c->acc_bucket[s] != b) {   /* a slot from an older lap of the ring */
+        c->acc_bucket[s] = b;
+        c->acc_ms[s] = 0;
+    }
+    c->acc_ms[s] += (uint32_t)ms;  /* ≤ 60 s per credit, ≤ 30 min + 60 s per slot */
+}
+
+/* Evidence inside the horizon: the PP_EXIT_BUCKETS newest buckets. */
+static int64_t acc_sum(const pp_core_t *c, int64_t mono_ms)
+{
+    const int64_t b = mono_ms / PP_EXIT_BUCKET_MS;
+    int64_t sum = 0;
+    for (unsigned s = 0; s < PP_EXIT_BUCKETS; s++) {
+        if (c->acc_ms[s] != 0 && c->acc_bucket[s] <= b && c->acc_bucket[s] > b - (int64_t)PP_EXIT_BUCKETS) {
+            sum += c->acc_ms[s];
+        }
+    }
+    return sum;
+}
+
+/* ms until the newest evidence leaves the horizon; 0 when there is none. */
+static int64_t acc_expiry_ms(const pp_core_t *c, int64_t mono_ms)
+{
+    const int64_t b = mono_ms / PP_EXIT_BUCKET_MS;
+    int64_t newest = -1;
+    for (unsigned s = 0; s < PP_EXIT_BUCKETS; s++) {
+        if (c->acc_ms[s] != 0 && c->acc_bucket[s] <= b && c->acc_bucket[s] > b - (int64_t)PP_EXIT_BUCKETS &&
+            c->acc_bucket[s] > newest) {
+            newest = c->acc_bucket[s];
+        }
+    }
+    if (newest < 0) return 0;
+    const int64_t left = (newest + (int64_t)PP_EXIT_BUCKETS) * PP_EXIT_BUCKET_MS - mono_ms;
+    return left > 0 ? left : 0;
 }
 
 /* Move to `to` for `why`. since_utc moves only when the STATE moves (a forced
- * relabel of the current state keeps the original entry time). */
+ * relabel of the current state keeps the original entry time). Every
+ * transition ends a probation and restarts the accumulated evidence; the
+ * probe sets its probation after this call. */
 static pp_event_t transition(pp_core_t *c, pp_state_t to, pp_reason_t why, pp_clock_t clk)
 {
     pp_event_t ev = no_event(c);
@@ -186,7 +266,72 @@ static pp_event_t transition(pp_core_t *c, pp_state_t to, pp_reason_t why, pp_cl
     if (ev.changed) c->p.since_utc = clk.valid ? clk.utc : 0;
     c->p.state = (uint8_t)to;
     c->p.reason = (uint8_t)why;
-    window_reset(c);
+    c->p.probation = PP_PROBATION_NONE;
+    acc_reset(c);
+    return ev;
+}
+
+/* ── battery-only probe ────────────────────────────────────────────────── */
+
+static int64_t probe_wait_s(uint8_t fails)
+{
+    const unsigned level = fails > PP_PROBE_LEVEL_CAP ? PP_PROBE_LEVEL_CAP : fails;
+    return PP_PROBE_QUIET_BASE_S << level;
+}
+
+/* Seconds without a brownout or a fresh low read, as far as they can be
+ * proven. With a valid clock, a dated entry (since_utc) and a dated newest
+ * brownout: since the later of the two, across reboots. Otherwise the time
+ * since boot or since this boot's last transition, whichever is later: every
+ * brownout reboots, so uptime is a lower bound on the time since the last one
+ * (any reboot restarts it: conservative). A fresh low read this boot caps it
+ * as well. */
+static int64_t quiet_s(const pp_core_t *c, int64_t mono_ms, pp_clock_t clk)
+{
+    const pp_brownout_t *last = c->p.hist_n > 0 ? &c->p.hist[c->p.hist_n - 1] : NULL;
+    int64_t q;
+    if (clk.valid && c->p.since_utc != 0 && clk.utc >= c->p.since_utc &&
+        (last == NULL || (last->utc != 0 && clk.utc >= last->utc))) {
+        int64_t anchor = c->p.since_utc;
+        if (last != NULL && last->utc > anchor) anchor = last->utc;
+        q = clk.utc - anchor;
+    } else {
+        q = (mono_ms - c->since_mono_ms) / 1000;
+    }
+    if (c->have_low) {
+        const int64_t lq = (mono_ms - c->last_low_ms) / 1000;
+        if (lq < q) q = lq;
+    }
+    return q < 0 ? 0 : q;
+}
+
+/* Seconds on probation: by UTC from the step (since_utc) when it is dated and
+ * the clock is valid, else since the step in this boot, or since boot. */
+static int64_t probation_s(const pp_core_t *c, int64_t mono_ms, pp_clock_t clk)
+{
+    if (clk.valid && c->p.since_utc != 0 && clk.utc >= c->p.since_utc) return clk.utc - c->p.since_utc;
+    const int64_t s = (mono_ms - c->since_mono_ms) / 1000;
+    return s < 0 ? 0 : s;
+}
+
+static pp_event_t probe_fail(pp_core_t *c, pp_state_t to, pp_clock_t clk)
+{
+    const uint8_t fails = c->p.probe_fails < PP_PROBE_FAILS_MAX ? (uint8_t)(c->p.probe_fails + 1u)
+                                                                : (uint8_t)PP_PROBE_FAILS_MAX;
+    const pp_event_t ev = transition(c, to, PP_REASON_PROBE_FAILED, clk);
+    c->p.probe_fails = fails;
+    return ev;
+}
+
+static pp_event_t probe_pass(pp_core_t *c)
+{
+    /* The state stays (reason probe); the probation flag goes. Persisted so a
+     * later brownout is a new episode, not a failed probe. The backoff level
+     * stays: only a qualifying exit or clear proves the power good again. */
+    c->p.probation = PP_PROBATION_NONE;
+    pp_event_t ev = no_event(c);
+    ev.persist = true;
+    ev.probe_passed = true;
     return ev;
 }
 
@@ -212,9 +357,12 @@ pp_link_t pp_brownout_link(const pp_brownout_t *prev, const pp_brownout_t *cur)
 
 pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock_t clk)
 {
-    /* A reboot always restarts the exit window: it is RAM-only evidence. */
-    window_reset(c);
+    /* A reboot always restarts the accumulated evidence: it is RAM only. */
+    acc_reset(c);
     c->have_read = false;
+    c->have_low = false;
+    c->monitor_live = false;
+    c->since_mono_ms = 0;   /* a state from an earlier boot: uptime counts from boot */
     if (!brownout_reset) return no_event(c);
 
     const pp_brownout_t cur = { .utc = clk.valid ? clk.utc : 0, .boot = boot };
@@ -232,7 +380,12 @@ pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock
 
     const pp_state_t from = (pp_state_t)c->p.state;
     pp_event_t ev;
-    if (link == PP_LINK_YES && from != PP_STATE_HOLD) {
+    if (c->p.probation != PP_PROBATION_NONE) {
+        /* A brownout on probation: the probe failed. It belongs to the episode
+         * the probe stepped out of, so it escalates like a linked one (hold),
+         * and the next probe waits twice as long. */
+        ev = probe_fail(c, PP_STATE_HOLD, clk);
+    } else if (link == PP_LINK_YES && from != PP_STATE_HOLD) {
         /* A second brownout in one episode: escalate, from no_flash and also
          * straight from normal (a unit that had recovered and browns out again
          * within 6 h has shown its power cannot carry the reduced load either).
@@ -253,48 +406,94 @@ pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock
     return ev;
 }
 
-pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_reading_t *p,
-                      bool fresh_present, int64_t mono_ms, pp_clock_t clk)
+static pp_event_t on_read(pp_core_t *c, power_read_reason_t reason, const power_reading_t *p,
+                          bool fresh_present, int64_t mono_ms, pp_clock_t clk)
 {
     /* Only a valid read with input present whose frames are changing is
      * evidence about the rail; stale, invalid and no_input reads never are. */
     const bool fresh = reason == POWER_READ_OK && p != NULL && p->input_present && fresh_present;
-    const bool gap = c->have_read &&
-                     (mono_ms < c->last_read_ms || mono_ms - c->last_read_ms > PP_READ_GAP_MAX_MS);
+    const bool in_seq = c->have_read && mono_ms >= c->last_read_ms &&
+                        mono_ms - c->last_read_ms <= PP_READ_GAP_MAX_MS;
+    const int64_t interval = in_seq ? mono_ms - c->last_read_ms : 0;
     c->have_read = true;
     c->last_read_ms = mono_ms;
+    /* A charger that answered: the monitor the probe needs (fail-closed
+     * without one). no_input is a live answer, the battery-only case itself. */
+    c->monitor_live = reason != POWER_READ_UNAVAILABLE && reason != POWER_READ_I2C_ERROR;
+
+    /* battery_v == 0 with input: the charger idles and the unit runs on the
+     * battery through the BATFET, so the rail IS the battery (C in the
+     * header). Judge it with the battery thresholds. */
+    const uint32_t sys = fresh ? p->system_mv : 0;
+    const uint32_t bat = fresh ? (p->battery_mv != 0 ? p->battery_mv : p->system_mv) : 0;
+    const bool qualifies = fresh && sys >= PP_SYS_EXIT_MV && bat >= PP_BAT_EXIT_MV;
+    const bool low = fresh && !qualifies;
+    const bool trigger = fresh && (sys < PP_SYS_TRIGGER_MV || bat < PP_BAT_TRIGGER_MV);
 
     const pp_state_t s = (pp_state_t)c->p.state;
     if (s == PP_STATE_NORMAL) {
-        window_reset(c);
-        if (fresh && (p->system_mv < PP_SYS_TRIGGER_MV ||
-                      (p->battery_mv > 0 && p->battery_mv < PP_BAT_TRIGGER_MV))) {
-            /* battery_mv == 0 with input = no battery or an idle charger
-             * (power-telemetry.md): never a trigger on its own. */
-            return transition(c, PP_STATE_NO_FLASH, PP_REASON_LOW_VOLTAGE, clk);
+        acc_reset(c);
+        if (c->p.probation == PP_PROBATION_NORMAL) {
+            if (trigger) return probe_fail(c, PP_STATE_NO_FLASH, clk);
+            if (probation_s(c, mono_ms, clk) >= PP_PROBATION_S) return probe_pass(c);
+            return no_event(c);
         }
+        if (trigger) return transition(c, PP_STATE_NO_FLASH, PP_REASON_LOW_VOLTAGE, clk);
         return no_event(c);
     }
     if (c->p.forced) {
-        window_reset(c);   /* a forced state never auto-exits */
+        acc_reset(c);   /* a forced state never auto-exits, never probes */
         return no_event(c);
     }
 
-    const bool qualifies = fresh && p->system_mv >= PP_SYS_EXIT_MV &&
-                           (p->battery_mv >= PP_BAT_EXIT_MV || p->battery_mv == 0);
-    if (!qualifies) {
-        window_reset(c);
+    if (qualifies) {
+        /* Only the interval between two consecutive qualifying reads counts. */
+        if (c->prev_qual && in_seq) acc_credit(c, mono_ms, interval);
+        c->prev_qual = true;
+        if (acc_sum(c, mono_ms) >= PP_EXIT_TARGET_MS) {
+            const pp_event_t ev = transition(c, PP_STATE_NORMAL, PP_REASON_POWER_RECOVERED, clk);
+            c->p.probe_fails = 0;   /* proven good power: the backoff starts over */
+            return ev;
+        }
+    } else if (low) {
+        /* Fresh, with input, and not good enough: the battery is not there
+         * yet. Everything collected goes, and the probe waits a full quiet
+         * period from here. */
+        acc_reset(c);
+        c->have_low = true;
+        c->last_low_ms = mono_ms;
+    } else {
+        c->prev_qual = false;   /* no evidence either way: pause */
+    }
+
+    if (c->p.probation == PP_PROBATION_NO_FLASH) {
+        if (trigger) return probe_fail(c, PP_STATE_HOLD, clk);
+        if (probation_s(c, mono_ms, clk) >= PP_PROBATION_S) return probe_pass(c);
         return no_event(c);
     }
-    if (!c->window_open || gap) {
-        c->window_open = true;
-        c->window_start_ms = mono_ms;
-        return no_event(c);
-    }
-    if (mono_ms - c->window_start_ms >= PP_EXIT_WINDOW_MS) {
-        return transition(c, PP_STATE_NORMAL, PP_REASON_POWER_RECOVERED, clk);
+    /* The probe is for the unit WITHOUT evidence. While qualifying evidence
+     * sits inside the horizon (or this read qualifies) the accumulation
+     * decides; once it has expired the probe may run again. */
+    if (qualifies || acc_sum(c, mono_ms) > 0) return no_event(c);
+    if (c->monitor_live && c->p.probe_fails < PP_PROBE_FAILS_MAX &&
+        quiet_s(c, mono_ms, clk) >= probe_wait_s(c->p.probe_fails)) {
+        /* One level down, on probation: steady-state work comes back before
+         * the saturating flashes do. */
+        const pp_state_t to = s == PP_STATE_HOLD ? PP_STATE_NO_FLASH : PP_STATE_NORMAL;
+        const pp_event_t ev = transition(c, to, PP_REASON_PROBE, clk);
+        c->p.probation = to == PP_STATE_NO_FLASH ? PP_PROBATION_NO_FLASH : PP_PROBATION_NORMAL;
+        return ev;
     }
     return no_event(c);
+}
+
+pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_reading_t *p,
+                      bool fresh_present, int64_t mono_ms, pp_clock_t clk)
+{
+    const pp_event_t ev = on_read(c, reason, p, fresh_present, mono_ms, clk);
+    /* The uptime fallbacks (quiet period, probation) count from here. */
+    if (ev.changed) c->since_mono_ms = mono_ms;
+    return ev;
 }
 
 pp_event_t pp_force(pp_core_t *c, pp_state_t state, pp_clock_t clk)
@@ -307,12 +506,14 @@ pp_event_t pp_force(pp_core_t *c, pp_state_t state, pp_clock_t clk)
 
 pp_event_t pp_clear(pp_core_t *c, pp_clock_t clk)
 {
-    if ((pp_state_t)c->p.state == PP_STATE_NORMAL && !c->p.forced && c->p.hist_n == 0) {
+    if ((pp_state_t)c->p.state == PP_STATE_NORMAL && !c->p.forced && c->p.hist_n == 0 &&
+        c->p.probation == PP_PROBATION_NONE && c->p.probe_fails == 0) {
         return no_event(c);   /* nothing to clear: no NVS write */
     }
     c->p.forced = false;
     c->p.hist_n = 0;
     memset(c->p.hist, 0, sizeof c->p.hist);
+    c->p.probe_fails = 0;
     return transition(c, PP_STATE_NORMAL, PP_REASON_CLEARED, clk);
 }
 
@@ -346,28 +547,59 @@ uint32_t pp_brownouts_6h(const pp_core_t *c, pp_clock_t clk, uint32_t cur_boot)
     return n;
 }
 
-int64_t pp_window_remaining_ms(const pp_core_t *c, int64_t mono_ms)
+int64_t pp_exit_remaining_ms(const pp_core_t *c, int64_t mono_ms)
 {
-    if (!c->window_open || mono_ms < c->window_start_ms) return -1;
-    const int64_t left = PP_EXIT_WINDOW_MS - (mono_ms - c->window_start_ms);
-    return left > 0 ? left : 0;
+    if ((pp_state_t)c->p.state == PP_STATE_NORMAL || c->p.forced) return -1;
+    const int64_t have = acc_sum(c, mono_ms);
+    if (have <= 0) return -1;
+    return have >= PP_EXIT_TARGET_MS ? 0 : PP_EXIT_TARGET_MS - have;
+}
+
+pp_recovery_t pp_recovery(const pp_core_t *c, int64_t mono_ms, pp_clock_t clk)
+{
+    pp_recovery_t r = { .qualifying_s = 0, .probe = PP_PROBE_OFF, .next_probe_s = -1,
+                        .backoff_level = c->p.probe_fails };
+    const pp_state_t s = (pp_state_t)c->p.state;
+    if (s != PP_STATE_NORMAL && !c->p.forced) r.qualifying_s = (uint32_t)(acc_sum(c, mono_ms) / 1000);
+    if (c->p.probation != PP_PROBATION_NONE) {
+        r.probe = PP_PROBE_PROBATION;
+    } else if (s == PP_STATE_NORMAL || c->p.forced) {
+        r.probe = PP_PROBE_OFF;
+    } else if (c->p.probe_fails >= PP_PROBE_FAILS_MAX) {
+        r.probe = PP_PROBE_EXHAUSTED;
+    } else if (!c->monitor_live) {
+        r.probe = PP_PROBE_NO_MONITOR;
+    } else {
+        r.probe = PP_PROBE_WAITING;
+        int64_t left = probe_wait_s(c->p.probe_fails) - quiet_s(c, mono_ms, clk);
+        const int64_t evidence_s = (acc_expiry_ms(c, mono_ms) + 999) / 1000;
+        if (evidence_s > left) left = evidence_s;   /* collected evidence blocks the probe */
+        r.next_probe_s = left > 0 ? left : 0;
+    }
+    return r;
 }
 
 int pp_render_json(char *buf, size_t cap, const pp_persist_t *p, bool persist_fault,
-                   uint32_t brownouts_6h, const pp_skips_t *skips)
+                   uint32_t brownouts_6h, const pp_skips_t *skips, const pp_recovery_t *rec)
 {
     if (buf == NULL || cap == 0 || p == NULL) return -1;
     const pp_skips_t z = {0, 0, 0};
     if (skips == NULL) skips = &z;
+    const pp_recovery_t none = { 0, PP_PROBE_OFF, -1, 0 };
+    if (rec == NULL) rec = &none;
     char since[24] = "null";
     if (p->since_utc != 0) snprintf(since, sizeof since, "%lld", (long long)p->since_utc);
+    char next[24] = "null";
+    if (rec->next_probe_s >= 0) snprintf(next, sizeof next, "%lld", (long long)rec->next_probe_s);
     /* Every string is a fixed enum name: no escaping needed. */
     const int n = snprintf(buf, cap,
         "{\"state\":\"%s\",\"reason\":\"%s\",\"since_utc\":%s,\"forced\":%s,"
         "\"persist_fault\":%s,\"brownouts_6h\":%lu,"
+        "\"qualifying_s\":%lu,\"probe\":\"%s\",\"next_probe_s\":%s,\"backoff_level\":%u,"
         "\"skipped\":{\"flash_runs\":%lu,\"ambit_runs\":%lu,\"ota\":%lu}}",
         pp_state_name((pp_state_t)p->state), pp_reason_name((pp_reason_t)p->reason), since,
         p->forced ? "true" : "false", persist_fault ? "true" : "false", (unsigned long)brownouts_6h,
+        (unsigned long)rec->qualifying_s, pp_probe_name(rec->probe), next, (unsigned)rec->backoff_level,
         (unsigned long)skips->flash_runs, (unsigned long)skips->ambit_runs,
         (unsigned long)skips->ota);
     if (n < 0 || (size_t)n >= cap) {
