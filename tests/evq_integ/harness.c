@@ -1771,7 +1771,7 @@ static void sc_worst(void)
         /* Brownout protection: worst-width health.power_protect (esp_stubs.c).
          * Re-pointed like every borrowed string above: the captured one points
          * into emit_status_event's (returned) frame. */
-        static char pp_worst[256];
+        static char pp_worst[PP_JSON_CAP];
         w.power_protect_json = power_protect_render_json(pp_worst, sizeof pp_worst) > 0 ? pp_worst : NULL;
         w.clock_valid = true; w.clock_source = src; w.clock_suspect = true;
         w.software_valid = true; w.firmware = fw; w.script_valid = true; w.script_sha256 = sha;

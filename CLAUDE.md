@@ -94,10 +94,33 @@ holds bench boards.
   Host evidence: tests/sdlog_host, tests/ambit_host, tests/evq_host X group.
 - **Brownout protection (2026-11)**: `components/power_protect` sheds whole schedule jobs and
   refuses updates (docs/power-protect.md). A shed run is NOT a failure (no fail streak) and
-  never touches the event log or its cursor; its NVS blob is written only on transitions,
-  brownout records, force and clear — never per read or heartbeat. Only fresh (changing),
-  valid, input-present charger frames may move it; battery-only units can only react to
-  `ESP_RST_BROWNOUT`.
+  never touches the event log or its cursor; its NVS blob is written only on transitions
+  (probe steps and their pass/failure included), brownout records, a protected unit's fresh
+  low read (first, dating/undating on clock-trust change, then at most hourly), force and
+  clear — never per read or heartbeat. ONE generation-ordered record: every write is gen+1
+  (never reused); protective updates go RTC_NOINIT mirror then NVS; relaxations (probe step,
+  probation pass, accumulated exit, clear, force down) go NVS FIRST and are adopted only on
+  success (refused: stay protected, keep the read's low veto, retry after 1 h; operator: not
+  applied; after an NVS error only a positive read of the new record = landed, anything else
+  (absent/old/unreadable: the pinned IDF can report NOT_FOUND or the OLD value after a landed
+  write) = fenced by protective records until TWO CLEAN writes follow the last failure (≤4
+  writes); otherwise persist_unconfirmed. First install writes the record THEN the epoch, so
+  epoch + no record = state lost → no_flash/state_missing. An unreadable epoch is UNVERIFIED (U1):
+  fail closed (>= no_flash, NVS forced kept), never read/write RTC, never write NVS, no
+  relaxation (operator clear/force-down -> identity_unverified), protective updates RAM only.
+  U2 on first read: the verified selection, then a hidden probation = failed probe, the quiet
+  period restarts, and THIS boot's U1 observations carry forward (rank max, forced OR, fails max,
+  its brownout entry newest-last); persisted RTC-first. No cross-lifetime/cross-record merging. No automatic relaxation without an NVS epoch; epoch creation is re-read
+  and retried after every successful write. Evidence: NativeNvsRelaxationTest runs the glue on
+  the pinned IDF NVS with fault injection). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
+  to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never
+  adopts an old record. Boot adopts the newer valid record by gen (RTC only after a non-power
+  reset, never consumed); a stored probation after a power loss = failed probe. Only fresh (changing), valid, input-present charger frames count as
+  evidence (accumulated, 30 min within 12 h; on exit `battery_v` 0 = judge the rail as the battery,
+  entry unchanged: a 0 never triggers);
+  battery-only units react to `ESP_RST_BROWNOUT` and to the bounded probe (one level down on
+  24-h probation after 6/12/24 h without a brownout, never forced, never without a charger
+  monitor, 6 failures max).
 - **Charger re-detection (2026-11)**: the MP2731 driver pulses REG09 BG_EN (1 then 0,
   both read back, under ONE I2C bus hold, reserved bits preserved) when the chip says
   "no input, not charging" beside a live panel (docs/charger-redetect.md). The

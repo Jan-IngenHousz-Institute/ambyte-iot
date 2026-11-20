@@ -57,17 +57,20 @@ typedef struct {
     bool        persist_fault;  /* NVS copy unreadable at boot or last write failed */
     uint32_t    brownouts_6h;
     pp_skips_t  skipped;
-    int64_t     exit_in_s;      /* seconds left in a running exit window; -1 = none */
+    int64_t     exit_in_s;      /* qualifying seconds still needed to exit; -1 = none collected */
+    pp_recovery_t recovery;     /* accumulated evidence, probe, backoff level */
 } power_protect_status_t;
 
 /* Once per boot, after nvs_flash_init + diag_boot_init and after the RTC /
  * clock_trust bootstrap, BEFORE AMBIT boot sync and the schedule runner start
  * (so the first action after a brownout is already shed). Never fails boot:
- * an unreadable blob starts at normal (logged). */
+ * an unreadable blob starts at no_flash, state_unreadable (logged). */
 void power_protect_boot(void);
 
 /* Feed one charger read (device_commands' power-state refresh, after
- * power_gate_step). `fresh_present` = power_gate_flash_ok(). */
+ * power_gate_step). `fresh_present` = power_gate_flash_ok(). This is also
+ * where the accumulated exit, the battery-only probe and the probation are
+ * decided: without charger reads nothing of that runs (fail-closed). */
 void power_protect_on_power_read(power_read_reason_t reason, const power_reading_t *p,
                                  bool fresh_present);
 
@@ -83,8 +86,27 @@ void power_protect_get_status(power_protect_status_t *out);
 /* health.power_protect. Returns the length, -1 when it does not fit. */
 int power_protect_render_json(char *buf, size_t cap);
 
-/* Operator actions. The new state applies in RAM at once; the return value is
- * the NVS persist result (ESP_OK also when nothing needed writing). */
+/* A relaxation could not be shown to have landed, and the protective fence
+ * written over it could not be confirmed on NVS either: the unit is protected
+ * now and across resets without power loss, but after a power loss the
+ * relaxation may still win. (Command reply detail "persist_unconfirmed".) */
+#define POWER_PROTECT_ERR_UNCONFIRMED ESP_ERR_NOT_FINISHED
+
+/* The NVS epoch exists but cannot be read (U1, round 7): a clear or a force
+ * down is refused with the state unchanged; a force up applies in RAM only;
+ * nothing is written until the epoch reads again. (Reply detail
+ * "identity_unverified".) */
+#define POWER_PROTECT_ERR_UNVERIFIED ESP_ERR_NOT_ALLOWED
+
+/* Operator actions; the return value is the NVS persist result (ESP_OK also
+ * when nothing needed writing). clear and a force DOWN (hold -> no_flash) are
+ * relaxations: written first, and NOT applied when the write fails. After a
+ * write error only a positive read of the new record counts as success;
+ * anything else is fenced by a newer protective record and the result is an
+ * error (POWER_PROTECT_ERR_UNCONFIRMED when the fence is not confirmed on NVS
+ * either). A force
+ * UP applies at once; if NVS refuses it, it holds in RAM and the RTC mirror
+ * (resets without power loss), not across a power loss. */
 esp_err_t power_protect_force(pp_state_t state);
 esp_err_t power_protect_clear(void);
 
