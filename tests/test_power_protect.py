@@ -92,7 +92,7 @@ class PowerProtectHostTest(unittest.TestCase):
                 if l.startswith("REPLY ")]
 
     def test_every_scenario_passes(self):
-        self.assertGreaterEqual(len(self.scenarios), 77)
+        self.assertGreaterEqual(len(self.scenarios), 82)
         for name in self.scenarios:
             with self.subTest(scenario=name):
                 self.run_case(name)
@@ -123,7 +123,10 @@ class PowerProtectHostTest(unittest.TestCase):
                      "u2_verification_reconciles", "r7_probation_merge", "r7_history_merge",
                      "r7_clear_reverify", "r7_verify_rtc_interrupt", "r7_probation_natural",
                      "r7_history_natural", "r7_clear_unreadable", "r7_verify_rtc_interrupt_hold",
-                     "r7_clear_reply", "r7_merge_gen", "r7_since_merge", "r7_merge_gen_natural"):
+                     "r7_clear_reply", "r7_merge_gen", "r7_since_merge", "r7_merge_gen_natural",
+                     # review round 8 (each fails on 8ac9d8c)
+                     "r8_u1_brownout_auto_verification", "r8_u1_brownout_survives_verification",
+                     "r8_u1_force_survives_verification", "r8_u1_u2_cycles", "r8_u1_brownout_history_cap"):
             self.assertIn(name, self.scenarios)
 
     def test_heartbeat_object(self):

@@ -284,6 +284,12 @@ typedef struct {
     bool     monitor_live;     /* the last read came from a charger that answered */
     int64_t  since_mono_ms;    /* monotonic time of this boot's last read-driven transition; 0 = boot */
     int64_t  relax_hold_until_ms; /* no relaxation before this (a failed commit); glue-owned */
+    /* U1 of THIS boot (pp_unverified_floor .. pp_on_verified): the brownout
+     * recorded meanwhile (at most one per boot), carried into the verified
+     * record by U2 (round 8). RAM only. */
+    bool          u1;
+    bool          u1_has_brownout;
+    pp_brownout_t u1_brownout;
     /* The NVS copy is not trustworthy: unreadable at boot, or the last write
      * failed. Cleared by the next successful write (the glue owns it). */
     bool     persist_fault;
@@ -354,9 +360,13 @@ void pp_unverified_floor(pp_core_t *c, pp_clock_t clk);
  * VERIFIED selection (NVS against same-lifetime RTC slots, by generation).
  * The result, conservatively: (a) a probation in it counts as a FAILED probe
  * (hold, backoff +1: the unverified period hid what happened); (b) the quiet
- * period restarts now (a dated low veto at the verification time); (c) the
- * state is raised to at least the RAM state of the U1 period (state rank and
- * forced only). Returns a persisting event (the caller writes it RTC-first). */
+ * period restarts now (a dated low veto at the verification time); (c) THIS
+ * BOOT's own U1 observations are carried forward (round 8): the higher state
+ * rank, forced as OR (a forced state never auto-exits), the larger failure
+ * count, and the brownout recorded during U1 appended newest-last (the
+ * oldest dropped at the cap) so it still links. Nothing from another record
+ * or another boot is merged. Returns a persisting event (the caller writes
+ * it RTC-first). */
 pp_event_t pp_on_verified(pp_core_t *c, const pp_persist_t *selected, int64_t mono_ms, pp_clock_t clk);
 
 /* Blob codec. encode always writes v2 (PP_BLOB_LEN). decode reads v2 and the

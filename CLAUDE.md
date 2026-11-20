@@ -109,7 +109,8 @@ holds bench boards.
   fail closed (>= no_flash, NVS forced kept), never read/write RTC, never write NVS, no
   relaxation (operator clear/force-down -> identity_unverified), protective updates RAM only.
   U2 on first read: the verified selection, then a hidden probation = failed probe, the quiet
-  period restarts, never below the U1 state; persisted RTC-first. No cross-lifetime merging. No automatic relaxation without an NVS epoch; epoch creation is re-read
+  period restarts, and THIS boot's U1 observations carry forward (rank max, forced OR, fails max,
+  its brownout entry newest-last); persisted RTC-first. No cross-lifetime/cross-record merging. No automatic relaxation without an NVS epoch; epoch creation is re-read
   and retried after every successful write. Evidence: NativeNvsRelaxationTest runs the glue on
   the pinned IDF NVS with fault injection). The RTC mirror is TWO slots (rewrite the non-newest one, arm last) bound
   to a per-NVS-lifetime epoch (pwr_protect/epoch, written once) so a reflashed/wiped NVS never

@@ -438,6 +438,10 @@ pp_event_t pp_on_boot(pp_core_t *c, bool brownout_reset, uint32_t boot, pp_clock
         c->p.hist_n--;
     }
     c->p.hist[c->p.hist_n++] = cur;
+    if (c->u1) {               /* U1: remembered for U2 (round 8) */
+        c->u1_has_brownout = true;
+        c->u1_brownout = cur;
+    }
 
     const pp_state_t from = (pp_state_t)c->p.state;
     pp_event_t ev;
@@ -602,6 +606,7 @@ pp_event_t pp_on_read(pp_core_t *c, power_read_reason_t reason, const power_read
 void pp_unverified_floor(pp_core_t *c, pp_clock_t clk)
 {
     c->persist_fault = true;   /* nothing of this period is on record */
+    c->u1 = true;
     if ((pp_state_t)c->p.state != PP_STATE_NORMAL) return;   /* already protective (forced kept) */
     c->p.state = PP_STATE_NO_FLASH;
     c->p.reason = PP_REASON_IDENTITY_UNVERIFIED;
@@ -622,13 +627,35 @@ pp_event_t pp_on_verified(pp_core_t *c, const pp_persist_t *selected, int64_t mo
         c->p.since_utc = now;
         if (c->p.probe_fails < PP_PROBE_FAILS_MAX) c->p.probe_fails++;
     }
-    /* (c) never below what the unit ran at while unverified (rank only) */
+    /* (c) this boot's own U1 observations (round 8): never below the state
+     * it ran at, forced as OR, the larger failure count, and its brownout */
+    const bool forced = c->p.forced || ram.forced;
     if (pp_protection_rank(&ram) > pp_protection_rank(&c->p)) {
         c->p.state = ram.state;
-        c->p.forced = ram.forced;
         c->p.reason = ram.reason;
         c->p.since_utc = ram.since_utc;
     }
+    if (forced && !c->p.forced) {
+        c->p.forced = true;   /* (the state is >= no_flash: a forced state always is) */
+        if (c->p.reason != PP_REASON_PROBE_FAILED) c->p.reason = PP_REASON_FORCED;
+    }
+    if (c->p.forced) c->p.probation = PP_PROBATION_NONE;
+    if (ram.probe_fails > c->p.probe_fails) c->p.probe_fails = ram.probe_fails;
+    if (c->u1_has_brownout) {
+        bool seen = false;
+        for (unsigned i = 0; i < c->p.hist_n; i++) {
+            if (c->p.hist[i].utc == c->u1_brownout.utc && c->p.hist[i].boot == c->u1_brownout.boot) seen = true;
+        }
+        if (!seen) {
+            if (c->p.hist_n == PP_HIST_MAX) {   /* drop the OLDEST */
+                memmove(&c->p.hist[0], &c->p.hist[1], (PP_HIST_MAX - 1) * sizeof c->p.hist[0]);
+                c->p.hist_n--;
+            }
+            c->p.hist[c->p.hist_n++] = c->u1_brownout;   /* newest last */
+        }
+    }
+    c->u1 = false;
+    c->u1_has_brownout = false;
     /* (b) the quiet period restarts now: the low veto mechanism is the
      * durable anchor the probe already honours (6 h, + the refresh margin
      * after a reboot), and every transition clears it */

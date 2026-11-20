@@ -2093,6 +2093,116 @@ static void r7_merge_gen_natural(void)
 }
 #endif
 
+/* ── round 8: this boot's own U1 observations carry into U2 ───────────── */
+
+#if HAVE_RECOVERY
+/* A brownout recorded during U1 links with the next one after an automatic
+ * verification (no operator, no write failure). */
+static void r8_u1_brownout_auto_verification(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    CHECK(s_unverified && s_core.p.hist_n == 1, "the brownout lives in U1 RAM");
+    g_epoch_get_err = ESP_OK;
+    good_reads(READS_30MIN + 4, 4100, 3900);
+    CHECK(s_epoch_verified && st() == PP_STATE_NO_FLASH && s_core.p.hist_n == 1, "U2 carries it (hist %u)",
+          (unsigned)s_core.p.hist_n);
+    pp_persist_t q;
+    CHECK(pp_decode(&q, g_blob, g_blob_len) && q.hist_n == 1 && q.hist[0].boot == 2, "and it is on record");
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD, "two brownouts 30 min apart link after the verification (state %d)", st());
+}
+
+/* The same through an operator force, with a forced no_flash. */
+static void r8_u1_brownout_survives_verification(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    g_epoch_get_err = ESP_OK;
+    CHECK(power_protect_force(PP_STATE_NO_FLASH) == ESP_OK, "verify and force no_flash");
+    CHECK(s_core.p.hist_n == 1, "history carried (%u)", (unsigned)s_core.p.hist_n);
+    advance_s(60);
+    reboot(ESP_RST_BROWNOUT, 3, true);
+    CHECK(st() == PP_STATE_HOLD, "two brownouts a minute apart escalate, even forced (state %d)", st());
+}
+
+/* A force set during U1 survives U2 (forced OR), also when the retried force
+ * is refused, and a forced state never auto-exits afterwards. */
+static void r8_u1_force_survives_verification(void)
+{
+    for (int variant = 0; variant < 2; variant++) {
+        fresh_nvs(); reboot(ESP_RST_BROWNOUT, 1, true);
+        g_fail_writes = true;
+        advance_s(60); reboot(ESP_RST_BROWNOUT, 2, true);   /* hold in RTC, NVS no_flash */
+        CHECK(st() == PP_STATE_HOLD && !s_core.p.forced, "v%d: RTC hold", variant);
+        g_fail_writes = false; g_epoch_get_err = ESP_FAIL;
+        reboot(ESP_RST_SW, 3, true);
+        CHECK(st() == PP_STATE_NO_FLASH && !s_core.p.forced, "v%d: U1 reads NVS no_flash", variant);
+        (void)power_protect_force(PP_STATE_NO_FLASH);
+        CHECK(s_core.p.forced, "v%d: forced in RAM", variant);
+        g_epoch_get_err = ESP_OK;
+        g_fail_writes = true;
+        (void)power_protect_force(PP_STATE_NO_FLASH);         /* verifies (U2), then the force: refused */
+        CHECK(st() == PP_STATE_HOLD && s_core.p.forced,
+              "v%d: U2 = the RTC hold, forced kept (state %d forced %d)", variant, st(), s_core.p.forced);
+        g_fail_writes = false;
+        if (variant == 1) {
+            reboot(ESP_RST_SW, 4, true);                      /* the RTC mirror agrees with RAM */
+            CHECK(st() == PP_STATE_HOLD && s_core.p.forced, "v1: RAM and the durable record agree on forced");
+        }
+        good_reads(READS_30MIN + 4, 4100, 3900);
+        CHECK(st() != PP_STATE_NORMAL && s_core.p.forced, "v%d: a forced state never auto-exits (state %d)",
+              variant, st());
+    }
+}
+
+/* U1 -> U2 -> U1 -> U2 across boots: each boot's brownout is carried; and
+ * once verified, a boot never returns to U1 (the identity latches). */
+static void r8_u1_u2_cycles(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_BROWNOUT, 2, true);
+    g_epoch_get_err = ESP_OK;
+    good_reads(READS_30MIN + 4, 4100, 3900);              /* U2 #1 */
+    CHECK(s_epoch_verified && s_core.p.hist_n == 1, "first carried");
+    g_epoch_get_err = ESP_FAIL;                           /* the epoch read fails again this boot */
+    quiet_reads(POWER_READ_NO_INPUT, H + 60);             /* past the low record's refresh hour */
+    const int w = g_writes;
+    good_reads(3, 4100, 3500);                            /* a low record: still written */
+    CHECK(s_epoch_verified && !s_unverified && g_writes > w, "verified latches for the boot");
+    advance_s(20 * 60);
+    reboot(ESP_RST_BROWNOUT, 3, true);                    /* U1 again, linked in RAM */
+    CHECK(s_unverified && st() == PP_STATE_HOLD, "U1: linked to the carried brownout (state %d)", st());
+    g_epoch_get_err = ESP_OK;
+    good_reads(READS_30MIN + 4, 4100, 3900);              /* U2 #2 */
+    CHECK(s_epoch_verified && st() == PP_STATE_HOLD && s_core.p.hist_n == 2, "both carried, hold (hist %u)",
+          (unsigned)s_core.p.hist_n);
+    reboot(ESP_RST_SW, 4, true);
+    CHECK(st() == PP_STATE_HOLD && s_core.p.hist_n == 2, "on record");
+}
+
+/* A full history: the U1 brownout goes in newest-last, the oldest drops. */
+static void r8_u1_brownout_history_cap(void)
+{
+    fresh_nvs(); reboot(ESP_RST_POWERON, 1, true);
+    for (uint32_t b = 2; b < 2 + PP_HIST_MAX; b++) {
+        reboot(ESP_RST_BROWNOUT, b, true);
+        advance_s(7 * H);
+    }
+    CHECK(s_core.p.hist_n == PP_HIST_MAX, "full");
+    const uint32_t oldest_next = s_core.p.hist[1].boot;
+    g_epoch_get_err = ESP_FAIL;
+    reboot(ESP_RST_BROWNOUT, 50, true);
+    g_epoch_get_err = ESP_OK;
+    (void)power_protect_force(PP_STATE_HOLD);              /* verifies */
+    CHECK(s_core.p.hist_n == PP_HIST_MAX && s_core.p.hist[PP_HIST_MAX - 1].boot == 50 &&
+          s_core.p.hist[0].boot == oldest_next, "newest last, the oldest dropped");
+}
+#endif
+
 static void low_voltage_trigger(void)
 {
     reboot(ESP_RST_POWERON, 1, true);
@@ -2667,6 +2777,11 @@ static const scenario_t k_scenarios[] = {
     {"r7_merge_gen", r7_merge_gen},
     {"r7_since_merge", r7_since_merge},
     {"r7_merge_gen_natural", r7_merge_gen_natural},
+    {"r8_u1_brownout_auto_verification", r8_u1_brownout_auto_verification},
+    {"r8_u1_brownout_survives_verification", r8_u1_brownout_survives_verification},
+    {"r8_u1_force_survives_verification", r8_u1_force_survives_verification},
+    {"r8_u1_u2_cycles", r8_u1_u2_cycles},
+    {"r8_u1_brownout_history_cap", r8_u1_brownout_history_cap},
     {"cmd_persist_unconfirmed", cmd_persist_unconfirmed},
 #endif
 #ifdef PP_NATIVE_NVS

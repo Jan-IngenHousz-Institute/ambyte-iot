@@ -497,8 +497,15 @@ The model is now one record, ordered by generation:
           happened;
         - (b) the **quiet period restarts** at the verification time (a dated
           low veto, which every transition clears);
-        - (c) the state is raised to at least the RAM state of the unverified
-          period (state rank and forced only).
+        - (c) **this boot's own U1 observations are carried forward** (round
+          8), with no merging of other records or other boots:
+          - the higher state rank;
+          - `forced` as OR, because a forced state never auto-exits;
+          - the larger failure count;
+          - the brownout recorded during U1. It is appended to the history
+            newest-last, dropping the oldest at the cap, so it still links
+            with the next one and counts in `brownouts_6h`. Round 8 found it
+            dropped: two brownouts 30 min apart stayed `no_flash`.
       - The result is persisted through the normal verified path (RTC first,
         then NVS). Any relaxation that was due is re-evaluated by the next
         read, never decided on the pre-verification state.
@@ -857,8 +864,17 @@ run fails unless every reply confirms the requested state. In Actions →
       record of round 6 are safe; and each of the reviewer's round-7 repros
       (probation, history, clear-then-verify, interrupted verification,
       cleared-while-unverified, clear reply, generation and since ties, the
-      old fence against a later clear) is a scenario that must hold (12 of
-      the 16 fail on 3ce665b);
+      old fence against a later clear) is a scenario that must hold. Of
+      these 16, 11 fail on 3ce665b: 6 reproduce the earlier defect (the
+      reviewer's own safety assertion), 5 assert the new U1/U2 policy
+      (`r7_clear_unreadable` passes there: its U1 check needs the new error
+      constant);
+    - (round 8) a brownout recorded during U1 links with the next one after
+      an automatic or operator-triggered verification; a force set during
+      U1 survives U2 (forced OR), also with the retried force refused, and
+      never auto-exits; U1 → U2 → U1 → U2 across boots carries each
+      brownout, and a verified boot never returns to U1; a full history
+      drops its oldest entry for the U1 brownout (all 5 fail on 8ac9d8c);
     - (round 5, native) every pair of two transient raw-write faults across
       a `clear` and its fence writes (a ≤ 16, b ≤ 24), then a direct power
       loss: `persist_failed` always means a forced hold on NVS (the reviewer's
