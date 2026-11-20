@@ -699,8 +699,8 @@ run fails unless every reply confirms the requested state. In Actions →
   durability regressions build against the round-0 head b4103f5, where all 5
   fail. `tests/test_evq_integration.py` I5 renders the widest
   `health.power_protect` through the production `pp_render_json`: the
-  max-width heartbeat is 6637 of 8192 bytes. The 6 round-2 regressions
-  build against round-1 head 92f1698, where all 6 fail.
+  max-width heartbeat is 6637 of 8192 bytes. The 5 round-2 regressions
+  build against round-1 head 92f1698, where all 5 fail.
 - `tests/sched_runner_host.c` decides shedding on the shipped `default.yaml`
   and `schedule/qe_multichannel.yaml` and proves the skip accounting;
   `tests/sensors_host/runner_driver.c` runs the production `run_job` in `hold`.
