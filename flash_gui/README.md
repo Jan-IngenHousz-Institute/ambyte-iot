@@ -155,8 +155,20 @@ work. A different client's active operation reports its kind and state as busy;
 the GUI does not take it over.
 
 An uncertain or expired result means the previous outcome is unknown. A changed
-store instance invalidates all IDs from the old store. The GUI preserves this
-evidence and stops automatic replay. After a failure, **New schedule request…**
+store instance invalidates all IDs from the old store. When the saved intent
+was still unfinished, the GUI preserves this evidence and stops automatic
+replay. When it had completed, its outcome is already known: the GUI preserves
+it and starts the next transfer on the new store without asking, so Initial
+setup after a full re-flash installs the workbook directly.
+
+```mermaid
+flowchart TD
+    Saved{Saved intent for this MAC} -->|none, or same store| Normal[Resume or admit as usual]
+    Saved -->|other store, completed| Fresh[Preserve it, number afresh on the new store]
+    Saved -->|other store, unfinished| Stop[Stop: outcome unknown, needs New schedule request]
+```
+
+After a failure, **New schedule request…**
 reads a stable current identity and shows the loaded tuple. You may then choose
 to preserve the old journal and admit a new operation for the selected schedule.
 Declining leaves the saved intent untouched. A live operation still blocks this

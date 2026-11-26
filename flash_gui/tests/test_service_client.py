@@ -114,6 +114,24 @@ def test_store_change_and_expiry_keep_journal_and_never_readmit(tmp_path):
     assert not any(b"schedule.begin" in line for line in expired.transport.sent)
 
 
+def test_finished_transfer_on_an_old_store_admits_the_next_one(tmp_path):
+    # HAR-346: a full re-flash gives the device a new service store. A saved
+    # transfer that already completed has a known outcome, so the next install
+    # starts without an explicit new request and keeps the old intent preserved.
+    c, board, clock = client(tmp_path)
+    assert upload(c)["state"] == "succeeded"
+    finished = c.journal.load()
+    assert finished["phase"] == "complete"
+    board.store, board.mode, board.bound = "2222222222222222", False, False
+    board.records.clear(); board.highest = 0; board.data = b""
+    reflashed, _, _ = client(tmp_path, board, clock)
+    assert upload(reflashed)["state"] == "succeeded"
+    entry = reflashed.journal.load()
+    assert entry["store"] == "2222222222222222" and entry["phase"] == "complete"
+    assert int(entry["op"], 16) == 1  # numbered from the new store, not the old one
+    assert board.data == BLOB
+
+
 def test_new_mac_never_inherits_port_journal(tmp_path):
     journal = svc.OperationJournal(tmp_path, MAC)
     other = svc.OperationJournal(tmp_path, "02:00:00:00:00:02")
