@@ -205,3 +205,97 @@ def test_experiment_change_warns_about_unexplained_timezone_drift(target):
     target.device.console=console
     result=e.change_experiment(target.preview,target.client,NEW)
     assert 'Timezone needs attention: Europe/Amsterdam → Etc/UTC' in result.timezone_result
+
+
+# ── HAR-345: openJII bindings follow a verified experiment change ──────────
+
+THING = 'AMBYTE_02000000000001'
+
+
+class Platform:
+    """A registry that records every binding write the sync makes."""
+    def __init__(self, *, visible=True, onboard_error=None, remove_status=True):
+        self.visible, self.onboard_error, self.remove_status = visible, onboard_error, remove_status
+        self.onboarded, self.removed = [], []
+
+    def find_device(self, mac):
+        return {'id': 'dev-1', 'thingName': THING, 'serialNumber': mac} if self.visible else None
+
+    def onboard_device(self, device_id, experiment_id):
+        if self.onboard_error:
+            raise self.onboard_error
+        self.onboarded.append((device_id, experiment_id))
+
+    def remove_experiment_device(self, experiment_id, device_id):
+        if isinstance(self.remove_status, Exception):
+            raise self.remove_status
+        self.removed.append((experiment_id, device_id))
+        return self.remove_status
+
+
+def test_bindings_onboard_the_destination_and_remove_the_old_experiment():
+    platform = Platform()
+    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
+    assert platform.onboarded == [('dev-1', NEW)] and platform.removed == [(OLD, 'dev-1')]
+    assert f'onboarded to {NEW}' in text and f'removed from {OLD}; its data stays there' in text
+
+
+def test_bindings_keep_the_old_experiment_when_the_operator_unticks_removal():
+    platform = Platform()
+    e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=False)
+    assert platform.onboarded == [('dev-1', NEW)] and platform.removed == []
+
+
+def test_bindings_never_remove_the_destination_itself():
+    platform = Platform()
+    e.sync_bindings(platform, MAC, THING, NEW, NEW, remove_previous=True)
+    assert platform.removed == []
+
+
+def test_bindings_skip_a_device_this_account_cannot_see():
+    platform = Platform(visible=False)
+    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
+    assert 'cannot see' in text and platform.onboarded == platform.removed == []
+
+
+def test_bindings_report_a_refused_onboarding_and_still_try_the_removal():
+    platform = Platform(onboard_error=OpenJIIError('onboarding device failed (403): forbidden'))
+    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
+    assert f'onboarding to {NEW} skipped' in text and '403' in text
+    assert platform.removed == [(OLD, 'dev-1')]
+
+
+@pytest.mark.parametrize('outcome,expected', [
+    (False, 'was not onboarded to'),
+    (OpenJIIError('removing the device from the experiment failed (403): no'), 'removal from'),
+])
+def test_bindings_report_removal_outcomes(outcome, expected):
+    text = e.sync_bindings(Platform(remove_status=outcome), MAC, THING, NEW, OLD, remove_previous=True)
+    assert expected in text
+
+
+def test_bindings_never_raise_on_an_unexpected_platform_failure():
+    class Broken(Platform):
+        def find_device(self, mac):
+            raise ValueError('unexpected payload')
+    text = e.sync_bindings(Broken(), MAC, THING, NEW, OLD, remove_previous=True)
+    assert 'could not be read' in text
+
+
+def test_remove_experiment_device_maps_statuses():
+    from flash_gui.openjii_client import OpenJIIClient
+    client = object.__new__(OpenJIIClient)
+    seen = []
+    def reply(status, payload=None):
+        def request(method, path, body=None, timeout=60):
+            seen.append((method, path))
+            return status, payload
+        return request
+    client._request = reply(204)
+    assert client.remove_experiment_device(OLD, 'dev-1') is True
+    assert seen[-1] == ('DELETE', f'/api/v1/experiments/{OLD}/devices/dev-1')
+    client._request = reply(404, {'message': 'not attached'})
+    assert client.remove_experiment_device(OLD, 'dev-1') is False
+    client._request = reply(403, {'message': 'Only experiment collaborators or managers can detach its devices'})
+    with pytest.raises(OpenJIIError, match='403.*collaborators'):
+        client.remove_experiment_device(OLD, 'dev-1')

@@ -8,12 +8,48 @@ It reads public configuration only, never NVS images, certificates or private ke
 To change experiment, sign in and select the destination in the main window,
 then click **Change experiment / workbook…** inside the destination window.
 The action requires service-capable firmware (v2.9.0+), access to the destination
-experiment and its pinned workbook/programming cell. It does not require access
-to the device's registry entry, an existing experiment binding, or permission
-to issue certificates. It makes no register, onboard, issue or rotate request.
-The existing wildcard ingest policy permits the topic change independently of
-registry bindings. The platform's bound-device list is therefore not changed
-by this local action.
+experiment and its pinned workbook/programming cell. The device change itself
+does not require access to the device's registry entry, an existing experiment
+binding, or permission to issue certificates, and makes no register, issue or
+rotate request. The existing wildcard ingest policy permits the topic change
+independently of registry bindings.
+
+## openJII bindings follow the change
+
+Once the device change is verified after reboot, the GUI updates openJII so its
+records match where the Ambyte now sends data (HAR-345). It finds the device by
+MAC, onboards it to the destination experiment and, when the operator leaves
+**After the change, also remove this Ambyte from its current experiment on
+openJII** ticked (the default), removes the binding to the experiment it left.
+Removal deletes only the binding; measurements stay in that experiment.
+
+This step is best effort and never undoes or hides the device change. Each part
+reports its own outcome in the result and the log: a device this account cannot
+see, a refused onboarding (for example 403 without device admin rights) or a
+refused removal (the platform allows it to the experiment's collaborators and
+managers) is named and skipped. It runs only after a verified change, never as
+a fallback after a failure, and it never registers, issues or rotates anything.
+This matters before openJII enforces bindings at the broker (OJD-2581): a
+device changed without a binding would then stop delivering.
+
+```mermaid
+sequenceDiagram
+    participant GUI as Destination window
+    participant USB as Selected Ambyte
+    participant API as openJII
+    GUI->>USB: Install workbook, write topics, reboot, verify
+    USB-->>GUI: Verified destination
+    GUI->>API: Find device by MAC
+    alt device visible
+        GUI->>API: Onboard to destination
+        opt remove from current experiment ticked
+            GUI->>API: Remove binding to the experiment it left
+        end
+        API-->>GUI: Outcome per step, reported and logged
+    else not visible
+        GUI-->>GUI: Report skipped onboarding, keep verified change
+    end
+```
 
 ## Which environment and credentials?
 

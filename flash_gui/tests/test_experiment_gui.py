@@ -124,3 +124,31 @@ def test_real_experiment_switch_warning_stays_visible_and_logged(monkeypatch,tar
     visible='\n'.join(v.value for v in (window.summary,window.message,window.maintenance_text))
     assert warning in visible
     assert any(warning in line for line in logs)
+
+
+def test_change_confirmation_names_the_bindings_and_reports_them(monkeypatch,target):
+    w,finish=dialog(monkeypatch,target)
+    w.remove_previous=Var(True)
+    texts,synced=[],[]
+    def confirm(title,text,**kw):texts.append(text);return True
+    monkeypatch.setattr(g.messagebox,'askyesno',confirm)
+    monkeypatch.setattr(e,'change_experiment',lambda *a,**kw:target.preview)
+    def sync(client,mac,thing,destination,previous,*,remove_previous):
+        synced.append((destination,previous,remove_previous))
+        return 'openJII: onboarded to destination.'
+    monkeypatch.setattr(e,'sync_bindings',sync)
+    w._change();finish()
+    assert 'Then onboard it to Destination example on openJII and remove it from' in texts[0]
+    assert synced==[(NEW,target.preview.experiment_id,True)]
+    assert 'openJII: onboarded to destination.' in w.message.value
+
+
+def test_failed_device_change_never_touches_bindings(monkeypatch,target):
+    w,finish=dialog(monkeypatch,target)
+    w.remove_previous=Var(True)
+    monkeypatch.setattr(g.messagebox,'askyesno',lambda *a,**kw:True)
+    def fail(*a,**kw):raise e.ExperimentSettingsError('Workbook installed; topic write unconfirmed')
+    monkeypatch.setattr(e,'change_experiment',fail)
+    monkeypatch.setattr(e,'sync_bindings',lambda *a,**kw:pytest.fail('bindings after a failed change'))
+    w._change();finish()
+    assert 'topic write unconfirmed' in w.message.value

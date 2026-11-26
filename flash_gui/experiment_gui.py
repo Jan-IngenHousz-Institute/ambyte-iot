@@ -48,6 +48,10 @@ class ExperimentDialog(tk.Toplevel):
             self.also_text = tk.StringVar(value="Also set this device's location")
             self.also_btn = ttk.Checkbutton(frame, textvariable=self.also_text, variable=self.also_location)
             self.also_btn.pack(anchor='w')
+            self.remove_previous = tk.BooleanVar(value=True)
+            self.remove_previous_btn = ttk.Checkbutton(frame, variable=self.remove_previous,
+                text='After the change, also remove this Ambyte from its current experiment on openJII')
+            self.remove_previous_btn.pack(anchor='w')
             self.location_default_reason = tk.StringVar()
             ttk.Label(frame, textvariable=self.location_default_reason, wraplength=720).pack(anchor='w')
             self.location_key = None
@@ -112,7 +116,8 @@ class ExperimentDialog(tk.Toplevel):
                             lambda status: self.app._confirm_timezone(status, parent=self)), log=self.app.log)
                     refreshed = settings.read_target(extra.port or value.device.port,
                         dict(getattr(self.app.settings, "mqtt_endpoints", {})))
-                    value = replace(refreshed, timezone_result=value.timezone_result, location_result=value.location_result)
+                    value = replace(refreshed, timezone_result=value.timezone_result, location_result=value.location_result,
+                                    bindings_result=value.bindings_result)
                 except settings.ExperimentSettingsError:
                     pass  # A readback failure does not erase the primary result.
                 except Exception:
@@ -224,26 +229,40 @@ class ExperimentDialog(tk.Toplevel):
         if target.environment and target.environment != client.env.key:
             self.message.set('The device broker and selected API environment differ. Select the matching API environment; this action preserves device credentials.')
             return
+        remove_previous = bool(self.remove_previous.get()) if hasattr(self, 'remove_previous') else False
+        previous_id = target.experiment_id if target.experiment_id != experiment.id else None
+        platform = (f'Then onboard it to {experiment.name} on openJII'
+                    + (f' and remove it from {previous_id}' if remove_previous and previous_id else '') + '.\n')
         unknown = ('\nBroker environment is UNKNOWN: confirm that this existing broker is correct for the selected API environment. '
                    'Credential validity has not been checked.\n' if not target.environment else '')
         if not messagebox.askyesno('Change experiment / workbook',
                 f'Device: {target.mac}\nKeep broker: {target.broker}\nAPI environment: {client.env.key}\n'
                 f'Destination: {experiment.name} ({experiment.id})\n{unknown}\n'
                 'Install its workbook and change the data/status topics, keeping registration and certificates. '
-                'Queued and transitional records follow the topic/workbook current when published. Continue?', parent=self):
+                'Queued and transitional records follow the topic/workbook current when published.\n'
+                + platform + 'Continue?', parent=self):
             return
         def apply(value):
             self._show(value)
             self.message.set('Experiment topics and workbook verified after reboot. Broker and client identity preserved; no registration or certificate writes.'
+                             + ('\n' + value.bindings_result if value.bindings_result else '')
                              + ('\n' + value.timezone_result if value.timezone_result else '')
                              + ('\n' + value.location_result if value.location_result else ''))
         selected = (self.destination_location.selected() if hasattr(self, 'destination_location')
                     and self.also_location.get() else None)
+        def change_then_bindings():
+            # Bindings follow only a verified device change, and never raise,
+            # so they cannot mask the change result or the maintenance flow.
+            value = settings.change_experiment(target, client, experiment.id,
+                allow_unknown_environment=not bool(target.environment), log=self.app.log)
+            bindings = settings.sync_bindings(client, target.mac, target.device.identity.thing_name,
+                                              experiment.id, previous_id, remove_previous=remove_previous)
+            self.app.log(bindings)
+            return replace(value, bindings_result=bindings)
         def set_destination_location(value):
             result = location_settings.set_location(value, selected, confirm=self._confirm_location, log=self.app.log)
             return replace(value, location_result=result)
-        self._run(lambda: settings.change_experiment(target, client, experiment.id,
-                  allow_unknown_environment=not bool(target.environment), log=self.app.log), apply,
+        self._run(change_then_bindings, apply,
                   'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…', maintain=True,
                   after_primary=set_destination_location if selected else None)
 

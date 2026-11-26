@@ -6,6 +6,10 @@ The destination workbook is authorized by its read endpoints. Device registry
 visibility/bindings are not an authorization gate for the wildcard ingest
 policy. Broker/certificate ownership is preserved, not guessed from API login.
 Queued records deliberately follow the current topic/provenance at publication.
+
+Only after the device change is verified does `sync_bindings` update openJII's
+experiment bindings to match. It is best effort: a refusal is reported, never
+raised, and it never registers, issues or rotates anything.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -32,6 +36,7 @@ class DeviceTarget:
     environment: str | None
     timezone_result: str | None = None
     location_result: str | None = None
+    bindings_result: str | None = None
 
     @property
     def mac(self):
@@ -214,6 +219,7 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
         raise ExperimentSettingsError("Experiment maintenance requires service-capable firmware (v2.9.0+). Update firmware while keeping settings first.")
     # Resolve against RUNNING firmware. No onboard, register, issue or rotate
     # call belongs here, including as a fallback after a 403 or USB failure.
+    # Bindings follow separately in sync_bindings, after verification.
     source = workbook_source(client, experiment_id, expected.device.identity.fw, log=log)
     descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
                                      source.built_against_fw, source.workbook_version_id)
@@ -263,3 +269,33 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
     except (OSError, ambyte_serial.ConsoleError, ServiceClientError, wifi_settings.WifiSettingsError,
             firmware_update.FirmwareUpdateError, ExperimentSettingsError) as exc:
         raise ExperimentSettingsError(f"{stage}. {exc} Read the device destination and retry this action. No registration or certificate write was attempted.") from None
+
+
+def sync_bindings(client, mac, thing_name, destination_id, previous_id, *, remove_previous):
+    """Make openJII's bindings follow a verified experiment change (HAR-345).
+
+    The device already sends to the destination; this only updates the
+    platform's record. Each step reports its own outcome so a refusal never
+    hides the device change or the other step. Never raises.
+    """
+    lines = []
+    try:
+        device = client.find_device(mac)
+    except Exception as exc:  # never let the platform hide a verified device change
+        return f"openJII: onboarding skipped, the device list could not be read: {exc}"
+    if not device or device.get('thingName') != thing_name or not device.get('id'):
+        return ("openJII: onboarding skipped, this account cannot see the device's registration. "
+                "Ask an admin of its organization to onboard it to the new experiment.")
+    try:
+        client.onboard_device(device['id'], destination_id)
+        lines.append(f"openJII: onboarded to {destination_id}.")
+    except Exception as exc:
+        lines.append(f"openJII: onboarding to {destination_id} skipped: {exc}")
+    if remove_previous and previous_id and previous_id != destination_id:
+        try:
+            removed = client.remove_experiment_device(previous_id, device['id'])
+            lines.append(f"openJII: removed from {previous_id}; its data stays there." if removed
+                         else f"openJII: was not onboarded to {previous_id}; nothing to remove.")
+        except Exception as exc:
+            lines.append(f"openJII: removal from {previous_id} skipped: {exc}")
+    return '\n'.join(lines)

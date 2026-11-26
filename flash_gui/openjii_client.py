@@ -23,6 +23,7 @@ Endpoints (packages/api/src/domains/... upstream)
   POST /api/v1/devices/{id}/credentials         issue → SHOW-ONCE cert bundle
   POST /api/v1/devices/{id}/credentials/rotate  re-issue for a live device
   POST /api/v1/devices/{id}/onboard             bind + authoritative MQTT config
+  DELETE /api/v1/experiments/{id}/devices/{deviceId}  remove one binding
 
 Issuance is refused while a certificate is live (status active/rotating) —
 those go down the /rotate path. The returned private key is show-once: the
@@ -378,6 +379,23 @@ class OpenJIIClient:
                 "onboard this board, or grant you admin on the device: "
                 f"{self._error_text(payload)}")
         raise OpenJIIError(f"issuing credentials failed ({status}): "
+                           f"{self._error_text(payload)}")
+
+    def remove_experiment_device(self, experiment_id: str, device_id: str) -> bool:
+        """Remove one experiment binding. False when the device was not bound.
+
+        Removal deletes the binding only; measurements stay in the experiment.
+        The platform allows it to the experiment's collaborators and managers.
+        """
+        if not device_id or not experiment_id:
+            raise OpenJIIError("removing a binding needs a device id and an experiment id.")
+        path = f"/api/v1/experiments/{experiment_id}/devices/{device_id}"
+        status, payload = self._request("DELETE", path)
+        if status in (200, 204):
+            return True
+        if status == 404:
+            return False
+        raise OpenJIIError(f"removing the device from the experiment failed ({status}): "
                            f"{self._error_text(payload)}")
 
     def onboard_device(self, device_id: str,
