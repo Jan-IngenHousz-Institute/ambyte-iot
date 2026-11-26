@@ -1,4 +1,4 @@
-# CLAUDE.md — ambyte-iot firmware
+# Agent context: ambyte-iot firmware
 
 ESP32-S3 firmware for Ambyte field devices (plant-measurement loggers carrying up to 4 AMBIT
 sensor boards over UART). Data flows: declarative schedule → internal event log (littlefs `/evstore`, append-only FIFO; SD = overflow for unsent + bulk archive) →
@@ -22,6 +22,13 @@ holds bench boards.
   `schedule <status|run|start|stop|reload|actions|validate|release|install>`,
   `record_env`, `charger_redetect [bg_en|dpdm|auto [on|off]]`, `ambit_spec <ch>`, `ambit_spec_raw <ch>` (cmd 35), `ping_uart <ch>`, `reboot`,
   `selftest` (factory PCBA test; host runner: `python -m flash_gui.factory_test`)
+
+## Component layers
+
+Before adding a `REQUIRES` to a component's `CMakeLists.txt`, or including a header from another
+component, read `.github/copilot-instructions.md`. It holds the allowed dependency direction
+between `domain`, `device_commands`, the infrastructure components and the adapters. The build
+does not enforce it, only review does.
 
 ## Architecture (delivery pipeline invariants — do not break)
 
