@@ -34,6 +34,12 @@ static esp_reset_reason_t reset_reason = ESP_RST_POWERON;
 static bool veto_on;
 static bool relaxed_session;   /* a deferred clear (dirty BG_EN) runs in a later session */
 static unsigned conversions;
+/* HAR-310 injections. */
+static int takes, take_fail_at = -1;  /* one-shot: the Nth xSemaphoreTake times out */
+static int fail_0b_skip;              /* REG0B writes that pass before fail_write_reg applies */
+static int dpdm_stuck_clears;         /* REG0B clears of bit 5 the chip ignores */
+static bool lock_fail_after_r17;      /* the next bus lock after a REG17 read fails */
+static bool lock_fail_next;
 
 esp_reset_reason_t esp_reset_reason(void) { return reset_reason; }
 void h_critical_enter(portMUX_TYPE *m) { assert(!m->held); m->held = 1; }
@@ -41,7 +47,9 @@ void h_critical_exit(portMUX_TYPE *m) { assert(m->held); m->held = 0; }
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &mutex_held; }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait)
 {
-    (void)wait; assert(m == &mutex_held && !mutex_held); mutex_held = 1; return pdTRUE;
+    (void)wait; assert(m == &mutex_held && !mutex_held);
+    if (++takes == take_fail_at) { take_fail_at = -1; return pdFALSE; }
+    mutex_held = 1; return pdTRUE;
 }
 BaseType_t xSemaphoreGive(SemaphoreHandle_t m) { assert(m == &mutex_held && mutex_held); mutex_held = 0; return pdTRUE; }
 int64_t esp_timer_get_time(void) { return clock_us; }
@@ -55,6 +63,7 @@ esp_err_t i2c_bus_lock(unsigned timeout)
 {
     assert(timeout > 0 && !locked);
     if (lock_error) return lock_error;
+    if (lock_fail_next) { lock_fail_next = false; return ESP_ERR_TIMEOUT; }
     locked = 1; sessions++; return ESP_OK;
 }
 esp_err_t i2c_bus_unlock(void) { assert(locked); locked = 0; return ESP_OK; }
@@ -65,6 +74,7 @@ esp_err_t i2c_master_write_read_device(int port, unsigned addr, const uint8_t *w
     (void)port; (void)timeout;
     assert(locked && addr == 0x4B && wn == 1 && rn == 1 && *w < 24);
     if (*w == fail_read_reg && fail_read_n > 0) { fail_read_n--; return ESP_FAIL; }
+    if (*w == 0x17 && lock_fail_after_r17) { lock_fail_after_r17 = false; lock_fail_next = true; }
     *r = regs[*w];
     return ESP_OK;
 }
@@ -72,7 +82,10 @@ esp_err_t i2c_master_write_to_device(int port, unsigned addr, const uint8_t *w, 
 {
     (void)port; (void)timeout;
     assert(locked && addr == 0x4B && wn == 2);
-    if (w[0] == fail_write_reg && fail_write_n > 0) { fail_write_n--; return ESP_FAIL; }
+    if (w[0] == fail_write_reg && fail_write_n > 0) {
+        if (w[0] == 0x0B && fail_0b_skip > 0) fail_0b_skip--;
+        else { fail_write_n--; return ESP_FAIL; }
+    }
     const uint8_t v = w[1];
     switch (w[0]) {
     case 0x03:   /* ADC control: a START converts instantly */
@@ -101,6 +114,7 @@ esp_err_t i2c_master_write_to_device(int port, unsigned addr, const uint8_t *w, 
     case 0x0B:
         dpdm_writes++;
         CHECK((v & 0x19) == 0, "DM/DP/FAST_CHG_RESET never written 1 (0x%02X)", v);
+        if (!(v & 0x20) && (regs[0x0B] & 0x20) && dpdm_stuck_clears > 0) { dpdm_stuck_clears--; return ESP_OK; }
         regs[0x0B] = dpdm_keep ? v : (uint8_t)(v & ~0x20);
         return ESP_OK;
     default:
@@ -188,10 +202,19 @@ static void reads_for(int64_t ms)
     }
 }
 
+static int render_has(const char *needle)
+{
+    char json[CHARGER_DIAGNOSTICS_JSON_CAP];
+    uint64_t window = 0;
+    CHECK(mp2731_render_diagnostics(json, sizeof json, &window, false) > 0, "render");
+    return strstr(json, needle) != NULL;
+}
+
 static void boot(void)
 {
     field_state();
     assert(mp2731_init() == ESP_OK);
+    sessions = 0;   /* boot reconciliation (REG09/REG0B reads) is not command traffic */
     mp2731_redetect_set_veto(veto);
     charger_redetect_command_config_t cfg = {.reply = reply, .submit = submit};
     charger_redetect_command_init(&cfg);
@@ -293,6 +316,72 @@ int main(int argc, char **argv)
         dpdm_keep = false; dpdm_writes = 0;
         CHECK(mp2731_charger_redetect(POWER_REDETECT_DPDM, &rep) == ESP_OK, "self-clearing");
         CHECK(!rep.latched && !rep.restored && rep.cleared && dpdm_writes == 1, "no restore needed");
+    } else if (!strcmp(c, "dpdm_settle_timeout")) {
+        /* HAR-310 #1 (Codex repro): the +5 s snapshot's mutex take times out.
+         * Takes: 1 = pulse, 2 = +1.5 s, 3 = +5 s. The restore must still run. */
+        dpdm_keep = true; takes = 0; take_fail_at = 3;
+        const esp_err_t err = mp2731_charger_redetect(POWER_REDETECT_DPDM, &rep);
+        CHECK(!(regs[0x0B] & 0x20), "REG0B bit 5 left asserted: 0x%02X (return %d)", regs[0x0B], err);
+        CHECK(err == ESP_OK && rep.latched && rep.restored && rep.cleared && rep.reg_after == 0xC6,
+              "restored and verified: err %d restored %d cleared %d after 0x%02X",
+              err, rep.restored, rep.cleared, rep.reg_after);
+        CHECK(rep.snapshots == 3, "the skipped snapshot is only missing evidence (%u)", rep.snapshots);
+        CHECK(!s_manual_active && s_redetect_marker == 0, "closed");
+    } else if (!strcmp(c, "dpdm_restore_io")) {
+        /* The restore write fails on the bus: never success, fail closed. */
+        dpdm_keep = true; fail_write_reg = 0x0B; fail_0b_skip = 1; fail_write_n = 1000;
+        const esp_err_t err = mp2731_charger_redetect(POWER_REDETECT_DPDM, &rep);
+        CHECK(err != ESP_OK && !rep.cleared, "unverified restore reported as success (%d)", err);
+        CHECK(regs[0x0B] & 0x20, "bus dead: bit 5 still set");
+        /* Pulses of any kind are refused while it is not proven 0. */
+        CHECK(mp2731_charger_redetect(POWER_REDETECT_BG_EN, &rep) == ESP_ERR_NOT_FINISHED &&
+              bg_set_writes == 0, "manual pulse over a dirty REG0B must be refused");
+        power_redetect_auto_t st;
+        CHECK(mp2731_redetect_auto(1, &st) == ESP_ERR_INVALID_STATE, "auto on refused while dirty");
+        CHECK(render_has("\"dirty\":[\"dpdm\"]"), "telemetry shows the dirty bit");
+        vary = true; model_detect = true;
+        reads_for(10 * 60 * 1000);
+        CHECK(bg_set_writes == 0, "no automatic pulse while dirty");
+        /* Bus back: the next power read restores it, then pulses are allowed. */
+        fail_write_n = 0;
+        reads_for(5 * 1000);
+        CHECK(!(regs[0x0B] & 0x20), "a power read must retry and prove the restore (0x%02X)", regs[0x0B]);
+        CHECK(render_has("\"dirty\":[]"), "clean again");
+        CHECK(mp2731_redetect_auto(1, &st) == ESP_OK, "auto on allowed again");
+        reads_for(5 * 60 * 1000);
+        CHECK(bg_edges == 1, "automatic pulse resumes after recovery (%d)", bg_edges);
+    } else if (!strcmp(c, "dpdm_restore_mismatch")) {
+        /* The restore write lands but bit 5 reads back 1 (twice). */
+        dpdm_keep = true; dpdm_stuck_clears = 2;
+        const esp_err_t err = mp2731_charger_redetect(POWER_REDETECT_DPDM, &rep);
+        CHECK(err == ESP_ERR_INVALID_STATE && !rep.cleared && (rep.reg_after & 0x20),
+              "readback mismatch is a failure (%d, 0x%02X)", err, rep.reg_after);
+        power_reading_t p;
+        (void)mp2731_read_power(&p);
+        CHECK(regs[0x0B] & 0x20, "chip still refuses once");
+        (void)mp2731_read_power(&p);
+        CHECK(!(regs[0x0B] & 0x20), "the next read restores it (0x%02X)", regs[0x0B]);
+        CHECK(mp2731_charger_redetect(POWER_REDETECT_DPDM, &rep) == ESP_OK && rep.cleared,
+              "pulses allowed again once clean");
+    } else if (!strcmp(c, "auto_bus_unavailable")) {
+        /* HAR-310 #2: the precheck passes, then the pulse's bus lock fails.
+         * Nothing was written: no dirty flag, a failed attempt, no pulse. */
+        vary = true; model_detect = true;
+        reads_for(170 * 1000);
+        lock_fail_after_r17 = true;
+        /* The uninitialised read this guards against is invisible to ASan:
+         * the MSan build (test_charger_redetect.MsanDriverTest) catches it. */
+        for (int i = 0; i < 4 && s_crd.attempts == 0; i++) {
+            power_reading_t p;
+            (void)mp2731_read_power(&p);
+            clock_us += 5000000;
+        }
+        CHECK(s_crd.attempts == 1 && s_crd.failed == 1 && !s_crd.pending, "one failed attempt");
+        CHECK(!strcmp(crd_outcome_name(s_crd.last_outcome), "bus_error"), "outcome %s",
+              crd_outcome_name(s_crd.last_outcome));
+        CHECK(!s_bg_en_dirty && bg_set_writes == 0 && bg_clear_writes == 0, "nothing written, nothing dirty");
+        reads_for(5 * 60 * 1000);
+        CHECK(bg_set_writes == 0, "backoff holds the next attempt");
     } else if (!strcmp(c, "veto")) {
         veto_on = true;
         CHECK(mp2731_charger_redetect(POWER_REDETECT_BG_EN, &rep) == ESP_ERR_NOT_ALLOWED, "veto");

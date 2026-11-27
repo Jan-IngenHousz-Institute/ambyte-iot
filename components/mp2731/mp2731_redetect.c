@@ -36,6 +36,7 @@ static void resolve(crd_t *s, crd_outcome_t outcome)
     s->last_after = s->last_status_in_window;
     if (outcome == CRD_OUT_CHARGING) s->charging++;
     else if (outcome == CRD_OUT_DETECTED) s->detected++;
+    else if (outcome == CRD_OUT_UNKNOWN) s->unknown++;
     else s->no_change++;
 }
 
@@ -66,7 +67,9 @@ crd_action_t crd_step(crd_t *s, const crd_obs_t *o, bool veto)
     }
 
     if (s->pending) {
-        if (o->status_valid) {
+        const bool in_window = now - s->attempt_ms <= CRD_OUTCOME_WINDOW_MS;
+        if (in_window && o->status_valid) {
+            s->window_obs = true;
             s->last_status_in_window = o->status;
             if (MP2731_STATUS_VIN(o->status) != 0u) s->saw_detect = true;
             if (charge == 1u || charge == 2u) s->saw_charge = true;
@@ -76,7 +79,10 @@ crd_action_t crd_step(crd_t *s, const crd_obs_t *o, bool veto)
             return CRD_RESOLVED;
         }
         if (now - s->attempt_ms >= CRD_OUTCOME_WINDOW_MS) {
-            resolve(s, s->saw_detect ? CRD_OUT_DETECTED : CRD_OUT_NO_CHANGE);
+            /* Closed from in-window evidence only; this read's own status
+             * counted above only if it is not past the deadline. */
+            resolve(s, s->saw_detect ? CRD_OUT_DETECTED
+                     : s->window_obs ? CRD_OUT_NO_CHANGE : CRD_OUT_UNKNOWN);
             return CRD_RESOLVED;
         }
         return CRD_NONE;
@@ -159,7 +165,7 @@ void crd_note_attempt(crd_t *s, int64_t now_ms, crd_pulse_t result, uint8_t stat
     case CRD_PULSE_OK:
         s->pending = true;
         s->attempt_ms = now_ms;
-        s->saw_detect = s->saw_charge = false;
+        s->saw_detect = s->saw_charge = s->window_obs = false;
         s->last_status_in_window = status_before;
         s->last_outcome = CRD_OUT_PENDING;
         break;
@@ -204,6 +210,7 @@ const char *crd_outcome_name(crd_outcome_t o)
     case CRD_OUT_BUS_ERROR:   return "bus_error";
     case CRD_OUT_NOT_LATCHED: return "not_latched";
     case CRD_OUT_NOT_CLEARED: return "not_cleared";
+    case CRD_OUT_UNKNOWN:     return "unknown";
     }
     return "none";
 }
@@ -264,14 +271,19 @@ int crd_render(const crd_t *s, int64_t now_ms, char *out, size_t cap)
     if (s->disabled == CRD_ENABLED) append(out, cap, &n, "null");
     else append(out, cap, &n, "\"%s\"", crd_disabled_name(s->disabled));
     append(out, cap, &n, ",\"attempts\":%u,\"charging\":%u,\"detected\":%u,\"no_change\":%u,"
-           "\"failed\":%u,\"blocked\":%u,\"vetoed\":%u,\"manual\":%u,\"dwell_s\":%lld,"
+           "\"unknown\":%u,\"failed\":%u,\"blocked\":%u,\"vetoed\":%u,\"manual\":%u,\"dwell_s\":%lld,"
            "\"backoff_s\":%u,\"next_in_s\":%lld,\"last_block\":",
            (unsigned)s->attempts, (unsigned)s->charging, (unsigned)s->detected,
-           (unsigned)s->no_change, (unsigned)s->failed, (unsigned)s->blocked,
+           (unsigned)s->no_change, (unsigned)s->unknown, (unsigned)s->failed, (unsigned)s->blocked,
            (unsigned)s->vetoed, (unsigned)s->manual, (long long)(dwell / 1000),
            (unsigned)(s->backoff_ms / 1000u), (long long)(next / 1000 + (next % 1000 != 0)));
     if (s->last_block == CRD_BLOCK_NONE) append(out, cap, &n, "null");
     else append(out, cap, &n, "\"%s\"", crd_block_name(s->last_block));
+    /* A pulsed bit not yet proven back at 0 (pulses refused until it is). */
+    append(out, cap, &n, ",\"dirty\":[%s%s%s]",
+           (s->dirty & CRD_DIRTY_BG_EN) ? "\"bg_en\"" : "",
+           (s->dirty & CRD_DIRTY_BG_EN) && (s->dirty & CRD_DIRTY_DPDM) ? "," : "",
+           (s->dirty & CRD_DIRTY_DPDM) ? "\"dpdm\"" : "");
     append(out, cap, &n, ",\"last\":");
     if (s->attempts == 0u) {
         append(out, cap, &n, "null}");

@@ -7,6 +7,7 @@
  */
 
 #include "ambit_flash.h"
+#include "ambit_flash_admit.h"
 #include "ambit_flash_port.h"
 
 #include <string.h>
@@ -820,6 +821,106 @@ static bool boot_read_version(uint8_t ch, ambit_fw_info_t *fw)
     return true;
 }
 
+/* Boot-sync channel states. */
+enum { CH_OK, CH_NEWER, CH_STALE, CH_SILENT, CH_BARE, CH_ABSENT, CH_SKIPPED };
+
+/* Maintenance admission for boot sync (ambit_flash_set_maintenance), wired
+ * by the composition root before ambit_flash_boot_sync. Unset = refused. */
+static ambit_flash_maint_t s_maint;
+
+void ambit_flash_set_maintenance(bool (*begin)(void), void (*end)(void))
+{
+    s_maint = (ambit_flash_maint_t){.begin = begin, .end = end};
+}
+
+/* The boot-sync flash loop (formerly inline in ambit_flash_boot_sync). Runs
+ * only inside ambit_flash_admitted, i.e. under a granted maintenance
+ * admission; every exit returns to it and maintenance ends there. */
+typedef struct {
+    const int *state;
+    int *fails;
+    const ambit_flash_target_t *tgt;
+    const char *ver;
+} boot_flash_ctx_t;
+
+static int boot_flash_channels(void *arg)
+{
+    boot_flash_ctx_t *c = arg;
+    const int *state = c->state;
+    int *fails = c->fails;
+    const ambit_flash_target_t tgt = *c->tgt;
+    const char *ver = c->ver;
+    /* Flash + verify each channel. ~30-60 s per channel; the console is already
+     * up and measurement has not started, so the UART bus is exclusively ours. */
+    int flashed = 0;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
+            continue;
+        }
+        /* Brownout protection can begin while earlier channels flash (~30-60 s
+         * each): re-check before starting the next one; a started flash ends. */
+        if (power_protect_blocks_flash()) {
+            ESP_LOGW(TAG, "boot sync: power protection is %s - not flashing ch%u or later",
+                     pp_state_name(power_protect_state()), ch);
+            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+            break;
+        }
+        /* (b) Count the attempt in NVS BEFORE touching the chip. ambit_flash_image
+         * erases the AMBIT app region before writing, so a host reset mid-flash
+         * (brownout/WDT/panic) both bricks the unit AND never reaches the post-flash
+         * bump — the half-written unit would then reflash-and-reset forever.
+         * Persisting up-front caps the loop at BOOT_FAIL_MAX even across interrupted
+         * flashes; a verified flash clears the count again below. */
+        boot_fail_bump(ch, ver, fails[ch]);
+        ESP_LOGW(TAG, "boot sync: auto-flashing ch%u -> v%s (attempt %d/%d)",
+                 ch, ver, fails[ch] + 1, BOOT_FAIL_MAX);
+        ambit_flash_image_result_t res;
+        bool verified = false;
+        const esp_err_t ferr = ambit_flash_image_gated(ch, tgt.dir, 0, flash_power_allows_write, &res);
+        if (ferr == ESP_ERR_NOT_ALLOWED) {
+            /* Protection began during the preflight / ROM connect: nothing was
+             * erased. Not an attempt; stop here like the check above. */
+            boot_fail_restore(ch, ver, fails[ch]);
+            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
+            ESP_LOGW(TAG, "boot sync: power protection began - ch%u and later not flashed", ch);
+            break;
+        }
+        if (ferr == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
+            for (int try = 0; try < BOOT_VERIFY_TRIES && !verified; try++) {
+                ambit_fw_info_t fw;
+                if (boot_read_version(ch, &fw)) {
+                    if (fw_matches(&fw, &tgt)) {
+                        verified = true;
+                    } else {
+                        ESP_LOGE(TAG, "  ch%u: flashed OK but app reports v%u.%u.%u — "
+                                      "does the folder name match the image?",
+                                 ch, fw.major, fw.minor, fw.batch);
+                        break;
+                    }
+                } else if (try + 1 < BOOT_VERIFY_TRIES) {
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+            }
+        }
+        if (verified) {
+            boot_fail_clear(ch);   /* clears the pre-attempt bump above */
+            flashed++;
+            ESP_LOGW(TAG, "  ch%u: now running v%s (verified)", ch, ver);
+            /* The unit rebooted into new firmware: refresh the identity cache
+             * (fw/hw_rev changed; a CH_BARE unit was never cached at all). */
+            cmd_ambit_device_info_invalidate(ch);
+            ambit_device_info_t inf;
+            (void)cmd_ambit_device_info(ch, &inf);
+        } else {
+            ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s — "
+                          "already counted)", ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);
+        }
+        vTaskDelay(pdMS_TO_TICKS(AMBIT_RESET_SETTLE_MS));   /* (c) rail recovery before the next channel */
+    }
+    return flashed;
+}
+
 int ambit_flash_boot_sync(void)
 {
     /* (a) Suspect-reset guard. A brownout/panic/watchdog reset can strike
@@ -884,7 +985,6 @@ int ambit_flash_boot_sync(void)
 
     /* Pass 1: app-level version read for every channel (harmless to running
      * units). Silent channels are remembered for the ROM-probe pass. */
-    enum { CH_OK, CH_NEWER, CH_STALE, CH_SILENT, CH_BARE, CH_ABSENT, CH_SKIPPED };
     int state[UART_SENSOR_NUM_CHANNELS];
     int fails[UART_SENSOR_NUM_CHANNELS];   /* -1 = not read from NVS yet */
     for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
@@ -1061,73 +1161,28 @@ int ambit_flash_boot_sync(void)
         return 0;
     }
 
-    /* Flash + verify each channel. ~30-60 s per channel; the console is already
-     * up and measurement has not started, so the UART bus is exclusively ours. */
-    int flashed = 0;
-    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
-        if (state[ch] != CH_STALE && state[ch] != CH_BARE) {
-            continue;
-        }
-        /* Brownout protection can begin while earlier channels flash (~30-60 s
-         * each): re-check before starting the next one; a started flash ends. */
-        if (power_protect_blocks_flash()) {
-            ESP_LOGW(TAG, "boot sync: power protection is %s - not flashing ch%u or later",
-                     pp_state_name(power_protect_state()), ch);
-            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
-            break;
-        }
-        /* (b) Count the attempt in NVS BEFORE touching the chip. ambit_flash_image
-         * erases the AMBIT app region before writing, so a host reset mid-flash
-         * (brownout/WDT/panic) both bricks the unit AND never reaches the post-flash
-         * bump — the half-written unit would then reflash-and-reset forever.
-         * Persisting up-front caps the loop at BOOT_FAIL_MAX even across interrupted
-         * flashes; a verified flash clears the count again below. */
-        boot_fail_bump(ch, ver, fails[ch]);
-        ESP_LOGW(TAG, "boot sync: auto-flashing ch%u -> v%s (attempt %d/%d)",
-                 ch, ver, fails[ch] + 1, BOOT_FAIL_MAX);
-        ambit_flash_image_result_t res;
-        bool verified = false;
-        const esp_err_t ferr = ambit_flash_image_gated(ch, tgt.dir, 0, flash_power_allows_write, &res);
-        if (ferr == ESP_ERR_NOT_ALLOWED) {
-            /* Protection began during the preflight / ROM connect: nothing was
-             * erased. Not an attempt; stop here like the check above. */
-            boot_fail_restore(ch, ver, fails[ch]);
-            power_protect_note_skip(POWER_PROTECT_SKIP_OTA);
-            ESP_LOGW(TAG, "boot sync: power protection began - ch%u and later not flashed", ch);
-            break;
-        }
-        if (ferr == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(BOOT_VERIFY_DELAY_MS));
-            for (int try = 0; try < BOOT_VERIFY_TRIES && !verified; try++) {
-                ambit_fw_info_t fw;
-                if (boot_read_version(ch, &fw)) {
-                    if (fw_matches(&fw, &tgt)) {
-                        verified = true;
-                    } else {
-                        ESP_LOGE(TAG, "  ch%u: flashed OK but app reports v%u.%u.%u — "
-                                      "does the folder name match the image?",
-                                 ch, fw.major, fw.minor, fw.batch);
-                        break;
-                    }
-                } else if (try + 1 < BOOT_VERIFY_TRIES) {
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                }
-            }
-        }
-        if (verified) {
-            boot_fail_clear(ch);   /* clears the pre-attempt bump above */
-            flashed++;
-            ESP_LOGW(TAG, "  ch%u: now running v%s (verified)", ch, ver);
-            /* The unit rebooted into new firmware: refresh the identity cache
-             * (fw/hw_rev changed; a CH_BARE unit was never cached at all). */
-            cmd_ambit_device_info_invalidate(ch);
-            ambit_device_info_t inf;
-            (void)cmd_ambit_device_info(ch, &inf);
-        } else {
-            ESP_LOGE(TAG, "  ch%u: auto-flash NOT verified (attempt %d/%d for v%s — "
-                          "already counted)", ch, fails[ch] + 1, BOOT_FAIL_MAX, ver);
-        }
-        vTaskDelay(pdMS_TO_TICKS(AMBIT_RESET_SETTLE_MS));   /* (c) rail recovery before the next channel */
+    /* Maintenance admission (PR #112 round 3). Every other AMBIT flash path
+     * (ambit_ota / ambit_flash command, attach-time update) runs under the
+     * global maintenance lock; boot sync used to flash without it. That let a
+     * boot flash run while the MP2731 driver held a charger quarantine (a
+     * BG_EN / USB_DET_EN not proven back at 0), let a power read write that
+     * bit's recovery in the middle of the flash, and left maintenance
+     * inactive so charger pulses were not vetoed during it. The power checks
+     * above stay (fresh external power, brownout protection); they are in
+     * addition to the admission, not instead of it. A refusal (busy: another
+     * maintenance op, or a quarantine that did not drain within
+     * APP_CHARGER_DRAIN_MS) is not an attempt: nothing is counted, nothing
+     * flashed, and the channels stay pending for the next boot or the
+     * attach-time path. The flash loop runs only inside the admission, so
+     * every exit of it ends maintenance. */
+    boot_flash_ctx_t ctx = {.state = state, .fails = fails, .tgt = &tgt, .ver = ver};
+    const int flashed = ambit_flash_admitted(&s_maint, boot_flash_channels, &ctx);
+    if (flashed == AMBIT_FLASH_ADMIT_DECLINED) {
+        ESP_LOGW(TAG, "boot sync: %d channel(s) need flashing, but maintenance admission was "
+                      "refused (another maintenance op, or a charger bit still quarantined) - "
+                      "not flashing; they stay pending for the next boot or attach-time update",
+                 n_need);
+        return 0;
     }
     ESP_LOGW(TAG, "boot sync: %d/%d channel(s) flashed to v%s", flashed, n_need, ver);
     return flashed;

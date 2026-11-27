@@ -139,6 +139,19 @@ flowchart TD
   `[A-Za-z0-9._-]` so they cannot change the download path.
 - **SD discipline.** The fetch takes an SD io reference per phase, never across an
   HTTP open; SD faults count under the `ambit_ota` writer in `sd_diag`.
+- **Maintenance admission, every flash.** The `ambit_flash` command, the attach-time
+  update and (since PR #112 round 3) the **boot-sync auto-flash** all flash only
+  inside the global maintenance admission (`app_maintenance_begin/end`). Boot sync
+  takes it after its power checks, through `ambit_flash_admitted`
+  (`components/ambit_flash/ambit_flash_admit.c`), and runs its flash loop only
+  inside it, so every exit ends maintenance. While it is held, charger re-detect
+  pulses and AICO re-arms are vetoed. It is not granted while the MP2731 driver
+  holds a charger quarantine (a BG_EN or USB_DET_EN not proven back at 0,
+  [charger-redetect.md](charger-redetect.md)), so no charger bit recovery can run
+  mid-flash. A refusal (another maintenance op, or a quarantine that did not drain
+  within 20 s) flashes nothing and counts nothing: the channels stay pending for
+  the next boot or the attach-time path. The power checks (fresh external power,
+  brownout protection) stay in addition to the admission, not instead of it.
 - **Blackout.** The download runs after measurement and MQTT are suspended, like
   `ambit_ota`, because the board cannot hold the broker's TLS session and a download at
   once. A failed fetch flashes nothing and counts towards the retry cap (3 per id).

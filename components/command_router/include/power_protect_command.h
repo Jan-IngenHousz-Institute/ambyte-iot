@@ -9,11 +9,13 @@
  *   {"type":"power_protect","id":…,"action":"force","state":"no_flash"|"hold"}
  *     → {"type":"power_protect_result","id","ok","action","detail","state",
  *        "reason","forced","since_utc"|null,"brownouts_6h","exit_in_s"|null,
+ *        "qualifying_s","probe","next_probe_s"|null,"backoff_level",
  *        "skipped":{"flash_runs","ambit_runs","ota"}}
  *
  * - status is read-only; clear and force change device state (fleet_command
  *   prints MUTATING) and take the maintenance lock like set_timezone.
- * - clear: back to normal, brownout history and the forced flag wiped.
+ * - clear: back to normal, brownout history, forced flag, probation and
+ *   backoff level wiped.
  * - force: a FORCED state that never auto-exits; only clear ends it (a linked
  *   brownout can still escalate forced no_flash to hold).
  * - Not retained: a retained force would re-apply after every clear.
@@ -21,7 +23,13 @@
  *   invalid_state (missing/unknown with force, present with status/clear).
  *   Runtime refusals: busy, queue_unavailable, maintenance_active, no_mem.
  *   A force/clear whose NVS write failed answers ok:false "persist_failed"
- *   with the (already applied in RAM) state.
+ *   with the state after it: unchanged for clear / a force down (relaxations
+ *   apply only once a positive read shows them on NVS: then ok), the forced
+ *   state for a force up (applied in RAM and RTC memory). A clear / force
+ *   down whose outcome is unknown is fenced; if the fence is not confirmed on
+ *   NVS either the reply is ok:false "persist_unconfirmed": protected now and
+ *   across resets, but a power loss may let the relaxation win (total NVS
+ *   failure cannot be made durable).
  *
  * Execution: the esp-mqtt task only parses, validates and copies a bounded
  * request; the power_protect API (mutex, NVS) runs on the maintenance worker.

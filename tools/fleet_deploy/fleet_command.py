@@ -533,7 +533,9 @@ def summarise(dev, reply):
         return (f"power_protect ok={reply.get('ok')} action={reply.get('action')} detail={reply.get('detail')} "
                 f"state={reply.get('state')} reason={reply.get('reason')} forced={reply.get('forced')} "
                 f"since_utc={reply.get('since_utc')} brownouts_6h={reply.get('brownouts_6h')} "
-                f"exit_in_s={reply.get('exit_in_s')} skipped(flash={sk.get('flash_runs')} "
+                f"exit_in_s={reply.get('exit_in_s')} qualifying_s={reply.get('qualifying_s')} "
+                f"probe={reply.get('probe')} next_probe_s={reply.get('next_probe_s')} "
+                f"backoff_level={reply.get('backoff_level')} skipped(flash={sk.get('flash_runs')} "
                 f"ambit={sk.get('ambit_runs')} ota={sk.get('ota')})")
     if t in ("vin_limit_result", "set_vin_limit_result"):
         reg01 = reply.get("reg01")

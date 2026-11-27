@@ -558,20 +558,38 @@ const char *diag_crash_json(void)
 /* components/power_protect (brownout protection): this harness drives the
  * delivery pipeline, not the protection state machine (tests/power_protect_host
  * does). The unit is never protected here, and every heartbeat carries the
- * WIDEST health.power_protect the firmware can render (longest state and
- * reason names, INT64_MIN since, u32-max counters), so I5's worst-case
- * telemetry budget includes it. */
+ * WIDEST health.power_protect the firmware can render, through the PRODUCTION
+ * renderer (power_protect_core.c's pp_render_json): the longest state, reason
+ * and probe names, INT64_MIN since, INT64_MAX next probe, u32-max counters,
+ * u8-max backoff level. So I5's worst-case telemetry budget includes every
+ * field the renderer emits, and any field added later. */
 #include "power_protect.h"
 void power_protect_on_power_read(power_read_reason_t reason, const power_reading_t *p, bool fresh_present)
 { (void)reason; (void)p; (void)fresh_present; }
 bool power_protect_blocks_flash(void) { return false; }
+static size_t longest(const char *(*name)(int), int n, int *which)
+{
+    size_t best = 0;
+    for (int i = 0; i < n; i++) {
+        if (strlen(name(i)) > best) { best = strlen(name(i)); *which = i; }
+    }
+    return best;
+}
+static const char *state_name(int i) { return pp_state_name((pp_state_t)i); }
+static const char *reason_name(int i) { return pp_reason_name((pp_reason_t)i); }
+static const char *probe_name(int i) { return pp_probe_name((pp_probe_t)i); }
 int power_protect_render_json(char *buf, size_t cap)
 {
-    int n = snprintf(buf, cap, "{\"state\":\"no_flash\",\"reason\":\"brownout_unordered\","
-                     "\"since_utc\":-9223372036854775808,\"forced\":true,\"persist_fault\":true,"
-                     "\"brownouts_6h\":4294967295,"
-                     "\"skipped\":{\"flash_runs\":4294967295,\"ambit_runs\":4294967295,\"ota\":4294967295}}");
-    return (n > 0 && (size_t)n < cap) ? n : -1;
+    int st = 0, rs = 0, pr = 0;
+    (void)longest(state_name, PP_STATE_HOLD + 1, &st);
+    (void)longest(reason_name, PP_REASON_COUNT, &rs);
+    (void)longest(probe_name, PP_PROBE_NO_MONITOR + 1, &pr);
+    pp_persist_t p;
+    memset(&p, 0, sizeof p);
+    p.state = (uint8_t)st; p.reason = (uint8_t)rs; p.forced = true; p.since_utc = INT64_MIN;
+    const pp_skips_t skips = { UINT32_MAX, UINT32_MAX, UINT32_MAX };
+    const pp_recovery_t rec = { UINT32_MAX, (pp_probe_t)pr, INT64_MAX, UINT8_MAX };
+    return pp_render_json(buf, cap, &p, true, UINT32_MAX, &skips, &rec);
 }
 
 /* diag_log_priv.h: downstream sink before install() (diag_boot.c on target). */

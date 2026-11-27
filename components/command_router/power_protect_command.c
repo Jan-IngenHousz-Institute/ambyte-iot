@@ -108,6 +108,12 @@ static char *render(const request_t *r, bool ok, const char *detail,
         cJSON_AddNumberToObject(j, "brownouts_6h", st->brownouts_6h) &&
         (st->exit_in_s >= 0 ? cJSON_AddNumberToObject(j, "exit_in_s", (double)st->exit_in_s) != NULL
                             : cJSON_AddNullToObject(j, "exit_in_s") != NULL) &&
+        cJSON_AddNumberToObject(j, "qualifying_s", st->recovery.qualifying_s) &&
+        cJSON_AddStringToObject(j, "probe", pp_probe_name(st->recovery.probe)) &&
+        (st->recovery.next_probe_s >= 0
+             ? cJSON_AddNumberToObject(j, "next_probe_s", (double)st->recovery.next_probe_s) != NULL
+             : cJSON_AddNullToObject(j, "next_probe_s") != NULL) &&
+        cJSON_AddNumberToObject(j, "backoff_level", st->recovery.backoff_level) &&
         (sk = cJSON_AddObjectToObject(j, "skipped")) != NULL &&
         cJSON_AddNumberToObject(sk, "flash_runs", st->skipped.flash_runs) &&
         cJSON_AddNumberToObject(sk, "ambit_runs", st->skipped.ambit_runs) &&
@@ -132,7 +138,12 @@ static void execute(void *arg)
                 : (s_config.clear ? s_config.clear() : ESP_ERR_NOT_SUPPORTED);
             s_config.maintenance_end();
             ok = err == ESP_OK;
-            detail = ok ? (r->action == ACT_FORCE ? "applied" : "cleared") : "persist_failed";
+            /* persist_unconfirmed: a relaxation whose outcome is unknown and
+             * whose protective fence is not confirmed on NVS either (it may
+             * still win after a power loss; power_protect.h). */
+            detail = ok ? (r->action == ACT_FORCE ? "applied" : "cleared")
+                        : err == POWER_PROTECT_ERR_UNCONFIRMED ? "persist_unconfirmed"
+                        : err == POWER_PROTECT_ERR_UNVERIFIED ? "identity_unverified" : "persist_failed";
         }
     }
     if (refusal != NULL) {
@@ -141,6 +152,7 @@ static void execute(void *arg)
         power_protect_status_t st;
         memset(&st, 0, sizeof st);
         st.exit_in_s = -1;
+        st.recovery.next_probe_s = -1;
         if (s_config.get_status) s_config.get_status(&st);
         char *json = render(r, ok, detail, &st);
         if (json != NULL) {
