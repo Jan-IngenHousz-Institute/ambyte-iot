@@ -72,7 +72,14 @@ LIVE_STATES = ("active", "rotating")
 
 
 class OpenJIIError(RuntimeError):
-    """API/auth failure, with a human-readable message."""
+    """API/auth failure, with a human-readable message.
+
+    `status` is the HTTP status when openJII answered, None when the outcome
+    is unknown (no response, or a response that could not be read).
+    """
+    def __init__(self, message: str = "", status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -398,7 +405,7 @@ class OpenJIIClient:
         except (ValueError, UnicodeDecodeError) as exc:  # a 2xx whose body would not parse
             raise OpenJIIError(f"onboarding response could not be read: {exc}") from None
         if status != 200:
-            raise OpenJIIError(f"onboarding device failed ({status}): {self._error_text(payload)}")
+            raise OpenJIIError(f"onboarding device failed ({status}): {self._error_text(payload)}", status)
 
     def device_experiment_ids(self, device_id: str) -> set[str]:
         """The experiments the device is bound to, as openJII records them."""
@@ -429,7 +436,7 @@ class OpenJIIClient:
         if status == 404:
             return False
         raise OpenJIIError(f"removing the device from the experiment failed ({status}): "
-                           f"{self._error_text(payload)}")
+                           f"{self._error_text(payload)}", status)
 
     def onboard_device(self, device_id: str,
                        experiment_id: str) -> DeviceOnboarding:

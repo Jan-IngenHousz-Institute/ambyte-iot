@@ -254,14 +254,30 @@ def test_onboarding_binds_the_destination_and_returns_the_device():
 
 
 def test_a_refused_onboarding_stops_before_any_device_write():
-    platform = Platform(refuse=OpenJIIError('onboarding device failed (403): no access'), lands=False)
+    platform = Platform(refuse=OpenJIIError('onboarding device failed (403): no access', 403), lands=False)
     with pytest.raises(e.ExperimentSettingsError, match='No device settings were changed.*refused.*403'):
         e.onboard_destination(platform, MAC, THING, NEW, 'Destination')
 
 
-def test_a_write_that_landed_counts_even_when_its_response_failed():
-    platform = Platform(refuse=OpenJIIError('onboarding response could not be read'), lands=True)
-    assert e.onboard_destination(platform, MAC, THING, NEW) == 'dev-1'
+def test_a_definite_refusal_stops_even_when_an_older_binding_exists():
+    platform = Platform(refuse=OpenJIIError('onboarding device failed (403): no access', 403), lands=False)
+    platform.bound.add(NEW)  # bound earlier by someone with the rights
+    with pytest.raises(e.ExperimentSettingsError, match='refused'):
+        e.onboard_destination(platform, MAC, THING, NEW)
+
+
+@pytest.mark.parametrize('error', [OpenJIIError('onboarding response could not be read'),
+                                   OpenJIIError('onboarding device failed (502): bad gateway', 502),
+                                   TimeoutError('timed out')])
+def test_an_ambiguous_write_that_landed_counts(error):
+    assert e.onboard_destination(Platform(refuse=error, lands=True), MAC, THING, NEW) == 'dev-1'
+
+
+def test_an_accepted_write_missing_on_read_back_stops_without_calling_it_a_refusal():
+    platform = Platform(lands=False)
+    with pytest.raises(e.ExperimentSettingsError, match='accepted the request but does not list') as error:
+        e.onboard_destination(platform, MAC, THING, NEW)
+    assert 'None' not in str(error.value)
 
 
 def test_an_unconfirmed_binding_stops_the_change():
@@ -291,11 +307,19 @@ def test_onboarding_never_lets_an_unexpected_failure_through():
 @pytest.mark.parametrize('outcome,expected', [
     (True, 'removed from Old example'),
     (False, 'no binding to Old example'),
-    (OpenJIIError('removing the device from the experiment failed (403): no'), 'removal from Old example'),
+    (OpenJIIError('removing the device from the experiment failed (403): no', 403), 'removal from Old example (' ),
 ])
 def test_removal_reports_its_outcome_and_never_raises(outcome, expected):
     text = e.remove_previous_binding(Platform(remove_status=outcome), 'dev-1', OLD, 'Old example')
     assert expected in text and OLD in text
+
+
+@pytest.mark.parametrize('still_bound,expected', [(False, 'removed from'), (True, 'did not take effect')])
+def test_an_ambiguous_removal_is_settled_by_the_read_back(still_bound, expected):
+    platform = Platform(remove_status=TimeoutError('timed out'))
+    if not still_bound:
+        platform.bound.discard(OLD)  # the DELETE committed before the timeout
+    assert expected in e.remove_previous_binding(platform, 'dev-1', OLD, 'Old example')
 
 
 def test_client_binding_and_read_back_map_statuses():
@@ -313,11 +337,13 @@ def test_client_binding_and_read_back_map_statuses():
     client.bind_device('dev-1', NEW)
     assert seen[-1] == ('POST', '/api/v1/devices/dev-1/onboard', {'experimentIds': [NEW], 'includeWorkbook': False})
     client._request = reply(403, {'message': 'forbidden'})
-    with pytest.raises(OpenJIIError, match='403'):
+    with pytest.raises(OpenJIIError, match='403') as refused:
         client.bind_device('dev-1', NEW)
+    assert refused.value.status == 403
     client._request = reply(None, raise_=ValueError('bad json'))
-    with pytest.raises(OpenJIIError, match='could not be read'):
+    with pytest.raises(OpenJIIError, match='could not be read') as unread:
         client.bind_device('dev-1', NEW)
+    assert unread.value.status is None
     client._request = reply(200, [{'id': OLD}, {'id': NEW}, 'junk'])
     assert client.device_experiment_ids('dev-1') == {OLD, NEW}
     client._request = reply(204)

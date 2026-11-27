@@ -4,7 +4,7 @@
 
 The destination workbook is authorized by its read endpoints. Device registry
 visibility/bindings are not an authorization gate for the wildcard ingest
-policy. Broker/certificate ownership is preserved, not guessed from API login.
+policy, but this action now requires them (see onboard_destination). Broker/certificate ownership is preserved, not guessed from API login.
 Queued records deliberately follow the current topic/provenance at publication.
 
 openJII's bindings follow the change in two steps around it (HAR-345):
@@ -210,7 +210,12 @@ def install_workbook(console, expected, source, journal, *, log=lambda text: Non
     return current
 
 
-def change_experiment(expected, client, experiment_id, *, allow_unknown_environment=False, log=lambda text: None):
+def preflight(expected, client, experiment_id, *, allow_unknown_environment=False, log=lambda text: None):
+    """Every check that needs no write: environment, topic, firmware, workbook.
+
+    Runs before onboard_destination so a change that cannot happen never adds
+    an openJII binding. Returns (new topic root, resolved workbook source).
+    """
     if expected.environment and expected.environment != client.env.key:
         raise ExperimentSettingsError("The device broker belongs to a different environment. Experiment maintenance preserves its broker and credentials.")
     if not expected.environment and not allow_unknown_environment:
@@ -218,11 +223,17 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
     new_root = topic_for_experiment(expected.device.settings['mqtt_topic_root'], experiment_id)
     if 'svc' not in expected.device.identity.capabilities:
         raise ExperimentSettingsError("Experiment maintenance requires service-capable firmware (v2.9.0+). Update firmware while keeping settings first.")
-    # Resolve against RUNNING firmware. No onboard, register, issue or rotate
-    # call belongs here, including as a fallback after a 403 or USB failure.
-    # Bindings are handled around this call: onboard_destination before it,
-    # remove_previous_binding after it.
-    source = workbook_source(client, experiment_id, expected.device.identity.fw, log=log)
+    # Resolve against RUNNING firmware.
+    return new_root, workbook_source(client, experiment_id, expected.device.identity.fw, log=log)
+
+
+def change_experiment(expected, client, experiment_id, *, allow_unknown_environment=False, log=lambda text: None,
+                      prepared=None):
+    # No onboard, register, issue or rotate call belongs here, including as a
+    # fallback after a 403 or USB failure. Bindings are handled around this
+    # call: onboard_destination before it, remove_previous_binding after it.
+    new_root, source = prepared or preflight(expected, client, experiment_id,
+                                             allow_unknown_environment=allow_unknown_environment, log=log)
     descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
                                      source.built_against_fw, source.workbook_version_id)
     journal = OperationJournal(config.SERVICE_OPERATIONS_DIR, expected.mac)
@@ -274,7 +285,7 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
 
 
 
-def _label(name, experiment_id):
+def experiment_label(name, experiment_id):
     return f"{name} ({experiment_id})" if name and name != experiment_id else experiment_id
 
 
@@ -285,7 +296,7 @@ def onboard_destination(client, mac, thing_name, destination_id, destination_nam
     binding is confirmed by reading it back, which also covers a write that
     landed but whose response could not be read. Returns the device id.
     """
-    destination = _label(destination_name, destination_id)
+    destination = experiment_label(destination_name, destination_id)
     stop = "No device settings were changed."
     try:
         device = client.find_device(mac)
@@ -299,21 +310,27 @@ def onboard_destination(client, mac, thing_name, destination_id, destination_nam
         raise ExperimentSettingsError(
             f"{stop} openJII's registration for {mac} has a different client name than this Ambyte "
             f"({device.get('thingName')} vs {thing_name}). Check the device's identity before changing experiments.")
-    refusal = None
+    unknown = None
     try:
         client.bind_device(device['id'], destination_id)
     except Exception as exc:
-        refusal = exc
+        status = getattr(exc, 'status', None)
+        if status is not None and 400 <= status < 500:
+            # A definite refusal stops, even if an older binding already exists.
+            raise ExperimentSettingsError(
+                f"{stop} openJII refused to onboard this Ambyte to {destination}: {exc}. Onboarding needs Can edit "
+                "or admin on the device (organization admin, or a Can edit grant), contribute access to the "
+                "destination, access to every experiment the device is already onboarded to, an active "
+                "destination and an active certificate.") from None
+        unknown = exc  # no answer, a 5xx or an unreadable reply: the read-back decides
     try:
         bound = destination_id in client.device_experiment_ids(device['id'])
     except Exception as exc:
         raise ExperimentSettingsError(
-            f"{stop} openJII could not confirm the binding to {destination}: {refusal or exc}") from None
+            f"{stop} openJII could not confirm the binding to {destination}: {unknown or exc}") from None
     if not bound:
-        raise ExperimentSettingsError(
-            f"{stop} openJII refused to onboard this Ambyte to {destination}: {refusal}. Onboarding needs "
-            "Can edit or admin on the device, collaborator or manager on the destination, access to every "
-            "experiment the device is already onboarded to, an active destination and an active certificate.")
+        detail = f": {unknown}" if unknown else "; it accepted the request but does not list the binding"
+        raise ExperimentSettingsError(f"{stop} openJII did not confirm the binding to {destination}{detail}.")
     return device['id']
 
 
@@ -322,10 +339,18 @@ def remove_previous_binding(client, device_id, previous_id, previous_name=None):
 
     Never raises: the device change and the new binding stand either way.
     """
-    previous = _label(previous_name, previous_id)
+    previous = experiment_label(previous_name, previous_id)
     try:
         removed = client.remove_experiment_device(previous_id, device_id)
     except Exception as exc:
-        return f"openJII: removal from {previous} refused: {exc} The device stays listed there; its data stays too."
+        status = getattr(exc, 'status', None)
+        if status is not None and 400 <= status < 500:
+            return f"openJII: removal from {previous} refused: {exc} The device stays listed there; remove it by hand."
+        try:  # no definite answer: the read-back says what happened
+            removed = previous_id not in client.device_experiment_ids(device_id)
+        except Exception:
+            return f"openJII: removal from {previous} not confirmed ({exc}). Check the device's Onboarding tab."
+        if not removed:
+            return f"openJII: removal from {previous} did not take effect ({exc}). Remove it by hand."
     return (f"openJII: removed from {previous}; its data stays there." if removed
             else f"openJII: no binding to {previous} found; nothing to remove.")

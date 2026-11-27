@@ -202,3 +202,24 @@ def test_a_different_board_on_refresh_keeps_the_verified_result(monkeypatch,targ
     w._change()
     assert w.target.mac == target.preview.mac
     assert 'openJII: onboarded to Destination example' in w.message.value
+
+
+def test_a_change_that_cannot_happen_adds_no_binding(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    def impossible(*a, **kw): raise e.ExperimentSettingsError('The stored topic is not a supported seven-segment ingest topic')
+    monkeypatch.setattr(e, 'preflight', impossible)
+    w._change(); finish()
+    assert calls == [] and 'seven-segment' in w.message.value
+
+
+def test_a_rerun_at_the_destination_says_why_nothing_is_removed(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    w.target = replace(w.target, experiment_id=NEW)
+    texts = []
+    def confirm(title, text, **kw): texts.append(text); return True
+    monkeypatch.setattr(g.messagebox, 'askyesno', confirm)
+    monkeypatch.setattr(e, 'change_experiment', lambda *a, **kw: target.preview)
+    w._change(); finish()
+    assert 'already sends to the destination' in texts[0]
+    assert [c[0] for c in calls] == ['onboard']

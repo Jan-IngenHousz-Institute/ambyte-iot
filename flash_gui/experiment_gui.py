@@ -233,13 +233,16 @@ class ExperimentDialog(tk.Toplevel):
         remove_previous = bool(self.remove_previous.get()) if hasattr(self, 'remove_previous') else False
         previous_id = target.experiment_id if target.experiment_id != experiment.id else None
         names = {e.id: e.name for e in getattr(self.app, 'experiments', []) or []}
-        previous_label = settings._label(names.get(previous_id), previous_id) if previous_id else None
+        previous_label = settings.experiment_label(names.get(previous_id), previous_id) if previous_id else None
         if not remove_previous:
             removal = ''
         elif previous_label:
             removal = f'After the change, remove it from {previous_label} on openJII.\n'
+        elif target.experiment_id == experiment.id:
+            removal = ('The device already sends to the destination, so the experiment it left is not known here. '
+                       'Remove that binding on openJII by hand if it is still listed.\n')
         else:
-            removal = "The device's current experiment is unknown, so no openJII binding will be removed.\n"
+            removal = "The device's topic names no experiment, so no openJII binding will be removed.\n"
         unknown = ('\nBroker environment is UNKNOWN: confirm that this existing broker is correct for the selected API environment. '
                    'Credential validity has not been checked.\n' if not target.environment else '')
         if not messagebox.askyesno('Change experiment / workbook',
@@ -264,24 +267,28 @@ class ExperimentDialog(tk.Toplevel):
             except (RuntimeError, tk.TclError):
                 pass  # logging never decides the outcome of a device change
         def onboard_change_remove():
-            # Onboard before any device write, so a refusal changes nothing on
-            # the Ambyte; remove the old binding only after verification.
+            # Read-only checks first, so a change that cannot happen adds no
+            # binding; onboard before any device write, so a refusal changes
+            # nothing on the Ambyte; remove the old binding only after verification.
+            unknown_env = not bool(target.environment)
+            prepared = settings.preflight(target, client, experiment.id,
+                                          allow_unknown_environment=unknown_env, log=log)
             device_id = settings.onboard_destination(client, target.mac, target.device.identity.thing_name,
                                                      experiment.id, experiment.name)
-            lines = [f'openJII: onboarded to {settings._label(experiment.name, experiment.id)}.']
+            lines = [f'openJII: onboarded to {settings.experiment_label(experiment.name, experiment.id)}.']
             log(lines[0])
             try:
                 value = settings.change_experiment(target, client, experiment.id,
-                    allow_unknown_environment=not bool(target.environment), log=self.app.log)
-            except settings.ExperimentSettingsError as exc:
+                    allow_unknown_environment=unknown_env, log=log, prepared=prepared)
+            except Exception as exc:
                 # The binding stays: harmless while the device still publishes
                 # to its old topic, and needed once the change is retried.
-                raise settings.ExperimentSettingsError(f'{lines[0]} {exc}') from None
+                raise settings.ExperimentSettingsError(f'{lines[0]} {exc or type(exc).__name__}') from None
             if remove_previous and previous_id:
                 lines.append(settings.remove_previous_binding(client, device_id, previous_id, names.get(previous_id)))
                 log(lines[-1])
             elif remove_previous:
-                lines.append("openJII: the device's previous experiment was unknown, so no binding was removed.")
+                lines.append('openJII: the experiment the device left is not known here, so no binding was removed.')
             return replace(value, bindings_result='\n'.join(lines))
         def set_destination_location(value):
             result = location_settings.set_location(value, selected, confirm=self._confirm_location, log=self.app.log)
