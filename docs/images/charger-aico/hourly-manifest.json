@@ -1,0 +1,166 @@
+{
+  "source_commit": "7bbfb5acd65601c5817ca17ea8db43ebfef8ed8c",
+  "firmware": "v2.21.0-9-g7bbfb5a",
+  "bench_signed_image_sha256": "eb2961bf2cabefd3fe2882639b0b3a0fed15b44441054e88ec7bf6e7e1252ebf",
+  "bench_mac": "28:37:2F:FF:E7:04",
+  "power_source": "laptop USB port, battery charge done",
+  "aico_on_utc": "2026-11-17T07:19:17Z",
+  "run_minutes_with_aico_on": 67.8,
+  "rearm_before": {
+    "stage": "wait",
+    "t_s": 3615.9,
+    "utc": "08:19:17Z",
+    "on": true,
+    "reg02": "DD",
+    "iin_ma": 500,
+    "iin_dpm_ma": 500,
+    "aico_stat": 0,
+    "resets": 0,
+    "failed": 0,
+    "last_reset": "none",
+    "next_check_in_s": 0,
+    "registers": {
+      "00": "48",
+      "01": "06",
+      "02": "DD",
+      "03": "10",
+      "04": "5B",
+      "05": "A6",
+      "06": "22",
+      "07": "A0",
+      "08": "95",
+      "09": "00",
+      "0A": "58",
+      "0B": "C0",
+      "0C": "39",
+      "0D": "80",
+      "0E": "D1",
+      "0F": "DC",
+      "10": "8A",
+      "11": "56",
+      "12": "00",
+      "13": "09",
+      "14": "08",
+      "15": "60",
+      "16": "EE",
+      "17": "00"
+    }
+  },
+  "rearm_after": {
+    "stage": "wait",
+    "t_s": 3620.3,
+    "utc": "08:19:22Z",
+    "on": true,
+    "reg02": "DD",
+    "iin_ma": 500,
+    "iin_dpm_ma": 500,
+    "aico_stat": 0,
+    "resets": 1,
+    "failed": 0,
+    "last_reset": "uptime 3615s",
+    "next_check_in_s": 3596,
+    "registers": {
+      "00": "48",
+      "01": "06",
+      "02": "DD",
+      "03": "10",
+      "04": "5B",
+      "05": "A6",
+      "06": "22",
+      "07": "A0",
+      "08": "95",
+      "09": "00",
+      "0A": "58",
+      "0B": "C0",
+      "0C": "39",
+      "0D": "80",
+      "0E": "D1",
+      "0F": "DA",
+      "10": "89",
+      "11": "56",
+      "12": "00",
+      "13": "08",
+      "14": "08",
+      "15": "60",
+      "16": "EE",
+      "17": "00"
+    }
+  },
+  "config_registers_compared": [
+    "00",
+    "01",
+    "02",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08",
+    "09",
+    "0A",
+    "0B",
+    "15",
+    "16",
+    "17"
+  ],
+  "config_registers_changed_across_rearm": {},
+  "firmware_log": [
+    "I (3615896) mp2731: AICO re-armed #1: REG00 0x48 rewritten, IIN_DPM 500 -> 500 mA (REG15 0x60)"
+  ],
+  "telemetry_aico_after_rearm": {
+    "enabled": true,
+    "iin_dpm_ma": 500,
+    "aico_stat": false,
+    "resets": 1,
+    "failed": 0,
+    "last_reset_ms": 3615088
+  },
+  "resets_at_end": 1,
+  "failed_at_end": 0,
+  "reg02_after_aico_off": "DC",
+  "fleet_deploy_checks_during_run": [
+    {
+      "t_s": 940.3,
+      "active": [
+        {
+          "createdAt": "2026-11-17T07:22:21Z",
+          "databaseId": 44038182272,
+          "status": "in_progress"
+        }
+      ]
+    },
+    {
+      "t_s": 2097.5,
+      "active": [
+        {
+          "createdAt": "2026-11-17T07:42:03Z",
+          "databaseId": 44040715084,
+          "status": "in_progress"
+        }
+      ]
+    },
+    {
+      "t_s": 3254.8,
+      "active": []
+    },
+    {
+      "t_s": 3968.0,
+      "active": []
+    }
+  ],
+  "restoration": {
+    "firmware": "2.23.0",
+    "release_tag": "v2.23.0",
+    "signed": true,
+    "signed_image_sha256": "c526e53d9954bd53011316511871eb870e50e47cb91879f49a0dfbfdf45c73a5",
+    "reg00_final": 72,
+    "reg01_final": 6,
+    "reg02_final": 220,
+    "config_keys_checked": 13,
+    "config_unchanged": true,
+    "schedule_sha256_unchanged": true,
+    "nvs_erased": false,
+    "cloud_commands_sent": false
+  },
+  "nvs_erased": false,
+  "cloud_commands_sent": false
+}

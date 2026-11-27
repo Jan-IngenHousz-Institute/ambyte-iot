@@ -326,9 +326,8 @@ register limit. The run shows the verified switch with bits 7:1 unchanged
 (`0xDC` ↔ `0xDD`), the re-arm writing REG00 back byte-exact, the counters and
 the heartbeat object (`resets` 0 → 1, `last_reset_ms` set), rejected syntax
 (`aico enable`, `aico ON`, `aico on now`, rc 1) and the exact restore of
-REG02=`0xDC`. **No AICO learning and no automatic hourly re-arm were observed
-on hardware**: the first needs a weak panel, the second an hour with AICO on.
-Both are host-tested only.
+REG02=`0xDC`. **No AICO learning was observed**: that needs a weak panel. The
+automatic hourly re-arm was captured in a second run, below.
 
 ![Real CLI replies: AICO on, manual re-arm, off and the telemetry object](images/charger-aico/cli-aico.png)
 
@@ -339,8 +338,44 @@ was returned to the production-signed official v2.22.0: REG00=`0x48`,
 REG01=`0x06`, REG02=`0xDC`, all 13 configuration values and the installed
 schedule SHA unchanged, no cloud or Wi-Fi command sent.
 
-Not qualified on hardware: AICO learning on a collapsing panel, the hourly
-automatic re-arm, the MQTT commands and fleet workflow (host-tested only),
+### Bench: the automatic hourly re-arm
+
+A second run on the same board left AICO on for 67.8 minutes with no command
+other than reads. The bench-signed candidate was built from `7bbfb5a`
+(`v2.21.0-9-g7bbfb5a`, a clean describe; its firmware sources are those of the
+merged release). `aico on` at 07:19:17 UTC, then `aico` and
+`mp2731_regs 1 0 read` every ~2 min, every ~5 s near the due time, with the
+console read passively in between to keep the firmware's own log lines.
+
+| Seconds after `aico on` | resets | next check | REG00 | REG02 | REG14 | REG15 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | 3600 s | `0x48` | `0xDD` | `0x08` | `0x60` |
+| 3600 (last poll before) | 0 | 0 s | `0x48` | `0xDD` | `0x08` | `0x60` |
+| 3605 (first poll after) | **1** | 3596 s | `0x48` | `0xDD` | `0x08` | `0x60` |
+| 4069 (end, then `aico off`) | 1 | 3132 s | `0x48` | `0xDC` | `0x08` | `0x60` |
+
+The re-arm fired by itself at uptime 3615 s, 60 minutes after `aico on`, and
+the firmware logged
+`AICO re-armed #1: REG00 0x48 rewritten, IIN_DPM 500 -> 500 mA (REG15 0x60)`.
+The configuration registers 00, 01, 02, 04-0B and 15-17 were identical in the
+dumps just before and just after it (REG03 is the ADC control the power reads
+write; 0C-14 are status, ADC and IIN_DPM). No second re-arm happened before
+the end, no failure was counted, and the heartbeat preview showed
+`"aico":{"enabled":true,"iin_dpm_ma":500,"aico_stat":false,"resets":1,"failed":0,"last_reset_ms":3615088}`.
+IIN_DPM stayed 500 mA because, with a full battery, AICO had learned nothing to
+release. `aico off` then restored REG02=`0xDC`, and the bench was returned to
+the production-signed official v2.23.0 (the release of this feature):
+REG00=`0x48`, REG01=`0x06`, REG02=`0xDC`, 13 configuration values and the
+schedule SHA unchanged, NVS preserved. Every fleet deployment that ran meanwhile
+targeted prod only.
+
+![Real USB capture: AICO re-armed by the firmware itself an hour after aico on](images/charger-aico/cli-aico-hourly.png)
+
+[Text excerpt](images/charger-aico/cli-aico-hourly.txt),
+[every poll with raw registers](images/charger-aico/hourly-polls.json) and the
+[run manifest](images/charger-aico/hourly-manifest.json).
+
+Not qualified on hardware: AICO learning on a collapsing panel, the MQTT commands and fleet workflow (host-tested only),
 `AICO_EN` across a night without input, and the AICO_STAT clearing behaviour
 (the datasheet does not say whether reading REG15 clears it). A field trial
 should switch AICO on for one unit on a weak panel and compare charge stops,

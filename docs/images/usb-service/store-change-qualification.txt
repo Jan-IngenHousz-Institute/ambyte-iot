@@ -1,0 +1,25 @@
+Service store change after a re-flash (HAR-346): physical USB, firmware 2.23.0, 2026-11-27
+Bench Ambyte 28:37:2F:FF:E7:04 on the dev broker. GUI service client driven by a qualification script.
+
+1. Back up the littlefs partition (0x620000, 512 KiB) before any change.
+2. Journaled workbook transfer on store b43fe702a1a0bed2
+   RESULT state=succeeded applied=True
+   journal: store=b43fe702a1a0bed2 op=0000000000000026 phase=complete
+3. Flash a littlefs image as Initial setup does (NVS and event log untouched)
+   Wrote 524288 bytes at 0x00620000. Hash of data verified.
+4. Same install with origin/main
+   RAISED UnknownOutcome: Device service store changed; verify device state before an explicit new request.
+   journal unchanged: store=b43fe702a1a0bed2 op=0000000000000026 phase=complete
+5. Same install with this branch
+   RESULT state=succeeded (reason already_active: the flashed image held the same bytes)
+   journal:  store=14a3b7825ac89216 op=0000000000000001 phase=complete
+   previous: store=b43fe702a1a0bed2 op=0000000000000026 phase=complete
+   settled schedule: INSTALLED 7dde435060be8e5b bench-har346
+
+PASS origin/main reproduces the field error word for word
+PASS the branch admits the next transfer on the new store, numbered from 1
+PASS the finished intent is preserved as <MAC>.previous.json
+PASS a second path hit the same condition: the GUI's own journal held a finished
+     op 0x25 on the old store, change_experiment failed without this fix and
+     passed with it (see the HAR-345 capture)
+PASS host GUI suite, serial: 710 tests and 29 subtests
