@@ -55,6 +55,12 @@ def target(usb, monkeypatch):
         return _programming()
     client = SimpleNamespace(env=config.ENVIRONMENTS['dev'], resolve_programming=resolve)
     preview = e.read_target('bench', {'dev':'example.test'})
+    # A registry where the signed-in account manages this board (HAR-345).
+    bound = {OLD}
+    client.find_device = lambda mac: {'id': 'dev-1', 'thingName': preview.device.identity.thing_name}
+    client.bind_device = lambda device_id, experiment_id: bound.add(experiment_id)
+    client.device_experiment_ids = lambda device_id: set(bound)
+    client.remove_experiment_device = lambda experiment_id, device_id: bound.discard(experiment_id) is None
     return SimpleNamespace(device=device, handles=handles, directory=directory, values=values,
                            client=client, calls=calls, preview=preview)
 
@@ -207,24 +213,32 @@ def test_experiment_change_warns_about_unexplained_timezone_drift(target):
     assert 'Timezone needs attention: Europe/Amsterdam → Etc/UTC' in result.timezone_result
 
 
-# ── HAR-345: openJII bindings follow a verified experiment change ──────────
+# ── HAR-345: openJII bindings around a verified experiment change ──────────
 
 THING = 'AMBYTE_02000000000001'
 
 
 class Platform:
-    """A registry that records every binding write the sync makes."""
-    def __init__(self, *, visible=True, onboard_error=None, remove_status=True):
-        self.visible, self.onboard_error, self.remove_status = visible, onboard_error, remove_status
-        self.onboarded, self.removed = [], []
+    """A registry that records binding writes and answers the read-back."""
+    def __init__(self, *, visible=True, thing=THING, refuse=None, lands=True, remove_status=True, unreadable=False):
+        self.visible, self.thing, self.refuse, self.lands = visible, thing, refuse, lands
+        self.remove_status, self.unreadable = remove_status, unreadable
+        self.bound, self.bind_calls, self.removed = {OLD}, [], []
 
     def find_device(self, mac):
-        return {'id': 'dev-1', 'thingName': THING, 'serialNumber': mac} if self.visible else None
+        return {'id': 'dev-1', 'thingName': self.thing, 'serialNumber': mac} if self.visible else None
 
-    def onboard_device(self, device_id, experiment_id):
-        if self.onboard_error:
-            raise self.onboard_error
-        self.onboarded.append((device_id, experiment_id))
+    def bind_device(self, device_id, experiment_id):
+        self.bind_calls.append((device_id, experiment_id))
+        if self.lands:
+            self.bound.add(experiment_id)
+        if self.refuse:
+            raise self.refuse
+
+    def device_experiment_ids(self, device_id):
+        if self.unreadable:
+            raise OpenJIIError('reading device experiments failed (500)')
+        return set(self.bound)
 
     def remove_experiment_device(self, experiment_id, device_id):
         if isinstance(self.remove_status, Exception):
@@ -233,69 +247,81 @@ class Platform:
         return self.remove_status
 
 
-def test_bindings_onboard_the_destination_and_remove_the_old_experiment():
+def test_onboarding_binds_the_destination_and_returns_the_device():
     platform = Platform()
-    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
-    assert platform.onboarded == [('dev-1', NEW)] and platform.removed == [(OLD, 'dev-1')]
-    assert f'onboarded to {NEW}' in text and f'removed from {OLD}; its data stays there' in text
+    assert e.onboard_destination(platform, MAC, THING, NEW, 'Destination') == 'dev-1'
+    assert platform.bind_calls == [('dev-1', NEW)] and NEW in platform.bound
 
 
-def test_bindings_keep_the_old_experiment_when_the_operator_unticks_removal():
-    platform = Platform()
-    e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=False)
-    assert platform.onboarded == [('dev-1', NEW)] and platform.removed == []
+def test_a_refused_onboarding_stops_before_any_device_write():
+    platform = Platform(refuse=OpenJIIError('onboarding device failed (403): no access'), lands=False)
+    with pytest.raises(e.ExperimentSettingsError, match='No device settings were changed.*refused.*403'):
+        e.onboard_destination(platform, MAC, THING, NEW, 'Destination')
 
 
-def test_bindings_never_remove_the_destination_itself():
-    platform = Platform()
-    e.sync_bindings(platform, MAC, THING, NEW, NEW, remove_previous=True)
-    assert platform.removed == []
+def test_a_write_that_landed_counts_even_when_its_response_failed():
+    platform = Platform(refuse=OpenJIIError('onboarding response could not be read'), lands=True)
+    assert e.onboard_destination(platform, MAC, THING, NEW) == 'dev-1'
 
 
-def test_bindings_skip_a_device_this_account_cannot_see():
-    platform = Platform(visible=False)
-    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
-    assert 'cannot see' in text and platform.onboarded == platform.removed == []
+def test_an_unconfirmed_binding_stops_the_change():
+    platform = Platform(unreadable=True)
+    with pytest.raises(e.ExperimentSettingsError, match='could not confirm'):
+        e.onboard_destination(platform, MAC, THING, NEW)
 
 
-def test_bindings_report_a_refused_onboarding_and_still_try_the_removal():
-    platform = Platform(onboard_error=OpenJIIError('onboarding device failed (403): forbidden'))
-    text = e.sync_bindings(platform, MAC, THING, NEW, OLD, remove_previous=True)
-    assert f'onboarding to {NEW} skipped' in text and '403' in text
-    assert platform.removed == [(OLD, 'dev-1')]
-
-
-@pytest.mark.parametrize('outcome,expected', [
-    (False, 'was not onboarded to'),
-    (OpenJIIError('removing the device from the experiment failed (403): no'), 'removal from'),
+@pytest.mark.parametrize('platform,reason', [
+    (Platform(visible=False), 'cannot see'),
+    (Platform(thing='AMBYTE_OTHER'), 'different client name'),
 ])
-def test_bindings_report_removal_outcomes(outcome, expected):
-    text = e.sync_bindings(Platform(remove_status=outcome), MAC, THING, NEW, OLD, remove_previous=True)
-    assert expected in text
+def test_onboarding_stops_for_a_device_it_cannot_match(platform, reason):
+    with pytest.raises(e.ExperimentSettingsError, match=reason):
+        e.onboard_destination(platform, MAC, THING, NEW)
+    assert platform.bind_calls == []
 
 
-def test_bindings_never_raise_on_an_unexpected_platform_failure():
+def test_onboarding_never_lets_an_unexpected_failure_through():
     class Broken(Platform):
         def find_device(self, mac):
             raise ValueError('unexpected payload')
-    text = e.sync_bindings(Broken(), MAC, THING, NEW, OLD, remove_previous=True)
-    assert 'could not be read' in text
+    with pytest.raises(e.ExperimentSettingsError, match='could not be read'):
+        e.onboard_destination(Broken(), MAC, THING, NEW)
 
 
-def test_remove_experiment_device_maps_statuses():
+@pytest.mark.parametrize('outcome,expected', [
+    (True, 'removed from Old example'),
+    (False, 'no binding to Old example'),
+    (OpenJIIError('removing the device from the experiment failed (403): no'), 'removal from Old example'),
+])
+def test_removal_reports_its_outcome_and_never_raises(outcome, expected):
+    text = e.remove_previous_binding(Platform(remove_status=outcome), 'dev-1', OLD, 'Old example')
+    assert expected in text and OLD in text
+
+
+def test_client_binding_and_read_back_map_statuses():
     from flash_gui.openjii_client import OpenJIIClient
     client = object.__new__(OpenJIIClient)
     seen = []
-    def reply(status, payload=None):
+    def reply(status, payload=None, raise_=None):
         def request(method, path, body=None, timeout=60):
-            seen.append((method, path))
+            seen.append((method, path, body))
+            if raise_:
+                raise raise_
             return status, payload
         return request
+    client._request = reply(200, {'thingName': 'x'})  # config shape is irrelevant here
+    client.bind_device('dev-1', NEW)
+    assert seen[-1] == ('POST', '/api/v1/devices/dev-1/onboard', {'experimentIds': [NEW], 'includeWorkbook': False})
+    client._request = reply(403, {'message': 'forbidden'})
+    with pytest.raises(OpenJIIError, match='403'):
+        client.bind_device('dev-1', NEW)
+    client._request = reply(None, raise_=ValueError('bad json'))
+    with pytest.raises(OpenJIIError, match='could not be read'):
+        client.bind_device('dev-1', NEW)
+    client._request = reply(200, [{'id': OLD}, {'id': NEW}, 'junk'])
+    assert client.device_experiment_ids('dev-1') == {OLD, NEW}
     client._request = reply(204)
     assert client.remove_experiment_device(OLD, 'dev-1') is True
-    assert seen[-1] == ('DELETE', f'/api/v1/experiments/{OLD}/devices/dev-1')
+    assert seen[-1][:2] == ('DELETE', f'/api/v1/experiments/{OLD}/devices/dev-1')
     client._request = reply(404, {'message': 'not attached'})
     assert client.remove_experiment_device(OLD, 'dev-1') is False
-    client._request = reply(403, {'message': 'Only experiment collaborators or managers can detach its devices'})
-    with pytest.raises(OpenJIIError, match='403.*collaborators'):
-        client.remove_experiment_device(OLD, 'dev-1')

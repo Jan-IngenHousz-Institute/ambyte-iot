@@ -7,9 +7,10 @@ visibility/bindings are not an authorization gate for the wildcard ingest
 policy. Broker/certificate ownership is preserved, not guessed from API login.
 Queued records deliberately follow the current topic/provenance at publication.
 
-Only after the device change is verified does `sync_bindings` update openJII's
-experiment bindings to match. It is best effort: a refusal is reported, never
-raised, and it never registers, issues or rotates anything.
+openJII's bindings follow the change in two steps around it (HAR-345):
+`onboard_destination` runs before any device write and stops the change on a
+refusal, and `remove_previous_binding` runs only after the change is verified.
+Neither registers, issues or rotates anything.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -219,7 +220,8 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
         raise ExperimentSettingsError("Experiment maintenance requires service-capable firmware (v2.9.0+). Update firmware while keeping settings first.")
     # Resolve against RUNNING firmware. No onboard, register, issue or rotate
     # call belongs here, including as a fallback after a 403 or USB failure.
-    # Bindings follow separately in sync_bindings, after verification.
+    # Bindings are handled around this call: onboard_destination before it,
+    # remove_previous_binding after it.
     source = workbook_source(client, experiment_id, expected.device.identity.fw, log=log)
     descriptor = schedule_descriptor(source.blob, source.sha256, source.script_version,
                                      source.built_against_fw, source.workbook_version_id)
@@ -271,31 +273,59 @@ def change_experiment(expected, client, experiment_id, *, allow_unknown_environm
         raise ExperimentSettingsError(f"{stage}. {exc} Read the device destination and retry this action. No registration or certificate write was attempted.") from None
 
 
-def sync_bindings(client, mac, thing_name, destination_id, previous_id, *, remove_previous):
-    """Make openJII's bindings follow a verified experiment change (HAR-345).
 
-    The device already sends to the destination; this only updates the
-    platform's record. Each step reports its own outcome so a refusal never
-    hides the device change or the other step. Never raises.
+def _label(name, experiment_id):
+    return f"{name} ({experiment_id})" if name and name != experiment_id else experiment_id
+
+
+def onboard_destination(client, mac, thing_name, destination_id, destination_name=None):
+    """Bind the device to the destination on openJII before the device changes.
+
+    Runs before any USB write, so a refusal changes nothing on the Ambyte. The
+    binding is confirmed by reading it back, which also covers a write that
+    landed but whose response could not be read. Returns the device id.
     """
-    lines = []
+    destination = _label(destination_name, destination_id)
+    stop = "No device settings were changed."
     try:
         device = client.find_device(mac)
-    except Exception as exc:  # never let the platform hide a verified device change
-        return f"openJII: onboarding skipped, the device list could not be read: {exc}"
-    if not device or device.get('thingName') != thing_name or not device.get('id'):
-        return ("openJII: onboarding skipped, this account cannot see the device's registration. "
-                "Ask an admin of its organization to onboard it to the new experiment.")
-    try:
-        client.onboard_device(device['id'], destination_id)
-        lines.append(f"openJII: onboarded to {destination_id}.")
     except Exception as exc:
-        lines.append(f"openJII: onboarding to {destination_id} skipped: {exc}")
-    if remove_previous and previous_id and previous_id != destination_id:
-        try:
-            removed = client.remove_experiment_device(previous_id, device['id'])
-            lines.append(f"openJII: removed from {previous_id}; its data stays there." if removed
-                         else f"openJII: was not onboarded to {previous_id}; nothing to remove.")
-        except Exception as exc:
-            lines.append(f"openJII: removal from {previous_id} skipped: {exc}")
-    return '\n'.join(lines)
+        raise ExperimentSettingsError(f"{stop} openJII's device list could not be read: {exc}") from None
+    if not device or not device.get('id'):
+        raise ExperimentSettingsError(
+            f"{stop} This openJII account cannot see the device's registration, so it cannot onboard it "
+            f"to {destination}. Ask an admin of the device's organization to onboard it, or to share it with you.")
+    if device.get('thingName') != thing_name:
+        raise ExperimentSettingsError(
+            f"{stop} openJII's registration for {mac} has a different client name than this Ambyte "
+            f"({device.get('thingName')} vs {thing_name}). Check the device's identity before changing experiments.")
+    refusal = None
+    try:
+        client.bind_device(device['id'], destination_id)
+    except Exception as exc:
+        refusal = exc
+    try:
+        bound = destination_id in client.device_experiment_ids(device['id'])
+    except Exception as exc:
+        raise ExperimentSettingsError(
+            f"{stop} openJII could not confirm the binding to {destination}: {refusal or exc}") from None
+    if not bound:
+        raise ExperimentSettingsError(
+            f"{stop} openJII refused to onboard this Ambyte to {destination}: {refusal}. Onboarding needs "
+            "Can edit or admin on the device, collaborator or manager on the destination, access to every "
+            "experiment the device is already onboarded to, an active destination and an active certificate.")
+    return device['id']
+
+
+def remove_previous_binding(client, device_id, previous_id, previous_name=None):
+    """After a verified change, drop the binding to the experiment the device left.
+
+    Never raises: the device change and the new binding stand either way.
+    """
+    previous = _label(previous_name, previous_id)
+    try:
+        removed = client.remove_experiment_device(previous_id, device_id)
+    except Exception as exc:
+        return f"openJII: removal from {previous} refused: {exc} The device stays listed there; its data stays too."
+    return (f"openJII: removed from {previous}; its data stays there." if removed
+            else f"openJII: no binding to {previous} found; nothing to remove.")

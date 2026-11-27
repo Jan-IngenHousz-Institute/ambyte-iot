@@ -105,7 +105,7 @@ class ExperimentDialog(tk.Toplevel):
             try:
                 value, error = action(), None
             except Exception as exc:
-                value, error = None, str(exc)
+                value, error = None, str(exc) or type(exc).__name__
             if error is None and (maintain or after_primary is not None):
                 try:
                     self.app._post(primary_ready, value)
@@ -116,8 +116,9 @@ class ExperimentDialog(tk.Toplevel):
                             lambda status: self.app._confirm_timezone(status, parent=self)), log=self.app.log)
                     refreshed = settings.read_target(extra.port or value.device.port,
                         dict(getattr(self.app.settings, "mqtt_endpoints", {})))
-                    value = replace(refreshed, timezone_result=value.timezone_result, location_result=value.location_result,
-                                    bindings_result=value.bindings_result)
+                    if refreshed.mac == value.mac:  # never attach this result to another board
+                        value = replace(refreshed, timezone_result=value.timezone_result,
+                                        location_result=value.location_result, bindings_result=value.bindings_result)
                 except settings.ExperimentSettingsError:
                     pass  # A readback failure does not erase the primary result.
                 except Exception:
@@ -231,16 +232,23 @@ class ExperimentDialog(tk.Toplevel):
             return
         remove_previous = bool(self.remove_previous.get()) if hasattr(self, 'remove_previous') else False
         previous_id = target.experiment_id if target.experiment_id != experiment.id else None
-        platform = (f'Then onboard it to {experiment.name} on openJII'
-                    + (f' and remove it from {previous_id}' if remove_previous and previous_id else '') + '.\n')
+        names = {e.id: e.name for e in getattr(self.app, 'experiments', []) or []}
+        previous_label = settings._label(names.get(previous_id), previous_id) if previous_id else None
+        if not remove_previous:
+            removal = ''
+        elif previous_label:
+            removal = f'After the change, remove it from {previous_label} on openJII.\n'
+        else:
+            removal = "The device's current experiment is unknown, so no openJII binding will be removed.\n"
         unknown = ('\nBroker environment is UNKNOWN: confirm that this existing broker is correct for the selected API environment. '
                    'Credential validity has not been checked.\n' if not target.environment else '')
         if not messagebox.askyesno('Change experiment / workbook',
                 f'Device: {target.mac}\nKeep broker: {target.broker}\nAPI environment: {client.env.key}\n'
                 f'Destination: {experiment.name} ({experiment.id})\n{unknown}\n'
-                'Install its workbook and change the data/status topics, keeping registration and certificates. '
+                f'First onboard it to {experiment.name} on openJII. If openJII refuses, nothing on the device changes.\n'
+                'Then install its workbook and change the data/status topics, keeping registration and certificates. '
                 'Queued and transitional records follow the topic/workbook current when published.\n'
-                + platform + 'Continue?', parent=self):
+                + removal + 'Continue?', parent=self):
             return
         def apply(value):
             self._show(value)
@@ -250,21 +258,37 @@ class ExperimentDialog(tk.Toplevel):
                              + ('\n' + value.location_result if value.location_result else ''))
         selected = (self.destination_location.selected() if hasattr(self, 'destination_location')
                     and self.also_location.get() else None)
-        def change_then_bindings():
-            # Bindings follow only a verified device change, and never raise,
-            # so they cannot mask the change result or the maintenance flow.
-            value = settings.change_experiment(target, client, experiment.id,
-                allow_unknown_environment=not bool(target.environment), log=self.app.log)
-            bindings = settings.sync_bindings(client, target.mac, target.device.identity.thing_name,
-                                              experiment.id, previous_id, remove_previous=remove_previous)
-            self.app.log(bindings)
-            return replace(value, bindings_result=bindings)
+        def log(text):
+            try:
+                self.app.log(text)
+            except (RuntimeError, tk.TclError):
+                pass  # logging never decides the outcome of a device change
+        def onboard_change_remove():
+            # Onboard before any device write, so a refusal changes nothing on
+            # the Ambyte; remove the old binding only after verification.
+            device_id = settings.onboard_destination(client, target.mac, target.device.identity.thing_name,
+                                                     experiment.id, experiment.name)
+            lines = [f'openJII: onboarded to {settings._label(experiment.name, experiment.id)}.']
+            log(lines[0])
+            try:
+                value = settings.change_experiment(target, client, experiment.id,
+                    allow_unknown_environment=not bool(target.environment), log=self.app.log)
+            except settings.ExperimentSettingsError as exc:
+                # The binding stays: harmless while the device still publishes
+                # to its old topic, and needed once the change is retried.
+                raise settings.ExperimentSettingsError(f'{lines[0]} {exc}') from None
+            if remove_previous and previous_id:
+                lines.append(settings.remove_previous_binding(client, device_id, previous_id, names.get(previous_id)))
+                log(lines[-1])
+            elif remove_previous:
+                lines.append("openJII: the device's previous experiment was unknown, so no binding was removed.")
+            return replace(value, bindings_result='\n'.join(lines))
         def set_destination_location(value):
             result = location_settings.set_location(value, selected, confirm=self._confirm_location, log=self.app.log)
             return replace(value, location_result=result)
-        self._run(change_then_bindings, apply,
-                  'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…', maintain=True,
-                  after_primary=set_destination_location if selected else None)
+        self._run(onboard_change_remove, apply,
+                  'Onboarding on openJII, then installing the destination workbook, saving topics, rebooting and verifying the same Ambyte…',
+                  maintain=True, after_primary=set_destination_location if selected else None)
 
     def _close(self):
         if self.working:

@@ -126,29 +126,79 @@ def test_real_experiment_switch_warning_stays_visible_and_logged(monkeypatch,tar
     assert any(warning in line for line in logs)
 
 
-def test_change_confirmation_names_the_bindings_and_reports_them(monkeypatch,target):
-    w,finish=dialog(monkeypatch,target)
-    w.remove_previous=Var(True)
-    texts,synced=[],[]
-    def confirm(title,text,**kw):texts.append(text);return True
-    monkeypatch.setattr(g.messagebox,'askyesno',confirm)
-    monkeypatch.setattr(e,'change_experiment',lambda *a,**kw:target.preview)
-    def sync(client,mac,thing,destination,previous,*,remove_previous):
-        synced.append((destination,previous,remove_previous))
-        return 'openJII: onboarded to destination.'
-    monkeypatch.setattr(e,'sync_bindings',sync)
-    w._change();finish()
-    assert 'Then onboard it to Destination example on openJII and remove it from' in texts[0]
-    assert synced==[(NEW,target.preview.experiment_id,True)]
-    assert 'openJII: onboarded to destination.' in w.message.value
+def _platform_dialog(monkeypatch, target, *, remove=True):
+    w, finish = dialog(monkeypatch, target)
+    w.remove_previous = Var(remove)
+    w.app.experiments = [SimpleNamespace(id=target.preview.experiment_id, name='Old example')]
+    calls = []
+    monkeypatch.setattr(e, 'onboard_destination',
+                        lambda *a, **kw: calls.append(('onboard', a[3])) or 'dev-1')
+    monkeypatch.setattr(e, 'remove_previous_binding',
+                        lambda client, device, previous, name: calls.append(('remove', previous, name)) or 'openJII: removed from Old example.')
+    return w, finish, calls
 
 
-def test_failed_device_change_never_touches_bindings(monkeypatch,target):
-    w,finish=dialog(monkeypatch,target)
-    w.remove_previous=Var(True)
-    monkeypatch.setattr(g.messagebox,'askyesno',lambda *a,**kw:True)
-    def fail(*a,**kw):raise e.ExperimentSettingsError('Workbook installed; topic write unconfirmed')
-    monkeypatch.setattr(e,'change_experiment',fail)
-    monkeypatch.setattr(e,'sync_bindings',lambda *a,**kw:pytest.fail('bindings after a failed change'))
-    w._change();finish()
+def test_onboarding_runs_first_and_removal_after_the_verified_change(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    texts = []
+    def confirm(title, text, **kw): texts.append(text); return True
+    monkeypatch.setattr(g.messagebox, 'askyesno', confirm)
+    monkeypatch.setattr(e, 'change_experiment', lambda *a, **kw: calls.append(('change',)) or target.preview)
+    w._change(); finish()
+    assert calls == [('onboard', NEW), ('change',), ('remove', target.preview.experiment_id, 'Old example')]
+    assert 'First onboard it to Destination example on openJII' in texts[0]
+    assert 'remove it from Old example (' in texts[0]
+    assert 'openJII: onboarded to Destination example' in w.message.value
+    assert 'openJII: removed from Old example.' in w.message.value
+
+
+def test_a_refused_onboarding_never_touches_the_device(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    def refuse(*a, **kw): raise e.ExperimentSettingsError('No device settings were changed. openJII refused (403)')
+    monkeypatch.setattr(e, 'onboard_destination', refuse)
+    monkeypatch.setattr(e, 'change_experiment', lambda *a, **kw: pytest.fail('device written after a refusal'))
+    w._change(); finish()
+    assert 'No device settings were changed' in w.message.value and w.target is None
+
+
+def test_a_failed_device_change_reports_the_binding_and_skips_removal(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    def fail(*a, **kw): raise e.ExperimentSettingsError('Workbook installed; topic write unconfirmed')
+    monkeypatch.setattr(e, 'change_experiment', fail)
+    w._change(); finish()
+    assert calls == [('onboard', NEW)]
+    assert 'openJII: onboarded to Destination example' in w.message.value
     assert 'topic write unconfirmed' in w.message.value
+
+
+def test_unticked_removal_keeps_the_old_binding(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target, remove=False)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    monkeypatch.setattr(e, 'change_experiment', lambda *a, **kw: target.preview)
+    w._change(); finish()
+    assert [c[0] for c in calls] == ['onboard']
+
+
+def test_an_empty_exception_is_still_a_failure(monkeypatch,target):
+    w, finish, calls = _platform_dialog(monkeypatch, target)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    def silent(*a, **kw): raise RuntimeError()
+    monkeypatch.setattr(e, 'onboard_destination', silent)
+    w._change(); finish()
+    assert w.message.value == 'RuntimeError' and w.target is None
+
+
+def test_a_different_board_on_refresh_keeps_the_verified_result(monkeypatch,target):
+    w, _, calls = _platform_dialog(monkeypatch, target)
+    w.app._post = lambda fn, *a: fn(*a)
+    monkeypatch.setattr(g.messagebox, 'askyesno', lambda *a, **kw: True)
+    monkeypatch.setattr(e, 'change_experiment', lambda *a, **kw: target.preview)
+    monkeypatch.setattr(g.maintenance, 'run', lambda *a, **kw: g.maintenance.MaintenanceResult('Workbook: ok', 'Fallback timezone: ok'))
+    other = replace(target.preview, device=replace(target.preview.device,
+                    identity=replace(target.preview.device.identity, mac='02:00:00:00:00:99')))
+    monkeypatch.setattr(e, 'read_target', lambda *a, **kw: other)
+    w._change()
+    assert w.target.mac == target.preview.mac
+    assert 'openJII: onboarded to Destination example' in w.message.value

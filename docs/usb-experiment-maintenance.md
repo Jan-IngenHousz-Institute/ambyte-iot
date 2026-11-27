@@ -16,39 +16,69 @@ independently of registry bindings.
 
 ## openJII bindings follow the change
 
-Once the device change is verified after reboot, the GUI updates openJII so its
-records match where the Ambyte now sends data (HAR-345). It finds the device by
-MAC, onboards it to the destination experiment and, when the operator leaves
-**After the change, also remove this Ambyte from its current experiment on
-openJII** ticked (the default), removes the binding to the experiment it left.
-Removal deletes only the binding; measurements stay in that experiment.
+The device change moves the Ambyte's data, because the experiment ID is part of
+the topic stored on the unit. openJII's bindings record which experiments a
+device serves, and openJII will refuse publishes to an unbound experiment once
+bindings are enforced at the broker (OJD-2581). So the GUI keeps them in step
+(HAR-345), in two parts around the device change:
 
-This step is best effort and never undoes or hides the device change. Each part
-reports its own outcome in the result and the log: a device this account cannot
-see, a refused onboarding (for example 403 without device admin rights) or a
-refused removal (the platform allows it to the experiment's collaborators and
-managers) is named and skipped. It runs only after a verified change, never as
-a fallback after a failure, and it never registers, issues or rotates anything.
-This matters before openJII enforces bindings at the broker (OJD-2581): a
-device changed without a binding would then stop delivering.
+1. **Before any device write**, it finds the device on openJII by MAC, onboards
+   it to the destination, and reads the bindings back to confirm. A write that
+   landed but whose response could not be read still counts. If openJII
+   refuses, or the binding cannot be confirmed, the action stops with
+   "No device settings were changed" and the reason.
+2. **After the change is verified**, and only when **After the change, also
+   remove this Ambyte from its current experiment on openJII** is ticked (the
+   default), it removes the binding to the experiment the device left. Removal
+   deletes only the binding; measurements stay. A refusal is reported and the
+   change stands.
+
+openJII refuses onboarding when the signed-in account lacks any of these:
+Can edit or admin on the device; collaborator or manager on the destination;
+access to every experiment the device is already onboarded to (a stale
+binding to someone else's experiment blocks it, which is one reason removal is
+on by default); an active destination; an active device certificate. Removal
+needs collaborator or manager on the experiment being left. openJII answers 404
+both for "not bound" and for an experiment it cannot find, reported as "no
+binding found".
+
+If onboarding succeeded but the device change then fails, the destination
+binding stays. That is harmless while the device still publishes to its old
+topic, and it is needed when the change is retried. Neither part registers,
+issues or rotates anything.
 
 ```mermaid
 sequenceDiagram
     participant GUI as Destination window
-    participant USB as Selected Ambyte
     participant API as openJII
-    GUI->>USB: Install workbook, write topics, reboot, verify
-    USB-->>GUI: Verified destination
-    GUI->>API: Find device by MAC
-    alt device visible
-        GUI->>API: Onboard to destination
+    participant USB as Selected Ambyte
+    GUI->>API: Find device by MAC, onboard to destination
+    GUI->>API: Read bindings back
+    alt destination bound
+        GUI->>USB: Install workbook, write topics, reboot, verify
+        USB-->>GUI: Verified destination
         opt remove from current experiment ticked
             GUI->>API: Remove binding to the experiment it left
         end
-        API-->>GUI: Outcome per step, reported and logged
-    else not visible
-        GUI-->>GUI: Report skipped onboarding, keep verified change
+    else refused or unconfirmed
+        GUI-->>GUI: Stop, no device settings were changed
     end
+```
+
+```mermaid
+flowchart TD
+    Start[Change experiment confirmed] --> Find{Device visible on openJII with this client name?}
+    Find -->|no| Stop1[Stop: no device settings changed]
+    Find -->|yes| Bind[Onboard to destination, read bindings back]
+    Bind -->|not bound| Stop2[Stop: openJII refused, reason shown]
+    Bind -->|bound| Change[Install workbook, write topics, reboot, verify]
+    Change -->|failed| Keep[Report stage; destination binding kept for the retry]
+    Change -->|verified| Ticked{Remove from current experiment ticked?}
+    Ticked -->|no| Done[Done, old binding kept]
+    Ticked -->|yes| Remove[Remove old binding]
+    Remove -->|204| Removed[Removed, data stays]
+    Remove -->|404| None[No binding found]
+    Remove -->|refused| Reported[Refusal reported, change stands]
 ```
 
 ## Which environment and credentials?
