@@ -48,6 +48,10 @@ class ExperimentDialog(tk.Toplevel):
             self.also_text = tk.StringVar(value="Also set this device's location")
             self.also_btn = ttk.Checkbutton(frame, textvariable=self.also_text, variable=self.also_location)
             self.also_btn.pack(anchor='w')
+            self.remove_previous = tk.BooleanVar(value=True)
+            self.remove_previous_btn = ttk.Checkbutton(frame, variable=self.remove_previous,
+                text='After the change, also remove this Ambyte from its current experiment on openJII')
+            self.remove_previous_btn.pack(anchor='w')
             self.location_default_reason = tk.StringVar()
             ttk.Label(frame, textvariable=self.location_default_reason, wraplength=720).pack(anchor='w')
             self.location_key = None
@@ -101,7 +105,7 @@ class ExperimentDialog(tk.Toplevel):
             try:
                 value, error = action(), None
             except Exception as exc:
-                value, error = None, str(exc)
+                value, error = None, str(exc) or type(exc).__name__
             if error is None and (maintain or after_primary is not None):
                 try:
                     self.app._post(primary_ready, value)
@@ -112,7 +116,9 @@ class ExperimentDialog(tk.Toplevel):
                             lambda status: self.app._confirm_timezone(status, parent=self)), log=self.app.log)
                     refreshed = settings.read_target(extra.port or value.device.port,
                         dict(getattr(self.app.settings, "mqtt_endpoints", {})))
-                    value = replace(refreshed, timezone_result=value.timezone_result, location_result=value.location_result)
+                    if refreshed.mac == value.mac:  # never attach this result to another board
+                        value = replace(refreshed, timezone_result=value.timezone_result,
+                                        location_result=value.location_result, bindings_result=value.bindings_result)
                 except settings.ExperimentSettingsError:
                     pass  # A readback failure does not erase the primary result.
                 except Exception:
@@ -224,28 +230,72 @@ class ExperimentDialog(tk.Toplevel):
         if target.environment and target.environment != client.env.key:
             self.message.set('The device broker and selected API environment differ. Select the matching API environment; this action preserves device credentials.')
             return
+        remove_previous = bool(self.remove_previous.get()) if hasattr(self, 'remove_previous') else False
+        previous_id = target.experiment_id if target.experiment_id != experiment.id else None
+        names = {e.id: e.name for e in getattr(self.app, 'experiments', []) or []}
+        previous_label = settings.experiment_label(names.get(previous_id), previous_id) if previous_id else None
+        if not remove_previous:
+            removal = ''
+        elif previous_label:
+            removal = f'After the change, remove it from {previous_label} on openJII.\n'
+        elif target.experiment_id == experiment.id:
+            removal = ('The device already sends to the destination, so the experiment it left is not known here. '
+                       'Remove that binding on openJII by hand if it is still listed.\n')
+        else:
+            removal = "The device's topic names no experiment, so no openJII binding will be removed.\n"
         unknown = ('\nBroker environment is UNKNOWN: confirm that this existing broker is correct for the selected API environment. '
                    'Credential validity has not been checked.\n' if not target.environment else '')
         if not messagebox.askyesno('Change experiment / workbook',
                 f'Device: {target.mac}\nKeep broker: {target.broker}\nAPI environment: {client.env.key}\n'
                 f'Destination: {experiment.name} ({experiment.id})\n{unknown}\n'
-                'Install its workbook and change the data/status topics, keeping registration and certificates. '
-                'Queued and transitional records follow the topic/workbook current when published. Continue?', parent=self):
+                f'First onboard it to {experiment.name} on openJII. If openJII refuses, nothing on the device changes.\n'
+                'Then install its workbook and change the data/status topics, keeping registration and certificates. '
+                'Queued and transitional records follow the topic/workbook current when published.\n'
+                + removal + 'Continue?', parent=self):
             return
         def apply(value):
             self._show(value)
             self.message.set('Experiment topics and workbook verified after reboot. Broker and client identity preserved; no registration or certificate writes.'
+                             + ('\n' + value.bindings_result if value.bindings_result else '')
                              + ('\n' + value.timezone_result if value.timezone_result else '')
                              + ('\n' + value.location_result if value.location_result else ''))
         selected = (self.destination_location.selected() if hasattr(self, 'destination_location')
                     and self.also_location.get() else None)
+        def log(text):
+            try:
+                self.app.log(text)
+            except (RuntimeError, tk.TclError):
+                pass  # logging never decides the outcome of a device change
+        def onboard_change_remove():
+            # Read-only checks first, so a change that cannot happen adds no
+            # binding; onboard before any device write, so a refusal changes
+            # nothing on the Ambyte; remove the old binding only after verification.
+            unknown_env = not bool(target.environment)
+            prepared = settings.preflight(target, client, experiment.id,
+                                          allow_unknown_environment=unknown_env, log=log)
+            device_id = settings.onboard_destination(client, target.mac, target.device.identity.thing_name,
+                                                     experiment.id, experiment.name)
+            lines = [f'openJII: onboarded to {settings.experiment_label(experiment.name, experiment.id)}.']
+            log(lines[0])
+            try:
+                value = settings.change_experiment(target, client, experiment.id,
+                    allow_unknown_environment=unknown_env, log=log, prepared=prepared)
+            except Exception as exc:
+                # The binding stays: harmless while the device still publishes
+                # to its old topic, and needed once the change is retried.
+                raise settings.ExperimentSettingsError(f'{lines[0]} {exc or type(exc).__name__}') from None
+            if remove_previous and previous_id:
+                lines.append(settings.remove_previous_binding(client, device_id, previous_id, names.get(previous_id)))
+                log(lines[-1])
+            elif remove_previous:
+                lines.append('openJII: the experiment the device left is not known here, so no binding was removed.')
+            return replace(value, bindings_result='\n'.join(lines))
         def set_destination_location(value):
             result = location_settings.set_location(value, selected, confirm=self._confirm_location, log=self.app.log)
             return replace(value, location_result=result)
-        self._run(lambda: settings.change_experiment(target, client, experiment.id,
-                  allow_unknown_environment=not bool(target.environment), log=self.app.log), apply,
-                  'Installing the destination workbook, saving topics, then rebooting and verifying the same Ambyte…', maintain=True,
-                  after_primary=set_destination_location if selected else None)
+        self._run(onboard_change_remove, apply,
+                  'Onboarding on openJII, then installing the destination workbook, saving topics, rebooting and verifying the same Ambyte…',
+                  maintain=True, after_primary=set_destination_location if selected else None)
 
     def _close(self):
         if self.working:

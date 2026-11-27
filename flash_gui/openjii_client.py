@@ -23,6 +23,8 @@ Endpoints (packages/api/src/domains/... upstream)
   POST /api/v1/devices/{id}/credentials         issue → SHOW-ONCE cert bundle
   POST /api/v1/devices/{id}/credentials/rotate  re-issue for a live device
   POST /api/v1/devices/{id}/onboard             bind + authoritative MQTT config
+  GET  /api/v1/devices/{id}/experiments       bindings, read back after onboarding
+  DELETE /api/v1/experiments/{id}/devices/{deviceId}  remove one binding
 
 Issuance is refused while a certificate is live (status active/rotating) —
 those go down the /rotate path. The returned private key is show-once: the
@@ -70,7 +72,14 @@ LIVE_STATES = ("active", "rotating")
 
 
 class OpenJIIError(RuntimeError):
-    """API/auth failure, with a human-readable message."""
+    """API/auth failure, with a human-readable message.
+
+    `status` is the HTTP status when openJII answered, None when the outcome
+    is unknown (no response, or a response that could not be read).
+    """
+    def __init__(self, message: str = "", status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -379,6 +388,55 @@ class OpenJIIClient:
                 f"{self._error_text(payload)}")
         raise OpenJIIError(f"issuing credentials failed ({status}): "
                            f"{self._error_text(payload)}")
+
+    def bind_device(self, device_id: str, experiment_id: str) -> None:
+        """Add one experiment binding, ignoring the returned configuration.
+
+        Maintenance keeps the device's own broker and topic, so only the
+        binding matters here. A failure is raised as OpenJIIError; callers
+        that need certainty read the bindings back with device_experiment_ids.
+        """
+        if not device_id or not experiment_id:
+            raise OpenJIIError("binding needs a device id and an experiment id.")
+        path = f"/api/v1/devices/{device_id}/onboard"
+        try:
+            status, payload = self._request(
+                "POST", path, {"experimentIds": [experiment_id], "includeWorkbook": False})
+        except (ValueError, UnicodeDecodeError) as exc:  # a 2xx whose body would not parse
+            raise OpenJIIError(f"onboarding response could not be read: {exc}") from None
+        if status != 200:
+            raise OpenJIIError(f"onboarding device failed ({status}): {self._error_text(payload)}", status)
+
+    def device_experiment_ids(self, device_id: str) -> set[str]:
+        """The experiments the device is bound to, as openJII records them."""
+        try:
+            status, payload = self._request("GET", f"/api/v1/devices/{device_id}/experiments")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise OpenJIIError(f"device experiments could not be read: {exc}") from None
+        if status != 200 or not isinstance(payload, list):
+            raise OpenJIIError(f"reading device experiments failed ({status}): {self._error_text(payload)}")
+        return {item["id"] for item in payload if isinstance(item, dict) and isinstance(item.get("id"), str)}
+
+    def remove_experiment_device(self, experiment_id: str, device_id: str) -> bool:
+        """Remove one experiment binding. False when the device was not bound.
+
+        Removal deletes the binding only; measurements stay in the experiment.
+        The platform allows it to the experiment's collaborators and managers,
+        and answers 404 both for "not bound" and for an experiment it cannot find.
+        """
+        if not device_id or not experiment_id:
+            raise OpenJIIError("removing a binding needs a device id and an experiment id.")
+        path = f"/api/v1/experiments/{experiment_id}/devices/{device_id}"
+        try:
+            status, payload = self._request("DELETE", path)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise OpenJIIError(f"removal response could not be read: {exc}") from None
+        if status in (200, 204):
+            return True
+        if status == 404:
+            return False
+        raise OpenJIIError(f"removing the device from the experiment failed ({status}): "
+                           f"{self._error_text(payload)}", status)
 
     def onboard_device(self, device_id: str,
                        experiment_id: str) -> DeviceOnboarding:

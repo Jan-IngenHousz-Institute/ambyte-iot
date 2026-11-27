@@ -268,7 +268,11 @@ service, changes the ingest/status topics, and verifies after reboot. The
 broker, certificates and registration are preserved. A known environment
 mismatch is refused; an unknown environment requires explicit confirmation of
 the displayed broker and API environment. Service-capable firmware (v2.9.0+)
-is required. No re-registration, binding or certificate rotation is attempted.
+is required. No re-registration or certificate rotation is attempted.
+Before touching the device, the GUI onboards it to the destination experiment
+on openJII; a refusal stops the action with no device change. After the change
+is verified it removes the binding to the experiment the device left, unless
+the operator unticks that option.
 Queued and transitional records follow the current topic/workbook when sent;
 this action does not drain or discard a backlog.
 
