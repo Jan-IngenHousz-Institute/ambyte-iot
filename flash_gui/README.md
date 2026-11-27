@@ -171,6 +171,14 @@ flowchart TD
     Saved -->|other store, unfinished| Stop[Stop: outcome unknown, needs New schedule request]
 ```
 
+Bench qualification on a dev Ambyte (firmware 2.23.0): `main` reproduced the
+field error after a littlefs re-flash, this rule admitted the next transfer on
+the new store and kept the finished one as previous.
+
+![Store change qualification](../docs/images/usb-service/store-change-qualification.png)
+
+[Transcript](../docs/images/usb-service/store-change-qualification.txt).
+
 After a failure, **New schedule request…**
 reads a stable current identity and shows the loaded tuple. You may then choose
 to preserve the old journal and admit a new operation for the selected schedule.
