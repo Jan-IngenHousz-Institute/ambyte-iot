@@ -95,6 +95,14 @@ flowchart TD
     Remove -->|unknown| Check[Read bindings back and report]
 ```
 
+Bench qualification on a dev Ambyte against dev openJII (firmware 2.23.0): a
+refused onboarding changed nothing, and two moves (A to B, then back) left
+openJII's bindings matching the device's topic each time.
+
+![openJII bindings qualification](images/usb-experiment-maintenance/bindings-qualification.png)
+
+[Transcript](images/usb-experiment-maintenance/bindings-qualification.txt).
+
 ## Which environment and credentials?
 
 The device's stored MQTT broker is its actual target. Selecting dev or prod in

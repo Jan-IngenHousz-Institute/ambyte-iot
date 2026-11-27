@@ -1,0 +1,26 @@
+openJII bindings around an experiment change (HAR-345): physical USB, firmware 2.23.0, 2026-11-27
+Bench Ambyte 28:37:2F:FF:E7:04, dev broker, dev openJII. Code: this branch merged with HAR-346.
+Experiments shown as A (the device's own) and B (a second dev experiment with the same pinned workbook).
+
+1. Refusal: destination that does not exist
+   STOPPED before device writes: No device settings were changed. openJII refused to onboard
+   this Ambyte to 00000000-0000-4000-8000-000000000000: onboarding device failed (404)
+   after: topic experiment A (unchanged=True), bindings [A]
+2. Move A -> B, removal ticked
+   before: topic A, bindings [A, B]  (B left over from an earlier attempt that failed on HAR-346)
+   read-only checks passed; destination workbook resolved
+   openJII: onboarded to B.
+   device verified: topic experiment B, workbook installed and confirmed after reboot
+   openJII: removed from A; its data stays there.
+   after: bindings [B]
+3. Move B -> A, removal ticked (restores the bench unit)
+   openJII: onboarded to A.
+   device verified: topic experiment A, workbook confirmed after reboot
+   openJII: removed from B; its data stays there.
+   after: bindings [A]
+
+PASS a refusal changes nothing on the device or on openJII
+PASS onboarding precedes the first device write; removal follows verification
+PASS openJII's bindings match the device's topic after each move
+PASS broker, client identity and certificate preserved; no register, issue or rotate request
+PASS host GUI suite on the combined tree, serial: 735 tests and 29 subtests
