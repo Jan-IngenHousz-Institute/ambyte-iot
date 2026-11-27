@@ -40,6 +40,11 @@ static bool s_ready = false;
 static SemaphoreHandle_t s_read_mtx;
 static mp2731_frame_t    s_last_frame;    /* diagnostics (CLI), under s_read_mtx */
 static esp_err_t         s_last_err = ESP_ERR_INVALID_STATE;
+/* Uptime (ms) at which s_last_frame was captured; -1 = never. The frame itself
+ * carries no time, so a reader of the cache (bench BLE `live`) could not tell a
+ * 5 s old frame from one an hour old (charger reads stop when their callers
+ * do). Same lock as the frame; written only beside it. */
+static int64_t           s_last_frame_ms = -1;
 static mp2731_history_t s_history;
 static portMUX_TYPE s_history_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint64_t s_overlap_epoch;
@@ -861,6 +866,7 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     history_finish(epoch, err, out, &f);
     s_last_frame = f;
     s_last_err = err;
+    s_last_frame_ms = uptime_ms();
     /* Re-detection rides on the reads that already happen (5-15 s): no task,
      * no polling of its own. The read's verdict and caller see nothing of it. */
     redetect_after_read(err, out, &f);
@@ -873,6 +879,11 @@ esp_err_t mp2731_read_power(power_reading_t *out)
 
 esp_err_t mp2731_last_frame(mp2731_frame_t *out)
 {
+    return mp2731_last_frame_at(out, NULL);
+}
+
+esp_err_t mp2731_last_frame_at(mp2731_frame_t *out, int64_t *captured_ms)
+{
     if (out == NULL || s_read_mtx == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -881,6 +892,7 @@ esp_err_t mp2731_last_frame(mp2731_frame_t *out)
     }
     *out = s_last_frame;
     const esp_err_t err = s_last_err;
+    if (captured_ms != NULL) *captured_ms = s_last_frame_ms;
     xSemaphoreGive(s_read_mtx);
     return err;
 }

@@ -1,0 +1,59 @@
+Bench BLE diagnostics: boot, advertise, PC client, phone, publisher starvation - real USB console
+Unit 28:37:2F:FF:E7:04 - 2026-11-17 local time (UTC+1)
+Firmware: v2.23.0-2-g1da5eb4-dirty = commit 8c88316 (env bench-ble, bench-signed)
+Excerpt in log order; prompts normalized; 'ble:' = reply to the 'ble' command (polled every 30 s).
+"[n more ...]" lines are annotations summarising repeated log lines.
+
+09:43:09 I heap_init: At 3FCB85C8 len 00031148 (196 KiB): RAM
+09:43:15 I BLE_INIT: Put all controller code in flash
+09:43:15 I ble_diag: controller + host ready: internal heap 217379 -> 182431 B
+09:43:41 I APP_MAIN: schedule runner started
+09:43:43 I ble_diag: advertising as Ambyte-E704 for 899 s
+09:43:43 I sync_runner: TELEMETRY id=253337 gate=OPEN Vbat=4200mV
+09:43:43 I mqtt_client: MQTT connected
+09:43:52 W sync_runner: publish deferred (window heap): id=253080 need=7482B int_largest=7668 dma_largest=6132 (attempt 0/30)
+09:43:52 W sync_runner: publish deferred (window heap): id=253080 need=6704B int_largest=7668 dma_largest=6132 (attempt 1/30)
+09:43:59 ble: Ambyte-E704 synced=1 adv=1 window_left=882s conn=none mtu=0 connects=0
+09:43:59 ble: heap internal free=20456 largest=7668 min=6260 | psram free=1223508
+         [2 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:44:18 > ble on 60
+09:44:19 I ble_diag: advertising as Ambyte-E704 for 3599 s
+09:44:22 I ble_diag: connected (handle 1)
+09:44:22 I ble_diag: mtu 247
+09:44:30 ble: Ambyte-E704 synced=1 adv=0 window_left=3588s conn=up mtu=247 connects=1
+09:44:30 ble: heap internal free=19508 largest=7668 min=6260 | psram free=1223468
+         [1 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:44:56 I ble_diag: disconnected reason=0x213
+09:44:56 I ble_diag: advertising as Ambyte-E704 for 3561 s
+         [11 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:45:59 I ble_diag: connected (handle 1)
+09:46:00 I ble_diag: mtu 247
+         [3 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:46:30 ble: Ambyte-E704 synced=1 adv=0 window_left=3468s conn=up mtu=247 connects=2
+09:46:30 ble: heap internal free=18972 largest=7668 min=6260 | psram free=1223500
+         [11 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:48:02 W event_log: quarantined event id=253080 (4336 B) -> /evstore/events/quarantine.log — cursor advanced, drain unblocked
+09:48:02 E dev_cmd: event id=253080 quarantined after 30 consecutive failed publish attempts — archived on SD, drain unblocked
+09:48:02 W sync_runner: publish deferred (window heap): id=253081 need=6708B int_largest=7668 dma_largest=6132 (attempt 1/30)
+09:48:32 W sync_runner: publish deferred (window heap): id=253081 need=6708B int_largest=7668 dma_largest=6132 (attempt 2/30)
+         [1 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:48:44 I sync_runner: TELEMETRY id=253348 gate=OPEN Vbat=4200mV
+09:48:45 I ble_diag: disconnected reason=0x213
+09:48:45 I ble_diag: advertising as Ambyte-E704 for 3333 s
+         [5 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:49:24 I ble_diag: connected (handle 1)
+09:49:24 I ble_diag: mtu 247
+         [3 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:50:00 ble: Ambyte-E704 synced=1 adv=0 window_left=3258s conn=up mtu=247 connects=3
+09:50:00 ble: heap internal free=18840 largest=7668 min=6260 | psram free=1223500
+         [19 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:52:02 W event_log: quarantined event id=253081 (4340 B) -> /evstore/events/quarantine.log — cursor advanced, drain unblocked
+09:52:02 E dev_cmd: event id=253081 quarantined after 30 consecutive failed publish attempts — archived on SD, drain unblocked
+09:52:02 W sync_runner: publish deferred (window heap): id=253144 need=8817B int_largest=7668 dma_largest=4852 (attempt 0/30)
+09:52:03 W sync_runner: publish deferred (window heap): id=253144 need=6712B int_largest=7668 dma_largest=6132 (attempt 1/30)
+         [1 more 'publish deferred (window heap)' lines, dma_largest=6132]
+09:52:21 I ble_diag: disconnected reason=0x213
+09:52:21 I ble_diag: advertising as Ambyte-E704 for 3116 s
+09:52:30 ble: Ambyte-E704 synced=1 adv=1 window_left=3108s conn=none mtu=0 connects=3
+09:52:30 ble: heap internal free=18808 largest=7668 min=6260 | psram free=1223532
+         [6 more 'publish deferred (window heap)' lines]

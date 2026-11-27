@@ -1,0 +1,55 @@
+# Bench-only BLE diagnostics prototype (env bench-ble, docs/bench/ble-diagnostics.md).
+# The release sdkconfig.defaults keeps Bluetooth out of the build entirely; this
+# overlay is the ONLY place it is switched on. Not qualified for release: no
+# pairing/authentication, and the radio's power and Wi-Fi coexistence cost is
+# what this env exists to measure.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+# One phone at a time, peripheral only.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# Read-only, unauthenticated by design for the bench: no security manager and,
+# above all, no bonding keys persisted to NVS.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# 244-byte page reads (4 seq + 240 data) in one ATT response.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+# Host buffers in PSRAM: the internal heap carries Wi-Fi, TLS and the publisher.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+# Wi-Fi STA (MIN_MODEM power save) + BLE share one radio.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_AMBYTE_BLE_DIAG=y
+
+# ── Internal RAM budget ──────────────────────────────────────────────────
+# First bench boot (2026-11-17, unit 28:37:2F:FF:E7:04, v2.23.0 base) with the
+# options above: esp_bt_controller_init -> "Malloc failed" x3, ESP_ERR_NO_MEM.
+# With MQTT up the release image leaves only ~20 KiB internal free (largest
+# block ~7.6 KiB); the controller's buffers must be internal. On the S3, IRAM
+# code and DRAM heap share one SRAM pool, so the standard Wi-Fi+BLE coexistence
+# trims below return heap for it. Bench-only; release keeps the IRAM fast paths.
+# Wi-Fi RX/TX fast paths move from IRAM to flash (lower peak Wi-Fi throughput,
+# irrelevant at our ~kB/s MQTT rate; Espressif's bleprph_wifi_coex does this).
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# Controller sized for what the service uses: one advertiser + one link
+# (each further activity costs 828 B), no scanning, no direct test mode, no
+# link-layer security (the SM is off in the host too).
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_BLE_SCAN=n
+CONFIG_BT_CTRL_DTM_ENABLE=n
+CONFIG_BT_CTRL_BLE_SECURITY_ENABLE=n
+# Second bench boot with the trims above: the controller + host came up but
+# cost 31 KiB internal (204,463 -> 173,303 B at init), the schedule runner
+# then failed to start (ESP_ERR_NO_MEM) and MQTT ran at 11 KiB internal free,
+# largest block 2.5 KiB. Controller code moves from IRAM to flash (IDF: "saving
+# over 20K bytes"). Cost: controller ISRs cannot run while the cache is off
+# during a flash erase (littlefs writes), so a BLE link may miss connection
+# events then; the supervision timeout (seconds) rides that out. Bench-only.
+CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y

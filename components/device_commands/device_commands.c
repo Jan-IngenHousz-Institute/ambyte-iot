@@ -2340,6 +2340,7 @@ static cmd_result_t emit_status_event(bool direct, char **preview_out)
         *preview_out = payload; /* caller frees; no store/publish/ack below */
         return make_result(ESP_OK, "preview only: synthetic measure_id=0");
     }
+    if (s_cfg.telemetry_built != NULL) s_cfg.telemetry_built(payload, strlen(payload));
 
     measurement_event_desc_t d = {
         .measure_id    = mid,

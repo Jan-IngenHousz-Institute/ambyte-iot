@@ -1,0 +1,13 @@
+menu "Ambyte bench BLE diagnostics"
+
+config AMBYTE_BLE_DIAG
+    bool "Serve read-only diagnostics over BLE (bench only)"
+    depends on BT_NIMBLE_ENABLED
+    default n
+    help
+        Bench prototype (docs/bench/ble-diagnostics.md): advertise for 15 min
+        after boot and serve the last heartbeat JSON plus the cached charger
+        frame over an unauthenticated read-only GATT service. Enabled only by
+        sdkconfig.bench.ble.defaults (env bench-ble). Never in a release build.
+
+endmenu

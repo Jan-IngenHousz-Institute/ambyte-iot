@@ -35,6 +35,12 @@ esp_err_t mp2731_read_power(power_reading_t *out);
 
 /* Diagnostics: the register frame and verdict of the most recent power read. */
 esp_err_t mp2731_last_frame(mp2731_frame_t *out);
+/* As mp2731_last_frame, plus the uptime (ms, esp_timer) at which that frame was
+ * captured (-1 = no read yet; captured_ms may be NULL). Copies the cache only:
+ * no I2C, no ADC start, no history or re-detect hook. Takes the read mutex
+ * (up to the I2C timeout while a read is in flight), so never call it from a
+ * context that must not block (e.g. a NimBLE host callback). */
+esp_err_t mp2731_last_frame_at(mp2731_frame_t *out, int64_t *captured_ms);
 
 /* Diagnostics only (CLI `mp2731_regs`): one raw register read, no side effects.
  * Works whenever the I2C bus is up, ready or not. */
