@@ -122,7 +122,7 @@ verified on the PC; if those bytes are unavailable, the GUI asks you to cache
 the selection and retry.
 
 The service client saves nonsecret intent in `<config>/service_operations/`,
-keyed by gateway MAC and the device's store instance. It flushes that intent
+one file per gateway MAC, recording the device's store instance. It flushes that intent
 before admitting an operation. Every 144-byte chunk is acknowledged with the
 durable offset. Disconnecting or closing the app preserves the journal; retrying
 the same selection resumes the same operation from the recorded offset. A lost
@@ -155,16 +155,19 @@ work. A different client's active operation reports its kind and state as busy;
 the GUI does not take it over.
 
 An uncertain or expired result means the previous outcome is unknown. A changed
-store instance invalidates all IDs from the old store. When the saved intent
-was still unfinished, the GUI preserves this evidence and stops automatic
-replay. When it had completed, its outcome is already known: the GUI preserves
-it and starts the next transfer on the new store without asking, so Initial
-setup after a full re-flash installs the workbook directly.
+store instance invalidates all IDs from the old store. Initial setup causes
+this, because it flashes a new littlefs image. When the saved intent was still
+unfinished, the GUI preserves this evidence and stops automatic replay. When it
+had finished (succeeded, failed or cancelled), its outcome is already known:
+the GUI moves it to `<MAC>.previous.json`, replacing any older copy, and starts
+the next transfer on the new store without a New schedule request. A live
+operation on the device still reports busy. Initial setup after a re-flash
+therefore installs the workbook directly.
 
 ```mermaid
 flowchart TD
     Saved{Saved intent for this MAC} -->|none, or same store| Normal[Resume or admit as usual]
-    Saved -->|other store, completed| Fresh[Preserve it, number afresh on the new store]
+    Saved -->|other store, finished| Fresh[Keep it as previous, number afresh on the new store]
     Saved -->|other store, unfinished| Stop[Stop: outcome unknown, needs New schedule request]
 ```
 

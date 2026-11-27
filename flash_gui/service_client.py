@@ -424,10 +424,11 @@ class ServiceClient:
         previous = self.journal.load()
         # A changed store (reformat or full re-flash) voids the old operation
         # IDs. Only an unfinished intent has an unknown outcome worth guarding;
-        # a completed one is preserved below and the new store numbers afresh.
-        if previous and previous["phase"] != "complete" and previous["store"] != self.store and not new_request:
-            raise UnknownOutcome("Device service store changed; verify device state before an explicit new request.")
+        # a finished one is preserved below and the new store numbers afresh.
+        # connect() applies the same rule first; this keeps _intent safe alone.
         if previous and previous["phase"] != "complete" and not new_request:
+            if previous["store"] != self.store:
+                raise UnknownOutcome("Device service store changed; verify device state before an explicit new request.")
             if previous["descriptor"] != descriptor:
                 result = self._read_intent(previous)
                 raise ServiceClientError(f"The saved {previous['descriptor']['kind']} operation ({result['state'] if result else 'reserved'}) must be resumed or cancelled first.")
